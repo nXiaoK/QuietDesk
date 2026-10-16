@@ -17,6 +17,7 @@ public enum MessageKind: UInt8, Sendable {
     case hello = 1, video, acknowledgement, input, ping, pong, clipboard, requestClipboard, releaseInput, inputStatus
     case clipboardSettings, clipboardBegin, clipboardEntry, clipboardChunk, clipboardEnd, clipboardReceipt, clipboardCancel
     case streamSettingsRequest, streamSettingsResult
+    case controlStatus
 }
 
 public struct Message: Sendable {
@@ -136,7 +137,8 @@ public struct Hello: Codable, Sendable {
     public let inputActions: Bool?
     public let clipboardSync: Bool?
     public let liveSettings: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true) {
+    public let controlStatusUpdates: Bool?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true) {
         self.name = name
         self.width = width
         self.height = height
@@ -145,6 +147,7 @@ public struct Hello: Codable, Sendable {
         self.inputActions = inputActions
         self.clipboardSync = clipboardSync
         self.liveSettings = liveSettings
+        self.controlStatusUpdates = controlStatusUpdates
     }
 
     public func validate() throws {
@@ -154,6 +157,11 @@ public struct Hello: Codable, Sendable {
             throw DeskError.invalid("远端版本或画面参数不兼容")
         }
     }
+}
+
+public struct ControlStatus: Codable, Sendable {
+    public let canControl: Bool
+    public init(canControl: Bool) { self.canControl = canControl }
 }
 
 public struct RemoteInput: Codable, Sendable {

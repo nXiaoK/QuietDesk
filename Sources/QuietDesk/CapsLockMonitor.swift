@@ -14,6 +14,11 @@ final class CapsLockMonitor {
     private var runLoopSource: CFRunLoopSource?
     private var gesture = CapsLockPress()
     private var pressedDevices = Set<UInt>()
+    private(set) var generation = UUID()
+    var isRunning: Bool {
+        guard manager != nil, let tap else { return false }
+        return CGEvent.tapIsEnabled(tap: tap)
+    }
     private static let secondsPerTick: Double = {
         var info = mach_timebase_info_data_t()
         mach_timebase_info(&info)
@@ -21,7 +26,8 @@ final class CapsLockMonitor {
     }()
 
     func start() throws {
-        guard manager == nil else { return }
+        if isRunning { return }
+        stop()
         guard AXIsProcessTrusted() else { throw DeskError.invalid("请在公司 Mac 的辅助功能中允许 QuietDesk，然后再次启用 Caps Lock") }
         guard IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else {
             throw DeskError.invalid("请在公司 Mac 的输入监控中允许 QuietDesk，退出重开应用后再次启用 Caps Lock")
@@ -48,9 +54,12 @@ final class CapsLockMonitor {
                     }
                     return nil
                 }
-            }, userInfo: Unmanaged.passUnretained(self).toOpaque()),
-              let source = CFMachPortCreateRunLoopSource(nil, tap, 0) else {
-            throw DeskError.invalid("无法捕获 Caps Lock，请检查公司 Mac 的辅助功能权限")
+            }, userInfo: Unmanaged.passUnretained(self).toOpaque()) else {
+            throw DeskError.invalid("系统尚未建立 Caps Lock 监听，请重新检测或完全退出后重开应用")
+        }
+        guard let source = CFMachPortCreateRunLoopSource(nil, tap, 0) else {
+            CFMachPortInvalidate(tap)
+            throw DeskError.invalid("无法建立 Caps Lock 监听，请完全退出后重新打开应用")
         }
         self.tap = tap
         runLoopSource = source
@@ -95,6 +104,7 @@ final class CapsLockMonitor {
     func reset() { gesture.reset(); pressedDevices.removeAll() }
 
     func stop() {
+        generation = UUID()
         reset()
         if let manager {
             IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)

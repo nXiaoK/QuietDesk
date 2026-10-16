@@ -37,6 +37,10 @@ final class DeskModel: ObservableObject {
     @Published var remoteName = ""
     @Published var clipboardStatus = ""
     @Published var canControl = false
+    @Published private(set) var localAccessibility = false
+    @Published private(set) var localInputMonitoring = false
+    @Published private(set) var localScreenRecording = false
+    @Published private(set) var capsLockRunning = false
     @Published var isFullScreen = false
     @Published private(set) var capsLockEnabled = UserDefaults.standard.bool(forKey: "capsLockActions")
     @Published private(set) var supportsInputActions = false
@@ -71,6 +75,9 @@ final class DeskModel: ObservableObject {
     private var helloReceived = false
     private var activity: NSObjectProtocol?
     private var metricsTimer: Timer?
+    private var permissionTimer: Timer?
+    private var capsLockStartAttempted = false
+    private var controlStatusUpdatesEnabled = false
     private var byteCount = 0
     private var frames = 0
     private var lastMetrics = ProcessInfo.processInfo.systemUptime
@@ -162,11 +169,23 @@ final class DeskModel: ObservableObject {
             self?.isFullScreen = enabled
         }
         canvas.capsLockMonitor.onFailure = { [weak self] message in
+            let failedMonitor = self?.canvas.capsLockMonitor.generation
             DispatchQueue.main.async {
-                self?.setCapsLockEnabled(false)
-                self?.inputStatus = message
+                guard let self, self.canvas.capsLockMonitor.generation == failedMonitor else { return }
+                self.canvas.capsLockMonitor.stop()
+                self.canvas.usesCapsLockActions = false
+                self.capsLockRunning = false
+                self.inputStatus = "\(message)；请点击重新检测，已勾选时可完全退出后重开，无需反复添加"
             }
         }
+        refreshPermissions(checkScreenCapture: true)
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.connected || self.capsLockEnabled else { return }
+                self.refreshPermissions()
+            }
+        }
+        if let permissionTimer { RunLoop.main.add(permissionTimer, forMode: .common) }
     }
 
     func toggleFullScreen() {
@@ -175,6 +194,7 @@ final class DeskModel: ObservableObject {
     }
 
     func requestInputMonitoring() {
+        if mode == .viewer { canvas.releaseControl() }
         if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
             _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
         }
@@ -184,17 +204,59 @@ final class DeskModel: ObservableObject {
     }
 
     func setCapsLockEnabled(_ enabled: Bool) {
-        if enabled {
-            do { try canvas.capsLockMonitor.start() }
-            catch { self.error = error.localizedDescription; return }
-        } else {
-            canvas.capsLockMonitor.stop()
-        }
         capsLockEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "capsLockActions")
-        canvas.usesCapsLockActions = enabled && supportsInputActions && canControl
-        if enabled && connected && !supportsInputActions { inputStatus = "远端版本较旧，请更新家里 Mac 后使用 Caps Lock 切换输入法" }
-        else { inputStatus = enabled ? "Caps Lock：短按切输入法，长按后松开切大写" : "Caps Lock 转发已关闭" }
+        refreshPermissions(retryCapsLock: true)
+        if !enabled { inputStatus = "Caps Lock 转发已关闭" }
+    }
+
+    func refreshPermissions(checkScreenCapture: Bool = false, retryCapsLock: Bool = false) {
+        let accessibility = AXIsProcessTrusted()
+        let inputMonitoring = mode == .viewer && IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
+        if localAccessibility != accessibility { localAccessibility = accessibility }
+        if localInputMonitoring != inputMonitoring { localInputMonitoring = inputMonitoring }
+        if checkScreenCapture, mode == .host { localScreenRecording = CGPreflightScreenCaptureAccess() }
+
+        if mode == .host, connected, canControl != accessibility {
+            canControl = accessibility
+            if !accessibility { injector?.releaseAll() }
+            status = accessibility ? "正在共享 · 允许键盘鼠标控制" : "正在共享 · 仅观看（辅助功能未生效）"
+            if controlStatusUpdatesEnabled, let peer {
+                do { peer.send(try Wire.json(.controlStatus, ControlStatus(canControl: accessibility))) }
+                catch { peer.close(error.localizedDescription) }
+            } else if accessibility {
+                status = "辅助功能已生效 · 旧版控制端需重新连接后操作"
+            }
+        }
+
+        guard mode == .viewer, capsLockEnabled else {
+            canvas.capsLockMonitor.stop()
+            canvas.usesCapsLockActions = false
+            capsLockRunning = false
+            capsLockStartAttempted = false
+            return
+        }
+        guard accessibility, inputMonitoring else {
+            canvas.capsLockMonitor.stop()
+            canvas.usesCapsLockActions = false
+            capsLockRunning = false
+            capsLockStartAttempted = false
+            inputStatus = "Caps Lock 等待本机辅助功能和输入监控生效；已勾选时请完全退出后重开，无需反复添加"
+            return
+        }
+        if !canvas.capsLockMonitor.isRunning, retryCapsLock || !capsLockStartAttempted {
+            capsLockStartAttempted = true
+            do {
+                try canvas.capsLockMonitor.start()
+                inputStatus = "Caps Lock：短按切输入法，长按后松开切大写"
+            } catch {
+                canvas.capsLockMonitor.stop()
+                inputStatus = "系统权限已允许，输入监听尚未就绪：\(error.localizedDescription)。请重新检测或完全退出后重开"
+            }
+        }
+        capsLockRunning = canvas.capsLockMonitor.isRunning
+        canvas.usesCapsLockActions = capsLockRunning && supportsInputActions && canControl
+        if connected, !supportsInputActions { inputStatus = "远端版本较旧，请更新家里 Mac 后使用 Caps Lock 切换输入法" }
     }
 
     func prepareHostCode() {
@@ -225,8 +287,12 @@ final class DeskModel: ObservableObject {
     }
 
     func requestAccessibility() {
+        if mode == .viewer { canvas.releaseControl() }
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
         _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     func openScreenPermission() {
@@ -524,6 +590,12 @@ final class DeskModel: ObservableObject {
 
     private func handleHost(_ message: Message, peer: Peer) throws {
         switch message.kind {
+        case .controlStatus:
+            guard message.payload.isEmpty else { throw DeskError.invalid("控制权限订阅消息无效") }
+            refreshPermissions()
+            controlStatusUpdatesEnabled = true
+            status = canControl ? "正在共享 · 允许键盘鼠标控制" : "正在共享 · 仅观看（辅助功能未生效）"
+            peer.send(try Wire.json(.controlStatus, ControlStatus(canControl: canControl)))
         case .acknowledgement:
             guard message.payload.count == 4 else { throw DeskError.invalid("画面确认无效") }
             var reader = ByteReader(message.payload)
@@ -586,16 +658,9 @@ final class DeskModel: ObservableObject {
             canControl = hello.canControl
             supportsInputActions = hello.inputActions == true
             canvas.canControl = hello.canControl
-            if capsLockEnabled {
-                do {
-                    try canvas.capsLockMonitor.start()
-                    canvas.usesCapsLockActions = supportsInputActions && canControl
-                    inputStatus = supportsInputActions ? "Caps Lock：短按切输入法，长按后松开切大写" : "请更新家里 Mac 后使用 Caps Lock 切换输入法"
-                } catch {
-                    canvas.usesCapsLockActions = false
-                    inputStatus = error.localizedDescription
-                }
-            }
+            controlStatusUpdatesEnabled = hello.controlStatusUpdates == true
+            if controlStatusUpdatesEnabled { peer.send(Message(.controlStatus)) }
+            refreshPermissions(retryCapsLock: true)
             canvas.remoteSize = CGSize(width: hello.width, height: hello.height)
             resolution = "\(hello.width) × \(hello.height)"
             status = hello.canControl ? "已连接 · 点击画面开始操作" : "已连接 · 仅观看（家里 Mac 需开启辅助功能）"
@@ -607,6 +672,16 @@ final class DeskModel: ObservableObject {
                 videoSettingsStatus = "当前生效：\(state.settings.summary)"
                 sendNextVideoSettings()
             } else { videoSettingsStatus = "主机需更新到 0.4.0 才能动态调整画质" }
+        case .controlStatus:
+            guard helloReceived, controlStatusUpdatesEnabled else { throw DeskError.invalid("对端不支持控制权限更新") }
+            let permission = try Wire.readJSON(ControlStatus.self, message.payload)
+            if canControl != permission.canControl {
+                if !permission.canControl { canvas.releaseControl() }
+                canControl = permission.canControl
+                canvas.canControl = permission.canControl
+                canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && canControl
+                status = permission.canControl ? "已连接 · 辅助功能已生效，点击画面开始操作" : "已连接 · 仅观看（家里 Mac 的辅助功能未生效）"
+            }
         case .video:
             guard helloReceived else { throw DeskError.invalid("缺少会话信息") }
             let packet = try VideoPacket.decode(message.payload)
@@ -891,6 +966,9 @@ final class DeskModel: ObservableObject {
     }
 
     private func clearSession() {
+        controlStatusUpdatesEnabled = false
+        capsLockRunning = false
+        capsLockStartAttempted = false
         latency = "— ms"
         lastLatencyAt = nil
         videoDebounceTask?.cancel()
@@ -955,4 +1033,6 @@ final class DeskModel: ObservableObject {
         inputStatus = ""
         status = mode == .host ? "共享已停止" : "已断开连接"
     }
+
+    deinit { permissionTimer?.invalidate() }
 }

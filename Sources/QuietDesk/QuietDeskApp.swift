@@ -55,7 +55,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem))?.booleanValue == true
         model?.initialLaunch(atLogin: launchedAtLogin)
     }
-    func applicationDidBecomeActive(_ notification: Notification) { model?.refreshLoginStatus() }
+    func applicationDidBecomeActive(_ notification: Notification) {
+        model?.refreshLoginStatus()
+        model?.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
+    }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         model?.prepareShowWindow()
         model?.mainWindow?.deminiaturize(nil)
@@ -229,6 +232,7 @@ struct DeskView: View {
             Button("知道了", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
         .onChange(of: immersive) { _, _ in showFullScreenMenu = false; showOptions = false; showCapsSettings = false }
+        .onChange(of: model.mode) { _, _ in model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true) }
     }
 
     private var optionsButton: some View {
@@ -295,7 +299,7 @@ struct DeskView: View {
 
     private var capsButton: some View {
         Button { showCapsSettings = true } label: {
-            Label(model.capsLockEnabled ? "Caps Lock ✓" : "Caps Lock", systemImage: "keyboard")
+            Label(model.capsLockEnabled ? (model.capsLockRunning ? "Caps Lock ✓" : "Caps Lock 待生效") : "Caps Lock", systemImage: "keyboard")
         }
         .popover(isPresented: $showCapsSettings) { capsSettings }
     }
@@ -308,9 +312,12 @@ struct DeskView: View {
                 set: { model.setCapsLockEnabled($0) }))
             Text("公司 Mac 需授权辅助功能和输入监控。仅在远程画面获得焦点时捕获 Caps Lock。")
                 .font(.caption).foregroundStyle(.secondary)
+            Text("本机辅助功能：\(model.localAccessibility ? "已生效" : "未生效") · 输入监控：\(model.localInputMonitoring ? "已生效" : "未生效")")
+                .font(.caption)
             HStack {
                 Button("辅助功能权限") { model.requestAccessibility() }
                 Button("输入监控权限") { model.requestInputMonitoring() }
+                Button("重新检测") { model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true) }
             }
             if !model.inputStatus.isEmpty { Text(model.inputStatus).font(.caption).textSelection(.enabled) }
         }
@@ -441,9 +448,17 @@ struct DeskView: View {
                     }
                     .padding(10)
                 }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("屏幕录制：\(model.localScreenRecording ? "已生效" : "未生效") · 辅助功能：\(model.localAccessibility ? "已生效" : "未生效")")
+                        .font(.callout)
+                    Text("已勾选仍未生效时，请完全退出后重开；升级后的旧授权记录可能需要移除并重新添加当前应用一次。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text("当前应用：\(Bundle.main.bundleURL.path)").font(.caption).textSelection(.enabled)
+                }
                 HStack(spacing: 12) {
                     Button("屏幕录制权限") { model.openScreenPermission() }
                     Button("辅助功能权限") { model.requestAccessibility() }
+                    Button("重新检测") { model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true) }
                     Spacer()
                     if locked {
                         Button("停止共享") { model.stop() }.controlSize(.large)

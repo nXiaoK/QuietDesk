@@ -20,6 +20,7 @@ public enum MessageKind: UInt8, Sendable {
     case controlStatus
     case deviceIdentity
     case sessionEffectsRequest, sessionEffectsResult
+    case sessionPauseRequest, sessionPauseResult
 }
 
 public struct Message: Sendable {
@@ -168,7 +169,8 @@ public struct Hello: Codable, Sendable {
     public let highRefreshVideoSettings: Bool?
     public let preferredHighRefreshSettings: StreamSettings?
     public let sessionEffects: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil) {
+    public let sessionPause: Bool?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -185,6 +187,7 @@ public struct Hello: Codable, Sendable {
         self.highRefreshVideoSettings = highRefreshVideoSettings
         self.preferredHighRefreshSettings = preferredHighRefreshSettings
         self.sessionEffects = sessionEffects
+        self.sessionPause = sessionPause
     }
 
     public func validate() throws {

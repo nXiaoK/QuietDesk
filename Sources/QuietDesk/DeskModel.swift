@@ -63,6 +63,11 @@ final class DeskModel: ObservableObject {
     @Published private(set) var sessionEffects = SessionEffectsState()
     @Published private(set) var sessionEffectsWorking = false
     @Published private(set) var sessionEffectsStatus = ""
+    @Published private(set) var supportsSessionPause = false
+    @Published private(set) var sessionPaused = false
+    @Published private(set) var sessionPauseWorking = false
+    @Published private(set) var sessionPauseStatus = ""
+    var sessionInputSuspended: Bool { mode == .viewer && (idlePolicy.isPaused || pauseTransmission.inputSuspended) }
     @Published private(set) var activeVideoState: VideoStreamState?
     @Published private(set) var videoTuning: VideoTuningSession?
     @Published private(set) var videoSettingsStatus = ""
@@ -150,6 +155,19 @@ final class DeskModel: ObservableObject {
     private var effectsCleanupTask: Task<Void, Never>?
     private var effectsRequestID: UUID?
     private var effectsRequestTimeout: Task<Void, Never>?
+    private var idlePolicy = SessionIdlePolicy(now: ProcessInfo.processInfo.systemUptime)
+    private var pauseTransmission = SessionPauseTransmission()
+    private var wakeInputGate = SessionWakeInputGate()
+    private var pauseRequestTimeout: Task<Void, Never>?
+    private var hostPauseTask: Task<Void, Never>?
+    private var hostPaused = false
+    private var reconnectDeferredForIdle = false
+    private var windowActivityMonitor: Any?
+    private var sessionFocusObservers: [NSObjectProtocol] = []
+    private var focusRefreshTask: Task<Void, Never>?
+    private var suppressIdleFocusWake = false
+    private var restoreCanvasFocusAfterIdle = false
+    private var freshFrameRequiredOnReconnect = false
 
     init() {
         if autoStartSharing { mode = .host }
@@ -171,8 +189,12 @@ final class DeskModel: ObservableObject {
                 }
             }
 
+        canvas.onUserActivity = { [weak self] in self?.recordSessionActivity() }
         canvas.onInput = { [weak self] value in
-            guard let self, self.connected, self.canControl else { return }
+            guard let self else { return }
+            self.recordSessionActivity()
+            let allowed = self.wakeInputGate.allows(value, suspended: self.sessionInputSuspended || !self.connected)
+            guard self.connected, self.canControl, allowed else { return }
             var input = value
             if input.kind == .switchInputSource || input.kind == .toggleCapsLock {
                 guard self.supportsInputActions else { return }
@@ -190,11 +212,13 @@ final class DeskModel: ObservableObject {
         canvas.onFailure = { [weak self] message in self?.peer?.close(message, retryable: true) }
         canvas.onPaste = { [weak self] input in
             guard let self, let peer = self.peer, self.connected else { return }
+            self.recordSessionActivity()
+            guard !self.sessionInputSuspended else { return }
             let interaction = self.canvas.interactionRevision
             self.clipboardStatus = "正在等待剪贴板同步后粘贴…"
             self.clipboardSync?.prepareForPaste { [weak self, weak peer] success in
                 guard let self, let peer, self.peer === peer, self.connected else { return }
-                guard success, self.canvas.interactionRevision == interaction,
+                guard success, !self.sessionInputSuspended, self.canvas.interactionRevision == interaction,
                       self.canvas.window?.firstResponder === self.canvas, self.canvas.window?.isKeyWindow == true else {
                     self.clipboardStatus = "粘贴未执行：同步失败、焦点离开或等待期间进行了其他操作"
                     return
@@ -299,7 +323,7 @@ final class DeskModel: ObservableObject {
             }
         }
 
-        canvas.updateSystemShortcutCapture(sessionActive: mode == .viewer && connected && canControl,
+        canvas.updateSystemShortcutCapture(sessionActive: mode == .viewer && connected && canControl && !sessionInputSuspended,
             accessibility: accessibility, inputMonitoring: inputMonitoring, retry: retryCapsLock)
         guard mode == .viewer, capsLockEnabled else {
             canvas.capsLockMonitor.stop()
@@ -327,7 +351,7 @@ final class DeskModel: ObservableObject {
             }
         }
         capsLockRunning = canvas.capsLockMonitor.isRunning
-        canvas.usesCapsLockActions = capsLockRunning && supportsInputActions && canControl
+        canvas.usesCapsLockActions = capsLockRunning && supportsInputActions && canControl && !sessionInputSuspended
         if connected, !supportsInputActions { inputStatus = "远端版本较旧，请更新家里 Mac 后使用 Caps Lock 切换输入法" }
     }
 
@@ -527,7 +551,7 @@ final class DeskModel: ObservableObject {
                             preferredSettings: preferredSettings.extendedCompatible, deviceID: self.trafficHistoryStore.localDeviceID,
                             deviceIdentityExchange: self.hostDeviceIdentityAdvertised ? true : nil,
                             highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings,
-                            sessionEffects: true)))
+                            sessionEffects: true, sessionPause: true)))
                         let streamer = ScreenStreamer()
                         self.streamer = streamer
                         streamer.onFrame = { [weak self, weak candidate] packet in
@@ -604,6 +628,12 @@ final class DeskModel: ObservableObject {
             UserDefaults.standard.set(self.port, forKey: "remotePort")
             let target = Target(address: address, port: port.rawValue, key: key)
             self.target = target
+            idlePolicy = SessionIdlePolicy(now: ProcessInfo.processInfo.systemUptime)
+            _ = idlePolicy.focusChanged(now: ProcessInfo.processInfo.systemUptime, focused: sessionWindowFocused, suppressWake: true)
+            pauseTransmission = SessionPauseTransmission()
+            wakeInputGate = SessionWakeInputGate()
+            reconnectDeferredForIdle = false
+            freshFrameRequiredOnReconnect = false
             let saved = connections.first(where: { $0.matches(address: address, port: port.rawValue) })?.videoSettings
             viewerQualityPolicy = ViewerQualityPolicy(preferred: saved.flatMap { (try? $0.validateControlValues()) != nil ? $0 : nil })
             savedTarget = false
@@ -615,6 +645,11 @@ final class DeskModel: ObservableObject {
     }
 
     private func beginConnection(_ target: Target) {
+        guard peer == nil else { return }
+        if reconnecting {
+            _ = idlePolicy.tick(now: ProcessInfo.processInfo.systemUptime)
+            if idlePolicy.isPaused { deferReconnectForIdle("10 分钟无窗口操作"); return }
+        }
         let candidate = Peer(connection: NWConnection(host: NWEndpoint.Host(target.address),
             port: NWEndpoint.Port(rawValue: target.port)!, using: SecureTransport.parameters(key: target.key)))
         trafficSession = makeTrafficSession(for: candidate)
@@ -676,6 +711,11 @@ final class DeskModel: ObservableObject {
 
     private func scheduleReconnect(_ reason: String) {
         reconnectTask?.cancel()
+        _ = idlePolicy.tick(now: ProcessInfo.processInfo.systemUptime)
+        if idlePolicy.isPaused {
+            deferReconnectForIdle(reason)
+            return
+        }
         let delay = retryBackoff.next()
         let token = generation
         active = true
@@ -684,9 +724,20 @@ final class DeskModel: ObservableObject {
         status = "\(Int(delay)) 秒后第 \(retryBackoff.attempt) 次重连 · \(reason)"
         reconnectTask = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(delay)) } catch { return }
-            guard let self, self.generation == token, let target = self.target, self.autoReconnect else { return }
+            guard let self, self.generation == token, let target = self.target, self.autoReconnect,
+                  !Task.isCancelled, self.peer == nil else { return }
             self.beginConnection(target)
         }
+    }
+
+    private func deferReconnectForIdle(_ reason: String) {
+        reconnectTask?.cancel()
+        active = true; working = false; reconnecting = true
+        reconnectDeferredForIdle = true
+        pauseTransmission.choose(paused: true)
+        sessionPaused = true
+        sessionPauseStatus = "空闲暂停 · 返回此窗口后继续重连"
+        status = "连接已断开，空闲暂停期间不在后台重连 · \(reason)"
     }
 
     func quickConnect(_ record: ConnectionRecord) {
@@ -735,6 +786,8 @@ final class DeskModel: ObservableObject {
 
     private func handleHost(_ message: Message, peer: Peer) throws {
         switch message.kind {
+        case .sessionPauseRequest:
+            applyHostSessionPause(try Wire.readJSON(SessionPauseRequest.self, message.payload), peer: peer)
         case .sessionEffectsRequest:
             applyHostSessionEffects(try Wire.readJSON(SessionEffectsRequest.self, message.payload), peer: peer)
         case .deviceIdentity:
@@ -759,7 +812,7 @@ final class DeskModel: ObservableObject {
         case .input:
             let input = try Wire.readJSON(RemoteInput.self, message.payload)
             try input.validate()
-            if canControl, let feedback = try injector?.receive(input) {
+            if canControl, !hostPaused, hostPauseTask == nil, let feedback = try injector?.receive(input) {
                 peer.send(try Wire.json(.inputStatus, feedback))
             }
         case .releaseInput: injector?.releaseAll()
@@ -794,11 +847,25 @@ final class DeskModel: ObservableObject {
             guard !helloReceived else { throw DeskError.invalid("重复的会话信息") }
             let hello = try Wire.readJSON(Hello.self, message.payload)
             try hello.validate()
+            if reconnecting, idlePolicy.isPaused || idlePolicy.tick(now: ProcessInfo.processInfo.systemUptime) {
+                clearSession()
+                peer.close("空闲暂停，返回窗口后继续连接")
+                deferReconnectForIdle("连接恢复前已达到空闲时限")
+                return
+            }
             helloReceived = true
             connected = true
             working = false
             remoteName = hello.name
             reconnecting = false
+            supportsSessionPause = hello.sessionPause == true
+            if !supportsSessionPause {
+                idlePolicy.synchronize(paused: false, now: ProcessInfo.processInfo.systemUptime)
+                pauseTransmission = SessionPauseTransmission()
+            } else if idlePolicy.tick(now: ProcessInfo.processInfo.systemUptime) {
+                pauseTransmission.choose(paused: true)
+            }
+            if freshFrameRequiredOnReconnect { pauseTransmission.requireFreshFrame() }
             saveConnection(name: hello.name)
             if let id = hello.deviceID, let trafficSession {
                 try trafficSession.bind(DeviceIdentity(id: id, name: hello.name))
@@ -846,6 +913,25 @@ final class DeskModel: ObservableObject {
                 applyInitialVideoQualityIfReady()
                 sendNextVideoSettings()
             } else { videoSettingsStatus = "主机需更新到 0.4.0 才能动态调整画质" }
+            publishSessionPause()
+            sendNextSessionPause()
+            if let token = pauseTransmission.freshFrameToken { scheduleFreshFrameTimeout(token, peer: peer) }
+        case .sessionPauseResult:
+            guard helloReceived, supportsSessionPause else { throw DeskError.invalid("当前连接未启用空闲暂停") }
+            let result = try Wire.readJSON(SessionPauseResult.self, message.payload)
+            let oldRequest = pauseTransmission.pending
+            guard pauseTransmission.receive(result) else { return }
+            pauseRequestTimeout?.cancel()
+            if let error = result.error {
+                sessionPauseStatus = "暂停/恢复失败：\(error)"
+                if !result.paused, oldRequest?.paused == true { self.error = "空闲暂停失败，画面仍在传输：\(error)" }
+                if oldRequest?.paused == idlePolicy.isPaused {
+                    idlePolicy.synchronize(paused: result.paused, now: ProcessInfo.processInfo.systemUptime)
+                }
+            } else { sessionPauseStatus = result.paused ? "空闲暂停 · 加密会话仍保持" : "正在等待恢复后的新画面…" }
+            publishSessionPause()
+            sendNextSessionPause()
+            if let token = pauseTransmission.freshFrameToken { scheduleFreshFrameTimeout(token, peer: peer) }
         case .sessionEffectsResult:
             guard helloReceived, supportsSessionEffects else { throw DeskError.invalid("当前连接未启用被控端设置") }
             let result = try Wire.readJSON(SessionEffectsResult.self, message.payload)
@@ -864,16 +950,33 @@ final class DeskModel: ObservableObject {
                 if !permission.canControl { canvas.releaseControl() }
                 canControl = permission.canControl
                 canvas.canControl = permission.canControl
-                canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && canControl
+                canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && canControl && !sessionInputSuspended
                 status = permission.canControl ? "已连接 · 辅助功能已生效，点击画面开始操作" : "已连接 · 仅观看（家里 Mac 的辅助功能未生效）"
             }
         case .video:
             guard helloReceived else { throw DeskError.invalid("缺少会话信息") }
             let packet = try VideoPacket.decode(message.payload)
-            try canvas.present(packet) { [weak peer] in
+            let freshToken = packet.sps.isEmpty ? nil : pauseTransmission.freshFrameToken
+            try canvas.present(packet) { [weak self, weak peer] in
                 var data = Data()
                 data.put(packet.sequence)
                 peer?.send(Message(.acknowledgement, data))
+                if let freshToken {
+                    DispatchQueue.main.async {
+                        guard let self, let peer, self.peer === peer,
+                              self.pauseTransmission.decodedFreshFrame(token: freshToken) else { return }
+                        self.pauseRequestTimeout?.cancel()
+                        self.sessionPauseStatus = ""
+                        self.freshFrameRequiredOnReconnect = false
+                        self.publishSessionPause()
+                        if self.restoreCanvasFocusAfterIdle, self.sessionWindowFocused, self.canControl,
+                           let window = self.mainWindow, NSApp.keyWindow === window,
+                           window.firstResponder == nil || window.firstResponder === window || window.firstResponder === self.canvas {
+                            window.makeFirstResponder(self.canvas)
+                        }
+                        self.restoreCanvasFocusAfterIdle = false
+                    }
+                }
             }
             frames += 1
         case .clipboard:
@@ -1054,6 +1157,160 @@ final class DeskModel: ObservableObject {
         catch { videoSettingsStatus = "画质已生效，但保存记录失败：\(error.localizedDescription)" }
     }
 
+    func resumeSession() { recordSessionActivity() }
+
+    private var sessionWindowFocused: Bool {
+        guard NSApp.isActive, let key = NSApp.keyWindow else { return false }
+        return belongsToSessionWindow(key)
+    }
+
+    private func belongsToSessionWindow(_ window: NSWindow) -> Bool {
+        var current: NSWindow? = window
+        while let candidate = current {
+            if candidate === mainWindow { return true }
+            current = candidate.sheetParent ?? candidate.parent
+        }
+        return false
+    }
+
+    private func observeSessionEvent(_ event: NSEvent) -> NSEvent? {
+        guard mode == .viewer, supportsSessionPause || idlePolicy.isPaused || reconnecting,
+              let window = event.window, belongsToSessionWindow(window) else { return event }
+        let wasSuspended = sessionInputSuspended
+        let windowWasFocused = sessionWindowFocused
+        recordSessionActivity()
+        let kind: RemoteInput.Kind
+        switch event.type {
+        case .keyDown: kind = .keyDown
+        case .keyUp: kind = .keyUp
+        case .flagsChanged: kind = .flags
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown: kind = .down
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp: kind = .up
+        case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged: kind = .drag
+        case .scrollWheel: kind = .scroll
+        default: kind = .move
+        }
+        var input = RemoteInput(kind: kind)
+        let keyboard = kind == .keyDown || kind == .keyUp || kind == .flags
+        if keyboard { input.keyCode = event.keyCode }
+        else { input.button = min(2, max(0, event.buttonNumber)) }
+        input.flags = UInt64(event.modifierFlags.rawValue)
+        let allowed = wakeInputGate.allows(input, suspended: wasSuspended || sessionInputSuspended || !connected)
+        let remoteTarget = keyboard ? window.firstResponder === canvas
+            : canvas.window === window && canvas.bounds.contains(canvas.convert(event.locationInWindow, from: nil))
+        // AppKit must still receive the click that activates an inactive window.
+        return !allowed && remoteTarget && windowWasFocused ? nil : event
+    }
+
+    private func dismissClipboardPrompt() {
+        guard let clipboardFilePrompt else { return }
+        suppressIdleFocusWake = true
+        clipboardFilePrompt.dismiss()
+        sessionWindowFocusChanged()
+    }
+
+    func sessionWindowFocusChanged() {
+        focusRefreshTask?.cancel()
+        focusRefreshTask = Task { [weak self] in
+            await Task.yield()
+            guard let self, !Task.isCancelled else { return }
+            if NSApp.isActive, NSApp.keyWindow == nil, let window = self.mainWindow,
+               window.isVisible, !window.isMiniaturized { return }
+            let resumed = self.idlePolicy.focusChanged(now: ProcessInfo.processInfo.systemUptime,
+                focused: self.sessionWindowFocused, suppressWake: self.suppressIdleFocusWake)
+            self.suppressIdleFocusWake = false
+            if resumed { self.resumeIdleTransmission() }
+        }
+    }
+
+    private func recordSessionActivity() {
+        guard mode == .viewer, supportsSessionPause || idlePolicy.isPaused || reconnecting,
+              sessionWindowFocused else { return }
+        if idlePolicy.activity(now: ProcessInfo.processInfo.systemUptime, focused: true) { resumeIdleTransmission() }
+    }
+
+    private func resumeIdleTransmission() {
+        guard mode == .viewer else { return }
+        pauseTransmission.choose(paused: false)
+        sessionPauseStatus = "正在恢复画面…"
+        publishSessionPause()
+        if reconnectDeferredForIdle, autoReconnect, let target {
+            reconnectDeferredForIdle = false
+            freshFrameRequiredOnReconnect = true
+            pauseTransmission.requireFreshFrame()
+            beginConnection(target)
+        } else { sendNextSessionPause() }
+    }
+
+    private func publishSessionPause() {
+        if mode == .viewer {
+            sessionPaused = idlePolicy.isPaused || pauseTransmission.desiredPaused || pauseTransmission.appliedPaused
+            sessionPauseWorking = pauseTransmission.pending != nil || pauseTransmission.freshFrameToken != nil
+        } else { sessionPaused = hostPaused; sessionPauseWorking = hostPauseTask != nil }
+        canvas.updateSystemShortcutCapture(sessionActive: mode == .viewer && connected && canControl && !sessionInputSuspended,
+            accessibility: localAccessibility, inputMonitoring: localInputMonitoring)
+        canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && canControl && !sessionInputSuspended
+        refreshClipboardFocus()
+    }
+
+    private func sendNextSessionPause() {
+        guard mode == .viewer, connected, supportsSessionPause, let peer,
+              let request = pauseTransmission.nextRequest() else { return }
+        publishSessionPause()
+        canvas.releaseControl()
+        do { peer.send(try Wire.json(.sessionPauseRequest, request)) }
+        catch { peer.close(error.localizedDescription); return }
+        pauseRequestTimeout?.cancel()
+        pauseRequestTimeout = Task { [weak self, weak peer] in
+            do { try await Task.sleep(for: .seconds(25)) } catch { return }
+            guard let self, let peer, self.peer === peer, self.pauseTransmission.pending?.id == request.id else { return }
+            peer.close("暂停/恢复超过 25 秒未确认，重新建立会话", retryable: true)
+        }
+    }
+
+    private func scheduleFreshFrameTimeout(_ token: UUID, peer: Peer) {
+        pauseRequestTimeout?.cancel()
+        pauseRequestTimeout = Task { [weak self, weak peer] in
+            do { try await Task.sleep(for: .seconds(25)) } catch { return }
+            guard let self, let peer, self.peer === peer, self.pauseTransmission.freshFrameToken == token else { return }
+            peer.close("恢复后超过 25 秒未收到新关键帧，重新建立会话", retryable: true)
+        }
+    }
+
+    private func applyHostSessionPause(_ request: SessionPauseRequest, peer: Peer) {
+        guard let streamer else { return }
+        guard hostPauseTask == nil else {
+            if let reply = try? Wire.json(.sessionPauseResult, SessionPauseResult(id: request.id, paused: hostPaused,
+                error: "正在处理上一项暂停/恢复")) { peer.send(reply) }
+            return
+        }
+        injector?.releaseAll()
+        let token = generation
+        let capture = captureTask, video = hostSettingsTask
+        hostPauseTask = Task { [weak self, weak peer] in
+            guard let self, let peer else { return }
+            defer {
+                if self.generation == token, self.peer === peer {
+                    self.hostPauseTask = nil
+                    self.publishSessionPause()
+                }
+            }
+            await capture?.value
+            await video?.value
+            guard self.generation == token, self.peer === peer, self.streamer === streamer, !Task.isCancelled else { return }
+            var failure: String?
+            do { self.hostPaused = try await streamer.setSessionPaused(request.paused) }
+            catch { failure = error.localizedDescription }
+            guard self.generation == token, self.peer === peer, self.streamer === streamer, !Task.isCancelled else { return }
+            self.sessionPauseStatus = failure ?? (self.hostPaused ? "控制端空闲暂停，保留加密会话" : "画面传输已恢复")
+            if let reply = try? Wire.json(.sessionPauseResult, SessionPauseResult(id: request.id, paused: self.hostPaused, error: failure)) {
+                peer.send(reply)
+            }
+            if !self.hostPaused, failure == nil { streamer.resumeAfterReconfiguration() }
+        }
+        publishSessionPause()
+    }
+
     private func applyHostVideoSettings(_ request: StreamSettingsRequest, peer: Peer) {
         guard let state = activeVideoState, let streamer else { return }
         if hostSettingsRequestID == request.id { return }
@@ -1073,6 +1330,7 @@ final class DeskModel: ObservableObject {
         hostSettingsRequestID = request.id
         let token = generation
         let capture = captureTask
+        let pause = hostPauseTask
         hostSettingsTask = Task { [weak self, weak peer] in
             guard let self, let peer else { return }
             defer {
@@ -1082,6 +1340,7 @@ final class DeskModel: ObservableObject {
             }
             do {
                 await capture?.value
+                await pause?.value
                 guard self.generation == token, self.peer === peer, self.streamer === streamer,
                       self.hostSettingsRequestID == request.id, !Task.isCancelled else { return }
                 let updated = try await streamer.reconfigure(request.settings)
@@ -1137,11 +1396,12 @@ final class DeskModel: ObservableObject {
     }
 
     private var automaticClipboardSendingAllowed: Bool {
-        mode == .viewer ? NSApp.isActive : remoteReceivesAutomaticClipboard
+        guard !sessionInputSuspended, !hostPaused, hostPauseTask == nil else { return false }
+        return mode == .viewer ? NSApp.isActive : remoteReceivesAutomaticClipboard
     }
 
     private func sendClipboardPreference(to peer: Peer) throws {
-        let receives = mode == .viewer ? !controlling : true
+        let receives = !sessionInputSuspended && !hostPaused && (mode == .viewer ? !controlling : true)
         peer.send(try Wire.json(.clipboardSettings, ClipboardPreference(enabled: clipboardEnabled,
             session: clipboardSession, receivesAutomaticUpdates: receives)))
         lastClipboardReceivePreference = receives
@@ -1149,8 +1409,9 @@ final class DeskModel: ObservableObject {
 
     func refreshClipboardFocus() {
         clipboardSync?.setAutomaticSendingAllowed(automaticClipboardSendingAllowed)
+        let receives = !sessionInputSuspended && !hostPaused && (mode == .viewer ? !controlling : true)
         guard mode == .viewer, connected, supportsClipboard, let peer,
-              lastClipboardReceivePreference != !controlling else { return }
+              lastClipboardReceivePreference != receives else { return }
         do { try sendClipboardPreference(to: peer) }
         catch { clipboardStatus = error.localizedDescription }
     }
@@ -1168,13 +1429,14 @@ final class DeskModel: ObservableObject {
             }
             sync.onFileOffer = { [weak self, weak sync] offer in
                 guard let self, let sync, self.clipboardSync === sync else { return }
-                self.clipboardFilePrompt?.dismiss()
+                self.dismissClipboardPrompt()
                 self.clipboardFilePrompt = nil
                 self.pendingFileOffer = offer
                 guard let offer else { return }
                 if self.mode == .viewer { self.canvas.releaseControl() }
                 else { self.injector?.releaseAll() }
-                let prompt = ClipboardFilePrompt(offer: offer, peerName: self.mode == .viewer ? self.remoteName : "") { [weak sync] accepted in
+                let prompt = ClipboardFilePrompt(offer: offer, peerName: self.mode == .viewer ? self.remoteName : "") { [weak self, weak sync] accepted in
+                    self?.recordSessionActivity()
                     sync?.respondToFileOffer(id: offer.id, accept: accepted)
                 }
                 self.clipboardFilePrompt = prompt
@@ -1188,7 +1450,7 @@ final class DeskModel: ObservableObject {
             clipboardSync?.setAutomaticSendingAllowed(automaticClipboardSendingAllowed)
         } else if !enabled {
             clipboardSync?.stop(); clipboardSync = nil
-            clipboardFilePrompt?.dismiss(); clipboardFilePrompt = nil
+            dismissClipboardPrompt(); clipboardFilePrompt = nil
             pendingFileOffer = nil
             if connected { clipboardStatus = supportsClipboard ? "自动剪贴板已关闭" : "对端版本较旧，可使用手动文字同步" }
         }
@@ -1219,6 +1481,25 @@ final class DeskModel: ObservableObject {
     }
 
     func attachWindow(_ window: NSWindow) {
+        if mainWindow !== window {
+            for observer in sessionFocusObservers { NotificationCenter.default.removeObserver(observer) }
+            sessionFocusObservers = [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification].map { name in
+                NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.sessionWindowFocusChanged() }
+                }
+            }
+            if windowActivityMonitor == nil {
+                windowActivityMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged,
+                    .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp,
+                    .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel]) { [weak self] event in
+                        var result: NSEvent? = event
+                        MainActor.assumeIsolated {
+                            if let self { result = self.observeSessionEvent(event) }
+                        }
+                        return result
+                    }
+            }
+        }
         mainWindow = window
         if shouldMinimizeOnLaunch {
             shouldMinimizeOnLaunch = false
@@ -1279,6 +1560,22 @@ final class DeskModel: ObservableObject {
         metricsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
+                if self.mode == .viewer,
+                   (self.connected && self.supportsSessionPause || self.reconnecting && self.target != nil),
+                   self.idlePolicy.tick(now: ProcessInfo.processInfo.systemUptime) {
+                    self.restoreCanvasFocusAfterIdle = self.controlling
+                    self.pauseTransmission.choose(paused: true)
+                    self.sessionPauseStatus = "10 分钟无窗口操作，正在暂停画面与自动剪贴板…"
+                    if self.connected {
+                        self.publishSessionPause()
+                        self.sendNextSessionPause()
+                    } else {
+                        let candidate = self.peer
+                        self.clearSession()
+                        candidate?.close("空闲暂停，返回窗口后继续连接")
+                        self.deferReconnectForIdle("10 分钟无窗口操作")
+                    }
+                }
                 let seconds = max(0.01, ProcessInfo.processInfo.systemUptime - self.lastMetrics)
                 self.traffic = String(format: "%.2f Mbps", Double(self.byteCount) * 8 / seconds / 1_000_000)
                 self.frameRate = String(format: "%.0f fps", Double(self.frames) / seconds)
@@ -1295,6 +1592,18 @@ final class DeskModel: ObservableObject {
     }
 
     private func clearSession() {
+        if mode == .viewer, target != nil, sessionInputSuspended { freshFrameRequiredOnReconnect = true }
+        hostPauseTask?.cancel()
+        hostPauseTask = nil
+        hostPaused = false
+        restoreCanvasFocusAfterIdle = false
+        pauseRequestTimeout?.cancel()
+        pauseRequestTimeout = nil
+        supportsSessionPause = false
+        pauseTransmission = SessionPauseTransmission(paused: idlePolicy.isPaused)
+        if freshFrameRequiredOnReconnect { pauseTransmission.requireFreshFrame() }
+        sessionPaused = idlePolicy.isPaused
+        sessionPauseWorking = false
         hostEffectsTask?.cancel()
         hostEffectsTask = nil
         if let effects = hostSessionEffects {
@@ -1338,7 +1647,7 @@ final class DeskModel: ObservableObject {
         stableTask?.cancel()
         clipboardSync?.stop()
         clipboardSync = nil
-        clipboardFilePrompt?.dismiss(); clipboardFilePrompt = nil
+        dismissClipboardPrompt(); clipboardFilePrompt = nil
         pendingFileOffer = nil
         canvas.synchronizesClipboard = false
         supportsClipboard = false
@@ -1368,6 +1677,12 @@ final class DeskModel: ObservableObject {
     }
 
     func stop() {
+        idlePolicy = SessionIdlePolicy(now: ProcessInfo.processInfo.systemUptime)
+        pauseTransmission = SessionPauseTransmission()
+        wakeInputGate = SessionWakeInputGate()
+        reconnectDeferredForIdle = false
+        freshFrameRequiredOnReconnect = false
+        sessionPauseStatus = ""
         hostingRequested = false
         connectionError = nil
         hostRetryTask?.cancel()
@@ -1402,5 +1717,8 @@ final class DeskModel: ObservableObject {
         displayRefreshTask?.cancel()
         hostPreparationTask?.cancel()
         if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
+        focusRefreshTask?.cancel()
+        for observer in sessionFocusObservers { NotificationCenter.default.removeObserver(observer) }
+        if let windowActivityMonitor { NSEvent.removeMonitor(windowActivityMonitor) }
     }
 }

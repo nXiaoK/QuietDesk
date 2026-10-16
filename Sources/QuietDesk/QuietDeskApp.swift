@@ -67,8 +67,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model?.refreshLoginStatus()
         model?.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
         model?.refreshClipboardFocus()
+        model?.sessionWindowFocusChanged()
     }
-    func applicationDidResignActive(_ notification: Notification) { model?.refreshClipboardFocus() }
+    func applicationDidResignActive(_ notification: Notification) {
+        model?.refreshClipboardFocus()
+        model?.sessionWindowFocusChanged()
+    }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         model?.prepareShowWindow()
         model?.mainWindow?.deminiaturize(nil)
@@ -192,10 +196,27 @@ struct DeskView: View {
         ZStack {
             Color.black
             CanvasView(canvas: model.canvas)
+            if model.connected && model.sessionInputSuspended {
+                VStack(spacing: 12) {
+                    Image(systemName: model.sessionPauseWorking ? "arrow.triangle.2.circlepath" : "pause.circle")
+                        .font(.system(size: 28)).foregroundStyle(.secondary)
+                    Text("空闲暂停")
+                        .font(.title3.weight(.semibold))
+                    Text(model.sessionPauseStatus.isEmpty ? "10 分钟没有窗口操作，已暂停画面与自动剪贴板。" : model.sessionPauseStatus)
+                        .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    Text("加密连接保持；已确认的文件传输继续。切回窗口或在窗口操作即可恢复，首次操作不会发送到旧画面。")
+                        .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    if !model.sessionPauseWorking { Button("恢复画面") { model.resumeSession() } }
+                }
+                .padding(22).frame(maxWidth: 400)
+                .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+            }
             if !model.connected {
                 VStack(spacing: 14) {
-                    ProgressView().controlSize(.small)
-                    Text(model.reconnecting ? "连接中断，正在自动重连…" : "尚未连接").font(.title3.weight(.semibold))
+                    if model.sessionPaused {
+                        Image(systemName: "pause.circle").font(.system(size: 28)).foregroundStyle(.secondary)
+                    } else { ProgressView().controlSize(.small) }
+                    Text(model.sessionPaused ? "空闲暂停，等待返回窗口" : model.reconnecting ? "连接中断，正在自动重连…" : "尚未连接").font(.title3.weight(.semibold))
                     Text(model.reconnecting ? model.status : "退出全屏后输入地址和配对码")
                         .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
                     if model.reconnecting {
@@ -310,6 +331,8 @@ struct DeskView: View {
     }
 
     private var controlStatus: String {
+        if model.sessionPaused && model.reconnecting { return "空闲暂停 · 返回窗口后继续连接" }
+        if model.sessionInputSuspended { return "画面暂停或恢复中 · 暂不发送键盘鼠标" }
         if model.reconnecting { return "自动重连中 · 键盘鼠标暂不发送" }
         if !model.canControl { return "仅观看 · 共享端辅助功能未生效" }
         return model.controlling ? "正在控制远端 · ⌃⌥Esc 释放键盘鼠标" : "已释放 · 点按画面开始控制"
@@ -321,7 +344,7 @@ struct DeskView: View {
             Text(model.latency).help("网络往返延迟（RTT），约每 5 秒更新")
             Text(model.frameRate).help("静止画面不重复编码，0 fps 正常")
             Text(model.traffic).help("视频、控制和剪贴板的收发流量")
-        } else { Text(model.reconnecting ? "正在重连" : "未连接") }
+        } else { Text(model.sessionPaused ? "空闲暂停" : model.reconnecting ? "正在重连" : "未连接") }
     }
 
     private var clipboardActivity: some View {

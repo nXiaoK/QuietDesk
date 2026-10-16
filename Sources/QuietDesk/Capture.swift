@@ -23,6 +23,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var captureStarted = false
     private var encoding = false
     private var reconfiguring = false
+    private var sessionPaused = false
     private var forceKeyFrame = true
     private var idleWaiter: (UUID, CheckedContinuation<Void, Error>)?
     private var watchdog: DispatchSourceTimer?
@@ -138,6 +139,40 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 } catch let rollbackError {
                     queue.async { [weak self] in self?.onError?("画质调整失败且无法恢复原配置：\(rollbackError.localizedDescription)") }
                 }
+            }
+            throw error
+        }
+    }
+
+    func setSessionPaused(_ paused: Bool) async throws -> Bool {
+        let current = try queue.sync { () throws -> SCStream in
+            guard running, captureStarted, let stream else { throw DeskError.invalid("屏幕采集尚未就绪") }
+            return stream
+        }
+        if paused {
+            try queue.sync {
+                guard running, stream === current else { throw CancellationError() }
+                sessionPaused = true
+            }
+            return true
+        }
+        try await pauseAtFrameBoundary()
+        do {
+            try Task.checkCancellation()
+            try queue.sync {
+                guard running, stream === current else { throw CancellationError() }
+                sessionPaused = false
+                forceKeyFrame = true
+                latest = lastCapture
+                discardMismatchedFrame()
+            }
+            // The caller sends the resume result before releasing the new keyframe.
+            return false
+        } catch {
+            queue.sync {
+                guard running, stream === current else { return }
+                reconfiguring = false
+                pump()
             }
             throw error
         }
@@ -259,7 +294,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     private func pump() {
-        guard running, !reconfiguring, waiting == nil, !encoding else { return }
+        guard running, !reconfiguring, !sessionPaused, waiting == nil, !encoding else { return }
         discardMismatchedFrame()
         guard let latest, let encoder else { return }
         self.latest = nil

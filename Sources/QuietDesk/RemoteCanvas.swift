@@ -24,6 +24,7 @@ final class RemoteCanvas: NSView {
         didSet { if let shortcutStatus { onSystemShortcutStatus?(shortcutStatus.0, shortcutStatus.1) } }
     }
     var onInput: ((RemoteInput) -> Void)?
+    var onUserActivity: (() -> Void)?
     var onPaste: ((RemoteInput) -> Void)?
     var synchronizesClipboard = false
     private(set) var interactionRevision: UInt64 = 0
@@ -289,6 +290,7 @@ final class RemoteCanvas: NSView {
         let rect = pictureRect
         guard rect.width > 0, rect.height > 0 else { return }
         if kind != .up && kind != .drag && !rect.contains(point) { return }
+        onUserActivity?()
         if kind == .down || kind == .scroll { interactionRevision &+= 1 }
         var input = RemoteInput(kind: kind)
         input.x = min(1, max(0, (point.x - rect.minX) / rect.width))
@@ -334,6 +336,7 @@ final class RemoteCanvas: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        onUserActivity?()
         if !event.isARepeat { interactionRevision &+= 1 }
         let modifiers = event.modifierFlags.intersection([.control, .command, .option, .shift])
         if SystemShortcutRouting.localAction(keyCode: event.keyCode, flags: UInt64(event.modifierFlags.rawValue)) == .toggleFullScreen {
@@ -366,6 +369,7 @@ final class RemoteCanvas: NSView {
         keyboard(event, .keyUp)
     }
     override func flagsChanged(with event: NSEvent) {
+        onUserActivity?()
         if usesCapsLockActions && event.keyCode == 57 { return }
         keyboard(event, .flags)
     }

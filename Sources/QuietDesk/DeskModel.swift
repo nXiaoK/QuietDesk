@@ -21,6 +21,7 @@ final class DeskModel: ObservableObject {
     @Published var displayID = CGMainDisplayID() {
         didSet { UserDefaults.standard.set(Int(displayID), forKey: "sharedDisplay") }
     }
+    @Published private(set) var screens: [(id: CGDirectDisplayID, name: String)] = []
     @Published var active = false
     @Published var working = false
     @Published var connected = false
@@ -119,13 +120,10 @@ final class DeskModel: ObservableObject {
     private var videoRequestTimeout: Task<Void, Never>?
     private var hostSettingsTask: Task<Void, Never>?
     private var hostSettingsRequestID: UUID?
-
-    var screens: [(id: CGDirectDisplayID, name: String)] {
-        NSScreen.screens.compactMap { screen in
-            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
-            return (number.uint32Value, screen.localizedName)
-        }
-    }
+    private var screenObserver: NSObjectProtocol?
+    private var displayRefreshTask: Task<Void, Never>?
+    private var hostPreparationTask: Task<Void, Never>?
+    private var capturedDisplay: DisplaySnapshot?
 
     init() {
         if autoStartSharing { mode = .host }
@@ -134,6 +132,19 @@ final class DeskModel: ObservableObject {
            [1280, 1920, 2560, 3840].contains(saved.longestEdge), [10, 15, 30].contains(saved.framesPerSecond),
            [1, 2, 3, 5, 8, 12].contains(saved.megabits) { settings = saved }
         if let id = UserDefaults.standard.object(forKey: "sharedDisplay") as? Int { displayID = CGDirectDisplayID(clamping: id) }
+        refreshDisplays()
+        screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.displayRefreshTask?.cancel()
+                    self.displayRefreshTask = Task { [weak self] in
+                        do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+                        self?.refreshDisplays()
+                        self?.displayRefreshTask = nil
+                    }
+                }
+            }
 
         canvas.onInput = { [weak self] value in
             guard let self, self.connected, self.canControl else { return }
@@ -320,6 +331,36 @@ final class DeskModel: ObservableObject {
         return value
     }
 
+    private func displaySnapshot(_ id: CGDirectDisplayID) -> DisplaySnapshot {
+        DisplaySnapshot(id: id, pixelWidth: CGDisplayPixelsWide(id), pixelHeight: CGDisplayPixelsHigh(id),
+                        bounds: CGDisplayBounds(id))
+    }
+
+    private func refreshDisplays() {
+        let current = NSScreen.screens.compactMap { screen -> (id: CGDirectDisplayID, name: String)? in
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
+            return (number.uint32Value, screen.localizedName)
+        }
+        screens = current
+        let available = current.map { displaySnapshot($0.id) }
+        if let selection = DisplaySelection.select(preferred: displayID, main: CGMainDisplayID(), available: available),
+           selection.id != displayID { displayID = selection.id }
+        if mode == .host, hostingRequested, active, let capturedDisplay,
+           DisplaySelection.requiresRestart(captured: capturedDisplay, available: available) {
+            restartHostAfterFailure("共享显示器已变化，正在重新准备共享")
+        }
+    }
+
+    private func selectShareableDisplay(_ displays: [SCDisplay]) throws -> (display: SCDisplay, snapshot: DisplaySnapshot) {
+        guard let selection = DisplaySelection.select(preferred: displayID, main: CGMainDisplayID(),
+            available: displays.filter { CGDisplayIsActive($0.displayID) != 0 }.map { displaySnapshot($0.displayID) }),
+              let display = displays.first(where: { $0.displayID == selection.id }) else {
+            throw DeskError.invalid("当前没有可共享的显示器，等待显示器恢复")
+        }
+        if displayID != selection.id { displayID = selection.id }
+        return (display, selection)
+    }
+
     func startHosting(interactive: Bool = true) {
         guard !active, !working else { return }
         hostingRequested = true
@@ -336,22 +377,19 @@ final class DeskModel: ObservableObject {
             status = "正在准备共享…"
             let token = UUID()
             generation = token
-            Task { [weak self] in
+            hostPreparationTask = Task { [weak self] in
                 guard let self else { return }
+                defer { if self.generation == token { self.hostPreparationTask = nil } }
                 do {
                     let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                    guard self.generation == token else { return }
-                    guard let display = content.displays.first(where: { $0.displayID == self.displayID }) else {
-                        throw DeskError.invalid("所选显示器已不可用，请重新选择")
-                    }
-                    let settings = self.settings
-                    let (width, height) = settings.dimensions(width: CGDisplayPixelsWide(display.displayID),
-                                                               height: CGDisplayPixelsHigh(display.displayID))
+                    guard self.generation == token, self.hostingRequested, !Task.isCancelled else { return }
+                    self.refreshDisplays()
+                    _ = try self.selectShareableDisplay(content.displays)
                     let listener = try NWListener(using: SecureTransport.parameters(key: key), on: port)
                     listener.newConnectionHandler = { [weak self] connection in
                         DispatchQueue.main.async {
                             guard let self, self.generation == token, self.active else { connection.cancel(); return }
-                            self.accept(connection, display: display, width: width, height: height, settings: settings)
+                            self.accept(connection, generation: token)
                         }
                     }
                     listener.stateUpdateHandler = { [weak self] state in
@@ -375,7 +413,7 @@ final class DeskModel: ObservableObject {
                     self.beginMetrics()
                     listener.start(queue: DispatchQueue(label: "quietdesk.listener"))
                 } catch {
-                    guard self.generation == token else { return }
+                    guard self.generation == token, self.hostingRequested, !Task.isCancelled else { return }
                     self.working = false
                     self.status = "共享未启动：\(error.localizedDescription)"
                     if self.hostingRequested { self.scheduleHostRetry() }
@@ -389,59 +427,72 @@ final class DeskModel: ObservableObject {
         }
     }
 
-    private func accept(_ connection: NWConnection, display: SCDisplay, width: Int, height: Int, settings: StreamSettings) {
+    private func accept(_ connection: NWConnection, generation token: UUID) {
         let candidate = Peer(connection: connection)
         let id = UUID()
         pending[id] = candidate
         candidate.onReady = { [weak self, weak candidate] in
             DispatchQueue.main.async {
-                guard let self, let candidate, self.pending.removeValue(forKey: id) != nil, self.active else { return }
+                guard let self, let candidate, self.pending.removeValue(forKey: id) != nil,
+                      self.generation == token, self.active, self.hostingRequested else { return }
                 guard self.peer == nil else { candidate.close("这台 Mac 当前已有控制连接"); return }
                 self.peer = candidate
-                self.connected = true
-                self.canControl = AXIsProcessTrusted()
-                self.status = self.canControl ? "正在共享 · 允许键盘鼠标控制" : "正在共享 · 仅观看（未授权辅助功能）"
-                self.resolution = "\(width) × \(height)"
-                self.activeVideoState = VideoStreamState(settings: settings, width: width, height: height)
-                self.injector = InputInjector(displayID: display.displayID)
-                do {
-                    candidate.send(try Wire.json(.hello, Hello(name: Host.current().localizedName ?? "家里 Mac",
-                        width: width, height: height, settings: settings, canControl: self.canControl)))
-                    let streamer = ScreenStreamer()
-                    self.streamer = streamer
-                    streamer.onFrame = { [weak self, weak candidate] packet in
-                        guard let candidate else { return }
-                        do {
-                            candidate.send(Message(.video, try packet.encode()))
-                            DispatchQueue.main.async {
-                                guard let self, self.peer === candidate else { return }
-                                self.frames += 1
-                            }
-                        } catch { candidate.close(error.localizedDescription) }
-                    }
-                    streamer.onError = { [weak candidate] in candidate?.close($0, retryable: true) }
-                    streamer.onUserStop = { [weak self, weak candidate] in
-                        DispatchQueue.main.async {
-                            guard let self, let candidate, self.peer === candidate else { return }
-                            self.recordDisconnect("用户从系统停止了屏幕共享")
-                            self.stop()
+                self.status = "正在准备连接画面…"
+                self.captureTask = Task { [weak self, weak candidate] in
+                    guard let self, let candidate else { return }
+                    do {
+                        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                        guard self.generation == token, self.active, self.peer === candidate, !Task.isCancelled else { return }
+                        self.refreshDisplays()
+                        let (display, snapshot) = try self.selectShareableDisplay(content.displays)
+                        let settings = self.settings
+                        let (width, height) = settings.dimensions(width: snapshot.pixelWidth, height: snapshot.pixelHeight)
+                        self.capturedDisplay = snapshot
+                        self.connected = true
+                        self.canControl = AXIsProcessTrusted()
+                        self.status = self.canControl ? "正在共享 · 允许键盘鼠标控制" : "正在共享 · 仅观看（未授权辅助功能）"
+                        self.resolution = "\(width) × \(height)"
+                        self.activeVideoState = VideoStreamState(settings: settings, width: width, height: height)
+                        self.injector = InputInjector(displayID: display.displayID)
+                        candidate.send(try Wire.json(.hello, Hello(name: Host.current().localizedName ?? "家里 Mac",
+                            width: width, height: height, settings: settings, canControl: self.canControl)))
+                        let streamer = ScreenStreamer()
+                        self.streamer = streamer
+                        streamer.onFrame = { [weak self, weak candidate] packet in
+                            guard let candidate else { return }
+                            do {
+                                candidate.send(Message(.video, try packet.encode()))
+                                DispatchQueue.main.async {
+                                    guard let self, self.peer === candidate else { return }
+                                    self.frames += 1
+                                }
+                            } catch { candidate.close(error.localizedDescription) }
                         }
-                    }
-                    self.captureTask = Task { [weak self, weak candidate] in
-                        do {
-                            try await streamer.start(display: display, width: width, height: height, settings: settings)
-                            guard let self, let candidate, self.peer === candidate, !Task.isCancelled else {
-                                await streamer.stop()
-                                return
+                        streamer.onError = { [weak candidate] in candidate?.close($0, retryable: true) }
+                        streamer.onUserStop = { [weak self, weak candidate] in
+                            DispatchQueue.main.async {
+                                guard let self, let candidate, self.peer === candidate else { return }
+                                self.recordDisconnect("用户从系统停止了屏幕共享")
+                                self.stop()
                             }
-                        } catch { candidate?.close(error.localizedDescription, retryable: true) }
+                        }
+                        try await streamer.start(display: display, width: width, height: height, settings: settings)
+                        guard self.generation == token, self.active, self.peer === candidate, !Task.isCancelled else {
+                            await streamer.stop()
+                            return
+                        }
+                    } catch {
+                        guard self.generation == token, self.active, self.peer === candidate, !Task.isCancelled else { return }
+                        if self.capturedDisplay == nil { self.restartHostAfterFailure("共享准备失败：\(error.localizedDescription)") }
+                        else { candidate.close(error.localizedDescription, retryable: true) }
                     }
-                } catch { candidate.close(error.localizedDescription) }
+                }
             }
         }
         candidate.onMessage = { [weak self, weak candidate] message in
             DispatchQueue.main.async {
-                guard let self, let candidate, self.peer === candidate else { return }
+                guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
+                guard self.connected else { candidate.close("屏幕共享尚未就绪", retryable: true); return }
                 do { try self.handleHost(message, peer: candidate) }
                 catch { candidate.close(error.localizedDescription) }
             }
@@ -450,7 +501,7 @@ final class DeskModel: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.pending.removeValue(forKey: id)
-                if let candidate, self.peer === candidate {
+                if let candidate, self.generation == token, self.peer === candidate {
                     self.recordDisconnect(reason)
                     self.clearSession()
                     self.status = self.active ? "等待重新连接 · \(reason)" : "共享已停止"
@@ -459,7 +510,7 @@ final class DeskModel: ObservableObject {
         }
         candidate.onTraffic = { [weak self, weak candidate] count in
             DispatchQueue.main.async {
-                guard let self, let candidate, self.peer === candidate else { return }
+                guard let self, let candidate, self.generation == token, self.peer === candidate else { return }
                 self.byteCount += count
             }
         }
@@ -1038,6 +1089,7 @@ final class DeskModel: ObservableObject {
         clipboardSession = nil
         captureTask?.cancel()
         captureTask = nil
+        capturedDisplay = nil
         if let streamer { Task { await streamer.stop() } }
         streamer = nil
         injector?.releaseAll()
@@ -1058,6 +1110,8 @@ final class DeskModel: ObservableObject {
         hostingRequested = false
         connectionError = nil
         hostRetryTask?.cancel()
+        hostPreparationTask?.cancel()
+        hostPreparationTask = nil
         reconnectTask?.cancel()
         stableTask?.cancel()
         target = nil
@@ -1082,5 +1136,10 @@ final class DeskModel: ObservableObject {
         status = mode == .host ? "共享已停止" : "已断开连接"
     }
 
-    deinit { permissionTimer?.invalidate() }
+    deinit {
+        permissionTimer?.invalidate()
+        displayRefreshTask?.cancel()
+        hostPreparationTask?.cancel()
+        if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
+    }
 }

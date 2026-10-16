@@ -6,7 +6,7 @@ func runLiveSettingsChecks() {
     let initial = VideoStreamState(settings: .init(), width: 1920, height: 1080)
     let low = StreamSettings(longestEdge: 1280, framesPerSecond: 10, megabits: 1)
     let medium = StreamSettings(longestEdge: 2560, framesPerSecond: 15, megabits: 5)
-    let high = StreamSettings(longestEdge: 3840, framesPerSecond: 30, megabits: 12)
+    let high = StreamSettings.highest
     func state(_ settings: StreamSettings) -> VideoStreamState {
         let (w, h) = settings.dimensions(width: 5120, height: 2880)
         return VideoStreamState(settings: settings, width: w, height: h)
@@ -25,6 +25,126 @@ func runLiveSettingsChecks() {
         let decodedResult = try Wire.readJSON(StreamSettingsResult.self, Wire.json(.streamSettingsResult, result).payload)
         try check(decodedResult.state == result.state, "Applied state changed over wire")
         try check(MessageKind.inputStatus.rawValue == 10 && MessageKind.clipboardCancel.rawValue == 17 && Wire.version == 1, "Legacy wire values changed")
+    }
+
+    run("Native resolution preserves source pixels within decoder limits without upscaling") {
+        for (width, height, expectedWidth, expectedHeight) in [
+            (6016, 3384, 6016, 3384), (5120, 2880, 5120, 2880), (1279, 719, 1278, 718),
+            (1440, 2560, 1440, 2560), (8192, 8192, 6000, 6000), (16000, 9000, 8000, 4500),
+            (32768, 1080, 8192, 270)
+        ] {
+            let (w, h) = high.dimensions(width: width, height: height)
+            try check(w == expectedWidth && h == expectedHeight, "Native dimensions changed for \(width) × \(height)")
+            try VideoStreamState(settings: high, width: w, height: h).validate()
+            try check(w <= width && h <= height, "Native mode enlarged the source")
+        }
+        try check(high.summary.contains("原分辨率") && high.megabits == 30, "Native quality label or bitrate missing")
+    }
+
+    run("New hosts send legacy initial settings and optional extended defaults without changing old JSON fields") {
+        struct LegacyHello: Decodable {
+            let version: Int
+            let name: String
+            let width: Int
+            let height: Int
+            let settings: StreamSettings
+            let canControl: Bool
+            let liveSettings: Bool?
+        }
+        let compatible = high.legacyCompatible
+        try check(compatible == StreamSettings(longestEdge: 3840, framesPerSecond: 30, megabits: 12), "Legacy initial ceiling changed")
+        let hello = Hello(name: "host", width: 3840, height: 2160, settings: compatible,
+                          canControl: true, preferredSettings: high)
+        let data = try JSONEncoder().encode(hello)
+        let legacy = try JSONDecoder().decode(LegacyHello.self, from: data)
+        try check(legacy.version == 1 && legacy.settings == compatible && legacy.liveSettings == true,
+                  "New host broke old control values")
+        let decoded = try Wire.readJSON(Hello.self, data)
+        try decoded.validate()
+        try check(decoded.extendedVideoSettings == true && decoded.preferredSettings == high, "Extended host default lost")
+        var object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        object.removeValue(forKey: "extendedVideoSettings")
+        object.removeValue(forKey: "preferredSettings")
+        let oldHost = try Wire.readJSON(Hello.self, JSONSerialization.data(withJSONObject: object))
+        try check(oldHost.extendedVideoSettings == nil && oldHost.preferredSettings == nil && oldHost.settings == compatible,
+                  "Old host was assumed to support native quality")
+        try rejects("Invalid advertised host default accepted") {
+            try Hello(name: "host", width: 1920, height: 1080, settings: .init(), canControl: true,
+                      preferredSettings: .init(megabits: 1000)).validate()
+        }
+    }
+
+    run("First low RTT selects highest once before or after session information") {
+        var early = ViewerQualityPolicy()
+        early.observeRoundTrip(9.9)
+        try check(early.settingsForConnection(hostDefault: initial.settings, supportsExtended: true) == initial.settings,
+                  "Session default changed before policy decision")
+        try check(early.takeInitialAutomaticSettings(supportsExtended: true) == high, "Early RTT was lost")
+        early.observeRoundTrip(1)
+        try check(early.takeInitialAutomaticSettings(supportsExtended: true) == nil, "Auto quality ran more than once")
+
+        var late = ViewerQualityPolicy()
+        _ = late.settingsForConnection(hostDefault: initial.settings, supportsExtended: true)
+        try check(late.takeInitialAutomaticSettings(supportsExtended: true) == nil, "Missing RTT enabled highest quality")
+        late.observeRoundTrip(0)
+        try check(late.takeInitialAutomaticSettings(supportsExtended: true) == high, "Late RTT did not apply")
+    }
+
+    run("Saved and manual preferences take precedence and first high RTT cannot later trigger an upgrade") {
+        var saved = ViewerQualityPolicy(preferred: low)
+        saved.observeRoundTrip(1)
+        try check(saved.settingsForConnection(hostDefault: high, supportsExtended: true) == low,
+                  "Host default replaced saved preference")
+        try check(saved.takeInitialAutomaticSettings(supportsExtended: true) == nil, "Auto quality replaced saved preference")
+
+        var manual = ViewerQualityPolicy()
+        manual.observeRoundTrip(1)
+        manual.chooseManually()
+        try check(manual.takeInitialAutomaticSettings(supportsExtended: true) == nil, "Late hello or RTT replaced manual choice")
+
+        var slow = ViewerQualityPolicy()
+        slow.observeRoundTrip(.nan); slow.observeRoundTrip(-1); slow.observeRoundTrip(.infinity)
+        try check(slow.takeInitialAutomaticSettings(supportsExtended: true) == nil, "Invalid RTT consumed the decision")
+        slow.observeRoundTrip(10)
+        slow.observeRoundTrip(1)
+        try check(slow.takeInitialAutomaticSettings(supportsExtended: true) == nil, "First RTT threshold was not strict")
+        slow.observeRoundTrip(1)
+        try check(slow.takeInitialAutomaticSettings(supportsExtended: true) == nil, "Later fast sample changed settled default")
+
+        var oldHost = ViewerQualityPolicy()
+        oldHost.observeRoundTrip(1)
+        try check(oldHost.takeInitialAutomaticSettings(supportsExtended: false) == nil, "Native quality sent to an old host")
+    }
+
+    run("Reconnect restores confirmed quality without reopening initial automatic selection") {
+        var policy = ViewerQualityPolicy()
+        policy.observeRoundTrip(2)
+        try check(policy.takeInitialAutomaticSettings(supportsExtended: true) == high, "Initial auto setting missing")
+        try check(policy.confirm(high, maySave: policy.maySaveCurrentChoice), "Confirmed auto quality not persisted")
+        policy.discardUnfinishedSample()
+        try check(policy.settingsForConnection(hostDefault: low, supportsExtended: true) == high, "Reconnect lost confirmed quality")
+        policy.observeRoundTrip(1)
+        try check(policy.takeInitialAutomaticSettings(supportsExtended: true) == nil, "Reconnect reran automatic selection")
+
+        var interrupted = ViewerQualityPolicy()
+        interrupted.observeRoundTrip(2)
+        interrupted.discardUnfinishedSample()
+        _ = interrupted.settingsForConnection(hostDefault: low, supportsExtended: true)
+        try check(interrupted.takeInitialAutomaticSettings(supportsExtended: true) == nil, "Failed peer's unconsumed RTT leaked into reconnect")
+    }
+
+    run("Legacy fallback preserves an extended saved preference until a manual choice is confirmed") {
+        var policy = ViewerQualityPolicy(preferred: high)
+        let fallback = policy.settingsForConnection(hostDefault: low, supportsExtended: false)
+        let fallbackMaySave = policy.maySaveCurrentChoice
+        try check(fallback == high.legacyCompatible && !fallbackMaySave, "Old-host fallback was not protected")
+        policy.chooseManually()
+        try check(!policy.confirm(fallback, maySave: fallbackMaySave) && policy.preferred == high,
+                  "In-flight fallback reply erased original preference after a manual edit")
+        try check(policy.confirm(low, maySave: policy.maySaveCurrentChoice) && policy.preferred == low,
+                  "Confirmed manual legacy choice was not saved")
+        try check(policy.settingsForConnection(hostDefault: high, supportsExtended: true) == low,
+                  "New host replaced manually saved legacy quality")
     }
 
     run("Rapid quality edits coalesce while only one request is in flight") {

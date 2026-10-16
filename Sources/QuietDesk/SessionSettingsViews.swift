@@ -224,7 +224,7 @@ private struct SessionQualitySection: View {
                     Picker("最长边", selection: Binding(get: { model.viewerSettings.longestEdge }, set: { value in
                         var settings = model.viewerSettings; settings.longestEdge = value; model.chooseViewerSettings(settings)
                     })) {
-                        ForEach(StreamSettings.longestEdges, id: \.self) { Text("\($0)").tag($0) }
+                        ForEach(model.viewerLongestEdges, id: \.self) { Text(StreamSettings.resolutionLabel($0)).tag($0) }
                     }
                     .labelsHidden().frame(maxWidth: .infinity)
                 }
@@ -242,7 +242,7 @@ private struct SessionQualitySection: View {
                     Picker("目标码率", selection: Binding(get: { model.viewerSettings.megabits }, set: { value in
                         var settings = model.viewerSettings; settings.megabits = value; model.chooseViewerSettings(settings)
                     })) {
-                        ForEach(StreamSettings.bitRates, id: \.self) { Text("\($0) Mbps").tag($0) }
+                        ForEach(model.viewerBitRates, id: \.self) { Text("\($0) Mbps").tag($0) }
                     }
                     .labelsHidden().frame(maxWidth: .infinity)
                 }
@@ -283,12 +283,12 @@ private struct SessionQualitySection: View {
                 }
             }
             if !compact {
-                Text("不修改共享端的默认共享设置；已保存的连接会恢复上次确认的画质。")
+                Text(model.supportsExtendedVideoSettings ? "已保存画质与手动选择优先；首次 RTT <10 ms 的低延迟新连接默认最高画质。" : "已保存的连接会恢复画质；原分辨率和 30 Mbps 需共享端更新后使用。")
                     .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
         }
         .font(.system(size: compact ? 11 : 12))
-        .help("画质调整只改变当前共享会话，不修改共享端默认值；同一连接记录会恢复上次确认的画质。可连续选择，等待时会合并为最新设置。")
+        .help("画质调整只改变当前共享会话，不修改共享端默认值；同一连接记录会恢复上次确认的画质。无已保存画质时，首次 RTT 低于 10 ms 默认选最高画质，手动选择优先。RTT 不代表网络类型。原分辨率不放大，上限单边 8192 像素、总计 3600 万像素；H.264 仍为有损。可连续选择，等待时会合并为最新设置。")
     }
 }
 

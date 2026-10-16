@@ -36,6 +36,7 @@ final class DeskModel: ObservableObject {
     @Published var traffic = "0.00 Mbps"
     @Published var frameRate = "0 fps"
     @Published var latency = "— ms"
+    @Published private(set) var roundTripMilliseconds: Double?
     @Published var showFullScreenStatistics = UserDefaults.standard.bool(forKey: "showFullScreenStatistics") {
         didSet { UserDefaults.standard.set(showFullScreenStatistics, forKey: "showFullScreenStatistics") }
     }
@@ -52,10 +53,13 @@ final class DeskModel: ObservableObject {
     @Published private(set) var capsLockEnabled = UserDefaults.standard.bool(forKey: "capsLockActions")
     @Published private(set) var supportsInputActions = false
     @Published private(set) var supportsLiveSettings = false
+    @Published private(set) var supportsExtendedVideoSettings = false
     @Published private(set) var activeVideoState: VideoStreamState?
     @Published private(set) var videoTuning: VideoTuningSession?
     @Published private(set) var videoSettingsStatus = ""
     var viewerSettings: StreamSettings { videoTuning?.desired ?? activeVideoState?.settings ?? StreamSettings() }
+    var viewerLongestEdges: [Int] { supportsExtendedVideoSettings ? StreamSettings.longestEdges : StreamSettings.legacyLongestEdges }
+    var viewerBitRates: [Int] { supportsExtendedVideoSettings ? StreamSettings.bitRates : StreamSettings.legacyBitRates }
     @Published var inputStatus = ""
     @Published private(set) var connections = ConnectionStore.load()
     @Published var autoReconnect = UserDefaults.standard.object(forKey: "autoReconnect") as? Bool ?? true
@@ -115,7 +119,8 @@ final class DeskModel: ObservableObject {
     }
     private var target: Target?
     private var savedTarget = false
-    private var preferredViewerSettings: StreamSettings?
+    private var viewerQualityPolicy = ViewerQualityPolicy()
+    private var pendingVideoPreferenceCanSave = true
     private var videoDebounceTask: Task<Void, Never>?
     private var videoRequestTimeout: Task<Void, Never>?
     private var hostSettingsTask: Task<Void, Never>?
@@ -129,8 +134,7 @@ final class DeskModel: ObservableObject {
         if autoStartSharing { mode = .host }
         if let data = UserDefaults.standard.data(forKey: "streamSettings"),
            let saved = try? JSONDecoder().decode(StreamSettings.self, from: data),
-           [1280, 1920, 2560, 3840].contains(saved.longestEdge), [10, 15, 30].contains(saved.framesPerSecond),
-           [1, 2, 3, 5, 8, 12].contains(saved.megabits) { settings = saved }
+           (try? saved.validateControlValues()) != nil { settings = saved }
         if let id = UserDefaults.standard.object(forKey: "sharedDisplay") as? Int { displayID = CGDirectDisplayID(clamping: id) }
         refreshDisplays()
         screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
@@ -445,7 +449,8 @@ final class DeskModel: ObservableObject {
                         guard self.generation == token, self.active, self.peer === candidate, !Task.isCancelled else { return }
                         self.refreshDisplays()
                         let (display, snapshot) = try self.selectShareableDisplay(content.displays)
-                        let settings = self.settings
+                        let preferredSettings = self.settings
+                        let settings = preferredSettings.legacyCompatible
                         let (width, height) = settings.dimensions(width: snapshot.pixelWidth, height: snapshot.pixelHeight)
                         self.capturedDisplay = snapshot
                         self.connected = true
@@ -455,7 +460,8 @@ final class DeskModel: ObservableObject {
                         self.activeVideoState = VideoStreamState(settings: settings, width: width, height: height)
                         self.injector = InputInjector(displayID: display.displayID)
                         candidate.send(try Wire.json(.hello, Hello(name: Host.current().localizedName ?? "家里 Mac",
-                            width: width, height: height, settings: settings, canControl: self.canControl)))
+                            width: width, height: height, settings: settings, canControl: self.canControl,
+                            preferredSettings: preferredSettings)))
                         let streamer = ScreenStreamer()
                         self.streamer = streamer
                         streamer.onFrame = { [weak self, weak candidate] packet in
@@ -531,9 +537,8 @@ final class DeskModel: ObservableObject {
             UserDefaults.standard.set(self.port, forKey: "remotePort")
             let target = Target(address: address, port: port.rawValue, key: key)
             self.target = target
-            if let saved = connections.first(where: { $0.matches(address: address, port: port.rawValue) })?.videoSettings,
-               (try? saved.validateControlValues()) != nil { preferredViewerSettings = saved }
-            else { preferredViewerSettings = nil }
+            let saved = connections.first(where: { $0.matches(address: address, port: port.rawValue) })?.videoSettings
+            viewerQualityPolicy = ViewerQualityPolicy(preferred: saved.flatMap { (try? $0.validateControlValues()) != nil ? $0 : nil })
             savedTarget = false
             retryBackoff.reset()
             generation = UUID()
@@ -552,8 +557,11 @@ final class DeskModel: ObservableObject {
         candidate.onRoundTripMilliseconds = { [weak self, weak candidate] milliseconds in
             DispatchQueue.main.async {
                 guard let self, let candidate, self.peer === candidate else { return }
-                self.latency = String(format: "%.0f ms", milliseconds)
+                self.roundTripMilliseconds = milliseconds
+                self.latency = String(format: milliseconds < 10 ? "%.1f ms" : "%.0f ms", milliseconds)
                 self.lastLatencyAt = ProcessInfo.processInfo.systemUptime
+                self.viewerQualityPolicy.observeRoundTrip(milliseconds)
+                self.applyInitialVideoQualityIfReady()
             }
         }
         status = reconnecting ? "正在重新建立加密连接…" : "正在建立加密连接…"
@@ -734,9 +742,13 @@ final class DeskModel: ObservableObject {
             let state = VideoStreamState(settings: hello.settings, width: hello.width, height: hello.height)
             activeVideoState = state
             supportsLiveSettings = hello.liveSettings == true
+            supportsExtendedVideoSettings = supportsLiveSettings && hello.extendedVideoSettings == true
             if supportsLiveSettings {
-                videoTuning = try VideoTuningSession(applied: state, preferred: preferredViewerSettings)
+                let hostDefault = supportsExtendedVideoSettings ? (hello.preferredSettings ?? hello.settings) : hello.settings
+                let preferred = viewerQualityPolicy.settingsForConnection(hostDefault: hostDefault, supportsExtended: supportsExtendedVideoSettings)
+                videoTuning = try VideoTuningSession(applied: state, preferred: preferred)
                 videoSettingsStatus = "当前生效：\(state.settings.summary)"
+                applyInitialVideoQualityIfReady()
                 sendNextVideoSettings()
             } else { videoSettingsStatus = "主机需更新到 0.4.0 才能动态调整画质" }
         case .controlStatus:
@@ -787,7 +799,9 @@ final class DeskModel: ObservableObject {
             if let error = result.error { videoSettingsStatus = "调整失败：\(error)" }
             else {
                 videoSettingsStatus = "已生效：\(result.state.settings.summary)"
-                saveVideoPreference(result.state.settings)
+                if viewerQualityPolicy.confirm(result.state.settings, maySave: pendingVideoPreferenceCanSave) {
+                    saveVideoPreference(result.state.settings)
+                }
             }
             sendNextVideoSettings()
         default: throw DeskError.invalid("收到当前角色不支持的消息")
@@ -796,20 +810,41 @@ final class DeskModel: ObservableObject {
 
     func chooseViewerSettings(_ settings: StreamSettings) {
         guard connected, supportsLiveSettings, var tuning = videoTuning else { return }
+        guard supportsExtendedVideoSettings || settings == settings.legacyCompatible else {
+            videoSettingsStatus = "共享端需更新后才能使用原分辨率和 30 Mbps"
+            return
+        }
         do { try tuning.choose(settings) }
         catch { videoSettingsStatus = error.localizedDescription; return }
+        viewerQualityPolicy.chooseManually()
+        if tuning.pending?.settings == settings { pendingVideoPreferenceCanSave = true }
         videoTuning = tuning
         videoDebounceTask?.cancel()
+        if tuning.pending == nil, tuning.applied.settings == settings {
+            _ = viewerQualityPolicy.confirm(settings, maySave: true)
+            saveVideoPreference(settings)
+            return
+        }
         videoDebounceTask = Task { [weak self] in
             do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
             self?.sendNextVideoSettings()
         }
     }
 
+    private func applyInitialVideoQualityIfReady() {
+        guard connected, supportsLiveSettings, var tuning = videoTuning,
+              let settings = viewerQualityPolicy.takeInitialAutomaticSettings(supportsExtended: supportsExtendedVideoSettings) else { return }
+        do { try tuning.choose(settings) }
+        catch { videoSettingsStatus = error.localizedDescription; return }
+        videoTuning = tuning
+        sendNextVideoSettings()
+    }
+
     private func sendNextVideoSettings() {
         guard connected, supportsLiveSettings, let peer, var tuning = videoTuning,
               let request = tuning.nextRequest() else { return }
         videoTuning = tuning
+        pendingVideoPreferenceCanSave = viewerQualityPolicy.maySaveCurrentChoice
         videoSettingsStatus = "正在应用：\(request.settings.summary)"
         do { peer.send(try Wire.json(.streamSettingsRequest, request)) }
         catch { videoSettingsStatus = error.localizedDescription; peer.close(error.localizedDescription); return }
@@ -822,7 +857,6 @@ final class DeskModel: ObservableObject {
     }
 
     private func saveVideoPreference(_ settings: StreamSettings) {
-        preferredViewerSettings = settings
         guard let target, let index = connections.firstIndex(where: { $0.matches(address: target.address, port: target.port) }) else { return }
         connections[index].videoSettings = settings
         do { try ConnectionStore.save(connections) }
@@ -846,23 +880,30 @@ final class DeskModel: ObservableObject {
             return
         }
         hostSettingsRequestID = request.id
+        let token = generation
+        let capture = captureTask
         hostSettingsTask = Task { [weak self, weak peer] in
             guard let self, let peer else { return }
             defer {
-                if self.hostSettingsRequestID == request.id { self.hostSettingsRequestID = nil; self.hostSettingsTask = nil }
+                if self.generation == token, self.peer === peer, self.hostSettingsRequestID == request.id {
+                    self.hostSettingsRequestID = nil; self.hostSettingsTask = nil
+                }
             }
             do {
-                await self.captureTask?.value
-                guard self.peer === peer, !Task.isCancelled else { return }
+                await capture?.value
+                guard self.generation == token, self.peer === peer, self.streamer === streamer,
+                      self.hostSettingsRequestID == request.id, !Task.isCancelled else { return }
                 let updated = try await streamer.reconfigure(request.settings)
-                guard self.peer === peer, !Task.isCancelled else { return }
+                guard self.generation == token, self.peer === peer, self.streamer === streamer,
+                      self.hostSettingsRequestID == request.id, !Task.isCancelled else { return }
                 self.activeVideoState = updated
                 self.resolution = "\(updated.width) × \(updated.height)"
                 self.videoSettingsStatus = "控制端已调整：\(updated.settings.summary)"
                 peer.send(try Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: updated)))
                 streamer.resumeAfterReconfiguration()
             } catch {
-                guard self.peer === peer, let actual = self.activeVideoState else { return }
+                guard self.generation == token, self.peer === peer, self.hostSettingsRequestID == request.id,
+                      !Task.isCancelled, let actual = self.activeVideoState else { return }
                 if let result = try? Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: actual, error: error.localizedDescription)) { peer.send(result) }
             }
         }
@@ -1050,7 +1091,10 @@ final class DeskModel: ObservableObject {
                 let seconds = max(0.01, ProcessInfo.processInfo.systemUptime - self.lastMetrics)
                 self.traffic = String(format: "%.2f Mbps", Double(self.byteCount) * 8 / seconds / 1_000_000)
                 self.frameRate = String(format: "%.0f fps", Double(self.frames) / seconds)
-                if let measured = self.lastLatencyAt, ProcessInfo.processInfo.systemUptime - measured > 15 { self.latency = "— ms" }
+                if let measured = self.lastLatencyAt, ProcessInfo.processInfo.systemUptime - measured > 15 {
+                    self.latency = "— ms"
+                    self.roundTripMilliseconds = nil
+                }
                 self.byteCount = 0
                 self.frames = 0
                 self.lastMetrics = ProcessInfo.processInfo.systemUptime
@@ -1064,13 +1108,16 @@ final class DeskModel: ObservableObject {
         capsLockRunning = false
         capsLockStartAttempted = false
         latency = "— ms"
+        roundTripMilliseconds = nil
         lastLatencyAt = nil
+        viewerQualityPolicy.discardUnfinishedSample()
         videoDebounceTask?.cancel()
         videoRequestTimeout?.cancel()
         hostSettingsTask?.cancel()
         hostSettingsTask = nil
         hostSettingsRequestID = nil
         supportsLiveSettings = false
+        supportsExtendedVideoSettings = false
         videoTuning = nil
         activeVideoState = nil
         videoSettingsStatus = ""

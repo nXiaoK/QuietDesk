@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import QuietDeskCore
 
 struct SharingView: View {
     @ObservedObject var model: DeskModel
@@ -224,6 +225,7 @@ struct SharingView: View {
                                 Text("1920 · 办公").tag(1920)
                                 Text("2560 · 清晰").tag(2560)
                                 Text("3840 · 高分辨率").tag(3840)
+                                Text(StreamSettings.resolutionLabel(StreamSettings.nativeLongestEdge)).tag(StreamSettings.nativeLongestEdge)
                             }
                             .labelsHidden()
                         }
@@ -241,7 +243,7 @@ struct SharingView: View {
                         HStack(spacing: 8) {
                             Text("目标码率")
                             Picker("目标码率", selection: $model.settings.megabits) {
-                                ForEach([1, 2, 3, 5, 8, 12], id: \.self) { Text("\($0) Mbps").tag($0) }
+                                ForEach(StreamSettings.bitRates, id: \.self) { Text("\($0) Mbps").tag($0) }
                             }
                             .labelsHidden()
                         }
@@ -251,6 +253,7 @@ struct SharingView: View {
                     VStack(alignment: .leading, spacing: 5) {
                         Text("建议先用 1920 / 15 fps / 3 Mbps。静止画面不重复编码；码率是目标值，关键帧和网络开销可能产生短时峰值。")
                         Text("控制端在会话中调整画质不会修改这里的默认值。")
+                        Text("原分辨率不放大画面，上限为单边 8192 像素、总计 3600 万像素；仍使用有损 H.264。新档位需两端更新，旧控制端沿用兼容画质。")
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)

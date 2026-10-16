@@ -256,6 +256,7 @@ final class InputInjector {
     private var heldKeys = Set<UInt16>()
     private var heldButtons = Set<Int>()
     private var lastPoint = CGPoint.zero
+    private var scroll = ScrollAccumulator()
     private let source = CGEventSource(stateID: .hidSystemState)
     private let inputSources = InputSources()
     private var remoteCapsLock: Bool?
@@ -323,8 +324,9 @@ final class InputInjector {
                 if down { heldKeys.insert(input.keyCode) } else { heldKeys.remove(input.keyCode) }
             }
         case .scroll:
+            guard let pixels = try scroll.accumulate(deltaX: input.deltaX, deltaY: input.deltaY) else { return nil }
             event = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
-                            wheel1: Int32(input.deltaY.rounded()), wheel2: Int32(input.deltaX.rounded()), wheel3: 0)
+                            wheel1: pixels.y, wheel2: pixels.x, wheel3: 0)
             event?.location = point
         case .move, .drag, .down, .up:
             let type: CGEventType
@@ -350,6 +352,7 @@ final class InputInjector {
     }
 
     func releaseAll() {
+        scroll.reset()
         for key in heldKeys {
             let event = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false)
             if [54, 55, 56, 57, 58, 59, 60, 61, 62, 63].contains(key) { event?.type = .flagsChanged }

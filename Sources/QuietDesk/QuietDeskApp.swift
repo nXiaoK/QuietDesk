@@ -85,6 +85,7 @@ struct DeskView: View {
     @State private var showTrafficStatistics = false
     @State private var showSessionEffects = false
     @State private var dismissedClipboardStatus = ""
+    @State private var clipboardNoticeRevision: UInt64 = 0
 
     private var locked: Bool { model.active || model.working }
     private var sessionLayout: Bool { model.mode == .viewer && (model.connected || model.reconnecting) }
@@ -174,7 +175,16 @@ struct DeskView: View {
         } message: { Text(model.error ?? "") }
         .onChange(of: immersive) { _, _ in showFullScreenMenu = false; showOptions = false; showCapsSettings = false; showTrafficStatistics = false; showSessionEffects = false }
         .onChange(of: model.mode) { _, _ in model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true) }
-        .onReceive(model.$clipboardStatus) { _ in dismissedClipboardStatus = "" }
+        .onReceive(model.$clipboardStatus) { _ in
+            dismissedClipboardStatus = ""
+            clipboardNoticeRevision &+= 1
+        }
+        .task(id: clipboardNoticeRevision) {
+            let message = model.clipboardStatus
+            guard !message.isEmpty else { return }
+            do { try await Task.sleep(for: .seconds(1)) } catch { return }
+            dismissedClipboardStatus = message
+        }
         .onChange(of: model.controlling) { _, controlling in if controlling { showFullScreenMenu = false; showOptions = false } }
     }
 

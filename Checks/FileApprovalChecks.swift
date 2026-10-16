@@ -18,9 +18,11 @@ func runFileApprovalChecks() {
             b.onFileOffer = { if let value = $0 { offer.set(value); offerReady.signal() } }
             b.onReceive = { if case .files(let urls) = $0 { correct.set((try? Data(contentsOf: urls[0])) == bytes) } }
             defer { stopTransfers(a, b) }
+            let requestedAt = ProcessInfo.processInfo.systemUptime
             a.send(.files([file])) { success.set($0); done.signal() }
             try wait(offerReady, "No file offer")
             guard let value = offer.read() else { throw CheckFailure("Missing file offer") }
+            try check(value.createdUptime >= requestedAt && value.createdUptime <= ProcessInfo.processInfo.systemUptime, "Offer countdown does not use the request clock")
             try check(value.names == ["项目.bin"] && value.count == 1 && value.bytes == UInt64(bytes.count), "Offer metadata changed")
             try check(messages.read() == [.clipboardBegin] && replies.read() == 0, "File data or receipt sent before approval")
             try check(!FileManager.default.fileExists(atPath: storage.path), "Files written before approval")

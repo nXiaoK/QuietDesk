@@ -27,6 +27,11 @@ final class DeskModel: ObservableObject {
     @Published var controlling = false
     @Published var status = "准备就绪"
     @Published var error: String?
+    @Published private(set) var connectionError: String?
+    var connectionFailure: String? {
+        guard mode == .viewer, !active, !working, !connected else { return nil }
+        return connectionError
+    }
     @Published var traffic = "0.00 Mbps"
     @Published var frameRate = "0 fps"
     @Published var latency = "— ms"
@@ -36,6 +41,7 @@ final class DeskModel: ObservableObject {
     @Published var resolution = ""
     @Published var remoteName = ""
     @Published var clipboardStatus = ""
+    @Published private(set) var pendingFileOffer: ClipboardFileOffer?
     @Published var canControl = false
     @Published private(set) var localAccessibility = false
     @Published private(set) var localInputMonitoring = false
@@ -457,6 +463,7 @@ final class DeskModel: ObservableObject {
 
     func connect() {
         guard !active, !working else { return }
+        connectionError = nil
         do {
             let address = address.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !address.isEmpty, !address.contains("://"), !address.contains("/") else {
@@ -476,7 +483,7 @@ final class DeskModel: ObservableObject {
             generation = UUID()
             beginMetrics()
             beginConnection(target)
-        } catch { self.error = error.localizedDescription }
+        } catch { self.connectionError = error.localizedDescription }
     }
 
     private func beginConnection(_ target: Target) {
@@ -524,6 +531,7 @@ final class DeskModel: ObservableObject {
                 } else {
                     self.stop()
                     self.status = reason
+                    self.connectionError = reason
                 }
             }
         }
@@ -549,6 +557,7 @@ final class DeskModel: ObservableObject {
         guard !active, !working else { return }
         address = record.address
         port = String(record.port)
+        connectionError = nil
         do {
             guard let key = try KeyStore.load(account: "remote." + record.id.uuidString) else {
                 viewerCode = ""
@@ -556,7 +565,7 @@ final class DeskModel: ObservableObject {
             }
             viewerCode = key.code
             connect()
-        } catch { self.error = error.localizedDescription }
+        } catch { self.connectionError = error.localizedDescription }
     }
 
     func removeConnection(_ record: ConnectionRecord) {
@@ -849,10 +858,11 @@ final class DeskModel: ObservableObject {
                 guard let self, let sync, self.clipboardSync === sync else { return }
                 self.clipboardFilePrompt?.dismiss()
                 self.clipboardFilePrompt = nil
+                self.pendingFileOffer = offer
                 guard let offer else { return }
                 if self.mode == .viewer { self.canvas.releaseControl() }
                 else { self.injector?.releaseAll() }
-                let prompt = ClipboardFilePrompt(offer: offer) { [weak sync] accepted in
+                let prompt = ClipboardFilePrompt(offer: offer, peerName: self.mode == .viewer ? self.remoteName : "") { [weak sync] accepted in
                     sync?.respondToFileOffer(id: offer.id, accept: accepted)
                 }
                 self.clipboardFilePrompt = prompt
@@ -864,6 +874,7 @@ final class DeskModel: ObservableObject {
         } else if !enabled {
             clipboardSync?.stop(); clipboardSync = nil
             clipboardFilePrompt?.dismiss(); clipboardFilePrompt = nil
+            pendingFileOffer = nil
             if connected { clipboardStatus = supportsClipboard ? "自动剪贴板已关闭" : "对端版本较旧，可使用手动文字同步" }
         }
     }
@@ -984,6 +995,7 @@ final class DeskModel: ObservableObject {
         clipboardSync?.stop()
         clipboardSync = nil
         clipboardFilePrompt?.dismiss(); clipboardFilePrompt = nil
+        pendingFileOffer = nil
         canvas.synchronizesClipboard = false
         supportsClipboard = false
         remoteClipboardEnabled = false
@@ -1009,6 +1021,7 @@ final class DeskModel: ObservableObject {
 
     func stop() {
         hostingRequested = false
+        connectionError = nil
         hostRetryTask?.cancel()
         reconnectTask?.cancel()
         stableTask?.cancel()

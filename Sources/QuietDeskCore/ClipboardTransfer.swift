@@ -27,6 +27,13 @@ public struct ClipboardFileOffer: Identifiable {
     public let names: [String]
     public let count: Int
     public let bytes: UInt64
+    public let createdUptime: TimeInterval
+
+    public init(id: UUID, names: [String], count: Int, bytes: UInt64,
+                createdUptime: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        self.id = id; self.names = names; self.count = count; self.bytes = bytes
+        self.createdUptime = createdUptime
+    }
 }
 
 private struct ClipboardBegin: Codable {
@@ -360,9 +367,11 @@ public final class ClipboardTransfer {
         discardIncoming()
         if value.type == "files", requireFileApproval {
             let id = UUID()
-            pendingFileOffer = (id, value, ProcessInfo.processInfo.systemUptime)
+            let created = ProcessInfo.processInfo.systemUptime
+            pendingFileOffer = (id, value, created)
             ensureTimer()
-            onFileOffer?(ClipboardFileOffer(id: id, names: value.names ?? [], count: value.rootCount ?? value.count, bytes: value.bytes))
+            onFileOffer?(ClipboardFileOffer(id: id, names: value.names ?? [], count: value.rootCount ?? value.count,
+                bytes: value.bytes, createdUptime: created))
             onStatus?("收到文件复制请求，确认接收后才会下载（90 秒内）")
             return
         }

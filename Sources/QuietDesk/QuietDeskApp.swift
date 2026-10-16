@@ -23,6 +23,7 @@ struct QuietDeskApp: App {
                 }
         }
         .defaultSize(width: 1080, height: 760)
+        .windowToolbarStyle(.unified)
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandMenu("远程控制") {
@@ -69,408 +70,234 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct DeskView: View {
     @ObservedObject var model: DeskModel
-    @State private var showCode = false
     @State private var showCapsSettings = false
     @State private var showOptions = false
     @State private var showFullScreenMenu = false
+    @State private var dismissedClipboardStatus = ""
 
     private var locked: Bool { model.active || model.working }
+    private var sessionLayout: Bool { model.mode == .viewer && (model.connected || model.reconnecting) }
     private var immersive: Bool { model.isFullScreen && model.mode == .viewer }
+    private var remoteTitle: String { model.remoteName.isEmpty ? model.address : model.remoteName }
+    private var showClipboardActivity: Bool {
+        !model.clipboardStatus.isEmpty && model.clipboardStatus != dismissedClipboardStatus
+            && !model.clipboardStatus.hasPrefix("双向剪贴板已开启")
+            && !model.clipboardStatus.hasPrefix("自动剪贴板已关闭")
+            && !model.clipboardStatus.hasPrefix("对端版本较旧")
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            if !immersive {
-                HStack(spacing: 12) {
-                    Image(systemName: "display.2").font(.system(size: 26)).foregroundStyle(.tint)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("QuietDesk").font(.title2.weight(.semibold))
-                        Text("为两台 Mac 之间的专注工作而做").font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Picker("模式", selection: $model.mode) {
-                        ForEach(DeskModel.Mode.allCases, id: \.self) { mode in Text(mode.rawValue).tag(mode) }
-                    }
-                    .pickerStyle(.segmented).frame(width: 310).disabled(locked)
-                }
-                .padding(20)
-
-                Divider()
-            }
-
-            if model.mode == .viewer {
-                if !immersive { viewerControls }
-                ZStack {
-                    Color.black
-                    CanvasView(canvas: model.canvas)
-                    if !model.connected {
-                        VStack(spacing: 14) {
-                            Image(systemName: "macbook.and.macmini").font(.system(size: 48, weight: .light))
-                            Text(model.reconnecting ? "正在自动重连…" : model.working ? "正在连接家里的 Mac…" : "你的另一张书桌").font(.title2)
-                            Text(model.reconnecting ? model.status : model.working ? "正在验证配对码并准备画面" : "输入地址和配对码，继续手边的工作")
-                                .font(.callout).foregroundStyle(.gray)
-                            if model.working { ProgressView().controlSize(.small) }
-                        }
-                        .foregroundStyle(.white.opacity(0.85))
-                        .allowsHitTesting(false)
-                    }
-                }
-                .frame(minWidth: 760, minHeight: 320, maxHeight: .infinity)
-                .overlay(alignment: .trailing) {
-                    if immersive {
-                        Button {
-                            model.canvas.releaseControl()
-                            showFullScreenMenu.toggle()
-                        } label: {
-                            Image(systemName: "slider.horizontal.3")
-                                .font(.system(size: 17, weight: .semibold))
-                                .frame(width: 40, height: 40)
-                                .background(.ultraThinMaterial, in: Circle())
-                                .overlay(Circle().stroke(.white.opacity(0.25)))
-                                .contentShape(Circle())
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("展开控制与设置")
-                        .help("点击展开控制与设置")
-                        .padding(.trailing, 16)
-                        .popover(isPresented: $showFullScreenMenu, arrowEdge: .leading) {
-                            ScrollView {
-                                VStack(spacing: 0) {
-                                    HStack {
-                                        Text("控制与设置").font(.headline)
-                                        Spacer()
-                                        Button("收起") { showFullScreenMenu = false }
-                                    }.padding(16)
-                                    HStack {
-                                        Button("退出全屏") { showFullScreenMenu = false; model.toggleFullScreen() }
-                                        Button("释放控制") { model.canvas.releaseControl() }
-                                    }
-                                    Divider().padding(.top, 14)
-                                    connectionSettings
-                                    Divider()
-                                    capsSettings
-                                    Divider()
-                                    HStack {
-                                        Button("发送文字") { model.pushClipboard() }.disabled(!model.connected)
-                                        Button("获取文字") { model.pullClipboard() }.disabled(!model.connected)
-                                        Spacer()
-                                        Button(model.active ? "断开" : "返回连接") {
-                                            showFullScreenMenu = false
-                                            if model.active { model.stop() } else { model.toggleFullScreen() }
-                                        }
-                                    }.padding(16)
-                                }
-                            }
-                            .frame(width: 400, height: min(680, max(360, (model.mainWindow?.frame.height ?? 760) - 100)))
-                        }
-                    }
-                }
-                .overlay(alignment: .bottomTrailing) {
-                    if immersive && model.showFullScreenStatistics {
-                        VStack(alignment: .trailing, spacing: 4) {
-                            Text("延迟 \(model.latency) · \(model.resolution.isEmpty ? "—" : model.resolution)")
-                            Text("\(model.frameRate) · 收发 \(model.traffic)")
-                        }
-                        .font(.caption).monospacedDigit().foregroundStyle(.white.opacity(0.9))
-                        .padding(10).background(.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 8))
-                        .padding(16).allowsHitTesting(false)
-                    }
-                }
-                .overlay(alignment: .bottomLeading) {
-                    if immersive && model.clipboardStatus.hasPrefix("正在") {
-                        Text(model.clipboardStatus).font(.caption).lineLimit(3)
-                            .frame(maxWidth: 360, alignment: .leading)
-                            .padding(10).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
-                            .padding(12).allowsHitTesting(false)
-                    }
-                }
-                if !immersive {
-                    HStack {
-                        Text(model.controlling ? "正在控制远端 · 按 ⌃⌥Esc 释放键盘鼠标" : "点击画面操作 · ⌃⌥Esc 返回本机")
-                        Spacer()
-                        capsButton
-                        optionsButton
-                        Button { model.pushClipboard() } label: { Label("发送文字", systemImage: "arrow.up.doc.on.clipboard") }
-                            .disabled(!model.connected)
-                        Button { model.pullClipboard() } label: { Label("获取文字", systemImage: "arrow.down.doc") }
-                            .disabled(!model.connected)
-                        Button { model.toggleFullScreen() } label: { Label("全屏", systemImage: "arrow.up.left.and.arrow.down.right") }
-                            .help("进入全屏（⌃⌘F）")
-                    }
-                    .font(.caption).padding(.horizontal, 16).padding(.vertical, 9)
-                }
+            if model.mode == .host {
+                SharingView(model: model)
+            } else if sessionLayout || immersive {
+                remoteContent
             } else {
-                hostControls
+                ConnectionView(model: model, showOptions: $showOptions,
+                               openCaps: { model.canvas.releaseControl(); showCapsSettings = true })
             }
-
             if !immersive {
                 Divider()
-                HStack(spacing: 9) {
-                    Circle().fill(model.connected ? .green : model.active ? .orange : .secondary).frame(width: 7, height: 7)
-                    Text(model.status).lineLimit(1).textSelection(.enabled)
-                    Spacer(minLength: 8)
-                    if !model.resolution.isEmpty { Text(model.resolution).monospacedDigit() }
-                    if model.connected { Text(model.latency).monospacedDigit().help("网络往返延迟（RTT）") }
-                    Text(model.frameRate).monospacedDigit()
-                    Text(model.traffic).monospacedDigit()
-                    Image(systemName: "lock.shield").foregroundStyle(.secondary)
+                statusBar
+            }
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+        .background(WindowReader(resolved: { model.attachWindow($0) }, fullScreen: { model.isFullScreen = $0 }).frame(width: 0, height: 0))
+        .frame(minWidth: 860, minHeight: 540)
+        .ignoresSafeArea(immersive ? .container : [], edges: .all)
+        .navigationTitle(sessionLayout ? remoteTitle : "QuietDesk")
+        .navigationSubtitle(sessionLayout ? "\(model.reconnecting ? "正在重连" : "已连接") · \(model.address):\(model.port)" : "为两台 Mac 之间的专注工作而做")
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                Picker("模式", selection: $model.mode) {
+                    ForEach(DeskModel.Mode.allCases, id: \.self) { mode in Text(mode.rawValue).tag(mode) }
                 }
-                .font(.caption).padding(.horizontal, 16).padding(.vertical, 12)
-                if !model.clipboardStatus.isEmpty {
-                    Text(model.clipboardStatus).font(.caption).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 8)
-                }
-                if !model.inputStatus.isEmpty {
-                    Text(model.inputStatus).font(.caption).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.bottom, 8)
+                .pickerStyle(.segmented).frame(width: 244).disabled(locked)
+                .help(locked ? "断开连接或停止共享后可切换" : "连接另一台 Mac，或共享这台 Mac")
+            }
+            ToolbarItemGroup(placement: .primaryAction) {
+                if sessionLayout {
+                    Button { model.canvas.releaseControl(); model.pushClipboard() } label: { Label("发送文字", systemImage: "doc.badge.arrow.up") }
+                        .help("发送本机剪贴板文字").disabled(!model.connected)
+                    Button { model.canvas.releaseControl(); model.pullClipboard() } label: { Label("获取文字", systemImage: "arrow.down.doc") }
+                        .help("获取远端剪贴板文字").disabled(!model.connected)
+                    Button { model.canvas.releaseControl(); showCapsSettings = true } label: { Label("Caps Lock 设置", systemImage: "capslock") }
+                        .help("Caps Lock 转发设置")
+                    Button { model.canvas.releaseControl(); showOptions.toggle() } label: { Label("画质与连接", systemImage: "slider.horizontal.3") }
+                        .help("本次会话画质、连接与剪贴板")
+                        .popover(isPresented: $showOptions, arrowEdge: .top) {
+                            ConnectionSettingsView(model: model, openCaps: { showOptions = false; showCapsSettings = true })
+                        }
+                    Button { model.toggleFullScreen() } label: { Label("全屏", systemImage: "arrow.up.left.and.arrow.down.right") }
+                        .help("进入全屏（⌃⌘F）")
+                    Divider()
+                    Button("断开") { model.stop() }
+                } else if model.mode == .viewer {
+                    Button { model.mode = .host } label: {
+                        HStack(spacing: 5) {
+                            Circle().fill(.secondary).frame(width: 6, height: 6)
+                            Text("共享已停止").font(.caption)
+                        }
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(Color.primary.opacity(0.05), in: Capsule())
+                    }
+                    .buttonStyle(.plain).disabled(locked).help("打开「共享这台 Mac」")
                 }
             }
         }
-        .background(.background)
-        .background(WindowReader { model.attachWindow($0) }.frame(width: 0, height: 0))
-        .frame(minWidth: 860, minHeight: 640)
-        .alert("QuietDesk", isPresented: Binding(get: { model.error != nil }, set: { if !$0 { model.error = nil } })) {
+        .toolbar(immersive ? .hidden : .visible, for: .windowToolbar)
+        .sheet(isPresented: $showCapsSettings) {
+            CapsLockSettingsView(model: model, done: { showCapsSettings = false })
+        }
+        .alert("QuietDesk", isPresented: Binding(get: { model.error != nil },
+            set: { if !$0 { model.error = nil } })) {
             Button("知道了", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
         .onChange(of: immersive) { _, _ in showFullScreenMenu = false; showOptions = false; showCapsSettings = false }
         .onChange(of: model.mode) { _, _ in model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true) }
+        .onReceive(model.$clipboardStatus) { _ in dismissedClipboardStatus = "" }
+        .onChange(of: model.controlling) { _, controlling in if controlling { showFullScreenMenu = false; showOptions = false } }
     }
 
-    private var optionsButton: some View {
-        Button { showOptions = true } label: { Image(systemName: "gearshape") }
-            .accessibilityLabel("画质与连接设置")
-            .help("画质、连接与剪贴板设置")
-            .popover(isPresented: $showOptions) { connectionSettings }
-    }
-
-    private var connectionSettings: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("画质与连接设置").font(.headline)
-            GroupBox {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("画质 · 连接中即时调整").font(.headline)
-                    if model.connected && !model.supportsLiveSettings {
-                        Text("请将家里 Mac 更新到 0.4.0，以支持动态调节。")
-                            .font(.caption).foregroundStyle(.secondary)
+    private var remoteContent: some View {
+        ZStack {
+            Color.black
+            CanvasView(canvas: model.canvas)
+            if !model.connected {
+                VStack(spacing: 14) {
+                    ProgressView().controlSize(.small)
+                    Text(model.reconnecting ? "连接中断，正在自动重连…" : "尚未连接").font(.title3.weight(.semibold))
+                    Text(model.reconnecting ? model.status : "退出全屏后输入地址和配对码")
+                        .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    if model.reconnecting {
+                        Text("重连期间不发送键盘鼠标").font(.caption).foregroundStyle(.secondary)
+                        Button("停止重连") { model.stop() }
                     } else {
-                        Picker("最长边", selection: Binding(get: { model.viewerSettings.longestEdge }, set: { value in
-                            var settings = model.viewerSettings; settings.longestEdge = value; model.chooseViewerSettings(settings)
-                        })) {
-                            ForEach(StreamSettings.longestEdges, id: \.self) { Text("\($0)").tag($0) }
-                        }
-                        Picker("帧率上限", selection: Binding(get: { model.viewerSettings.framesPerSecond }, set: { value in
-                            var settings = model.viewerSettings; settings.framesPerSecond = value; model.chooseViewerSettings(settings)
-                        })) {
-                            ForEach(StreamSettings.frameRates, id: \.self) { Text("\($0) fps").tag($0) }
-                        }
-                        Picker("目标码率", selection: Binding(get: { model.viewerSettings.megabits }, set: { value in
-                            var settings = model.viewerSettings; settings.megabits = value; model.chooseViewerSettings(settings)
-                        })) {
-                            ForEach(StreamSettings.bitRates, id: \.self) { Text("\($0) Mbps").tag($0) }
-                        }
-                    }
-                    if let state = model.activeVideoState {
-                        Text("生效值：\(state.settings.summary)\n视频尺寸：\(state.width) × \(state.height)")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    HStack(alignment: .top) {
-                        if model.videoTuning?.pending != nil { ProgressView().controlSize(.small) }
-                        Text(model.connected ? model.videoSettingsStatus : "连接后可动态调整，无需先停止共享。")
-                            .font(.caption).foregroundStyle(.secondary)
+                        Button("返回连接") { model.toggleFullScreen() }
                     }
                 }
-                .padding(6)
-                .disabled(!model.connected || !model.supportsLiveSettings)
-            }
-            Toggle("全屏显示连接状态", isOn: $model.showFullScreenStatistics)
-            Text("显示网络往返延迟、分辨率、视频 FPS 和收发流量。延迟约每 5 秒更新，静止画面的 FPS 可能为 0。")
-                .font(.caption).foregroundStyle(.secondary)
-            Toggle("断线自动重连", isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) }))
-            Toggle("双向同步文字、图片和文件", isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) }))
-            Text("文字和图片自动同步；文件先提示接收，确认后下载，完成后再粘贴。")
-                .font(.caption).foregroundStyle(.secondary)
-            Button("打开接收文件目录") { model.openReceivedFiles() }
-            if !model.lastDisconnect.isEmpty {
-                Divider()
-                Text("上次断开：\(model.lastDisconnect)").font(.caption).textSelection(.enabled)
+                .padding(24).frame(maxWidth: 420)
+                .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
             }
         }
-        .padding(18).frame(width: 360)
-    }
-
-    private var capsButton: some View {
-        Button { showCapsSettings = true } label: {
-            Label(model.capsLockEnabled ? (model.capsLockRunning ? "Caps Lock ✓" : "Caps Lock 待生效") : "Caps Lock", systemImage: "keyboard")
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .overlay {
+            if model.controlling { Rectangle().strokeBorder(Color.accentColor, lineWidth: 2).allowsHitTesting(false) }
         }
-        .popover(isPresented: $showCapsSettings) { capsSettings }
-    }
-
-    private var capsSettings: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Caps Lock 操作远端").font(.headline)
-            Text("短按切换中英文；按住至少 0.6 秒后松开，切换大写锁定。大写锁定开启时，短按先解除大写。")
-            Toggle("启用 Caps Lock 转发", isOn: Binding(get: { model.capsLockEnabled },
-                set: { model.setCapsLockEnabled($0) }))
-            Text("公司 Mac 需授权辅助功能和输入监控。仅在远程画面获得焦点时捕获 Caps Lock。")
-                .font(.caption).foregroundStyle(.secondary)
-            Text("本机辅助功能：\(model.localAccessibility ? "已生效" : "未生效") · 输入监控：\(model.localInputMonitoring ? "已生效" : "未生效")")
-                .font(.caption)
-            HStack {
-                Button("辅助功能权限") { model.requestAccessibility() }
-                Button("输入监控权限") { model.requestInputMonitoring() }
-                Button("重新检测") { model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true) }
+        .overlay(alignment: .topLeading) {
+            if immersive && model.showFullScreenStatistics {
+                HStack(spacing: 10) {
+                    Circle().fill(model.connected ? .green : .orange).frame(width: 6, height: 6)
+                    metrics
+                }
+                .font(.caption).monospacedDigit().foregroundStyle(.white)
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(.black.opacity(0.8), in: Capsule()).padding(16).allowsHitTesting(false)
             }
-            if !model.inputStatus.isEmpty { Text(model.inputStatus).font(.caption).textSelection(.enabled) }
         }
-        .font(.callout).padding(20).frame(width: 340)
-    }
-
-    private var viewerControls: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .bottom, spacing: 10) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("家里 Mac 的地址").font(.caption).foregroundStyle(.secondary)
-                    TextField("域名或 IP", text: $model.address).textFieldStyle(.roundedBorder).frame(minWidth: 160)
-                }
-                .disabled(locked)
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("映射后的端口").font(.caption).foregroundStyle(.secondary)
-                    TextField("5908", text: $model.port).textFieldStyle(.roundedBorder).frame(width: 85)
-                }
-                .disabled(locked)
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("家里 Mac 显示的配对码").font(.caption).foregroundStyle(.secondary)
-                    SecureField("粘贴完整配对码", text: $model.viewerCode).textFieldStyle(.roundedBorder).frame(minWidth: 180)
-                }
-                .disabled(locked)
-                if locked {
-                    Button("断开") { model.stop() }.controlSize(.large)
-                } else {
-                    Button("连接") { model.connect() }.buttonStyle(.borderedProminent).controlSize(.large)
-                }
+        .overlay(alignment: .topTrailing) {
+            if showClipboardActivity {
+                clipboardActivity.padding(.top, 16).padding(.trailing, immersive ? 76 : 16)
             }
-            if !model.connections.isEmpty {
-                HStack {
-                    Menu("最近连接") {
-                        ForEach(model.connections) { record in
-                            Button("\(record.name) · \(record.address):\(record.port)") { model.quickConnect(record) }
-                        }
-                    }
-                    .disabled(locked)
-                    ForEach(Array(model.connections.prefix(2))) { record in
-                        Button(record.name) { model.quickConnect(record) }.disabled(locked)
-                            .help("\(record.address):\(record.port)")
-                    }
-                    Spacer()
-                    Menu("管理记录") {
-                        ForEach(model.connections) { record in
-                            Button("移除 \(record.name) · \(record.address)") { model.removeConnection(record) }
-                        }
-                    }.disabled(locked)
-                }.font(.caption)
-            }
-        }.padding(16)
-    }
-
-    private var hostControls: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("把这张书桌带走").font(.largeTitle.weight(.semibold))
-                    Text("在家里 Mac 开启共享，然后从公司 Mac 连接。使用现有的 TCP 端口映射。")
-                        .foregroundStyle(.secondary)
-                }
-                GroupBox {
-                    VStack(alignment: .leading, spacing: 16) {
-                        HStack {
-                            Label("默认共享设置", systemImage: "slider.horizontal.3").font(.headline)
-                            Spacer()
-                            Text("H.264 · 加密连接").font(.caption).foregroundStyle(.secondary)
-                        }
-                        HStack(spacing: 24) {
-                            Picker("显示器", selection: $model.displayID) {
-                                ForEach(model.screens, id: \.id) { screen in Text(screen.name).tag(screen.id) }
-                            }
-                            HStack { Text("监听端口"); TextField("5908", text: $model.hostPort).frame(width: 80) }
-                        }
-                        HStack(spacing: 24) {
-                            Picker("最长边", selection: $model.settings.longestEdge) {
-                                Text("1280 · 省流").tag(1280)
-                                Text("1920 · 办公").tag(1920)
-                                Text("2560 · 清晰").tag(2560)
-                                Text("3840 · 高分辨率").tag(3840)
-                            }
-                            Picker("帧率上限", selection: $model.settings.framesPerSecond) {
-                                Text("10 fps").tag(10); Text("15 fps").tag(15); Text("30 fps").tag(30)
-                            }
-                            Picker("目标码率", selection: $model.settings.megabits) {
-                                ForEach([1, 2, 3, 5, 8, 12], id: \.self) { Text("\($0) Mbps").tag($0) }
-                            }
-                        }
-                        Text("建议先用 1920 / 15 fps / 3 Mbps。静止画面不重复编码；码率是目标值，关键帧和网络开销可能产生短时峰值。")
-                            .font(.caption).foregroundStyle(.secondary)
-                        if model.connected, let state = model.activeVideoState {
-                            Text("当前会话：\(state.settings.summary)。控制端动态调整不会修改这里的默认值。")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    .padding(10).disabled(locked)
-                }
-                GroupBox {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Label("后台与登录启动", systemImage: "power").font(.headline)
-                        Toggle("登录后自动启动 QuietDesk", isOn: Binding(get: { model.loginEnabled }, set: { model.setLoginEnabled($0) }))
-                        Toggle("启动后自动开启共享", isOn: $model.autoStartSharing)
-                        Toggle("登录自动启动时最小化窗口", isOn: $model.minimizeAtLogin)
-                        Toggle("双向同步文字、图片和文件", isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) }))
-                        Text("文件和文件夹需接收端确认后才下载；文字和图片仍自动同步。")
-                            .font(.caption).foregroundStyle(.secondary)
-                        Button("打开接收文件目录") { model.openReceivedFiles() }
-                        if model.loginNeedsApproval { Button("在系统设置中允许登录启动") { LaunchSettings.openSettings() } }
-                        Text("建议先将应用移到应用程序文件夹并完成屏幕录制、辅助功能授权。登录前 / FileVault 解锁前无法共享。关闭共享窗口后仍可从菜单栏打开，退出应用会停止共享。")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }.padding(10)
-                }
-                GroupBox {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Label("配对码", systemImage: "key.horizontal").font(.headline)
-                        Text("持有码即可查看和控制这台 Mac，请只交给自己的设备。配对码保存在本机钥匙串。")
-                            .font(.callout).foregroundStyle(.secondary)
-                        if showCode {
-                            Text(model.hostCode.isEmpty ? "尚未生成" : model.hostCode)
-                                .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
-                        }
-                        HStack {
-                            Button("复制配对码") { model.copyHostCode() }
-                            Button(showCode ? "隐藏" : "显示") { model.prepareHostCode(); showCode.toggle() }
-                            Spacer()
-                            Button("重新生成") { model.regenerateKey() }.disabled(locked)
-                        }
-                    }
-                    .padding(10)
-                }
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("屏幕录制：\(model.localScreenRecording ? "已生效" : "未生效") · 辅助功能：\(model.localAccessibility ? "已生效" : "未生效")")
-                        .font(.callout)
-                    Text("已勾选仍未生效时，请完全退出后重开；升级后的旧授权记录可能需要移除并重新添加当前应用一次。")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Text("当前应用：\(Bundle.main.bundleURL.path)").font(.caption).textSelection(.enabled)
-                }
-                HStack(spacing: 12) {
-                    Button("屏幕录制权限") { model.openScreenPermission() }
-                    Button("辅助功能权限") { model.requestAccessibility() }
-                    Button("重新检测") { model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true) }
-                    Spacer()
-                    if locked {
-                        Button("停止共享") { model.stop() }.controlSize(.large)
-                    } else {
-                        Button("开启共享") { model.startHosting() }.buttonStyle(.borderedProminent).controlSize(.large)
-                    }
-                }
-                Text("共享期间 Mac 保持唤醒。支持一个显示器与一个控制连接；暂不包含音频和登录窗口控制。")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            .padding(28)
         }
+        .overlay(alignment: .trailing) {
+            if immersive {
+                HStack(spacing: 16) {
+                    if showFullScreenMenu {
+                        FullScreenSettingsView(model: model, close: { showFullScreenMenu = false })
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                            .shadow(color: .black.opacity(0.3), radius: 16, y: 6)
+                    }
+                    Button {
+                        model.canvas.releaseControl()
+                        showFullScreenMenu.toggle()
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.system(size: 20, weight: .medium)).frame(width: 44, height: 44)
+                            .foregroundStyle(showFullScreenMenu ? Color.white : Color.primary)
+                            .background {
+                                if showFullScreenMenu { Circle().fill(Color.accentColor) }
+                                else { Circle().fill(.regularMaterial) }
+                            }
+                            .overlay(Circle().stroke(.white.opacity(0.2)))
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain).help(showFullScreenMenu ? "收起控制与设置" : "展开控制与设置")
+                    .accessibilityLabel(showFullScreenMenu ? "收起控制与设置" : "展开控制与设置")
+                }
+                .padding(.trailing, 16)
+            }
+        }
+    }
+
+    private var statusBar: some View {
+        HStack(spacing: 10) {
+            if model.mode == .host {
+                Circle().fill(model.active ? .green : model.working ? .orange : .secondary).frame(width: 6, height: 6)
+                Text(model.status).lineLimit(1).textSelection(.enabled)
+                Spacer(minLength: 8)
+                if !model.resolution.isEmpty { Text(model.resolution) }
+                Text(model.frameRate)
+                Text(model.traffic)
+            } else if sessionLayout {
+                Label(controlStatus, systemImage: model.controlling ? "cursorarrow.rays" : "cursorarrow")
+                    .foregroundStyle(model.controlling ? Color.accentColor : Color.secondary).lineLimit(1)
+                    .help(model.status)
+                Spacer(minLength: 8)
+                Label(model.canvas.synchronizesClipboard ? "双向同步" : "同步未启用", systemImage: "arrow.triangle.2.circlepath")
+                    .help(model.clipboardStatus.isEmpty ? "文字和图片自动同步；文件需逐次确认，接收完成后再粘贴。" : model.clipboardStatus)
+                Label(model.capsLockEnabled ? (model.capsLockRunning ? "Caps Lock 转发" : "Caps Lock 待生效") : "Caps Lock 关闭", systemImage: "capslock")
+                    .help(model.inputStatus.isEmpty ? "短按切换中英文；按住至少 0.6 秒后松开切换大写。仅在远程画面获得焦点时捕获。" : model.inputStatus)
+                if model.pendingFileOffer != nil {
+                    Image(systemName: "doc.on.doc").foregroundStyle(.orange).help("1 个文件请求待确认")
+                }
+                metrics
+            } else {
+                Circle().fill(locked ? .orange : .secondary).frame(width: 6, height: 6)
+                Text(locked ? model.status : model.connectionFailure == nil ? "未连接" : "连接失败").lineLimit(1)
+                Spacer(minLength: 8)
+                Text("连接后：⌃⌥Esc 释放键盘鼠标 · ⌃⌘F 全屏 · Esc 发送到远端")
+                    .foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+        .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
+        .padding(.horizontal, 12).frame(height: 28)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private var controlStatus: String {
+        if model.reconnecting { return "自动重连中 · 键盘鼠标暂不发送" }
+        if !model.canControl { return "仅观看 · 共享端辅助功能未生效" }
+        return model.controlling ? "正在控制远端 · ⌃⌥Esc 释放键盘鼠标" : "已释放 · 点按画面开始控制"
+    }
+
+    @ViewBuilder private var metrics: some View {
+        if model.connected {
+            if !model.resolution.isEmpty { Text(model.resolution) }
+            Text(model.latency).help("网络往返延迟（RTT），约每 5 秒更新")
+            Text(model.frameRate).help("静止画面不重复编码，0 fps 正常")
+            Text(model.traffic).help("视频、控制和剪贴板的收发流量")
+        } else { Text(model.reconnecting ? "正在重连" : "未连接") }
+    }
+
+    private var clipboardActivity: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: model.pendingFileOffer == nil ? "arrow.triangle.2.circlepath" : "doc.on.doc")
+                .foregroundStyle(model.pendingFileOffer == nil ? Color.accentColor : Color.orange)
+            VStack(alignment: .leading, spacing: 7) {
+                Text(model.pendingFileOffer == nil ? "剪贴板与文件" : "1 个文件请求待确认").font(.headline)
+                Text(model.clipboardStatus).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                if model.clipboardStatus.contains("接收完成") {
+                    Button("打开接收文件目录") { model.openReceivedFiles() }.controlSize(.small)
+                }
+            }.frame(maxWidth: .infinity, alignment: .leading)
+            Button { dismissedClipboardStatus = model.clipboardStatus } label: { Image(systemName: "xmark") }
+                .buttonStyle(.plain).foregroundStyle(.secondary).help("收起状态提示")
+        }
+        .padding(14).frame(width: 320)
+        .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color(nsColor: .separatorColor)))
+        .shadow(color: .black.opacity(0.16), radius: 12, y: 4)
     }
 }
 
@@ -498,10 +325,29 @@ private struct TrayView: View {
 
 private struct WindowReader: NSViewRepresentable {
     let resolved: (NSWindow) -> Void
-    func makeNSView(context: Context) -> Probe { let view = Probe(); view.resolved = resolved; return view }
-    func updateNSView(_ view: Probe, context: Context) { view.resolved = resolved }
+    let fullScreen: (Bool) -> Void
+    func makeNSView(context: Context) -> Probe {
+        let view = Probe(); view.resolved = resolved; view.fullScreen = fullScreen; return view
+    }
+    func updateNSView(_ view: Probe, context: Context) { view.resolved = resolved; view.fullScreen = fullScreen }
     final class Probe: NSView {
         var resolved: ((NSWindow) -> Void)?
-        override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); if let window { resolved?(window) } }
+        var fullScreen: ((Bool) -> Void)?
+        private var observers: [NSObjectProtocol] = []
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            for observer in observers { NotificationCenter.default.removeObserver(observer) }
+            observers.removeAll()
+            guard let window else { return }
+            window.minSize = NSSize(width: 860, height: 640)
+            resolved?(window)
+            fullScreen?(window.styleMask.contains(.fullScreen))
+            for name in [NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification] {
+                observers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.fullScreen?(self?.window?.styleMask.contains(.fullScreen) == true) }
+                })
+            }
+        }
+        deinit { for observer in observers { NotificationCenter.default.removeObserver(observer) } }
     }
 }

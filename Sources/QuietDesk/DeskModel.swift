@@ -59,6 +59,10 @@ final class DeskModel: ObservableObject {
     @Published private(set) var supportsLiveSettings = false
     @Published private(set) var supportsExtendedVideoSettings = false
     @Published private(set) var supportsHighRefreshVideoSettings = false
+    @Published private(set) var supportsSessionEffects = false
+    @Published private(set) var sessionEffects = SessionEffectsState()
+    @Published private(set) var sessionEffectsWorking = false
+    @Published private(set) var sessionEffectsStatus = ""
     @Published private(set) var activeVideoState: VideoStreamState?
     @Published private(set) var videoTuning: VideoTuningSession?
     @Published private(set) var videoSettingsStatus = ""
@@ -139,6 +143,11 @@ final class DeskModel: ObservableObject {
     private let trafficHistoryStore = TrafficHistoryStore()
     private var trafficSession: TrafficSession?
     private var hostDeviceIdentityAdvertised = false
+    private var hostSessionEffects: HostSessionEffects?
+    private var hostEffectsTask: Task<Void, Never>?
+    private var effectsCleanupTask: Task<Void, Never>?
+    private var effectsRequestID: UUID?
+    private var effectsRequestTimeout: Task<Void, Never>?
 
     init() {
         if autoStartSharing { mode = .host }
@@ -487,6 +496,9 @@ final class DeskModel: ObservableObject {
                 self.captureTask = Task { [weak self, weak candidate] in
                     guard let self, let candidate else { return }
                     do {
+                        await self.effectsCleanupTask?.value
+                        guard self.generation == token, self.peer === candidate, !Task.isCancelled else { return }
+                        self.installHostSessionEffects(for: candidate)
                         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
                         guard self.generation == token, self.active, self.peer === candidate, !Task.isCancelled else { return }
                         self.refreshDisplays()
@@ -506,7 +518,8 @@ final class DeskModel: ObservableObject {
                             width: width, height: height, settings: settings, canControl: self.canControl,
                             preferredSettings: preferredSettings.extendedCompatible, deviceID: self.trafficHistoryStore.localDeviceID,
                             deviceIdentityExchange: self.hostDeviceIdentityAdvertised ? true : nil,
-                            highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings)))
+                            highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings,
+                            sessionEffects: true)))
                         let streamer = ScreenStreamer()
                         self.streamer = streamer
                         streamer.onFrame = { [weak self, weak candidate] packet in
@@ -714,6 +727,8 @@ final class DeskModel: ObservableObject {
 
     private func handleHost(_ message: Message, peer: Peer) throws {
         switch message.kind {
+        case .sessionEffectsRequest:
+            applyHostSessionEffects(try Wire.readJSON(SessionEffectsRequest.self, message.payload), peer: peer)
         case .deviceIdentity:
             guard hostDeviceIdentityAdvertised, let trafficSession,
                   trafficSession.connectionID == peer.trafficMeter.connectionID else {
@@ -812,6 +827,7 @@ final class DeskModel: ObservableObject {
             supportsLiveSettings = hello.liveSettings == true
             supportsExtendedVideoSettings = supportsLiveSettings && hello.extendedVideoSettings == true
             supportsHighRefreshVideoSettings = supportsExtendedVideoSettings && hello.highRefreshVideoSettings == true
+            supportsSessionEffects = hello.sessionEffects == true
             if supportsLiveSettings {
                 let hostDefault = supportsHighRefreshVideoSettings ? (hello.preferredHighRefreshSettings ?? hello.preferredSettings ?? hello.settings)
                     : supportsExtendedVideoSettings ? (hello.preferredSettings ?? hello.settings) : hello.settings
@@ -822,6 +838,17 @@ final class DeskModel: ObservableObject {
                 applyInitialVideoQualityIfReady()
                 sendNextVideoSettings()
             } else { videoSettingsStatus = "主机需更新到 0.4.0 才能动态调整画质" }
+        case .sessionEffectsResult:
+            guard helloReceived, supportsSessionEffects else { throw DeskError.invalid("当前连接未启用被控端设置") }
+            let result = try Wire.readJSON(SessionEffectsResult.self, message.payload)
+            guard result.id == nil || result.id == effectsRequestID else { return }
+            sessionEffects = result.state
+            sessionEffectsStatus = result.error ?? "被控端设置已生效"
+            if result.id != nil {
+                effectsRequestTimeout?.cancel()
+                effectsRequestID = nil
+                sessionEffectsWorking = false
+            }
         case .controlStatus:
             guard helloReceived, controlStatusUpdatesEnabled else { throw DeskError.invalid("对端不支持控制权限更新") }
             let permission = try Wire.readJSON(ControlStatus.self, message.payload)
@@ -914,6 +941,86 @@ final class DeskModel: ObservableObject {
         catch { videoSettingsStatus = error.localizedDescription; return }
         videoTuning = tuning
         sendNextVideoSettings()
+    }
+
+    func setRemoteMuted(_ enabled: Bool) {
+        requestSessionEffects(SessionEffectsState(muted: enabled, privacy: sessionEffects.privacy))
+    }
+
+    func setRemotePrivacy(_ enabled: Bool) {
+        requestSessionEffects(SessionEffectsState(muted: sessionEffects.muted, privacy: enabled))
+    }
+
+    private func requestSessionEffects(_ desired: SessionEffectsState) {
+        guard connected, supportsSessionEffects, !sessionEffectsWorking, let peer else { return }
+        let request = SessionEffectsRequest(state: desired)
+        effectsRequestID = request.id
+        sessionEffectsWorking = true
+        sessionEffectsStatus = "正在应用被控端设置…"
+        do { peer.send(try Wire.json(.sessionEffectsRequest, request)) }
+        catch { sessionEffectsWorking = false; effectsRequestID = nil; sessionEffectsStatus = error.localizedDescription; return }
+        effectsRequestTimeout?.cancel()
+        effectsRequestTimeout = Task { [weak self, weak peer] in
+            do { try await Task.sleep(for: .seconds(15)) } catch { return }
+            guard let self, let peer, self.peer === peer, self.effectsRequestID == request.id else { return }
+            peer.close("被控端设置超过 15 秒未确认，已断开以恢复本机状态", retryable: true)
+        }
+    }
+
+    private func installHostSessionEffects(for peer: Peer) {
+        let effects = HostSessionEffects()
+        hostSessionEffects = effects
+        effects.onStateChange = { [weak self, weak peer, weak effects] state, message in
+            guard let self, let peer, let effects, self.peer === peer, self.hostSessionEffects === effects else { return }
+            self.sessionEffects = state
+            if let message { self.sessionEffectsStatus = message }
+            if let result = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(state: state, error: message)) { peer.send(result) }
+            if !state.privacy, self.hostEffectsTask == nil, let streamer = self.streamer {
+                let token = self.generation
+                self.hostEffectsTask = Task { [weak self, weak peer] in
+                    guard let self, let peer else { return }
+                    defer { if self.generation == token, self.peer === peer { self.hostEffectsTask = nil } }
+                    do { try await streamer.setExcludesCurrentApplication(false) }
+                    catch {
+                        guard self.generation == token, self.peer === peer else { return }
+                        self.sessionEffectsStatus = error.localizedDescription
+                        peer.close("防窥已退出，但采集恢复失败，正在重建共享：\(error.localizedDescription)", retryable: true)
+                    }
+                }
+            }
+        }
+    }
+
+    private func applyHostSessionEffects(_ request: SessionEffectsRequest, peer: Peer) {
+        guard let effects = hostSessionEffects, let streamer else { return }
+        guard hostEffectsTask == nil else {
+            if let reply = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(id: request.id, state: effects.state,
+                error: "正在处理上一项被控端设置")) { peer.send(reply) }
+            return
+        }
+        let token = generation
+        let capture = captureTask
+        hostEffectsTask = Task { [weak self, weak peer] in
+            guard let self, let peer else { return }
+            defer { if self.generation == token, self.peer === peer { self.hostEffectsTask = nil } }
+            var failure: String?
+            var filterRestoreFailed = false
+            do {
+                await capture?.value
+                try Task.checkCancellation()
+                _ = try await effects.apply(request.state) { try await streamer.setExcludesCurrentApplication(true) }
+            } catch { failure = error.localizedDescription }
+            guard self.generation == token, self.peer === peer, self.hostSessionEffects === effects, !Task.isCancelled else { return }
+            if !effects.state.privacy {
+                do { try await streamer.setExcludesCurrentApplication(false) }
+                catch { failure = failure ?? error.localizedDescription; filterRestoreFailed = true }
+            }
+            guard self.generation == token, self.peer === peer, !Task.isCancelled else { return }
+            self.sessionEffects = effects.state
+            self.sessionEffectsStatus = failure ?? "被控端设置已生效"
+            if let reply = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(id: request.id, state: effects.state, error: failure)) { peer.send(reply) }
+            if filterRestoreFailed { peer.close("采集过滤器恢复失败，正在重建共享：\(failure ?? "未知错误")", retryable: true) }
+        }
     }
 
     private func sendNextVideoSettings() {
@@ -1180,6 +1287,23 @@ final class DeskModel: ObservableObject {
     }
 
     private func clearSession() {
+        hostEffectsTask?.cancel()
+        hostEffectsTask = nil
+        if let effects = hostSessionEffects {
+            hostSessionEffects = nil
+            let token = generation
+            effectsCleanupTask = Task { [weak self] in
+                if let message = await effects.reset(), let self, self.generation == token, self.hostSessionEffects == nil {
+                    self.sessionEffectsStatus = message
+                }
+            }
+        }
+        effectsRequestTimeout?.cancel()
+        effectsRequestID = nil
+        sessionEffectsWorking = false
+        supportsSessionEffects = false
+        sessionEffects = SessionEffectsState()
+        sessionEffectsStatus = ""
         flushTrafficHistory()
         trafficSession = nil
         currentTrafficDeviceID = nil

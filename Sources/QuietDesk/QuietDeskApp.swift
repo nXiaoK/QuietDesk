@@ -4,6 +4,13 @@ import Carbon
 import QuietDeskCore
 
 @main
+enum QuietDeskEntry {
+    @MainActor static func main() {
+        if HostSessionEffects.runWatchdogIfRequested() { return }
+        QuietDeskApp.main()
+    }
+}
+
 struct QuietDeskApp: App {
     @StateObject private var model = DeskModel()
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -76,6 +83,7 @@ struct DeskView: View {
     @State private var showOptions = false
     @State private var showFullScreenMenu = false
     @State private var showTrafficStatistics = false
+    @State private var showSessionEffects = false
     @State private var dismissedClipboardStatus = ""
 
     private var locked: Bool { model.active || model.working }
@@ -98,7 +106,7 @@ struct DeskView: View {
             } else {
                 ConnectionView(model: model, showOptions: $showOptions,
                                openCaps: { model.canvas.releaseControl(); showCapsSettings = true },
-                               openTraffic: openTrafficStatistics)
+                               openTraffic: openTrafficStatistics, openEffects: openSessionEffects)
             }
             if !immersive {
                 Divider()
@@ -131,7 +139,7 @@ struct DeskView: View {
                         .help("本次会话画质、连接与剪贴板")
                         .popover(isPresented: $showOptions, arrowEdge: .top) {
                             ConnectionSettingsView(model: model, openCaps: { showOptions = false; showCapsSettings = true },
-                                                   openTraffic: openTrafficStatistics)
+                                                   openTraffic: openTrafficStatistics, openEffects: openSessionEffects)
                         }
                     Button { model.toggleFullScreen() } label: { Label("全屏", systemImage: "arrow.up.left.and.arrow.down.right") }
                         .help("进入全屏（⌃⌘F）")
@@ -157,11 +165,14 @@ struct DeskView: View {
         .sheet(isPresented: $showTrafficStatistics) {
             TrafficStatisticsView(model: model, done: { showTrafficStatistics = false })
         }
+        .sheet(isPresented: $showSessionEffects) {
+            SessionEffectsView(model: model, done: { showSessionEffects = false })
+        }
         .alert("QuietDesk", isPresented: Binding(get: { model.error != nil },
             set: { if !$0 { model.error = nil } })) {
             Button("知道了", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
-        .onChange(of: immersive) { _, _ in showFullScreenMenu = false; showOptions = false; showCapsSettings = false; showTrafficStatistics = false }
+        .onChange(of: immersive) { _, _ in showFullScreenMenu = false; showOptions = false; showCapsSettings = false; showTrafficStatistics = false; showSessionEffects = false }
         .onChange(of: model.mode) { _, _ in model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true) }
         .onReceive(model.$clipboardStatus) { _ in dismissedClipboardStatus = "" }
         .onChange(of: model.controlling) { _, controlling in if controlling { showFullScreenMenu = false; showOptions = false } }
@@ -213,7 +224,7 @@ struct DeskView: View {
                 HStack(spacing: 16) {
                     if showFullScreenMenu {
                         FullScreenSettingsView(model: model, close: { showFullScreenMenu = false },
-                                               openTraffic: openTrafficStatistics)
+                                               openTraffic: openTrafficStatistics, openEffects: openSessionEffects)
                             .clipShape(RoundedRectangle(cornerRadius: 12))
                             .shadow(color: .black.opacity(0.3), radius: 16, y: 6)
                     }
@@ -244,6 +255,13 @@ struct DeskView: View {
         showOptions = false
         showFullScreenMenu = false
         showTrafficStatistics = true
+    }
+
+    private func openSessionEffects() {
+        model.canvas.releaseControl()
+        showOptions = false
+        showFullScreenMenu = false
+        showSessionEffects = true
     }
 
     private var statusBar: some View {

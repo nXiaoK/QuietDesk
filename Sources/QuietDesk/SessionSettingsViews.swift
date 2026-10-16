@@ -6,47 +6,52 @@ struct ConnectionSettingsView: View {
     @ObservedObject var model: DeskModel
     let openCaps: () -> Void
     let openTraffic: () -> Void
+    let openEffects: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            SessionQualitySection(model: model, compact: false)
-            Divider()
-            VStack(alignment: .leading, spacing: 8) {
-                Text("连接").font(.headline)
-                Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
-                Toggle(isOn: $model.showFullScreenStatistics) { Text("全屏显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
-                Text("显示往返延迟、分辨率、视频 FPS 和收发流量。往返延迟约每 5 秒更新，FPS 与流量每秒更新；静止画面 FPS 可能为 0。")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                Button(action: openTraffic) { Label("设备历史流量…", systemImage: "chart.bar.xaxis") }
-            }
-            Divider()
-            VStack(alignment: .leading, spacing: 8) {
-                Text("剪贴板与文件").font(.headline)
-                Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) { Text("双向同步文字、图片和文件").frame(maxWidth: .infinity, alignment: .leading) }
-                Text("文字和图片按控制端焦点同步；文件需逐次确认后下载，完成后再粘贴。")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                Button { model.openReceivedFiles() } label: {
-                    Label("打开接收文件目录", systemImage: "folder")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                SessionQualitySection(model: model, compact: false)
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("连接").font(.headline)
+                    Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
+                    Toggle(isOn: $model.showFullScreenStatistics) { Text("全屏显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
+                    Text("显示往返延迟、分辨率、视频 FPS 和收发流量。往返延迟约每 5 秒更新，FPS 与流量每秒更新；静止画面 FPS 可能为 0。")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Button(action: openTraffic) { Label("设备历史流量…", systemImage: "chart.bar.xaxis") }
+                    Button(action: openEffects) { Label("被控端静音与防窥…", systemImage: "display.trianglebadge.exclamationmark") }
                 }
-                .help("~/Library/Application Support/QuietDesk/Clipboard/received/")
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("剪贴板与文件").font(.headline)
+                    Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) { Text("双向同步文字、图片和文件").frame(maxWidth: .infinity, alignment: .leading) }
+                    Text("文字和图片按控制端焦点同步；文件需逐次确认后下载，完成后再粘贴。")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Button { model.openReceivedFiles() } label: {
+                        Label("打开接收文件目录", systemImage: "folder")
+                    }
+                    .help("~/Library/Application Support/QuietDesk/Clipboard/received/")
+                }
+                Divider()
+                HStack(spacing: 8) {
+                    Label("Caps Lock 转发", systemImage: "capslock")
+                    CapsLockStateLabel(model: model)
+                    Spacer(minLength: 0)
+                    Button("设置…", action: openCaps).buttonStyle(.link)
+                }
+                if !model.lastDisconnect.isEmpty {
+                    Text("上次断开：\(model.lastDisconnect)")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .lineLimit(3).textSelection(.enabled).help(model.lastDisconnect)
+                }
             }
-            Divider()
-            HStack(spacing: 8) {
-                Label("Caps Lock 转发", systemImage: "capslock")
-                CapsLockStateLabel(model: model)
-                Spacer(minLength: 0)
-                Button("设置…", action: openCaps).buttonStyle(.link)
-            }
-            if !model.lastDisconnect.isEmpty {
-                Text("上次断开：\(model.lastDisconnect)")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .lineLimit(3).textSelection(.enabled).help(model.lastDisconnect)
-            }
+            .font(.system(size: 13))
+            .toggleStyle(.switch).controlSize(.small)
+            .padding(16).frame(width: 340)
+            .background(Color(nsColor: .windowBackgroundColor))
         }
-        .font(.system(size: 13))
-        .toggleStyle(.switch).controlSize(.small)
-        .padding(16).frame(width: 340)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(width: 340).frame(maxHeight: 560)
     }
 }
 
@@ -88,6 +93,7 @@ struct FullScreenSettingsView: View {
     @ObservedObject var model: DeskModel
     let close: () -> Void
     let openTraffic: () -> Void
+    let openEffects: () -> Void
     @State private var showingCaps = false
 
     var body: some View {
@@ -115,69 +121,80 @@ struct FullScreenSettingsView: View {
                 Button(action: close) { Image(systemName: "xmark").frame(width: 22, height: 22) }
                     .buttonStyle(.plain).foregroundStyle(.secondary).help("收起控制与设置")
             }
-            if showingCaps {
-                CapsLockDetails(model: model, compact: true)
-            } else {
-                HStack(spacing: 8) {
-                    Button { model.canvas.releaseControl() } label: {
-                        VStack(spacing: 3) {
-                            Label("释放控制", systemImage: "cursorarrow")
-                            Text("⌃⌥ Esc").font(.system(size: 10)).foregroundStyle(.secondary)
-                        }.frame(maxWidth: .infinity)
-                    }
-                    Button { close(); model.toggleFullScreen() } label: {
-                        VStack(spacing: 3) {
-                            Label("退出全屏", systemImage: "arrow.down.right.and.arrow.up.left")
-                            Text("⌃⌘F").font(.system(size: 10)).foregroundStyle(.secondary)
-                        }.frame(maxWidth: .infinity)
-                    }
-                }
-                .buttonStyle(.bordered).controlSize(.regular)
-                Divider()
-                SessionQualitySection(model: model, compact: true)
-                Divider()
-                VStack(spacing: 6) {
-                    Toggle(isOn: $model.showFullScreenStatistics) { Text("显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
-                        .help("显示往返延迟、分辨率、视频 FPS 和收发流量。往返延迟约每 5 秒更新，FPS 与流量每秒更新；静止画面 FPS 可能为 0。")
-                    Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
-                    Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) { Text("双向同步文字、图片和文件").frame(maxWidth: .infinity, alignment: .leading) }
-                        .help("文字和图片按控制端焦点同步；文件需逐次确认后下载，完成后再粘贴。")
-                }
-                .toggleStyle(.switch).controlSize(.small)
-                Divider()
-                VStack(spacing: 0) {
-                    Button(action: openTraffic) {
-                        HStack {
-                            Label("设备历史流量", systemImage: "chart.bar.xaxis")
-                            Spacer()
-                            Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
-                        }.frame(minHeight: 28)
-                    }
-                    Button { model.openReceivedFiles() } label: {
-                        HStack {
-                            Label("打开接收文件目录", systemImage: "folder")
-                            Spacer()
-                            Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
-                        }.frame(minHeight: 28)
-                    }
-                    .help("~/Library/Application Support/QuietDesk/Clipboard/received/")
-                    Button {
-                        showingCaps = true
-                        model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
-                    } label: {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    if showingCaps {
+                        CapsLockDetails(model: model, compact: true)
+                    } else {
                         HStack(spacing: 8) {
-                            Label("Caps Lock 转发", systemImage: "capslock")
-                            CapsLockStateLabel(model: model)
-                            Spacer(minLength: 0)
-                            Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
-                        }.frame(minHeight: 28)
+                            Button { model.canvas.releaseControl() } label: {
+                                VStack(spacing: 3) {
+                                    Label("释放控制", systemImage: "cursorarrow")
+                                    Text("⌃⌥ Esc").font(.system(size: 10)).foregroundStyle(.secondary)
+                                }.frame(maxWidth: .infinity)
+                            }
+                            Button { close(); model.toggleFullScreen() } label: {
+                                VStack(spacing: 3) {
+                                    Label("退出全屏", systemImage: "arrow.down.right.and.arrow.up.left")
+                                    Text("⌃⌘F").font(.system(size: 10)).foregroundStyle(.secondary)
+                                }.frame(maxWidth: .infinity)
+                            }
+                        }
+                        .buttonStyle(.bordered).controlSize(.regular)
+                        Divider()
+                        SessionQualitySection(model: model, compact: true)
+                        Divider()
+                        VStack(spacing: 6) {
+                            Toggle(isOn: $model.showFullScreenStatistics) { Text("显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
+                                .help("显示往返延迟、分辨率、视频 FPS 和收发流量。往返延迟约每 5 秒更新，FPS 与流量每秒更新；静止画面 FPS 可能为 0。")
+                            Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
+                            Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) { Text("双向同步文字、图片和文件").frame(maxWidth: .infinity, alignment: .leading) }
+                                .help("文字和图片按控制端焦点同步；文件需逐次确认后下载，完成后再粘贴。")
+                        }
+                        .toggleStyle(.switch).controlSize(.small)
+                        Divider()
+                        VStack(spacing: 0) {
+                            Button(action: openEffects) {
+                                HStack {
+                                    Label("被控端静音与防窥", systemImage: "display.trianglebadge.exclamationmark")
+                                    Spacer()
+                                    Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
+                                }.frame(minHeight: 28)
+                            }
+                            Button(action: openTraffic) {
+                                HStack {
+                                    Label("设备历史流量", systemImage: "chart.bar.xaxis")
+                                    Spacer()
+                                    Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
+                                }.frame(minHeight: 28)
+                            }
+                            Button { model.openReceivedFiles() } label: {
+                                HStack {
+                                    Label("打开接收文件目录", systemImage: "folder")
+                                    Spacer()
+                                    Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
+                                }.frame(minHeight: 28)
+                            }
+                            .help("~/Library/Application Support/QuietDesk/Clipboard/received/")
+                            Button {
+                                showingCaps = true
+                                model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Label("Caps Lock 转发", systemImage: "capslock")
+                                    CapsLockStateLabel(model: model)
+                                    Spacer(minLength: 0)
+                                    Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
+                                }.frame(minHeight: 28)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        if !model.lastDisconnect.isEmpty {
+                            Text("上次断开：\(model.lastDisconnect)")
+                                .font(.system(size: 10)).foregroundStyle(.secondary)
+                                .lineLimit(2).textSelection(.enabled).help(model.lastDisconnect)
+                        }
                     }
-                }
-                .buttonStyle(.plain)
-                if !model.lastDisconnect.isEmpty {
-                    Text("上次断开：\(model.lastDisconnect)")
-                        .font(.system(size: 10)).foregroundStyle(.secondary)
-                        .lineLimit(2).textSelection(.enabled).help(model.lastDisconnect)
                 }
             }
             Spacer(minLength: 0)

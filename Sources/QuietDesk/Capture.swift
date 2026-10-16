@@ -143,6 +143,31 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
+    func setExcludesCurrentApplication(_ enabled: Bool) async throws {
+        let snapshot = try queue.sync { () throws -> (SCStream, CGDirectDisplayID) in
+            guard running, let stream, let displayID else { throw DeskError.invalid("屏幕采集尚未就绪") }
+            return (stream, displayID)
+        }
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        guard let display = content.displays.first(where: { $0.displayID == snapshot.1 }) else {
+            throw DeskError.invalid("共享的显示器已变化，请等待重新连接")
+        }
+        let filter: SCContentFilter
+        if enabled {
+            guard let application = content.applications.first(where: { $0.processID == ProcessInfo.processInfo.processIdentifier }) else {
+                throw DeskError.invalid("无法从采集中排除本应用，防窥未开启")
+            }
+            filter = SCContentFilter(display: display, excludingApplications: [application], exceptingWindows: [])
+        } else { filter = SCContentFilter(display: display, excludingWindows: []) }
+        try Task.checkCancellation()
+        try await snapshot.0.updateContentFilter(filter)
+        try Task.checkCancellation()
+        try queue.sync {
+            guard running, stream === snapshot.0 else { throw CancellationError() }
+            forceKeyFrame = true
+        }
+    }
+
     private func pauseAtFrameBoundary() async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async { [self] in

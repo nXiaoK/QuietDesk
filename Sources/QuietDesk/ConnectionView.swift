@@ -7,6 +7,7 @@ struct ConnectionView: View {
     @Binding var showOptions: Bool
     let openCaps: () -> Void
     let openTraffic: () -> Void
+    let openEffects: () -> Void
     @State private var showRecords = false
 
     private var locked: Bool { model.active || model.working }
@@ -58,7 +59,7 @@ struct ConnectionView: View {
                             Button { model.canvas.releaseControl(); showOptions = true } label: { Label("连接选项…", systemImage: "slider.horizontal.3") }
                                 .popover(isPresented: $showOptions, arrowEdge: .bottom) {
                                     ConnectionSettingsView(model: model, openCaps: { showOptions = false; openCaps() },
-                                                           openTraffic: openTraffic)
+                                                           openTraffic: openTraffic, openEffects: openEffects)
                                 }
                             Button(action: openCaps) { Label("Caps Lock 设置…", systemImage: "capslock") }
                             Spacer()

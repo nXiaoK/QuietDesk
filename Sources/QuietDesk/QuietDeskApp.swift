@@ -59,7 +59,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidBecomeActive(_ notification: Notification) {
         model?.refreshLoginStatus()
         model?.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
+        model?.refreshClipboardFocus()
     }
+    func applicationDidResignActive(_ notification: Notification) { model?.refreshClipboardFocus() }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         model?.prepareShowWindow()
         model?.mainWindow?.deminiaturize(nil)
@@ -245,7 +247,7 @@ struct DeskView: View {
                     .help(model.status)
                 Spacer(minLength: 8)
                 Label(model.canvas.synchronizesClipboard ? "双向同步" : "同步未启用", systemImage: "arrow.triangle.2.circlepath")
-                    .help(model.clipboardStatus.isEmpty ? "文字和图片自动同步；文件需逐次确认，接收完成后再粘贴。" : model.clipboardStatus)
+                    .help(model.clipboardStatus.isEmpty ? "文字和图片按控制端焦点同步；文件需逐次确认，接收完成后再粘贴。" : model.clipboardStatus)
                 Label(model.capsLockEnabled ? (model.capsLockRunning ? "Caps Lock 转发" : "Caps Lock 待生效") : "Caps Lock 关闭", systemImage: "capslock")
                     .help(model.inputStatus.isEmpty ? "短按切换中英文；按住至少 0.6 秒后松开切换大写。仅在远程画面获得焦点时捕获。" : model.inputStatus)
                 if model.pendingFileOffer != nil {

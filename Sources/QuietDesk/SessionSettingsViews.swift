@@ -21,7 +21,7 @@ struct ConnectionSettingsView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("剪贴板与文件").font(.headline)
                 Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) { Text("双向同步文字、图片和文件").frame(maxWidth: .infinity, alignment: .leading) }
-                Text("文字和图片自动同步；文件需逐次确认后下载，完成后再粘贴。")
+                Text("文字和图片按控制端焦点同步；文件需逐次确认后下载，完成后再粘贴。")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Button { model.openReceivedFiles() } label: {
                     Label("打开接收文件目录", systemImage: "folder")
@@ -138,7 +138,7 @@ struct FullScreenSettingsView: View {
                         .help("显示往返延迟、分辨率、视频 FPS 和收发流量。往返延迟约每 5 秒更新，FPS 与流量每秒更新；静止画面 FPS 可能为 0。")
                     Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
                     Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) { Text("双向同步文字、图片和文件").frame(maxWidth: .infinity, alignment: .leading) }
-                        .help("文字和图片自动同步；文件需逐次确认后下载，完成后再粘贴。")
+                        .help("文字和图片按控制端焦点同步；文件需逐次确认后下载，完成后再粘贴。")
                 }
                 .toggleStyle(.switch).controlSize(.small)
                 Divider()

@@ -298,7 +298,7 @@ struct SharingView: View {
                     Toggle("双向同步文字、图片和文件", isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) }))
                         .toggleStyle(.checkbox)
                     Divider()
-                    Text("文字和图片自动同步；文件和文件夹需接收端逐次确认后才下载。")
+                    Text("文字和图片按控制端焦点同步；文件和文件夹需接收端逐次确认后才下载。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

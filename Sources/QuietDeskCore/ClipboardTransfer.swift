@@ -17,8 +17,10 @@ public struct ClipboardPreference: Codable {
     public let enabled: Bool
     public let session: UUID?
     public let fileApproval: Bool?
-    public init(enabled: Bool, session: UUID? = nil, fileApproval: Bool? = true) {
+    public let receivesAutomaticUpdates: Bool?
+    public init(enabled: Bool, session: UUID? = nil, fileApproval: Bool? = true, receivesAutomaticUpdates: Bool? = nil) {
         self.enabled = enabled; self.session = session; self.fileApproval = fileApproval
+        self.receivesAutomaticUpdates = receivesAutomaticUpdates
     }
 }
 

@@ -99,6 +99,9 @@ final class DeskModel: ObservableObject {
     private var supportsClipboard = false
     private var remoteClipboardEnabled = false
     private var remoteFileApproval = false
+    private var remoteReceivesAutomaticClipboard = true
+    private var remoteClipboardFocusAware = false
+    private var lastClipboardReceivePreference: Bool?
     private var clipboardFilePrompt: ClipboardFilePrompt?
     private var clipboardSession: UUID?
     private var initialLaunchHandled = false
@@ -144,7 +147,9 @@ final class DeskModel: ObservableObject {
         }
         canvas.onRelease = { [weak self] in self?.peer?.send(Message(.releaseInput)) }
         canvas.onFocus = { [weak self] focused in
-            self?.controlling = focused
+            guard let self else { return }
+            self.controlling = focused
+            self.refreshClipboardFocus()
         }
         canvas.onFailure = { [weak self] message in self?.peer?.close(message, retryable: true) }
         canvas.onPaste = { [weak self] input in
@@ -628,7 +633,9 @@ final class DeskModel: ObservableObject {
             supportsClipboard = true
             remoteClipboardEnabled = preference.enabled
             remoteFileApproval = preference.fileApproval == true
-            if first { peer.send(try Wire.json(.clipboardSettings, ClipboardPreference(enabled: clipboardEnabled, session: session))) }
+            remoteReceivesAutomaticClipboard = preference.receivesAutomaticUpdates ?? true
+            remoteClipboardFocusAware = preference.receivesAutomaticUpdates != nil
+            if first { try sendClipboardPreference(to: peer) }
             updateClipboardSync()
         case .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel:
             clipboardSync?.receive(message)
@@ -660,7 +667,7 @@ final class DeskModel: ObservableObject {
             supportsClipboard = hello.clipboardSync == true
             if supportsClipboard {
                 clipboardSession = UUID()
-                peer.send(try Wire.json(.clipboardSettings, ClipboardPreference(enabled: clipboardEnabled, session: clipboardSession)))
+                try sendClipboardPreference(to: peer)
             } else {
                 clipboardStatus = "对端版本较旧，可使用手动文字同步；图片和文件需两端升级到 0.3.0"
             }
@@ -709,6 +716,8 @@ final class DeskModel: ObservableObject {
             guard preference.session == clipboardSession else { throw DeskError.invalid("剪贴板会话不匹配") }
             remoteClipboardEnabled = preference.enabled
             remoteFileApproval = preference.fileApproval == true
+            remoteReceivesAutomaticClipboard = preference.receivesAutomaticUpdates ?? true
+            remoteClipboardFocusAware = preference.receivesAutomaticUpdates != nil
             updateClipboardSync()
         case .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel:
             clipboardSync?.receive(message)
@@ -838,17 +847,37 @@ final class DeskModel: ObservableObject {
         clipboardEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "clipboardEnabled")
         if supportsClipboard, let peer {
-            do { peer.send(try Wire.json(.clipboardSettings, ClipboardPreference(enabled: enabled, session: clipboardSession))) }
+            do { try sendClipboardPreference(to: peer) }
             catch { clipboardStatus = error.localizedDescription }
         }
         updateClipboardSync()
+    }
+
+    private var automaticClipboardSendingAllowed: Bool {
+        mode == .viewer ? NSApp.isActive : remoteReceivesAutomaticClipboard
+    }
+
+    private func sendClipboardPreference(to peer: Peer) throws {
+        let receives = mode == .viewer ? !controlling : true
+        peer.send(try Wire.json(.clipboardSettings, ClipboardPreference(enabled: clipboardEnabled,
+            session: clipboardSession, receivesAutomaticUpdates: receives)))
+        lastClipboardReceivePreference = receives
+    }
+
+    func refreshClipboardFocus() {
+        clipboardSync?.setAutomaticSendingAllowed(automaticClipboardSendingAllowed)
+        guard mode == .viewer, connected, supportsClipboard, let peer,
+              lastClipboardReceivePreference != !controlling else { return }
+        do { try sendClipboardPreference(to: peer) }
+        catch { clipboardStatus = error.localizedDescription }
     }
 
     private func updateClipboardSync() {
         let enabled = connected && supportsClipboard && clipboardEnabled && remoteClipboardEnabled
         canvas.synchronizesClipboard = enabled
         if enabled, clipboardSync == nil, let peer, let clipboardSession {
-            let sync = ClipboardSync(session: clipboardSession, allowsFileSending: remoteFileApproval) { [weak peer] in peer?.send($0) }
+            let sync = ClipboardSync(session: clipboardSession, allowsFileSending: remoteFileApproval,
+                allowsAutomaticSending: automaticClipboardSendingAllowed) { [weak peer] in peer?.send($0) }
             clipboardSync = sync
             sync.onStatus = { [weak self, weak sync] message in
                 guard let self, let sync, self.clipboardSync === sync else { return }
@@ -868,9 +897,12 @@ final class DeskModel: ObservableObject {
                 self.clipboardFilePrompt = prompt
                 prompt.present()
             }
-            clipboardStatus = "双向剪贴板已开启：文字和图片自动同步，文件确认后接收"
+            clipboardStatus = remoteClipboardFocusAware
+                ? "双向剪贴板已开启：控制端在 QuietDesk 前台时发送，远端在释放控制后发送；文件确认后接收"
+                : "双向剪贴板已开启：控制端在 QuietDesk 前台时发送；两端升级后可按控制焦点限制远端发送，文件确认后接收"
         } else if enabled {
             clipboardSync?.allowsFileSending = remoteFileApproval
+            clipboardSync?.setAutomaticSendingAllowed(automaticClipboardSendingAllowed)
         } else if !enabled {
             clipboardSync?.stop(); clipboardSync = nil
             clipboardFilePrompt?.dismiss(); clipboardFilePrompt = nil
@@ -1000,6 +1032,9 @@ final class DeskModel: ObservableObject {
         supportsClipboard = false
         remoteClipboardEnabled = false
         remoteFileApproval = false
+        remoteReceivesAutomaticClipboard = true
+        remoteClipboardFocusAware = false
+        lastClipboardReceivePreference = nil
         clipboardSession = nil
         captureTask?.cancel()
         captureTask = nil

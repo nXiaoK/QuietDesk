@@ -3,15 +3,58 @@ import QuietDeskCore
 import CryptoKit
 
 @MainActor
+protocol ClipboardPasteboard: AnyObject {
+    var changeCount: Int { get }
+    var fileURLs: [URL]? { get }
+    var pngData: Data? { get }
+    var text: String? { get }
+    var contentMarker: String? { get }
+    func write(_ payload: ClipboardPayload, marker: String) -> Bool
+}
+
+@MainActor
+private final class SystemClipboardPasteboard: ClipboardPasteboard {
+    private let pasteboard = NSPasteboard.general
+    private static let marker = NSPasteboard.PasteboardType("local.quietdesk.clipboard-session")
+    var changeCount: Int { pasteboard.changeCount }
+    var fileURLs: [URL]? { pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] }
+    var pngData: Data? {
+        if let png = pasteboard.data(forType: .png) { return png }
+        guard let tiff = pasteboard.data(forType: .tiff), let bitmap = NSBitmapImageRep(data: tiff) else { return nil }
+        return bitmap.representation(using: .png, properties: [:])
+    }
+    var text: String? { pasteboard.string(forType: .string) }
+    var contentMarker: String? { pasteboard.string(forType: Self.marker) }
+
+    func write(_ payload: ClipboardPayload, marker: String) -> Bool {
+        let accepted: Bool
+        switch payload {
+        case .text(let bytes):
+            guard let text = String(data: bytes, encoding: .utf8) else { return false }
+            pasteboard.clearContents(); accepted = pasteboard.setString(text, forType: .string)
+        case .png(let bytes):
+            pasteboard.clearContents(); accepted = pasteboard.setData(bytes, forType: .png)
+        case .files(let urls):
+            pasteboard.clearContents(); accepted = pasteboard.writeObjects(urls as [NSURL])
+        }
+        if accepted { pasteboard.setString(marker, forType: Self.marker) }
+        return accepted
+    }
+}
+
+@MainActor
 final class ClipboardSync {
     static let storageURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("QuietDesk/Clipboard", isDirectory: true)
     var onStatus: ((String) -> Void)?
     var onFileOffer: ((ClipboardFileOffer?) -> Void)?
     var allowsFileSending: Bool
+    private var allowsAutomaticSending: Bool
+    private let pasteboard: ClipboardPasteboard
     private let transfer: ClipboardTransfer
     private var timer: Timer?
-    private var observedChange = NSPasteboard.general.changeCount
+    private var observedChange: Int
+    private var pendingFileOffer: (id: UUID, change: Int)?
     private var sharedChange: Int?
     private var sendingChange: Int?
     private var waiters: [(Bool) -> Void] = []
@@ -19,12 +62,17 @@ final class ClipboardSync {
     private var hasSharedState = false
     private var lastSharedMarker: String?
     private let session: UUID
-    private static let marker = NSPasteboard.PasteboardType("local.quietdesk.clipboard-session")
 
-    init(session: UUID, allowsFileSending: Bool, send: @escaping (Message) -> Void) {
+    init(session: UUID, allowsFileSending: Bool, allowsAutomaticSending: Bool = true,
+         pasteboard: ClipboardPasteboard? = nil, storage: URL? = nil,
+         send: @escaping (Message) -> Void) {
         self.session = session
         self.allowsFileSending = allowsFileSending
-        transfer = ClipboardTransfer(storage: Self.storageURL, requireFileApproval: true)
+        self.allowsAutomaticSending = allowsAutomaticSending
+        let pasteboard = pasteboard ?? SystemClipboardPasteboard()
+        self.pasteboard = pasteboard
+        observedChange = pasteboard.changeCount
+        transfer = ClipboardTransfer(storage: storage ?? Self.storageURL, requireFileApproval: true)
         transfer.onSend = { [weak self] message in
             DispatchQueue.main.async {
                 guard let self, self.running else { return }
@@ -41,7 +89,9 @@ final class ClipboardSync {
         transfer.onFileOffer = { [weak self] offer in
             DispatchQueue.main.async {
                 guard let self, self.running else { return }
+                self.pendingFileOffer = offer.map { ($0.id, self.pasteboard.changeCount) }
                 self.onFileOffer?(offer)
+                if offer == nil { self.poll() }
             }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
@@ -52,21 +102,27 @@ final class ClipboardSync {
 
     func receive(_ message: Message) { transfer.receive(message) }
 
+    func setAutomaticSendingAllowed(_ allowed: Bool) {
+        allowsAutomaticSending = allowed
+        if allowed { poll() }
+    }
+
     func respondToFileOffer(id: UUID, accept: Bool) {
-        guard running else { return }
-        if accept, NSPasteboard.general.changeCount != observedChange {
+        guard running, let pendingFileOffer, pendingFileOffer.id == id else { return }
+        if accept, pasteboard.changeCount != pendingFileOffer.change {
             transfer.respondToFileOffer(id: id, accept: false)
             sendCurrent()
             return
         }
+        if accept { observedChange = pendingFileOffer.change }
         transfer.respondToFileOffer(id: id, accept: accept)
     }
 
     func prepareForPaste(_ completion: @escaping (Bool) -> Void) {
-        guard running else { completion(false); return }
-        let change = NSPasteboard.general.changeCount
+        guard running, allowsAutomaticSending else { completion(false); return }
+        let change = pasteboard.changeCount
         if change == sharedChange { completion(true); return }
-        if let files = NSPasteboard.general.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !files.isEmpty {
+        if let files = pasteboard.fileURLs, !files.isEmpty {
             if sendingChange != change { sendCurrent() }
             if change == sharedChange { completion(true); return }
             completion(false)
@@ -86,21 +142,21 @@ final class ClipboardSync {
     }
 
     private func poll() {
-        guard running, NSPasteboard.general.changeCount != observedChange else { return }
+        guard running, allowsAutomaticSending else { return }
+        let change = pasteboard.changeCount
+        guard change != observedChange, change != pendingFileOffer?.change else { return }
         sendCurrent()
     }
 
     private func sendCurrent() {
-        let pasteboard = NSPasteboard.general
+        guard running, allowsAutomaticSending else { return }
         let change = pasteboard.changeCount
         observedChange = change
         let payload: ClipboardPayload
-        if let files = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !files.isEmpty {
+        if let files = pasteboard.fileURLs, !files.isEmpty {
             payload = .files(files)
-        } else if let png = pasteboard.data(forType: .png) { payload = .png(png) }
-        else if let tiff = pasteboard.data(forType: .tiff), let bitmap = NSBitmapImageRep(data: tiff),
-                let png = bitmap.representation(using: .png, properties: [:]) { payload = .png(png) }
-        else if let text = pasteboard.string(forType: .string) { payload = .text(Data(text.utf8)) }
+        } else if let png = pasteboard.pngData { payload = .png(png) }
+        else if let text = pasteboard.text { payload = .text(Data(text.utf8)) }
         else {
             onStatus?("此剪贴板类型暂不能同步")
             let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
@@ -112,7 +168,7 @@ final class ClipboardSync {
         if isFile {
             let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
         }
-        if (!isFile && lastSharedMarker == contentMarker) || ((hasSharedState || sendingChange != nil) && pasteboard.string(forType: Self.marker) == contentMarker) {
+        if (!isFile && lastSharedMarker == contentMarker) || ((hasSharedState || sendingChange != nil) && pasteboard.contentMarker == contentMarker) {
             hasSharedState = true
             lastSharedMarker = contentMarker
             sharedChange = change
@@ -139,21 +195,15 @@ final class ClipboardSync {
 
     private func apply(_ payload: ClipboardPayload) -> Bool {
         guard running else { return false }
-        let pasteboard = NSPasteboard.general
-        let accepted: Bool
         switch payload {
         case .text(let bytes):
-            guard let text = String(data: bytes, encoding: .utf8) else { return false }
-            pasteboard.clearContents(); accepted = pasteboard.setString(text, forType: .string)
+            guard String(data: bytes, encoding: .utf8) != nil else { return false }
         case .png(let bytes):
             guard NSBitmapImageRep(data: bytes) != nil else { onStatus?("接收的图片无效"); return false }
-            pasteboard.clearContents(); accepted = pasteboard.setData(bytes, forType: .png)
-        case .files(let urls):
-            pasteboard.clearContents(); accepted = pasteboard.writeObjects(urls as [NSURL])
+        case .files: break
         }
-        guard accepted else { onStatus?("系统剪贴板写入失败"); return false }
         let contentMarker = marker(for: payload)
-        pasteboard.setString(contentMarker, forType: Self.marker)
+        guard pasteboard.write(payload, marker: contentMarker) else { onStatus?("系统剪贴板写入失败"); return false }
         observedChange = pasteboard.changeCount
         sharedChange = observedChange
         hasSharedState = true

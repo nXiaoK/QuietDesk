@@ -14,6 +14,15 @@ final class RemoteCanvas: NSView {
     private var lastMove: TimeInterval = 0
     private var localShortcutKeys = Set<UInt16>()
     let capsLockMonitor = CapsLockMonitor()
+    private let systemShortcutMonitor = SystemShortcutMonitor()
+    private var shortcutSessionActive = false
+    private var shortcutAccessibility = false
+    private var shortcutInputMonitoring = false
+    private var shortcutStartAttempted = false
+    private var shortcutStatus: (String, Bool)?
+    var onSystemShortcutStatus: ((String, Bool) -> Void)? {
+        didSet { if let shortcutStatus { onSystemShortcutStatus?(shortcutStatus.0, shortcutStatus.1) } }
+    }
     var onInput: ((RemoteInput) -> Void)?
     var onPaste: ((RemoteInput) -> Void)?
     var synchronizesClipboard = false
@@ -24,7 +33,7 @@ final class RemoteCanvas: NSView {
     var onFullScreen: ((Bool) -> Void)?
     var onToggleFullScreen: (() -> Void)?
     var remoteSize = CGSize(width: 16, height: 10)
-    var canControl = false
+    var canControl = false { didSet { reconcileSystemShortcutCapture() } }
     var usesCapsLockActions = false
 
     override var acceptsFirstResponder: Bool { canControl }
@@ -42,6 +51,25 @@ final class RemoteCanvas: NSView {
                 && self.window?.firstResponder === self
         }
         capsLockMonitor.onAction = { [weak self] kind in self?.onInput?(RemoteInput(kind: kind)) }
+        systemShortcutMonitor.scope = { [weak self] in self?.shortcutScope ?? SystemShortcutScope() }
+        systemShortcutMonitor.onEvent = { [weak self] event in
+            guard let self else { return }
+            switch event.type {
+            case .keyDown: self.keyDown(with: event)
+            case .keyUp: self.keyUp(with: event)
+            case .flagsChanged: self.flagsChanged(with: event)
+            default: break
+            }
+        }
+        systemShortcutMonitor.onFailure = { [weak self] message in
+            guard let self else { return }
+            let token = self.systemShortcutMonitor.generation
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.systemShortcutMonitor.generation == token else { return }
+                self.releaseControl()
+                self.publishShortcutStatus(message, running: false)
+            }
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -57,23 +85,32 @@ final class RemoteCanvas: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        if systemShortcutMonitor.isRunning { releaseControl() }
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
         observers.removeAll()
-        guard let window else { return }
+        systemShortcutMonitor.stop()
+        shortcutStartAttempted = false
+        guard let window else { publishShortcutStatus("全屏控制画面获得焦点后自动转发系统快捷键", running: false); return }
         window.acceptsMouseMovedEvents = true
         observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification,
             object: window, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.releaseControl() }
+            })
+        observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification,
+            object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.reconcileSystemShortcutCapture() }
             })
         for name in [NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
                     guard let self else { return }
                     self.onFullScreen?(self.window?.styleMask.contains(.fullScreen) == true)
+                    self.reconcileSystemShortcutCapture()
                 }
             })
         }
         onFullScreen?(window.styleMask.contains(.fullScreen))
+        reconcileSystemShortcutCapture()
     }
 
     override func updateTrackingAreas() {
@@ -141,6 +178,7 @@ final class RemoteCanvas: NSView {
     }
 
     func reset() {
+        shortcutSessionActive = false
         releaseControl()
         canControl = false
         decoder.stop()
@@ -152,6 +190,9 @@ final class RemoteCanvas: NSView {
     }
 
     func releaseControl() {
+        systemShortcutMonitor.stop()
+        shortcutStartAttempted = false
+        publishShortcutStatus("全屏控制画面获得焦点后自动转发系统快捷键", running: false)
         interactionRevision &+= 1
         capsLockMonitor.reset()
         localShortcutKeys.removeAll()
@@ -160,8 +201,80 @@ final class RemoteCanvas: NSView {
         if window?.firstResponder === self { window?.makeFirstResponder(nil) }
     }
 
-    override func becomeFirstResponder() -> Bool { capsLockMonitor.reset(); localShortcutKeys.removeAll(); onFocus?(true); return true }
-    override func resignFirstResponder() -> Bool { capsLockMonitor.reset(); localShortcutKeys.removeAll(); onRelease?(); onFocus?(false); return true }
+    override func becomeFirstResponder() -> Bool {
+        capsLockMonitor.reset(); localShortcutKeys.removeAll(); onFocus?(true)
+        // NSWindow assigns firstResponder after this callback returns.
+        DispatchQueue.main.async { [weak self] in self?.reconcileSystemShortcutCapture() }
+        return true
+    }
+    override func resignFirstResponder() -> Bool {
+        systemShortcutMonitor.stop()
+        shortcutStartAttempted = false
+        publishShortcutStatus("全屏控制画面获得焦点后自动转发系统快捷键", running: false)
+        capsLockMonitor.reset(); localShortcutKeys.removeAll(); onRelease?(); onFocus?(false)
+        return true
+    }
+
+    func updateSystemShortcutCapture(sessionActive: Bool, accessibility: Bool, inputMonitoring: Bool, retry: Bool = false) {
+        shortcutSessionActive = sessionActive
+        shortcutAccessibility = accessibility
+        shortcutInputMonitoring = inputMonitoring
+        reconcileSystemShortcutCapture(retry: retry)
+    }
+
+    private var shortcutScope: SystemShortcutScope {
+        SystemShortcutScope(sessionActive: shortcutSessionActive, canControl: canControl,
+            fullScreen: window?.styleMask.contains(.fullScreen) == true,
+            keyWindow: NSApp?.isActive == true && window?.isKeyWindow == true,
+            canvasFocused: window?.firstResponder === self)
+    }
+
+    private func reconcileSystemShortcutCapture(retry: Bool = false) {
+        guard shortcutScope.isActive else {
+            let wasCapturing = systemShortcutMonitor.isRunning || (shortcutStatus?.1 == true)
+            systemShortcutMonitor.stop()
+            shortcutStartAttempted = false
+            if wasCapturing { onRelease?() }
+            if retry || shortcutStatus?.1 != false {
+                publishShortcutStatus("全屏控制画面获得焦点后自动转发系统快捷键", running: false)
+            }
+            return
+        }
+        guard shortcutAccessibility, shortcutInputMonitoring else {
+            if systemShortcutMonitor.isRunning { releaseControl() }
+            else { systemShortcutMonitor.stop() }
+            shortcutStartAttempted = false
+            publishShortcutStatus("系统快捷键转发等待本机辅助功能和输入监控生效，请重新检测", running: false)
+            return
+        }
+        guard !SystemShortcutMonitor.secureInputActive else {
+            if systemShortcutMonitor.isRunning { releaseControl() }
+            else { systemShortcutMonitor.stop() }
+            shortcutStartAttempted = false
+            publishShortcutStatus("本机安全输入已开启，系统快捷键转发暂不可用", running: false)
+            return
+        }
+        if systemShortcutMonitor.isRunning { publishShortcutStatus("全屏系统快捷键正在转发；⌃⌥Esc 释放，⌃⌘F 退出全屏", running: true); return }
+        guard retry || !shortcutStartAttempted else {
+            if shortcutStatus?.1 == true { publishShortcutStatus("系统快捷键转发已暂停，请重新检测", running: false) }
+            return
+        }
+        if shortcutStartAttempted { onRelease?() }
+        shortcutStartAttempted = true
+        do {
+            try systemShortcutMonitor.start()
+            publishShortcutStatus("全屏系统快捷键正在转发；⌃⌥Esc 释放，⌃⌘F 退出全屏", running: true)
+        } catch {
+            systemShortcutMonitor.stop()
+            publishShortcutStatus(error.localizedDescription, running: false)
+        }
+    }
+
+    private func publishShortcutStatus(_ message: String, running: Bool) {
+        guard shortcutStatus?.0 != message || shortcutStatus?.1 != running else { return }
+        shortcutStatus = (message, running)
+        onSystemShortcutStatus?(message, running)
+    }
 
     private var pictureRect: CGRect {
         let scale = min(bounds.width / max(1, remoteSize.width), bounds.height / max(1, remoteSize.height))
@@ -223,12 +336,12 @@ final class RemoteCanvas: NSView {
     override func keyDown(with event: NSEvent) {
         if !event.isARepeat { interactionRevision &+= 1 }
         let modifiers = event.modifierFlags.intersection([.control, .command, .option, .shift])
-        if event.keyCode == 3, modifiers == [.control, .command] {
+        if SystemShortcutRouting.localAction(keyCode: event.keyCode, flags: UInt64(event.modifierFlags.rawValue)) == .toggleFullScreen {
             localShortcutKeys.insert(event.keyCode)
             if !event.isARepeat { onToggleFullScreen?() }
             return
         }
-        if event.keyCode == 53, event.modifierFlags.contains([.control, .option]) {
+        if SystemShortcutRouting.localAction(keyCode: event.keyCode, flags: UInt64(event.modifierFlags.rawValue)) == .releaseControl {
             localShortcutKeys.insert(event.keyCode)
             releaseControl()
             return

@@ -40,6 +40,8 @@ struct ConnectionSettingsView: View {
                     Spacer(minLength: 0)
                     Button("设置…", action: openCaps).buttonStyle(.link)
                 }
+                Text(model.systemShortcutStatus).font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 if !model.lastDisconnect.isEmpty {
                     Text("上次断开：\(model.lastDisconnect)")
                         .font(.caption).foregroundStyle(.secondary)
@@ -67,12 +69,13 @@ struct CapsLockSettingsView: View {
                     .frame(width: 42, height: 42)
                     .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Caps Lock 操作远端").font(.system(size: 15, weight: .semibold))
-                    Text("仅在远程画面获得焦点时捕获 Caps Lock。")
+                    Text("键盘与快捷键").font(.system(size: 15, weight: .semibold))
+                    Text("全屏系统快捷键与 Caps Lock 操作远端。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
-            CapsLockDetails(model: model, compact: false)
+            ScrollView { CapsLockDetails(model: model, compact: false) }
+                .frame(height: 350)
             HStack {
                 Spacer()
                 Button("完成", action: done).buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
@@ -104,7 +107,7 @@ struct FullScreenSettingsView: View {
                         .buttonStyle(.plain).frame(width: 20, height: 24).help("返回控制与设置")
                 }
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(showingCaps ? "Caps Lock 操作远端" : (model.remoteName.isEmpty ? "控制与设置" : model.remoteName))
+                    Text(showingCaps ? "键盘与快捷键" : (model.remoteName.isEmpty ? "控制与设置" : model.remoteName))
                         .font(.system(size: 13, weight: .semibold)).lineLimit(1)
                     if showingCaps {
                         Text("仅在远程画面获得焦点时捕获")
@@ -152,6 +155,8 @@ struct FullScreenSettingsView: View {
                                 .help("文字和图片按控制端焦点同步；文件需逐次确认后下载，完成后再粘贴。")
                         }
                         .toggleStyle(.switch).controlSize(.small)
+                        Text(model.systemShortcutStatus).font(.system(size: 10)).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                         Divider()
                         VStack(spacing: 0) {
                             Button(action: openEffects) {
@@ -337,6 +342,15 @@ private struct CapsLockDetails: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: compact ? 12 : 16) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("全屏系统快捷键").font(.headline)
+                Text(model.systemShortcutStatus)
+                    .foregroundStyle(model.systemShortcutsRunning ? Color.green : Color.secondary)
+                Text("全屏并点按远程画面后，⌘空格、⌘Tab 等组合键转发到远端。⌃⌥Esc 释放控制、⌃⌘F 退出全屏仍在本机执行。需要下方两项本机权限；系统安全输入开启时暂停转发。")
+                    .foregroundStyle(.secondary)
+            }
+            .font(.system(size: compact ? 10 : 11))
+            .fixedSize(horizontal: false, vertical: true)
             Toggle(isOn: Binding(get: { model.capsLockEnabled }, set: { model.setCapsLockEnabled($0) })) { Text("启用 Caps Lock 转发").frame(maxWidth: .infinity, alignment: .leading) }
                 .toggleStyle(.switch).controlSize(.small)
                 .padding(compact ? 9 : 11)

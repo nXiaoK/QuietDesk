@@ -71,6 +71,8 @@ final class DeskModel: ObservableObject {
     var viewerFrameRates: [Int] { supportsHighRefreshVideoSettings ? StreamSettings.frameRates : StreamSettings.legacyFrameRates }
     var viewerBitRates: [Int] { supportsHighRefreshVideoSettings ? StreamSettings.bitRates : supportsExtendedVideoSettings ? StreamSettings.extendedBitRates : StreamSettings.legacyBitRates }
     @Published var inputStatus = ""
+    @Published private(set) var systemShortcutStatus = "全屏控制画面获得焦点后自动转发系统快捷键"
+    @Published private(set) var systemShortcutsRunning = false
     @Published private(set) var connections = ConnectionStore.load()
     @Published var autoReconnect = UserDefaults.standard.object(forKey: "autoReconnect") as? Bool ?? true
     @Published var reconnecting = false
@@ -213,6 +215,10 @@ final class DeskModel: ObservableObject {
         canvas.onFullScreen = { [weak self] enabled in
             self?.isFullScreen = enabled
         }
+        canvas.onSystemShortcutStatus = { [weak self] message, running in
+            self?.systemShortcutStatus = message
+            self?.systemShortcutsRunning = running
+        }
         canvas.capsLockMonitor.onFailure = { [weak self] message in
             let failedMonitor = self?.canvas.capsLockMonitor.generation
             DispatchQueue.main.async {
@@ -293,6 +299,8 @@ final class DeskModel: ObservableObject {
             }
         }
 
+        canvas.updateSystemShortcutCapture(sessionActive: mode == .viewer && connected && canControl,
+            accessibility: accessibility, inputMonitoring: inputMonitoring, retry: retryCapsLock)
         guard mode == .viewer, capsLockEnabled else {
             canvas.capsLockMonitor.stop()
             canvas.usesCapsLockActions = false

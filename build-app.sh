@@ -53,7 +53,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSHighResolutionCapable</key><true/>
   <key>NSScreenCaptureUsageDescription</key><string>用于将这台 Mac 的屏幕传输到你自己的另一台 Mac。</string>
   <key>NSLocalNetworkUsageDescription</key><string>用于与你自己的另一台 Mac 建立远程桌面连接。</string>
-  <key>NSInputMonitoringUsageDescription</key><string>仅在远程控制画面获得焦点时识别 Caps Lock 的短按与长按。</string>
+  <key>NSInputMonitoringUsageDescription</key><string>仅在远程画面聚焦时处理 Caps Lock，并在全屏控制时转发系统快捷键。</string>
 </dict></plist>
 PLIST
 if [[ -n "${SIGNING_IDENTITY:-}" ]]; then

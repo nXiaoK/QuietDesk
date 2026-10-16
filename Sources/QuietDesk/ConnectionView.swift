@@ -61,7 +61,7 @@ struct ConnectionView: View {
                                     ConnectionSettingsView(model: model, openCaps: { showOptions = false; openCaps() },
                                                            openTraffic: openTraffic, openEffects: openEffects)
                                 }
-                            Button(action: openCaps) { Label("Caps Lock 设置…", systemImage: "capslock") }
+                            Button(action: openCaps) { Label("键盘设置…", systemImage: "keyboard") }
                             Spacer()
                             if locked {
                                 ProgressView().controlSize(.small)

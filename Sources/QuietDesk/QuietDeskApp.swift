@@ -134,8 +134,8 @@ struct DeskView: View {
                         .help("发送本机剪贴板文字").disabled(!model.connected)
                     Button { model.canvas.releaseControl(); model.pullClipboard() } label: { Label("获取文字", systemImage: "arrow.down.doc") }
                         .help("获取远端剪贴板文字").disabled(!model.connected)
-                    Button { model.canvas.releaseControl(); showCapsSettings = true } label: { Label("Caps Lock 设置", systemImage: "capslock") }
-                        .help("Caps Lock 转发设置")
+                    Button { model.canvas.releaseControl(); showCapsSettings = true } label: { Label("键盘设置", systemImage: "keyboard") }
+                        .help("全屏系统快捷键与 Caps Lock 转发设置")
                     Button { model.canvas.releaseControl(); showOptions.toggle() } label: { Label("画质与连接", systemImage: "slider.horizontal.3") }
                         .help("本次会话画质、连接与剪贴板")
                         .popover(isPresented: $showOptions, arrowEdge: .top) {

@@ -184,7 +184,7 @@ struct DeskView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .overlay {
-            if model.controlling { Rectangle().strokeBorder(Color.accentColor, lineWidth: 2).allowsHitTesting(false) }
+            if model.controlling && !immersive { Rectangle().strokeBorder(Color.accentColor, lineWidth: 2).allowsHitTesting(false) }
         }
         .overlay(alignment: .topLeading) {
             if immersive && model.showFullScreenStatistics {

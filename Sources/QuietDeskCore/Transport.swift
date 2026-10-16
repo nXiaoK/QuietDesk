@@ -39,6 +39,7 @@ public final class Peer {
     public var onMessage: ((Message) -> Void)?
     public var onClose: ((String) -> Void)?
     public var onTraffic: ((Int) -> Void)?
+    public let trafficMeter = TrafficMeter()
     public var onRoundTripMilliseconds: ((Double) -> Void)?
     public private(set) var closeIsRetryable = false
     private let connection: NWConnection
@@ -122,7 +123,9 @@ public final class Peer {
                     return
                 }
                 pendingBytes += data.count
+                let meter = trafficMeter
                 connection.send(content: data, completion: .contentProcessed { [weak self] error in
+                    if error == nil { meter.record(sentBytes: UInt64(data.count)) }
                     guard let self else { completion?(false); return }
                     self.pendingBytes -= data.count
                     if let error { self.finish("发送失败：\(error.localizedDescription)") }
@@ -193,6 +196,7 @@ public final class Peer {
             if let data, !data.isEmpty {
                 buffer.data.append(data)
                 self.lastReceived = ProcessInfo.processInfo.systemUptime
+                self.trafficMeter.record(receivedBytes: UInt64(data.count))
                 self.onTraffic?(data.count)
             }
             if buffer.data.count == count {

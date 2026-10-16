@@ -6,6 +6,7 @@ struct ConnectionView: View {
     @ObservedObject var model: DeskModel
     @Binding var showOptions: Bool
     let openCaps: () -> Void
+    let openTraffic: () -> Void
     @State private var showRecords = false
 
     private var locked: Bool { model.active || model.working }
@@ -23,6 +24,9 @@ struct ConnectionView: View {
                             Text("输入地址和配对码，继续手边的工作")
                                 .font(.callout).foregroundStyle(.secondary)
                         }
+                        Spacer(minLength: 0)
+                        Button(action: openTraffic) { Label("流量统计…", systemImage: "chart.bar.xaxis") }
+                            .buttonStyle(.link).font(.callout)
                     }
                     VStack(spacing: 14) {
                         VStack(spacing: 0) {
@@ -53,7 +57,8 @@ struct ConnectionView: View {
                         HStack(spacing: 18) {
                             Button { model.canvas.releaseControl(); showOptions = true } label: { Label("连接选项…", systemImage: "slider.horizontal.3") }
                                 .popover(isPresented: $showOptions, arrowEdge: .bottom) {
-                                    ConnectionSettingsView(model: model, openCaps: { showOptions = false; openCaps() })
+                                    ConnectionSettingsView(model: model, openCaps: { showOptions = false; openCaps() },
+                                                           openTraffic: openTraffic)
                                 }
                             Button(action: openCaps) { Label("Caps Lock 设置…", systemImage: "capslock") }
                             Spacer()

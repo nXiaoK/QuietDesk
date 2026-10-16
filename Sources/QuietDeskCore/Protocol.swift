@@ -18,6 +18,7 @@ public enum MessageKind: UInt8, Sendable {
     case clipboardSettings, clipboardBegin, clipboardEntry, clipboardChunk, clipboardEnd, clipboardReceipt, clipboardCancel
     case streamSettingsRequest, streamSettingsResult
     case controlStatus
+    case deviceIdentity
 }
 
 public struct Message: Sendable {
@@ -155,7 +156,9 @@ public struct Hello: Codable, Sendable {
     public let controlStatusUpdates: Bool?
     public let extendedVideoSettings: Bool?
     public let preferredSettings: StreamSettings?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil) {
+    public let deviceID: UUID?
+    public let deviceIdentityExchange: Bool?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -167,6 +170,8 @@ public struct Hello: Codable, Sendable {
         self.controlStatusUpdates = controlStatusUpdates
         self.extendedVideoSettings = extendedVideoSettings
         self.preferredSettings = preferredSettings
+        self.deviceID = deviceID
+        self.deviceIdentityExchange = deviceIdentityExchange
     }
 
     public func validate() throws {

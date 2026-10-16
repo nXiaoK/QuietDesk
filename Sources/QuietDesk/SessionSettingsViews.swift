@@ -5,6 +5,7 @@ import SwiftUI
 struct ConnectionSettingsView: View {
     @ObservedObject var model: DeskModel
     let openCaps: () -> Void
+    let openTraffic: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -16,6 +17,7 @@ struct ConnectionSettingsView: View {
                 Toggle(isOn: $model.showFullScreenStatistics) { Text("全屏显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
                 Text("显示往返延迟、分辨率、视频 FPS 和收发流量。往返延迟约每 5 秒更新，FPS 与流量每秒更新；静止画面 FPS 可能为 0。")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Button(action: openTraffic) { Label("设备历史流量…", systemImage: "chart.bar.xaxis") }
             }
             Divider()
             VStack(alignment: .leading, spacing: 8) {
@@ -85,6 +87,7 @@ struct CapsLockSettingsView: View {
 struct FullScreenSettingsView: View {
     @ObservedObject var model: DeskModel
     let close: () -> Void
+    let openTraffic: () -> Void
     @State private var showingCaps = false
 
     var body: some View {
@@ -143,6 +146,13 @@ struct FullScreenSettingsView: View {
                 .toggleStyle(.switch).controlSize(.small)
                 Divider()
                 VStack(spacing: 0) {
+                    Button(action: openTraffic) {
+                        HStack {
+                            Label("设备历史流量", systemImage: "chart.bar.xaxis")
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
+                        }.frame(minHeight: 28)
+                    }
                     Button { model.openReceivedFiles() } label: {
                         HStack {
                             Label("打开接收文件目录", systemImage: "folder")

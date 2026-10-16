@@ -4,6 +4,7 @@ import QuietDeskCore
 
 struct SharingView: View {
     @ObservedObject var model: DeskModel
+    let openTraffic: () -> Void
     @State private var showCode = false
 
     private var locked: Bool { model.active || model.working }
@@ -45,6 +46,8 @@ struct SharingView: View {
         VStack(alignment: .leading, spacing: 20) {
             launchSection
             clipboardSection
+            Button(action: openTraffic) { Label("设备流量统计…", systemImage: "chart.bar.xaxis") }
+                .buttonStyle(.link)
             Text("共享期间 Mac 保持唤醒。支持一个显示器与一个控制连接；暂不包含音频和登录窗口控制。")
                 .font(.caption)
                 .foregroundStyle(.secondary)

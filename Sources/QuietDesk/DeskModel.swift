@@ -34,6 +34,10 @@ final class DeskModel: ObservableObject {
         return connectionError
     }
     @Published var traffic = "0.00 Mbps"
+    @Published private(set) var trafficHistory: [DeviceTrafficRecord] = []
+    @Published private(set) var trafficHistoryError: String?
+    @Published private(set) var trafficHistoryStatus = "从本版开始按设备累计；旧版设备需双方升级。"
+    @Published private(set) var currentTrafficDeviceID: UUID?
     @Published var frameRate = "0 fps"
     @Published var latency = "— ms"
     @Published private(set) var roundTripMilliseconds: Double?
@@ -130,6 +134,9 @@ final class DeskModel: ObservableObject {
     private var displayRefreshTask: Task<Void, Never>?
     private var hostPreparationTask: Task<Void, Never>?
     private var capturedDisplay: DisplaySnapshot?
+    private let trafficHistoryStore = TrafficHistoryStore()
+    private var trafficSession: TrafficSession?
+    private var hostDeviceIdentityAdvertised = false
 
     init() {
         if autoStartSharing { mode = .host }
@@ -213,6 +220,26 @@ final class DeskModel: ObservableObject {
             }
         }
         if let permissionTimer { RunLoop.main.add(permissionTimer, forMode: .common) }
+        trafficHistoryStore.observe { [weak self] records, message in
+            DispatchQueue.main.async {
+                self?.trafficHistory = records
+                self?.trafficHistoryError = message
+            }
+        }
+    }
+
+    func flushTrafficHistory() {
+        if let trafficSession, let peer { trafficSession.receive(peer.trafficMeter.snapshot()) }
+        trafficHistoryStore.flush()
+    }
+
+    private func makeTrafficSession(for peer: Peer) -> TrafficSession {
+        let history = trafficHistoryStore
+        let session = TrafficSession(connectionID: peer.trafficMeter.connectionID,
+            onDelta: { identity, delta in history.record(identity, delta: delta) },
+            onError: { history.reportCountingError($0) })
+        peer.trafficMeter.onUpdate = session.receive
+        return session
     }
 
     func toggleFullScreen() {
@@ -442,6 +469,8 @@ final class DeskModel: ObservableObject {
 
     private func accept(_ connection: NWConnection, generation token: UUID) {
         let candidate = Peer(connection: connection)
+        let session = makeTrafficSession(for: candidate)
+        let history = trafficHistoryStore
         let id = UUID()
         pending[id] = candidate
         candidate.onReady = { [weak self, weak candidate] in
@@ -450,6 +479,8 @@ final class DeskModel: ObservableObject {
                       self.generation == token, self.active, self.hostingRequested else { return }
                 guard self.peer == nil else { candidate.close("这台 Mac 当前已有控制连接"); return }
                 self.peer = candidate
+                self.trafficSession = session
+                self.trafficHistoryStatus = "等待远端设备标识；旧版设备需双方升级后才能累计。"
                 self.status = "正在准备连接画面…"
                 self.captureTask = Task { [weak self, weak candidate] in
                     guard let self, let candidate else { return }
@@ -468,9 +499,11 @@ final class DeskModel: ObservableObject {
                         self.resolution = "\(width) × \(height)"
                         self.activeVideoState = VideoStreamState(settings: settings, width: width, height: height)
                         self.injector = InputInjector(displayID: display.displayID)
+                        self.hostDeviceIdentityAdvertised = self.trafficHistoryStore.localDeviceID != nil
                         candidate.send(try Wire.json(.hello, Hello(name: Host.current().localizedName ?? "家里 Mac",
                             width: width, height: height, settings: settings, canControl: self.canControl,
-                            preferredSettings: preferredSettings)))
+                            preferredSettings: preferredSettings, deviceID: self.trafficHistoryStore.localDeviceID,
+                            deviceIdentityExchange: self.hostDeviceIdentityAdvertised ? true : nil)))
                         let streamer = ScreenStreamer()
                         self.streamer = streamer
                         streamer.onFrame = { [weak self, weak candidate] packet in
@@ -513,6 +546,7 @@ final class DeskModel: ObservableObject {
             }
         }
         candidate.onClose = { [weak self, weak candidate] reason in
+            history.requestFlush()
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.pending.removeValue(forKey: id)
@@ -559,6 +593,10 @@ final class DeskModel: ObservableObject {
     private func beginConnection(_ target: Target) {
         let candidate = Peer(connection: NWConnection(host: NWEndpoint.Host(target.address),
             port: NWEndpoint.Port(rawValue: target.port)!, using: SecureTransport.parameters(key: target.key)))
+        trafficSession = makeTrafficSession(for: candidate)
+        let history = trafficHistoryStore
+        currentTrafficDeviceID = nil
+        trafficHistoryStatus = "等待远端设备标识；旧版设备需双方升级后才能累计。"
         peer = candidate
         active = true
         working = true
@@ -594,6 +632,7 @@ final class DeskModel: ObservableObject {
             }
         }
         candidate.onClose = { [weak self, weak candidate] reason in
+            history.requestFlush()
             let retryable = candidate?.closeIsRetryable == true
             DispatchQueue.main.async {
                 guard let self, let candidate, self.peer === candidate else { return }
@@ -672,6 +711,15 @@ final class DeskModel: ObservableObject {
 
     private func handleHost(_ message: Message, peer: Peer) throws {
         switch message.kind {
+        case .deviceIdentity:
+            guard hostDeviceIdentityAdvertised, let trafficSession,
+                  trafficSession.connectionID == peer.trafficMeter.connectionID else {
+                throw DeskError.invalid("当前连接未启用设备标识交换")
+            }
+            let identity = try Wire.readJSON(DeviceIdentity.self, message.payload)
+            try trafficSession.bind(identity)
+            currentTrafficDeviceID = identity.id
+            trafficHistoryStatus = "历史流量已按远端设备持续累计。"
         case .controlStatus:
             guard message.payload.isEmpty else { throw DeskError.invalid("控制权限订阅消息无效") }
             refreshPermissions()
@@ -726,6 +774,14 @@ final class DeskModel: ObservableObject {
             remoteName = hello.name
             reconnecting = false
             saveConnection(name: hello.name)
+            if let id = hello.deviceID, let trafficSession {
+                try trafficSession.bind(DeviceIdentity(id: id, name: hello.name))
+                currentTrafficDeviceID = id
+                trafficHistoryStatus = "历史流量已按远端设备持续累计。"
+            } else { trafficHistoryStatus = "对端没有设备标识，仅显示瞬时流量；双方升级后可累计历史。" }
+            if hello.deviceIdentityExchange == true, let id = trafficHistoryStore.localDeviceID {
+                peer.send(try Wire.json(.deviceIdentity, DeviceIdentity(id: id, name: Host.current().localizedName ?? "这台 Mac")))
+            }
             stableTask?.cancel()
             stableTask = Task { [weak self, weak peer] in
                 do { try await Task.sleep(for: .seconds(30)) } catch { return }
@@ -1113,6 +1169,11 @@ final class DeskModel: ObservableObject {
     }
 
     private func clearSession() {
+        flushTrafficHistory()
+        trafficSession = nil
+        currentTrafficDeviceID = nil
+        hostDeviceIdentityAdvertised = false
+        trafficHistoryStatus = "从本版开始按设备累计；旧版设备需双方升级。"
         controlStatusUpdatesEnabled = false
         capsLockRunning = false
         capsLockStartAttempted = false

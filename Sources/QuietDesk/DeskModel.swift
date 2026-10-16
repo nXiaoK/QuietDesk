@@ -87,6 +87,7 @@ final class DeskModel: ObservableObject {
     private var activity: NSObjectProtocol?
     private var metricsTimer: Timer?
     private var permissionTimer: Timer?
+    private var permissionGuide: PermissionGuide?
     private var capsLockStartAttempted = false
     private var controlStatusUpdatesEnabled = false
     private var byteCount = 0
@@ -207,7 +208,7 @@ final class DeskModel: ObservableObject {
         refreshPermissions(checkScreenCapture: true)
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, self.connected || self.capsLockEnabled else { return }
+                guard let self, self.connected || self.capsLockEnabled || self.permissionGuide?.isVisible == true else { return }
                 self.refreshPermissions()
             }
         }
@@ -224,9 +225,7 @@ final class DeskModel: ObservableObject {
         if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
             _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
         }
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
-            NSWorkspace.shared.open(url)
-        }
+        openPermissionSettings(.inputMonitoring)
     }
 
     func setCapsLockEnabled(_ enabled: Bool) {
@@ -237,6 +236,7 @@ final class DeskModel: ObservableObject {
     }
 
     func refreshPermissions(checkScreenCapture: Bool = false, retryCapsLock: Bool = false) {
+        permissionGuide?.refreshStatus()
         let accessibility = AXIsProcessTrusted()
         let inputMonitoring = mode == .viewer && IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
         if localAccessibility != accessibility { localAccessibility = accessibility }
@@ -316,14 +316,23 @@ final class DeskModel: ObservableObject {
         if mode == .viewer { canvas.releaseControl() }
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
         _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
-        }
+        openPermissionSettings(.accessibility)
     }
 
     func openScreenPermission() {
+        if mode == .viewer { canvas.releaseControl() }
         _ = CGRequestScreenCaptureAccess()
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+        openPermissionSettings(.screenRecording)
+    }
+
+    private func openPermissionSettings(_ kind: PermissionGuide.Kind) {
+        if permissionGuide == nil {
+            permissionGuide = PermissionGuide { [weak self] in
+                self?.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
+            }
+        }
+        permissionGuide?.present(for: kind)
+        if let url = kind.settingsURL {
             NSWorkspace.shared.open(url)
         }
     }

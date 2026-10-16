@@ -76,6 +76,7 @@ private final class ClipboardPair {
     private(set) var localMessages: [MessageKind] = []
     private(set) var remoteMessages: [MessageKind] = []
     var routeLocal: ((Message) -> Bool)?
+    var routeRemote: ((Message) -> Bool)?
 
     init(storage: URL, localAllowed: Bool = false, remoteAllowed: Bool = false) {
         let session = UUID()
@@ -89,12 +90,12 @@ private final class ClipboardPair {
             pasteboard: remote, storage: storage.appendingPathComponent("remote")) { [weak self] message in
                 guard let self else { return }
                 self.remoteMessages.append(message.kind)
-                self.localSync.receive(message)
+                if self.routeRemote?(message) != false { self.localSync.receive(message) }
             }
     }
 
     func stop() {
-        routeLocal = nil
+        routeLocal = nil; routeRemote = nil
         localSync.onFileOffer = nil; remoteSync.onFileOffer = nil
         localSync.stop(); remoteSync.stop()
         pump(for: 0.04)
@@ -228,6 +229,81 @@ private struct ClipboardFocusChecks {
             pair.localSync.respondToFileOffer(id: stale, accept: true)
             pump(for: 0.35)
             try require(pair.local.writes == 0 && !pair.remoteMessages.contains(.clipboardEntry), "Stale approval downloaded a file")
+        }
+
+        run("A remote replacement file survives cancellation gaps without sending older deferred local content") { folder in
+            let pair = ClipboardPair(storage: folder, remoteAllowed: true)
+            defer { pair.stop() }
+            pair.local.copy(.text(Data("older background copy".utf8)))
+            let first = folder.appendingPathComponent("first.bin"), second = folder.appendingPathComponent("second.bin")
+            try Data([1]).write(to: first)
+            let bytes = Data(repeating: 92, count: 90_000)
+            try bytes.write(to: second)
+            var offer: ClipboardFileOffer?
+            pair.localSync.onFileOffer = { value in
+                offer = value
+                if value != nil { pair.localSync.setAutomaticSendingAllowed(true) }
+            }
+            pair.remote.copy(.files([first]))
+            try eventually("First remote file offer missing") { offer != nil }
+            let previous = offer!.id
+            var held: Message?
+            pair.routeRemote = { message in
+                if message.kind == .clipboardBegin { held = message; return false }
+                return true
+            }
+            pair.remote.copy(.files([second]))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("Replacement cancellation did not clear the first prompt") { held != nil && offer == nil }
+            pump(for: 0.35)
+            try require(pair.local.reads == 0 && !pair.localMessages.contains(.clipboardBegin),
+                        "The remote cancellation gap sent older local clipboard content")
+            pair.localSync.receive(held!)
+            try eventually("Second remote file offer missing") { offer != nil && offer!.id != previous }
+            pump(for: 0.35)
+            pair.localSync.respondToFileOffer(id: previous, accept: true)
+            try require(pair.local.reads == 0 && !pair.localMessages.contains(.clipboardBegin),
+                        "The replacement prompt sent older local clipboard content")
+            pair.localSync.respondToFileOffer(id: offer!.id, accept: true)
+            try eventually("Replacement file did not arrive") { pair.local.writes == 1 }
+            guard case .files(let urls) = pair.local.payload else { throw FocusCheckFailure("Replacement file was overwritten") }
+            try require(urls.count == 1 && urls[0].lastPathComponent == "second.bin" && Data(contentsOf: urls[0]) == bytes,
+                        "Wrong file survived the remote replacement")
+            try require(!pair.localMessages.contains(.clipboardBegin), "Older local content cancelled the replacement file")
+        }
+
+        run("Remote text replacing a file prompt cannot be overwritten by older deferred local content") { folder in
+            let pair = ClipboardPair(storage: folder, remoteAllowed: true)
+            defer { pair.stop() }
+            pair.local.copy(.text(Data("older background copy".utf8)))
+            let file = folder.appendingPathComponent("superseded.bin")
+            try Data([7]).write(to: file)
+            var offer: ClipboardFileOffer?
+            pair.localSync.onFileOffer = { value in
+                offer = value
+                if value != nil { pair.localSync.setAutomaticSendingAllowed(true) }
+            }
+            pair.remote.copy(.files([file]))
+            try eventually("File offer missing before remote text copy") { offer != nil }
+            var held: Message?
+            pair.routeRemote = { message in
+                if message.kind == .clipboardBegin { held = message; return false }
+                return true
+            }
+            pair.remote.copy(.text(Data("newer remote text".utf8)))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("Remote text replacement was not held") { held != nil && offer == nil }
+            pump(for: 0.35)
+            try require(pair.local.reads == 0 && !pair.localMessages.contains(.clipboardBegin),
+                        "The cancellation gap read or transmitted older local content")
+            pair.localSync.receive(held!)
+            try eventually("New remote text did not arrive") { pair.local.copiedText == "newer remote text" }
+            pump(for: 0.35)
+            try require(pair.remote.copiedText == "newer remote text" && !pair.localMessages.contains(.clipboardBegin),
+                        "Older local content replaced the new remote text")
+            try require(pair.local.writes == 1 && !FileManager.default.fileExists(atPath:
+                folder.appendingPathComponent("local/received", isDirectory: true).path),
+                        "Superseded file was applied")
         }
 
         run("Declining a prompt resumes the latest deferred local copy") { folder in

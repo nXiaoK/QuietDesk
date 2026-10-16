@@ -38,6 +38,10 @@ public struct ClipboardFileOffer: Identifiable {
     }
 }
 
+public enum ClipboardFileOfferEndReason {
+    case accepted, declined, superseded, cancelled, failed, timedOut, stopped
+}
+
 private struct ClipboardBegin: Codable {
     let revision: ClipboardRevision
     let sequence: UInt64
@@ -84,6 +88,7 @@ public final class ClipboardTransfer {
     public var onApply: ((ClipboardPayload, @escaping (Bool) -> Void) -> Void)?
     public var onStatus: ((String) -> Void)?
     public var onFileOffer: ((ClipboardFileOffer?) -> Void)?
+    public var onFileOfferEnded: ((UUID, ClipboardFileOfferEndReason) -> Void)?
     private let queue = DispatchQueue(label: "quietdesk.clipboard.files", qos: .utility)
     private let storage: URL
     private let requireFileApproval: Bool
@@ -147,16 +152,18 @@ public final class ClipboardTransfer {
     public func respondToFileOffer(id: UUID, accept: Bool) {
         queue.async { [self] in
             guard !stopped, let pending = pendingFileOffer, pending.id == id else { return }
-            pendingFileOffer = nil
-            onFileOffer?(nil)
             if accept {
-                do { try startReceiving(pending.begin) }
+                do {
+                    try startReceiving(pending.begin)
+                    finishFileOffer(.accepted)
+                }
                 catch {
                     sendJSON(.clipboardCancel, ClipboardReceipt(revision: pending.begin.revision, sequence: 0, reason: error.localizedDescription))
-                    discardIncoming()
+                    discardIncoming(reason: .failed)
                     onStatus?("文件接收未启动：\(error.localizedDescription)")
                 }
             } else {
+                finishFileOffer(.declined)
                 sendJSON(.clipboardCancel, ClipboardReceipt(revision: pending.begin.revision, sequence: 0, reason: "对端选择不接收文件"))
                 onStatus?("已取消接收文件，未下载文件内容")
             }
@@ -171,7 +178,7 @@ public final class ClipboardTransfer {
                 onStatus?("正在准备剪贴板…")
                 let (type, parts) = try plan(payload)
                 cancelOutgoing("剪贴板已被新的复制内容替换")
-                discardIncoming()
+                discardIncoming(reason: .superseded)
                 clock &+= 1
                 let revision = ClipboardRevision(counter: clock, origin: origin)
                 newest = revision
@@ -228,7 +235,7 @@ public final class ClipboardTransfer {
                         onStatus?(receipt.reason ?? "剪贴板同步已取消")
                     }
                     if incoming?.begin.revision == receipt.revision || pendingFileOffer?.begin.revision == receipt.revision {
-                        discardIncoming(); onStatus?(receipt.reason ?? "剪贴板接收已取消")
+                        discardIncoming(reason: .cancelled); onStatus?(receipt.reason ?? "剪贴板接收已取消")
                     }
                 default: break
                 }
@@ -236,7 +243,7 @@ public final class ClipboardTransfer {
                 onStatus?("剪贴板同步失败：\(error.localizedDescription)")
                 if let incoming { sendJSON(.clipboardCancel, ClipboardReceipt(revision: incoming.begin.revision, sequence: incoming.sequence, reason: error.localizedDescription)) }
                 if let pendingFileOffer { sendJSON(.clipboardCancel, ClipboardReceipt(revision: pendingFileOffer.begin.revision, sequence: 0, reason: error.localizedDescription)) }
-                discardIncoming()
+                discardIncoming(reason: .failed)
                 cancelOutgoing(error.localizedDescription)
             }
         }
@@ -247,7 +254,7 @@ public final class ClipboardTransfer {
             stopped = true
             timer?.cancel(); timer = nil
             cancelOutgoing("连接结束", notify: false)
-            discardIncoming()
+            discardIncoming(reason: .stopped)
             completion?()
         }
     }
@@ -366,7 +373,7 @@ public final class ClipboardTransfer {
         }
         newest = value.revision
         cancelOutgoing("对端有更新的剪贴板内容")
-        discardIncoming()
+        discardIncoming(reason: .superseded)
         if value.type == "files", requireFileApproval {
             let id = UUID()
             let created = ProcessInfo.processInfo.systemUptime
@@ -495,8 +502,14 @@ public final class ClipboardTransfer {
         if notify { sendJSON(.clipboardCancel, ClipboardReceipt(revision: outgoing.revision, sequence: outgoing.sequence, reason: reason)) }
         outgoing.completion(false)
     }
-    private func discardIncoming() {
-        if pendingFileOffer != nil { pendingFileOffer = nil; onFileOffer?(nil) }
+    private func finishFileOffer(_ reason: ClipboardFileOfferEndReason) {
+        guard let pending = pendingFileOffer else { return }
+        pendingFileOffer = nil
+        onFileOfferEnded?(pending.id, reason)
+        onFileOffer?(nil)
+    }
+    private func discardIncoming(reason: ClipboardFileOfferEndReason) {
+        finishFileOffer(reason)
         guard let incoming else { return }
         try? incoming.handle?.close(); incoming.handle = nil
         try? FileManager.default.removeItem(at: incoming.directory)
@@ -512,12 +525,12 @@ public final class ClipboardTransfer {
             if let outgoing = self.outgoing, now - outgoing.updated > 90 { self.cancelOutgoing("剪贴板传输确认超时"); self.onStatus?("剪贴板同步超时，请重新复制") }
             if let incoming = self.incoming, now - incoming.updated > 90 {
                 self.sendJSON(.clipboardCancel, ClipboardReceipt(revision: incoming.begin.revision, sequence: incoming.sequence, reason: "接收超时"))
-                self.discardIncoming()
+                self.discardIncoming(reason: .timedOut)
                 self.onStatus?("剪贴板接收超时")
             }
             if let pending = self.pendingFileOffer, now - pending.created > 90 {
                 self.sendJSON(.clipboardCancel, ClipboardReceipt(revision: pending.begin.revision, sequence: 0, reason: "文件接收请求已过期，请重新复制"))
-                self.discardIncoming()
+                self.discardIncoming(reason: .timedOut)
                 self.onStatus?("文件接收请求已过期，未下载文件内容")
             }
         }

@@ -55,6 +55,7 @@ final class ClipboardSync {
     private var timer: Timer?
     private var observedChange: Int
     private var pendingFileOffer: (id: UUID, change: Int)?
+    private var deferredLocalChange: Int?
     private var sharedChange: Int?
     private var sendingChange: Int?
     private var waiters: [(Bool) -> Void] = []
@@ -88,10 +89,25 @@ final class ClipboardSync {
         transfer.onStatus = { [weak self] status in DispatchQueue.main.async { self?.onStatus?(status) } }
         transfer.onFileOffer = { [weak self] offer in
             DispatchQueue.main.async {
-                guard let self, self.running else { return }
-                self.pendingFileOffer = offer.map { ($0.id, self.pasteboard.changeCount) }
+                guard let self, self.running, let offer else { return }
+                let change = self.pasteboard.changeCount
+                self.pendingFileOffer = (offer.id, change)
+                self.deferredLocalChange = change
                 self.onFileOffer?(offer)
-                if offer == nil { self.poll() }
+            }
+        }
+        transfer.onFileOfferEnded = { [weak self] id, reason in
+            DispatchQueue.main.async {
+                guard let self, self.running, let pending = self.pendingFileOffer, pending.id == id else { return }
+                self.pendingFileOffer = nil
+                switch reason {
+                case .accepted: self.observedChange = pending.change
+                case .declined, .timedOut, .failed: self.deferredLocalChange = nil
+                // A remote cancellation can precede replacement data; keep the older local version deferred.
+                case .superseded, .cancelled, .stopped: break
+                }
+                self.onFileOffer?(nil)
+                self.poll()
             }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
@@ -114,7 +130,6 @@ final class ClipboardSync {
             sendCurrent()
             return
         }
-        if accept { observedChange = pendingFileOffer.change }
         transfer.respondToFileOffer(id: id, accept: accept)
     }
 
@@ -144,7 +159,7 @@ final class ClipboardSync {
     private func poll() {
         guard running, allowsAutomaticSending else { return }
         let change = pasteboard.changeCount
-        guard change != observedChange, change != pendingFileOffer?.change else { return }
+        guard change != observedChange, change != deferredLocalChange else { return }
         sendCurrent()
     }
 
@@ -205,6 +220,7 @@ final class ClipboardSync {
         let contentMarker = marker(for: payload)
         guard pasteboard.write(payload, marker: contentMarker) else { onStatus?("系统剪贴板写入失败"); return false }
         observedChange = pasteboard.changeCount
+        deferredLocalChange = nil
         sharedChange = observedChange
         hasSharedState = true
         lastSharedMarker = contentMarker

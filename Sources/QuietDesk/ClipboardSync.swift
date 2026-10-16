@@ -27,18 +27,34 @@ private final class SystemClipboardPasteboard: ClipboardPasteboard {
     var contentMarker: String? { pasteboard.string(forType: Self.marker) }
 
     func write(_ payload: ClipboardPayload, marker: String) -> Bool {
-        let accepted: Bool
+        var items: [NSPasteboardItem] = []
         switch payload {
         case .text(let bytes):
             guard let text = String(data: bytes, encoding: .utf8) else { return false }
-            pasteboard.clearContents(); accepted = pasteboard.setString(text, forType: .string)
+            let item = NSPasteboardItem()
+            guard item.setString(text, forType: .string) else { return false }
+            items = [item]
         case .png(let bytes):
-            pasteboard.clearContents(); accepted = pasteboard.setData(bytes, forType: .png)
+            let item = NSPasteboardItem()
+            guard item.setData(bytes, forType: .png) else { return false }
+            items = [item]
         case .files(let urls):
-            pasteboard.clearContents(); accepted = pasteboard.writeObjects(urls as [NSURL])
+            guard !urls.isEmpty else { return false }
+            for url in urls {
+                let item = NSPasteboardItem(), writer = url as NSURL
+                for type in writer.writableTypes(for: pasteboard) {
+                    if let value = writer.pasteboardPropertyList(forType: type),
+                       !item.setPropertyList(value, forType: type) { return false }
+                }
+                guard item.setString(url.absoluteString, forType: .fileURL) else { return false }
+                items.append(item)
+            }
         }
-        if accepted { pasteboard.setString(marker, forType: Self.marker) }
-        return accepted
+        for item in items {
+            guard item.setString(marker, forType: Self.marker) else { return false }
+        }
+        pasteboard.clearContents()
+        return pasteboard.writeObjects(items)
     }
 }
 

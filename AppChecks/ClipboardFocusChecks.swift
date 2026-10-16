@@ -54,6 +54,8 @@ private final class MemoryPasteboard: ClipboardPasteboard {
         self.payload = payload; marker = nil; changeCount += 1
     }
 
+    func republish() { marker = nil; changeCount += 1 }
+
     func write(_ payload: ClipboardPayload, marker: String) -> Bool {
         guard !rejectsWrites else { return false }
         self.payload = payload; self.marker = marker
@@ -351,6 +353,148 @@ private struct ClipboardFocusChecks {
             pair.localSync.prepareForPaste { ready = $0 }
             try eventually("Failed write did not complete preparation") { ready != nil }
             try require(ready == false && pair.remote.writes == 0, "Rejected write acknowledged paste readiness")
+        }
+
+        run("Received files never return an offer to their sender after marker loss and focus release; modified files still send") { folder in
+            let pair = ClipboardPair(storage: folder, localAllowed: true)
+            defer { pair.stop() }
+            let project = folder.appendingPathComponent("project"), extra = folder.appendingPathComponent("extra.txt")
+            try FileManager.default.createDirectory(at: project.appendingPathComponent("src"), withIntermediateDirectories: true)
+            try Data("original".utf8).write(to: project.appendingPathComponent("src/code.txt"))
+            try Data("extra".utf8).write(to: extra)
+            var receiving: ClipboardFileOffer?, returned: ClipboardFileOffer?
+            pair.remoteSync.onFileOffer = { receiving = $0 }
+            pair.localSync.onFileOffer = { returned = $0 }
+            pair.local.copy(.files([project, extra]))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Remote file offer missing") { receiving != nil }
+            pair.remoteSync.respondToFileOffer(id: receiving!.id, accept: true)
+            try eventually("Remote files were not published") { pair.remote.writes == 1 }
+            guard case .files(let received) = pair.remote.payload else { throw FocusCheckFailure("Expected received files") }
+            pair.remote.copy(.files(Array(received.reversed())))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            pump(for: 0.45)
+            try require(returned == nil && !pair.remoteMessages.contains(.clipboardBegin),
+                        "The sender received its own file approval after focus release")
+            guard let copiedProject = received.first(where: { $0.lastPathComponent == "project" }) else {
+                throw FocusCheckFailure("Received directory missing")
+            }
+            let modified = Data("modified remote content is longer".utf8)
+            try modified.write(to: copiedProject.appendingPathComponent("src/code.txt"))
+            pair.remote.copy(.files(received))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("Modified received files were incorrectly suppressed") { returned != nil }
+            pair.localSync.respondToFileOffer(id: returned!.id, accept: true)
+            try eventually("Modified files did not return after explicit copying") { pair.local.writes == 1 }
+            guard case .files(let roundTrip) = pair.local.payload,
+                  let changed = roundTrip.first(where: { $0.lastPathComponent == "project" }) else {
+                throw FocusCheckFailure("Modified round trip lost the directory")
+            }
+            try require(Data(contentsOf: changed.appendingPathComponent("src/code.txt")) == modified,
+                        "A changed file was mistaken for unchanged received data")
+        }
+
+        run("Received text and PNG stay local after marker loss and repeated focus changes") { folder in
+            guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+                  let png = bitmap.representation(using: .png, properties: [:]) else {
+                throw FocusCheckFailure("Cannot create an in-memory PNG")
+            }
+            for (index, payload) in [ClipboardPayload.text(Data("clipboard text".utf8)), .png(png)].enumerated() {
+                let pair = ClipboardPair(storage: folder.appendingPathComponent(String(index)), localAllowed: true)
+                defer { pair.stop() }
+                pair.local.copy(payload)
+                pair.localSync.setAutomaticSendingAllowed(true)
+                try eventually("Text or PNG did not arrive") { pair.remote.writes == 1 }
+                pair.remote.republish()
+                for _ in 0..<3 {
+                    pair.remoteSync.setAutomaticSendingAllowed(true)
+                    pair.remoteSync.setAutomaticSendingAllowed(false)
+                }
+                pair.remoteSync.setAutomaticSendingAllowed(true)
+                pump(for: 0.35)
+                try require(!pair.remoteMessages.contains(.clipboardBegin) && pair.local.writes == 0,
+                            "Received text or image echoed to its source")
+            }
+        }
+
+        run("A rejected clipboard write cannot mark received files as shared or suppress a later explicit copy") { folder in
+            let pair = ClipboardPair(storage: folder, localAllowed: true)
+            defer { pair.stop() }
+            let file = folder.appendingPathComponent("failed.bin")
+            try Data([1, 2, 3]).write(to: file)
+            pair.remote.rejectsWrites = true
+            var receiving: ClipboardFileOffer?, returned: ClipboardFileOffer?
+            var failed = false
+            pair.remoteSync.onFileOffer = { receiving = $0 }
+            pair.localSync.onFileOffer = { returned = $0 }
+            pair.localSync.onStatus = { if $0.contains("无法写入") { failed = true } }
+            pair.local.copy(.files([file]))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("No file offer before rejected clipboard write") { receiving != nil }
+            pair.remoteSync.respondToFileOffer(id: receiving!.id, accept: true)
+            try eventually("Rejected file publication was not reported") { failed }
+            try require(pair.remote.writes == 0 && !pair.remoteMessages.contains(.clipboardBegin),
+                        "Rejected publication was treated as a new local file copy")
+            let receivedDirectory = folder.appendingPathComponent("remote/received")
+            let saved = try FileManager.default.contentsOfDirectory(at: receivedDirectory, includingPropertiesForKeys: nil)
+            try require(saved.count == 1, "Expected the completed file to remain available after clipboard rejection")
+            pair.remote.rejectsWrites = false
+            pair.remote.copy(.files([saved[0].appendingPathComponent("failed.bin")]))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("A file never published to the clipboard was incorrectly treated as an echo") { returned != nil }
+            pair.localSync.respondToFileOffer(id: returned!.id, accept: false)
+        }
+
+        run("Declining a file never sends it back and a fresh copy of the same source can retry") { folder in
+            let pair = ClipboardPair(storage: folder, localAllowed: true)
+            defer { pair.stop() }
+            let file = folder.appendingPathComponent("retry.bin")
+            try Data([6, 7]).write(to: file)
+            var offer: ClipboardFileOffer?
+            var offered = 0
+            pair.remoteSync.onFileOffer = { value in offer = value; if value != nil { offered += 1 } }
+            pair.local.copy(.files([file]))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("First retry offer missing") { offer != nil }
+            pair.remoteSync.respondToFileOffer(id: offer!.id, accept: false)
+            try eventually("Decline did not clear its prompt") { offer == nil }
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            pump(for: 0.35)
+            try require(pair.remote.writes == 0 && !pair.remoteMessages.contains(.clipboardBegin), "Declined files echoed")
+            pair.local.copy(.files([file]))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("A new copy could not retry the same declined source file") { offered == 2 && offer != nil }
+            pair.remoteSync.respondToFileOffer(id: offer!.id, accept: false)
+        }
+
+        run("An interrupted file followed by text never publishes or echoes the cancelled file") { folder in
+            let pair = ClipboardPair(storage: folder, localAllowed: true)
+            defer { pair.stop() }
+            let file = folder.appendingPathComponent("cancelled.bin")
+            try Data(repeating: 99, count: 150_000).write(to: file)
+            var offer: ClipboardFileOffer?, held: Message?
+            pair.remoteSync.onFileOffer = { offer = $0 }
+            pair.routeLocal = { message in
+                if message.kind == .clipboardChunk, held == nil { held = message; return false }
+                return true
+            }
+            pair.local.copy(.files([file]))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("No file to interrupt") { offer != nil }
+            pair.remoteSync.respondToFileOffer(id: offer!.id, accept: true)
+            try eventually("No file chunk to interrupt") { held != nil }
+            pair.local.copy(.text(Data("replacement text".utf8)))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Replacement text did not supersede the interrupted file") { pair.remote.copiedText == "replacement text" }
+            pair.remote.republish()
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            pump(for: 0.35)
+            try require(pair.remote.writes == 1 && !pair.remoteMessages.contains(.clipboardBegin),
+                        "Cancelled file or its replacement echoed to the sender")
+            try require(!FileManager.default.fileExists(atPath: folder.appendingPathComponent("remote/received").path),
+                        "An interrupted file was published")
         }
 
         run("Focus preference is optional, round-trips both states and rejects non-boolean input") { _ in

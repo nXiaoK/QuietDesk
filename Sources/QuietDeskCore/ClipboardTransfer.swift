@@ -97,6 +97,7 @@ public final class ClipboardTransfer {
     private var newest: ClipboardRevision?
     private var outgoing: Outgoing?
     private var incoming: Incoming?
+    private var appliedFiles: [Part]?
     private var pendingFileOffer: (id: UUID, begin: ClipboardBegin, created: TimeInterval)?
     private var stopped = false
     private var timer: DispatchSourceTimer?
@@ -177,6 +178,12 @@ public final class ClipboardTransfer {
             do {
                 onStatus?("正在准备剪贴板…")
                 let (type, parts) = try plan(payload)
+                if type == "files", matchesAppliedFiles(parts) {
+                    completion(true)
+                    onStatus?("接收的文件未变化，已跳过回传")
+                    return
+                }
+                appliedFiles = nil
                 cancelOutgoing("剪贴板已被新的复制内容替换")
                 discardIncoming(reason: .superseded)
                 clock &+= 1
@@ -281,7 +288,9 @@ public final class ClipboardTransfer {
                 }
                 pending.append((url, url.lastPathComponent))
             }
-            while let (url, relative) = pending.popLast() {
+            while let (next, relative) = pending.popLast() {
+                var url = next
+                url.removeAllCachedResourceValues()
                 _ = try ClipboardPaths.destination(root: storage, relative: relative)
                 let values = try url.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey, .isRegularFileKey, .fileSizeKey, .contentModificationDateKey])
                 guard values.isSymbolicLink != true, values.isDirectory == true || values.isRegularFile == true else {
@@ -299,6 +308,22 @@ public final class ClipboardTransfer {
             }
             return ("files", parts)
         }
+    }
+
+    private func matchesAppliedFiles(_ parts: [Part]) -> Bool {
+        guard let appliedFiles, appliedFiles.count == parts.count else { return false }
+        let current = parts.sorted { $0.path < $1.path }
+        let applied = appliedFiles.sorted { $0.path < $1.path }
+        return zip(current, applied).allSatisfy { left, right in
+            left.path == right.path && left.url?.standardizedFileURL == right.url?.standardizedFileURL
+                && left.directory == right.directory && left.size == right.size
+                && left.mode == right.mode && left.modified == right.modified
+        }
+    }
+
+    private func rememberAppliedFiles(_ payload: ClipboardPayload) {
+        if case .files = payload { appliedFiles = (try? plan(payload))?.1 }
+        else { appliedFiles = nil }
     }
 
     private func advance(_ transfer: Outgoing) throws {
@@ -478,6 +503,7 @@ public final class ClipboardTransfer {
                 self.queue.async {
                     guard !self.stopped, self.newest == value.revision else { return }
                     if accepted {
+                        self.rememberAppliedFiles(payload)
                         self.acknowledge(value.revision, value.sequence)
                         self.onStatus?("剪贴板接收完成，可以粘贴")
                     } else {
@@ -488,6 +514,7 @@ public final class ClipboardTransfer {
             }
         } else {
             onReceive?(payload)
+            rememberAppliedFiles(payload)
             acknowledge(value.revision, value.sequence)
             onStatus?("剪贴板接收完成，可以粘贴")
         }

@@ -285,12 +285,21 @@ final class InputInjector {
     private let source = CGEventSource(stateID: .hidSystemState)
     private let inputSources = InputSources()
     private var remoteCapsLock: Bool?
+    private let isTrusted: () -> Bool
+    private let postEvent: (CGEvent) -> Void
 
-    init(displayID: CGDirectDisplayID) { bounds = CGDisplayBounds(displayID) }
+    convenience init(displayID: CGDirectDisplayID) { self.init(bounds: CGDisplayBounds(displayID)) }
+
+    init(bounds: CGRect, isTrusted: @escaping () -> Bool = { AXIsProcessTrusted() },
+         postEvent: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) }) {
+        self.bounds = bounds
+        self.isTrusted = isTrusted
+        self.postEvent = postEvent
+    }
 
     func receive(_ input: RemoteInput) throws -> InputFeedback? {
         try input.validate()
-        guard AXIsProcessTrusted() else { releaseAll(); return nil }
+        guard isTrusted() else { releaseAll(); return nil }
         if input.independentCapsLock == true || input.kind == .switchInputSource || input.kind == .toggleCapsLock {
             if remoteCapsLock == nil { remoteCapsLock = CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift) }
         }
@@ -303,7 +312,7 @@ final class InputInjector {
                 modifiers.remove(.maskAlphaShift)
                 if remoteCapsLock == true { modifiers.insert(.maskAlphaShift) }
                 event?.flags = modifiers
-                event?.post(tap: .cghidEventTap)
+                if let event { postEvent(event) }
                 return InputFeedback(message: remoteCapsLock == true ? "远端大写锁定已开启" : "远端大写锁定已关闭",
                                      capsLocked: remoteCapsLock == true)
             }
@@ -350,8 +359,20 @@ final class InputInjector {
             }
         case .scroll:
             guard let pixels = try scroll.accumulate(deltaX: input.deltaX, deltaY: input.deltaY) else { return nil }
-            event = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
-                            wheel1: pixels.y, wheel2: pixels.x, wheel3: 0)
+            let heldButton = heldButtons.min()
+            let moveType: CGEventType = heldButton == nil ? .mouseMoved
+                : heldButton == 0 ? .leftMouseDragged : heldButton == 1 ? .rightMouseDragged : .otherMouseDragged
+            let moveButton = CGMouseButton(rawValue: UInt32(heldButton ?? 0)) ?? .left
+            guard let move = CGEvent(mouseEventSource: source, mouseType: moveType, mouseCursorPosition: point, mouseButton: moveButton),
+                  let wheel = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
+                    wheel1: pixels.y, wheel2: pixels.x, wheel3: 0) else {
+                throw DeskError.invalid("无法建立远端滚动事件")
+            }
+            // A scroll's location does not move the pointer used for window and view routing.
+            move.flags = flags
+            postEvent(move)
+            lastPoint = point
+            event = wheel
             event?.location = point
         case .move, .drag, .down, .up:
             let type: CGEventType
@@ -372,7 +393,7 @@ final class InputInjector {
         case .switchInputSource, .toggleCapsLock: return nil
         }
         event?.flags = flags
-        event?.post(tap: .cghidEventTap)
+        if let event { postEvent(event) }
         return nil
     }
 
@@ -382,14 +403,14 @@ final class InputInjector {
             let event = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false)
             if [54, 55, 56, 57, 58, 59, 60, 61, 62, 63].contains(key) { event?.type = .flagsChanged }
             event?.flags = remoteCapsLock == true ? [.maskAlphaShift] : []
-            event?.post(tap: .cghidEventTap)
+            if let event { postEvent(event) }
         }
         for button in heldButtons {
             let type: CGEventType = button == 0 ? .leftMouseUp : button == 1 ? .rightMouseUp : .otherMouseUp
             let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: lastPoint,
                                 mouseButton: CGMouseButton(rawValue: UInt32(button)) ?? .left)
             event?.flags = remoteCapsLock == true ? [.maskAlphaShift] : []
-            event?.post(tap: .cghidEventTap)
+            if let event { postEvent(event) }
         }
         heldKeys.removeAll()
         heldButtons.removeAll()

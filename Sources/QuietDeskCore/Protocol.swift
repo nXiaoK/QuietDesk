@@ -105,10 +105,12 @@ public struct StreamSettings: Codable, Equatable, Sendable {
     public static let legacyLongestEdges = [1280, 1920, 2560, 3840]
     public static let nativeLongestEdge = 8192
     public static let longestEdges = legacyLongestEdges + [nativeLongestEdge]
-    public static let frameRates = [10, 15, 30]
+    public static let legacyFrameRates = [10, 15, 30]
+    public static let frameRates = legacyFrameRates + [60]
     public static let legacyBitRates = [1, 2, 3, 5, 8, 12]
-    public static let bitRates = legacyBitRates + [30]
-    public static let highest = StreamSettings(longestEdge: nativeLongestEdge, framesPerSecond: 30, megabits: 30)
+    public static let extendedBitRates = legacyBitRates + [30]
+    public static let bitRates = extendedBitRates + [60, 100]
+    public static let highest = StreamSettings(longestEdge: nativeLongestEdge, framesPerSecond: 60, megabits: 100)
     public var longestEdge: Int
     public var framesPerSecond: Int
     public var megabits: Int
@@ -131,7 +133,11 @@ public struct StreamSettings: Codable, Equatable, Sendable {
 
     public var legacyCompatible: StreamSettings {
         StreamSettings(longestEdge: min(longestEdge, Self.legacyLongestEdges.last!),
-                       framesPerSecond: framesPerSecond, megabits: min(megabits, Self.legacyBitRates.last!))
+                       framesPerSecond: min(framesPerSecond, 30), megabits: min(megabits, Self.legacyBitRates.last!))
+    }
+
+    public var extendedCompatible: StreamSettings {
+        StreamSettings(longestEdge: longestEdge, framesPerSecond: min(framesPerSecond, 30), megabits: min(megabits, 30))
     }
 
     public func dimensions(width: Int, height: Int) -> (Int, Int) {
@@ -158,7 +164,9 @@ public struct Hello: Codable, Sendable {
     public let preferredSettings: StreamSettings?
     public let deviceID: UUID?
     public let deviceIdentityExchange: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil) {
+    public let highRefreshVideoSettings: Bool?
+    public let preferredHighRefreshSettings: StreamSettings?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -172,6 +180,8 @@ public struct Hello: Codable, Sendable {
         self.preferredSettings = preferredSettings
         self.deviceID = deviceID
         self.deviceIdentityExchange = deviceIdentityExchange
+        self.highRefreshVideoSettings = highRefreshVideoSettings
+        self.preferredHighRefreshSettings = preferredHighRefreshSettings
     }
 
     public func validate() throws {
@@ -181,6 +191,7 @@ public struct Hello: Codable, Sendable {
             throw DeskError.invalid("远端版本或画面参数不兼容")
         }
         if extendedVideoSettings == true, let preferredSettings { try preferredSettings.validateControlValues() }
+        if highRefreshVideoSettings == true, let preferredHighRefreshSettings { try preferredHighRefreshSettings.validateControlValues() }
     }
 }
 

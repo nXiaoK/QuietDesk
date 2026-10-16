@@ -58,12 +58,14 @@ final class DeskModel: ObservableObject {
     @Published private(set) var supportsInputActions = false
     @Published private(set) var supportsLiveSettings = false
     @Published private(set) var supportsExtendedVideoSettings = false
+    @Published private(set) var supportsHighRefreshVideoSettings = false
     @Published private(set) var activeVideoState: VideoStreamState?
     @Published private(set) var videoTuning: VideoTuningSession?
     @Published private(set) var videoSettingsStatus = ""
     var viewerSettings: StreamSettings { videoTuning?.desired ?? activeVideoState?.settings ?? StreamSettings() }
     var viewerLongestEdges: [Int] { supportsExtendedVideoSettings ? StreamSettings.longestEdges : StreamSettings.legacyLongestEdges }
-    var viewerBitRates: [Int] { supportsExtendedVideoSettings ? StreamSettings.bitRates : StreamSettings.legacyBitRates }
+    var viewerFrameRates: [Int] { supportsHighRefreshVideoSettings ? StreamSettings.frameRates : StreamSettings.legacyFrameRates }
+    var viewerBitRates: [Int] { supportsHighRefreshVideoSettings ? StreamSettings.bitRates : supportsExtendedVideoSettings ? StreamSettings.extendedBitRates : StreamSettings.legacyBitRates }
     @Published var inputStatus = ""
     @Published private(set) var connections = ConnectionStore.load()
     @Published var autoReconnect = UserDefaults.standard.object(forKey: "autoReconnect") as? Bool ?? true
@@ -502,8 +504,9 @@ final class DeskModel: ObservableObject {
                         self.hostDeviceIdentityAdvertised = self.trafficHistoryStore.localDeviceID != nil
                         candidate.send(try Wire.json(.hello, Hello(name: Host.current().localizedName ?? "家里 Mac",
                             width: width, height: height, settings: settings, canControl: self.canControl,
-                            preferredSettings: preferredSettings, deviceID: self.trafficHistoryStore.localDeviceID,
-                            deviceIdentityExchange: self.hostDeviceIdentityAdvertised ? true : nil)))
+                            preferredSettings: preferredSettings.extendedCompatible, deviceID: self.trafficHistoryStore.localDeviceID,
+                            deviceIdentityExchange: self.hostDeviceIdentityAdvertised ? true : nil,
+                            highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings)))
                         let streamer = ScreenStreamer()
                         self.streamer = streamer
                         streamer.onFrame = { [weak self, weak candidate] packet in
@@ -808,9 +811,12 @@ final class DeskModel: ObservableObject {
             activeVideoState = state
             supportsLiveSettings = hello.liveSettings == true
             supportsExtendedVideoSettings = supportsLiveSettings && hello.extendedVideoSettings == true
+            supportsHighRefreshVideoSettings = supportsExtendedVideoSettings && hello.highRefreshVideoSettings == true
             if supportsLiveSettings {
-                let hostDefault = supportsExtendedVideoSettings ? (hello.preferredSettings ?? hello.settings) : hello.settings
-                let preferred = viewerQualityPolicy.settingsForConnection(hostDefault: hostDefault, supportsExtended: supportsExtendedVideoSettings)
+                let hostDefault = supportsHighRefreshVideoSettings ? (hello.preferredHighRefreshSettings ?? hello.preferredSettings ?? hello.settings)
+                    : supportsExtendedVideoSettings ? (hello.preferredSettings ?? hello.settings) : hello.settings
+                let preferred = viewerQualityPolicy.settingsForConnection(hostDefault: hostDefault, supportsExtended: supportsExtendedVideoSettings,
+                                                                         supportsHighRefresh: supportsHighRefreshVideoSettings)
                 videoTuning = try VideoTuningSession(applied: state, preferred: preferred)
                 videoSettingsStatus = "当前生效：\(state.settings.summary)"
                 applyInitialVideoQualityIfReady()
@@ -879,6 +885,10 @@ final class DeskModel: ObservableObject {
             videoSettingsStatus = "共享端需更新后才能使用原分辨率和 30 Mbps"
             return
         }
+        guard supportsHighRefreshVideoSettings || settings == settings.extendedCompatible else {
+            videoSettingsStatus = "60 fps 与 60/100 Mbps 需两端更新后使用"
+            return
+        }
         do { try tuning.choose(settings) }
         catch { videoSettingsStatus = error.localizedDescription; return }
         viewerQualityPolicy.chooseManually()
@@ -898,7 +908,8 @@ final class DeskModel: ObservableObject {
 
     private func applyInitialVideoQualityIfReady() {
         guard connected, supportsLiveSettings, var tuning = videoTuning,
-              let settings = viewerQualityPolicy.takeInitialAutomaticSettings(supportsExtended: supportsExtendedVideoSettings) else { return }
+              let settings = viewerQualityPolicy.takeInitialAutomaticSettings(supportsExtended: supportsExtendedVideoSettings,
+                                                                              supportsHighRefresh: supportsHighRefreshVideoSettings) else { return }
         do { try tuning.choose(settings) }
         catch { videoSettingsStatus = error.localizedDescription; return }
         videoTuning = tuning
@@ -1188,6 +1199,7 @@ final class DeskModel: ObservableObject {
         hostSettingsRequestID = nil
         supportsLiveSettings = false
         supportsExtendedVideoSettings = false
+        supportsHighRefreshVideoSettings = false
         videoTuning = nil
         activeVideoState = nil
         videoSettingsStatus = ""

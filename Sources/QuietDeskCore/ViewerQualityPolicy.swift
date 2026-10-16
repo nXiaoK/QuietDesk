@@ -11,9 +11,9 @@ public struct ViewerQualityPolicy {
         initialDecisionPending = preferred == nil
     }
 
-    public mutating func settingsForConnection(hostDefault: StreamSettings, supportsExtended: Bool) -> StreamSettings {
+    public mutating func settingsForConnection(hostDefault: StreamSettings, supportsExtended: Bool, supportsHighRefresh: Bool = false) -> StreamSettings {
         let desired = preferred ?? hostDefault
-        let compatible = supportsExtended ? desired : desired.legacyCompatible
+        let compatible = supportsHighRefresh ? desired : supportsExtended ? desired.extendedCompatible : desired.legacyCompatible
         maySaveCurrentChoice = preferred == nil || desired == compatible
         return compatible
     }
@@ -23,10 +23,11 @@ public struct ViewerQualityPolicy {
         firstRoundTrip = milliseconds
     }
 
-    public mutating func takeInitialAutomaticSettings(supportsExtended: Bool) -> StreamSettings? {
+    public mutating func takeInitialAutomaticSettings(supportsExtended: Bool, supportsHighRefresh: Bool = false) -> StreamSettings? {
         guard initialDecisionPending, let firstRoundTrip else { return nil }
         initialDecisionPending = false
-        return supportsExtended && firstRoundTrip < 10 ? .highest : nil
+        guard supportsExtended, firstRoundTrip < 10 else { return nil }
+        return supportsHighRefresh ? .highest : StreamSettings.highest.extendedCompatible
     }
 
     public mutating func chooseManually() {

@@ -243,7 +243,7 @@ private struct SessionQualitySection: View {
                     Picker("帧率上限", selection: Binding(get: { model.viewerSettings.framesPerSecond }, set: { value in
                         var settings = model.viewerSettings; settings.framesPerSecond = value; model.chooseViewerSettings(settings)
                     })) {
-                        ForEach(StreamSettings.frameRates, id: \.self) { Text("\($0) fps").tag($0) }
+                        ForEach(model.viewerFrameRates, id: \.self) { Text("\($0) fps").tag($0) }
                     }
                     .labelsHidden().frame(maxWidth: .infinity)
                 }
@@ -298,7 +298,7 @@ private struct SessionQualitySection: View {
             }
         }
         .font(.system(size: compact ? 11 : 12))
-        .help("画质调整只改变当前共享会话，不修改共享端默认值；同一连接记录会恢复上次确认的画质。无已保存画质时，首次 RTT 低于 10 ms 默认选最高画质，手动选择优先。RTT 不代表网络类型。原分辨率不放大，上限单边 8192 像素、总计 3600 万像素；H.264 仍为有损。可连续选择，等待时会合并为最新设置。")
+        .help("画质调整只改变当前共享会话，不修改共享端默认值；同一连接记录会恢复上次确认的画质。无已保存画质时，首次 RTT 低于 10 ms 默认选最高画质，手动选择优先。RTT 不代表网络类型。原分辨率不放大，上限单边 8192 像素、总计 3600 万像素。60 fps 与 60/100 Mbps 需两端更新；H.264 / 4:2:0 仍为有损，窗口缩放也会影响细节。可连续选择，等待时会合并为最新设置。")
     }
 }
 

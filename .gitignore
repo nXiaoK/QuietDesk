@@ -1,5 +1,7 @@
 .build/
 dist/
+work/
+outputs/
 .DS_Store
 .swiftpm/
 __pycache__/

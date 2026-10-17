@@ -12,6 +12,7 @@ final class DeskModel: ObservableObject {
     @Published var port = UserDefaults.standard.string(forKey: "remotePort") ?? "5908"
     @Published var viewerCode = ""
     @Published var hostCode = ""
+    @Published private(set) var hostCodeNeedsSetup = false
     @Published var hostPort = UserDefaults.standard.string(forKey: "listenPort") ?? "5908" {
         didSet { UserDefaults.standard.set(hostPort, forKey: "listenPort") }
     }
@@ -130,8 +131,10 @@ final class DeskModel: ObservableObject {
         let address: String
         let port: UInt16
         let key: PairingKey
+        let recordID: UUID?
     }
     private var target: Target?
+    private var selectedConnectionID: UUID?
     private var savedTarget = false
     private var viewerQualityPolicy = ViewerQualityPolicy()
     private var screenObserver: NSObjectProtocol?
@@ -412,20 +415,37 @@ final class DeskModel: ObservableObject {
     func prepareHostCode() {
         guard hostCode.isEmpty else { return }
         do {
-            if let key = try KeyStore.load() { hostCode = key.code }
-            else { try replaceKey() }
+            if let key = try KeyStore.load() {
+                hostCode = key.code
+                hostCodeNeedsSetup = false
+            } else { hostCodeNeedsSetup = true }
         } catch { self.error = error.localizedDescription }
     }
 
     func regenerateKey() {
         guard !active, !working else { return }
-        do { try replaceKey() } catch { self.error = error.localizedDescription }
+        do {
+            let key = try PairingKey.generate()
+            try KeyStore.save(key)
+            hostCode = key.code
+            hostCodeNeedsSetup = false
+            status = "新配对码已保存，可以开启共享；旧配对码已失效"
+        } catch { self.error = error.localizedDescription }
     }
 
-    private func replaceKey() throws {
-        let key = try PairingKey.generate()
-        try KeyStore.save(key)
-        hostCode = key.code
+    func restoreHostCode(_ code: String) -> Bool {
+        guard !active, !working else { return false }
+        do {
+            let key = try PairingKey(code: code)
+            try KeyStore.save(key)
+            hostCode = key.code
+            hostCodeNeedsSetup = false
+            status = "原配对码已保存，可以开启共享"
+            return true
+        } catch {
+            self.error = error.localizedDescription
+            return false
+        }
     }
 
     func copyHostCode() {
@@ -502,10 +522,14 @@ final class DeskModel: ObservableObject {
 
     func startHosting(interactive: Bool = true) {
         guard !active, !working, !systemSleeping else { return }
+        prepareHostCode()
+        guard !hostCode.isEmpty else {
+            status = hostCodeNeedsSetup ? "请先补录原配对码，或明确选择生成新配对码，再开启共享" : "配对码未能读取，请检查本机凭据文件"
+            return
+        }
         DiagnosticLog.shared.record(.hostStarted, role: .host, state: .requested)
         hostingRequested = true
         hostRetryTask?.cancel()
-        prepareHostCode()
         do {
             let key = try PairingKey(code: hostCode)
             let port = try validPort(hostPort)
@@ -718,7 +742,8 @@ final class DeskModel: ObservableObject {
             let port = try validPort()
             UserDefaults.standard.set(address, forKey: "remoteAddress")
             UserDefaults.standard.set(self.port, forKey: "remotePort")
-            let target = Target(address: address, port: port.rawValue, key: key)
+            let record = ConnectionStore.matching(connections, address: address, port: port.rawValue, preferredID: selectedConnectionID)
+            let target = Target(address: address, port: port.rawValue, key: key, recordID: record?.id)
             self.target = target
             idlePolicy = SessionIdlePolicy(now: SessionClock.now)
             _ = idlePolicy.focusChanged(now: SessionClock.now, focused: sessionWindowFocused, suppressWake: true)
@@ -726,7 +751,7 @@ final class DeskModel: ObservableObject {
             wakeInputGate = SessionWakeInputGate()
             reconnectDeferredForIdle = false
             freshFrameRequiredOnReconnect = false
-            let saved = connections.first(where: { $0.matches(address: address, port: port.rawValue) })?.videoSettings
+            let saved = record?.videoSettings
             viewerQualityPolicy = ViewerQualityPolicy(preferred: saved.flatMap { (try? $0.validateControlValues()) != nil ? $0 : nil })
             savedTarget = false
             retryBackoff.reset()
@@ -875,11 +900,12 @@ final class DeskModel: ObservableObject {
         guard !active, !working else { return }
         address = record.address
         port = String(record.port)
+        selectedConnectionID = record.id
+        viewerCode = ""
         connectionError = nil
         do {
             guard let key = try KeyStore.load(account: "remote." + record.id.uuidString) else {
-                viewerCode = ""
-                throw DeskError.invalid("此记录的配对码不在钥匙串中，请重新粘贴并连接")
+                throw DeskError.invalid("此记录尚未保存到本机凭据文件。请在上方补录原配对码后连接；成功后会记住，无需读取钥匙串")
             }
             viewerCode = key.code
             connect()
@@ -890,6 +916,7 @@ final class DeskModel: ObservableObject {
         do {
             try KeyStore.remove(account: "remote." + record.id.uuidString)
             connections.removeAll { $0.id == record.id }
+            if selectedConnectionID == record.id { selectedConnectionID = nil }
             try ConnectionStore.save(connections)
         } catch { self.error = error.localizedDescription }
     }
@@ -897,7 +924,7 @@ final class DeskModel: ObservableObject {
     private func saveConnection(name: String) {
         guard !savedTarget, let target else { return }
         do {
-            var record = connections.first { $0.matches(address: target.address, port: target.port) }
+            var record = ConnectionStore.matching(connections, address: target.address, port: target.port, preferredID: target.recordID)
                 ?? ConnectionRecord(address: target.address, port: target.port, name: name)
             record.name = name
             record.lastConnected = Date()
@@ -1280,7 +1307,9 @@ final class DeskModel: ObservableObject {
     }
 
     private func saveVideoPreference(_ settings: StreamSettings) {
-        guard let target, let index = connections.firstIndex(where: { $0.matches(address: target.address, port: target.port) }) else { return }
+        guard let target,
+              let record = ConnectionStore.matching(connections, address: target.address, port: target.port, preferredID: target.recordID),
+              let index = connections.firstIndex(where: { $0.id == record.id }) else { return }
         connections[index].videoSettings = settings
         do { try ConnectionStore.save(connections) }
         catch { videoSettingsStatus = "画质已生效，但保存记录失败：\(error.localizedDescription)" }

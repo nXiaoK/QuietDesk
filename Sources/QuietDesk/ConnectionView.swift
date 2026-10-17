@@ -103,7 +103,7 @@ struct ConnectionView: View {
                                                    remove: { model.removeConnection(record) })
                                 }
                             }.disabled(locked)
-                            Text("点按「连接」使用已保存的配对码；悬停卡片或右键可移除记录。")
+                            Text("点按「连接」使用本机保存的配对码；旧记录首次需补录原码一次。悬停卡片或右键可移除记录。")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
@@ -117,7 +117,7 @@ struct ConnectionView: View {
         .sheet(isPresented: $showRecords) {
             VStack(alignment: .leading, spacing: 16) {
                 Text("管理连接记录").font(.title3.weight(.semibold))
-                Text("配对码保存在本机钥匙串。移除记录会同时删除该记录保存的配对码。")
+                Text("配对码保存在本机私有文件，由当前账户的文件权限保护，未单独加密。移除记录会删除本机文件中对应的配对码；旧钥匙串条目保持不动。")
                     .font(.callout).foregroundStyle(.secondary)
                 if model.connections.isEmpty {
                     ContentUnavailableView("没有连接记录", systemImage: "desktopcomputer")

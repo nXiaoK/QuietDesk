@@ -2,6 +2,14 @@ import Foundation
 import QuietDeskCore
 
 enum ConnectionStore {
+    static func matching(_ records: [ConnectionRecord], address: String, port: UInt16,
+                         preferredID: UUID? = nil) -> ConnectionRecord? {
+        if let preferredID, let selected = records.first(where: { $0.id == preferredID && $0.matches(address: address, port: port) }) {
+            return selected
+        }
+        return records.first { $0.matches(address: address, port: port) }
+    }
+
     static func load() -> [ConnectionRecord] {
         guard let data = UserDefaults.standard.data(forKey: "connections"),
               let records = try? JSONDecoder().decode([ConnectionRecord].self, from: data) else { return [] }

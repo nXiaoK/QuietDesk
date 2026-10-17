@@ -6,6 +6,7 @@ struct SharingView: View {
     @ObservedObject var model: DeskModel
     let openTraffic: () -> Void
     @State private var showCode = false
+    @State private var previousCode = ""
 
     private var locked: Bool { model.active || model.working }
 
@@ -32,6 +33,8 @@ struct SharingView: View {
             }
             .background(Color(nsColor: .windowBackgroundColor))
         }
+        .onAppear { model.prepareHostCode() }
+        .onDisappear { previousCode = "" }
     }
 
     private var mainColumn: some View {
@@ -146,12 +149,12 @@ struct SharingView: View {
             HStack {
                 Label("配对码", systemImage: "key.horizontal").font(.headline)
                 Spacer()
-                Text("保存在本机钥匙串").font(.caption).foregroundStyle(.secondary)
+                Text("保存在本机私有文件").font(.caption).foregroundStyle(.secondary)
             }
             card {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 12) {
-                        Text(showCode ? (model.hostCode.isEmpty ? "尚未生成" : model.hostCode) : "••••-••••-••••-••••")
+                        Text(model.hostCode.isEmpty ? "尚未配置" : showCode ? model.hostCode : "••••-••••-••••-••••")
                             .font(.system(.callout, design: .monospaced))
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -162,19 +165,38 @@ struct SharingView: View {
                             Label(showCode ? "隐藏" : "显示", systemImage: showCode ? "eye.slash" : "eye")
                         }
                         Button { model.copyHostCode() } label: { Label("复制配对码", systemImage: "doc.on.doc") }
+                            .disabled(model.hostCode.isEmpty)
                     }
                     .controlSize(.small)
+                    if model.hostCodeNeedsSetup {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("已有配对码请补录一次，保持原设备连接。这里不再读取钥匙串；无法取得旧码时可在下方生成新码。")
+                                .font(.caption).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            HStack(spacing: 8) {
+                                SecureField("输入原来的完整配对码", text: $previousCode)
+                                    .textFieldStyle(.roundedBorder)
+                                    .accessibilityLabel("原来的主机配对码")
+                                Button("保存原配对码") {
+                                    if model.restoreHostCode(previousCode) { previousCode = "" }
+                                }
+                                .disabled(previousCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            }
+                            .disabled(locked)
+                        }
+                    }
                     Divider()
                     HStack(alignment: .top, spacing: 12) {
                         VStack(alignment: .leading, spacing: 5) {
                             Text("持有配对码即可查看和控制这台 Mac，请只交给自己的设备。")
+                            Text("本机文件由当前账户权限保护，未单独加密。生成新码会让原配对码失效。")
                             if locked { Text("共享中不可重新生成；停止共享后可用。") }
                         }
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                         Spacer(minLength: 0)
-                        Button("重新生成…") { model.regenerateKey() }
+                        Button(model.hostCode.isEmpty ? "生成新配对码" : "重新生成…") { model.regenerateKey() }
                             .controlSize(.small)
                             .disabled(locked)
                     }

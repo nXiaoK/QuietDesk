@@ -103,15 +103,19 @@ private final class ClipboardPair {
         let session = UUID()
         localSync = ClipboardSync(session: session, allowsFileSending: true, allowsAutomaticSending: localAllowed,
             pasteboard: local, storage: storage.appendingPathComponent("local")) { [weak self] message in
-                guard let self else { return }
-                self.localMessages.append(message.kind)
-                if self.routeLocal?(message) != false { self.remoteSync.receive(message) }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.localMessages.append(message.kind)
+                    if self.routeLocal?(message) != false { self.remoteSync.receive(message) }
+                }
             }
         remoteSync = ClipboardSync(session: session, allowsFileSending: true, allowsAutomaticSending: remoteAllowed,
             pasteboard: remote, storage: storage.appendingPathComponent("remote")) { [weak self] message in
-                guard let self else { return }
-                self.remoteMessages.append(message.kind)
-                if self.routeRemote?(message) != false { self.localSync.receive(message) }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.remoteMessages.append(message.kind)
+                    if self.routeRemote?(message) != false { self.localSync.receive(message) }
+                }
             }
     }
 
@@ -668,7 +672,7 @@ private struct ClipboardFocusChecks {
                 let pasteboard = MemoryPasteboard()
                 var messages: [MessageKind] = []
                 let sync = ClipboardSync(session: UUID(), allowsFileSending: true, pasteboard: pasteboard,
-                    storage: folder.appendingPathComponent(type)) { messages.append($0.kind) }
+                    storage: folder.appendingPathComponent(type)) { message in DispatchQueue.main.async { messages.append(message.kind) } }
                 defer { sync.stop() }
                 let begin = "{\"revision\":{\"counter\":1,\"origin\":\"\(UUID().uuidString)\"},\"sequence\":0,\"type\":\"\(type)\",\"count\":1,\"bytes\":\(limit + 1)}"
                 sync.receive(Message(.clipboardBegin, Data(begin.utf8)))
@@ -690,7 +694,7 @@ private struct ClipboardFocusChecks {
             let pasteboard = MemoryPasteboard(), probe = ImageConversionProbe()
             var messages: [MessageKind] = []
             let sync = ClipboardSync(session: UUID(), allowsFileSending: true, pasteboard: pasteboard, storage: folder,
-                                     convertTIFF: { probe.convert($0) }) { messages.append($0.kind) }
+                                     convertTIFF: { probe.convert($0) }) { message in DispatchQueue.main.async { messages.append(message.kind) } }
             defer { probe.release.signal(); sync.stop() }
             pasteboard.copy(.text(Data("fallback".utf8)))
             pasteboard.rawTIFF = Data([1, 2, 3])

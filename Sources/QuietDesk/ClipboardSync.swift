@@ -93,6 +93,7 @@ final class ClipboardSync {
     private var allowsAutomaticSending: Bool
     private let pasteboard: ClipboardPasteboard
     private let transfer: ClipboardTransfer
+    nonisolated let receiveMessage: @Sendable (Message) -> Void
     private var timer: Timer?
     private var observedChange: Int
     private var pendingFileOffer: (id: UUID, change: Int)?
@@ -109,7 +110,7 @@ final class ClipboardSync {
     private var lastSharedMarker: String?
     private let session: UUID
 
-    init(session: UUID, allowsFileSending: Bool, allowsAutomaticSending: Bool = true,
+    init(session: UUID, allowsFileSending: Bool, allowsAutomaticSending: Bool = true, allowsChunkWindow: Bool = false,
          pasteboard: ClipboardPasteboard? = nil, storage: URL? = nil,
          convertTIFF: @escaping (Data) -> Data? = { data in
              autoreleasepool { NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) }
@@ -122,13 +123,11 @@ final class ClipboardSync {
         let pasteboard = pasteboard ?? SystemClipboardPasteboard()
         self.pasteboard = pasteboard
         observedChange = pasteboard.changeCount
-        transfer = ClipboardTransfer(storage: storage ?? Self.storageURL, requireFileApproval: true)
-        transfer.onSend = { [weak self] message in
-            DispatchQueue.main.async {
-                guard let self, self.running else { return }
-                send(message)
-            }
-        }
+        let transfer = ClipboardTransfer(storage: storage ?? Self.storageURL, requireFileApproval: true,
+                                         allowsChunkWindow: allowsChunkWindow)
+        self.transfer = transfer
+        receiveMessage = { [weak transfer] message in transfer?.receive(message) }
+        transfer.onSend = send
         transfer.onApply = { [weak self] payload, completion in
             DispatchQueue.main.async {
                 guard let self else { completion(false); return }
@@ -176,7 +175,7 @@ final class ClipboardSync {
         if let timer { RunLoop.main.add(timer, forMode: .common) }
     }
 
-    func receive(_ message: Message) { transfer.receive(message) }
+    func receive(_ message: Message) { receiveMessage(message) }
 
     func setAutomaticSendingAllowed(_ allowed: Bool) {
         allowsAutomaticSending = allowed

@@ -28,9 +28,12 @@ public struct ClipboardPreference: Codable {
     public let session: UUID?
     public let fileApproval: Bool?
     public let receivesAutomaticUpdates: Bool?
-    public init(enabled: Bool, session: UUID? = nil, fileApproval: Bool? = true, receivesAutomaticUpdates: Bool? = nil) {
+    public let chunkWindow: Bool?
+    public init(enabled: Bool, session: UUID? = nil, fileApproval: Bool? = true, receivesAutomaticUpdates: Bool? = nil,
+                chunkWindow: Bool? = true) {
         self.enabled = enabled; self.session = session; self.fileApproval = fileApproval
         self.receivesAutomaticUpdates = receivesAutomaticUpdates
+        self.chunkWindow = chunkWindow
     }
 }
 
@@ -60,6 +63,7 @@ private struct ClipboardBegin: Codable {
     let bytes: UInt64
     let names: [String]?
     let rootCount: Int?
+    let chunkWindow: Bool?
 }
 
 private struct ClipboardEntry: Codable {
@@ -102,6 +106,7 @@ public final class ClipboardTransfer {
     private let queue = DispatchQueue(label: "quietdesk.clipboard.files", qos: .utility)
     private let storage: URL
     private let requireFileApproval: Bool
+    private let allowsChunkWindow: Bool
     private let origin = UUID()
     private var clock: UInt64 = 0
     private var newest: ClipboardRevision?
@@ -112,6 +117,8 @@ public final class ClipboardTransfer {
     private var stopped = false
     private var timer: DispatchSourceTimer?
     private static let chunkSize = 32_768
+    private static let windowChunkSize = 262_144
+    private static let maximumInFlightMessages: UInt64 = 16
 
     private struct Part {
         let path: String
@@ -126,8 +133,10 @@ public final class ClipboardTransfer {
         let revision: ClipboardRevision
         let parts: [Part]
         let completion: (Bool) -> Void
+        let windowed: Bool
         var index = -1
         var sequence: UInt64 = 0
+        var acknowledged: UInt64?
         var remaining: UInt64 = 0
         var offset = 0
         var handle: FileHandle?
@@ -136,8 +145,9 @@ public final class ClipboardTransfer {
         var transferred: UInt64 = 0
         var total: UInt64 = 0
         var progressAt: TimeInterval = 0
-        init(revision: ClipboardRevision, parts: [Part], completion: @escaping (Bool) -> Void) {
+        init(revision: ClipboardRevision, parts: [Part], windowed: Bool, completion: @escaping (Bool) -> Void) {
             self.revision = revision; self.parts = parts; self.completion = completion
+            self.windowed = windowed
         }
         deinit { try? handle?.close() }
     }
@@ -156,8 +166,9 @@ public final class ClipboardTransfer {
         deinit { try? handle?.close() }
     }
 
-    public init(storage: URL, requireFileApproval: Bool = false) {
+    public init(storage: URL, requireFileApproval: Bool = false, allowsChunkWindow: Bool = false) {
         self.storage = storage; self.requireFileApproval = requireFileApproval
+        self.allowsChunkWindow = allowsChunkWindow
     }
 
     public func respondToFileOffer(id: UUID, accept: Bool) {
@@ -199,7 +210,7 @@ public final class ClipboardTransfer {
                 clock &+= 1
                 let revision = ClipboardRevision(counter: clock, origin: origin)
                 newest = revision
-                let transfer = Outgoing(revision: revision, parts: parts, completion: completion)
+                let transfer = Outgoing(revision: revision, parts: parts, windowed: allowsChunkWindow, completion: completion)
                 outgoing = transfer
                 installed = true
                 var total: UInt64 = 0
@@ -216,7 +227,7 @@ public final class ClipboardTransfer {
                     rootCount = urls.count
                 } else { names = nil; rootCount = nil }
                 sendJSON(.clipboardBegin, ClipboardBegin(revision: revision, sequence: 0, type: type, count: parts.count,
-                    bytes: total, names: names, rootCount: rootCount))
+                    bytes: total, names: names, rootCount: rootCount, chunkWindow: transfer.windowed ? true : nil))
                 ensureTimer()
                 onStatus?(type == "files" ? "已发送文件信息，等待对端确认接收（90 秒内）" : "正在同步剪贴板：\(parts.count) 项，\(ByteCountFormatter.string(fromByteCount: Int64(clamping: total), countStyle: .file))")
             } catch {
@@ -238,13 +249,21 @@ public final class ClipboardTransfer {
                 case .clipboardEnd: try end(Wire.readJSON(ClipboardReceipt.self, message.payload))
                 case .clipboardReceipt:
                     let receipt = try Wire.readJSON(ClipboardReceipt.self, message.payload)
-                    guard let outgoing, receipt.revision == outgoing.revision, receipt.sequence == outgoing.sequence else { return }
+                    guard let outgoing, receipt.revision == outgoing.revision else { return }
+                    guard receipt.sequence <= outgoing.sequence else { throw DeskError.invalid("剪贴板确认序号超出发送范围") }
+                    if let acknowledged = outgoing.acknowledged {
+                        guard receipt.sequence > acknowledged else { return }
+                        guard outgoing.windowed || receipt.sequence == outgoing.sequence else { return }
+                    } else {
+                        guard receipt.sequence == 0 else { throw DeskError.invalid("剪贴板开始确认无效") }
+                    }
+                    outgoing.acknowledged = receipt.sequence
                     outgoing.updated = ProcessInfo.processInfo.systemUptime
-                    if outgoing.ending {
+                    if outgoing.ending, receipt.sequence == outgoing.sequence {
                         self.outgoing = nil
                         outgoing.completion(true)
                         onStatus?("剪贴板已同步")
-                    } else { try advance(outgoing) }
+                    } else { try fillWindow(outgoing) }
                 case .clipboardCancel:
                     let receipt = try Wire.readJSON(ClipboardReceipt.self, message.payload)
                     if outgoing?.revision == receipt.revision {
@@ -337,11 +356,17 @@ public final class ClipboardTransfer {
         else { appliedFiles = nil }
     }
 
+    private func fillWindow(_ transfer: Outgoing) throws {
+        guard let acknowledged = transfer.acknowledged else { return }
+        let credit = transfer.windowed ? Self.maximumInFlightMessages : 1
+        while !transfer.ending, transfer.sequence - acknowledged < credit { try advance(transfer) }
+    }
+
     private func advance(_ transfer: Outgoing) throws {
         transfer.sequence &+= 1
         if transfer.remaining > 0 {
             let part = transfer.parts[transfer.index]
-            let count = Int(min(UInt64(Self.chunkSize), transfer.remaining))
+            let count = Int(min(UInt64(transfer.windowed ? Self.windowChunkSize : Self.chunkSize), transfer.remaining))
             let bytes: Data
             if let data = part.data { bytes = data.subdata(in: transfer.offset..<(transfer.offset + count)) }
             else { bytes = try transfer.handle?.read(upToCount: count) ?? Data() }
@@ -413,6 +438,7 @@ public final class ClipboardTransfer {
             onStatus?(error.localizedDescription)
             return
         }
+        guard value.chunkWindow != true || allowsChunkWindow else { throw DeskError.invalid("对端未协商剪贴板传输窗口") }
         newest = value.revision
         cancelOutgoing("对端有更新的剪贴板内容")
         discardIncoming(reason: .superseded)
@@ -473,7 +499,8 @@ public final class ClipboardTransfer {
         let sequence: UInt64 = try reader.take()
         guard pendingFileOffer?.begin.revision != revision else { throw DeskError.invalid("尚未确认接收文件") }
         guard let incoming, incoming.begin.revision == revision else { return }
-        guard sequence == incoming.sequence + 1, reader.remaining > 0, reader.remaining <= Self.chunkSize,
+        let maximumChunk = incoming.begin.chunkWindow == true ? Self.windowChunkSize : Self.chunkSize
+        guard sequence == incoming.sequence + 1, reader.remaining > 0, reader.remaining <= maximumChunk,
               UInt64(reader.remaining) <= incoming.remaining, let handle = incoming.handle else { throw DeskError.invalid("文件分块顺序或长度无效") }
         let bytes = try reader.bytes(reader.remaining)
         try handle.write(contentsOf: bytes)

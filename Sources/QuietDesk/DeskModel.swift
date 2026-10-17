@@ -122,6 +122,7 @@ final class DeskModel: ObservableObject {
     private var supportsClipboard = false
     private var remoteClipboardEnabled = false
     private var remoteFileApproval = false
+    private var remoteClipboardChunkWindow = false
     private var remoteReceivesAutomaticClipboard = true
     private var remoteClipboardFocusAware = false
     private var lastClipboardReceivePreference: Bool?
@@ -931,6 +932,7 @@ final class DeskModel: ObservableObject {
             supportsClipboard = true
             remoteClipboardEnabled = preference.enabled
             remoteFileApproval = preference.fileApproval == true
+            remoteClipboardChunkWindow = preference.chunkWindow == true
             remoteReceivesAutomaticClipboard = preference.receivesAutomaticUpdates ?? true
             remoteClipboardFocusAware = preference.receivesAutomaticUpdates != nil
             if first { try sendClipboardPreference(to: peer) }
@@ -1095,6 +1097,7 @@ final class DeskModel: ObservableObject {
             guard preference.session == clipboardSession else { throw DeskError.invalid("剪贴板会话不匹配") }
             remoteClipboardEnabled = preference.enabled
             remoteFileApproval = preference.fileApproval == true
+            remoteClipboardChunkWindow = preference.chunkWindow == true
             remoteReceivesAutomaticClipboard = preference.receivesAutomaticUpdates ?? true
             remoteClipboardFocusAware = preference.receivesAutomaticUpdates != nil
             updateClipboardSync()
@@ -1540,7 +1543,7 @@ final class DeskModel: ObservableObject {
         canvas.synchronizesClipboard = enabled
         if enabled, clipboardSync == nil, let peer, let clipboardSession {
             let sync = ClipboardSync(session: clipboardSession, allowsFileSending: remoteFileApproval,
-                allowsAutomaticSending: automaticClipboardSendingAllowed) { [weak peer] in peer?.send($0) }
+                allowsAutomaticSending: automaticClipboardSendingAllowed, allowsChunkWindow: remoteClipboardChunkWindow) { [weak peer] in peer?.send($0) }
             clipboardSync = sync
             sync.onDiagnostic = { [weak self, weak sync] event in
                 guard let self, let sync, self.clipboardSync === sync else { return }
@@ -1776,6 +1779,7 @@ final class DeskModel: ObservableObject {
         supportsClipboard = false
         remoteClipboardEnabled = false
         remoteFileApproval = false
+        remoteClipboardChunkWindow = false
         remoteReceivesAutomaticClipboard = true
         remoteClipboardFocusAware = false
         lastClipboardReceivePreference = nil

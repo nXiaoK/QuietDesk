@@ -533,10 +533,22 @@ final class DeskModel: ObservableObject {
                     self.refreshDisplays()
                     _ = try self.selectShareableDisplay(content.displays)
                     let listener = try NWListener(using: SecureTransport.parameters(key: key), on: port)
+                    let admission = PendingHandshakeGate()
                     listener.newConnectionHandler = { [weak self] connection in
+                        let address: String?
+                        if case .hostPort(let host, _) = connection.endpoint { address = host.debugDescription }
+                        else { address = nil }
+                        guard let id = admission.reserve(address: address, now: ProcessInfo.processInfo.systemUptime) else {
+                            connection.cancel()
+                            return
+                        }
                         DispatchQueue.main.async {
-                            guard let self, self.generation == token, self.active else { connection.cancel(); return }
-                            self.accept(connection, generation: token)
+                            guard let self, self.generation == token, self.active else {
+                                admission.release(id)
+                                connection.cancel()
+                                return
+                            }
+                            self.accept(connection, generation: token, admission: admission, id: id)
                         }
                     }
                     listener.stateUpdateHandler = { [weak self] state in
@@ -578,13 +590,13 @@ final class DeskModel: ObservableObject {
         }
     }
 
-    private func accept(_ connection: NWConnection, generation token: UUID) {
-        let candidate = Peer(connection: connection)
+    private func accept(_ connection: NWConnection, generation token: UUID, admission: PendingHandshakeGate, id: UUID) {
+        let candidate = Peer(connection: connection, handshakeTimeout: peer == nil ? 15 : 5)
         let session = makeTrafficSession(for: candidate)
         let history = trafficHistoryStore
-        let id = UUID()
         pending[id] = candidate
         candidate.onReady = { [weak self, weak candidate] in
+            admission.release(id)
             DispatchQueue.main.async {
                 guard let self, let candidate, self.pending.removeValue(forKey: id) != nil,
                       self.generation == token, self.active, self.hostingRequested else { return }
@@ -680,6 +692,7 @@ final class DeskModel: ObservableObject {
             }
         }
         candidate.onClose = { [weak self, weak candidate] reason in
+            admission.release(id)
             history.requestFlush()
             DispatchQueue.main.async {
                 guard let self else { return }

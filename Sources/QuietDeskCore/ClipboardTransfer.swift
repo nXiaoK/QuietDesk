@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 
-public enum ClipboardPayload {
+public enum ClipboardPayload: Sendable {
     case text(Data), png(Data), files([URL])
 }
 
@@ -55,6 +55,21 @@ public enum ClipboardFileOfferEndReason {
     case accepted, declined, superseded, cancelled, failed, timedOut, stopped
 }
 
+public final class ClipboardApplyPermit: @unchecked Sendable {
+    private let lock = NSLock()
+    private var valid = true
+
+    public func performIfValid(_ apply: () -> Bool) -> Bool {
+        lock.withLock {
+            guard valid else { return false }
+            valid = false
+            return apply()
+        }
+    }
+
+    fileprivate func invalidate() { lock.withLock { valid = false } }
+}
+
 private struct ClipboardBegin: Codable {
     let revision: ClipboardRevision
     let sequence: UInt64
@@ -100,6 +115,7 @@ public final class ClipboardTransfer {
     public var onSend: ((Message) -> Void)?
     public var onReceive: ((ClipboardPayload) -> Void)?
     public var onApply: ((ClipboardPayload, @escaping (Bool) -> Void) -> Void)?
+    public var onApplyWithPermit: ((ClipboardPayload, ClipboardApplyPermit, @escaping (Bool) -> Void) -> Void)?
     public var onStatus: ((String) -> Void)?
     public var onFileOffer: ((ClipboardFileOffer?) -> Void)?
     public var onFileOfferEnded: ((UUID, ClipboardFileOfferEndReason) -> Void)?
@@ -116,6 +132,7 @@ public final class ClipboardTransfer {
     private var incoming: Incoming?
     private var appliedFiles: [Part]?
     private var pendingFileOffer: (id: UUID, begin: ClipboardBegin, created: TimeInterval)?
+    private var applying: (revision: ClipboardRevision, permit: ClipboardApplyPermit)?
     private var stopped = false
     private var timer: DispatchSourceTimer?
     private static let chunkSize = 32_768
@@ -271,6 +288,10 @@ public final class ClipboardTransfer {
                     } else { try fillWindow(outgoing) }
                 case .clipboardCancel:
                     let receipt = try Wire.readJSON(ClipboardReceipt.self, message.payload)
+                    if applying?.revision == receipt.revision {
+                        applying?.permit.invalidate(); applying = nil
+                        onStatus?(receipt.reason ?? "剪贴板接收已取消")
+                    }
                     if outgoing?.revision == receipt.revision {
                         cancelOutgoing(receipt.reason ?? "对端取消同步", notify: false)
                         onStatus?(receipt.reason ?? "剪贴板同步已取消")
@@ -557,11 +578,17 @@ public final class ClipboardTransfer {
             try? FileManager.default.removeItem(at: incoming.directory)
         }
         self.incoming = nil
-        if let onApply {
-            onApply(payload) { [weak self] accepted in
+        if onApplyWithPermit != nil || onApply != nil {
+            let permit = onApplyWithPermit == nil ? nil : ClipboardApplyPermit()
+            if let permit { applying = (value.revision, permit) }
+            let completion: (Bool) -> Void = { [weak self] accepted in
                 guard let self else { return }
                 self.queue.async {
                     guard !self.stopped, self.newest == value.revision else { return }
+                    if let permit {
+                        guard self.applying?.permit === permit else { return }
+                        permit.invalidate(); self.applying = nil
+                    }
                     if accepted {
                         self.rememberAppliedFiles(payload)
                         self.acknowledge(value.revision, value.sequence)
@@ -572,6 +599,8 @@ public final class ClipboardTransfer {
                     }
                 }
             }
+            if let onApplyWithPermit, let permit { onApplyWithPermit(payload, permit, completion) }
+            else { onApply?(payload, completion) }
         } else {
             onReceive?(payload)
             rememberAppliedFiles(payload)
@@ -596,6 +625,7 @@ public final class ClipboardTransfer {
         onFileOffer?(nil)
     }
     private func discardIncoming(reason: ClipboardFileOfferEndReason) {
+        applying?.permit.invalidate(); applying = nil
         finishFileOffer(reason)
         guard let incoming else { return }
         try? incoming.handle?.close(); incoming.handle = nil

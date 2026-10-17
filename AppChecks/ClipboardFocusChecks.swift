@@ -100,7 +100,8 @@ private final class ClipboardPair {
     var routeLocal: ((Message) -> Bool)?
     var routeRemote: ((Message) -> Bool)?
 
-    init(storage: URL, localAllowed: Bool = false, remoteAllowed: Bool = false) {
+    init(storage: URL, localAllowed: Bool = false, remoteAllowed: Bool = false,
+         validateRemotePNG: ((Data) -> Bool)? = nil) {
         let session = UUID()
         localSync = ClipboardSync(session: session, allowsFileSending: true, allowsAutomaticSending: localAllowed,
             pasteboard: local, storage: storage.appendingPathComponent("local")) { [weak self] message in
@@ -111,7 +112,7 @@ private final class ClipboardPair {
                 }
             }
         remoteSync = ClipboardSync(session: session, allowsFileSending: true, allowsAutomaticSending: remoteAllowed,
-            pasteboard: remote, storage: storage.appendingPathComponent("remote")) { [weak self] message in
+            pasteboard: remote, storage: storage.appendingPathComponent("remote"), validatePNG: validateRemotePNG) { [weak self] message in
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.remoteMessages.append(message.kind)
@@ -708,6 +709,104 @@ private struct ClipboardFocusChecks {
             probe.release.signal()
             pump(for: 0.15)
             try require(messages.filter { $0 == .clipboardBegin }.count == 1, "Stale image superseded a newer copy")
+        }
+
+        run("Received PNG validates on a background queue before publication and paste readiness") { folder in
+            guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+                  let png = bitmap.representation(using: .png, properties: [:]) else {
+                throw FocusCheckFailure("Cannot create an in-memory PNG")
+            }
+            let probe = ImageConversionProbe()
+            let pair = ClipboardPair(storage: folder, localAllowed: true, validateRemotePNG: { bytes in
+                guard let checked = probe.convert(bytes) else { return false }
+                return NSBitmapImageRep(data: checked) != nil
+            })
+            defer { probe.release.signal(); pair.stop() }
+            var events: [ClipboardSync.DiagnosticEvent] = []
+            pair.localSync.onDiagnostic = { events.append($0) }
+            pair.local.copy(.png(png))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("PNG validation did not start") { probe.state.began }
+            try require(probe.state.background && pair.remote.writes == 0 && !events.contains(.sent(.png, fileCount: 0)),
+                        "PNG was decoded on main or acknowledged before validation")
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            var paste: Bool?
+            pair.remoteSync.prepareForPaste { paste = $0 }
+            try require(paste == nil, "Unvalidated PNG was reported paste-ready")
+            probe.release.signal()
+            try eventually("Validated PNG was not published and acknowledged") {
+                pair.remote.writes == 1 && paste == true && events.contains(.sent(.png, fileCount: 0))
+            }
+        }
+
+        run("Invalid received PNG is rejected without publication, success acknowledgement or paste readiness") { folder in
+            let probe = ImageConversionProbe()
+            let pair = ClipboardPair(storage: folder, localAllowed: true, validateRemotePNG: { bytes in
+                guard let checked = probe.convert(bytes) else { return false }
+                return NSBitmapImageRep(data: checked) != nil
+            })
+            defer { probe.release.signal(); pair.stop() }
+            var localEvents: [ClipboardSync.DiagnosticEvent] = [], remoteEvents: [ClipboardSync.DiagnosticEvent] = []
+            pair.localSync.onDiagnostic = { localEvents.append($0) }
+            pair.remoteSync.onDiagnostic = { remoteEvents.append($0) }
+            pair.local.copy(.png(Data([0, 1, 2, 3])))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Invalid PNG validation did not start") { probe.state.began }
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            var paste: Bool?
+            pair.remoteSync.prepareForPaste { paste = $0 }
+            try require(paste == nil && probe.state.background, "Invalid PNG validated on main or reported readiness early")
+            probe.release.signal()
+            try eventually("Invalid PNG did not fail at both ends") {
+                remoteEvents.contains(.applyFailed(.png, fileCount: 0)) && localEvents.contains(.sendFailed(.png, fileCount: 0))
+            }
+            try require(pair.remote.writes == 0 && paste == false && !localEvents.contains(.sent(.png, fileCount: 0)),
+                        "Invalid PNG was published or acknowledged as successful")
+        }
+
+        for interruption in ["new-copy", "remote-revision", "remote-cancel", "stop"] {
+            run("Pending PNG validation cannot publish after \(interruption)") { folder in
+                let probe = ImageConversionProbe()
+                let pair = ClipboardPair(storage: folder, localAllowed: true,
+                    validateRemotePNG: { probe.convert($0) != nil })
+                defer { probe.release.signal(); pair.stop() }
+                var begin: Message?, cancelled = false
+                pair.routeLocal = { message in if message.kind == .clipboardBegin { begin = message }; return true }
+                pair.remoteSync.onStatus = { if $0 == "cancel pending image" { cancelled = true } }
+                pair.local.copy(.png(Data([1, 2, 3])))
+                pair.localSync.setAutomaticSendingAllowed(true)
+                try eventually("No pending PNG validation") { probe.state.began }
+                switch interruption {
+                case "new-copy":
+                    pair.remote.copy(.text(Data("new local copy".utf8)))
+                case "remote-revision":
+                    pair.local.copy(.text(Data("new remote revision".utf8)))
+                    pair.localSync.setAutomaticSendingAllowed(true)
+                    try eventually("New remote revision did not apply") { pair.remote.copiedText == "new remote revision" }
+                case "remote-cancel":
+                    guard let begin,
+                          var receipt = try JSONSerialization.jsonObject(with: begin.payload) as? [String: Any] else {
+                        throw FocusCheckFailure("No PNG revision to cancel")
+                    }
+                    receipt["reason"] = "cancel pending image"
+                    pair.remoteSync.receive(Message(.clipboardCancel, try JSONSerialization.data(withJSONObject: receipt)))
+                    try eventually("Pending image cancellation was not processed") { cancelled }
+                default: pair.remoteSync.stop()
+                }
+                probe.release.signal()
+                pump(for: 0.15)
+                if interruption == "remote-revision" {
+                    try require(pair.remote.writes == 1 && pair.remote.copiedText == "new remote revision",
+                                "Old PNG overwrote a newer remote revision")
+                } else {
+                    try require(pair.remote.writes == 0, "Cancelled or superseded PNG was published")
+                    if interruption == "new-copy" {
+                        try require(pair.remote.copiedText == "new local copy", "PNG overwrote a newer local copy")
+                    }
+                }
+            }
         }
 
         run("Sensitive clipboard contents are neither read nor sent by polling or paste preparation") { folder in

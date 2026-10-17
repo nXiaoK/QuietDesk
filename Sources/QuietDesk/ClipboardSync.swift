@@ -107,6 +107,8 @@ final class ClipboardSync {
     private var imagePreparation: UUID?
     private let imageQueue = DispatchQueue(label: "quietdesk.clipboard.images", qos: .utility)
     private let convertTIFF: (Data) -> Data?
+    private let validatePNG: (Data) -> Bool
+    private var imageApplication: (token: UUID, completion: (Bool) -> Void)?
     private var waiters: [(Bool) -> Void] = []
     private var running = true
     private var hasSharedState = false
@@ -118,11 +120,13 @@ final class ClipboardSync {
          convertTIFF: @escaping (Data) -> Data? = { data in
              autoreleasepool { NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) }
          },
+         validatePNG: ((Data) -> Bool)? = nil,
          send: @escaping (Message) -> Void) {
         self.session = session
         self.allowsFileSending = allowsFileSending
         self.allowsAutomaticSending = allowsAutomaticSending
         self.convertTIFF = convertTIFF
+        self.validatePNG = validatePNG ?? { data in autoreleasepool { NSBitmapImageRep(data: data) != nil } }
         let pasteboard = pasteboard ?? SystemClipboardPasteboard()
         self.pasteboard = pasteboard
         observedChange = pasteboard.changeCount
@@ -131,16 +135,17 @@ final class ClipboardSync {
         self.transfer = transfer
         receiveMessage = { [weak transfer] message in transfer?.receive(message) }
         transfer.onSend = send
-        transfer.onApply = { [weak self] payload, completion in
+        transfer.onApplyWithPermit = { [weak self] payload, permit, completion in
             DispatchQueue.main.async {
                 guard let self else { completion(false); return }
-                completion(self.apply(payload))
+                self.prepareApplication(payload, permit: permit, completion: completion)
             }
         }
         transfer.onStatus = { [weak self] status in DispatchQueue.main.async { self?.onStatus?(status) } }
         transfer.onFileOffer = { [weak self] offer in
             DispatchQueue.main.async {
                 guard let self, self.running, let offer else { return }
+                self.cancelImageApplication()
                 if self.imagePreparation != nil {
                     self.imagePreparation = nil
                     self.sendingChange = nil
@@ -208,6 +213,7 @@ final class ClipboardSync {
             completion(false)
             return
         }
+        if imageApplication != nil { waiters.append(completion); return }
         let change = pasteboard.changeCount
         if change == sharedChange { completion(true); return }
         if let files = pasteboard.fileURLs, !files.isEmpty {
@@ -229,6 +235,7 @@ final class ClipboardSync {
 
     func stop() {
         running = false
+        cancelImageApplication()
         imagePreparation = nil
         timer?.invalidate(); timer = nil
         transfer.stop()
@@ -248,6 +255,7 @@ final class ClipboardSync {
         let change = pasteboard.changeCount
         observedChange = change
         imagePreparation = nil
+        cancelImageApplication()
         guard !pasteboard.isSensitive else {
             sendingChange = nil
             onStatus?("剪贴板内容已标记为敏感，未同步到对端")
@@ -324,7 +332,7 @@ final class ClipboardSync {
             return
         }
         staleFileChange = nil
-        let contentMarker = marker(for: payload)
+        let contentMarker = Self.marker(for: payload, session: session)
         let isFile: Bool
         if case .files = payload { isFile = true } else { isFile = false }
         if isFile {
@@ -359,7 +367,52 @@ final class ClipboardSync {
         }
     }
 
-    private func apply(_ payload: ClipboardPayload) -> Bool {
+    private func cancelImageApplication() {
+        guard let pending = imageApplication else { return }
+        imageApplication = nil
+        pending.completion(false)
+        let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+    }
+
+    private func prepareApplication(_ payload: ClipboardPayload, permit: ClipboardApplyPermit,
+                                    completion: @escaping (Bool) -> Void) {
+        guard running else { completion(false); return }
+        cancelImageApplication()
+        guard case .png(let bytes) = payload else {
+            completion(permit.performIfValid { apply(payload) })
+            return
+        }
+        let token = UUID(), change = pasteboard.changeCount, session = session
+        imageApplication = (token, completion)
+        let validate = validatePNG
+        imageQueue.async { [weak self] in
+            let valid = validate(bytes)
+            let contentMarker = valid ? Self.marker(for: payload, session: session) : nil
+            DispatchQueue.main.async {
+                guard let self, self.imageApplication?.token == token else { return }
+                self.imageApplication = nil
+                guard self.running, self.pasteboard.changeCount == change else {
+                    completion(false)
+                    let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
+                    return
+                }
+                guard let contentMarker else {
+                    self.onDiagnostic?(.applyFailed(.png, fileCount: 0))
+                    self.onStatus?("接收的图片无效")
+                    completion(false)
+                    let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
+                    return
+                }
+                let accepted = permit.performIfValid { self.apply(payload, contentMarker: contentMarker) }
+                completion(accepted)
+                if !accepted {
+                    let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
+                }
+            }
+        }
+    }
+
+    private func apply(_ payload: ClipboardPayload, contentMarker: String? = nil) -> Bool {
         guard running else { return false }
         let summary = diagnosticSummary(for: payload)
         switch payload {
@@ -368,15 +421,10 @@ final class ClipboardSync {
                 onDiagnostic?(.applyFailed(summary.kind, fileCount: summary.fileCount))
                 return false
             }
-        case .png(let bytes):
-            guard NSBitmapImageRep(data: bytes) != nil else {
-                onDiagnostic?(.applyFailed(summary.kind, fileCount: summary.fileCount))
-                onStatus?("接收的图片无效")
-                return false
-            }
+        case .png: break
         case .files: break
         }
-        let contentMarker = marker(for: payload)
+        let contentMarker = contentMarker ?? Self.marker(for: payload, session: session)
         guard pasteboard.write(payload, marker: contentMarker) else {
             onDiagnostic?(.applyFailed(summary.kind, fileCount: summary.fileCount))
             onStatus?("系统剪贴板写入失败")
@@ -403,7 +451,7 @@ final class ClipboardSync {
         }
     }
 
-    private func marker(for payload: ClipboardPayload) -> String {
+    nonisolated private static func marker(for payload: ClipboardPayload, session: UUID) -> String {
         let data: Data
         let type: String
         switch payload {

@@ -61,8 +61,8 @@ python3 scripts/version.py current
 
 工作流分为：
 
-- **CI**：PR 面向 `main` 时运行 Python 版本检查、`QuietDeskChecks`、Universal 构建及应用元数据检查，也支持手动运行。它没有运行下方全部独立 App 检查脚本，也不发布安装包。
-- **Build and release macOS**：推送 `main` 会触发；手动运行仅从 `main` 发布。它执行版本与 Core 检查、Universal 构建、打包，随后创建标签并发布 Release。默认仍为临时签名、未公证。
+- **CI**：PR 面向 `main` 时运行 Python 版本检查、`QuietDeskChecks`、下方独立 App 检查、Universal 构建及应用元数据检查，也支持手动运行，不发布安装包。
+- **Build and release macOS**：推送 `main` 会触发；手动运行仅从 `main` 发布。它执行版本、Core 与独立 App 检查、Universal 构建、打包，随后创建标签并发布 Release。默认仍为临时签名、未公证。
 
 自动发布按正式版本标签分配版本：`auto` 首次使用配置的版本下限，之后递增补丁号；手动运行可选 `patch`、`minor`、`major`。构建号由基础值加工作流运行序号生成。流程串行执行，同次运行重跑会复用已分配标签；文件先上传到草稿后公开。发布前若 `main` 已有更新提交，旧任务跳过正式发布，由新提交继续处理。
 
@@ -72,6 +72,8 @@ python3 scripts/version.py current
 swift run --disable-sandbox QuietDeskChecks
 ./scripts/run-app-checks.sh
 ./scripts/run-input-checks.sh
+./scripts/run-video-checks.sh
+./scripts/run-session-data-checks.sh
 ./scripts/run-session-effects-checks.sh
 ./scripts/run-traffic-checks.sh
 ./scripts/run-log-checks.sh
@@ -83,6 +85,8 @@ python3 -m unittest discover -s scripts/tests -v
 | `QuietDeskChecks` | 协议、兼容、视频、剪贴板传输、画质、流量及空闲策略；网络检查仅使用 `127.0.0.1` |
 | `run-app-checks.sh` | 实际 `ClipboardSync` 配合内存剪贴板和临时目录，验证焦点与传输顺序 |
 | `run-input-checks.sh` | 验证真实 AppKit 鼠标、滚轮事件到远程输入的转换，以及被控端 CGEvent 字段；使用离屏画布与假提交器，不向系统注入输入 |
+| `run-video-checks.sh` | 编码丢帧恢复、三帧窗口和画质/暂停边界，CoreMedia 数据持有与合成 H.264 编解码；不采集屏幕 |
+| `run-session-data-checks.sh` | 后台数据路由、解码确认、新画面令牌、旧会话隔离与并发指标聚合 |
 | `run-session-effects-checks.sh` | 假音频、假遮罩及会话退出屏障，验证取消和恢复顺序 |
 | `run-traffic-checks.sh` | 临时目录中的设备身份、历史保存及错误处理 |
 | `run-log-checks.sh` | 临时目录中的日志轮转、并发聚合、隐私字段、文件权限与导出错误恢复 |

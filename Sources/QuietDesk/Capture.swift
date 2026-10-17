@@ -4,6 +4,7 @@ import QuietDeskCore
 
 // Encoder and acknowledgement state share one queue with the capture pump.
 struct VideoFrameFlow {
+    static let maximumOutstandingFrames = 3
     private(set) var sequence: UInt32
     private(set) var encoding: UInt32?
     private(set) var waiting: [UInt32: TimeInterval] = [:]
@@ -17,7 +18,8 @@ struct VideoFrameFlow {
     var isIdle: Bool { encoding == nil && waiting.isEmpty }
 
     mutating func begin(at now: TimeInterval) -> (sequence: UInt32, forceKeyFrame: Bool)? {
-        guard encoding == nil, waiting.isEmpty else { return nil }
+        // The encoding reservation also consumes a credit; there is no unbounded encoder queue.
+        guard encoding == nil, waiting.count < Self.maximumOutstandingFrames else { return nil }
         repeat { sequence &+= 1 } while waiting[sequence] != nil
         encoding = sequence
         encodingStartedAt = now
@@ -258,25 +260,21 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             guard running, captureStarted, let stream else { throw DeskError.invalid("屏幕采集尚未就绪") }
             return stream
         }
-        if paused {
-            try queue.sync {
-                guard running, stream === current else { throw CancellationError() }
-                sessionPaused = true
-            }
-            return true
-        }
         try await pauseAtFrameBoundary()
         do {
             try Task.checkCancellation()
             try queue.sync {
                 guard running, stream === current else { throw CancellationError() }
-                sessionPaused = false
-                frameFlow.requestKeyFrame()
-                latest = lastCapture
-                discardMismatchedFrame()
+                sessionPaused = paused
+                if paused { reconfiguring = false }
+                else {
+                    frameFlow.requestKeyFrame()
+                    latest = lastCapture
+                    discardMismatchedFrame()
+                }
             }
             // The caller sends the resume result before releasing the new keyframe.
-            return false
+            return paused
         } catch {
             queue.sync {
                 guard running, stream === current else { return }
@@ -327,7 +325,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                     guard let self, let waiter = self.idleWaiter, waiter.0 == token else { return }
                     self.idleWaiter = nil
                     self.reconfiguring = false
-                    waiter.1.resume(throwing: DeskError.invalid("上一帧仍未确认，请稍后重试画质调整"))
+                    waiter.1.resume(throwing: DeskError.invalid("仍有视频帧未确认，请稍后重试调整"))
                     self.pump()
                 }
             }

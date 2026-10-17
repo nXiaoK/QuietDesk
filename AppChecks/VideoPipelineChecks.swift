@@ -82,6 +82,99 @@ private struct VideoPipelineChecks {
             try require(flow.isIdle && flow.stalled(at: 200) == nil, "A failed submission did not drain its encoder state")
         }
 
+        run("Three outstanding frames fill the credit window and encoding also reserves a credit") {
+            var flow = VideoFrameFlow()
+            var sent: [UInt32] = []
+            for index in 0..<3 {
+                guard let frame = flow.begin(at: Double(index)) else { throw VideoCheckFailure("The window stopped before three frames") }
+                try require(flow.begin(at: Double(index)) == nil, "More than one encoding operation was submitted")
+                _ = flow.encoded(frame.sequence, at: Double(index))
+                sent.append(frame.sequence)
+            }
+            try require(flow.waiting.count == 3 && flow.begin(at: 3) == nil, "The window exceeded its three-frame bound")
+            _ = flow.acknowledge(sent[1])
+            let fourth = flow.begin(at: 4)
+            try require(fourth != nil && flow.waiting.count == 2, "A released credit did not allow another frame")
+            try require(flow.begin(at: 4) == nil, "An encoding frame was not counted against the window")
+            _ = flow.encoded(fourth!.sequence, at: 4)
+            try require(flow.waiting.count == 3 && flow.begin(at: 5) == nil, "An encoded replacement overfilled the window")
+        }
+
+        run("Out-of-order and duplicate acknowledgements release only their own credit") {
+            var flow = VideoFrameFlow()
+            var sent: [UInt32] = []
+            for index in 0..<3 {
+                let frame = flow.begin(at: Double(index))!
+                _ = flow.encoded(frame.sequence, at: Double(index))
+                sent.append(frame.sequence)
+            }
+            try require(!flow.acknowledge(sent[2] &+ 1) && flow.waiting.count == 3, "An unknown ack released a credit")
+            try require(flow.acknowledge(sent[2]) && flow.waiting.count == 2, "An out-of-order ack was ignored")
+            try require(!flow.acknowledge(sent[2]) && flow.waiting.count == 2, "A duplicate ack released a second credit")
+            try require(!flow.isIdle, "A partial acknowledgement drained the frame boundary")
+            _ = flow.acknowledge(sent[0])
+            try require(!flow.isIdle, "The boundary ignored the remaining older frame")
+            _ = flow.acknowledge(sent[1])
+            try require(flow.isIdle, "All acknowledged frames did not drain the boundary")
+        }
+
+        run("A reconfiguration or pause boundary waits for both all acknowledgements and encoding") {
+            var flow = VideoFrameFlow()
+            let first = flow.begin(at: 0)!
+            _ = flow.encoded(first.sequence, at: 0)
+            let second = flow.begin(at: 1)!
+            _ = flow.acknowledge(first.sequence)
+            try require(!flow.isIdle, "The boundary resumed while a frame was still encoding")
+            _ = flow.dropped(second.sequence)
+            try require(flow.isIdle, "A dropped final frame prevented the boundary from draining")
+            flow.requestKeyFrame()
+            try require(flow.begin(at: 2)?.forceKeyFrame == true, "Resume did not preserve its mandatory keyframe")
+        }
+
+        run("A drop returns the encoding credit without releasing older in-flight frames") {
+            var flow = VideoFrameFlow()
+            for index in 0..<2 {
+                let frame = flow.begin(at: Double(index))!
+                _ = flow.encoded(frame.sequence, at: Double(index))
+            }
+            let dropped = flow.begin(at: 2)!
+            _ = flow.dropped(dropped.sequence)
+            try require(flow.waiting.count == 2 && !flow.isIdle, "A drop released an unrelated frame or drained the boundary")
+            try require(!flow.acknowledge(dropped.sequence), "A dropped frame incorrectly required an ack")
+            try require(flow.begin(at: 3) != nil, "A dropped frame consumed its credit permanently")
+        }
+
+        run("New frames and acknowledgements cannot hide the oldest missing acknowledgement") {
+            var flow = VideoFrameFlow()
+            let first = flow.begin(at: 0)!
+            _ = flow.encoded(first.sequence, at: 0)
+            let second = flow.begin(at: 30)!
+            _ = flow.encoded(second.sequence, at: 30)
+            let third = flow.begin(at: 60)!
+            _ = flow.encoded(third.sequence, at: 60)
+            _ = flow.acknowledge(second.sequence)
+            _ = flow.acknowledge(third.sequence)
+            try require(flow.stalled(at: 91)?.contains("确认") == true, "Recent frames extended an older frame's timeout")
+            _ = flow.acknowledge(first.sequence)
+            try require(flow.stalled(at: 91) == nil, "An acknowledged frame remained in the watchdog")
+        }
+
+        run("The credit window and per-frame acknowledgements survive sequence wraparound") {
+            var flow = VideoFrameFlow(sequence: UInt32.max - 1)
+            var sent: [UInt32] = []
+            for index in 0..<3 {
+                let frame = flow.begin(at: Double(index))!
+                _ = flow.encoded(frame.sequence, at: Double(index))
+                sent.append(frame.sequence)
+            }
+            try require(sent == [UInt32.max, 0, 1], "Frame sequence did not wrap without trapping")
+            try require(flow.acknowledge(0) && !flow.acknowledge(0), "A wrapped sequence was ignored or acknowledged twice")
+            _ = flow.acknowledge(UInt32.max)
+            try require(!flow.isIdle && flow.waiting[1] != nil, "A pre-wrap acknowledgement released a post-wrap frame")
+            _ = flow.acknowledge(1)
+            try require(flow.isIdle, "Wrapped frames did not drain")
+        }
+
         print("Video pipeline checks: \(passed) passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

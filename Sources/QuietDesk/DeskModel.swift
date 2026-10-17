@@ -98,10 +98,9 @@ final class DeskModel: ObservableObject {
     private var peer: Peer?
     private var dataChannel: SessionDataChannel?
     private var pending: [UUID: Peer] = [:]
-    private var streamer: ScreenStreamer?
-    private var injector: InputInjector?
+    private var hostSession = HostSession()
+    private var viewerSession = ViewerSession()
     private var generation = UUID()
-    private var helloReceived = false
     private var activity: NSObjectProtocol?
     private var metricsTimer: Timer?
     private var permissionTimer: Timer?
@@ -109,10 +108,7 @@ final class DeskModel: ObservableObject {
     private var capsLockStartAttempted = false
     private var controlStatusUpdatesEnabled = false
     private var lastMetrics = SessionClock.now
-    private var captureTask: Task<Void, Never>?
-    private var lastLatencyAt: TimeInterval?
     private var reconnectTask: Task<Void, Never>?
-    private var stableTask: Task<Void, Never>?
     private var hostRetryTask: Task<Void, Never>?
     private var retryBackoff = RetryBackoff()
     private var hostBackoff = RetryBackoff()
@@ -138,37 +134,22 @@ final class DeskModel: ObservableObject {
     private var target: Target?
     private var savedTarget = false
     private var viewerQualityPolicy = ViewerQualityPolicy()
-    private var pendingVideoPreferenceCanSave = true
-    private var videoDebounceTask: Task<Void, Never>?
-    private var videoRequestTimeout: Task<Void, Never>?
-    private var hostSettingsTask: Task<Void, Never>?
-    private var hostSettingsRequestID: UUID?
     private var screenObserver: NSObjectProtocol?
     private var powerObservers: [NSObjectProtocol] = []
     private var systemSleeping = false
     private var displayRefreshTask: Task<Void, Never>?
     private var hostPreparationTask: Task<Void, Never>?
-    private var capturedDisplay: DisplaySnapshot?
     private let trafficHistoryStore = TrafficHistoryStore()
     private var trafficSession: TrafficSession?
-    private var hostDeviceIdentityAdvertised = false
-    private var hostSessionEffects: HostSessionEffects?
-    private var hostEffectsTask: Task<Void, Never>?
     private var effectsCleanupTask: Task<Void, Never>?
-    private var effectsRequestID: UUID?
-    private var effectsRequestTimeout: Task<Void, Never>?
     private var idlePolicy = SessionIdlePolicy(now: SessionClock.now)
     private var pauseTransmission = SessionPauseTransmission()
     private var wakeInputGate = SessionWakeInputGate()
-    private var pauseRequestTimeout: Task<Void, Never>?
-    private var hostPauseTask: Task<Void, Never>?
-    private var hostPaused = false
     private var reconnectDeferredForIdle = false
     private var windowActivityMonitor: Any?
     private var sessionFocusObservers: [NSObjectProtocol] = []
     private var focusRefreshTask: Task<Void, Never>?
     private var suppressIdleFocusWake = false
-    private var restoreCanvasFocusAfterIdle = false
     private var freshFrameRequiredOnReconnect = false
 
     init() {
@@ -386,7 +367,7 @@ final class DeskModel: ObservableObject {
 
         if mode == .host, connected, canControl != accessibility {
             canControl = accessibility
-            if !accessibility { injector?.releaseAll() }
+            if !accessibility { hostSession.injector?.releaseAll() }
             status = accessibility ? "正在共享 · 允许键盘鼠标控制" : "正在共享 · 仅观看（辅助功能未生效）"
             if controlStatusUpdatesEnabled, let peer {
                 do { peer.send(try Wire.json(.controlStatus, ControlStatus(canControl: accessibility))) }
@@ -502,7 +483,7 @@ final class DeskModel: ObservableObject {
         let available = current.map { displaySnapshot($0.id) }
         if let selection = DisplaySelection.select(preferred: displayID, main: CGMainDisplayID(), available: available),
            selection.id != displayID { displayID = selection.id }
-        if mode == .host, hostingRequested, active, let capturedDisplay,
+        if mode == .host, hostingRequested, active, let capturedDisplay = hostSession.capturedDisplay,
            DisplaySelection.requiresRestart(captured: capturedDisplay, available: available) {
             DiagnosticLog.shared.record(.displayChanged, role: .host, state: .requested)
             restartHostAfterFailure("共享显示器已变化，正在重新准备共享")
@@ -620,21 +601,22 @@ final class DeskModel: ObservableObject {
                 self.trafficSession = session
                 self.trafficHistoryStatus = "等待远端设备标识；旧版设备需双方升级后才能累计。"
                 self.status = "正在准备连接画面…"
-                self.captureTask = Task { [weak self, weak candidate] in
-                    guard let self, let candidate else { return }
+                let host = self.hostSession
+                host.captureTask = Task { [weak self, weak candidate, weak host] in
+                    guard let self, let candidate, let host, self.hostSession === host else { return }
                     do {
                         await self.effectsCleanupTask?.value
-                        guard self.generation == token, self.peer === candidate, !Task.isCancelled else { return }
+                        guard self.generation == token, self.peer === candidate, self.hostSession === host, !Task.isCancelled else { return }
                         self.installHostSessionEffects(for: candidate)
                         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                        guard self.generation == token, self.active, self.peer === candidate, !Task.isCancelled else { return }
+                        guard self.generation == token, self.active, self.peer === candidate, self.hostSession === host, !Task.isCancelled else { return }
                         self.refreshDisplays()
                         let (display, snapshot) = try self.selectShareableDisplay(content.displays)
                         let preferredSettings = self.settings
                         let settings = preferredSettings.legacyCompatible
                         let capture = ScreenStreamer.prepareCapture(display: display, settings: settings)
                         let (width, height) = (capture.width, capture.height)
-                        self.capturedDisplay = snapshot
+                        host.capturedDisplay = snapshot
                         self.connected = true
                         self.canControl = AXIsProcessTrusted()
                         self.status = self.canControl ? "正在共享 · 允许键盘鼠标控制" : "正在共享 · 仅观看（未授权辅助功能）"
@@ -642,16 +624,16 @@ final class DeskModel: ObservableObject {
                         let state = VideoStreamState(settings: settings, width: width, height: height)
                         self.activeVideoState = state
                         self.recordVideoConfiguration(state)
-                        self.injector = InputInjector(displayID: display.displayID)
-                        self.hostDeviceIdentityAdvertised = self.trafficHistoryStore.localDeviceID != nil
+                        host.injector = InputInjector(displayID: display.displayID)
+                        host.deviceIdentityAdvertised = self.trafficHistoryStore.localDeviceID != nil
                         candidate.send(try Wire.json(.hello, Hello(name: Host.current().localizedName ?? "家里 Mac",
                             width: width, height: height, settings: settings, canControl: self.canControl,
                             preferredSettings: preferredSettings.extendedCompatible, deviceID: self.trafficHistoryStore.localDeviceID,
-                            deviceIdentityExchange: self.hostDeviceIdentityAdvertised ? true : nil,
+                            deviceIdentityExchange: host.deviceIdentityAdvertised ? true : nil,
                             highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings,
                             sessionEffects: true, sessionPause: true)))
                         let streamer = ScreenStreamer()
-                        self.streamer = streamer
+                        host.streamer = streamer
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak candidate] packet in
                             guard let candidate else { return }
@@ -660,22 +642,22 @@ final class DeskModel: ObservableObject {
                                 channel.recordFrame()
                             } catch { candidate.close(error.localizedDescription) }
                         }
-                        streamer.onDiagnosticError = { [weak self, weak candidate] error in
+                        streamer.onDiagnosticError = { [weak self, weak candidate, weak host] error in
                             DispatchQueue.main.async {
-                                guard let self, let candidate, self.peer === candidate else { return }
+                                guard let self, let candidate, let host, self.peer === candidate, self.hostSession === host else { return }
                                 self.recordDiagnosticFailure(.captureFailed, error: error)
                             }
                         }
                         streamer.onError = { [weak candidate] in candidate?.close($0, retryable: true) }
-                        streamer.onUserStop = { [weak self, weak candidate] in
+                        streamer.onUserStop = { [weak self, weak candidate, weak host] in
                             DispatchQueue.main.async {
-                                guard let self, let candidate, self.peer === candidate else { return }
+                                guard let self, let candidate, let host, self.peer === candidate, self.hostSession === host else { return }
                                 self.recordDisconnect("用户从系统停止了屏幕共享")
                                 self.stop()
                             }
                         }
                         try await streamer.start(capture)
-                        guard self.generation == token, self.active, self.peer === candidate, !Task.isCancelled else {
+                        guard self.generation == token, self.active, self.peer === candidate, self.hostSession === host, !Task.isCancelled else {
                             await streamer.stop()
                             return
                         }
@@ -684,9 +666,9 @@ final class DeskModel: ObservableObject {
                                      .pixelHeight: capture.sourceHeight, .logicalWidth: Int(snapshot.bounds.width),
                                      .logicalHeight: Int(snapshot.bounds.height)])
                     } catch {
-                        guard self.generation == token, self.active, self.peer === candidate, !Task.isCancelled else { return }
+                        guard self.generation == token, self.active, self.peer === candidate, self.hostSession === host, !Task.isCancelled else { return }
                         self.recordDiagnosticFailure(.captureFailed, error: error)
-                        if self.capturedDisplay == nil { self.restartHostAfterFailure("共享准备失败：\(error.localizedDescription)") }
+                        if host.capturedDisplay == nil { self.restartHostAfterFailure("共享准备失败：\(error.localizedDescription)") }
                         else { candidate.close(error.localizedDescription, retryable: true) }
                     }
                 }
@@ -758,21 +740,22 @@ final class DeskModel: ObservableObject {
     }
 
     private func makeDataChannel(for peer: Peer) -> SessionDataChannel {
-        SessionDataChannel(send: { [weak peer] in peer?.send($0) }) { [weak self, weak peer] token in
+        let viewer = viewerSession
+        return SessionDataChannel(send: { [weak peer] in peer?.send($0) }) { [weak self, weak peer, weak viewer] token in
             DispatchQueue.main.async {
-                guard let self, let peer, self.peer === peer,
+                guard let self, let peer, let viewer, self.peer === peer, self.viewerSession === viewer,
                       self.pauseTransmission.decodedFreshFrame(token: token) else { return }
                 self.dataChannel?.expectFreshFrame(nil)
-                self.pauseRequestTimeout?.cancel()
+                viewer.pauseRequestTimeout?.cancel()
                 self.sessionPauseStatus = ""
                 self.freshFrameRequiredOnReconnect = false
                 self.publishSessionPause()
-                if self.restoreCanvasFocusAfterIdle, self.sessionWindowFocused, self.canControl,
+                if viewer.restoreCanvasFocusAfterIdle, self.sessionWindowFocused, self.canControl,
                    let window = self.mainWindow, NSApp.keyWindow === window,
                    window.firstResponder == nil || window.firstResponder === window || window.firstResponder === self.canvas {
                     window.makeFirstResponder(self.canvas)
                 }
-                self.restoreCanvasFocusAfterIdle = false
+                viewer.restoreCanvasFocusAfterIdle = false
             }
         }
     }
@@ -795,16 +778,17 @@ final class DeskModel: ObservableObject {
         dataChannel = channel
         active = true
         working = true
-        helloReceived = false
-        candidate.onRoundTripMilliseconds = { [weak self, weak candidate] milliseconds in
+        let viewer = viewerSession
+        viewer.helloReceived = false
+        candidate.onRoundTripMilliseconds = { [weak self, weak candidate, weak viewer] milliseconds in
             DispatchQueue.main.async {
-                guard let self, let candidate, self.peer === candidate else { return }
+                guard let self, let candidate, let viewer, self.peer === candidate, self.viewerSession === viewer else { return }
                 self.roundTripMilliseconds = milliseconds
                 if let microseconds = Int(exactly: (milliseconds * 1_000).rounded()), microseconds >= 0 {
                     DiagnosticLog.shared.record(.connectionMetrics, role: .viewer, values: [.roundTripMicroseconds: microseconds])
                 }
                 self.latency = String(format: milliseconds < 10 ? "%.1f ms" : "%.0f ms", milliseconds)
-                self.lastLatencyAt = SessionClock.now
+                viewer.lastLatencyAt = SessionClock.now
                 self.viewerQualityPolicy.observeRoundTrip(milliseconds)
                 self.applyInitialVideoQualityIfReady()
             }
@@ -939,7 +923,7 @@ final class DeskModel: ObservableObject {
         case .sessionEffectsRequest:
             applyHostSessionEffects(try Wire.readJSON(SessionEffectsRequest.self, message.payload), peer: peer)
         case .deviceIdentity:
-            guard hostDeviceIdentityAdvertised, let trafficSession,
+            guard hostSession.deviceIdentityAdvertised, let trafficSession,
                   trafficSession.connectionID == peer.trafficMeter.connectionID else {
                 throw DeskError.invalid("当前连接未启用设备标识交换")
             }
@@ -956,18 +940,18 @@ final class DeskModel: ObservableObject {
         case .acknowledgement:
             guard message.payload.count == 4 else { throw DeskError.invalid("画面确认无效") }
             var reader = ByteReader(message.payload)
-            streamer?.acknowledge(try reader.take() as UInt32)
+            hostSession.streamer?.acknowledge(try reader.take() as UInt32)
         case .input:
             let input = try Wire.readJSON(RemoteInput.self, message.payload)
             try input.validate()
             if input.kind == .scroll {
                 DiagnosticLog.shared.count(.scrollReceived)
-                if !canControl || hostPaused || hostPauseTask != nil { DiagnosticLog.shared.count(.scrollSuppressed) }
+                if !canControl || hostSession.paused || hostSession.pauseTask != nil { DiagnosticLog.shared.count(.scrollSuppressed) }
             }
-            if canControl, !hostPaused, hostPauseTask == nil, let feedback = try injector?.receive(input) {
+            if canControl, !hostSession.paused, hostSession.pauseTask == nil, let feedback = try hostSession.injector?.receive(input) {
                 peer.send(try Wire.json(.inputStatus, feedback))
             }
-        case .releaseInput: injector?.releaseAll()
+        case .releaseInput: hostSession.injector?.releaseAll()
         case .clipboard: try receiveClipboard(message.payload)
         case .requestClipboard: sendClipboard(to: peer)
         case .clipboardSettings:
@@ -997,7 +981,7 @@ final class DeskModel: ObservableObject {
     private func handleViewer(_ message: Message, peer: Peer) throws {
         switch message.kind {
         case .hello:
-            guard !helloReceived else { throw DeskError.invalid("重复的会话信息") }
+            guard !viewerSession.helloReceived else { throw DeskError.invalid("重复的会话信息") }
             let hello = try Wire.readJSON(Hello.self, message.payload)
             try hello.validate()
             if reconnecting, idlePolicy.isPaused || idlePolicy.tick(now: SessionClock.now) {
@@ -1006,7 +990,7 @@ final class DeskModel: ObservableObject {
                 deferReconnectForIdle("连接恢复前已达到空闲时限")
                 return
             }
-            helloReceived = true
+            viewerSession.helloReceived = true
             dataChannel?.configureVideo(canvas.makeVideoReceiver())
             connected = true
             working = false
@@ -1029,10 +1013,11 @@ final class DeskModel: ObservableObject {
             if hello.deviceIdentityExchange == true, let id = trafficHistoryStore.localDeviceID {
                 peer.send(try Wire.json(.deviceIdentity, DeviceIdentity(id: id, name: Host.current().localizedName ?? "这台 Mac")))
             }
-            stableTask?.cancel()
-            stableTask = Task { [weak self, weak peer] in
+            let viewer = viewerSession
+            viewer.stableTask?.cancel()
+            viewer.stableTask = Task { [weak self, weak peer, weak viewer] in
                 do { try await Task.sleep(for: .seconds(30)) } catch { return }
-                guard let self, let peer, self.peer === peer else { return }
+                guard let self, let peer, let viewer, self.peer === peer, self.viewerSession === viewer else { return }
                 self.retryBackoff.reset()
             }
             supportsClipboard = hello.clipboardSync == true
@@ -1072,13 +1057,13 @@ final class DeskModel: ObservableObject {
             sendNextSessionPause()
             if let token = pauseTransmission.freshFrameToken { scheduleFreshFrameTimeout(token, peer: peer) }
         case .sessionPauseResult:
-            guard helloReceived, supportsSessionPause else { throw DeskError.invalid("当前连接未启用空闲暂停") }
+            guard viewerSession.helloReceived, supportsSessionPause else { throw DeskError.invalid("当前连接未启用空闲暂停") }
             let result = try Wire.readJSON(SessionPauseResult.self, message.payload)
             let oldRequest = pauseTransmission.pending
             guard pauseTransmission.receive(result) else { return }
             DiagnosticLog.shared.record(result.paused ? .sessionPaused : .sessionResumed, role: .viewer,
                 state: result.error == nil ? .succeeded : .failed)
-            pauseRequestTimeout?.cancel()
+            viewerSession.pauseRequestTimeout?.cancel()
             if let error = result.error {
                 sessionPauseStatus = "暂停/恢复失败：\(error)"
                 if !result.paused, oldRequest?.paused == true { self.error = "空闲暂停失败，画面仍在传输：\(error)" }
@@ -1090,19 +1075,19 @@ final class DeskModel: ObservableObject {
             sendNextSessionPause()
             if let token = pauseTransmission.freshFrameToken { scheduleFreshFrameTimeout(token, peer: peer) }
         case .sessionEffectsResult:
-            guard helloReceived, supportsSessionEffects else { throw DeskError.invalid("当前连接未启用被控端设置") }
+            guard viewerSession.helloReceived, supportsSessionEffects else { throw DeskError.invalid("当前连接未启用被控端设置") }
             let result = try Wire.readJSON(SessionEffectsResult.self, message.payload)
-            guard result.id == nil || result.id == effectsRequestID else { return }
+            guard result.id == nil || result.id == viewerSession.effectsRequestID else { return }
             sessionEffects = result.state
             DiagnosticLog.shared.record(.sessionEffectsChanged, role: .viewer, state: result.error == nil ? .succeeded : .failed)
             sessionEffectsStatus = result.error ?? "被控端设置已生效"
             if result.id != nil {
-                effectsRequestTimeout?.cancel()
-                effectsRequestID = nil
+                viewerSession.effectsRequestTimeout?.cancel()
+                viewerSession.effectsRequestID = nil
                 sessionEffectsWorking = false
             }
         case .controlStatus:
-            guard helloReceived, controlStatusUpdatesEnabled else { throw DeskError.invalid("对端不支持控制权限更新") }
+            guard viewerSession.helloReceived, controlStatusUpdatesEnabled else { throw DeskError.invalid("对端不支持控制权限更新") }
             let permission = try Wire.readJSON(ControlStatus.self, message.payload)
             if canControl != permission.canControl {
                 if !permission.canControl { canvas.releaseControl() }
@@ -1114,7 +1099,7 @@ final class DeskModel: ObservableObject {
         case .video:
             throw DeskError.invalid("视频会话尚未就绪")
         case .clipboard:
-            guard helloReceived else { throw DeskError.invalid("缺少会话信息") }
+            guard viewerSession.helloReceived else { throw DeskError.invalid("缺少会话信息") }
             try receiveClipboard(message.payload)
         case .clipboardSettings:
             guard supportsClipboard else { throw DeskError.invalid("对端不支持自动剪贴板") }
@@ -1129,13 +1114,13 @@ final class DeskModel: ObservableObject {
         case .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel:
             clipboardSync?.receive(message)
         case .inputStatus:
-            guard helloReceived, supportsInputActions else { throw DeskError.invalid("不支持的键盘状态消息") }
+            guard viewerSession.helloReceived, supportsInputActions else { throw DeskError.invalid("不支持的键盘状态消息") }
             inputStatus = try Wire.readJSON(InputFeedback.self, message.payload).message
         case .streamSettingsResult:
-            guard helloReceived, supportsLiveSettings, var tuning = videoTuning else { throw DeskError.invalid("对端不支持动态画质") }
+            guard viewerSession.helloReceived, supportsLiveSettings, var tuning = videoTuning else { throw DeskError.invalid("对端不支持动态画质") }
             let result = try Wire.readJSON(StreamSettingsResult.self, message.payload)
             guard try tuning.receive(result) else { return }
-            videoRequestTimeout?.cancel()
+            viewerSession.videoRequestTimeout?.cancel()
             videoTuning = tuning
             activeVideoState = result.state
             recordVideoConfiguration(result.state, succeeded: result.error == nil)
@@ -1144,7 +1129,7 @@ final class DeskModel: ObservableObject {
             if let error = result.error { videoSettingsStatus = "调整失败：\(error)" }
             else {
                 videoSettingsStatus = "已生效：\(result.state.settings.summary)"
-                if viewerQualityPolicy.confirm(result.state.settings, maySave: pendingVideoPreferenceCanSave) {
+                if viewerQualityPolicy.confirm(result.state.settings, maySave: viewerSession.pendingVideoPreferenceCanSave) {
                     saveVideoPreference(result.state.settings)
                 }
             }
@@ -1166,17 +1151,19 @@ final class DeskModel: ObservableObject {
         do { try tuning.choose(settings) }
         catch { videoSettingsStatus = error.localizedDescription; return }
         viewerQualityPolicy.chooseManually()
-        if tuning.pending?.settings == settings { pendingVideoPreferenceCanSave = true }
+        if tuning.pending?.settings == settings { viewerSession.pendingVideoPreferenceCanSave = true }
         videoTuning = tuning
-        videoDebounceTask?.cancel()
+        viewerSession.videoDebounceTask?.cancel()
         if tuning.pending == nil, tuning.applied.settings == settings {
             _ = viewerQualityPolicy.confirm(settings, maySave: true)
             saveVideoPreference(settings)
             return
         }
-        videoDebounceTask = Task { [weak self] in
+        let viewer = viewerSession
+        viewer.videoDebounceTask = Task { [weak self, weak viewer] in
             do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
-            self?.sendNextVideoSettings()
+            guard let self, let viewer, self.viewerSession === viewer else { return }
+            self.sendNextVideoSettings()
         }
     }
 
@@ -1200,36 +1187,39 @@ final class DeskModel: ObservableObject {
 
     private func requestSessionEffects(_ desired: SessionEffectsState) {
         guard connected, supportsSessionEffects, !sessionEffectsWorking, let peer else { return }
+        let viewer = viewerSession
         let request = SessionEffectsRequest(state: desired)
-        effectsRequestID = request.id
+        viewerSession.effectsRequestID = request.id
         sessionEffectsWorking = true
         sessionEffectsStatus = "正在应用被控端设置…"
         do { peer.send(try Wire.json(.sessionEffectsRequest, request)) }
-        catch { sessionEffectsWorking = false; effectsRequestID = nil; sessionEffectsStatus = error.localizedDescription; return }
-        effectsRequestTimeout?.cancel()
-        effectsRequestTimeout = Task { [weak self, weak peer] in
+        catch { sessionEffectsWorking = false; viewerSession.effectsRequestID = nil; sessionEffectsStatus = error.localizedDescription; return }
+        viewerSession.effectsRequestTimeout?.cancel()
+        viewer.effectsRequestTimeout = Task { [weak self, weak peer, weak viewer] in
             do { try await Task.sleep(for: .seconds(15)) } catch { return }
-            guard let self, let peer, self.peer === peer, self.effectsRequestID == request.id else { return }
+            guard let self, let peer, let viewer, self.peer === peer, self.viewerSession === viewer,
+                  viewer.effectsRequestID == request.id else { return }
             peer.close("被控端设置超过 15 秒未确认，已断开以恢复本机状态", retryable: true)
         }
     }
 
     private func installHostSessionEffects(for peer: Peer) {
+        let host = hostSession
         let effects = HostSessionEffects()
-        hostSessionEffects = effects
-        effects.onStateChange = { [weak self, weak peer, weak effects] state, message in
-            guard let self, let peer, let effects, self.peer === peer, self.hostSessionEffects === effects else { return }
+        host.effects = effects
+        effects.onStateChange = { [weak self, weak peer, weak effects, weak host] state, message in
+            guard let self, let peer, let effects, let host, self.peer === peer, self.hostSession === host, host.effects === effects else { return }
             self.sessionEffects = state
             if let message { self.sessionEffectsStatus = message }
             if let result = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(state: state, error: message)) { peer.send(result) }
-            if !state.privacy, self.hostEffectsTask == nil, let streamer = self.streamer {
+            if !state.privacy, host.effectsTask == nil, let streamer = host.streamer {
                 let token = self.generation
-                self.hostEffectsTask = Task { [weak self, weak peer] in
-                    guard let self, let peer else { return }
-                    defer { if self.generation == token, self.peer === peer { self.hostEffectsTask = nil } }
+                host.effectsTask = Task { [weak self, weak peer, weak host] in
+                    guard let self, let peer, let host, self.hostSession === host else { return }
+                    defer { if self.generation == token, self.peer === peer, self.hostSession === host { host.effectsTask = nil } }
                     do { try await streamer.setExcludesCurrentApplication(false) }
                     catch {
-                        guard self.generation == token, self.peer === peer else { return }
+                        guard self.generation == token, self.peer === peer, self.hostSession === host else { return }
                         self.sessionEffectsStatus = error.localizedDescription
                         peer.close("防窥已退出，但采集恢复失败，正在重建共享：\(error.localizedDescription)", retryable: true)
                     }
@@ -1239,17 +1229,18 @@ final class DeskModel: ObservableObject {
     }
 
     private func applyHostSessionEffects(_ request: SessionEffectsRequest, peer: Peer) {
-        guard let effects = hostSessionEffects, let streamer else { return }
-        guard hostEffectsTask == nil else {
+        let host = hostSession
+        guard let effects = host.effects, let streamer = host.streamer else { return }
+        guard host.effectsTask == nil else {
             if let reply = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(id: request.id, state: effects.state,
                 error: "正在处理上一项被控端设置")) { peer.send(reply) }
             return
         }
         let token = generation
-        let capture = captureTask
-        hostEffectsTask = Task { [weak self, weak peer] in
-            guard let self, let peer else { return }
-            defer { if self.generation == token, self.peer === peer { self.hostEffectsTask = nil } }
+        let capture = host.captureTask
+        host.effectsTask = Task { [weak self, weak peer, weak host] in
+            guard let self, let peer, let host, self.hostSession === host else { return }
+            defer { if self.generation == token, self.peer === peer, self.hostSession === host { host.effectsTask = nil } }
             var failure: String?
             var filterRestoreFailed = false
             do {
@@ -1257,12 +1248,12 @@ final class DeskModel: ObservableObject {
                 try Task.checkCancellation()
                 _ = try await effects.apply(request.state) { try await streamer.setExcludesCurrentApplication(true) }
             } catch { failure = error.localizedDescription }
-            guard self.generation == token, self.peer === peer, self.hostSessionEffects === effects, !Task.isCancelled else { return }
+            guard self.generation == token, self.peer === peer, self.hostSession === host, host.effects === effects, !Task.isCancelled else { return }
             if !effects.state.privacy {
                 do { try await streamer.setExcludesCurrentApplication(false) }
                 catch { failure = failure ?? error.localizedDescription; filterRestoreFailed = true }
             }
-            guard self.generation == token, self.peer === peer, !Task.isCancelled else { return }
+            guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
             self.sessionEffects = effects.state
             self.sessionEffectsStatus = failure ?? "被控端设置已生效"
             if let reply = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(id: request.id, state: effects.state, error: failure)) { peer.send(reply) }
@@ -1274,14 +1265,16 @@ final class DeskModel: ObservableObject {
         guard connected, supportsLiveSettings, let peer, var tuning = videoTuning,
               let request = tuning.nextRequest() else { return }
         videoTuning = tuning
-        pendingVideoPreferenceCanSave = viewerQualityPolicy.maySaveCurrentChoice
+        viewerSession.pendingVideoPreferenceCanSave = viewerQualityPolicy.maySaveCurrentChoice
         videoSettingsStatus = "正在应用：\(request.settings.summary)"
         do { peer.send(try Wire.json(.streamSettingsRequest, request)) }
         catch { videoSettingsStatus = error.localizedDescription; peer.close(error.localizedDescription); return }
-        videoRequestTimeout?.cancel()
-        videoRequestTimeout = Task { [weak self, weak peer] in
+        viewerSession.videoRequestTimeout?.cancel()
+        let viewer = viewerSession
+        viewer.videoRequestTimeout = Task { [weak self, weak peer, weak viewer] in
             do { try await Task.sleep(for: .seconds(25)) } catch { return }
-            guard let self, let peer, self.peer === peer, self.videoTuning?.pending?.id == request.id else { return }
+            guard let self, let peer, let viewer, self.peer === peer, self.viewerSession === viewer,
+                  self.videoTuning?.pending?.id == request.id else { return }
             peer.close("画质调整超过 25 秒未确认，重新建立共享", retryable: true)
         }
     }
@@ -1389,7 +1382,7 @@ final class DeskModel: ObservableObject {
         if mode == .viewer {
             sessionPaused = idlePolicy.isPaused || pauseTransmission.desiredPaused || pauseTransmission.appliedPaused
             sessionPauseWorking = pauseTransmission.pending != nil || pauseTransmission.freshFrameToken != nil
-        } else { sessionPaused = hostPaused; sessionPauseWorking = hostPauseTask != nil }
+        } else { sessionPaused = hostSession.paused; sessionPauseWorking = hostSession.pauseTask != nil }
         canvas.updateSystemShortcutCapture(sessionActive: mode == .viewer && connected && canControl && !sessionInputSuspended,
             accessibility: localAccessibility, inputMonitoring: localInputMonitoring)
         canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && canControl && !sessionInputSuspended
@@ -1403,63 +1396,69 @@ final class DeskModel: ObservableObject {
         canvas.releaseControl()
         do { peer.send(try Wire.json(.sessionPauseRequest, request)) }
         catch { peer.close(error.localizedDescription); return }
-        pauseRequestTimeout?.cancel()
-        pauseRequestTimeout = Task { [weak self, weak peer] in
+        viewerSession.pauseRequestTimeout?.cancel()
+        let viewer = viewerSession
+        viewer.pauseRequestTimeout = Task { [weak self, weak peer, weak viewer] in
             do { try await Task.sleep(for: .seconds(25)) } catch { return }
-            guard let self, let peer, self.peer === peer, self.pauseTransmission.pending?.id == request.id else { return }
+            guard let self, let peer, let viewer, self.peer === peer, self.viewerSession === viewer,
+                  self.pauseTransmission.pending?.id == request.id else { return }
             peer.close("暂停/恢复超过 25 秒未确认，重新建立会话", retryable: true)
         }
     }
 
     private func scheduleFreshFrameTimeout(_ token: UUID, peer: Peer) {
-        pauseRequestTimeout?.cancel()
-        pauseRequestTimeout = Task { [weak self, weak peer] in
+        viewerSession.pauseRequestTimeout?.cancel()
+        let viewer = viewerSession
+        viewer.pauseRequestTimeout = Task { [weak self, weak peer, weak viewer] in
             do { try await Task.sleep(for: .seconds(25)) } catch { return }
-            guard let self, let peer, self.peer === peer, self.pauseTransmission.freshFrameToken == token else { return }
+            guard let self, let peer, let viewer, self.peer === peer, self.viewerSession === viewer,
+                  self.pauseTransmission.freshFrameToken == token else { return }
             peer.close("恢复后超过 25 秒未收到新关键帧，重新建立会话", retryable: true)
         }
     }
 
     private func applyHostSessionPause(_ request: SessionPauseRequest, peer: Peer) {
-        guard let streamer else { return }
-        guard hostPauseTask == nil else {
-            if let reply = try? Wire.json(.sessionPauseResult, SessionPauseResult(id: request.id, paused: hostPaused,
+        let host = hostSession
+        guard let streamer = host.streamer else { return }
+        guard host.pauseTask == nil else {
+            if let reply = try? Wire.json(.sessionPauseResult, SessionPauseResult(id: request.id, paused: host.paused,
                 error: "正在处理上一项暂停/恢复")) { peer.send(reply) }
             return
         }
-        injector?.releaseAll()
+        host.injector?.releaseAll()
         let token = generation
-        let capture = captureTask, video = hostSettingsTask
-        hostPauseTask = Task { [weak self, weak peer] in
-            guard let self, let peer else { return }
+        let capture = host.captureTask, video = host.settingsTask
+        host.pauseTask = Task { [weak self, weak peer, weak host] in
+            guard let self, let peer, let host, self.hostSession === host else { return }
             defer {
-                if self.generation == token, self.peer === peer {
-                    self.hostPauseTask = nil
+                if self.generation == token, self.peer === peer, self.hostSession === host {
+                    host.pauseTask = nil
                     self.publishSessionPause()
                 }
             }
             await capture?.value
             await video?.value
-            guard self.generation == token, self.peer === peer, self.streamer === streamer, !Task.isCancelled else { return }
+            guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer, !Task.isCancelled else { return }
             var failure: String?
-            do { self.hostPaused = try await streamer.setSessionPaused(request.paused) }
+            do { host.paused = try await streamer.setSessionPaused(request.paused) }
             catch { failure = error.localizedDescription }
-            guard self.generation == token, self.peer === peer, self.streamer === streamer, !Task.isCancelled else { return }
-            self.sessionPauseStatus = failure ?? (self.hostPaused ? "控制端空闲暂停，保留加密会话" : "画面传输已恢复")
-            DiagnosticLog.shared.record(self.hostPaused ? .sessionPaused : .sessionResumed, role: .host,
+            guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer, !Task.isCancelled else { return }
+            self.sessionPauseStatus = failure ?? (host.paused ? "控制端空闲暂停，保留加密会话" : "画面传输已恢复")
+            DiagnosticLog.shared.record(host.paused ? .sessionPaused : .sessionResumed, role: .host,
                 state: failure == nil ? .succeeded : .failed)
-            if let reply = try? Wire.json(.sessionPauseResult, SessionPauseResult(id: request.id, paused: self.hostPaused, error: failure)) {
+            if let reply = try? Wire.json(.sessionPauseResult, SessionPauseResult(id: request.id, paused: host.paused, error: failure)) {
                 peer.send(reply)
             }
-            if !self.hostPaused, failure == nil { streamer.resumeAfterReconfiguration() }
+            if !host.paused, failure == nil { streamer.resumeAfterReconfiguration() }
         }
         publishSessionPause()
     }
 
     private func applyHostVideoSettings(_ request: StreamSettingsRequest, peer: Peer) {
-        guard let state = activeVideoState, let streamer else { return }
-        if hostSettingsRequestID == request.id { return }
-        if hostSettingsRequestID != nil {
+        let host = hostSession
+        guard let state = activeVideoState, let streamer = host.streamer else { return }
+        if host.settingsRequestID == request.id { return }
+        if host.settingsRequestID != nil {
             if let result = try? Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: state, error: "正在处理上一项画质调整")) { peer.send(result) }
             return
         }
@@ -1472,25 +1471,25 @@ final class DeskModel: ObservableObject {
             if let result = try? Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: state)) { peer.send(result) }
             return
         }
-        hostSettingsRequestID = request.id
+        host.settingsRequestID = request.id
         let token = generation
-        let capture = captureTask
-        let pause = hostPauseTask
-        hostSettingsTask = Task { [weak self, weak peer] in
-            guard let self, let peer else { return }
+        let capture = host.captureTask
+        let pause = host.pauseTask
+        host.settingsTask = Task { [weak self, weak peer, weak host] in
+            guard let self, let peer, let host, self.hostSession === host else { return }
             defer {
-                if self.generation == token, self.peer === peer, self.hostSettingsRequestID == request.id {
-                    self.hostSettingsRequestID = nil; self.hostSettingsTask = nil
+                if self.generation == token, self.peer === peer, self.hostSession === host, host.settingsRequestID == request.id {
+                    host.settingsRequestID = nil; host.settingsTask = nil
                 }
             }
             do {
                 await capture?.value
                 await pause?.value
-                guard self.generation == token, self.peer === peer, self.streamer === streamer,
-                      self.hostSettingsRequestID == request.id, !Task.isCancelled else { return }
+                guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
+                      host.settingsRequestID == request.id, !Task.isCancelled else { return }
                 let updated = try await streamer.reconfigure(request.settings)
-                guard self.generation == token, self.peer === peer, self.streamer === streamer,
-                      self.hostSettingsRequestID == request.id, !Task.isCancelled else { return }
+                guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
+                      host.settingsRequestID == request.id, !Task.isCancelled else { return }
                 self.activeVideoState = updated
                 self.recordVideoConfiguration(updated)
                 self.resolution = "\(updated.width) × \(updated.height)"
@@ -1498,7 +1497,7 @@ final class DeskModel: ObservableObject {
                 peer.send(try Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: updated)))
                 streamer.resumeAfterReconfiguration()
             } catch {
-                guard self.generation == token, self.peer === peer, self.hostSettingsRequestID == request.id,
+                guard self.generation == token, self.peer === peer, self.hostSession === host, host.settingsRequestID == request.id,
                       !Task.isCancelled, let actual = self.activeVideoState else { return }
                 self.recordDiagnosticFailure(.streamConfigured, error: error)
                 if let result = try? Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: actual, error: error.localizedDescription)) { peer.send(result) }
@@ -1547,12 +1546,12 @@ final class DeskModel: ObservableObject {
     }
 
     private var automaticClipboardSendingAllowed: Bool {
-        guard !sessionInputSuspended, !hostPaused, hostPauseTask == nil else { return false }
+        guard !sessionInputSuspended, !hostSession.paused, hostSession.pauseTask == nil else { return false }
         return mode == .viewer ? NSApp.isActive : remoteReceivesAutomaticClipboard
     }
 
     private func sendClipboardPreference(to peer: Peer) throws {
-        let receives = !sessionInputSuspended && !hostPaused && (mode == .viewer ? !controlling : true)
+        let receives = !sessionInputSuspended && !hostSession.paused && (mode == .viewer ? !controlling : true)
         peer.send(try Wire.json(.clipboardSettings, ClipboardPreference(enabled: clipboardEnabled,
             session: clipboardSession, receivesAutomaticUpdates: receives)))
         lastClipboardReceivePreference = receives
@@ -1560,7 +1559,7 @@ final class DeskModel: ObservableObject {
 
     func refreshClipboardFocus() {
         clipboardSync?.setAutomaticSendingAllowed(automaticClipboardSendingAllowed)
-        let receives = !sessionInputSuspended && !hostPaused && (mode == .viewer ? !controlling : true)
+        let receives = !sessionInputSuspended && !hostSession.paused && (mode == .viewer ? !controlling : true)
         guard mode == .viewer, connected, supportsClipboard, let peer,
               lastClipboardReceivePreference != receives else { return }
         do { try sendClipboardPreference(to: peer) }
@@ -1590,7 +1589,7 @@ final class DeskModel: ObservableObject {
                 self.pendingFileOffer = offer
                 guard let offer else { return }
                 if self.mode == .viewer { self.canvas.releaseControl() }
-                else { self.injector?.releaseAll() }
+                else { self.hostSession.injector?.releaseAll() }
                 let prompt = ClipboardFilePrompt(offer: offer, peerName: self.mode == .viewer ? self.remoteName : "") { [weak self, weak sync] accepted in
                     self?.recordSessionActivity()
                     sync?.respondToFileOffer(id: offer.id, accept: accepted)
@@ -1768,7 +1767,7 @@ final class DeskModel: ObservableObject {
                 if self.mode == .viewer,
                    (self.connected && self.supportsSessionPause || self.reconnecting && self.target != nil),
                    self.idlePolicy.tick(now: SessionClock.now) {
-                    self.restoreCanvasFocusAfterIdle = self.controlling
+                    self.viewerSession.restoreCanvasFocusAfterIdle = self.controlling
                     self.pauseTransmission.choose(paused: true)
                     self.sessionPauseStatus = "10 分钟无窗口操作，正在暂停画面与自动剪贴板…"
                     if self.connected {
@@ -1785,7 +1784,7 @@ final class DeskModel: ObservableObject {
                 let metrics = self.dataChannel?.takeMetrics() ?? (bytes: 0, frames: 0)
                 self.traffic = String(format: "%.2f Mbps", Double(metrics.bytes) * 8 / seconds / 1_000_000)
                 self.frameRate = String(format: "%.0f fps", Double(metrics.frames) / seconds)
-                if let measured = self.lastLatencyAt, SessionClock.now - measured > 15 {
+                if let measured = self.viewerSession.lastLatencyAt, SessionClock.now - measured > 15 {
                     self.latency = "— ms"
                     self.roundTripMilliseconds = nil
                 }
@@ -1799,30 +1798,37 @@ final class DeskModel: ObservableObject {
         dataChannel?.invalidate()
         dataChannel = nil
         if mode == .viewer, target != nil, sessionInputSuspended { freshFrameRequiredOnReconnect = true }
-        hostPauseTask?.cancel()
-        hostPauseTask = nil
-        hostPaused = false
-        restoreCanvasFocusAfterIdle = false
-        pauseRequestTimeout?.cancel()
-        pauseRequestTimeout = nil
+        let oldHost = hostSession
+        let oldViewer = viewerSession
+        oldHost.pauseTask?.cancel()
+        oldHost.effectsTask?.cancel()
+        oldHost.settingsTask?.cancel()
+        oldHost.captureTask?.cancel()
+        oldViewer.pauseRequestTimeout?.cancel()
+        oldViewer.effectsRequestTimeout?.cancel()
+        oldViewer.videoDebounceTask?.cancel()
+        oldViewer.videoRequestTimeout?.cancel()
+        oldViewer.stableTask?.cancel()
+        if let effects = oldHost.effects {
+            let token = generation
+            effectsCleanupTask = Task { [weak self] in
+                if let message = await effects.reset(), let self, self.generation == token, self.hostSession.effects == nil {
+                    self.sessionEffectsStatus = message
+                }
+            }
+        }
+        if let streamer = oldHost.streamer {
+            DiagnosticLog.shared.record(.captureStopped, role: .host)
+            Task { await streamer.stop() }
+        }
+        oldHost.injector?.releaseAll()
+        hostSession = HostSession()
+        viewerSession = ViewerSession()
         supportsSessionPause = false
         pauseTransmission = SessionPauseTransmission(paused: idlePolicy.isPaused)
         if freshFrameRequiredOnReconnect { pauseTransmission.requireFreshFrame() }
         sessionPaused = idlePolicy.isPaused
         sessionPauseWorking = false
-        hostEffectsTask?.cancel()
-        hostEffectsTask = nil
-        if let effects = hostSessionEffects {
-            hostSessionEffects = nil
-            let token = generation
-            effectsCleanupTask = Task { [weak self] in
-                if let message = await effects.reset(), let self, self.generation == token, self.hostSessionEffects == nil {
-                    self.sessionEffectsStatus = message
-                }
-            }
-        }
-        effectsRequestTimeout?.cancel()
-        effectsRequestID = nil
         sessionEffectsWorking = false
         supportsSessionEffects = false
         sessionEffects = SessionEffectsState()
@@ -1830,27 +1836,19 @@ final class DeskModel: ObservableObject {
         flushTrafficHistory()
         trafficSession = nil
         currentTrafficDeviceID = nil
-        hostDeviceIdentityAdvertised = false
         trafficHistoryStatus = "从本版开始按设备累计；旧版设备需双方升级。"
         controlStatusUpdatesEnabled = false
         capsLockRunning = false
         capsLockStartAttempted = false
         latency = "— ms"
         roundTripMilliseconds = nil
-        lastLatencyAt = nil
         viewerQualityPolicy.discardUnfinishedSample()
-        videoDebounceTask?.cancel()
-        videoRequestTimeout?.cancel()
-        hostSettingsTask?.cancel()
-        hostSettingsTask = nil
-        hostSettingsRequestID = nil
         supportsLiveSettings = false
         supportsExtendedVideoSettings = false
         supportsHighRefreshVideoSettings = false
         videoTuning = nil
         activeVideoState = nil
         videoSettingsStatus = ""
-        stableTask?.cancel()
         clipboardSync?.stop()
         clipboardSync = nil
         dismissClipboardPrompt(); clipboardFilePrompt = nil
@@ -1864,16 +1862,6 @@ final class DeskModel: ObservableObject {
         remoteClipboardFocusAware = false
         lastClipboardReceivePreference = nil
         clipboardSession = nil
-        captureTask?.cancel()
-        captureTask = nil
-        capturedDisplay = nil
-        if let streamer {
-            DiagnosticLog.shared.record(.captureStopped, role: .host)
-            Task { await streamer.stop() }
-        }
-        streamer = nil
-        injector?.releaseAll()
-        injector = nil
         peer = nil
         connected = false
         working = false
@@ -1883,7 +1871,6 @@ final class DeskModel: ObservableObject {
         canvas.usesCapsLockActions = false
         canvas.capsLockMonitor.stop()
         canvas.reset()
-        helloReceived = false
     }
 
     func stop() {
@@ -1901,7 +1888,7 @@ final class DeskModel: ObservableObject {
         hostPreparationTask?.cancel()
         hostPreparationTask = nil
         reconnectTask?.cancel()
-        stableTask?.cancel()
+        viewerSession.stableTask?.cancel()
         target = nil
         reconnecting = false
         if mode == .viewer, isFullScreen { canvas.window?.toggleFullScreen(nil) }

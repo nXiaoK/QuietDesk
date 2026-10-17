@@ -16,3 +16,10 @@ swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     "${core_objects[@]}" Sources/QuietDesk/Capture.swift Sources/QuietDesk/InputSources.swift AppChecks/InputInjectorChecks.swift \
     -o "$build_directory/InputInjectorChecks"
 "$build_directory/InputInjectorChecks"
+
+swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
+    -module-cache-path "$build_directory/ModuleCache" -I "$build_directory/Modules" \
+    "${core_objects[@]}" Sources/QuietDesk/RemoteCanvas.swift Sources/QuietDesk/CapsLockMonitor.swift \
+    Sources/QuietDesk/SystemShortcutMonitor.swift AppChecks/RemoteCanvasChecks.swift \
+    -o "$build_directory/RemoteCanvasChecks"
+"$build_directory/RemoteCanvasChecks"

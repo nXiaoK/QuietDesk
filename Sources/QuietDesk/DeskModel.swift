@@ -1193,7 +1193,9 @@ final class DeskModel: ObservableObject {
         var input = RemoteInput(kind: kind)
         let keyboard = kind == .keyDown || kind == .keyUp || kind == .flags
         if keyboard { input.keyCode = event.keyCode }
-        else { input.button = min(2, max(0, event.buttonNumber)) }
+        else if kind == .down || kind == .up || kind == .drag {
+            input.button = min(2, max(0, event.buttonNumber))
+        }
         input.flags = UInt64(event.modifierFlags.rawValue)
         let allowed = wakeInputGate.allows(input, suspended: wasSuspended || sessionInputSuspended || !connected)
         let remoteTarget = keyboard ? window.firstResponder === canvas

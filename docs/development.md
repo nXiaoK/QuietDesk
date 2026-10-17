@@ -81,7 +81,7 @@ python3 -m unittest discover -s scripts/tests -v
 | --- | --- |
 | `QuietDeskChecks` | 协议、兼容、视频、剪贴板传输、画质、流量及空闲策略；网络检查仅使用 `127.0.0.1` |
 | `run-app-checks.sh` | 实际 `ClipboardSync` 配合内存剪贴板和临时目录，验证焦点与传输顺序 |
-| `run-input-checks.sh` | 构造 CGEvent 并由假提交器收集，不向系统注入输入 |
+| `run-input-checks.sh` | 验证真实 AppKit 鼠标、滚轮事件到远程输入的转换，以及被控端 CGEvent 字段；使用离屏画布与假提交器，不向系统注入输入 |
 | `run-session-effects-checks.sh` | 假音频、假遮罩及会话退出屏障，验证取消和恢复顺序 |
 | `run-traffic-checks.sh` | 临时目录中的设备身份、历史保存及错误处理 |
 | Python 检查 | 版本分配、参数校验及重跑规则 |

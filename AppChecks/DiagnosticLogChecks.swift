@@ -1,4 +1,5 @@
 import Foundation
+import QuietDeskCore
 
 private struct LogCheckFailure: Error, CustomStringConvertible {
     let description: String
@@ -96,6 +97,83 @@ private struct DiagnosticLogChecks {
             try require(counters.reduce(0, { $0 + ($1["scrollSent"] ?? 0) }) == 2_000
                         && counters.reduce(0, { $0 + ($1["scrollReceived"] ?? 0) }) == 4_000,
                         "Concurrent aggregate input counts were lost or duplicated")
+        }
+
+        await run("Performance export preserves only typed measurements and anonymous connection identifiers") { folder in
+            let log = DiagnosticLog(directory: folder.appendingPathComponent("private-device-name"))
+            let summary = PerformanceSummary(metric: .encode, messageKind: MessageKind.video.rawValue,
+                unit: .microseconds, count: 4, minimum: 100, maximum: 400, mean: 250,
+                p95UpperBound: 500, worstIdentifier: 7, windowMilliseconds: 5_000)
+            log.record(.performanceDiagnosticsChanged, role: .host, state: .enabled)
+            log.recordPerformance(summary, role: .host, connectionID: 2)
+            log.record(.performanceDiagnosticsChanged, role: .host, state: .disabled)
+            let output = folder.appendingPathComponent("performance.txt")
+            try await log.export(to: output)
+            let lines = try entries(at: output)
+            let windows = lines.filter { $0["event"] as? String == "performanceWindow" }
+            try require(windows.count == 1, "Export lost or duplicated the queued performance window")
+            let entry = windows[0]
+            try require(Set(entry.keys) == Set(["timestamp", "event", "role", "performance", "connectionID"]),
+                        "Performance records contain unexpected metadata or payload fields")
+            try require(entry["role"] as? String == "host" && entry["connectionID"] as? Int == 2,
+                        "Performance role or anonymous connection number disappeared")
+            guard let values = entry["performance"] as? [String: Any] else {
+                throw LogCheckFailure("The performance summary was not structured JSON")
+            }
+            let allowed = Set(["metric", "messageKind", "unit", "count", "minimum", "maximum", "mean",
+                               "p95UpperBound", "worstIdentifier", "windowMilliseconds"])
+            try require(Set(values.keys) == allowed, "Performance summary acquired arbitrary fields")
+            let decoded = try JSONDecoder().decode(PerformanceSummary.self, from: JSONSerialization.data(withJSONObject: values))
+            try require(decoded.metric == .encode && decoded.unit == .microseconds
+                        && decoded.messageKind == MessageKind.video.rawValue && decoded.count == 4
+                        && decoded.minimum == 100 && decoded.maximum == 400 && decoded.mean == 250
+                        && decoded.p95UpperBound == 500 && decoded.worstIdentifier == 7 && decoded.windowMilliseconds == 5_000,
+                        "Performance measurements changed during export")
+            for (key, value) in values where key != "metric" && key != "unit" {
+                try require(value is NSNumber, "Performance field \(key) contains nonnumeric content")
+            }
+            let changes = lines.filter { $0["event"] as? String == "performanceDiagnosticsChanged" }
+            try require(changes.compactMap { $0["state"] as? String } == ["enabled", "disabled"],
+                        "Performance diagnostics state changes disappeared")
+            let text = try String(contentsOf: output, encoding: .utf8)
+            try require(!text.contains("private-device-name") && !text.contains(folder.path),
+                        "Private directory or device labels entered the performance export")
+        }
+
+        await run("Performance summaries share bounded pending work and existing log rotation") { folder in
+            let summary = PerformanceSummary(metric: .sendQueue, unit: .microseconds, count: 1,
+                minimum: 100, maximum: 100, mean: 100, p95UpperBound: 100, windowMilliseconds: 5_000)
+            let concurrent = DiagnosticLog(directory: folder.appendingPathComponent("concurrent"),
+                                           pendingLimit: 8, counterInterval: 60)
+            DispatchQueue.concurrentPerform(iterations: 2_000) { _ in
+                concurrent.recordPerformance(summary, role: .viewer, connectionID: 1)
+            }
+            try require(concurrent.flush() == nil, "Concurrent performance logging failed")
+            let concurrentOutput = folder.appendingPathComponent("concurrent.txt")
+            try await concurrent.export(to: concurrentOutput)
+            let lines = try entries(at: concurrentOutput)
+            let written = lines.filter { $0["event"] as? String == "performanceWindow" }.count
+            let dropped = lines.compactMap { ($0["values"] as? [String: Int])?["entriesDropped"] }.reduce(0, +)
+            try require(written + dropped == 2_000, "Performance admission bypassed bounded logging or lost drop accounting")
+
+            let directory = folder.appendingPathComponent("rotated")
+            let log = DiagnosticLog(directory: directory, maximumFileBytes: 512, retainedFileCount: 2)
+            for connection in 1...20 {
+                log.recordPerformance(summary, role: .viewer, connectionID: connection)
+                try require(log.flush() == nil, "Performance rotation failed")
+            }
+            let output = folder.appendingPathComponent("rotated.txt")
+            try await log.export(to: output)
+            let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])
+            try require(files.count == 2, "Performance windows exceeded the retained file limit")
+            for file in files {
+                try require(try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0 <= 512,
+                            "A performance log exceeded the existing byte limit")
+                _ = try entries(at: file)
+            }
+            let connections = try entries(at: output).compactMap { $0["connectionID"] as? Int }
+            try require(!connections.isEmpty && connections == connections.sorted() && connections.last == 20 && connections.first! > 1,
+                        "Performance export lost the latest window or changed retained order")
         }
 
         await run("Error logging excludes arbitrary domains, descriptions, paths and underlying payloads") { folder in

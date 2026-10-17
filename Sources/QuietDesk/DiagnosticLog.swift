@@ -1,4 +1,5 @@
 import Foundation
+import QuietDeskCore
 
 final class DiagnosticLog: @unchecked Sendable {
     enum Event: String, Codable {
@@ -9,6 +10,7 @@ final class DiagnosticLog: @unchecked Sendable {
         case clipboardOffered, clipboardOfferReceived, clipboardAccepted, clipboardRejected
         case clipboardCompleted, clipboardCancelled, clipboardFailed, clipboardEchoSuppressed
         case permissionChanged, exportRequested, exportCompleted, exportFailed, counters
+        case performanceDiagnosticsChanged, performanceWindow
     }
     enum Role: String, Codable { case viewer, host }
     enum State: String, Codable {
@@ -53,6 +55,7 @@ final class DiagnosticLog: @unchecked Sendable {
     private struct Metadata: Codable {
         let appVersion: String
         let appBuild: String
+        let buildRevision: String?
         let macOS: String
         let architecture: String
         init() {
@@ -65,6 +68,11 @@ final class DiagnosticLog: @unchecked Sendable {
             }
             appVersion = version("CFBundleShortVersionString")
             appBuild = version("CFBundleVersion")
+            if let revision = Bundle.main.object(forInfoDictionaryKey: "QuietDeskBuildRevision") as? String,
+               (7...40).contains(revision.utf8.count), revision.utf8.allSatisfy({
+                   (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0)
+               }) { buildRevision = revision }
+            else { buildRevision = nil }
             let system = ProcessInfo.processInfo.operatingSystemVersion
             macOS = "\(system.majorVersion).\(system.minorVersion).\(system.patchVersion)"
             #if arch(arm64)
@@ -84,6 +92,8 @@ final class DiagnosticLog: @unchecked Sendable {
         var values: [String: Int]?
         var error: SafeError?
         var environment: Metadata?
+        var performance: PerformanceSummary?
+        var connectionID: Int?
     }
 
     private let directory: URL
@@ -118,6 +128,17 @@ final class DiagnosticLog: @unchecked Sendable {
     // Only enumerated events, numeric measurements and sanitized error codes may enter the log.
     func record(_ event: Event, role: Role? = nil, state: State? = nil,
                 values: [Field: Int] = [:], error: Error? = nil) {
+        enqueue(Entry(timestamp: Date(), event: event, role: role, state: state,
+                      values: values.isEmpty ? nil : Dictionary(uniqueKeysWithValues: values.map { ($0.key.rawValue, $0.value) }),
+                      error: error.map(SafeError.init), environment: event == .applicationStarted ? Metadata() : nil))
+    }
+
+    func recordPerformance(_ summary: PerformanceSummary, role: Role, connectionID: Int) {
+        enqueue(Entry(timestamp: Date(), event: .performanceWindow, role: role,
+                      performance: summary, connectionID: connectionID))
+    }
+
+    private func enqueue(_ entry: Entry) {
         lock.lock()
         guard pendingEntries < pendingLimit else {
             droppedEntries = min(Int.max - 1, droppedEntries) + 1
@@ -126,9 +147,6 @@ final class DiagnosticLog: @unchecked Sendable {
         }
         pendingEntries += 1
         lock.unlock()
-        let entry = Entry(timestamp: Date(), event: event, role: role, state: state,
-                          values: values.isEmpty ? nil : Dictionary(uniqueKeysWithValues: values.map { ($0.key.rawValue, $0.value) }),
-                          error: error.map(SafeError.init), environment: event == .applicationStarted ? Metadata() : nil)
         queue.async { [self] in
             append(entry)
             lock.lock(); pendingEntries -= 1; lock.unlock()

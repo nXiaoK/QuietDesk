@@ -65,17 +65,20 @@ public final class Peer {
     private let idleTimeout: TimeInterval
     private let handshakeTimeout: TimeInterval
     private let heartbeatInterval: TimeInterval
+    private let diagnostics: PerformanceDiagnostics?
     private var roundTrip = RoundTripProbe()
+    private var roundTripDiagnostic: (identifier: UInt64, token: PerformanceDiagnostics.Token)?
     private final class ReadBuffer {
         var data = Data()
         init(capacity: Int) { data.reserveCapacity(capacity) }
     }
 
-    public init(connection: NWConnection, idleTimeout: TimeInterval = 30, handshakeTimeout: TimeInterval = 15, heartbeatInterval: TimeInterval = 5) {
+    public init(connection: NWConnection, idleTimeout: TimeInterval = 30, handshakeTimeout: TimeInterval = 15, heartbeatInterval: TimeInterval = 5, diagnostics: PerformanceDiagnostics? = nil) {
         self.connection = connection
         self.idleTimeout = idleTimeout
         self.handshakeTimeout = handshakeTimeout
         self.heartbeatInterval = heartbeatInterval
+        self.diagnostics = diagnostics
     }
 
     public func start() {
@@ -124,12 +127,23 @@ public final class Peer {
 
     private func sendHeartbeat() {
         let payload = onRoundTripMilliseconds == nil ? nil : roundTrip.begin(at: SessionClock.now)
+        if let payload {
+            roundTripDiagnostic = nil
+            if let token = diagnostics?.start() {
+                var reader = ByteReader(payload)
+                if let identifier: UInt64 = try? reader.take() { roundTripDiagnostic = (identifier, token) }
+            }
+        }
         send(Message(.ping, payload ?? Data()))
     }
 
     public func send(_ message: Message, completion: ((Bool) -> Void)? = nil) {
+        let queuedAt = diagnostics?.start()
+        let kind = message.kind
         queue.async { [self] in
             guard ready, !closed else { completion?(false); return }
+            let identifier = diagnosticIdentifier(for: message)
+            diagnostics?.record(.sendQueue, since: queuedAt, kind: kind, identifier: identifier)
             do {
                 let data = try message.framed()
                 guard pendingBytes + data.count <= Wire.maximumMessageBytes * 2 else {
@@ -138,8 +152,13 @@ public final class Peer {
                     return
                 }
                 pendingBytes += data.count
+                diagnostics?.recordValue(.pendingSendBytes, pendingBytes, kind: kind, identifier: identifier)
                 let meter = trafficMeter
+                let submittedAt = diagnostics?.start()
                 connection.send(content: data, completion: .contentProcessed { [weak self] error in
+                    if let self, !self.closed {
+                        self.diagnostics?.record(.sendCompletion, since: submittedAt, kind: kind, identifier: identifier)
+                    }
                     if error == nil { meter.record(sentBytes: UInt64(data.count)) }
                     guard let self else { completion?(false); return }
                     self.pendingBytes -= data.count
@@ -164,6 +183,7 @@ public final class Peer {
         closeIsRetryable = retryable
         timer?.cancel()
         timer = nil
+        roundTripDiagnostic = nil
         connection.stateUpdateHandler = nil
         connection.cancel()
         onClose?(reason)
@@ -176,22 +196,31 @@ public final class Peer {
     }
 
     private func receiveHeader() {
+        let headerStartedAt = diagnostics?.start()
         readExactly(4) { [weak self] data in
             guard let self, !self.closed else { return }
+            self.diagnostics?.record(.receiveHeaderWait, since: headerStartedAt)
             do {
                 var reader = ByteReader(data)
                 let size: UInt32 = try reader.take()
                 guard size >= 1, size <= Wire.maximumMessageBytes else {
                     throw DeskError.invalid("无效的消息长度")
                 }
+                let bodyStartedAt = self.diagnostics?.start()
                 self.readExactly(Int(size)) { [weak self] body in
                     guard let self else { return }
                     do {
                         let message = try Wire.decodeBody(body)
+                        let identifier = self.diagnosticIdentifier(for: message)
+                        self.diagnostics?.record(.receiveBody, since: bodyStartedAt, kind: message.kind, identifier: identifier)
                         switch message.kind {
                         case .ping: self.send(Message(.pong, message.payload.count == 8 ? message.payload : Data()))
                         case .pong:
                             if let milliseconds = self.roundTrip.complete(message.payload, at: SessionClock.now) {
+                                if let diagnostic = self.roundTripDiagnostic {
+                                    self.diagnostics?.record(.roundTrip, since: diagnostic.token, kind: .pong, identifier: diagnostic.identifier)
+                                    self.roundTripDiagnostic = nil
+                                }
                                 self.onRoundTripMilliseconds?(milliseconds)
                             }
                         default:
@@ -199,11 +228,14 @@ public final class Peer {
                                 self.deliverySequence &+= 1
                                 let sequence = self.deliverySequence
                                 self.waitingForMessage = true
+                                let handlingStartedAt = self.diagnostics?.start()
+                                let kind = message.kind
                                 handle(message) { [weak self] in
                                     guard let self else { return }
                                     self.queue.async { [weak self] in
                                         guard let self, !self.closed, self.waitingForMessage,
                                               self.deliverySequence == sequence else { return }
+                                        self.diagnostics?.record(.messageHandler, since: handlingStartedAt, kind: kind, identifier: identifier)
                                         self.waitingForMessage = false
                                         self.receiveHeader()
                                     }
@@ -216,6 +248,23 @@ public final class Peer {
                     } catch { self.finish(error.localizedDescription, retryable: false) }
                 }
             } catch { self.finish(error.localizedDescription, retryable: false) }
+        }
+    }
+
+    private func diagnosticIdentifier(for message: Message) -> UInt64? {
+        guard diagnostics?.isEnabled == true else { return nil }
+        var reader = ByteReader(message.payload)
+        switch message.kind {
+        case .video:
+            guard message.payload.count >= 13, let sequence: UInt32 = try? reader.take() else { return nil }
+            return UInt64(sequence)
+        case .acknowledgement:
+            guard message.payload.count == 4, let sequence: UInt32 = try? reader.take() else { return nil }
+            return UInt64(sequence)
+        case .ping, .pong:
+            guard message.payload.count == 8 else { return nil }
+            return try? reader.take() as UInt64
+        default: return nil
         }
     }
 

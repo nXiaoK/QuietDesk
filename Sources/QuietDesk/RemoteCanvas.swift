@@ -8,6 +8,7 @@ final class RemoteCanvas: NSView {
     private let videoLayer = AVSampleBufferDisplayLayer()
     private var decoder = VideoDecoder()
     private var mailbox = LatestFrameMailbox()
+    private var diagnostics: PerformanceDiagnostics?
     private var awaitingDisplay = false
     private var tracking: NSTrackingArea?
     private var observers: [NSObjectProtocol] = []
@@ -130,7 +131,12 @@ final class RemoteCanvas: NSView {
         addTrackingArea(area)
     }
 
-    func makeVideoReceiver() -> (VideoPacket, @escaping () -> Void) -> Void {
+    func makeVideoReceiver(diagnostics: PerformanceDiagnostics? = nil) -> (VideoPacket, @escaping () -> Void) -> Void {
+        decoder.stop()
+        mailbox.stopDiagnostics()
+        decoder = VideoDecoder(diagnostics: diagnostics)
+        mailbox = LatestFrameMailbox(diagnostics: diagnostics)
+        self.diagnostics = diagnostics
         let inbox = mailbox
         let decoder = decoder
         return { [weak self] packet, acknowledged in
@@ -171,7 +177,9 @@ final class RemoteCanvas: NSView {
             }
             return
         }
-        guard let image = mailbox.take() else { return }
+        guard let received = mailbox.takeWithTiming() else { return }
+        let image = received.frame
+        let enqueueStarted = diagnostics?.start()
         var format: CMVideoFormatDescription?
         var sample: CMSampleBuffer?
         var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
@@ -186,6 +194,9 @@ final class RemoteCanvas: NSView {
                                  Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
         }
         videoLayer.enqueue(sample)
+        // Enqueue completion does not confirm that the frame has reached the screen.
+        diagnostics?.record(.decodeToDisplay, since: received.decodedAt, kind: .video, identifier: received.sequence.map(UInt64.init))
+        diagnostics?.record(.displayEnqueue, since: enqueueStarted, kind: .video, identifier: received.sequence.map(UInt64.init))
     }
 
     func reset() {
@@ -193,8 +204,10 @@ final class RemoteCanvas: NSView {
         releaseControl()
         canControl = false
         decoder.stop()
+        mailbox.stopDiagnostics()
         decoder = VideoDecoder()
         mailbox = LatestFrameMailbox()
+        diagnostics = nil
         videoLayer.stopRequestingMediaData()
         videoLayer.flushAndRemoveImage()
         awaitingDisplay = false

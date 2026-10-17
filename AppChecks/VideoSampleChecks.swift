@@ -172,6 +172,101 @@ private struct VideoSampleChecks {
             }
         }
 
+        run("Mailbox timing follows only the latest accepted frame and cannot cross diagnostic epochs") {
+            var time: TimeInterval = 10
+            let diagnostics = PerformanceDiagnostics(enabled: true, clock: { time })
+            let mailbox = LatestFrameMailbox(diagnostics: diagnostics)
+            var image: CVPixelBuffer?
+            let status = CVPixelBufferCreate(nil, 32, 32, kCVPixelFormatType_32BGRA, nil, &image)
+            guard status == kCVReturnSuccess, let image else { throw SampleCheckFailure("Creating mailbox pixels failed") }
+            try require(mailbox.offer(image, sequence: UInt32.max), "The initial frame was not scheduled")
+            time = 10.1
+            try require(!mailbox.offer(image, sequence: 0), "A replacement scheduled a second display callback")
+            try require(!mailbox.offer(image, sequence: UInt32.max), "A stale decode replaced the current frame")
+            time = 10.25
+            let newest = mailbox.takeWithTiming()
+            try require(newest?.sequence == 0 && newest?.decodedAt?.startedAt == 10.1,
+                        "Frame timing did not follow the accepted sequence through wraparound")
+            diagnostics.record(.decodeToDisplay, since: newest?.decodedAt)
+            let repeated = mailbox.takeWithTiming()
+            try require(repeated?.frame === image && repeated?.decodedAt == nil,
+                        "A layout replay lost the retained image or reused its timing")
+            let first = diagnostics.drain()
+            try require(first.first(where: { $0.metric == .displayReplaced })?.count == 1,
+                        "A stale frame was counted as a pending display replacement")
+            try require(first.first(where: { $0.metric == .decodeToDisplay })?.maximum == 150_000,
+                        "Display timing included the replaced frame's wait")
+            _ = mailbox.offer(image, sequence: 1)
+            diagnostics.setEnabled(false)
+            diagnostics.setEnabled(true)
+            diagnostics.record(.decodeToDisplay, since: mailbox.takeWithTiming()?.decodedAt)
+            try require(diagnostics.drain().isEmpty, "A previous diagnostic epoch leaked into the new window")
+            _ = mailbox.offer(image, sequence: 2)
+            mailbox.stopDiagnostics()
+            _ = mailbox.offer(image, sequence: 3)
+            let stopped = mailbox.takeWithTiming()
+            try require(stopped?.sequence == 3 && stopped?.decodedAt == nil && diagnostics.drain().isEmpty,
+                        "Stopping diagnostics changed latest-frame behavior or retained timing from late callbacks")
+            _ = mailbox.offer(image)
+            try require(mailbox.takeWithTiming()?.sequence == nil && !mailbox.offer(image, sequence: 2),
+                        "An unnumbered frame inherited stale metadata or erased the sequence watermark")
+        }
+
+        run("Decode diagnostics can be enabled after session creation and stay quiet while disabled") {
+            let packets = try encodedPackets()
+            let diagnostics = PerformanceDiagnostics()
+            let decoder = VideoDecoder(diagnostics: diagnostics)
+            defer { decoder.stop() }
+            for (index, packet) in packets.enumerated() {
+                if index == 1 { diagnostics.setEnabled(true) }
+                let ready = DispatchSemaphore(value: 0)
+                let result = ResultBox<Bool>(false)
+                decoder.decode(packet) {
+                    if case .success = $0 { result.set(true) }
+                    ready.signal()
+                }
+                try require(ready.wait(timeout: .now() + 10) == .success && result.get(),
+                            "The instrumented synthetic frame did not decode")
+                let summaries = diagnostics.drain()
+                if index == 0 {
+                    try require(summaries.isEmpty, "Disabled decode diagnostics emitted samples")
+                } else {
+                    try require(summaries.first(where: { $0.metric == .decodeQueue })?.count == 1,
+                                "Enabling diagnostics missed decode queue timing")
+                    try require(summaries.first(where: { $0.metric == .decodePrepare })?.count == 1,
+                                "Enabling diagnostics missed sample and session preparation timing")
+                    try require(summaries.first(where: { $0.metric == .decode })?.count == 1,
+                                "Enabling diagnostics missed decoder completion timing")
+                    if let hardware = summaries.first(where: { $0.metric == .decoderHardware }) {
+                        try require(hardware.minimum >= 0 && hardware.maximum <= 1, "Hardware status was not boolean")
+                    }
+                }
+            }
+        }
+
+        run("Rejected samples retain preparation timing and release their diagnostic slots") {
+            let diagnostics = PerformanceDiagnostics(enabled: true)
+            let decoder = VideoDecoder(diagnostics: diagnostics)
+            defer { decoder.stop() }
+            for sequence in UInt32(1)...5 {
+                let ready = DispatchSemaphore(value: 0)
+                let rejected = ResultBox<Bool>(false)
+                decoder.decode(VideoPacket(sequence: sequence, sps: Data(), pps: Data(), avcc: Data([1]))) {
+                    if case .failure = $0 { rejected.set(true) }
+                    ready.signal()
+                }
+                try require(ready.wait(timeout: .now() + 10) == .success && rejected.get(),
+                            "The invalid synthetic sample did not fail")
+            }
+            let summaries = diagnostics.drain()
+            try require(summaries.first(where: { $0.metric == .decodeQueue })?.count == 5,
+                        "Preparation failure consumed a diagnostic tracking slot permanently")
+            try require(summaries.first(where: { $0.metric == .decodePrepare })?.count == 5,
+                        "Failed sample preparation was omitted from diagnostics")
+            try require(!summaries.contains(where: { $0.metric == .decode }),
+                        "A sample rejected before submission reported decoder work")
+        }
+
         print("Video sample checks: \(passed) passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

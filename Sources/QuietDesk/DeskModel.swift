@@ -41,6 +41,7 @@ final class DeskModel: ObservableObject {
     @Published private(set) var currentTrafficDeviceID: UUID?
     @Published var frameRate = "0 fps"
     @Published var latency = "— ms"
+    @Published private(set) var performanceDiagnosticsEnabled = false
     @Published private(set) var roundTripMilliseconds: Double?
     @Published var showFullScreenStatistics = UserDefaults.standard.bool(forKey: "showFullScreenStatistics") {
         didSet { UserDefaults.standard.set(showFullScreenStatistics, forKey: "showFullScreenStatistics") }
@@ -104,6 +105,11 @@ final class DeskModel: ObservableObject {
     private var generation = UUID()
     private var activity: NSObjectProtocol?
     private var metricsTimer: Timer?
+    private var performanceDiagnostics: PerformanceDiagnostics?
+    private let performanceQueue = DispatchQueue(label: "quietdesk.performance", qos: .utility)
+    private var performanceTimer: DispatchSourceTimer?
+    private var performanceConnectionID = 0
+    private var performanceRole: DiagnosticLog.Role?
     private var permissionTimer: Timer?
     private var permissionGuide: PermissionGuide?
     private var capsLockStartAttempted = false
@@ -282,6 +288,45 @@ final class DeskModel: ObservableObject {
     }
 
     private var diagnosticRole: DiagnosticLog.Role { mode == .viewer ? .viewer : .host }
+
+    func setPerformanceDiagnosticsEnabled(_ enabled: Bool) {
+        guard performanceDiagnosticsEnabled != enabled else { return }
+        if !enabled { flushPerformanceDiagnostics() }
+        performanceDiagnosticsEnabled = enabled
+        performanceDiagnostics?.setEnabled(enabled)
+        DiagnosticLog.shared.record(.performanceDiagnosticsChanged, role: diagnosticRole,
+            state: enabled ? .enabled : .disabled)
+        if enabled, let activeVideoState { recordVideoConfiguration(activeVideoState) }
+    }
+
+    private func attachPerformanceDiagnostics(_ diagnostics: PerformanceDiagnostics, role: DiagnosticLog.Role) {
+        performanceTimer?.cancel()
+        performanceConnectionID += 1
+        let connectionID = performanceConnectionID
+        performanceRole = role
+        performanceDiagnostics = diagnostics
+        diagnostics.setEnabled(performanceDiagnosticsEnabled)
+        let timer = DispatchSource.makeTimerSource(queue: performanceQueue)
+        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.setEventHandler {
+            for summary in diagnostics.drain() {
+                DiagnosticLog.shared.recordPerformance(summary, role: role, connectionID: connectionID)
+            }
+        }
+        performanceTimer = timer
+        timer.resume()
+    }
+
+    func flushPerformanceDiagnostics() {
+        guard let performanceDiagnostics, let performanceRole else { return }
+        let connectionID = performanceConnectionID
+        // Finish any timer drain and enqueue its rows before the log export can start.
+        performanceQueue.sync {
+            for summary in performanceDiagnostics.drain() {
+                DiagnosticLog.shared.recordPerformance(summary, role: performanceRole, connectionID: connectionID)
+            }
+        }
+    }
 
     private func recordDiagnosticFailure(_ event: DiagnosticLog.Event, error: Error) {
         var values: [DiagnosticLog.Field: Int] = [:]
@@ -608,7 +653,8 @@ final class DeskModel: ObservableObject {
     }
 
     private func accept(_ connection: NWConnection, generation token: UUID, admission: PendingHandshakeGate, id: UUID) {
-        let candidate = Peer(connection: connection, handshakeTimeout: peer == nil ? 15 : 5)
+        let diagnostics = PerformanceDiagnostics()
+        let candidate = Peer(connection: connection, handshakeTimeout: peer == nil ? 15 : 5, diagnostics: diagnostics)
         let channel = makeDataChannel(for: candidate)
         let session = makeTrafficSession(for: candidate)
         let history = trafficHistoryStore
@@ -621,6 +667,7 @@ final class DeskModel: ObservableObject {
                 guard self.peer == nil else { candidate.close("这台 Mac 当前已有控制连接"); return }
                 DiagnosticLog.shared.record(.connectionReady, role: .host, state: .ready)
                 self.peer = candidate
+                self.attachPerformanceDiagnostics(diagnostics, role: .host)
                 self.dataChannel = channel
                 self.trafficSession = session
                 self.trafficHistoryStatus = "等待远端设备标识；旧版设备需双方升级后才能累计。"
@@ -656,7 +703,7 @@ final class DeskModel: ObservableObject {
                             deviceIdentityExchange: host.deviceIdentityAdvertised ? true : nil,
                             highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings,
                             sessionEffects: true, sessionPause: true)))
-                        let streamer = ScreenStreamer()
+                        let streamer = ScreenStreamer(diagnostics: diagnostics)
                         host.streamer = streamer
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak candidate] packet in
@@ -791,8 +838,10 @@ final class DeskModel: ObservableObject {
             _ = idlePolicy.tick(now: SessionClock.now)
             if idlePolicy.isPaused { deferReconnectForIdle("10 分钟无窗口操作"); return }
         }
+        let diagnostics = PerformanceDiagnostics(enabled: performanceDiagnosticsEnabled)
         let candidate = Peer(connection: NWConnection(host: NWEndpoint.Host(target.address),
-            port: NWEndpoint.Port(rawValue: target.port)!, using: SecureTransport.parameters(key: target.key)))
+            port: NWEndpoint.Port(rawValue: target.port)!, using: SecureTransport.parameters(key: target.key)), diagnostics: diagnostics)
+        attachPerformanceDiagnostics(diagnostics, role: .viewer)
         DiagnosticLog.shared.record(.connectionStarted, role: .viewer, state: .requested)
         trafficSession = makeTrafficSession(for: candidate)
         let history = trafficHistoryStore
@@ -1018,7 +1067,7 @@ final class DeskModel: ObservableObject {
                 return
             }
             viewerSession.helloReceived = true
-            dataChannel?.configureVideo(canvas.makeVideoReceiver())
+            dataChannel?.configureVideo(canvas.makeVideoReceiver(diagnostics: performanceDiagnostics))
             connected = true
             working = false
             remoteName = hello.name
@@ -1824,6 +1873,12 @@ final class DeskModel: ObservableObject {
     }
 
     private func clearSession() {
+        performanceTimer?.cancel()
+        performanceTimer = nil
+        flushPerformanceDiagnostics()
+        performanceDiagnostics?.setEnabled(false)
+        performanceDiagnostics = nil
+        performanceRole = nil
         dataChannel?.invalidate()
         dataChannel = nil
         if mode == .viewer, target != nil, sessionInputSuspended { freshFrameRequiredOnReconnect = true }
@@ -1941,6 +1996,8 @@ final class DeskModel: ObservableObject {
     }
 
     deinit {
+        performanceTimer?.cancel()
+        performanceDiagnostics?.setEnabled(false)
         permissionTimer?.invalidate()
         displayRefreshTask?.cancel()
         hostPreparationTask?.cancel()

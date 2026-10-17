@@ -331,6 +331,8 @@ if !CommandLine.arguments.contains("--skip-network") {
 }
 
 runTransportChecks()
+runPerformanceDiagnosticsChecks()
+runTransportDiagnosticsChecks()
 runProtocolFuzzChecks()
 runPeerDeliveryChecks()
 runHandshakeAdmissionChecks()

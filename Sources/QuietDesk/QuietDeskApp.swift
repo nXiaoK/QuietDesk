@@ -393,6 +393,9 @@ private struct TrayView: View {
             }
         }
         Divider()
+        Toggle("性能诊断", isOn: Binding(get: { model.performanceDiagnosticsEnabled },
+            set: { model.setPerformanceDiagnosticsEnabled($0) }))
+            .help("记录视频与传输耗时，导出诊断日志后发送两端日志")
         Button(exportingLogs ? "正在导出日志…" : "导出诊断日志…") { exportLogs() }
             .disabled(exportingLogs)
         Divider()
@@ -417,6 +420,7 @@ private struct TrayView: View {
             Task { @MainActor in
                 defer { exportingLogs = false }
                 do {
+                    model.flushPerformanceDiagnostics()
                     try await DiagnosticLog.shared.export(to: destination)
                     DiagnosticLog.shared.record(.exportCompleted)
                     NSWorkspace.shared.activateFileViewerSelecting([destination])

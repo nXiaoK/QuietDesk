@@ -78,11 +78,15 @@ public final class VideoEncoder {
     }
 
     public var usesHardware: Bool {
-        guard let session else { return false }
+        hardwareAccelerationStatus ?? false
+    }
+
+    public var hardwareAccelerationStatus: Bool? {
+        guard let session else { return nil }
         var value: Unmanaged<CFTypeRef>?
         guard VTSessionCopyProperty(session, key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
-                                    allocator: nil, valueOut: &value) == noErr else { return false }
-        return (value?.takeRetainedValue() as? NSNumber)?.boolValue ?? false
+                                    allocator: nil, valueOut: &value) == noErr else { return nil }
+        return (value?.takeRetainedValue() as? NSNumber)?.boolValue
     }
 
     private static func packet(from sample: CMSampleBuffer, sequence: UInt32) throws -> VideoPacket {

@@ -47,6 +47,7 @@ public final class Peer {
     public let queue = DispatchQueue(label: "quietdesk.peer", qos: .userInteractive)
     public var onReady: (() -> Void)?
     public var onMessage: ((Message) -> Void)?
+    public var onMessageHandled: ((Message, @escaping () -> Void) -> Void)?
     public var onClose: ((String) -> Void)?
     public var onTraffic: ((Int) -> Void)?
     public let trafficMeter = TrafficMeter()
@@ -59,6 +60,8 @@ public final class Peer {
     private var lastReceived = ProcessInfo.processInfo.systemUptime
     private var timer: DispatchSourceTimer?
     private var pendingBytes = 0
+    private var deliverySequence: UInt64 = 0
+    private var waitingForMessage = false
     private let idleTimeout: TimeInterval
     private let handshakeTimeout: TimeInterval
     private let heartbeatInterval: TimeInterval
@@ -166,6 +169,7 @@ public final class Peer {
         onClose?(reason)
         onReady = nil
         onMessage = nil
+        onMessageHandled = nil
         onClose = nil
         onTraffic = nil
         onRoundTripMilliseconds = nil
@@ -190,7 +194,23 @@ public final class Peer {
                             if let milliseconds = self.roundTrip.complete(message.payload, at: ProcessInfo.processInfo.systemUptime) {
                                 self.onRoundTripMilliseconds?(milliseconds)
                             }
-                        default: self.onMessage?(message)
+                        default:
+                            if let handle = self.onMessageHandled {
+                                self.deliverySequence &+= 1
+                                let sequence = self.deliverySequence
+                                self.waitingForMessage = true
+                                handle(message) { [weak self] in
+                                    guard let self else { return }
+                                    self.queue.async { [weak self] in
+                                        guard let self, !self.closed, self.waitingForMessage,
+                                              self.deliverySequence == sequence else { return }
+                                        self.waitingForMessage = false
+                                        self.receiveHeader()
+                                    }
+                                }
+                                return
+                            }
+                            self.onMessage?(message)
                         }
                         self.receiveHeader()
                     } catch { self.finish(error.localizedDescription, retryable: false) }

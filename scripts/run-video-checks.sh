@@ -16,3 +16,8 @@ swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     "${core_objects[@]}" Sources/QuietDesk/Capture.swift Sources/QuietDesk/InputSources.swift AppChecks/VideoPipelineChecks.swift \
     -o "$build_directory/VideoPipelineChecks"
 "$build_directory/VideoPipelineChecks"
+
+swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
+    -module-cache-path "$build_directory/ModuleCache" -I "$build_directory/Modules" \
+    "${core_objects[@]}" AppChecks/VideoSampleChecks.swift -o "$build_directory/VideoSampleChecks"
+"$build_directory/VideoSampleChecks"

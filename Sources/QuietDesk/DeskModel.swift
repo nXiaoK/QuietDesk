@@ -96,6 +96,7 @@ final class DeskModel: ObservableObject {
 
     private var listener: NWListener?
     private var peer: Peer?
+    private var dataChannel: SessionDataChannel?
     private var pending: [UUID: Peer] = [:]
     private var streamer: ScreenStreamer?
     private var injector: InputInjector?
@@ -107,8 +108,6 @@ final class DeskModel: ObservableObject {
     private var permissionGuide: PermissionGuide?
     private var capsLockStartAttempted = false
     private var controlStatusUpdatesEnabled = false
-    private var byteCount = 0
-    private var frames = 0
     private var lastMetrics = ProcessInfo.processInfo.systemUptime
     private var captureTask: Task<Void, Never>?
     private var lastLatencyAt: TimeInterval?
@@ -594,6 +593,7 @@ final class DeskModel: ObservableObject {
 
     private func accept(_ connection: NWConnection, generation token: UUID, admission: PendingHandshakeGate, id: UUID) {
         let candidate = Peer(connection: connection, handshakeTimeout: peer == nil ? 15 : 5)
+        let channel = makeDataChannel(for: candidate)
         let session = makeTrafficSession(for: candidate)
         let history = trafficHistoryStore
         pending[id] = candidate
@@ -605,6 +605,7 @@ final class DeskModel: ObservableObject {
                 guard self.peer == nil else { candidate.close("这台 Mac 当前已有控制连接"); return }
                 DiagnosticLog.shared.record(.connectionReady, role: .host, state: .ready)
                 self.peer = candidate
+                self.dataChannel = channel
                 self.trafficSession = session
                 self.trafficHistoryStatus = "等待远端设备标识；旧版设备需双方升级后才能累计。"
                 self.status = "正在准备连接画面…"
@@ -640,14 +641,12 @@ final class DeskModel: ObservableObject {
                             sessionEffects: true, sessionPause: true)))
                         let streamer = ScreenStreamer()
                         self.streamer = streamer
-                        streamer.onFrame = { [weak self, weak candidate] packet in
+                        channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
+                        streamer.onFrame = { [weak candidate] packet in
                             guard let candidate else { return }
                             do {
                                 candidate.send(Message(.video, try packet.encode()))
-                                DispatchQueue.main.async {
-                                    guard let self, self.peer === candidate else { return }
-                                    self.frames += 1
-                                }
+                                channel.recordFrame()
                             } catch { candidate.close(error.localizedDescription) }
                         }
                         streamer.onDiagnosticError = { [weak self, weak candidate] error in
@@ -682,8 +681,12 @@ final class DeskModel: ObservableObject {
                 }
             }
         }
-        candidate.onMessage = { [weak self, weak candidate] message in
+        candidate.onMessageHandled = { [weak self, weak candidate] message, resume in
+            do {
+                if try channel.receive(message) { resume(); return }
+            } catch { candidate?.close(error.localizedDescription); resume(); return }
             DispatchQueue.main.async {
+                defer { resume() }
                 guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
                 guard self.connected else { candidate.close("屏幕共享尚未就绪", retryable: true); return }
                 do { try self.handleHost(message, peer: candidate) }
@@ -706,12 +709,7 @@ final class DeskModel: ObservableObject {
                 }
             }
         }
-        candidate.onTraffic = { [weak self, weak candidate] count in
-            DispatchQueue.main.async {
-                guard let self, let candidate, self.generation == token, self.peer === candidate else { return }
-                self.byteCount += count
-            }
-        }
+        candidate.onTraffic = { channel.recordBytes($0) }
         candidate.start()
     }
 
@@ -748,6 +746,26 @@ final class DeskModel: ObservableObject {
         }
     }
 
+    private func makeDataChannel(for peer: Peer) -> SessionDataChannel {
+        SessionDataChannel(send: { [weak peer] in peer?.send($0) }) { [weak self, weak peer] token in
+            DispatchQueue.main.async {
+                guard let self, let peer, self.peer === peer,
+                      self.pauseTransmission.decodedFreshFrame(token: token) else { return }
+                self.dataChannel?.expectFreshFrame(nil)
+                self.pauseRequestTimeout?.cancel()
+                self.sessionPauseStatus = ""
+                self.freshFrameRequiredOnReconnect = false
+                self.publishSessionPause()
+                if self.restoreCanvasFocusAfterIdle, self.sessionWindowFocused, self.canControl,
+                   let window = self.mainWindow, NSApp.keyWindow === window,
+                   window.firstResponder == nil || window.firstResponder === window || window.firstResponder === self.canvas {
+                    window.makeFirstResponder(self.canvas)
+                }
+                self.restoreCanvasFocusAfterIdle = false
+            }
+        }
+    }
+
     private func beginConnection(_ target: Target) {
         guard peer == nil else { return }
         if reconnecting {
@@ -762,6 +780,8 @@ final class DeskModel: ObservableObject {
         currentTrafficDeviceID = nil
         trafficHistoryStatus = "等待远端设备标识；旧版设备需双方升级后才能累计。"
         peer = candidate
+        let channel = makeDataChannel(for: candidate)
+        dataChannel = channel
         active = true
         working = true
         helloReceived = false
@@ -786,22 +806,23 @@ final class DeskModel: ObservableObject {
                 self.status = "连接已加密，等待画面…"
             }
         }
-        candidate.onMessage = { [weak self, weak candidate] message in
+        candidate.onMessageHandled = { [weak self, weak candidate] message, resume in
+            do {
+                if try channel.receive(message) { resume(); return }
+            } catch { candidate?.close(error.localizedDescription); resume(); return }
             DispatchQueue.main.async {
+                defer { resume() }
                 guard let self, let candidate, self.peer === candidate else { return }
-                do { try self.handleViewer(message, peer: candidate) }
-                catch {
+                do {
+                    try self.handleViewer(message, peer: candidate)
+                    channel.expectFreshFrame(self.pauseTransmission.freshFrameToken)
+                } catch {
                     self.recordDiagnosticFailure(.connectionFailed, error: error)
                     candidate.close(error.localizedDescription)
                 }
             }
         }
-        candidate.onTraffic = { [weak self, weak candidate] count in
-            DispatchQueue.main.async {
-                guard let self, let candidate, self.peer === candidate else { return }
-                self.byteCount += count
-            }
-        }
+        candidate.onTraffic = { channel.recordBytes($0) }
         candidate.onClose = { [weak self, weak candidate] reason in
             history.requestFlush()
             let retryable = candidate?.closeIsRetryable == true
@@ -974,6 +995,7 @@ final class DeskModel: ObservableObject {
                 return
             }
             helloReceived = true
+            dataChannel?.configureVideo(canvas.makeVideoReceiver())
             connected = true
             working = false
             remoteName = hello.name
@@ -1078,31 +1100,7 @@ final class DeskModel: ObservableObject {
                 status = permission.canControl ? "已连接 · 辅助功能已生效，点击画面开始操作" : "已连接 · 仅观看（家里 Mac 的辅助功能未生效）"
             }
         case .video:
-            guard helloReceived else { throw DeskError.invalid("缺少会话信息") }
-            let packet = try VideoPacket.decode(message.payload)
-            let freshToken = packet.sps.isEmpty ? nil : pauseTransmission.freshFrameToken
-            try canvas.present(packet) { [weak self, weak peer] in
-                var data = Data()
-                data.put(packet.sequence)
-                peer?.send(Message(.acknowledgement, data))
-                if let freshToken {
-                    DispatchQueue.main.async {
-                        guard let self, let peer, self.peer === peer,
-                              self.pauseTransmission.decodedFreshFrame(token: freshToken) else { return }
-                        self.pauseRequestTimeout?.cancel()
-                        self.sessionPauseStatus = ""
-                        self.freshFrameRequiredOnReconnect = false
-                        self.publishSessionPause()
-                        if self.restoreCanvasFocusAfterIdle, self.sessionWindowFocused, self.canControl,
-                           let window = self.mainWindow, NSApp.keyWindow === window,
-                           window.firstResponder == nil || window.firstResponder === window || window.firstResponder === self.canvas {
-                            window.makeFirstResponder(self.canvas)
-                        }
-                        self.restoreCanvasFocusAfterIdle = false
-                    }
-                }
-            }
-            frames += 1
+            throw DeskError.invalid("视频会话尚未就绪")
         case .clipboard:
             guard helloReceived else { throw DeskError.invalid("缺少会话信息") }
             try receiveClipboard(message.payload)
@@ -1564,6 +1562,7 @@ final class DeskModel: ObservableObject {
             let sync = ClipboardSync(session: clipboardSession, allowsFileSending: remoteFileApproval,
                 allowsAutomaticSending: automaticClipboardSendingAllowed, allowsChunkWindow: remoteClipboardChunkWindow) { [weak peer] in peer?.send($0) }
             clipboardSync = sync
+            dataChannel?.configureClipboard(sync.receiveMessage)
             sync.onDiagnostic = { [weak self, weak sync] event in
                 guard let self, let sync, self.clipboardSync === sync else { return }
                 self.recordClipboardDiagnostic(event)
@@ -1594,6 +1593,7 @@ final class DeskModel: ObservableObject {
             clipboardSync?.allowsFileSending = remoteFileApproval
             clipboardSync?.setAutomaticSendingAllowed(automaticClipboardSendingAllowed)
         } else if !enabled {
+            dataChannel?.configureClipboard(nil)
             clipboardSync?.stop(); clipboardSync = nil
             dismissClipboardPrompt(); clipboardFilePrompt = nil
             pendingFileOffer = nil
@@ -1698,8 +1698,6 @@ final class DeskModel: ObservableObject {
     }
 
     private func beginMetrics() {
-        byteCount = 0
-        frames = 0
         lastMetrics = ProcessInfo.processInfo.systemUptime
         metricsTimer?.invalidate()
         metricsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -1722,14 +1720,13 @@ final class DeskModel: ObservableObject {
                     }
                 }
                 let seconds = max(0.01, ProcessInfo.processInfo.systemUptime - self.lastMetrics)
-                self.traffic = String(format: "%.2f Mbps", Double(self.byteCount) * 8 / seconds / 1_000_000)
-                self.frameRate = String(format: "%.0f fps", Double(self.frames) / seconds)
+                let metrics = self.dataChannel?.takeMetrics() ?? (bytes: 0, frames: 0)
+                self.traffic = String(format: "%.2f Mbps", Double(metrics.bytes) * 8 / seconds / 1_000_000)
+                self.frameRate = String(format: "%.0f fps", Double(metrics.frames) / seconds)
                 if let measured = self.lastLatencyAt, ProcessInfo.processInfo.systemUptime - measured > 15 {
                     self.latency = "— ms"
                     self.roundTripMilliseconds = nil
                 }
-                self.byteCount = 0
-                self.frames = 0
                 self.lastMetrics = ProcessInfo.processInfo.systemUptime
             }
         }
@@ -1737,6 +1734,8 @@ final class DeskModel: ObservableObject {
     }
 
     private func clearSession() {
+        dataChannel?.invalidate()
+        dataChannel = nil
         if mode == .viewer, target != nil, sessionInputSuspended { freshFrameRequiredOnReconnect = true }
         hostPauseTask?.cancel()
         hostPauseTask = nil

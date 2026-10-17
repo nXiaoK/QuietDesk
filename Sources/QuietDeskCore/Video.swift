@@ -122,8 +122,50 @@ public final class VideoEncoder {
 }
 
 public final class VideoSamples {
+    private final class BlockStorage {
+        let data: NSData
+        private let lock = NSLock()
+        private var released = false
+
+        init(_ data: NSData) { self.data = data.copy() as! NSData }
+
+        func releaseBlockRetain() {
+            // A failed creation may already have disposed its temporary block.
+            let shouldRelease = lock.withLock {
+                guard !released else { return false }
+                released = true
+                return true
+            }
+            if shouldRelease { Unmanaged.passUnretained(self).release() }
+        }
+    }
+
     private var format: CMVideoFormatDescription?
     public init() {}
+
+    static func block(for data: NSData, allocator: CFAllocator? = nil) throws -> CMBlockBuffer {
+        guard data.length > 0 else { throw DeskError.invalid("空视频帧") }
+        let storage = BlockStorage(data)
+        var source = CMBlockBufferCustomBlockSource()
+        source.version = UInt32(kCMBlockBufferCustomBlockSourceVersion)
+        source.refCon = Unmanaged.passRetained(storage).toOpaque()
+        source.FreeBlock = { context, _, _ in
+            guard let context else { return }
+            Unmanaged<BlockStorage>.fromOpaque(context).takeUnretainedValue().releaseBlockRetain()
+        }
+        var block: CMBlockBuffer?
+        let status = withExtendedLifetime(storage) {
+            CMBlockBufferCreateWithMemoryBlock(allocator: allocator,
+                memoryBlock: UnsafeMutableRawPointer(mutating: storage.data.bytes),
+                blockLength: storage.data.length, blockAllocator: kCFAllocatorNull, customBlockSource: &source,
+                offsetToData: 0, dataLength: storage.data.length, flags: 0, blockBufferOut: &block)
+        }
+        guard status == noErr, let block else {
+            if block == nil { storage.releaseBlockRetain() }
+            throw DeskError.system("无法创建视频缓冲", status)
+        }
+        return block
+    }
 
     public func sample(for packet: VideoPacket) throws -> CMSampleBuffer {
         if !packet.sps.isEmpty {
@@ -151,16 +193,8 @@ public final class VideoSamples {
             format = created
         }
         guard let format else { throw DeskError.invalid("尚未收到视频关键帧") }
-        var block: CMBlockBuffer?
-        let allocation = CMBlockBufferCreateWithMemoryBlock(allocator: nil, memoryBlock: nil,
-            blockLength: packet.avcc.count, blockAllocator: nil, customBlockSource: nil,
-            offsetToData: 0, dataLength: packet.avcc.count, flags: 0, blockBufferOut: &block)
-        guard allocation == noErr, let block else { throw DeskError.system("无法分配视频缓冲", allocation) }
-        let copy = packet.avcc.withUnsafeBytes {
-            CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block,
-                offsetIntoDestination: 0, dataLength: packet.avcc.count)
-        }
-        guard copy == noErr else { throw DeskError.system("无法复制视频缓冲", copy) }
+        // NSData owns a stable immutable pointer; bridging may itself copy some Data representations.
+        let block = try Self.block(for: packet.avcc as NSData)
         var sample: CMSampleBuffer?
         var size = packet.avcc.count
         var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)

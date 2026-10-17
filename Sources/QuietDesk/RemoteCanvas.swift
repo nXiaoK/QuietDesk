@@ -130,23 +130,26 @@ final class RemoteCanvas: NSView {
         addTrackingArea(area)
     }
 
-    func present(_ packet: VideoPacket, acknowledged: @escaping () -> Void) throws {
+    func makeVideoReceiver() -> (VideoPacket, @escaping () -> Void) -> Void {
         let inbox = mailbox
-        decoder.decode(packet) { [weak self] result in
-            switch result {
-            case .success(let image):
-                if inbox.offer(image) {
+        let decoder = decoder
+        return { [weak self] packet, acknowledged in
+            decoder.decode(packet) { [weak self] result in
+                switch result {
+                case .success(let image):
+                    if inbox.offer(image) {
+                        DispatchQueue.main.async {
+                            guard let self, self.mailbox === inbox else { return }
+                            self.showLatestFrame()
+                        }
+                    }
+                    // Decode completion is independent of window visibility and display readiness.
+                    acknowledged()
+                case .failure(let error):
                     DispatchQueue.main.async {
                         guard let self, self.mailbox === inbox else { return }
-                        self.showLatestFrame()
+                        self.onFailure?(error.localizedDescription)
                     }
-                }
-                // Decode completion is independent of window visibility and display readiness.
-                acknowledged()
-            case .failure(let error):
-                DispatchQueue.main.async {
-                    guard let self, self.mailbox === inbox else { return }
-                    self.onFailure?(error.localizedDescription)
                 }
             }
         }

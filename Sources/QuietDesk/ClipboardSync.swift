@@ -60,10 +60,22 @@ private final class SystemClipboardPasteboard: ClipboardPasteboard {
 
 @MainActor
 final class ClipboardSync {
+    enum PayloadKind: String { case text, png, files }
+    enum DiagnosticEvent: Equatable {
+        case sending(PayloadKind, fileCount: Int)
+        case sent(PayloadKind, fileCount: Int)
+        case sendFailed(PayloadKind, fileCount: Int)
+        case applied(PayloadKind, fileCount: Int)
+        case applyFailed(PayloadKind, fileCount: Int)
+        case fileOfferReceived(count: Int, totalBytes: UInt64)
+        case fileOfferAccepted, fileOfferRejected, staleFilesSuppressed
+    }
+
     static let storageURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("QuietDesk/Clipboard", isDirectory: true)
     var onStatus: ((String) -> Void)?
     var onFileOffer: ((ClipboardFileOffer?) -> Void)?
+    var onDiagnostic: ((DiagnosticEvent) -> Void)?
     var allowsFileSending: Bool
     private var allowsAutomaticSending: Bool
     private let pasteboard: ClipboardPasteboard
@@ -111,6 +123,7 @@ final class ClipboardSync {
                 self.pendingFileOffer = (offer.id, change)
                 self.deferredLocalChange = change
                 self.staleFileChange = change
+                self.onDiagnostic?(.fileOfferReceived(count: offer.count, totalBytes: offer.bytes))
                 self.onFileOffer?(offer)
             }
         }
@@ -119,8 +132,13 @@ final class ClipboardSync {
                 guard let self, self.running, let pending = self.pendingFileOffer, pending.id == id else { return }
                 self.pendingFileOffer = nil
                 switch reason {
-                case .accepted: self.observedChange = pending.change
-                case .declined, .timedOut, .failed: self.deferredLocalChange = nil
+                case .accepted:
+                    self.observedChange = pending.change
+                    self.onDiagnostic?(.fileOfferAccepted)
+                case .declined:
+                    self.deferredLocalChange = nil
+                    self.onDiagnostic?(.fileOfferRejected)
+                case .timedOut, .failed: self.deferredLocalChange = nil
                 // A remote cancellation can precede replacement data; keep the older local version deferred.
                 case .superseded, .cancelled, .stopped: break
                 }
@@ -157,6 +175,7 @@ final class ClipboardSync {
         if change == sharedChange { completion(true); return }
         if let files = pasteboard.fileURLs, !files.isEmpty {
             guard staleFileChange != change else {
+                onDiagnostic?(.staleFilesSuppressed)
                 completion(false)
                 onStatus?("此文件复制早于远端请求，请在本机重新复制后再粘贴")
                 return
@@ -202,6 +221,7 @@ final class ClipboardSync {
         }
         // Closing a remote prompt can restore focus without a new local file copy.
         if case .files = payload, staleFileChange == change {
+            onDiagnostic?(.staleFilesSuppressed)
             let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
             return
         }
@@ -226,9 +246,13 @@ final class ClipboardSync {
             return
         }
         sendingChange = change
+        let summary = diagnosticSummary(for: payload)
+        onDiagnostic?(.sending(summary.kind, fileCount: summary.fileCount))
         transfer.send(payload) { [weak self] success in
             DispatchQueue.main.async {
-                guard let self, self.running, self.sendingChange == change else { return }
+                guard let self, self.running else { return }
+                self.onDiagnostic?(success ? .sent(summary.kind, fileCount: summary.fileCount) : .sendFailed(summary.kind, fileCount: summary.fileCount))
+                guard self.sendingChange == change else { return }
                 self.sendingChange = nil
                 if success { self.sharedChange = change; self.hasSharedState = true; self.lastSharedMarker = contentMarker }
                 let callbacks = self.waiters; self.waiters.removeAll()
@@ -239,15 +263,27 @@ final class ClipboardSync {
 
     private func apply(_ payload: ClipboardPayload) -> Bool {
         guard running else { return false }
+        let summary = diagnosticSummary(for: payload)
         switch payload {
         case .text(let bytes):
-            guard String(data: bytes, encoding: .utf8) != nil else { return false }
+            guard String(data: bytes, encoding: .utf8) != nil else {
+                onDiagnostic?(.applyFailed(summary.kind, fileCount: summary.fileCount))
+                return false
+            }
         case .png(let bytes):
-            guard NSBitmapImageRep(data: bytes) != nil else { onStatus?("接收的图片无效"); return false }
+            guard NSBitmapImageRep(data: bytes) != nil else {
+                onDiagnostic?(.applyFailed(summary.kind, fileCount: summary.fileCount))
+                onStatus?("接收的图片无效")
+                return false
+            }
         case .files: break
         }
         let contentMarker = marker(for: payload)
-        guard pasteboard.write(payload, marker: contentMarker) else { onStatus?("系统剪贴板写入失败"); return false }
+        guard pasteboard.write(payload, marker: contentMarker) else {
+            onDiagnostic?(.applyFailed(summary.kind, fileCount: summary.fileCount))
+            onStatus?("系统剪贴板写入失败")
+            return false
+        }
         observedChange = pasteboard.changeCount
         deferredLocalChange = nil
         staleFileChange = nil
@@ -255,8 +291,17 @@ final class ClipboardSync {
         hasSharedState = true
         lastSharedMarker = contentMarker
         sendingChange = nil
+        onDiagnostic?(.applied(summary.kind, fileCount: summary.fileCount))
         let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(true) }
         return true
+    }
+
+    private func diagnosticSummary(for payload: ClipboardPayload) -> (kind: PayloadKind, fileCount: Int) {
+        switch payload {
+        case .text: return (.text, 0)
+        case .png: return (.png, 0)
+        case .files(let urls): return (.files, urls.count)
+        }
     }
 
     private func marker(for payload: ClipboardPayload) -> String {

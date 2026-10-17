@@ -1,12 +1,14 @@
 import SwiftUI
 import AppKit
 import Carbon
+import UniformTypeIdentifiers
 import QuietDeskCore
 
 @main
 enum QuietDeskEntry {
     @MainActor static func main() {
         if HostSessionEffects.runWatchdogIfRequested() { return }
+        DiagnosticLog.shared.record(.applicationStarted)
         QuietDeskApp.main()
     }
 }
@@ -78,7 +80,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model?.mainWindow?.deminiaturize(nil)
         return true
     }
-    func applicationWillTerminate(_ notification: Notification) { model?.stop() }
+    func applicationWillTerminate(_ notification: Notification) {
+        model?.stop()
+        DiagnosticLog.shared.record(.applicationStopped)
+        DiagnosticLog.shared.flush()
+    }
 }
 
 struct DeskView: View {
@@ -371,6 +377,7 @@ struct DeskView: View {
 private struct TrayView: View {
     @ObservedObject var model: DeskModel
     @Environment(\.openWindow) private var openWindow
+    @State private var exportingLogs = false
     var body: some View {
         Text(model.status)
         Button("打开主窗口") {
@@ -386,7 +393,44 @@ private struct TrayView: View {
             }
         }
         Divider()
+        Button(exportingLogs ? "正在导出日志…" : "导出诊断日志…") { exportLogs() }
+            .disabled(exportingLogs)
+        Divider()
         Button("退出 QuietDesk") { NSApp.terminate(nil) }
+    }
+
+    private func exportLogs() {
+        model.canvas.releaseControl()
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSSavePanel()
+        panel.title = "导出 QuietDesk 诊断日志"
+        panel.message = "导出最近的运行日志，方便排查连接、画质和剪贴板问题。日志不包含配对码或剪贴板内容。"
+        panel.allowedContentTypes = [.plainText]
+        panel.canCreateDirectories = true
+        let date = DateFormatter()
+        date.locale = Locale(identifier: "en_US_POSIX")
+        date.dateFormat = "yyyyMMdd-HHmmss"
+        panel.nameFieldStringValue = "QuietDesk-logs-\(date.string(from: Date())).txt"
+        exportingLogs = true
+        panel.begin { response in
+            guard response == .OK, let destination = panel.url else { exportingLogs = false; return }
+            Task { @MainActor in
+                defer { exportingLogs = false }
+                do {
+                    try await DiagnosticLog.shared.export(to: destination)
+                    DiagnosticLog.shared.record(.exportCompleted)
+                    NSWorkspace.shared.activateFileViewerSelecting([destination])
+                } catch {
+                    DiagnosticLog.shared.record(.exportFailed, state: .failed, error: error)
+                    let alert = NSAlert()
+                    alert.messageText = "诊断日志未导出"
+                    alert.informativeText = (error as? DiagnosticLog.Failure)?.localizedDescription
+                        ?? "日志导出失败，请更换保存位置并检查可用空间和文件访问权限。"
+                    alert.addButton(withTitle: "知道了")
+                    alert.runModal()
+                }
+            }
+        }
     }
 }
 

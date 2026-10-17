@@ -565,6 +565,54 @@ private struct ClipboardFocusChecks {
                         "An interrupted file was published")
         }
 
+        run("Clipboard diagnostics report typed lifecycle events without names, paths or contents") { folder in
+            let pair = ClipboardPair(storage: folder)
+            defer { pair.stop() }
+            var localEvents: [ClipboardSync.DiagnosticEvent] = [], remoteEvents: [ClipboardSync.DiagnosticEvent] = []
+            pair.localSync.onDiagnostic = { localEvents.append($0) }
+            pair.remoteSync.onDiagnostic = { remoteEvents.append($0) }
+            let secret = "private clipboard contents"
+            pair.local.copy(.text(Data(secret.utf8)))
+            pump(for: 0.35)
+            try require(localEvents.isEmpty && remoteEvents.isEmpty && pair.local.reads == 0,
+                        "Diagnostics read or reported an inactive clipboard")
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Successful text synchronization was not diagnosed") { localEvents.contains(.sent(.text, fileCount: 0)) }
+            try require(localEvents == [.sending(.text, fileCount: 0), .sent(.text, fileCount: 0)]
+                        && remoteEvents == [.applied(.text, fileCount: 0)], "Text lifecycle diagnostics changed")
+            pair.remote.rejectsWrites = true
+            pair.local.copy(.text(Data("another private value".utf8)))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("A send failure was not diagnosed") { localEvents.contains(.sendFailed(.text, fileCount: 0)) }
+            try require(remoteEvents.contains(.applyFailed(.text, fileCount: 0)), "A failed clipboard application was not diagnosed")
+            pair.remote.rejectsWrites = false
+            let file = folder.appendingPathComponent("private-file-name.bin")
+            let dormant = folder.appendingPathComponent("private-dormant-name.bin")
+            try Data([1, 2, 3]).write(to: file); try Data([4]).write(to: dormant)
+            pair.remote.copy(.files([dormant]))
+            var offer: ClipboardFileOffer?
+            pair.remoteSync.onFileOffer = { offer = $0 }
+            pair.local.copy(.files([file]))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("File offer diagnostics missing") { offer != nil && remoteEvents.contains(.fileOfferReceived(count: 1, totalBytes: 3)) }
+            pair.remoteSync.respondToFileOffer(id: offer!.id, accept: false)
+            try eventually("File rejection was not diagnosed") { remoteEvents.contains(.fileOfferRejected) && localEvents.contains(.sendFailed(.files, fileCount: 1)) }
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try require(remoteEvents.contains(.staleFilesSuppressed), "Stale file suppression was not diagnosed")
+            pair.remoteSync.setAutomaticSendingAllowed(false)
+            pair.local.copy(.files([file]))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Retry file offer missing") { offer != nil }
+            pair.remoteSync.respondToFileOffer(id: offer!.id, accept: true)
+            try eventually("Accepted file completion was not diagnosed") { localEvents.contains(.sent(.files, fileCount: 1)) }
+            try require(remoteEvents.contains(.fileOfferAccepted) && remoteEvents.contains(.applied(.files, fileCount: 1)),
+                        "File approval or application diagnostics missing")
+            let description = String(describing: localEvents + remoteEvents)
+            for privateValue in [secret, "another private value", file.lastPathComponent, dormant.lastPathComponent, folder.path] {
+                try require(!description.contains(privateValue), "Diagnostic event exposed clipboard content or a file path")
+            }
+        }
+
         run("Focus preference is optional, round-trips both states and rejects non-boolean input") { _ in
             let legacy = try Wire.readJSON(ClipboardPreference.self, Data("{\"enabled\":true}".utf8))
             try require(legacy.receivesAutomaticUpdates == nil && (legacy.receivesAutomaticUpdates ?? true),

@@ -7,8 +7,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     struct CapturePlan {
         fileprivate let filter: SCContentFilter
         fileprivate let displayID: CGDirectDisplayID
-        fileprivate let sourceWidth: Int
-        fileprivate let sourceHeight: Int
+        let sourceWidth: Int
+        let sourceHeight: Int
         fileprivate let settings: StreamSettings
         let width: Int
         let height: Int
@@ -17,6 +17,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     let queue = DispatchQueue(label: "quietdesk.capture", qos: .userInteractive)
     var onFrame: ((VideoPacket) -> Void)?
     var onError: ((String) -> Void)?
+    var onDiagnosticError: ((Error) -> Void)?
     var onUserStop: (() -> Void)?
     private var stream: SCStream?
     private var encoder: VideoEncoder?
@@ -93,11 +94,16 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                     self.waiting = packet.sequence
                     self.sentAt = ProcessInfo.processInfo.systemUptime
                     self.onFrame?(packet)
-                case .failure(let error): self.onError?(error.localizedDescription)
+                case .failure(let error): self.reportError(error)
                 }
             }
         }
         return encoder
+    }
+
+    private func reportError(_ error: Error, message: String? = nil) {
+        onDiagnosticError?(error)
+        onError?(message ?? error.localizedDescription)
     }
 
     func start(_ capture: CapturePlan) async throws {
@@ -123,7 +129,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             watchdog.setEventHandler { [weak self] in
                 guard let self, self.running, self.waiting != nil || self.encoding else { return }
                 if ProcessInfo.processInfo.systemUptime - self.sentAt > 90 {
-                    self.onError?(self.encoding ? "视频编码超过 90 秒无输出" : "视频解码确认超过 90 秒未返回")
+                    self.reportError(DeskError.invalid(self.encoding ? "视频编码超过 90 秒无输出" : "视频解码确认超过 90 秒未返回"))
                 }
             }
             self.watchdog = watchdog
@@ -178,7 +184,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                         pump()
                     }
                 } catch let rollbackError {
-                    queue.async { [weak self] in self?.onError?("画质调整失败且无法恢复原配置：\(rollbackError.localizedDescription)") }
+                    queue.async { [weak self] in
+                        self?.reportError(rollbackError, message: "画质调整失败且无法恢复原配置：\(rollbackError.localizedDescription)")
+                    }
                 }
             }
             throw error
@@ -314,7 +322,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 self.onUserStop?()
                 return
             }
-            self.onError?("屏幕采集停止：\(error.localizedDescription)")
+            self.reportError(error, message: "屏幕采集停止：\(error.localizedDescription)")
         }
     }
 
@@ -345,7 +353,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         let keyFrame = forceKeyFrame
         forceKeyFrame = false
         do { try encoder.encode(latest.0, time: latest.1, sequence: sequence, forceKeyFrame: keyFrame) }
-        catch { encoding = false; onError?(error.localizedDescription) }
+        catch { encoding = false; reportError(error) }
     }
 
     deinit { watchdog?.cancel() }

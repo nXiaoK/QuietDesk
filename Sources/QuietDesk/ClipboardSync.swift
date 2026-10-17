@@ -276,23 +276,27 @@ final class ClipboardSync {
             imagePreparation = token
             sendingChange = change
             let convert = convertTIFF
-            imageQueue.async { [weak self] in
-                let png = convert(tiff)
-                DispatchQueue.main.async {
-                    guard let self, self.running, self.imagePreparation == token else { return }
-                    self.imagePreparation = nil
-                    self.sendingChange = nil
-                    guard self.allowsAutomaticSending, self.pasteboard.changeCount == change else {
-                        let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
-                        self.poll()
-                        return
+            let imageQueue = imageQueue
+            transfer.prepareSend { [weak self] preparation in
+                guard let preparation else { return }
+                imageQueue.async {
+                    let png = convert(tiff)
+                    DispatchQueue.main.async {
+                        guard let self, self.running, self.imagePreparation == token else { return }
+                        self.imagePreparation = nil
+                        self.sendingChange = nil
+                        guard self.allowsAutomaticSending, self.pasteboard.changeCount == change else {
+                            let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
+                            self.poll()
+                            return
+                        }
+                        guard let png else {
+                            self.onStatus?("剪贴板图片无法转换为 PNG")
+                            let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
+                            return
+                        }
+                        self.sendPrepared(.png(png), change: change, preparation: preparation)
                     }
-                    guard let png else {
-                        self.onStatus?("剪贴板图片无法转换为 PNG")
-                        let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
-                        return
-                    }
-                    self.sendPrepared(.png(png), change: change)
                 }
             }
             return
@@ -306,7 +310,7 @@ final class ClipboardSync {
         sendPrepared(payload, change: change)
     }
 
-    private func sendPrepared(_ payload: ClipboardPayload, change: Int) {
+    private func sendPrepared(_ payload: ClipboardPayload, change: Int, preparation: UUID? = nil) {
         do {
             switch payload {
             case .text(let bytes): try ClipboardAutomaticLimits.validate(type: "text", bytes: UInt64(bytes.count))
@@ -354,7 +358,7 @@ final class ClipboardSync {
         sendingChange = change
         let summary = diagnosticSummary(for: payload)
         onDiagnostic?(.sending(summary.kind, fileCount: summary.fileCount))
-        transfer.send(payload) { [weak self] success in
+        transfer.send(payload, preparation: preparation) { [weak self] success in
             DispatchQueue.main.async {
                 guard let self, self.running else { return }
                 self.onDiagnostic?(success ? .sent(summary.kind, fileCount: summary.fileCount) : .sendFailed(summary.kind, fileCount: summary.fileCount))
@@ -376,7 +380,12 @@ final class ClipboardSync {
 
     private func prepareApplication(_ payload: ClipboardPayload, permit: ClipboardApplyPermit,
                                     completion: @escaping (Bool) -> Void) {
-        guard running else { completion(false); return }
+        guard running, permit.isValid else { completion(false); return }
+        if imagePreparation != nil {
+            imagePreparation = nil
+            sendingChange = nil
+            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+        }
         cancelImageApplication()
         guard case .png(let bytes) = payload else {
             completion(permit.performIfValid { apply(payload) })

@@ -58,6 +58,7 @@ public enum ClipboardFileOfferEndReason {
 public final class ClipboardApplyPermit: @unchecked Sendable {
     private let lock = NSLock()
     private var valid = true
+    public var isValid: Bool { lock.withLock { valid } }
 
     public func performIfValid(_ apply: () -> Bool) -> Bool {
         lock.withLock {
@@ -133,6 +134,7 @@ public final class ClipboardTransfer {
     private var appliedFiles: [Part]?
     private var pendingFileOffer: (id: UUID, begin: ClipboardBegin, created: TimeInterval)?
     private var applying: (revision: ClipboardRevision, permit: ClipboardApplyPermit)?
+    private var sendPreparation: UUID?
     private var stopped = false
     private var timer: DispatchSourceTimer?
     private static let chunkSize = 32_768
@@ -214,9 +216,29 @@ public final class ClipboardTransfer {
         }
     }
 
-    public func send(_ payload: ClipboardPayload, completion: @escaping (Bool) -> Void = { _ in }) {
+    public func prepareSend(completion: @escaping (UUID?) -> Void) {
+        queue.async { [self] in
+            guard !stopped else { completion(nil); return }
+            let reason = "剪贴板已被新的复制内容替换"
+            cancelOutgoing(reason)
+            if let incoming {
+                sendJSON(.clipboardCancel, ClipboardReceipt(revision: incoming.begin.revision, sequence: incoming.sequence, reason: reason))
+            } else if let pendingFileOffer {
+                sendJSON(.clipboardCancel, ClipboardReceipt(revision: pendingFileOffer.begin.revision, sequence: 0, reason: reason))
+            } else if let applying {
+                sendJSON(.clipboardCancel, ClipboardReceipt(revision: applying.revision, sequence: 0, reason: reason))
+            }
+            discardIncoming(reason: .superseded)
+            let preparation = UUID()
+            sendPreparation = preparation
+            completion(preparation)
+        }
+    }
+
+    public func send(_ payload: ClipboardPayload, preparation: UUID? = nil, completion: @escaping (Bool) -> Void = { _ in }) {
         queue.async { [self] in
             guard !stopped else { completion(false); return }
+            guard preparation == nil || preparation == sendPreparation else { completion(false); return }
             var installed = false
             do {
                 onStatus?("正在准备剪贴板…")
@@ -625,6 +647,7 @@ public final class ClipboardTransfer {
         onFileOffer?(nil)
     }
     private func discardIncoming(reason: ClipboardFileOfferEndReason) {
+        sendPreparation = nil
         applying?.permit.invalidate(); applying = nil
         finishFileOffer(reason)
         guard let incoming else { return }

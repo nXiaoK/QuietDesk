@@ -101,10 +101,11 @@ private final class ClipboardPair {
     var routeRemote: ((Message) -> Bool)?
 
     init(storage: URL, localAllowed: Bool = false, remoteAllowed: Bool = false,
+         convertLocalTIFF: @escaping (Data) -> Data? = { data in NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) },
          validateRemotePNG: ((Data) -> Bool)? = nil) {
         let session = UUID()
         localSync = ClipboardSync(session: session, allowsFileSending: true, allowsAutomaticSending: localAllowed,
-            pasteboard: local, storage: storage.appendingPathComponent("local")) { [weak self] message in
+            pasteboard: local, storage: storage.appendingPathComponent("local"), convertTIFF: convertLocalTIFF) { [weak self] message in
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.localMessages.append(message.kind)
@@ -709,6 +710,101 @@ private struct ClipboardFocusChecks {
             probe.release.signal()
             pump(for: 0.15)
             try require(messages.filter { $0 == .clipboardBegin }.count == 1, "Stale image superseded a newer copy")
+        }
+
+        run("A remote PNG begin cancels an older TIFF preparation before the remote transfer ends") { folder in
+            guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+                  let png = bitmap.representation(using: .png, properties: [:]) else {
+                throw FocusCheckFailure("Cannot create an in-memory PNG")
+            }
+            let probe = ImageConversionProbe()
+            let pair = ClipboardPair(storage: folder, localAllowed: true, remoteAllowed: true,
+                                     convertLocalTIFF: { probe.convert($0) })
+            defer { probe.release.signal(); pair.stop() }
+            var held: Message?, localEvents: [ClipboardSync.DiagnosticEvent] = []
+            pair.localSync.onDiagnostic = { localEvents.append($0) }
+            pair.routeRemote = { message in
+                if message.kind == .clipboardChunk, held == nil { held = message; return false }
+                return true
+            }
+            pair.local.copy(.text(Data("older local copy".utf8)))
+            pair.local.rawTIFF = png
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Local TIFF preparation did not start") { probe.state.began }
+            pair.remote.copy(.png(png))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("Remote PNG did not begin receiving") { held != nil }
+            probe.release.signal()
+            try eventually("Local TIFF preparation did not resolve") {
+                pair.localMessages.contains(.clipboardBegin) || localEvents.contains(.sendFailed(.png, fileCount: 0))
+            }
+            try require(!pair.localMessages.contains(.clipboardBegin), "Older TIFF preparation superseded the newer remote PNG")
+            pair.localSync.receive(held!)
+            try eventually("Newer remote PNG did not apply after the superseded TIFF was discarded") { pair.local.writes == 1 }
+            try require(pair.remote.writes == 0, "Superseded TIFF was published on the remote clipboard")
+        }
+
+        run("Preparing a remote PNG application cancels older TIFF paste waiters before conversion completes") { folder in
+            guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+                  let png = bitmap.representation(using: .png, properties: [:]) else {
+                throw FocusCheckFailure("Cannot create an in-memory PNG")
+            }
+            let probe = ImageConversionProbe()
+            let pair = ClipboardPair(storage: folder, localAllowed: true, remoteAllowed: true,
+                                     convertLocalTIFF: { probe.convert($0) })
+            defer { probe.release.signal(); pair.stop() }
+            pair.local.copy(.text(Data("older TIFF copy".utf8)))
+            pair.local.rawTIFF = png
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Local TIFF conversion did not start") { probe.state.began }
+            var paste: Bool?
+            pair.localSync.prepareForPaste { paste = $0 }
+            try require(paste == nil, "TIFF paste did not wait for conversion")
+            pair.remote.copy(.png(png))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("Remote application did not cancel the old TIFF paste request") { paste == false }
+            try require(pair.local.writes == 0, "Remote PNG validation bypassed the image queue")
+            probe.release.signal()
+            try eventually("Remote PNG did not publish after TIFF preparation cancellation") { pair.local.writes == 1 }
+            try require(!pair.localMessages.contains(.clipboardBegin) && pair.remote.writes == 0,
+                        "The old TIFF copy returned to the remote clipboard")
+        }
+
+        run("A newer local TIFF copy cancels an older receiving PNG before conversion completes") { folder in
+            guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+                  let png = bitmap.representation(using: .png, properties: [:]) else {
+                throw FocusCheckFailure("Cannot create an in-memory PNG")
+            }
+            let probe = ImageConversionProbe()
+            let pair = ClipboardPair(storage: folder, localAllowed: true, remoteAllowed: true,
+                                     convertLocalTIFF: { probe.convert($0) })
+            defer { probe.release.signal(); pair.stop() }
+            var held: Message?, remoteEvents: [ClipboardSync.DiagnosticEvent] = []
+            pair.remoteSync.onDiagnostic = { remoteEvents.append($0) }
+            pair.routeRemote = { message in
+                if message.kind == .clipboardChunk, held == nil { held = message; return false }
+                return true
+            }
+            pair.remote.copy(.png(png))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("No remote PNG receiving to replace") { held != nil }
+            pair.local.copy(.text(Data("newer local TIFF".utf8)))
+            pair.local.rawTIFF = png
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Local TIFF did not start preparation") { probe.state.began }
+            try eventually("New local TIFF did not promptly cancel the older remote transfer") {
+                remoteEvents.contains(.sendFailed(.png, fileCount: 0))
+            }
+            pair.localSync.receive(held!)
+            probe.release.signal()
+            try eventually("Newer local TIFF was not sent after conversion") { pair.remote.writes == 1 }
+            try require(pair.local.writes == 0, "An older remote PNG overwrote the newer local copy")
         }
 
         run("Received PNG validates on a background queue before publication and paste readiness") { folder in

@@ -51,9 +51,18 @@ public final class LatestFrameMailbox {
     private let lock = NSLock()
     private var frame: CVPixelBuffer?
     private var scheduled = false
+    private var latestSequence: UInt32?
     public init() {}
-    public func offer(_ frame: CVPixelBuffer) -> Bool {
+    public func offer(_ frame: CVPixelBuffer, sequence: UInt32? = nil) -> Bool {
         lock.withLock {
+            if let sequence {
+                if let latestSequence {
+                    // Keep the watermark after take; late decode callbacks must not regress the display.
+                    let distance = sequence &- latestSequence
+                    guard distance > 0, distance < 0x8000_0000 else { return false }
+                }
+                latestSequence = sequence
+            }
             self.frame = frame
             if scheduled { return false }
             scheduled = true

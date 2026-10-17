@@ -137,7 +137,7 @@ final class RemoteCanvas: NSView {
             decoder.decode(packet) { [weak self] result in
                 switch result {
                 case .success(let image):
-                    if inbox.offer(image) {
+                    if inbox.offer(image, sequence: packet.sequence) {
                         DispatchQueue.main.async {
                             guard let self, self.mailbox === inbox else { return }
                             self.showLatestFrame()

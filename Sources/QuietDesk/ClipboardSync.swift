@@ -9,7 +9,13 @@ protocol ClipboardPasteboard: AnyObject {
     var pngData: Data? { get }
     var text: String? { get }
     var contentMarker: String? { get }
+    /// 内容由 macOS 通用剪贴板（接力/Handoff）等跨设备机制写入，而不是本机用户复制。
+    var isRelayedFromOtherDevice: Bool { get }
     func write(_ payload: ClipboardPayload, marker: String) -> Bool
+}
+
+extension ClipboardPasteboard {
+    var isRelayedFromOtherDevice: Bool { false }
 }
 
 @MainActor
@@ -25,6 +31,14 @@ private final class SystemClipboardPasteboard: ClipboardPasteboard {
     }
     var text: String? { pasteboard.string(forType: .string) }
     var contentMarker: String? { pasteboard.string(forType: Self.marker) }
+    // Universal Clipboard 写入的条目带有该类型；QuietDesk 不应把它当成本机新复制再转发给对端。
+    private static let relayedTypes: Set<NSPasteboard.PasteboardType> = [
+        NSPasteboard.PasteboardType("com.apple.is-remote-clipboard")
+    ]
+    var isRelayedFromOtherDevice: Bool {
+        guard let types = pasteboard.types else { return false }
+        return !Self.relayedTypes.isDisjoint(with: types)
+    }
 
     func write(_ payload: ClipboardPayload, marker: String) -> Bool {
         var items: [NSPasteboardItem] = []
@@ -216,6 +230,13 @@ final class ClipboardSync {
         else if let text = pasteboard.text { payload = .text(Data(text.utf8)) }
         else {
             onStatus?("此剪贴板类型暂不能同步")
+            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+            return
+        }
+        // 文件来自通用剪贴板（另一台 Mac 复制后由系统同步过来），对端本身就是来源，转发只会形成回环。
+        if case .files = payload, pasteboard.isRelayedFromOtherDevice {
+            onDiagnostic?(.staleFilesSuppressed)
+            onStatus?("剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传")
             let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
             return
         }

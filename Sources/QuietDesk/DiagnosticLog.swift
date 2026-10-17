@@ -23,6 +23,7 @@ final class DiagnosticLog: @unchecked Sendable {
         case payloadType, accessibilityGranted, inputMonitoringGranted, screenRecordingGranted
         case eventCount, scrollObserved, scrollSent, scrollReceived, scrollSuppressed, entriesDropped
         case pendingBytes, scaleTimes1000, retryAttempt, maximumDimension
+        case tcpAckStretchingDisabled
     }
     enum Counter: String {
         case scrollObserved, scrollSent, scrollReceived, scrollSuppressed

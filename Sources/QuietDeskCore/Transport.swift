@@ -13,7 +13,7 @@ public enum SecureTransport {
         }
     }
 
-    public static func parameters(key: PairingKey) -> NWParameters {
+    public static func parameters(key: PairingKey, responsiveAcknowledgements: Bool = false) -> NWParameters {
         let tls = NWProtocolTLS.Options()
         let identity = Data("quietdesk-v1".utf8)
         key.data.withUnsafeBytes { keyBytes in
@@ -33,6 +33,7 @@ public enum SecureTransport {
         sec_protocol_options_set_tls_resumption_enabled(tls.securityProtocolOptions, false)
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
+        tcp.disableAckStretching = responsiveAcknowledgements
         tcp.enableKeepalive = true
         tcp.keepaliveIdle = 15
         tcp.connectionTimeout = 10

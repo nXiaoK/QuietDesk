@@ -594,7 +594,7 @@ final class DeskModel: ObservableObject {
                     guard self.generation == token, self.hostingRequested, !Task.isCancelled else { return }
                     self.refreshDisplays()
                     _ = try self.selectShareableDisplay(content.displays)
-                    let listener = try NWListener(using: SecureTransport.parameters(key: key), on: port)
+                    let listener = try NWListener(using: SecureTransport.parameters(key: key, responsiveAcknowledgements: true), on: port)
                     let admission = PendingHandshakeGate()
                     listener.newConnectionHandler = { [weak self] connection in
                         let address: String?
@@ -654,6 +654,7 @@ final class DeskModel: ObservableObject {
 
     private func accept(_ connection: NWConnection, generation token: UUID, admission: PendingHandshakeGate, id: UUID) {
         let diagnostics = PerformanceDiagnostics()
+        let ackStretchingDisabled = (connection.parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options)?.disableAckStretching
         let candidate = Peer(connection: connection, handshakeTimeout: peer == nil ? 15 : 5, diagnostics: diagnostics)
         let channel = makeDataChannel(for: candidate)
         let session = makeTrafficSession(for: candidate)
@@ -665,7 +666,8 @@ final class DeskModel: ObservableObject {
                 guard let self, let candidate, self.pending.removeValue(forKey: id) != nil,
                       self.generation == token, self.active, self.hostingRequested else { return }
                 guard self.peer == nil else { candidate.close("这台 Mac 当前已有控制连接"); return }
-                DiagnosticLog.shared.record(.connectionReady, role: .host, state: .ready)
+                DiagnosticLog.shared.record(.connectionReady, role: .host, state: .ready,
+                    values: ackStretchingDisabled.map { [.tcpAckStretchingDisabled: $0 ? 1 : 0] } ?? [:])
                 self.peer = candidate
                 self.attachPerformanceDiagnostics(diagnostics, role: .host)
                 self.dataChannel = channel
@@ -839,8 +841,10 @@ final class DeskModel: ObservableObject {
             if idlePolicy.isPaused { deferReconnectForIdle("10 分钟无窗口操作"); return }
         }
         let diagnostics = PerformanceDiagnostics(enabled: performanceDiagnosticsEnabled)
-        let candidate = Peer(connection: NWConnection(host: NWEndpoint.Host(target.address),
-            port: NWEndpoint.Port(rawValue: target.port)!, using: SecureTransport.parameters(key: target.key)), diagnostics: diagnostics)
+        let connection = NWConnection(host: NWEndpoint.Host(target.address),
+            port: NWEndpoint.Port(rawValue: target.port)!, using: SecureTransport.parameters(key: target.key, responsiveAcknowledgements: true))
+        let ackStretchingDisabled = (connection.parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options)?.disableAckStretching
+        let candidate = Peer(connection: connection, diagnostics: diagnostics)
         attachPerformanceDiagnostics(diagnostics, role: .viewer)
         DiagnosticLog.shared.record(.connectionStarted, role: .viewer, state: .requested)
         trafficSession = makeTrafficSession(for: candidate)
@@ -871,7 +875,8 @@ final class DeskModel: ObservableObject {
         candidate.onReady = { [weak self, weak candidate] in
             DispatchQueue.main.async {
                 guard let self, let candidate, self.peer === candidate else { return }
-                DiagnosticLog.shared.record(.connectionReady, role: .viewer, state: .ready)
+                DiagnosticLog.shared.record(.connectionReady, role: .viewer, state: .ready,
+                    values: ackStretchingDisabled.map { [.tcpAckStretchingDisabled: $0 ? 1 : 0] } ?? [:])
                 self.status = "连接已加密，等待画面…"
             }
         }

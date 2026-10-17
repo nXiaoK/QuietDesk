@@ -47,6 +47,7 @@ jobs:
           ./scripts/run-session-effects-checks.sh
           ./scripts/run-traffic-checks.sh
           ./scripts/run-log-checks.sh
+          ./scripts/run-credential-checks.sh
       - name: Build Universal application
         env:
           QUIETDESK_VERSION: ${{ steps.version.outputs.version }}

@@ -266,8 +266,10 @@ final class DeskModel: ObservableObject {
         refreshPermissions(checkScreenCapture: true)
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, self.connected || self.capsLockEnabled || self.permissionGuide?.isVisible == true else { return }
-                self.refreshPermissions()
+                guard let self else { return }
+                let guideVisible = self.permissionGuide?.isVisible == true
+                guard self.connected || self.capsLockEnabled || guideVisible else { return }
+                self.refreshPermissions(checkScreenCapture: guideVisible)
             }
         }
         if let permissionTimer { RunLoop.main.add(permissionTimer, forMode: .common) }

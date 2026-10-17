@@ -35,11 +35,15 @@ final class PermissionGuide: NSWindowController {
     }
 
     private let state: PermissionGuideState
+    private let permissionCheck: (Kind) -> Bool
     private let onRefresh: () -> Void
     var isVisible: Bool { window?.isVisible == true }
 
-    init(bundleURL: URL = Bundle.main.bundleURL, onRefresh: @escaping () -> Void) {
+    init(bundleURL: URL = Bundle.main.bundleURL,
+         permissionCheck: @escaping (Kind) -> Bool = { $0.isEffective },
+         onRefresh: @escaping () -> Void) {
         state = PermissionGuideState(bundleURL: bundleURL)
+        self.permissionCheck = permissionCheck
         self.onRefresh = onRefresh
         let panel = PermissionGuidePanel(contentRect: NSRect(x: 0, y: 0, width: 520, height: 250),
             styleMask: [.titled, .closable, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -62,7 +66,11 @@ final class PermissionGuide: NSWindowController {
 
     func present(for kind: Kind) {
         state.kind = kind
-        state.effective = kind.isEffective
+        state.effective = permissionCheck(kind)
+        if state.effective {
+            close()
+            return
+        }
         guard let window else { return }
         window.title = "QuietDesk · \(kind.title)权限引导"
         let pointer = NSEvent.mouseLocation
@@ -75,7 +83,8 @@ final class PermissionGuide: NSWindowController {
 
     func refreshStatus() {
         guard isVisible else { return }
-        state.effective = state.kind.isEffective
+        state.effective = permissionCheck(state.kind)
+        if state.effective { close() }
     }
 }
 

@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import plistlib
 import subprocess
@@ -13,7 +14,7 @@ from version import ROOT, build_number, parse_version
 
 
 def main():
-    output = ROOT / "dist"
+    output = Path(os.environ.get("QUIETDESK_DIST_DIR", ROOT / "dist"))
     app = output / "QuietDesk.app"
     info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
     version = info["CFBundleShortVersionString"]

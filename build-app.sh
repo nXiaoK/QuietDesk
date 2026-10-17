@@ -11,10 +11,17 @@ fi
 VERSION_INFO=("${(@f)$(python3 scripts/version.py current)}")
 APP_VERSION="${VERSION_INFO[1]}"
 APP_BUILD="${VERSION_INFO[2]}"
+BUILD_ROOT="${QUIETDESK_BUILD_DIR:-$PWD/.build}"
+DIST_ROOT="${QUIETDESK_DIST_DIR:-$PWD/dist}"
+BUILD_REVISION=""
+if [[ -z "$(git status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+  BUILD_REVISION="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+fi
+if [[ ! "$BUILD_REVISION" =~ '^[0-9a-f]{40}$' ]]; then BUILD_REVISION=""; fi
 
-mkdir -p .build/module-cache
-export CLANG_MODULE_CACHE_PATH="$PWD/.build/module-cache"
-export SWIFT_MODULECACHE_PATH="$PWD/.build/module-cache"
+mkdir -p "$BUILD_ROOT/module-cache"
+export CLANG_MODULE_CACHE_PATH="$BUILD_ROOT/module-cache"
+export SWIFT_MODULECACHE_PATH="$BUILD_ROOT/module-cache"
 if [[ "$ARCH" == "universal" ]]; then
   ARCHES=(arm64 x86_64)
 else
@@ -22,13 +29,13 @@ else
 fi
 BINARIES=()
 for TARGET_ARCH in "${ARCHES[@]}"; do
-  swift build --product QuietDesk -c release --arch "$TARGET_ARCH" --disable-sandbox \
-    --cache-path "$PWD/.build/cache" --config-path "$PWD/.build/config" --security-path "$PWD/.build/security"
-  BIN_DIR="$(swift build -c release --arch "$TARGET_ARCH" --show-bin-path --disable-sandbox \
-    --cache-path "$PWD/.build/cache" --config-path "$PWD/.build/config" --security-path "$PWD/.build/security")"
+  swift build --product QuietDesk -c release --arch "$TARGET_ARCH" --scratch-path "$BUILD_ROOT" --disable-sandbox \
+    --cache-path "$BUILD_ROOT/cache" --config-path "$BUILD_ROOT/config" --security-path "$BUILD_ROOT/security"
+  BIN_DIR="$(swift build -c release --arch "$TARGET_ARCH" --show-bin-path --scratch-path "$BUILD_ROOT" --disable-sandbox \
+    --cache-path "$BUILD_ROOT/cache" --config-path "$BUILD_ROOT/config" --security-path "$BUILD_ROOT/security")"
   BINARIES+=("$BIN_DIR/QuietDesk")
 done
-APP="$PWD/dist/QuietDesk.app"
+APP="$DIST_ROOT/QuietDesk.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$PWD/Resources/QuietDesk.icns" "$APP/Contents/Resources/QuietDesk.icns"
 if [[ "${#BINARIES[@]}" == "2" ]]; then
@@ -49,6 +56,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIconFile</key><string>QuietDesk.icns</string>
   <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
   <key>CFBundleVersion</key><string>$APP_BUILD</string>
+  <key>QuietDeskBuildRevision</key><string>$BUILD_REVISION</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSScreenCaptureUsageDescription</key><string>用于将这台 Mac 的屏幕传输到你自己的另一台 Mac。</string>

@@ -107,6 +107,8 @@ public final class ClipboardTransfer {
     private let storage: URL
     private let requireFileApproval: Bool
     private let allowsChunkWindow: Bool
+    private let availableCapacity: (URL) throws -> UInt64
+    private var partialStorage: ClipboardPartialStorage?
     private let origin = UUID()
     private var clock: UInt64 = 0
     private var newest: ClipboardRevision?
@@ -166,9 +168,12 @@ public final class ClipboardTransfer {
         deinit { try? handle?.close() }
     }
 
-    public init(storage: URL, requireFileApproval: Bool = false, allowsChunkWindow: Bool = false) {
+    public init(storage: URL, requireFileApproval: Bool = false, allowsChunkWindow: Bool = false,
+                availableCapacity: ((URL) throws -> UInt64)? = nil) {
         self.storage = storage; self.requireFileApproval = requireFileApproval
         self.allowsChunkWindow = allowsChunkWindow
+        self.availableCapacity = availableCapacity ?? ClipboardPartialStorage.availableCapacity
+        queue.async { try? ClipboardPartialStorage.removeAbandoned(storage: storage) }
     }
 
     public func respondToFileOffer(id: UUID, accept: Bool) {
@@ -291,6 +296,7 @@ public final class ClipboardTransfer {
             timer?.cancel(); timer = nil
             cancelOutgoing("连接结束", notify: false)
             discardIncoming(reason: .stopped)
+            partialStorage = nil
             completion?()
         }
     }
@@ -452,11 +458,21 @@ public final class ClipboardTransfer {
             onStatus?("收到文件复制请求，确认接收后才会下载（90 秒内）")
             return
         }
-        try startReceiving(value)
+        do { try startReceiving(value) }
+        catch {
+            sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: 0, reason: error.localizedDescription))
+            throw error
+        }
     }
 
     private func startReceiving(_ value: ClipboardBegin) throws {
-        let folder = storage.appendingPathComponent("partial", isDirectory: true).appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        guard value.bytes <= (try availableCapacity(storage)) else {
+            throw DeskError.invalid("接收目录可用磁盘空间不足，未下载文件内容")
+        }
+        if partialStorage == nil { partialStorage = try ClipboardPartialStorage(storage: storage) }
+        guard let partialStorage else { throw DeskError.invalid("接收目录未准备好") }
+        let folder = partialStorage.directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         incoming = Incoming(begin: value, directory: folder)
         ensureTimer()

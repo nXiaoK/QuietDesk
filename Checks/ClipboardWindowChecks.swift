@@ -112,7 +112,7 @@ func runClipboardWindowChecks() {
                 b.onReceive = { _ in published.set(true) }
                 a.send(.text(Data(repeating: 65, count: 1_000_000))) { success.set($0); done.signal() }
                 try wait(done, "Invalid chunk did not cancel transfer")
-                try check(!success.read() && !published.read(), "Invalid chunk was applied or reported successful")
+                try check(changed.read() && !success.read() && !published.read(), "Invalid chunk was not exercised, was applied or reported successful")
             }
         }
     }

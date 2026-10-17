@@ -2,6 +2,59 @@ import AppKit
 import ScreenCaptureKit
 import QuietDeskCore
 
+// Encoder and acknowledgement state share one queue with the capture pump.
+struct VideoFrameFlow {
+    private(set) var sequence: UInt32
+    private(set) var encoding: UInt32?
+    private(set) var waiting: [UInt32: TimeInterval] = [:]
+    private(set) var forceKeyFrame = true
+    private var encodingStartedAt: TimeInterval?
+    private var encodingKeyFrame = false
+    private var consecutiveDrops = 0
+
+    init(sequence: UInt32 = 0) { self.sequence = sequence }
+
+    var isIdle: Bool { encoding == nil && waiting.isEmpty }
+
+    mutating func begin(at now: TimeInterval) -> (sequence: UInt32, forceKeyFrame: Bool)? {
+        guard encoding == nil, waiting.isEmpty else { return nil }
+        repeat { sequence &+= 1 } while waiting[sequence] != nil
+        encoding = sequence
+        encodingStartedAt = now
+        encodingKeyFrame = forceKeyFrame
+        forceKeyFrame = false
+        return (sequence, encodingKeyFrame)
+    }
+
+    mutating func encoded(_ number: UInt32, at now: TimeInterval) -> Bool {
+        guard encoding == number else { return false }
+        encoding = nil
+        encodingStartedAt = nil
+        consecutiveDrops = 0
+        waiting[number] = now
+        return true
+    }
+
+    mutating func dropped(_ number: UInt32) -> Bool {
+        guard encoding == number else { return false }
+        encoding = nil
+        encodingStartedAt = nil
+        consecutiveDrops = min(consecutiveDrops + 1, 3)
+        forceKeyFrame = forceKeyFrame || encodingKeyFrame || consecutiveDrops >= 3
+        return true
+    }
+
+    mutating func acknowledge(_ number: UInt32) -> Bool { waiting.removeValue(forKey: number) != nil }
+    mutating func requestKeyFrame() { forceKeyFrame = true }
+    mutating func cancelEncoding() { encoding = nil; encodingStartedAt = nil }
+
+    func stalled(at now: TimeInterval) -> String? {
+        if let encodingStartedAt, now - encodingStartedAt > 90 { return "视频编码超过 90 秒无输出" }
+        if let oldest = waiting.values.min(), now - oldest > 90 { return "视频解码确认超过 90 秒未返回" }
+        return nil
+    }
+}
+
 // Capture state is confined to queue; callbacks are installed before start.
 final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     struct CapturePlan {
@@ -30,17 +83,13 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var sourceHeight = 0
     private var latest: (CVPixelBuffer, CMTime)?
     private var lastCapture: (CVPixelBuffer, CMTime)?
-    private var waiting: UInt32?
-    private var sequence: UInt32 = 0
+    private var frameFlow = VideoFrameFlow()
     private var running = false
     private var captureStarted = false
-    private var encoding = false
     private var reconfiguring = false
     private var sessionPaused = false
-    private var forceKeyFrame = true
     private var idleWaiter: (UUID, CheckedContinuation<Void, Error>)?
     private var watchdog: DispatchSourceTimer?
-    private var sentAt = ProcessInfo.processInfo.systemUptime
 
     static func displaySnapshot(_ id: CGDirectDisplayID) -> DisplaySnapshot {
         let mode = CGDisplayCopyDisplayMode(id)
@@ -88,14 +137,26 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             guard let self else { return }
             self.queue.async {
                 guard self.running, self.encoderID == id else { return }
-                self.encoding = false
                 switch result {
                 case .success(let packet):
-                    self.waiting = packet.sequence
-                    self.sentAt = ProcessInfo.processInfo.systemUptime
+                    guard self.frameFlow.encoded(packet.sequence, at: ProcessInfo.processInfo.systemUptime) else { return }
                     self.onFrame?(packet)
-                case .failure(let error): self.reportError(error)
+                    self.completeFrameBoundary()
+                case .failure(let error):
+                    self.frameFlow.cancelEncoding()
+                    if let waiter = self.idleWaiter {
+                        self.idleWaiter = nil
+                        waiter.1.resume(throwing: error)
+                    }
+                    self.reportError(error)
                 }
+            }
+        }
+        encoder.onDropped = { [weak self] number in
+            guard let self else { return }
+            self.queue.async {
+                guard self.running, self.encoderID == id, self.frameFlow.dropped(number) else { return }
+                self.completeFrameBoundary()
             }
         }
         return encoder
@@ -127,10 +188,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             let watchdog = DispatchSource.makeTimerSource(queue: queue)
             watchdog.schedule(deadline: .now() + 2, repeating: 2)
             watchdog.setEventHandler { [weak self] in
-                guard let self, self.running, self.waiting != nil || self.encoding else { return }
-                if ProcessInfo.processInfo.systemUptime - self.sentAt > 90 {
-                    self.reportError(DeskError.invalid(self.encoding ? "视频编码超过 90 秒无输出" : "视频解码确认超过 90 秒未返回"))
-                }
+                guard let self, self.running,
+                      let message = self.frameFlow.stalled(at: ProcessInfo.processInfo.systemUptime) else { return }
+                self.reportError(DeskError.invalid(message))
             }
             self.watchdog = watchdog
             watchdog.resume()
@@ -164,7 +224,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 outputWidth = width
                 outputHeight = height
                 currentSettings = settings
-                forceKeyFrame = true
+                frameFlow.requestKeyFrame()
                 latest = lastCapture
                 discardMismatchedFrame()
                 old?.stop()
@@ -178,7 +238,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                     try await snapshot.0.updateConfiguration(Self.configuration(width: snapshot.3, height: snapshot.4, settings: snapshot.5))
                     queue.sync {
                         guard running, stream === snapshot.0 else { return }
-                        forceKeyFrame = true
+                        frameFlow.requestKeyFrame()
                         discardMismatchedFrame()
                         reconfiguring = false
                         pump()
@@ -211,7 +271,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             try queue.sync {
                 guard running, stream === current else { throw CancellationError() }
                 sessionPaused = false
-                forceKeyFrame = true
+                frameFlow.requestKeyFrame()
                 latest = lastCapture
                 discardMismatchedFrame()
             }
@@ -248,7 +308,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         try Task.checkCancellation()
         try queue.sync {
             guard running, stream === snapshot.0 else { throw CancellationError() }
-            forceKeyFrame = true
+            frameFlow.requestKeyFrame()
         }
     }
 
@@ -260,7 +320,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                     return
                 }
                 reconfiguring = true
-                if !encoding, waiting == nil { continuation.resume(); return }
+                if frameFlow.isIdle { continuation.resume(); return }
                 let token = UUID()
                 idleWaiter = (token, continuation)
                 queue.asyncAfter(deadline: .now() + 8) { [weak self] in
@@ -284,14 +344,17 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 
     func acknowledge(_ number: UInt32) {
         queue.async { [weak self] in
-            guard let self, self.waiting == number else { return }
-            self.waiting = nil
-            if !self.encoding, let waiter = self.idleWaiter {
-                self.idleWaiter = nil
-                waiter.1.resume()
-            }
-            self.pump()
+            guard let self, self.frameFlow.acknowledge(number) else { return }
+            self.completeFrameBoundary()
         }
+    }
+
+    private func completeFrameBoundary() {
+        if frameFlow.isIdle, let waiter = idleWaiter {
+            idleWaiter = nil
+            waiter.1.resume()
+        }
+        pump()
     }
 
     func stop() async {
@@ -301,7 +364,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             reconfiguring = false
             latest = nil
             lastCapture = nil
-            waiting = nil
+            frameFlow = VideoFrameFlow(sequence: frameFlow.sequence)
             if let waiter = idleWaiter { idleWaiter = nil; waiter.1.resume(throwing: CancellationError()) }
             watchdog?.cancel()
             watchdog = nil
@@ -343,17 +406,17 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     private func pump() {
-        guard running, !reconfiguring, !sessionPaused, waiting == nil, !encoding else { return }
+        guard running, !reconfiguring, !sessionPaused else { return }
         discardMismatchedFrame()
-        guard let latest, let encoder else { return }
+        guard let latest, let encoder,
+              let frame = frameFlow.begin(at: ProcessInfo.processInfo.systemUptime) else { return }
         self.latest = nil
-        sequence &+= 1
-        encoding = true
-        sentAt = ProcessInfo.processInfo.systemUptime
-        let keyFrame = forceKeyFrame
-        forceKeyFrame = false
-        do { try encoder.encode(latest.0, time: latest.1, sequence: sequence, forceKeyFrame: keyFrame) }
-        catch { encoding = false; reportError(error) }
+        do { try encoder.encode(latest.0, time: latest.1, sequence: frame.sequence, forceKeyFrame: frame.forceKeyFrame) }
+        catch {
+            frameFlow.cancelEncoding()
+            if let waiter = idleWaiter { idleWaiter = nil; waiter.1.resume(throwing: error) }
+            reportError(error)
+        }
     }
 
     deinit { watchdog?.cancel() }

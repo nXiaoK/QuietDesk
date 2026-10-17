@@ -6,6 +6,7 @@ import CoreVideo
 public final class VideoEncoder {
     private var session: VTCompressionSession?
     public var onOutput: ((Result<VideoPacket, Error>) -> Void)?
+    public var onDropped: ((UInt32) -> Void)?
 
     public init(width: Int, height: Int, settings: StreamSettings) throws {
         var created: VTCompressionSession?
@@ -16,14 +17,12 @@ public final class VideoEncoder {
             outputCallback: { context, frameContext, status, info, sample in
                 guard let context else { return }
                 let encoder = Unmanaged<VideoEncoder>.fromOpaque(context).takeUnretainedValue()
-                guard status == noErr, !info.contains(.frameDropped), let sample else {
-                    encoder.onOutput?(.failure(DeskError.system("视频编码失败", status)))
-                    return
+                let sequence = UInt32(UInt(bitPattern: frameContext))
+                switch VideoEncoder.output(status: status, info: info, sample: sample, sequence: sequence) {
+                case .success(let packet?): encoder.onOutput?(.success(packet))
+                case .success(nil): encoder.onDropped?(sequence)
+                case .failure(let error): encoder.onOutput?(.failure(error))
                 }
-                do {
-                    let sequence = UInt32(UInt(bitPattern: frameContext))
-                    encoder.onOutput?(.success(try VideoEncoder.packet(from: sample, sequence: sequence)))
-                } catch { encoder.onOutput?(.failure(error)) }
             }, refcon: Unmanaged.passUnretained(self).toOpaque(), compressionSessionOut: &created)
         guard status == noErr, let created else { throw DeskError.system("无法创建 H.264 编码器", status) }
         session = created
@@ -45,6 +44,15 @@ public final class VideoEncoder {
             session = nil
             throw error
         }
+    }
+
+    static func output(status: OSStatus, info: VTEncodeInfoFlags, sample: CMSampleBuffer?,
+                       sequence: UInt32) -> Result<VideoPacket?, Error> {
+        guard status == noErr else { return .failure(DeskError.system("视频编码失败", status)) }
+        // Real-time rate control may intentionally produce no compressed sample.
+        guard !info.contains(.frameDropped), let sample else { return .success(nil) }
+        do { return .success(try packet(from: sample, sequence: sequence)) }
+        catch { return .failure(error) }
     }
 
     private func set(_ key: CFString, _ value: CFTypeRef) throws {

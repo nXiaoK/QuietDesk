@@ -34,6 +34,7 @@ jobs:
           ./scripts/run-traffic-checks.sh
           ./scripts/run-log-checks.sh
           ./scripts/run-credential-checks.sh
+          ./scripts/run-permission-checks.sh
       - name: Build Universal application
         run: ./build-app.sh
       - name: Check application metadata

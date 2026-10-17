@@ -1,6 +1,6 @@
 # 开发指南
 
-[返回首页](../README.md) · [历史构建记录](../BUILD-AND-CHECKS.md) · [审查修复记录](review-fixes.md) · [配对码文件存储](local-credentials.md)
+[返回首页](../README.md) · [历史构建记录](../BUILD-AND-CHECKS.md) · [审查修复记录](review-fixes.md) · [配对码文件存储](local-credentials.md) · [权限引导](permission-flow.md)
 
 ## 环境
 
@@ -78,6 +78,7 @@ swift run --disable-sandbox QuietDeskChecks
 ./scripts/run-traffic-checks.sh
 ./scripts/run-log-checks.sh
 ./scripts/run-credential-checks.sh
+./scripts/run-permission-checks.sh
 python3 -m unittest discover -s scripts/tests -v
 ```
 
@@ -92,6 +93,7 @@ python3 -m unittest discover -s scripts/tests -v
 | `run-traffic-checks.sh` | 临时目录中的设备身份、历史保存及错误处理 |
 | `run-log-checks.sh` | 临时目录中的日志轮转、并发聚合、隐私字段、文件权限与导出错误恢复 |
 | `run-credential-checks.sh` | 临时目录中的凭据往返、权限、损坏保留、原子写入失败、并发更新及连接记录匹配；不访问真实凭据或钥匙串 |
+| `run-permission-checks.sh` | 独立 bundle ID 的透明面板与合成权限，验证引导自动关闭、切换及手动关闭；检查设置入口不调用主动授权 API |
 | Python 检查 | 版本分配、参数校验及重跑规则 |
 
 跳过 Core 中的本机网络检查可用 `swift run --disable-sandbox QuietDeskChecks --skip-network`；这仍会运行合成视频检查。运行环境须允许所需的本机网络和系统视频服务，受限环境中的失败应与业务缺陷区分。

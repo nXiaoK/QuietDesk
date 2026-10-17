@@ -40,6 +40,65 @@ func runTransportDiagnosticsChecks() {
             "Round-trip diagnostics lost their kind, unit or probe identifier")
     }
 
+    run("TCP reports follow mid-connection diagnostic changes and stop after close") {
+        let diagnostics = PerformanceDiagnostics()
+        let key = try PairingKey.generate()
+        let listener = try makeListener(key, queue: DispatchQueue(label: "checks.diagnostics-tcp"))
+        let server = Box<Peer?>(nil)
+        let ready = DispatchSemaphore(value: 0), echoed = DispatchSemaphore(value: 0), closed = DispatchSemaphore(value: 0)
+        listener.newConnectionHandler = { connection in
+            let peer = Peer(connection: connection, heartbeatInterval: 100)
+            server.set(peer)
+            peer.onMessage = { [weak peer] message in peer?.send(message) }
+            peer.start()
+        }
+        guard let port = listener.port else { throw CheckFailure("No TCP report port") }
+        let client = Peer(connection: NWConnection(host: "127.0.0.1", port: port,
+            using: SecureTransport.parameters(key: key)), heartbeatInterval: 0.05, diagnostics: diagnostics)
+        defer { client.close(); server.read()?.close(); listener.cancel() }
+        client.onReady = { ready.signal() }
+        client.onMessage = { _ in echoed.signal() }
+        client.onClose = { _ in closed.signal() }
+        client.start()
+        try wait(ready, "TCP diagnostic peer did not connect")
+        client.send(Message(.input, Data([1, 2, 3])))
+        try wait(echoed, "Disabled TCP diagnostics changed application delivery")
+        Thread.sleep(forTimeInterval: 0.15)
+        try check(diagnostics.drain().isEmpty, "Disabled TCP diagnostics retained samples")
+
+        let tcpMetrics: Set<PerformanceMetric> = [.tcpSmoothedRTT, .tcpMinimumRTT, .tcpRTTVariance,
+                                                 .tcpReportDuration, .tcpRetransmittedBytes, .tcpOutOfOrderBytes,
+                                                 .tcpSentBytes, .tcpReceivedBytes]
+        diagnostics.setEnabled(true)
+        var observed: Set<PerformanceMetric> = []
+        let deadline = Date().addingTimeInterval(3)
+        while observed != tcpMetrics, Date() < deadline {
+            for summary in diagnostics.drain() where tcpMetrics.contains(summary.metric) {
+                observed.insert(summary.metric)
+                try check(summary.count >= 1 && summary.messageKind == nil && summary.worstIdentifier == nil,
+                          "TCP report was labeled as an application message")
+            }
+            if observed != tcpMetrics { Thread.sleep(forTimeInterval: 0.01) }
+        }
+        try check(observed == tcpMetrics, "Enabling diagnostics on a ready peer did not collect TCP reports")
+        diagnostics.setEnabled(false)
+        client.queue.sync {}
+        diagnostics.setEnabled(true)
+        diagnostics.setEnabled(false)
+        client.queue.sync {}
+        Thread.sleep(forTimeInterval: 0.15)
+        try check(diagnostics.drain().isEmpty, "A late TCP report survived disabling diagnostics")
+
+        diagnostics.setEnabled(true)
+        client.close()
+        try wait(closed, "TCP diagnostic peer did not close")
+        _ = diagnostics.drain()
+        diagnostics.setEnabled(false)
+        diagnostics.setEnabled(true)
+        Thread.sleep(forTimeInterval: 0.15)
+        try check(diagnostics.drain().isEmpty, "A closed peer collected reports after a diagnostic epoch change")
+    }
+
     run("TLS diagnostics separate fragmented bodies, send queue and handlers while fencing stale callbacks") {
         let diagnostics = PerformanceDiagnostics()
         diagnostics.setEnabled(true)

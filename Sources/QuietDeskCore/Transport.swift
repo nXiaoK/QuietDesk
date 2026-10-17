@@ -69,6 +69,9 @@ public final class Peer {
     private let diagnostics: PerformanceDiagnostics?
     private var roundTrip = RoundTripProbe()
     private var roundTripDiagnostic: (identifier: UInt64, token: PerformanceDiagnostics.Token)?
+    private var diagnosticsObserver: UUID?
+    private var transportReport: (pending: NWConnection.PendingDataTransferReport, token: PerformanceDiagnostics.Token)?
+    private var collectingTransportReport: (id: UUID, token: PerformanceDiagnostics.Token)?
     private final class ReadBuffer {
         var data = Data()
         init(capacity: Int) { data.reserveCapacity(capacity) }
@@ -86,10 +89,14 @@ public final class Peer {
         queue.async { [self] in
             guard !started, !closed else { return }
             started = true
+            diagnosticsObserver = diagnostics?.observeEnableChanges { [weak self] in
+                self?.queue.async { [weak self] in self?.updateTransportDiagnostics() }
+            }
             let timer = DispatchSource.makeTimerSource(queue: queue)
             timer.schedule(deadline: .now() + heartbeatInterval, repeating: heartbeatInterval)
             timer.setEventHandler { [weak self] in
                 guard let self else { return }
+                self.collectTransportDiagnostics()
                 if SessionClock.now - self.lastReceived > (self.ready ? self.idleTimeout : self.handshakeTimeout) {
                     self.finish(self.ready ? "连接超过 \(Int(self.idleTimeout)) 秒无数据" : "建立连接超时，请检查地址或远端状态")
                 } else if self.ready {
@@ -104,6 +111,7 @@ public final class Peer {
                 case .ready:
                     self.ready = true
                     self.lastReceived = SessionClock.now
+                    self.updateTransportDiagnostics()
                     self.onReady?()
                     if self.onRoundTripMilliseconds != nil { self.sendHeartbeat() }
                     self.receiveHeader()
@@ -136,6 +144,50 @@ public final class Peer {
             }
         }
         send(Message(.ping, payload ?? Data()))
+    }
+
+    private func updateTransportDiagnostics() {
+        guard !closed, ready, let diagnostics, let token = diagnostics.start() else {
+            transportReport = nil
+            collectingTransportReport = nil
+            return
+        }
+        if let report = transportReport, !diagnostics.accepts(report.token) { transportReport = nil }
+        if let collection = collectingTransportReport, !diagnostics.accepts(collection.token) { collectingTransportReport = nil }
+        if transportReport == nil, collectingTransportReport == nil {
+            transportReport = (connection.startDataTransferReport(), token)
+        }
+    }
+
+    private func collectTransportDiagnostics() {
+        guard let report = transportReport, let diagnostics, diagnostics.accepts(report.token) else {
+            updateTransportDiagnostics()
+            return
+        }
+        transportReport = nil
+        let collection = UUID()
+        let token = report.token
+        collectingTransportReport = (collection, token)
+        report.pending.collect(queue: queue) { [weak self] result in
+            guard let self, !self.closed, self.collectingTransportReport?.id == collection else { return }
+            self.collectingTransportReport = nil
+            if diagnostics.accepts(token), result.duration.isFinite, result.duration > 0, !result.pathReports.isEmpty {
+                let path = result.aggregatePathReport
+                for (metric, seconds) in [(PerformanceMetric.tcpSmoothedRTT, path.transportSmoothedRTT),
+                                          (.tcpMinimumRTT, path.transportMinimumRTT), (.tcpRTTVariance, path.transportRTTVariance),
+                                          (.tcpReportDuration, result.duration)] {
+                    if seconds.isFinite, seconds >= 0, let microseconds = Int(exactly: (seconds * 1_000_000).rounded()) {
+                        diagnostics.recordValue(metric, microseconds, token: token)
+                    }
+                }
+                for (metric, bytes) in [(PerformanceMetric.tcpRetransmittedBytes, path.retransmittedTransportByteCount),
+                                        (.tcpOutOfOrderBytes, path.receivedTransportOutOfOrderByteCount),
+                                        (.tcpSentBytes, path.sentTransportByteCount), (.tcpReceivedBytes, path.receivedTransportByteCount)] {
+                    if let value = Int(exactly: bytes) { diagnostics.recordValue(metric, value, token: token) }
+                }
+            }
+            self.updateTransportDiagnostics()
+        }
     }
 
     public func send(_ message: Message, completion: ((Bool) -> Void)? = nil) {
@@ -185,6 +237,9 @@ public final class Peer {
         timer?.cancel()
         timer = nil
         roundTripDiagnostic = nil
+        transportReport = nil
+        collectingTransportReport = nil
+        if let diagnosticsObserver { diagnostics?.removeEnableObserver(diagnosticsObserver); self.diagnosticsObserver = nil }
         connection.stateUpdateHandler = nil
         connection.cancel()
         onClose?(reason)
@@ -293,5 +348,9 @@ public final class Peer {
         }
     }
 
-    deinit { timer?.cancel(); connection.cancel() }
+    deinit {
+        if let diagnosticsObserver { diagnostics?.removeEnableObserver(diagnosticsObserver) }
+        timer?.cancel()
+        connection.cancel()
+    }
 }

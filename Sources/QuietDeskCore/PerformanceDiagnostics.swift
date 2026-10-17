@@ -6,13 +6,16 @@ public enum PerformanceUnit: String, Codable, Sendable {
 
 public enum PerformanceMetric: String, Codable, CaseIterable, Sendable {
     case sendQueue, sendCompletion, receiveHeaderWait, receiveBody, messageHandler, roundTrip
+    case tcpSmoothedRTT, tcpMinimumRTT, tcpRTTVariance, tcpReportDuration
+    case tcpRetransmittedBytes, tcpOutOfOrderBytes, tcpSentBytes, tcpReceivedBytes
     case captureAge, encode, encodeCallbackQueue, videoAck, decodeQueue, decodePrepare, decode, decodeToDisplay, displayEnqueue
     case encodedBytes, keyframeBytes, pendingSendBytes
     case captureReplaced, displayReplaced, encoderHardware, decoderHardware, videoOutstanding
 
     public var unit: PerformanceUnit {
         switch self {
-        case .encodedBytes, .keyframeBytes, .pendingSendBytes: return .bytes
+        case .encodedBytes, .keyframeBytes, .pendingSendBytes, .tcpRetransmittedBytes, .tcpOutOfOrderBytes,
+             .tcpSentBytes, .tcpReceivedBytes: return .bytes
         case .captureReplaced, .displayReplaced, .encoderHardware, .decoderHardware, .videoOutstanding: return .count
         default: return .microseconds
         }
@@ -92,6 +95,7 @@ public final class PerformanceDiagnostics: @unchecked Sendable {
     private var generation: UInt64 = 0
     private var windowStartedAt: TimeInterval
     private var statistics: [Key: Statistics] = [:]
+    private var enableObservers: [UUID: () -> Void] = [:]
 
     public init(enabled: Bool = false, clock: @escaping () -> TimeInterval = { SessionClock.now }) {
         self.enabled = enabled
@@ -102,13 +106,29 @@ public final class PerformanceDiagnostics: @unchecked Sendable {
     public var isEnabled: Bool { lock.withLock { enabled } }
 
     public func setEnabled(_ value: Bool) {
-        lock.withLock {
-            guard enabled != value else { return }
+        let observers: [() -> Void] = lock.withLock {
+            guard enabled != value else { return [] }
             enabled = value
             generation &+= 1
             statistics.removeAll(keepingCapacity: true)
             windowStartedAt = clock()
+            return Array(enableObservers.values)
         }
+        for observer in observers { observer() }
+    }
+
+    func observeEnableChanges(_ observer: @escaping () -> Void) -> UUID {
+        lock.withLock {
+            let id = UUID()
+            enableObservers[id] = observer
+            return id
+        }
+    }
+
+    func removeEnableObserver(_ id: UUID) { _ = lock.withLock { enableObservers.removeValue(forKey: id) } }
+
+    func accepts(_ token: Token) -> Bool {
+        lock.withLock { enabled && token.owner == ObjectIdentifier(self) && token.generation == generation }
     }
 
     public func start() -> Token? {
@@ -130,10 +150,11 @@ public final class PerformanceDiagnostics: @unchecked Sendable {
         }
     }
 
-    public func recordValue(_ metric: PerformanceMetric, _ value: Int, kind: MessageKind? = nil, identifier: UInt64? = nil) {
+    public func recordValue(_ metric: PerformanceMetric, _ value: Int, kind: MessageKind? = nil, identifier: UInt64? = nil, token: Token? = nil) {
         guard value >= 0 else { return }
         lock.withLock {
             guard enabled else { return }
+            if let token { guard token.owner == ObjectIdentifier(self), token.generation == generation else { return } }
             statistics[Key(metric: metric, kind: kind?.rawValue), default: Statistics()].add(value, identifier: identifier)
         }
     }

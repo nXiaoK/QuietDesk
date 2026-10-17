@@ -13,9 +13,11 @@ import sys
 
 METRIC_UNITS = {
     **dict.fromkeys(("sendQueue", "sendCompletion", "receiveHeaderWait", "receiveBody", "messageHandler", "roundTrip",
+                     "tcpSmoothedRTT", "tcpMinimumRTT", "tcpRTTVariance", "tcpReportDuration",
                      "captureAge", "encode", "encodeCallbackQueue", "videoAck", "decodeQueue",
                      "decodePrepare", "decode", "decodeToDisplay", "displayEnqueue"), "microseconds"),
-    **dict.fromkeys(("encodedBytes", "keyframeBytes", "pendingSendBytes"), "bytes"),
+    **dict.fromkeys(("encodedBytes", "keyframeBytes", "pendingSendBytes", "tcpRetransmittedBytes", "tcpOutOfOrderBytes",
+                     "tcpSentBytes", "tcpReceivedBytes"), "bytes"),
     **dict.fromkeys(("captureReplaced", "displayReplaced", "encoderHardware", "decoderHardware",
                      "videoOutstanding"), "count"),
 }
@@ -213,6 +215,11 @@ def render_report(reports):
                   "displayEnqueue 测显示 sample 准备及入队，不等于实际上屏。receiveBody 不含等待帧头的空闲，"
                   "但包含消息体传输、对端生产和本端调度。receiveHeaderWait 包含静止等待和帧间隔，"
                   "不能直接当作网络时延。硬件状态缺少样本不等于软件编解码。", "",
+                  "tcpSmoothedRTT、tcpMinimumRTT 和 tcpRTTVariance 来自系统 TCP 报告，区别于有序消息通道中的应用 roundTrip；"
+                  "tcpRetransmittedBytes 和 tcpOutOfOrderBytes 是各次传输报告区间的字节计数，表中均值不是速率。"
+                  "tcpSentBytes、tcpReceivedBytes 和 tcpReportDuration 保留相同报告的传输量与实际区间时长；"
+                  "聚合窗口可能与报告区间错开，不能把窗口均值直接解释为吞吐。"
+                  "这些指标每个报告各记一个样本，P95 也不是逐包分位数；缺少报告不能解释为零重传。", "",
                   "不同指标覆盖的阶段可能重叠，不能直接累加成端到端耗时。窗口摘要无法还原逐帧轨迹；"
                   "日志轮转或坏行可能使会话片段不完整。", ""])
     return "\n".join(lines)

@@ -60,6 +60,39 @@ func runPerformanceDiagnosticsChecks() {
         try check(first.drain().first?.maximum == 250_000, "An unchanged switch invalidated active measurement")
     }
 
+    run("Asynchronous TCP report values retain units and reject disabled, stale and foreign tokens") {
+        let diagnostics = PerformanceDiagnostics(enabled: true)
+        let other = PerformanceDiagnostics(enabled: true)
+        guard let old = diagnostics.start(), let foreign = other.start() else { throw CheckFailure("No report token") }
+        diagnostics.setEnabled(false)
+        diagnostics.recordValue(.tcpRetransmittedBytes, 900, token: old)
+        diagnostics.setEnabled(true)
+        diagnostics.recordValue(.tcpRetransmittedBytes, 900, token: old)
+        diagnostics.recordValue(.tcpOutOfOrderBytes, 800, token: foreign)
+        try check(diagnostics.drain().isEmpty, "An old transport report crossed a diagnostic epoch or recorder")
+        guard let current = diagnostics.start() else { throw CheckFailure("No current report token") }
+        diagnostics.recordValue(.tcpSmoothedRTT, 3_000, token: current)
+        diagnostics.recordValue(.tcpMinimumRTT, 1_000, token: current)
+        diagnostics.recordValue(.tcpRTTVariance, 500, token: current)
+        diagnostics.recordValue(.tcpReportDuration, 5_000_000, token: current)
+        diagnostics.recordValue(.tcpRetransmittedBytes, 0, token: current)
+        diagnostics.recordValue(.tcpOutOfOrderBytes, 2_048, token: current)
+        diagnostics.recordValue(.tcpSentBytes, 4_096, token: current)
+        diagnostics.recordValue(.tcpReceivedBytes, 1_024, token: current)
+        let summaries = diagnostics.drain()
+        try check(summaries.count == 8 && summaries.allSatisfy { $0.count == 1 && $0.messageKind == nil && $0.worstIdentifier == nil },
+                  "TCP reports acquired application identifiers or lost samples")
+        try check(summaries.filter { $0.unit == .microseconds }.count == 4
+                  && summaries.filter { $0.unit == .bytes }.count == 4,
+                  "TCP report units changed")
+        try check(summaries.first { $0.metric == .tcpReportDuration }?.maximum == 5_000_000
+                  && summaries.first { $0.metric == .tcpSentBytes }?.maximum == 4_096
+                  && summaries.first { $0.metric == .tcpReceivedBytes }?.maximum == 1_024,
+                  "Report duration or transport byte counts were not preserved")
+        try check(summaries.first { $0.metric == .tcpRetransmittedBytes }?.maximum == 0,
+                  "A recorded zero retransmission count was discarded")
+    }
+
     run("Concurrent performance recording and draining preserve every sample") {
         let diagnostics = PerformanceDiagnostics(enabled: true)
         let drained = Box(0)

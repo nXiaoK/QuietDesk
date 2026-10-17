@@ -138,6 +138,32 @@ class PerformanceReportTests(unittest.TestCase):
                    for name in declaration.split(",")}
         self.assertEqual(set(report_module.METRIC_UNITS), metrics)
 
+    def test_tcp_report_values_use_transport_units_and_have_no_application_identifier(self):
+        records = [window(metric=metric, unit=unit, count=1, minimum=value, maximum=value,
+                          mean=value, p95UpperBound=value, messageKind=None, worstIdentifier=None)
+                   for metric, unit, value in (("tcpSmoothedRTT", "microseconds", 3000),
+                                               ("tcpMinimumRTT", "microseconds", 1000),
+                                               ("tcpRTTVariance", "microseconds", 500),
+                                               ("tcpReportDuration", "microseconds", 1000000),
+                                               ("tcpRetransmittedBytes", "bytes", 0),
+                                               ("tcpOutOfOrderBytes", "bytes", 2048),
+                                               ("tcpSentBytes", "bytes", 4096),
+                                               ("tcpReceivedBytes", "bytes", 1024))]
+        invalid = window(metric="tcpRetransmittedBytes", unit="microseconds")
+        report = report_module.read_report(self.write([*records, invalid]))
+        self.assertEqual((report.valid_windows, report.skipped_lines), (8, 1))
+        text = report_module.render_report([report])
+        self.assertIn("3.000 ms", text)
+        self.assertIn("0.500 ms", text)
+        self.assertIn("0.000 KiB", text)
+        self.assertIn("2.000 KiB", text)
+        self.assertIn("1000.000 ms", text)
+        self.assertIn("4.000 KiB", text)
+        self.assertIn("1.000 KiB", text)
+        self.assertIn("不是速率", text)
+        self.assertIn("不能把窗口均值直接解释为吞吐", text)
+        self.assertIn("不是逐包分位数", text)
+
     def test_oversized_and_invalid_utf8_lines_do_not_hide_following_windows(self):
         path = self.root / "damaged.jsonl"
         path.write_bytes(b"x" * (report_module.MAX_LINE_BYTES + 10) + b"\n\xff\n"

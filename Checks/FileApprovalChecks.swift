@@ -32,6 +32,62 @@ func runFileApprovalChecks() {
         }
     }
 
+    run("An equal-size edit of received files still prompts and transfers back after a fresh copy") {
+        try withCheckFolder { folder in
+            let file = folder.appendingPathComponent("edited.bin")
+            let original = Data([1, 2, 3]), modified = Data([4, 5, 6])
+            try original.write(to: file)
+            let a = ClipboardTransfer(storage: folder.appendingPathComponent("a"), requireFileApproval: true)
+            let b = ClipboardTransfer(storage: folder.appendingPathComponent("b"), requireFileApproval: true)
+            let done = DispatchSemaphore(value: 0)
+            let received = Box<[URL]>([]), correct = Box(false), success = Box(false), returnedOffer = Box(false)
+            a.onSend = { [weak b] in b?.receive($0) }; b.onSend = { [weak a] in a?.receive($0) }
+            b.onFileOffer = { [weak b] in if let offer = $0 { b?.respondToFileOffer(id: offer.id, accept: true) } }
+            a.onFileOffer = { [weak a] in
+                if let offer = $0 { returnedOffer.set(true); a?.respondToFileOffer(id: offer.id, accept: true) }
+            }
+            b.onReceive = { if case .files(let urls) = $0 { received.set(urls) } }
+            a.onReceive = { if case .files(let urls) = $0 { correct.set((try? Data(contentsOf: urls[0])) == modified) } }
+            defer { stopTransfers(a, b) }
+            a.send(.files([file])) { success.set($0); done.signal() }
+            try wait(done, "Original file did not arrive")
+            guard success.read(), let receivedFile = received.read().first else { throw CheckFailure("Original copy failed") }
+            try modified.write(to: receivedFile)
+            try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(2)], ofItemAtPath: receivedFile.path)
+            b.send(.files([receivedFile])) { success.set($0); done.signal() }
+            try wait(done, "Edited file did not return")
+            try check(returnedOffer.read() && success.read() && correct.read(), "Equal-size edit was silently mistaken for an echo")
+        }
+    }
+
+    run("A failed file publication cannot suppress a later explicit copy back to its sender") {
+        try withCheckFolder { folder in
+            let file = folder.appendingPathComponent("retry.bin"), bytes = Data([7, 8, 9])
+            try bytes.write(to: file)
+            let a = ClipboardTransfer(storage: folder.appendingPathComponent("a"), requireFileApproval: true)
+            let b = ClipboardTransfer(storage: folder.appendingPathComponent("b"), requireFileApproval: true)
+            let done = DispatchSemaphore(value: 0)
+            let downloaded = Box<[URL]>([]), correct = Box(false), success = Box(true), returnedOffer = Box(false)
+            a.onSend = { [weak b] in b?.receive($0) }; b.onSend = { [weak a] in a?.receive($0) }
+            b.onFileOffer = { [weak b] in if let offer = $0 { b?.respondToFileOffer(id: offer.id, accept: true) } }
+            a.onFileOffer = { [weak a] in
+                if let offer = $0 { returnedOffer.set(true); a?.respondToFileOffer(id: offer.id, accept: true) }
+            }
+            b.onApply = { payload, completion in
+                if case .files(let urls) = payload { downloaded.set(urls) }
+                completion(false)
+            }
+            a.onReceive = { if case .files(let urls) = $0 { correct.set((try? Data(contentsOf: urls[0])) == bytes) } }
+            defer { stopTransfers(a, b) }
+            a.send(.files([file])) { success.set($0); done.signal() }
+            try wait(done, "Failed publication was not reported")
+            try check(!success.read() && !downloaded.read().isEmpty, "Failed publication did not retain downloaded files")
+            b.send(.files(downloaded.read())) { success.set($0); done.signal() }
+            try wait(done, "Explicit copy after publication failure did not complete")
+            try check(returnedOffer.read() && success.read() && correct.read(), "Failed send incorrectly suppressed an explicit copy")
+        }
+    }
+
     run("Declining a file offer preserves storage and ignores a later acceptance of that offer") {
         try withCheckFolder { folder in
             let file = folder.appendingPathComponent("unused.bin")
@@ -117,26 +173,29 @@ func runFileApprovalChecks() {
         }
     }
 
-    run("Legacy file metadata still requires approval and missing capability stays disabled") {
-        try withCheckFolder { folder in
-            let revision: [String: Any] = ["counter": 1, "origin": UUID().uuidString]
-            let begin: [String: Any] = ["revision": revision, "sequence": 0, "type": "files", "count": 2, "bytes": 42]
-            let b = ClipboardTransfer(storage: folder.appendingPathComponent("b"), requireFileApproval: true)
-            let ready = DispatchSemaphore(value: 0), cancelled = DispatchSemaphore(value: 0), stopped = DispatchSemaphore(value: 0)
-            let offer = Box<ClipboardFileOffer?>(nil), acknowledged = Box(false)
-            b.onFileOffer = { if let value = $0 { offer.set(value); ready.signal() } }
-            b.onSend = { if $0.kind == .clipboardReceipt { acknowledged.set(true) }; if $0.kind == .clipboardCancel { cancelled.signal() } }
-            b.receive(Message(.clipboardBegin, try JSONSerialization.data(withJSONObject: begin)))
-            try wait(ready, "Legacy file offer bypassed prompt")
-            guard let offer = offer.read() else { throw CheckFailure("No legacy offer") }
-            try check(offer.names.isEmpty && offer.count == 2 && !acknowledged.read(), "Legacy offer was auto accepted")
-            b.respondToFileOffer(id: offer.id, accept: false)
-            try wait(cancelled, "Legacy transfer not declined")
-            b.stop { stopped.signal() }; try wait(stopped, "Receiver did not stop")
-            let legacy = try Wire.readJSON(ClipboardPreference.self, Data("{\"enabled\":true}".utf8))
-            try check(legacy.fileApproval == nil, "Old peer incorrectly advertises file consent")
-            let modern = ClipboardPreference(enabled: true, session: UUID())
-            try check(Wire.readJSON(ClipboardPreference.self, JSONEncoder().encode(modern)).fileApproval == true, "File approval capability lost")
+    run("Legacy file metadata with or without an optional fingerprint still requires approval") {
+        for fingerprint in [nil, String(repeating: "0", count: 64)] as [String?] {
+            try withCheckFolder { folder in
+                let revision: [String: Any] = ["counter": 1, "origin": UUID().uuidString]
+                var begin: [String: Any] = ["revision": revision, "sequence": 0, "type": "files", "count": 2, "bytes": 42]
+                if let fingerprint { begin["fingerprint"] = fingerprint }
+                let b = ClipboardTransfer(storage: folder.appendingPathComponent("b"), requireFileApproval: true)
+                let ready = DispatchSemaphore(value: 0), cancelled = DispatchSemaphore(value: 0), stopped = DispatchSemaphore(value: 0)
+                let offer = Box<ClipboardFileOffer?>(nil), acknowledged = Box(false)
+                b.onFileOffer = { if let value = $0 { offer.set(value); ready.signal() } }
+                b.onSend = { if $0.kind == .clipboardReceipt { acknowledged.set(true) }; if $0.kind == .clipboardCancel { cancelled.signal() } }
+                b.receive(Message(.clipboardBegin, try JSONSerialization.data(withJSONObject: begin)))
+                try wait(ready, "Legacy file offer bypassed prompt")
+                guard let offer = offer.read() else { throw CheckFailure("No legacy offer") }
+                try check(offer.names.isEmpty && offer.count == 2 && !acknowledged.read(), "Legacy offer was auto accepted")
+                b.respondToFileOffer(id: offer.id, accept: false)
+                try wait(cancelled, "Legacy transfer not declined")
+                b.stop { stopped.signal() }; try wait(stopped, "Receiver did not stop")
+                let legacy = try Wire.readJSON(ClipboardPreference.self, Data("{\"enabled\":true}".utf8))
+                try check(legacy.fileApproval == nil, "Old peer incorrectly advertises file consent")
+                let modern = ClipboardPreference(enabled: true, session: UUID())
+                try check(Wire.readJSON(ClipboardPreference.self, JSONEncoder().encode(modern)).fileApproval == true, "File approval capability lost")
+            }
         }
     }
 

@@ -1,6 +1,5 @@
 import Foundation
 import Darwin
-import CryptoKit
 
 public enum ClipboardPayload {
     case text(Data), png(Data), files([URL])
@@ -51,8 +50,6 @@ private struct ClipboardBegin: Codable {
     let bytes: UInt64
     let names: [String]?
     let rootCount: Int?
-    /// 可选：文件清单指纹（相对路径 + 类型 + 大小）。旧版本缺省为 nil，解码兼容。
-    let fingerprint: String?
 }
 
 private struct ClipboardEntry: Codable {
@@ -102,9 +99,6 @@ public final class ClipboardTransfer {
     private var incoming: Incoming?
     private var appliedFiles: [Part]?
     private var pendingFileOffer: (id: UUID, begin: ClipboardBegin, created: TimeInterval)?
-    /// 本端最近一次发出或成功写入剪贴板的文件指纹，用于识别对端把同一批文件再回传过来。
-    private var recentFiles: (fingerprint: String, at: TimeInterval)?
-    private static let echoWindow: TimeInterval = 120
     private var stopped = false
     private var timer: DispatchSourceTimer?
     private static let chunkSize = 32_768
@@ -190,8 +184,6 @@ public final class ClipboardTransfer {
                     return
                 }
                 appliedFiles = nil
-                let fingerprint = type == "files" ? Self.fingerprint(parts) : nil
-                recentFiles = fingerprint.map { (fingerprint: $0, at: ProcessInfo.processInfo.systemUptime) }
                 cancelOutgoing("剪贴板已被新的复制内容替换")
                 discardIncoming(reason: .superseded)
                 clock &+= 1
@@ -214,7 +206,7 @@ public final class ClipboardTransfer {
                     rootCount = urls.count
                 } else { names = nil; rootCount = nil }
                 sendJSON(.clipboardBegin, ClipboardBegin(revision: revision, sequence: 0, type: type, count: parts.count,
-                    bytes: total, names: names, rootCount: rootCount, fingerprint: fingerprint))
+                    bytes: total, names: names, rootCount: rootCount))
                 ensureTimer()
                 onStatus?(type == "files" ? "已发送文件信息，等待对端确认接收（90 秒内）" : "正在同步剪贴板：\(parts.count) 项，\(ByteCountFormatter.string(fromByteCount: Int64(clamping: total), countStyle: .file))")
             } catch {
@@ -330,16 +322,8 @@ public final class ClipboardTransfer {
     }
 
     private func rememberAppliedFiles(_ payload: ClipboardPayload) {
-        if case .files = payload {
-            appliedFiles = (try? plan(payload))?.1
-            recentFiles = appliedFiles.map { (fingerprint: Self.fingerprint($0), at: ProcessInfo.processInfo.systemUptime) }
-        } else { appliedFiles = nil; recentFiles = nil }
-    }
-
-    private static func fingerprint(_ parts: [Part]) -> String {
-        let canonical = parts.map { "\($0.path.precomposedStringWithCanonicalMapping)|\($0.directory ? 1 : 0)|\($0.size)" }
-            .sorted().joined(separator: "\n")
-        return SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined()
+        if case .files = payload { appliedFiles = (try? plan(payload))?.1 }
+        else { appliedFiles = nil }
     }
 
     private func advance(_ transfer: Outgoing) throws {
@@ -402,13 +386,6 @@ public final class ClipboardTransfer {
     private func begin(_ value: ClipboardBegin) throws {
         clock = max(clock, value.revision.counter)
         if pendingFileOffer?.begin.revision == value.revision { return }
-        // 对端提供的文件与本端刚发出/刚接收的完全相同（例如经系统通用剪贴板回流），直接忽略，不弹窗也不打断本端状态。
-        if value.type == "files", let fingerprint = value.fingerprint, let recent = recentFiles,
-           recent.fingerprint == fingerprint, ProcessInfo.processInfo.systemUptime - recent.at < Self.echoWindow {
-            sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: 0, reason: "对端已有相同文件，已忽略回传"))
-            onStatus?("已忽略对端回传的相同文件")
-            return
-        }
         guard newest == nil || value.revision > newest! else {
             sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: 0, reason: "已有更新的剪贴板内容"))
             return

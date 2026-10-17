@@ -32,6 +32,7 @@ private final class MemoryPasteboard: ClipboardPasteboard {
     private(set) var payload: ClipboardPayload = .text(Data())
     private var marker: String?
     var rejectsWrites = false
+    var isRelayedFromOtherDevice = false
 
     var fileURLs: [URL]? {
         reads += 1
@@ -155,6 +156,32 @@ private struct ClipboardFocusChecks {
             pair.localSync.setAutomaticSendingAllowed(true)
             pump(for: 0.35)
             try require(pair.localMessages.filter { $0 == .clipboardBegin }.isEmpty, "Received clipboard echoed on focus return")
+        }
+
+        run("System-relayed files never return an offer while a fresh local copy can still send") { folder in
+            let pair = ClipboardPair(storage: folder)
+            defer { pair.stop() }
+            let file = folder.appendingPathComponent("relayed.bin")
+            try Data([1, 2, 3]).write(to: file)
+            var offer: ClipboardFileOffer?, paste: Bool?
+            pair.localSync.onFileOffer = { offer = $0 }
+            pair.remote.isRelayedFromOtherDevice = true
+            pair.remote.copy(.files([file]))
+            for _ in 0..<3 {
+                pair.remoteSync.setAutomaticSendingAllowed(true)
+                pair.remoteSync.setAutomaticSendingAllowed(false)
+            }
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            pair.remoteSync.prepareForPaste { paste = $0 }
+            pump(for: 0.65)
+            try require(paste == false && offer == nil && !pair.remoteMessages.contains(.clipboardBegin)
+                        && pair.local.writes == 0, "A system-relayed file returned an offer or became paste-ready")
+            pair.remote.isRelayedFromOtherDevice = false
+            pair.remote.copy(.files([file]))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("A fresh local copy was suppressed after a system-relayed file") { offer != nil }
+            pair.localSync.respondToFileOffer(id: offer!.id, accept: true)
+            try eventually("The fresh local file was not published") { pair.local.writes == 1 }
         }
 
         run("In-flight paste preparation, chunks and receipts complete after focus loss") { folder in

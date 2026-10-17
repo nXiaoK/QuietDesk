@@ -49,10 +49,11 @@ public enum Wire {
     public static let maximumClipboardBytes = 1 * 1024 * 1024
 
     public static func decodeBody(_ body: Data) throws -> Message {
+        guard body.count <= maximumMessageBytes else { throw DeskError.invalid("消息过大") }
         guard let byte = body.first, let kind = MessageKind(rawValue: byte) else {
             throw DeskError.invalid("无法识别的消息类型")
         }
-        return Message(kind, Data(body.dropFirst()))
+        return Message(kind, body.dropFirst())
     }
 
     public static func json<T: Encodable>(_ kind: MessageKind, _ value: T) throws -> Message {
@@ -262,6 +263,7 @@ public struct VideoPacket: Sendable {
     }
 
     public static func decode(_ data: Data) throws -> VideoPacket {
+        guard data.count < Wire.maximumMessageBytes else { throw DeskError.invalid("视频帧过大") }
         var reader = ByteReader(data)
         let sequence: UInt32 = try reader.take()
         let spsLength: UInt16 = try reader.take()
@@ -290,13 +292,14 @@ public struct ByteReader {
     private let data: Data
     private var offset = 0
     public var remaining: Int { data.count - offset }
-    public init(_ data: Data) { self.data = Data(data) }
+    public init(_ data: Data) { self.data = data }
 
     public mutating func take<T: FixedWidthInteger>() throws -> T {
         let count = MemoryLayout<T>.size
         guard remaining >= count else { throw DeskError.invalid("消息被截断") }
         var value: T = 0
-        for byte in data[offset..<(offset + count)] { value = (value << 8) | T(byte) }
+        let start = data.startIndex + offset
+        for byte in data[start..<(start + count)] { value = (value << 8) | T(truncatingIfNeeded: byte) }
         offset += count
         return value
     }
@@ -304,7 +307,8 @@ public struct ByteReader {
     public mutating func bytes(_ count: Int) throws -> Data {
         guard count >= 0, remaining >= count else { throw DeskError.invalid("消息被截断") }
         defer { offset += count }
-        return Data(data[offset..<(offset + count)])
+        let start = data.startIndex + offset
+        return data[start..<(start + count)]
     }
 
     public mutating func skip(_ count: Int) throws {

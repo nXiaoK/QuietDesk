@@ -440,9 +440,11 @@ final class DeskModel: ObservableObject {
     func copyHostCode() {
         prepareHostCode()
         guard !hostCode.isEmpty else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(hostCode, forType: .string)
-        clipboardStatus = "配对码已复制，请通过可信渠道传到公司 Mac"
+        guard ClipboardPrivacy.copyPairingCode(hostCode) else {
+            clipboardStatus = "配对码复制失败，请重试"
+            return
+        }
+        clipboardStatus = "配对码已复制，仅在本机保留 60 秒，请通过可信渠道传递"
     }
 
     func requestAccessibility() {
@@ -1504,6 +1506,10 @@ final class DeskModel: ObservableObject {
     }
 
     private func sendClipboard(to peer: Peer) {
+        guard !ClipboardPrivacy.isSensitive() else {
+            clipboardStatus = "剪贴板内容已标记为敏感，未同步到对端"
+            return
+        }
         guard let text = NSPasteboard.general.string(forType: .string) else {
             clipboardStatus = "剪贴板中没有文字"
             return

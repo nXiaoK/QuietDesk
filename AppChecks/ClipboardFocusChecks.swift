@@ -49,6 +49,7 @@ private final class MemoryPasteboard: ClipboardPasteboard {
     private var marker: String?
     var rejectsWrites = false
     var isRelayedFromOtherDevice = false
+    var isSensitive = false
     var rawTIFF: Data?
     var tiffData: Data? { reads += 1; return rawTIFF }
 
@@ -707,6 +708,27 @@ private struct ClipboardFocusChecks {
             probe.release.signal()
             pump(for: 0.15)
             try require(messages.filter { $0 == .clipboardBegin }.count == 1, "Stale image superseded a newer copy")
+        }
+
+        run("Sensitive clipboard contents are neither read nor sent by polling or paste preparation") { folder in
+            let pair = ClipboardPair(storage: folder)
+            defer { pair.stop() }
+            let file = folder.appendingPathComponent("private.bin")
+            try Data([1]).write(to: file)
+            for payload in [ClipboardPayload.text(Data("private code".utf8)), .png(Data([1])), .files([file])] {
+                pair.local.copy(payload)
+                pair.local.isSensitive = true
+                pair.localSync.setAutomaticSendingAllowed(true)
+                var paste: Bool?
+                pair.localSync.prepareForPaste { paste = $0 }
+                pump(for: 0.05)
+                try require(paste == false && pair.local.reads == 0 && pair.localMessages.isEmpty,
+                            "Sensitive contents were read, sent or marked paste-ready")
+            }
+            pair.local.isSensitive = false
+            pair.local.copy(.text(Data("ordinary copy".utf8)))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Ordinary copy did not resume after sensitive contents") { pair.remote.copiedText == "ordinary copy" }
         }
 
         run("Focus preference is optional, round-trips both states and rejects non-boolean input") { _ in

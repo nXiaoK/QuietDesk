@@ -12,12 +12,14 @@ protocol ClipboardPasteboard: AnyObject {
     var contentMarker: String? { get }
     /// 内容由 macOS 通用剪贴板（接力/Handoff）等跨设备机制写入，而不是本机用户复制。
     var isRelayedFromOtherDevice: Bool { get }
+    var isSensitive: Bool { get }
     func write(_ payload: ClipboardPayload, marker: String) -> Bool
 }
 
 extension ClipboardPasteboard {
     var isRelayedFromOtherDevice: Bool { false }
     var tiffData: Data? { nil }
+    var isSensitive: Bool { false }
 }
 
 @MainActor
@@ -30,6 +32,7 @@ private final class SystemClipboardPasteboard: ClipboardPasteboard {
     var tiffData: Data? { pasteboard.data(forType: .tiff) }
     var text: String? { pasteboard.string(forType: .string) }
     var contentMarker: String? { pasteboard.string(forType: Self.marker) }
+    var isSensitive: Bool { ClipboardPrivacy.isSensitive(pasteboard) }
     // Universal Clipboard 写入的条目带有该类型；QuietDesk 不应把它当成本机新复制再转发给对端。
     private static let relayedTypes: Set<NSPasteboard.PasteboardType> = [
         NSPasteboard.PasteboardType("com.apple.is-remote-clipboard")
@@ -200,6 +203,11 @@ final class ClipboardSync {
 
     func prepareForPaste(_ completion: @escaping (Bool) -> Void) {
         guard running, allowsAutomaticSending else { completion(false); return }
+        guard !pasteboard.isSensitive else {
+            onStatus?("剪贴板内容已标记为敏感，未同步到对端")
+            completion(false)
+            return
+        }
         let change = pasteboard.changeCount
         if change == sharedChange { completion(true); return }
         if let files = pasteboard.fileURLs, !files.isEmpty {
@@ -240,6 +248,12 @@ final class ClipboardSync {
         let change = pasteboard.changeCount
         observedChange = change
         imagePreparation = nil
+        guard !pasteboard.isSensitive else {
+            sendingChange = nil
+            onStatus?("剪贴板内容已标记为敏感，未同步到对端")
+            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+            return
+        }
         let payload: ClipboardPayload
         if let files = pasteboard.fileURLs, !files.isEmpty {
             payload = .files(files)

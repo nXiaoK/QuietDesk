@@ -72,6 +72,7 @@ final class ClipboardSync {
     private var observedChange: Int
     private var pendingFileOffer: (id: UUID, change: Int)?
     private var deferredLocalChange: Int?
+    private var staleFileChange: Int?
     private var sharedChange: Int?
     private var sendingChange: Int?
     private var waiters: [(Bool) -> Void] = []
@@ -109,6 +110,7 @@ final class ClipboardSync {
                 let change = self.pasteboard.changeCount
                 self.pendingFileOffer = (offer.id, change)
                 self.deferredLocalChange = change
+                self.staleFileChange = change
                 self.onFileOffer?(offer)
             }
         }
@@ -154,6 +156,11 @@ final class ClipboardSync {
         let change = pasteboard.changeCount
         if change == sharedChange { completion(true); return }
         if let files = pasteboard.fileURLs, !files.isEmpty {
+            guard staleFileChange != change else {
+                completion(false)
+                onStatus?("此文件复制早于远端请求，请在本机重新复制后再粘贴")
+                return
+            }
             if sendingChange != change { sendCurrent() }
             if change == sharedChange { completion(true); return }
             completion(false)
@@ -193,6 +200,12 @@ final class ClipboardSync {
             let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
             return
         }
+        // Closing a remote prompt can restore focus without a new local file copy.
+        if case .files = payload, staleFileChange == change {
+            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+            return
+        }
+        staleFileChange = nil
         let contentMarker = marker(for: payload)
         let isFile: Bool
         if case .files = payload { isFile = true } else { isFile = false }
@@ -237,6 +250,7 @@ final class ClipboardSync {
         guard pasteboard.write(payload, marker: contentMarker) else { onStatus?("系统剪贴板写入失败"); return false }
         observedChange = pasteboard.changeCount
         deferredLocalChange = nil
+        staleFileChange = nil
         sharedChange = observedChange
         hasSharedState = true
         lastSharedMarker = contentMarker

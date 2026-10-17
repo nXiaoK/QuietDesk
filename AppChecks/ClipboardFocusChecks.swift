@@ -326,6 +326,74 @@ private struct ClipboardFocusChecks {
             try require(!pair.remoteMessages.contains(.clipboardEntry), "Declining the offer downloaded files")
         }
 
+        for failToStart in [false, true] {
+            run("\(failToStart ? "Failed" : "Declined") incoming offer cannot send an older local file without a new copy") { folder in
+                let storage = folder.appendingPathComponent(failToStart ? "failure" : "decline")
+                try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+                if failToStart { try Data([0]).write(to: storage.appendingPathComponent("remote")) }
+                let pair = ClipboardPair(storage: storage, localAllowed: true)
+                defer { pair.stop() }
+                let localFile = storage.appendingPathComponent("A.bin"), oldRemoteFile = storage.appendingPathComponent("older-B.bin")
+                try Data([1]).write(to: localFile)
+                try Data([2]).write(to: oldRemoteFile)
+                pair.remote.copy(.files([oldRemoteFile]))
+                var incoming: ClipboardFileOffer?, returned: ClipboardFileOffer?
+                pair.remoteSync.onFileOffer = { value in
+                    incoming = value
+                    if value != nil { pair.remoteSync.setAutomaticSendingAllowed(true) }
+                }
+                pair.localSync.onFileOffer = { returned = $0 }
+                pair.local.copy(.files([localFile]))
+                pair.localSync.setAutomaticSendingAllowed(true)
+                try eventually("A file did not prompt only on B") { incoming != nil }
+                try require(returned == nil && !pair.remoteMessages.contains(.clipboardBegin), "B offered an old copy during A's file prompt")
+                pair.remoteSync.setAutomaticSendingAllowed(false)
+                pair.remoteSync.respondToFileOffer(id: incoming!.id, accept: failToStart)
+                try eventually("B prompt did not close after decline or failure") { incoming == nil }
+                try require(pair.remote.reads == 0, "Closing the prompt read B's inactive clipboard")
+                for _ in 0..<3 {
+                    pair.remoteSync.setAutomaticSendingAllowed(false)
+                    pair.remoteSync.setAutomaticSendingAllowed(true)
+                }
+                let readsAfterFocus = pair.remote.reads
+                pump(for: 0.65)
+                try require(pair.remote.reads == readsAfterFocus, "Timer polling repeatedly reread an unchanged stale file copy")
+                var stalePaste: Bool?
+                pair.remoteSync.prepareForPaste { stalePaste = $0 }
+                try require(stalePaste == false && returned == nil && !pair.remoteMessages.contains(.clipboardBegin),
+                            "Closing A's copy request or preparing paste sent an older B file")
+                pair.remote.copy(.files([oldRemoteFile]))
+                pair.remoteSync.setAutomaticSendingAllowed(true)
+                try eventually("A fresh B copy of its original file did not prompt A") { returned != nil }
+                pair.localSync.respondToFileOffer(id: returned!.id, accept: false)
+            }
+        }
+
+        run("A genuinely new B file copy during A's pending offer can prompt A") { folder in
+            let pair = ClipboardPair(storage: folder, localAllowed: true)
+            defer { pair.stop() }
+            let a = folder.appendingPathComponent("A.bin"), b = folder.appendingPathComponent("B.bin")
+            try Data([1]).write(to: a); try Data([2]).write(to: b)
+            pair.remote.copy(.files([b]))
+            var incoming: ClipboardFileOffer?, returned: ClipboardFileOffer?
+            pair.remoteSync.onFileOffer = { incoming = $0 }
+            pair.localSync.onFileOffer = { returned = $0 }
+            pair.local.copy(.files([a]))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("A's pending file offer missing") { incoming != nil }
+            let stale = incoming!.id
+            pair.remote.copy(.files([b]))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("B's new file copy did not prompt A") { returned != nil && incoming == nil }
+            pair.remoteSync.respondToFileOffer(id: stale, accept: true)
+            try require(!pair.localMessages.contains(.clipboardEntry), "Stale acceptance sent A's superseded file")
+            pair.localSync.respondToFileOffer(id: returned!.id, accept: true)
+            try eventually("B's explicit file copy was not applied after A accepted") { pair.local.writes == 1 }
+            guard case .files(let urls) = pair.local.payload else { throw FocusCheckFailure("Expected B's file") }
+            try require(urls[0].lastPathComponent == "B.bin" && Data(contentsOf: urls[0]) == Data([2]),
+                        "The explicit B file copy changed or was blocked")
+        }
+
         run("Copies made while a background file prompt waits are not overwritten on acceptance") { folder in
             let pair = ClipboardPair(storage: folder, remoteAllowed: true)
             defer { pair.stop() }

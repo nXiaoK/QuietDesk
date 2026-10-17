@@ -1,6 +1,6 @@
 # 开发指南
 
-[返回首页](../README.md) · [历史构建记录](../BUILD-AND-CHECKS.md)
+[返回首页](../README.md) · [历史构建记录](../BUILD-AND-CHECKS.md) · [本轮审查修复记录](review-fixes.md)
 
 ## 环境
 

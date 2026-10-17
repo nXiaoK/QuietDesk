@@ -337,9 +337,6 @@ final class DeskModel: ObservableObject {
 
     func requestInputMonitoring() {
         if mode == .viewer { canvas.releaseControl() }
-        if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
-            _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
-        }
         openPermissionSettings(.inputMonitoring)
     }
 
@@ -460,14 +457,11 @@ final class DeskModel: ObservableObject {
 
     func requestAccessibility() {
         if mode == .viewer { canvas.releaseControl() }
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
-        _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
         openPermissionSettings(.accessibility)
     }
 
     func openScreenPermission() {
         if mode == .viewer { canvas.releaseControl() }
-        _ = CGRequestScreenCaptureAccess()
         openPermissionSettings(.screenRecording)
     }
 
@@ -534,8 +528,12 @@ final class DeskModel: ObservableObject {
             let key = try PairingKey(code: hostCode)
             let port = try validPort(hostPort)
             guard CGPreflightScreenCaptureAccess() else {
+                localScreenRecording = false
+                let failure = DeskError.invalid("请在系统设置中允许屏幕录制，权限实际生效后再开启共享")
+                recordDiagnosticFailure(.hostStopped, error: failure)
+                status = "共享未启动：\(failure.localizedDescription)"
                 if interactive { openScreenPermission() }
-                throw DeskError.invalid("请允许 QuietDesk 录制屏幕，然后完全退出并重新打开应用")
+                return
             }
             working = true
             status = "正在准备共享…"

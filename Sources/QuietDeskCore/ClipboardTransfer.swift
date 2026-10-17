@@ -45,7 +45,7 @@ public struct ClipboardFileOffer: Identifiable {
     public let createdUptime: TimeInterval
 
     public init(id: UUID, names: [String], count: Int, bytes: UInt64,
-                createdUptime: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+                createdUptime: TimeInterval = SessionClock.now) {
         self.id = id; self.names = names; self.count = count; self.bytes = bytes
         self.createdUptime = createdUptime
     }
@@ -143,7 +143,7 @@ public final class ClipboardTransfer {
         var offset = 0
         var handle: FileHandle?
         var ending = false
-        var updated = ProcessInfo.processInfo.systemUptime
+        var updated = SessionClock.now
         var transferred: UInt64 = 0
         var total: UInt64 = 0
         var progressAt: TimeInterval = 0
@@ -162,7 +162,7 @@ public final class ClipboardTransfer {
         var remaining: UInt64 = 0
         var received: UInt64 = 0
         var handle: FileHandle?
-        var updated = ProcessInfo.processInfo.systemUptime
+        var updated = SessionClock.now
         var progressAt: TimeInterval = 0
         init(begin: ClipboardBegin, directory: URL) { self.begin = begin; self.directory = directory }
         deinit { try? handle?.close() }
@@ -263,7 +263,7 @@ public final class ClipboardTransfer {
                         guard receipt.sequence == 0 else { throw DeskError.invalid("剪贴板开始确认无效") }
                     }
                     outgoing.acknowledged = receipt.sequence
-                    outgoing.updated = ProcessInfo.processInfo.systemUptime
+                    outgoing.updated = SessionClock.now
                     if outgoing.ending, receipt.sequence == outgoing.sequence {
                         self.outgoing = nil
                         outgoing.completion(true)
@@ -380,7 +380,7 @@ public final class ClipboardTransfer {
             transfer.remaining -= UInt64(bytes.count)
             transfer.offset += bytes.count
             transfer.transferred += UInt64(bytes.count)
-            let now = ProcessInfo.processInfo.systemUptime
+            let now = SessionClock.now
             if now - transfer.progressAt > 0.5 {
                 transfer.progressAt = now
                 onStatus?("正在发送：\(ByteCountFormatter.string(fromByteCount: Int64(clamping: transfer.transferred), countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: Int64(clamping: transfer.total), countStyle: .file))")
@@ -450,7 +450,7 @@ public final class ClipboardTransfer {
         discardIncoming(reason: .superseded)
         if value.type == "files", requireFileApproval {
             let id = UUID()
-            let created = ProcessInfo.processInfo.systemUptime
+            let created = SessionClock.now
             pendingFileOffer = (id, value, created)
             ensureTimer()
             onFileOffer?(ClipboardFileOffer(id: id, names: value.names ?? [], count: value.rootCount ?? value.count,
@@ -502,7 +502,7 @@ public final class ClipboardTransfer {
         incoming.entries.append(value)
         incoming.remaining = value.bytes
         incoming.sequence = value.sequence
-        incoming.updated = ProcessInfo.processInfo.systemUptime
+        incoming.updated = SessionClock.now
         acknowledge(value.revision, value.sequence)
     }
 
@@ -523,7 +523,7 @@ public final class ClipboardTransfer {
         incoming.remaining -= UInt64(bytes.count)
         incoming.received += UInt64(bytes.count)
         incoming.sequence = sequence
-        incoming.updated = ProcessInfo.processInfo.systemUptime
+        incoming.updated = SessionClock.now
         if incoming.updated - incoming.progressAt > 0.5 {
             incoming.progressAt = incoming.updated
             onStatus?("正在接收：\(ByteCountFormatter.string(fromByteCount: Int64(clamping: incoming.received), countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: Int64(clamping: incoming.begin.bytes), countStyle: .file))")
@@ -608,7 +608,7 @@ public final class ClipboardTransfer {
         timer.schedule(deadline: .now() + 5, repeating: 5)
         timer.setEventHandler { [weak self] in
             guard let self else { return }
-            let now = ProcessInfo.processInfo.systemUptime
+            let now = SessionClock.now
             if let outgoing = self.outgoing, now - outgoing.updated > 90 { self.cancelOutgoing("剪贴板传输确认超时"); self.onStatus?("剪贴板同步超时，请重新复制") }
             if let incoming = self.incoming, now - incoming.updated > 90 {
                 self.sendJSON(.clipboardCancel, ClipboardReceipt(revision: incoming.begin.revision, sequence: incoming.sequence, reason: "接收超时"))

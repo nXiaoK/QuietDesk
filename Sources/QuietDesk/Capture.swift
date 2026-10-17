@@ -141,7 +141,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 guard self.running, self.encoderID == id else { return }
                 switch result {
                 case .success(let packet):
-                    guard self.frameFlow.encoded(packet.sequence, at: ProcessInfo.processInfo.systemUptime) else { return }
+                    guard self.frameFlow.encoded(packet.sequence, at: SessionClock.now) else { return }
                     self.onFrame?(packet)
                     self.completeFrameBoundary()
                 case .failure(let error):
@@ -191,7 +191,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             watchdog.schedule(deadline: .now() + 2, repeating: 2)
             watchdog.setEventHandler { [weak self] in
                 guard let self, self.running,
-                      let message = self.frameFlow.stalled(at: ProcessInfo.processInfo.systemUptime) else { return }
+                      let message = self.frameFlow.stalled(at: SessionClock.now) else { return }
                 self.reportError(DeskError.invalid(message))
             }
             self.watchdog = watchdog
@@ -407,7 +407,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         guard running, !reconfiguring, !sessionPaused else { return }
         discardMismatchedFrame()
         guard let latest, let encoder,
-              let frame = frameFlow.begin(at: ProcessInfo.processInfo.systemUptime) else { return }
+              let frame = frameFlow.begin(at: SessionClock.now) else { return }
         self.latest = nil
         do { try encoder.encode(latest.0, time: latest.1, sequence: frame.sequence, forceKeyFrame: frame.forceKeyFrame) }
         catch {

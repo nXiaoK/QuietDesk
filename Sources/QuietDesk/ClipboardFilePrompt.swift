@@ -145,7 +145,7 @@ struct ClipboardFilePromptView: View {
             .foregroundStyle(.secondary)
 
             TimelineView(.periodic(from: .now, by: 1)) { _ in
-                let remaining = max(0, 90 - (ProcessInfo.processInfo.systemUptime - offer.createdUptime))
+                let remaining = max(0, 90 - (SessionClock.now - offer.createdUptime))
                 VStack(alignment: .leading, spacing: 7) {
                     Label(remaining > 0 ? "约 \(Int(ceil(remaining))) 秒后未确认将自动拒绝" : "已到确认时限，等待请求清理…", systemImage: "clock")
                         .font(.system(size: 11))

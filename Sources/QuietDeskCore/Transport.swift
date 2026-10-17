@@ -57,7 +57,7 @@ public final class Peer {
     private var closed = false
     private var started = false
     private var ready = false
-    private var lastReceived = ProcessInfo.processInfo.systemUptime
+    private var lastReceived = SessionClock.now
     private var timer: DispatchSourceTimer?
     private var pendingBytes = 0
     private var deliverySequence: UInt64 = 0
@@ -86,7 +86,7 @@ public final class Peer {
             timer.schedule(deadline: .now() + heartbeatInterval, repeating: heartbeatInterval)
             timer.setEventHandler { [weak self] in
                 guard let self else { return }
-                if ProcessInfo.processInfo.systemUptime - self.lastReceived > (self.ready ? self.idleTimeout : self.handshakeTimeout) {
+                if SessionClock.now - self.lastReceived > (self.ready ? self.idleTimeout : self.handshakeTimeout) {
                     self.finish(self.ready ? "连接超过 \(Int(self.idleTimeout)) 秒无数据" : "建立连接超时，请检查地址或远端状态")
                 } else if self.ready {
                     self.sendHeartbeat()
@@ -99,7 +99,7 @@ public final class Peer {
                 switch state {
                 case .ready:
                     self.ready = true
-                    self.lastReceived = ProcessInfo.processInfo.systemUptime
+                    self.lastReceived = SessionClock.now
                     self.onReady?()
                     if self.onRoundTripMilliseconds != nil { self.sendHeartbeat() }
                     self.receiveHeader()
@@ -123,7 +123,7 @@ public final class Peer {
     }
 
     private func sendHeartbeat() {
-        let payload = onRoundTripMilliseconds == nil ? nil : roundTrip.begin(at: ProcessInfo.processInfo.systemUptime)
+        let payload = onRoundTripMilliseconds == nil ? nil : roundTrip.begin(at: SessionClock.now)
         send(Message(.ping, payload ?? Data()))
     }
 
@@ -191,7 +191,7 @@ public final class Peer {
                         switch message.kind {
                         case .ping: self.send(Message(.pong, message.payload.count == 8 ? message.payload : Data()))
                         case .pong:
-                            if let milliseconds = self.roundTrip.complete(message.payload, at: ProcessInfo.processInfo.systemUptime) {
+                            if let milliseconds = self.roundTrip.complete(message.payload, at: SessionClock.now) {
                                 self.onRoundTripMilliseconds?(milliseconds)
                             }
                         default:
@@ -227,7 +227,7 @@ public final class Peer {
             guard let self, !self.closed else { return }
             if let data, !data.isEmpty {
                 buffer.data.append(data)
-                self.lastReceived = ProcessInfo.processInfo.systemUptime
+                self.lastReceived = SessionClock.now
                 self.trafficMeter.record(receivedBytes: UInt64(data.count))
                 self.onTraffic?(data.count)
             }

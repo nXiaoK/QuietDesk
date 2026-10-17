@@ -108,7 +108,7 @@ final class DeskModel: ObservableObject {
     private var permissionGuide: PermissionGuide?
     private var capsLockStartAttempted = false
     private var controlStatusUpdatesEnabled = false
-    private var lastMetrics = ProcessInfo.processInfo.systemUptime
+    private var lastMetrics = SessionClock.now
     private var captureTask: Task<Void, Never>?
     private var lastLatencyAt: TimeInterval?
     private var reconnectTask: Task<Void, Never>?
@@ -144,6 +144,8 @@ final class DeskModel: ObservableObject {
     private var hostSettingsTask: Task<Void, Never>?
     private var hostSettingsRequestID: UUID?
     private var screenObserver: NSObjectProtocol?
+    private var powerObservers: [NSObjectProtocol] = []
+    private var systemSleeping = false
     private var displayRefreshTask: Task<Void, Never>?
     private var hostPreparationTask: Task<Void, Never>?
     private var capturedDisplay: DisplaySnapshot?
@@ -155,7 +157,7 @@ final class DeskModel: ObservableObject {
     private var effectsCleanupTask: Task<Void, Never>?
     private var effectsRequestID: UUID?
     private var effectsRequestTimeout: Task<Void, Never>?
-    private var idlePolicy = SessionIdlePolicy(now: ProcessInfo.processInfo.systemUptime)
+    private var idlePolicy = SessionIdlePolicy(now: SessionClock.now)
     private var pauseTransmission = SessionPauseTransmission()
     private var wakeInputGate = SessionWakeInputGate()
     private var pauseRequestTimeout: Task<Void, Never>?
@@ -188,6 +190,15 @@ final class DeskModel: ObservableObject {
                     }
                 }
             }
+
+        powerObservers = [NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification].map { name in
+            NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    if name == NSWorkspace.willSleepNotification { self?.systemWillSleep() }
+                    else { self?.systemDidWake() }
+                }
+            }
+        }
 
         canvas.onUserActivity = { [weak self] in self?.recordSessionActivity() }
         canvas.onInput = { [weak self] value in
@@ -509,7 +520,7 @@ final class DeskModel: ObservableObject {
     }
 
     func startHosting(interactive: Bool = true) {
-        guard !active, !working else { return }
+        guard !active, !working, !systemSleeping else { return }
         DiagnosticLog.shared.record(.hostStarted, role: .host, state: .requested)
         hostingRequested = true
         hostRetryTask?.cancel()
@@ -539,7 +550,7 @@ final class DeskModel: ObservableObject {
                         let address: String?
                         if case .hostPort(let host, _) = connection.endpoint { address = host.debugDescription }
                         else { address = nil }
-                        guard let id = admission.reserve(address: address, now: ProcessInfo.processInfo.systemUptime) else {
+                        guard let id = admission.reserve(address: address, now: SessionClock.now) else {
                             connection.cancel()
                             return
                         }
@@ -727,8 +738,8 @@ final class DeskModel: ObservableObject {
             UserDefaults.standard.set(self.port, forKey: "remotePort")
             let target = Target(address: address, port: port.rawValue, key: key)
             self.target = target
-            idlePolicy = SessionIdlePolicy(now: ProcessInfo.processInfo.systemUptime)
-            _ = idlePolicy.focusChanged(now: ProcessInfo.processInfo.systemUptime, focused: sessionWindowFocused, suppressWake: true)
+            idlePolicy = SessionIdlePolicy(now: SessionClock.now)
+            _ = idlePolicy.focusChanged(now: SessionClock.now, focused: sessionWindowFocused, suppressWake: true)
             pauseTransmission = SessionPauseTransmission()
             wakeInputGate = SessionWakeInputGate()
             reconnectDeferredForIdle = false
@@ -767,9 +778,9 @@ final class DeskModel: ObservableObject {
     }
 
     private func beginConnection(_ target: Target) {
-        guard peer == nil else { return }
+        guard peer == nil, !systemSleeping else { return }
         if reconnecting {
-            _ = idlePolicy.tick(now: ProcessInfo.processInfo.systemUptime)
+            _ = idlePolicy.tick(now: SessionClock.now)
             if idlePolicy.isPaused { deferReconnectForIdle("10 分钟无窗口操作"); return }
         }
         let candidate = Peer(connection: NWConnection(host: NWEndpoint.Host(target.address),
@@ -793,7 +804,7 @@ final class DeskModel: ObservableObject {
                     DiagnosticLog.shared.record(.connectionMetrics, role: .viewer, values: [.roundTripMicroseconds: microseconds])
                 }
                 self.latency = String(format: milliseconds < 10 ? "%.1f ms" : "%.0f ms", milliseconds)
-                self.lastLatencyAt = ProcessInfo.processInfo.systemUptime
+                self.lastLatencyAt = SessionClock.now
                 self.viewerQualityPolicy.observeRoundTrip(milliseconds)
                 self.applyInitialVideoQualityIfReady()
             }
@@ -844,7 +855,8 @@ final class DeskModel: ObservableObject {
 
     private func scheduleReconnect(_ reason: String) {
         reconnectTask?.cancel()
-        _ = idlePolicy.tick(now: ProcessInfo.processInfo.systemUptime)
+        guard !systemSleeping else { return }
+        _ = idlePolicy.tick(now: SessionClock.now)
         if idlePolicy.isPaused {
             deferReconnectForIdle(reason)
             return
@@ -988,7 +1000,7 @@ final class DeskModel: ObservableObject {
             guard !helloReceived else { throw DeskError.invalid("重复的会话信息") }
             let hello = try Wire.readJSON(Hello.self, message.payload)
             try hello.validate()
-            if reconnecting, idlePolicy.isPaused || idlePolicy.tick(now: ProcessInfo.processInfo.systemUptime) {
+            if reconnecting, idlePolicy.isPaused || idlePolicy.tick(now: SessionClock.now) {
                 clearSession()
                 peer.close("空闲暂停，返回窗口后继续连接")
                 deferReconnectForIdle("连接恢复前已达到空闲时限")
@@ -1002,9 +1014,9 @@ final class DeskModel: ObservableObject {
             reconnecting = false
             supportsSessionPause = hello.sessionPause == true
             if !supportsSessionPause {
-                idlePolicy.synchronize(paused: false, now: ProcessInfo.processInfo.systemUptime)
+                idlePolicy.synchronize(paused: false, now: SessionClock.now)
                 pauseTransmission = SessionPauseTransmission()
-            } else if idlePolicy.tick(now: ProcessInfo.processInfo.systemUptime) {
+            } else if idlePolicy.tick(now: SessionClock.now) {
                 pauseTransmission.choose(paused: true)
             }
             if freshFrameRequiredOnReconnect { pauseTransmission.requireFreshFrame() }
@@ -1071,7 +1083,7 @@ final class DeskModel: ObservableObject {
                 sessionPauseStatus = "暂停/恢复失败：\(error)"
                 if !result.paused, oldRequest?.paused == true { self.error = "空闲暂停失败，画面仍在传输：\(error)" }
                 if oldRequest?.paused == idlePolicy.isPaused {
-                    idlePolicy.synchronize(paused: result.paused, now: ProcessInfo.processInfo.systemUptime)
+                    idlePolicy.synchronize(paused: result.paused, now: SessionClock.now)
                 }
             } else { sessionPauseStatus = result.paused ? "空闲暂停 · 加密会话仍保持" : "正在等待恢复后的新画面…" }
             publishSessionPause()
@@ -1347,7 +1359,7 @@ final class DeskModel: ObservableObject {
             guard let self, !Task.isCancelled else { return }
             if NSApp.isActive, NSApp.keyWindow == nil, let window = self.mainWindow,
                window.isVisible, !window.isMiniaturized { return }
-            let resumed = self.idlePolicy.focusChanged(now: ProcessInfo.processInfo.systemUptime,
+            let resumed = self.idlePolicy.focusChanged(now: SessionClock.now,
                 focused: self.sessionWindowFocused, suppressWake: self.suppressIdleFocusWake)
             self.suppressIdleFocusWake = false
             if resumed { self.resumeIdleTransmission() }
@@ -1357,7 +1369,7 @@ final class DeskModel: ObservableObject {
     private func recordSessionActivity() {
         guard mode == .viewer, supportsSessionPause || idlePolicy.isPaused || reconnecting,
               sessionWindowFocused else { return }
-        if idlePolicy.activity(now: ProcessInfo.processInfo.systemUptime, focused: true) { resumeIdleTransmission() }
+        if idlePolicy.activity(now: SessionClock.now, focused: true) { resumeIdleTransmission() }
     }
 
     private func resumeIdleTransmission() {
@@ -1683,7 +1695,7 @@ final class DeskModel: ObservableObject {
     }
 
     private func scheduleHostRetry() {
-        guard hostingRequested else { return }
+        guard hostingRequested, !systemSleeping else { return }
         hostRetryTask?.cancel()
         let delay = hostBackoff.next()
         let token = generation
@@ -1697,15 +1709,65 @@ final class DeskModel: ObservableObject {
         }
     }
 
+    private func systemWillSleep() {
+        systemSleeping = true
+        reconnectTask?.cancel()
+        hostRetryTask?.cancel()
+        if mode == .host {
+            let resume = hostingRequested
+            if active || working { stop() }
+            hostingRequested = resume
+            if resume { status = "系统即将睡眠，唤醒后恢复共享" }
+        } else if target != nil, active || working || reconnecting {
+            let candidate = peer
+            clearSession()
+            candidate?.close("本机进入睡眠，等待唤醒后重新连接")
+            active = true
+            reconnecting = autoReconnect
+            freshFrameRequiredOnReconnect = true
+            status = "系统即将睡眠，连接已暂停"
+        }
+    }
+
+    private func systemDidWake() {
+        systemSleeping = false
+        refreshPermissions(checkScreenCapture: mode == .host, retryCapsLock: true)
+        if mode == .host, hostingRequested {
+            hostRetryTask?.cancel()
+            hostBackoff.reset()
+            if active || working {
+                stop()
+                hostingRequested = true
+            }
+            startHosting(interactive: false)
+        } else if let target, active || working || reconnecting {
+            reconnectTask?.cancel()
+            let candidate = peer
+            clearSession()
+            candidate?.close("系统唤醒，重新建立连接")
+            guard autoReconnect else {
+                stop()
+                status = "系统已唤醒，请重新连接"
+                return
+            }
+            retryBackoff.reset()
+            freshFrameRequiredOnReconnect = true
+            pauseTransmission.requireFreshFrame()
+            active = true
+            reconnecting = true
+            beginConnection(target)
+        }
+    }
+
     private func beginMetrics() {
-        lastMetrics = ProcessInfo.processInfo.systemUptime
+        lastMetrics = SessionClock.now
         metricsTimer?.invalidate()
         metricsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 if self.mode == .viewer,
                    (self.connected && self.supportsSessionPause || self.reconnecting && self.target != nil),
-                   self.idlePolicy.tick(now: ProcessInfo.processInfo.systemUptime) {
+                   self.idlePolicy.tick(now: SessionClock.now) {
                     self.restoreCanvasFocusAfterIdle = self.controlling
                     self.pauseTransmission.choose(paused: true)
                     self.sessionPauseStatus = "10 分钟无窗口操作，正在暂停画面与自动剪贴板…"
@@ -1719,15 +1781,15 @@ final class DeskModel: ObservableObject {
                         self.deferReconnectForIdle("10 分钟无窗口操作")
                     }
                 }
-                let seconds = max(0.01, ProcessInfo.processInfo.systemUptime - self.lastMetrics)
+                let seconds = max(0.01, SessionClock.now - self.lastMetrics)
                 let metrics = self.dataChannel?.takeMetrics() ?? (bytes: 0, frames: 0)
                 self.traffic = String(format: "%.2f Mbps", Double(metrics.bytes) * 8 / seconds / 1_000_000)
                 self.frameRate = String(format: "%.0f fps", Double(metrics.frames) / seconds)
-                if let measured = self.lastLatencyAt, ProcessInfo.processInfo.systemUptime - measured > 15 {
+                if let measured = self.lastLatencyAt, SessionClock.now - measured > 15 {
                     self.latency = "— ms"
                     self.roundTripMilliseconds = nil
                 }
-                self.lastMetrics = ProcessInfo.processInfo.systemUptime
+                self.lastMetrics = SessionClock.now
             }
         }
         if let metricsTimer { RunLoop.main.add(metricsTimer, forMode: .common) }
@@ -1827,7 +1889,7 @@ final class DeskModel: ObservableObject {
     func stop() {
         if peer != nil { DiagnosticLog.shared.record(.connectionClosed, role: diagnosticRole, state: .cancelled) }
         if mode == .host, active || working { DiagnosticLog.shared.record(.hostStopped, role: .host, state: .cancelled) }
-        idlePolicy = SessionIdlePolicy(now: ProcessInfo.processInfo.systemUptime)
+        idlePolicy = SessionIdlePolicy(now: SessionClock.now)
         pauseTransmission = SessionPauseTransmission()
         wakeInputGate = SessionWakeInputGate()
         reconnectDeferredForIdle = false
@@ -1867,6 +1929,7 @@ final class DeskModel: ObservableObject {
         displayRefreshTask?.cancel()
         hostPreparationTask?.cancel()
         if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
+        for observer in powerObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
         focusRefreshTask?.cancel()
         for observer in sessionFocusObservers { NotificationCenter.default.removeObserver(observer) }
         if let windowActivityMonitor { NSEvent.removeMonitor(windowActivityMonitor) }

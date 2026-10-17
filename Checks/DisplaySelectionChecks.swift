@@ -7,6 +7,48 @@ func runDisplaySelectionChecks() {
     let external = DisplaySnapshot(id: 2, pixelWidth: 3840, pixelHeight: 2160,
                                    bounds: CGRect(x: -1920, y: 0, width: 1920, height: 1080))
 
+    run("Retina native capture retains backing pixels instead of the logical desktop size") {
+        let source = DisplaySnapshot.capturePixelDimensions(contentSize: CGSize(width: 1512, height: 982),
+            pointPixelScale: 2, fallbackWidth: 1512, fallbackHeight: 982)
+        try check(source.width == 3024 && source.height == 1964, "Retina capture discarded three quarters of the source pixels")
+        let native = StreamSettings.highest.dimensions(width: source.width, height: source.height)
+        try check(native.0 == 3024 && native.1 == 1964, "Native quality still used the logical resolution")
+        let capped = StreamSettings().dimensions(width: source.width, height: source.height)
+        try check(capped.0 == 1920 && capped.1 == 1246, "Retina capture bypassed a capped quality selection")
+        let largerCap = StreamSettings(longestEdge: 3840).dimensions(width: source.width, height: source.height)
+        try check(largerCap.0 == source.width && largerCap.1 == source.height, "A larger quality preset upscaled Retina content")
+    }
+
+    run("Capture scaling supports standard, scaled, fractional and portrait displays") {
+        for (points, scale, width, height) in [
+            (CGSize(width: 1512, height: 982), CGFloat(1), 1512, 982),
+            (CGSize(width: 1800, height: 1169), CGFloat(2), 3600, 2338),
+            (CGSize(width: 1280, height: 800), CGFloat(1.5), 1920, 1200),
+            (CGSize(width: 982, height: 1512), CGFloat(2), 1964, 3024)
+        ] {
+            let source = DisplaySnapshot.capturePixelDimensions(contentSize: points,
+                pointPixelScale: scale, fallbackWidth: 1, fallbackHeight: 1)
+            try check(source.width == width && source.height == height, "Capture scale or orientation changed")
+        }
+    }
+
+    run("Unavailable capture geometry uses backing pixel fallback without trapping") {
+        for (points, scale) in [
+            (CGSize(width: 1512, height: 982), CGFloat(0)),
+            (CGSize(width: 1512, height: 982), CGFloat(-1)),
+            (CGSize(width: 1512, height: 982), CGFloat.nan),
+            (CGSize(width: 1512, height: 982), CGFloat.infinity),
+            (CGSize(width: 0, height: 982), CGFloat(2)),
+            (CGSize(width: -1512, height: 982), CGFloat(2)),
+            (CGSize(width: CGFloat.infinity, height: 982), CGFloat(2)),
+            (CGSize(width: CGFloat.greatestFiniteMagnitude, height: 982), CGFloat(2))
+        ] {
+            let source = DisplaySnapshot.capturePixelDimensions(contentSize: points,
+                pointPixelScale: scale, fallbackWidth: 3024, fallbackHeight: 1964)
+            try check(source.width == 3024 && source.height == 1964, "Invalid geometry bypassed the native fallback")
+        }
+    }
+
     run("Display recovery preserves the chosen display and falls back to the current main display") {
         try check(DisplaySelection.select(preferred: 2, main: 1, available: [main, external]) == external,
                   "An available user selection was overwritten")

@@ -10,6 +10,15 @@ public struct DisplaySnapshot: Equatable, Sendable {
         self.id = id; self.pixelWidth = pixelWidth; self.pixelHeight = pixelHeight; self.bounds = bounds
     }
 
+    public static func capturePixelDimensions(contentSize: CGSize, pointPixelScale: CGFloat,
+                                               fallbackWidth: Int, fallbackHeight: Int) -> (width: Int, height: Int) {
+        guard pointPixelScale.isFinite, pointPixelScale > 0,
+              let width = Int(exactly: (contentSize.width * pointPixelScale).rounded()),
+              let height = Int(exactly: (contentSize.height * pointPixelScale).rounded()),
+              width > 0, height > 0 else { return (fallbackWidth, fallbackHeight) }
+        return (width, height)
+    }
+
     fileprivate var isAvailable: Bool {
         id != 0 && pixelWidth > 0 && pixelHeight > 0
             && bounds.origin.x.isFinite && bounds.origin.y.isFinite

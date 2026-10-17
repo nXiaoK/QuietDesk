@@ -4,6 +4,16 @@ import QuietDeskCore
 
 // Capture state is confined to queue; callbacks are installed before start.
 final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    struct CapturePlan {
+        fileprivate let filter: SCContentFilter
+        fileprivate let displayID: CGDirectDisplayID
+        fileprivate let sourceWidth: Int
+        fileprivate let sourceHeight: Int
+        fileprivate let settings: StreamSettings
+        let width: Int
+        let height: Int
+    }
+
     let queue = DispatchQueue(label: "quietdesk.capture", qos: .userInteractive)
     var onFrame: ((VideoPacket) -> Void)?
     var onError: ((String) -> Void)?
@@ -15,6 +25,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var currentSettings = StreamSettings()
     private var outputWidth = 0
     private var outputHeight = 0
+    private var sourceWidth = 0
+    private var sourceHeight = 0
     private var latest: (CVPixelBuffer, CMTime)?
     private var lastCapture: (CVPixelBuffer, CMTime)?
     private var waiting: UInt32?
@@ -29,10 +41,36 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var watchdog: DispatchSourceTimer?
     private var sentAt = ProcessInfo.processInfo.systemUptime
 
+    static func displaySnapshot(_ id: CGDirectDisplayID) -> DisplaySnapshot {
+        let mode = CGDisplayCopyDisplayMode(id)
+        let rotated = Int((CGDisplayRotation(id) / 90).rounded()) % 2 != 0
+        let width = rotated ? mode?.pixelHeight : mode?.pixelWidth
+        let height = rotated ? mode?.pixelWidth : mode?.pixelHeight
+        return DisplaySnapshot(id: id, pixelWidth: width ?? CGDisplayPixelsWide(id),
+                               pixelHeight: height ?? CGDisplayPixelsHigh(id), bounds: CGDisplayBounds(id))
+    }
+
+    static func prepareCapture(display: SCDisplay, settings: StreamSettings) -> CapturePlan {
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let source = sourceDimensions(filter: filter, displayID: display.displayID)
+        let (width, height) = settings.dimensions(width: source.width, height: source.height)
+        return CapturePlan(filter: filter, displayID: display.displayID, sourceWidth: source.width,
+                           sourceHeight: source.height, settings: settings, width: width, height: height)
+    }
+
+    private static func sourceDimensions(filter: SCContentFilter, displayID: CGDirectDisplayID) -> (width: Int, height: Int) {
+        let fallback = displaySnapshot(displayID)
+        // SCK reports the desktop rectangle in points, including on Retina displays.
+        return DisplaySnapshot.capturePixelDimensions(contentSize: filter.contentRect.size,
+            pointPixelScale: CGFloat(filter.pointPixelScale), fallbackWidth: fallback.pixelWidth,
+            fallbackHeight: fallback.pixelHeight)
+    }
+
     private static func configuration(width: Int, height: Int, settings: StreamSettings) -> SCStreamConfiguration {
         let configuration = SCStreamConfiguration()
         configuration.width = width
         configuration.height = height
+        configuration.captureResolution = .best
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: Int32(settings.framesPerSecond))
         configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         configuration.queueDepth = 3
@@ -62,19 +100,22 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         return encoder
     }
 
-    func start(display: SCDisplay, width: Int, height: Int, settings: StreamSettings) async throws {
+    func start(_ capture: CapturePlan) async throws {
+        let width = capture.width, height = capture.height, settings = capture.settings
         let id = UUID()
         let encoder = try makeEncoder(width: width, height: height, settings: settings, id: id)
-        let stream = SCStream(filter: SCContentFilter(display: display, excludingWindows: []),
+        let stream = SCStream(filter: capture.filter,
             configuration: Self.configuration(width: width, height: height, settings: settings), delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         queue.sync {
             self.encoder = encoder
             encoderID = id
             self.stream = stream
-            displayID = display.displayID
+            displayID = capture.displayID
             outputWidth = width
             outputHeight = height
+            sourceWidth = capture.sourceWidth
+            sourceHeight = capture.sourceHeight
             currentSettings = settings
             running = true
             let watchdog = DispatchSource.makeTimerSource(queue: queue)
@@ -96,11 +137,11 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 
     func reconfigure(_ settings: StreamSettings) async throws -> VideoStreamState {
         try settings.validateControlValues()
-        let snapshot = try queue.sync { () throws -> (SCStream, CGDirectDisplayID, Int, Int, StreamSettings) in
-            guard running, captureStarted, let stream, let displayID else { throw DeskError.invalid("屏幕采集尚未就绪，请稍后调整") }
-            return (stream, displayID, outputWidth, outputHeight, currentSettings)
+        let snapshot = try queue.sync { () throws -> (SCStream, Int, Int, Int, Int, StreamSettings) in
+            guard running, captureStarted, let stream, displayID != nil else { throw DeskError.invalid("屏幕采集尚未就绪，请稍后调整") }
+            return (stream, sourceWidth, sourceHeight, outputWidth, outputHeight, currentSettings)
         }
-        let (width, height) = settings.dimensions(width: CGDisplayPixelsWide(snapshot.1), height: CGDisplayPixelsHigh(snapshot.1))
+        let (width, height) = settings.dimensions(width: snapshot.1, height: snapshot.2)
         let id = UUID()
         let replacement = try makeEncoder(width: width, height: height, settings: settings, id: id)
         do { try await pauseAtFrameBoundary() }
@@ -128,7 +169,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             replacement.stop()
             if queue.sync(execute: { running && stream === snapshot.0 }) {
                 do {
-                    try await snapshot.0.updateConfiguration(Self.configuration(width: snapshot.2, height: snapshot.3, settings: snapshot.4))
+                    try await snapshot.0.updateConfiguration(Self.configuration(width: snapshot.3, height: snapshot.4, settings: snapshot.5))
                     queue.sync {
                         guard running, stream === snapshot.0 else { return }
                         forceKeyFrame = true

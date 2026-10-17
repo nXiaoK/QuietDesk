@@ -415,8 +415,7 @@ final class DeskModel: ObservableObject {
     }
 
     private func displaySnapshot(_ id: CGDirectDisplayID) -> DisplaySnapshot {
-        DisplaySnapshot(id: id, pixelWidth: CGDisplayPixelsWide(id), pixelHeight: CGDisplayPixelsHigh(id),
-                        bounds: CGDisplayBounds(id))
+        ScreenStreamer.displaySnapshot(id)
     }
 
     private func refreshDisplays() {
@@ -537,7 +536,8 @@ final class DeskModel: ObservableObject {
                         let (display, snapshot) = try self.selectShareableDisplay(content.displays)
                         let preferredSettings = self.settings
                         let settings = preferredSettings.legacyCompatible
-                        let (width, height) = settings.dimensions(width: snapshot.pixelWidth, height: snapshot.pixelHeight)
+                        let capture = ScreenStreamer.prepareCapture(display: display, settings: settings)
+                        let (width, height) = (capture.width, capture.height)
                         self.capturedDisplay = snapshot
                         self.connected = true
                         self.canControl = AXIsProcessTrusted()
@@ -572,7 +572,7 @@ final class DeskModel: ObservableObject {
                                 self.stop()
                             }
                         }
-                        try await streamer.start(display: display, width: width, height: height, settings: settings)
+                        try await streamer.start(capture)
                         guard self.generation == token, self.active, self.peer === candidate, !Task.isCancelled else {
                             await streamer.stop()
                             return

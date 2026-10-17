@@ -80,12 +80,19 @@ final class RemoteCanvas: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         videoLayer.frame = bounds
+        videoLayer.contentsScale = window?.backingScaleFactor ?? 1
         CATransaction.commit()
         showLatestFrame()
     }
 
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        needsLayout = true
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        needsLayout = true
         if systemShortcutMonitor.isRunning { releaseControl() }
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
         observers.removeAll()

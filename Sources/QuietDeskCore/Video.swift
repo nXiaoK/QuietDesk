@@ -32,8 +32,11 @@ public final class VideoEncoder {
             try set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel)
             try set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: settings.framesPerSecond))
             try set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: settings.megabits * 1_000_000))
-            try set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: settings.framesPerSecond * 4))
-            try set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: 4))
+            // TCP delivers every frame, and start, resume and setting changes force keyframes, so periodic ones only add
+            // bursts. Zero would let VideoToolbox pick about two seconds; an hour is effectively none. Keep the old
+            // four seconds if an encoder rejects the long interval.
+            do { try setKeyFrameInterval(seconds: 3_600, framesPerSecond: settings.framesPerSecond) }
+            catch { try setKeyFrameInterval(seconds: 4, framesPerSecond: settings.framesPerSecond) }
             // A one-second window allows codec bursts; this is not a per-packet bandwidth ceiling.
             try set(kVTCompressionPropertyKey_DataRateLimits,
                     [NSNumber(value: settings.megabits * 1_000_000 / 8), NSNumber(value: 1)] as CFArray)
@@ -59,6 +62,11 @@ public final class VideoEncoder {
         guard let session else { return }
         let result = VTSessionSetProperty(session, key: key, value: value)
         guard result == noErr else { throw DeskError.system("设置视频参数失败：\(key)", result) }
+    }
+
+    private func setKeyFrameInterval(seconds: Int, framesPerSecond: Int) throws {
+        try set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: framesPerSecond * seconds))
+        try set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: seconds))
     }
 
     public func encode(_ buffer: CVPixelBuffer, time: CMTime, sequence: UInt32, forceKeyFrame: Bool = false) throws {

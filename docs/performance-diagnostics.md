@@ -32,8 +32,8 @@ python3 scripts/analyze-performance.py viewer.jsonl host.jsonl --output report.m
 
 | 指标 | 测量边界 |
 |---|---|
-| sendQueue | 调用发送到 Peer 串行队列实际处理的等待。 |
-| sendCompletion | 提交给 Network.framework 到 contentProcessed 回调；不等于对端收到，也不等于网络交付。 |
+| sendQueue | 调用发送到该消息开始提交给 Network.framework 的等待；build 16 起包括排在匀速发送视频之后的等待。 |
+| sendCompletion | 首段提交给 Network.framework 到最后一段 contentProcessed 回调；匀速发送的视频包含分段间隔。不等于对端收到，也不等于网络交付。 |
 | receiveHeaderWait | 请求下一个 4 字节消息头到完整读到消息头；不带消息类型或帧号，包含静止等待、帧间隔和调度，不能直接当作网络时延。 |
 | receiveBody | 已读完消息长度后，到消息体读取、解析完成；不包含等待下一帧头的空闲，但包含传输、对端生产及本端调度。 |
 | messageHandler | 协议消息交给处理器，到处理器允许继续接收的时间。 |
@@ -41,7 +41,7 @@ python3 scripts/analyze-performance.py viewer.jsonl host.jsonl --output report.m
 | tcpSmoothedRTT / tcpMinimumRTT / tcpRTTVariance | Network.framework 传输报告提供的 TCP 平滑 RTT、最小 RTT 和 RTT 变化估计；按 Swift `TimeInterval` 换算为微秒保存。系统底层 RTT 读数可能只有毫秒精度，零也可能低于该精度；RTT 变化估计不解释为统计学上的方差平方单位。 |
 | tcpRetransmittedBytes / tcpOutOfOrderBytes | 每次系统传输报告区间内的 TCP 重传发送字节数及接收乱序字节数；不是丢包数量、累计全会话值或速率。无报告不代表零重传。 |
 | tcpSentBytes / tcpReceivedBytes / tcpReportDuration | 同一系统传输报告内发送、接收的传输层字节数，以及实际报告区间时长（微秒）；用于结合流量观察重传，字节数不等同于应用视频载荷。 |
-| pendingSendBytes | 采样时尚未收到 contentProcessed 回调的发送字节数；不是 TCP 内核队列的直接读数。 |
+| pendingSendBytes | 采样时尚未收到 contentProcessed 回调的发送字节数，包括等待匀速提交的视频；不是 TCP 内核队列的直接读数。 |
 | captureAge | 采集回调保存最新画面，到选择该画面编码的等待；不含 ScreenCaptureKit 内部采集/交付耗时，也不统计暂停或重配时有意重放旧画面的等待。 |
 | encode | 提交编码到应用收到编码结果的时间，包含 VideoToolbox 工作及输出回调中的 AVCC 数据准备，不是纯硬件编码耗时。 |
 | encodeCallbackQueue | VideoToolbox 输出回调到采集队列实际处理结果的等待。 |

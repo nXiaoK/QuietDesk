@@ -705,6 +705,7 @@ final class DeskModel: ObservableObject {
                             deviceIdentityExchange: host.deviceIdentityAdvertised ? true : nil,
                             highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings,
                             sessionEffects: true, sessionPause: true)))
+                        candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         let streamer = ScreenStreamer(diagnostics: diagnostics)
                         host.streamer = streamer
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
@@ -1577,6 +1578,7 @@ final class DeskModel: ObservableObject {
                 self.recordVideoConfiguration(updated)
                 self.resolution = "\(updated.width) × \(updated.height)"
                 self.videoSettingsStatus = "控制端已调整：\(updated.settings.summary)"
+                peer.setVideoPacing(VideoSendPacing(megabits: updated.settings.megabits))
                 peer.send(try Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: updated)))
                 streamer.resumeAfterReconfiguration()
             } catch {

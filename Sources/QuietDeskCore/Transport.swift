@@ -72,9 +72,26 @@ public final class Peer {
     private var diagnosticsObserver: UUID?
     private var transportReport: (pending: NWConnection.PendingDataTransferReport, token: PerformanceDiagnostics.Token)?
     private var collectingTransportReport: (id: UUID, token: PerformanceDiagnostics.Token)?
+    private var outgoing: [OutgoingMessage] = []
+    private var videoPacer: VideoSendPacer?
+    private var pacingTimer: DispatchSourceTimer?
+    private var pacingScheduled = false
     private final class ReadBuffer {
         var data = Data()
         init(capacity: Int) { data.reserveCapacity(capacity) }
+    }
+    private final class OutgoingMessage {
+        let data: Data
+        let kind: MessageKind
+        let identifier: UInt64?
+        let queuedAt: PerformanceDiagnostics.Token?
+        let completion: ((Bool) -> Void)?
+        var offset = 0
+        var submittedAt: PerformanceDiagnostics.Token?
+        init(data: Data, kind: MessageKind, identifier: UInt64?, queuedAt: PerformanceDiagnostics.Token?, completion: ((Bool) -> Void)?) {
+            self.data = data; self.kind = kind; self.identifier = identifier
+            self.queuedAt = queuedAt; self.completion = completion
+        }
     }
 
     public init(connection: NWConnection, idleTimeout: TimeInterval = 30, handshakeTimeout: TimeInterval = 15, heartbeatInterval: TimeInterval = 5, diagnostics: PerformanceDiagnostics? = nil) {
@@ -196,7 +213,6 @@ public final class Peer {
         queue.async { [self] in
             guard ready, !closed else { completion?(false); return }
             let identifier = diagnosticIdentifier(for: message)
-            diagnostics?.record(.sendQueue, since: queuedAt, kind: kind, identifier: identifier)
             do {
                 let data = try message.framed()
                 guard pendingBytes + data.count <= Wire.maximumMessageBytes * 2 else {
@@ -206,24 +222,83 @@ public final class Peer {
                 }
                 pendingBytes += data.count
                 diagnostics?.recordValue(.pendingSendBytes, pendingBytes, kind: kind, identifier: identifier)
-                let meter = trafficMeter
-                let submittedAt = diagnostics?.start()
-                connection.send(content: data, completion: .contentProcessed { [weak self] error in
-                    if let self, !self.closed {
-                        self.diagnostics?.record(.sendCompletion, since: submittedAt, kind: kind, identifier: identifier)
-                    }
-                    if error == nil { meter.record(sentBytes: UInt64(data.count)) }
-                    guard let self else { completion?(false); return }
-                    self.pendingBytes -= data.count
-                    if let error { self.finish("发送失败：\(error.localizedDescription)") }
-                    self.onTraffic?(data.count)
-                    completion?(error == nil && !self.closed)
-                })
+                outgoing.append(OutgoingMessage(data: data, kind: kind, identifier: identifier, queuedAt: queuedAt, completion: completion))
+                submitOutgoing()
             } catch {
                 finish(error.localizedDescription)
                 completion?(false)
             }
         }
+    }
+
+    // Applies to video messages not yet fully submitted; nil submits them at once as before.
+    public func setVideoPacing(_ pacing: VideoSendPacing?) {
+        queue.async { [self] in
+            guard !closed, videoPacer?.pacing != pacing else { return }
+            videoPacer = pacing.map { VideoSendPacer($0, now: SessionClock.now) }
+            submitOutgoing()
+        }
+    }
+
+    // Messages keep their order; only video bytes wait for pacing credit.
+    private func submitOutgoing() {
+        while !closed, let message = outgoing.first {
+            var count = message.data.count - message.offset
+            if message.kind == .video, var pacer = videoPacer {
+                let step = pacer.next(remaining: count, now: SessionClock.now)
+                videoPacer = pacer
+                guard step.bytes > 0 else { schedulePacing(after: step.delay); return }
+                count = step.bytes
+            }
+            if message.offset == 0 {
+                diagnostics?.record(.sendQueue, since: message.queuedAt, kind: message.kind, identifier: message.identifier)
+                message.submittedAt = diagnostics?.start()
+            }
+            let range = message.offset..<(message.offset + count)
+            message.offset = range.upperBound
+            let last = message.offset == message.data.count
+            if last { outgoing.removeFirst() }
+            submit(message, range: range, last: last)
+        }
+    }
+
+    private func submit(_ message: OutgoingMessage, range: Range<Int>, last: Bool) {
+        let content = range.count == message.data.count ? message.data : message.data.subdata(in: range)
+        let meter = trafficMeter
+        connection.send(content: content, completion: .contentProcessed { [weak self] error in
+            if last {
+                if let self, !self.closed {
+                    self.diagnostics?.record(.sendCompletion, since: message.submittedAt, kind: message.kind, identifier: message.identifier)
+                }
+                if error == nil { meter.record(sentBytes: UInt64(message.data.count)) }
+            }
+            guard let self else { if last { message.completion?(false) }; return }
+            self.pendingBytes -= range.count
+            if let error { self.finish("发送失败：\(error.localizedDescription)") }
+            if last {
+                self.onTraffic?(message.data.count)
+                message.completion?(error == nil && !self.closed)
+            }
+        })
+    }
+
+    private func schedulePacing(after delay: TimeInterval) {
+        guard !pacingScheduled else { return }
+        pacingScheduled = true
+        if let pacingTimer {
+            pacingTimer.schedule(deadline: .now() + delay, leeway: .microseconds(200))
+            return
+        }
+        // Strict timing keeps background timer coalescing from throttling a paced frame.
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.pacingScheduled = false
+            self.submitOutgoing()
+        }
+        timer.schedule(deadline: .now() + delay, leeway: .microseconds(200))
+        pacingTimer = timer
+        timer.resume()
     }
 
     public func close(_ reason: String = "已断开连接", retryable: Bool = false) {
@@ -236,6 +311,12 @@ public final class Peer {
         closeIsRetryable = retryable
         timer?.cancel()
         timer = nil
+        pacingTimer?.cancel()
+        pacingTimer = nil
+        pacingScheduled = false
+        videoPacer = nil
+        let unsent = outgoing
+        outgoing.removeAll()
         roundTripDiagnostic = nil
         transportReport = nil
         collectingTransportReport = nil
@@ -249,6 +330,8 @@ public final class Peer {
         onClose = nil
         onTraffic = nil
         onRoundTripMilliseconds = nil
+        // Messages still waiting for pacing never reached Network.framework.
+        for message in unsent { message.completion?(false) }
     }
 
     private func receiveHeader() {
@@ -351,6 +434,8 @@ public final class Peer {
     deinit {
         if let diagnosticsObserver { diagnostics?.removeEnableObserver(diagnosticsObserver) }
         timer?.cancel()
+        pacingTimer?.cancel()
         connection.cancel()
+        for message in outgoing { message.completion?(false) }
     }
 }

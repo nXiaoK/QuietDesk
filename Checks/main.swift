@@ -332,6 +332,7 @@ if !CommandLine.arguments.contains("--skip-network") {
 
 runTransportChecks()
 runInteractiveTransportChecks()
+runVideoPacingChecks()
 runPerformanceDiagnosticsChecks()
 runTransportDiagnosticsChecks()
 runProtocolFuzzChecks()

@@ -330,6 +330,7 @@ if !CommandLine.arguments.contains("--skip-network") {
     }
 }
 
+runTransportChecks()
 runReliabilityChecks()
 runLiveSettingsChecks()
 runFileApprovalChecks()

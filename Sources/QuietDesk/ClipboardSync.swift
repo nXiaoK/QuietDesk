@@ -7,6 +7,7 @@ protocol ClipboardPasteboard: AnyObject {
     var changeCount: Int { get }
     var fileURLs: [URL]? { get }
     var pngData: Data? { get }
+    var tiffData: Data? { get }
     var text: String? { get }
     var contentMarker: String? { get }
     /// 内容由 macOS 通用剪贴板（接力/Handoff）等跨设备机制写入，而不是本机用户复制。
@@ -16,6 +17,7 @@ protocol ClipboardPasteboard: AnyObject {
 
 extension ClipboardPasteboard {
     var isRelayedFromOtherDevice: Bool { false }
+    var tiffData: Data? { nil }
 }
 
 @MainActor
@@ -24,11 +26,8 @@ private final class SystemClipboardPasteboard: ClipboardPasteboard {
     private static let marker = NSPasteboard.PasteboardType("local.quietdesk.clipboard-session")
     var changeCount: Int { pasteboard.changeCount }
     var fileURLs: [URL]? { pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] }
-    var pngData: Data? {
-        if let png = pasteboard.data(forType: .png) { return png }
-        guard let tiff = pasteboard.data(forType: .tiff), let bitmap = NSBitmapImageRep(data: tiff) else { return nil }
-        return bitmap.representation(using: .png, properties: [:])
-    }
+    var pngData: Data? { pasteboard.data(forType: .png) }
+    var tiffData: Data? { pasteboard.data(forType: .tiff) }
     var text: String? { pasteboard.string(forType: .string) }
     var contentMarker: String? { pasteboard.string(forType: Self.marker) }
     // Universal Clipboard 写入的条目带有该类型；QuietDesk 不应把它当成本机新复制再转发给对端。
@@ -101,6 +100,9 @@ final class ClipboardSync {
     private var staleFileChange: Int?
     private var sharedChange: Int?
     private var sendingChange: Int?
+    private var imagePreparation: UUID?
+    private let imageQueue = DispatchQueue(label: "quietdesk.clipboard.images", qos: .utility)
+    private let convertTIFF: (Data) -> Data?
     private var waiters: [(Bool) -> Void] = []
     private var running = true
     private var hasSharedState = false
@@ -109,10 +111,14 @@ final class ClipboardSync {
 
     init(session: UUID, allowsFileSending: Bool, allowsAutomaticSending: Bool = true,
          pasteboard: ClipboardPasteboard? = nil, storage: URL? = nil,
+         convertTIFF: @escaping (Data) -> Data? = { data in
+             autoreleasepool { NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) }
+         },
          send: @escaping (Message) -> Void) {
         self.session = session
         self.allowsFileSending = allowsFileSending
         self.allowsAutomaticSending = allowsAutomaticSending
+        self.convertTIFF = convertTIFF
         let pasteboard = pasteboard ?? SystemClipboardPasteboard()
         self.pasteboard = pasteboard
         observedChange = pasteboard.changeCount
@@ -133,6 +139,10 @@ final class ClipboardSync {
         transfer.onFileOffer = { [weak self] offer in
             DispatchQueue.main.async {
                 guard let self, self.running, let offer else { return }
+                if self.imagePreparation != nil {
+                    self.imagePreparation = nil
+                    self.sendingChange = nil
+                }
                 let change = self.pasteboard.changeCount
                 self.pendingFileOffer = (offer.id, change)
                 self.deferredLocalChange = change
@@ -170,6 +180,12 @@ final class ClipboardSync {
 
     func setAutomaticSendingAllowed(_ allowed: Bool) {
         allowsAutomaticSending = allowed
+        if !allowed, imagePreparation != nil {
+            imagePreparation = nil
+            sendingChange = nil
+            observedChange = Int.min
+            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+        }
         if allowed { poll() }
     }
 
@@ -206,6 +222,7 @@ final class ClipboardSync {
 
     func stop() {
         running = false
+        imagePreparation = nil
         timer?.invalidate(); timer = nil
         transfer.stop()
         let callbacks = waiters; waiters.removeAll()
@@ -223,13 +240,60 @@ final class ClipboardSync {
         guard running, allowsAutomaticSending else { return }
         let change = pasteboard.changeCount
         observedChange = change
+        imagePreparation = nil
         let payload: ClipboardPayload
         if let files = pasteboard.fileURLs, !files.isEmpty {
             payload = .files(files)
         } else if let png = pasteboard.pngData { payload = .png(png) }
+        else if let tiff = pasteboard.tiffData {
+            guard UInt64(tiff.count) <= ClipboardAutomaticLimits.imageBytes else {
+                onStatus?("图片超过 64 MiB，未自动同步，请保存为文件后复制")
+                let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+                return
+            }
+            let token = UUID()
+            imagePreparation = token
+            sendingChange = change
+            let convert = convertTIFF
+            imageQueue.async { [weak self] in
+                let png = convert(tiff)
+                DispatchQueue.main.async {
+                    guard let self, self.running, self.imagePreparation == token else { return }
+                    self.imagePreparation = nil
+                    self.sendingChange = nil
+                    guard self.allowsAutomaticSending, self.pasteboard.changeCount == change else {
+                        let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
+                        self.poll()
+                        return
+                    }
+                    guard let png else {
+                        self.onStatus?("剪贴板图片无法转换为 PNG")
+                        let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
+                        return
+                    }
+                    self.sendPrepared(.png(png), change: change)
+                }
+            }
+            return
+        }
         else if let text = pasteboard.text { payload = .text(Data(text.utf8)) }
         else {
             onStatus?("此剪贴板类型暂不能同步")
+            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+            return
+        }
+        sendPrepared(payload, change: change)
+    }
+
+    private func sendPrepared(_ payload: ClipboardPayload, change: Int) {
+        do {
+            switch payload {
+            case .text(let bytes): try ClipboardAutomaticLimits.validate(type: "text", bytes: UInt64(bytes.count))
+            case .png(let bytes): try ClipboardAutomaticLimits.validate(type: "png", bytes: UInt64(bytes.count))
+            case .files: break
+            }
+        } catch {
+            onStatus?(error.localizedDescription)
             let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
             return
         }
@@ -306,6 +370,7 @@ final class ClipboardSync {
             return false
         }
         observedChange = pasteboard.changeCount
+        imagePreparation = nil
         deferredLocalChange = nil
         staleFileChange = nil
         sharedChange = observedChange

@@ -24,6 +24,22 @@ private func eventually(_ message: String, _ condition: () -> Bool) throws {
     try require(condition(), message)
 }
 
+private final class ImageConversionProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var background = false
+    private var began = false
+    let release = DispatchSemaphore(value: 0)
+    var state: (began: Bool, background: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        return (began, background)
+    }
+    func convert(_ data: Data) -> Data? {
+        lock.lock(); began = true; background = !Thread.isMainThread; lock.unlock()
+        _ = release.wait(timeout: .now() + 5)
+        return data
+    }
+}
+
 @MainActor
 private final class MemoryPasteboard: ClipboardPasteboard {
     private(set) var changeCount = 0
@@ -33,6 +49,8 @@ private final class MemoryPasteboard: ClipboardPasteboard {
     private var marker: String?
     var rejectsWrites = false
     var isRelayedFromOtherDevice = false
+    var rawTIFF: Data?
+    var tiffData: Data? { reads += 1; return rawTIFF }
 
     var fileURLs: [URL]? {
         reads += 1
@@ -52,7 +70,7 @@ private final class MemoryPasteboard: ClipboardPasteboard {
     var contentMarker: String? { reads += 1; return marker }
 
     func copy(_ payload: ClipboardPayload) {
-        self.payload = payload; marker = nil; changeCount += 1
+        self.payload = payload; rawTIFF = nil; marker = nil; changeCount += 1
     }
 
     func republish() { marker = nil; changeCount += 1 }
@@ -638,6 +656,53 @@ private struct ClipboardFocusChecks {
             for privateValue in [secret, "another private value", file.lastPathComponent, dormant.lastPathComponent, folder.path] {
                 try require(!description.contains(privateValue), "Diagnostic event exposed clipboard content or a file path")
             }
+        }
+
+        run("Automatic clipboard size limits reject oversized local and remote payloads before transfer") { folder in
+            for (type, limit) in [("text", ClipboardAutomaticLimits.textBytes), ("png", ClipboardAutomaticLimits.imageBytes)] {
+                try ClipboardAutomaticLimits.validate(type: type, bytes: limit)
+                do {
+                    try ClipboardAutomaticLimits.validate(type: type, bytes: limit + 1)
+                    throw FocusCheckFailure("Accepted oversized \(type)")
+                } catch is DeskError { }
+                let pasteboard = MemoryPasteboard()
+                var messages: [MessageKind] = []
+                let sync = ClipboardSync(session: UUID(), allowsFileSending: true, pasteboard: pasteboard,
+                    storage: folder.appendingPathComponent(type)) { messages.append($0.kind) }
+                defer { sync.stop() }
+                let begin = "{\"revision\":{\"counter\":1,\"origin\":\"\(UUID().uuidString)\"},\"sequence\":0,\"type\":\"\(type)\",\"count\":1,\"bytes\":\(limit + 1)}"
+                sync.receive(Message(.clipboardBegin, Data(begin.utf8)))
+                try eventually("Oversized remote payload was not refused") { messages.contains(.clipboardCancel) }
+                try require(!messages.contains(.clipboardReceipt) && pasteboard.writes == 0,
+                            "Oversized remote payload was accepted or applied")
+                try require(!FileManager.default.fileExists(atPath: folder.appendingPathComponent(type + "/partial").path),
+                            "Oversized payload created a partial directory")
+            }
+            let pair = ClipboardPair(storage: folder.appendingPathComponent("local"), localAllowed: true)
+            defer { pair.stop() }
+            pair.local.copy(.text(Data(repeating: 65, count: Int(ClipboardAutomaticLimits.textBytes) + 1)))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            pump(for: 0.1)
+            try require(!pair.localMessages.contains(.clipboardBegin), "Oversized local text began transferring")
+        }
+
+        run("TIFF conversion runs off the main thread and a newer copy cancels its prepared image") { folder in
+            let pasteboard = MemoryPasteboard(), probe = ImageConversionProbe()
+            var messages: [MessageKind] = []
+            let sync = ClipboardSync(session: UUID(), allowsFileSending: true, pasteboard: pasteboard, storage: folder,
+                                     convertTIFF: { probe.convert($0) }) { messages.append($0.kind) }
+            defer { probe.release.signal(); sync.stop() }
+            pasteboard.copy(.text(Data("fallback".utf8)))
+            pasteboard.rawTIFF = Data([1, 2, 3])
+            sync.setAutomaticSendingAllowed(true)
+            try eventually("TIFF conversion never started") { probe.state.began }
+            try require(probe.state.background && messages.isEmpty, "TIFF conversion blocked the main thread or sent early")
+            pasteboard.copy(.text(Data("newer text".utf8)))
+            sync.setAutomaticSendingAllowed(true)
+            try eventually("Newer text was not offered") { messages.contains(.clipboardBegin) }
+            probe.release.signal()
+            pump(for: 0.15)
+            try require(messages.filter { $0 == .clipboardBegin }.count == 1, "Stale image superseded a newer copy")
         }
 
         run("Focus preference is optional, round-trips both states and rejects non-boolean input") { _ in

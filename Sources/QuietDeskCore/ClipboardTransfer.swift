@@ -5,6 +5,16 @@ public enum ClipboardPayload {
     case text(Data), png(Data), files([URL])
 }
 
+public enum ClipboardAutomaticLimits {
+    public static let textBytes: UInt64 = 16 * 1_024 * 1_024
+    public static let imageBytes: UInt64 = 64 * 1_024 * 1_024
+
+    public static func validate(type: String, bytes: UInt64) throws {
+        if type == "text", bytes > textBytes { throw DeskError.invalid("文字超过 16 MiB，未自动同步，请保存为文件后复制") }
+        if type == "png", bytes > imageBytes { throw DeskError.invalid("图片超过 64 MiB，未自动同步，请保存为文件后复制") }
+    }
+}
+
 public struct ClipboardRevision: Codable, Equatable, Comparable {
     public let counter: UInt64
     public let origin: UUID
@@ -275,6 +285,7 @@ public final class ClipboardTransfer {
         case .text(let data), .png(let data):
             let type: String
             if case .text = payload { type = "text" } else { type = "png" }
+            try ClipboardAutomaticLimits.validate(type: type, bytes: UInt64(data.count))
             return (type, [Part(path: "content", directory: false, size: UInt64(data.count), mode: 0o600,
                                 modified: Date(), url: nil, data: data)])
         case .files(let urls):
@@ -395,6 +406,12 @@ public final class ClipboardTransfer {
               value.names == nil || (value.names!.count <= 3 && value.names!.allSatisfy { $0.utf8.count <= 256 }),
               value.rootCount == nil || (value.rootCount! > 0 && value.rootCount! <= value.count) else {
             throw DeskError.invalid("剪贴板传输信息无效")
+        }
+        do { try ClipboardAutomaticLimits.validate(type: value.type, bytes: value.bytes) }
+        catch {
+            sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: 0, reason: error.localizedDescription))
+            onStatus?(error.localizedDescription)
+            return
         }
         newest = value.revision
         cancelOutgoing("对端有更新的剪贴板内容")

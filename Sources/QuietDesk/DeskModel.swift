@@ -217,7 +217,10 @@ final class DeskModel: ObservableObject {
                 self.error = error.localizedDescription
             }
         }
-        canvas.onRelease = { [weak self] in self?.peer?.send(Message(.releaseInput)) }
+        canvas.onRelease = { [weak self] in
+            guard let self, self.connected else { return }
+            self.peer?.send(Message(.releaseInput))
+        }
         canvas.onFocus = { [weak self] focused in
             guard let self else { return }
             self.controlling = focused
@@ -778,7 +781,10 @@ final class DeskModel: ObservableObject {
             DispatchQueue.main.async {
                 defer { resume() }
                 guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
-                guard self.connected else { candidate.close("屏幕共享尚未就绪", retryable: true); return }
+                guard self.connected else {
+                    if message.kind != .releaseInput { candidate.close("屏幕共享尚未就绪", retryable: true) }
+                    return
+                }
                 do { try self.handleHost(message, peer: candidate) }
                 catch {
                     self.recordDiagnosticFailure(.connectionFailed, error: error)

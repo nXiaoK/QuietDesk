@@ -811,6 +811,7 @@ final class DeskModel: ObservableObject {
 
     func connect() {
         guard !active, !working else { return }
+        remoteName = ""
         connectionError = nil
         do {
             let address = address.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1983,6 +1984,7 @@ final class DeskModel: ObservableObject {
         controlStatusUpdatesEnabled = false
         capsLockRunning = false
         capsLockStartAttempted = false
+        resolution = ""
         latency = "— ms"
         roundTripMilliseconds = nil
         viewerQualityPolicy.discardUnfinishedSample()
@@ -2049,6 +2051,7 @@ final class DeskModel: ObservableObject {
         traffic = "0.00 Mbps"
         frameRate = "0 fps"
         resolution = ""
+        remoteName = ""
         clipboardStatus = ""
         inputStatus = ""
         status = mode == .host ? "共享已停止" : "已断开连接"

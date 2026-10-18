@@ -12,6 +12,10 @@ struct VideoFrameFlow {
     private var encodingStartedAt: TimeInterval?
     private var encodingKeyFrame = false
     private var consecutiveDrops = 0
+    private(set) var mediaHold = false
+    private(set) var mediaRecoveryFrameEncoded = false
+    private var mediaRecoveryRequested = false
+    private var mediaRecoveryIssued = false
 
     init(sequence: UInt32 = 0) { self.sequence = sequence }
 
@@ -19,12 +23,14 @@ struct VideoFrameFlow {
 
     mutating func begin(at now: TimeInterval) -> (sequence: UInt32, forceKeyFrame: Bool)? {
         // The encoding reservation also consumes a credit; there is no unbounded encoder queue.
-        guard encoding == nil, waiting.count < Self.maximumOutstandingFrames else { return nil }
+        guard encoding == nil, waiting.count < Self.maximumOutstandingFrames,
+              !mediaHold || mediaRecoveryRequested else { return nil }
         repeat { sequence &+= 1 } while waiting[sequence] != nil
         encoding = sequence
         encodingStartedAt = now
         encodingKeyFrame = forceKeyFrame
         forceKeyFrame = false
+        if mediaHold { mediaRecoveryRequested = false }
         return (sequence, encodingKeyFrame)
     }
 
@@ -34,6 +40,7 @@ struct VideoFrameFlow {
         encodingStartedAt = nil
         consecutiveDrops = 0
         waiting[number] = now
+        if mediaHold { mediaRecoveryFrameEncoded = true }
         return true
     }
 
@@ -43,12 +50,40 @@ struct VideoFrameFlow {
         encodingStartedAt = nil
         consecutiveDrops = min(consecutiveDrops + 1, 3)
         forceKeyFrame = forceKeyFrame || encodingKeyFrame || consecutiveDrops >= 3
+        if mediaHold { mediaRecoveryRequested = true }
         return true
     }
 
     mutating func acknowledge(_ number: UInt32) -> Bool { waiting.removeValue(forKey: number) != nil }
     mutating func requestKeyFrame() { forceKeyFrame = true }
     mutating func cancelEncoding() { encoding = nil; encodingStartedAt = nil }
+
+    mutating func prepareMediaRecovery() {
+        encoding = nil
+        encodingStartedAt = nil
+        waiting.removeAll()
+        forceKeyFrame = true
+        consecutiveDrops = 0
+        mediaHold = true
+        mediaRecoveryRequested = false
+        mediaRecoveryIssued = false
+        mediaRecoveryFrameEncoded = false
+    }
+
+    mutating func requestMediaRecoveryFrame() {
+        guard mediaHold, !mediaRecoveryIssued else { return }
+        mediaRecoveryIssued = true
+        mediaRecoveryRequested = true
+    }
+
+    @discardableResult
+    mutating func resumeMediaFrames() -> Bool {
+        guard mediaHold, mediaRecoveryFrameEncoded else { return false }
+        mediaHold = false
+        mediaRecoveryRequested = false
+        mediaRecoveryIssued = false
+        return true
+    }
 
     func stalled(at now: TimeInterval) -> String? {
         if let encodingStartedAt, now - encodingStartedAt > 90 { return "视频编码超过 90 秒无输出" }
@@ -99,6 +134,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var sessionPaused = false
     private var idleWaiter: (UUID, CheckedContinuation<Void, Error>)?
     private var watchdog: DispatchSourceTimer?
+    private let encoderCleanupQueue = DispatchQueue(label: "quietdesk.capture.encoder-cleanup", qos: .userInitiated)
 
     init(diagnostics: PerformanceDiagnostics? = nil) {
         self.diagnostics = diagnostics
@@ -161,6 +197,14 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 guard self.running, self.encoderID == id else { return }
                 switch result {
                 case .success(let packet):
+                    if self.frameFlow.mediaHold {
+                        guard !packet.sps.isEmpty, !packet.pps.isEmpty,
+                              (try? MediaFrame.containsIDR(packet.avcc)) == true else {
+                            self.frameFlow.cancelEncoding()
+                            self.reportError(DeskError.invalid("媒体恢复未产生独立 IDR 帧"))
+                            return
+                        }
+                    }
                     guard self.frameFlow.encoded(packet.sequence, at: SessionClock.now) else { return }
                     self.diagnostics?.record(.encodeCallbackQueue, since: encodedAt, kind: .video, identifier: UInt64(packet.sequence))
                     if let encodedAt { self.acknowledgements[packet.sequence] = encodedAt }
@@ -391,6 +435,58 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         queue.async { [weak self] in
             guard let self, self.running else { return }
             self.reconfiguring = false
+            self.pump()
+        }
+    }
+
+    // Completion runs on the capture queue. A new encoder fences outputs still arriving from the old epoch.
+    func prepareMediaRecovery(completion: @escaping (Bool) -> Void) {
+        queue.async { [weak self] in
+            guard let self, self.running, self.captureStarted, !self.reconfiguring, !self.sessionPaused else {
+                completion(false)
+                return
+            }
+            let id = UUID()
+            let replacement: VideoEncoder
+            do { replacement = try self.makeEncoder(width: self.outputWidth, height: self.outputHeight, settings: self.currentSettings, id: id) }
+            catch {
+                self.onDiagnosticError?(error)
+                completion(false)
+                return
+            }
+            let old = self.encoder
+            self.encoderID = id
+            self.encoder = replacement
+            self.encoderHardwareChecked = false
+            self.encoderHardware = nil
+            self.encodingTimingLock.withLock { self.encodingStarted = nil }
+            self.acknowledgements.removeAll()
+            self.frameFlow.prepareMediaRecovery()
+            self.latest = self.lastCapture
+            self.latest?.2 = nil
+            self.discardMismatchedFrame()
+            // Completing an old encoder must not block the new epoch or wait for a lost decoder ACK.
+            self.encoderCleanupQueue.async { old?.stop() }
+            completion(true)
+        }
+    }
+
+    func produceMediaRecoveryFrame() {
+        queue.async { [weak self] in
+            guard let self, self.running, !self.reconfiguring, !self.sessionPaused, self.frameFlow.mediaHold else { return }
+            if self.latest == nil {
+                self.latest = self.lastCapture
+                self.latest?.2 = nil
+            }
+            self.frameFlow.requestMediaRecoveryFrame()
+            self.pump()
+        }
+    }
+
+    func resumeMediaFrames() {
+        queue.async { [weak self] in
+            guard let self, self.running, !self.reconfiguring, !self.sessionPaused,
+                  self.frameFlow.resumeMediaFrames() else { return }
             self.pump()
         }
     }

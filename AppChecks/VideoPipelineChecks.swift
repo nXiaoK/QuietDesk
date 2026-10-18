@@ -11,6 +11,13 @@ private func require(_ condition: @autoclosure () -> Bool, _ message: String) th
     guard condition() else { throw VideoCheckFailure(message) }
 }
 
+private final class EncodedRecoveryPacket: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<VideoPacket, Error>?
+    func set(_ result: Result<VideoPacket, Error>) { lock.withLock { self.result = result } }
+    func get() -> Result<VideoPacket, Error>? { lock.withLock { result } }
+}
+
 @main
 private struct VideoPipelineChecks {
     static func main() {
@@ -173,6 +180,83 @@ private struct VideoPipelineChecks {
             try require(!flow.isIdle && flow.waiting[1] != nil, "A pre-wrap acknowledgement released a post-wrap frame")
             _ = flow.acknowledge(1)
             try require(flow.isIdle, "Wrapped frames did not drain")
+        }
+
+        run("Media recovery clears lost credits immediately while preserving the capture sequence") {
+            var flow = VideoFrameFlow()
+            for index in 0..<3 {
+                let frame = flow.begin(at: Double(index))!
+                _ = flow.encoded(frame.sequence, at: Double(index))
+            }
+            let lastSequence = flow.sequence
+            flow.prepareMediaRecovery()
+            try require(flow.isIdle && flow.mediaHold && flow.sequence == lastSequence && flow.stalled(at: 1_000) == nil,
+                        "Recovery waited for a missing acknowledgement or reset capture identity")
+            try require(flow.begin(at: 4) == nil && !flow.resumeMediaFrames(), "Prepare allowed P frames before its recovery IDR")
+            flow.requestMediaRecoveryFrame()
+            let recovery = flow.begin(at: 5)!
+            try require(recovery.sequence == lastSequence + 1 && recovery.forceKeyFrame, "Recovery did not reserve a new forced keyframe")
+        }
+
+        run("Media hold produces one recovery output and cannot release prediction before commit") {
+            var flow = VideoFrameFlow()
+            flow.prepareMediaRecovery()
+            flow.requestMediaRecoveryFrame()
+            let recovery = flow.begin(at: 0)!
+            _ = flow.encoded(recovery.sequence, at: 0)
+            _ = flow.acknowledge(recovery.sequence)
+            flow.requestMediaRecoveryFrame()
+            try require(flow.mediaRecoveryFrameEncoded && flow.begin(at: 1) == nil,
+                        "Repeated produce or an ACK released another frame while awaiting commit")
+            try require(flow.resumeMediaFrames(), "A completed recovery could not commit")
+            try require(flow.begin(at: 2)?.forceKeyFrame == false, "Commit did not resume the new encoder prediction chain")
+        }
+
+        run("Old media callbacks cannot release new encoding and dropped recovery output stays an IDR") {
+            var flow = VideoFrameFlow(sequence: UInt32.max - 1)
+            let old = flow.begin(at: 0)!
+            flow.prepareMediaRecovery()
+            flow.requestMediaRecoveryFrame()
+            let recovery = flow.begin(at: 1)!
+            try require(recovery.sequence == 0 && !flow.encoded(old.sequence, at: 2)
+                        && !flow.dropped(old.sequence) && !flow.acknowledge(old.sequence)
+                        && flow.encoding == recovery.sequence, "An old callback changed the replacement frame")
+            _ = flow.dropped(recovery.sequence)
+            let retry = flow.begin(at: 3)
+            try require(retry?.forceKeyFrame == true && !flow.mediaRecoveryFrameEncoded,
+                        "A rate-control drop left recovery stuck or released a P frame")
+            flow.prepareMediaRecovery()
+            try require(flow.begin(at: 4) == nil && !flow.resumeMediaFrames(), "Abort reused the candidate reference chain")
+        }
+
+        run("Fresh encoders produce real IDR frames when replaying the same retained pixel buffer") {
+            var pixelBuffer: CVPixelBuffer?
+            let status = CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nil, &pixelBuffer)
+            guard status == kCVReturnSuccess, let pixelBuffer else { throw VideoCheckFailure("Could not create an offline video buffer") }
+            CVPixelBufferLockBaseAddress(pixelBuffer, [])
+            for plane in 0..<CVPixelBufferGetPlaneCount(pixelBuffer) {
+                if let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane) {
+                    memset(base, plane == 0 ? 16 : 128,
+                           CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane) * CVPixelBufferGetHeightOfPlane(pixelBuffer, plane))
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+            for sequence: UInt32 in [UInt32.max, 0] {
+                let output = EncodedRecoveryPacket()
+                let done = DispatchSemaphore(value: 0)
+                let encoder = try VideoEncoder(width: 64, height: 64, settings: StreamSettings(framesPerSecond: 60, megabits: 3))
+                encoder.onOutput = { result in output.set(result); done.signal() }
+                encoder.onDropped = { _ in done.signal() }
+                defer { encoder.stop() }
+                try encoder.encode(pixelBuffer, time: CMTime(value: 1, timescale: 60), sequence: sequence, forceKeyFrame: true)
+                guard done.wait(timeout: .now() + 10) == .success, let result = output.get() else {
+                    throw VideoCheckFailure("Fresh encoder did not output the retained recovery frame")
+                }
+                let packet = try result.get()
+                let idr = try MediaFrame.containsIDR(packet.avcc)
+                try require(idr && !packet.sps.isEmpty && !packet.pps.isEmpty && packet.sequence == sequence,
+                            "Recovery output was not a real IDR with its original capture identity")
+            }
         }
 
         print("Video pipeline checks: \(passed) passed, \(failed) failed")

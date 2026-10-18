@@ -1057,8 +1057,12 @@ final class DeskModel: ObservableObject {
                 peer.send(try Wire.json(.inputStatus, feedback))
             }
         case .releaseInput: hostSession.injector?.releaseAll()
-        case .clipboard: try receiveClipboard(message.payload)
-        case .requestClipboard: sendClipboard(to: peer)
+        case .clipboard:
+            guard clipboardEnabled else { clipboardStatus = "已忽略远端发送的剪贴板文字（剪贴板同步已关闭）"; return }
+            try receiveClipboard(message.payload)
+        case .requestClipboard:
+            guard clipboardEnabled else { clipboardStatus = "已拒绝远端读取剪贴板（剪贴板同步已关闭）"; return }
+            sendClipboard(to: peer)
         case .clipboardSettings:
             let preference = try Wire.readJSON(ClipboardPreference.self, message.payload)
             guard let session = preference.session, clipboardSession == nil || clipboardSession == session else {
@@ -1205,6 +1209,10 @@ final class DeskModel: ObservableObject {
             throw DeskError.invalid("视频会话尚未就绪")
         case .clipboard:
             guard viewerSession.helloReceived else { throw DeskError.invalid("缺少会话信息") }
+            guard viewerSession.clipboardPullPending else { return }
+            viewerSession.clipboardPullPending = false
+            viewerSession.clipboardPullTimeout?.cancel()
+            viewerSession.clipboardPullTimeout = nil
             try receiveClipboard(message.payload)
         case .clipboardSettings:
             guard supportsClipboard else { throw DeskError.invalid("对端不支持自动剪贴板") }
@@ -1641,7 +1649,21 @@ final class DeskModel: ObservableObject {
     }
 
     func pushClipboard() { if let peer, connected { sendClipboard(to: peer) } }
-    func pullClipboard() { if connected { peer?.send(Message(.requestClipboard)); clipboardStatus = "正在获取远端剪贴板…" } }
+    func pullClipboard() {
+        guard connected, let peer else { return }
+        let viewer = viewerSession
+        viewer.clipboardPullTimeout?.cancel()
+        viewer.clipboardPullPending = true
+        peer.send(Message(.requestClipboard))
+        clipboardStatus = "正在获取远端剪贴板…"
+        viewer.clipboardPullTimeout = Task { [weak self, weak viewer] in
+            do { try await Task.sleep(for: .seconds(5)) } catch { return }
+            guard let self, let viewer, self.viewerSession === viewer, viewer.clipboardPullPending, !Task.isCancelled else { return }
+            viewer.clipboardPullPending = false
+            viewer.clipboardPullTimeout = nil
+            self.clipboardStatus = "未收到远端剪贴板文字（对方可能没有文字或已关闭剪贴板同步）"
+        }
+    }
 
     func setClipboardEnabled(_ enabled: Bool) {
         clipboardEnabled = enabled
@@ -1923,6 +1945,7 @@ final class DeskModel: ObservableObject {
         oldViewer.videoDebounceTask?.cancel()
         oldViewer.videoRequestTimeout?.cancel()
         oldViewer.stableTask?.cancel()
+        oldViewer.clipboardPullTimeout?.cancel()
         if let effects = oldHost.effects {
             let token = generation
             effectsCleanupTask = Task { [weak self] in

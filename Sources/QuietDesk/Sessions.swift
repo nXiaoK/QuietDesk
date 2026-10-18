@@ -21,6 +21,8 @@ final class HostSession {
 final class ViewerSession {
     var helloReceived = false
     var stableTask: Task<Void, Never>?
+    var clipboardPullTimeout: Task<Void, Never>?
+    var clipboardPullPending = false
     var videoDebounceTask: Task<Void, Never>?
     var videoRequestTimeout: Task<Void, Never>?
     var pendingVideoPreferenceCanSave = true

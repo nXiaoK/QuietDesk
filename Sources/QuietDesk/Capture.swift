@@ -94,6 +94,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var encoderHardware: Bool?
     private var running = false
     private var captureStarted = false
+    private var excludesCurrentApplication = false
     private var reconfiguring = false
     private var sessionPaused = false
     private var idleWaiter: (UUID, CheckedContinuation<Void, Error>)?
@@ -216,6 +217,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             encoderHardware = nil
             encoderID = id
             self.stream = stream
+            excludesCurrentApplication = false
             displayID = capture.displayID
             outputWidth = width
             outputHeight = height
@@ -336,10 +338,12 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     func setExcludesCurrentApplication(_ enabled: Bool) async throws {
-        let snapshot = try queue.sync { () throws -> (SCStream, CGDirectDisplayID) in
+        let snapshot = try queue.sync { () throws -> (SCStream, CGDirectDisplayID)? in
             guard running, let stream, let displayID else { throw DeskError.invalid("屏幕采集尚未就绪") }
+            guard excludesCurrentApplication != enabled else { return nil }
             return (stream, displayID)
         }
+        guard let snapshot else { return }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         guard let display = content.displays.first(where: { $0.displayID == snapshot.1 }) else {
             throw DeskError.invalid("共享的显示器已变化，请等待重新连接")
@@ -356,6 +360,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         try Task.checkCancellation()
         try queue.sync {
             guard running, stream === snapshot.0 else { throw CancellationError() }
+            excludesCurrentApplication = enabled
             frameFlow.requestKeyFrame()
         }
     }

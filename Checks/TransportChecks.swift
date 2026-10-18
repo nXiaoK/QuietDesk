@@ -32,7 +32,7 @@ func runTransportChecks() {
     }
 
     if CommandLine.arguments.contains("--skip-network") { return }
-    run("A refused loopback connection fails before the handshake timeout and remains retryable") {
+    run("A refused loopback connection stops automatic reconnect before the handshake timeout") {
         let key = try PairingKey.generate()
         let queue = DispatchQueue(label: "checks.refused-connection")
         let listener = try makeListener(key, queue: queue)
@@ -53,6 +53,43 @@ func runTransportChecks() {
         peer.start()
         try wait(closed, seconds: 4, "Refused connection waited for the handshake timeout")
         try check(reason.read() == SecureTransport.connectionFailureReason(.posix(.ECONNREFUSED)), "Refusal reason was not specific")
-        try check(peer.closeIsRetryable, "Network failure must retain automatic reconnect classification")
+        try check(!peer.closeIsRetryable, "A closed listening port kept automatic reconnect active")
     }
+    run("Stopping a host listener ends retries when the replacement connection is refused") {
+        let key = try PairingKey.generate()
+        let queue = DispatchQueue(label: "checks.stopped-host")
+        let listener = try makeListener(key, queue: queue)
+        guard let port = listener.port else { throw CheckFailure("No port") }
+        let server = Box<Peer?>(nil)
+        let ready = DispatchSemaphore(value: 0), disconnected = DispatchSemaphore(value: 0)
+        listener.newConnectionHandler = { connection in
+            let peer = Peer(connection: connection)
+            server.set(peer)
+            peer.onReady = { ready.signal() }
+            peer.start()
+        }
+        let client = Peer(connection: NWConnection(host: "127.0.0.1", port: port,
+            using: SecureTransport.parameters(key: key)))
+        client.onClose = { _ in disconnected.signal() }
+        defer { client.close(); server.read()?.close(); listener.cancel() }
+        client.start()
+        try wait(ready, "Host connection did not become ready")
+        let cancelled = DispatchSemaphore(value: 0)
+        listener.stateUpdateHandler = { if case .cancelled = $0 { cancelled.signal() } }
+        listener.cancel()
+        try wait(cancelled, "Host listener did not stop")
+        server.read()?.close("host stopped sharing")
+        try wait(disconnected, "Viewer did not observe host closure")
+        try check(client.closeIsRetryable, "An ordinary connection drop lost its transient retry path")
+
+        let replacement = Peer(connection: NWConnection(host: "127.0.0.1", port: port,
+            using: SecureTransport.parameters(key: key)), heartbeatInterval: 0.1)
+        let refused = DispatchSemaphore(value: 0)
+        replacement.onClose = { _ in refused.signal() }
+        defer { replacement.close() }
+        replacement.start()
+        try wait(refused, seconds: 4, "Closed host kept the replacement connection waiting")
+        try check(!replacement.closeIsRetryable, "Closed host scheduled another automatic reconnect")
+    }
+
 }

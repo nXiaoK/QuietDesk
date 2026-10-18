@@ -13,7 +13,7 @@ public enum SecureTransport {
     public static func connectionFailureReason(_ error: NWError) -> String? {
         guard case .posix(let code) = error else { return nil }
         switch code {
-        case .ECONNREFUSED: return "对方拒绝连接，请确认已开启共享，并检查端口与端口映射"
+        case .ECONNREFUSED: return "对方拒绝连接，可能已关闭共享或应用。已停止自动重连，请确认共享状态、地址和端口"
         case .EHOSTUNREACH: return "无法到达对方主机，请检查地址、网络与防火墙"
         case .ENETUNREACH: return "网络不可达，请检查本机网络连接与路由"
         default: return nil
@@ -144,12 +144,15 @@ public final class Peer {
                         let failure = SecureTransport.tlsFailure(code: code, description: error.localizedDescription, afterReady: self.ready)
                         self.finish(failure.reason, retryable: failure.retryable)
                     }
-                    else { self.finish(SecureTransport.connectionFailureReason(error) ?? "连接失败：\(error.localizedDescription)") }
+                    else {
+                        self.finish(SecureTransport.connectionFailureReason(error) ?? "连接失败：\(error.localizedDescription)",
+                                    retryable: error != .posix(.ECONNREFUSED))
+                    }
                 case .waiting(let error):
                     if case .tls(let code) = error, SecureTransport.pairingFailureCodes.contains(code) {
                         self.finish("TLS 配对验证失败：\(error.localizedDescription)", retryable: false)
                     } else if let reason = SecureTransport.connectionFailureReason(error) {
-                        self.finish(reason)
+                        self.finish(reason, retryable: error != .posix(.ECONNREFUSED))
                     }
                 case .cancelled: self.finish("连接已关闭")
                 default: break

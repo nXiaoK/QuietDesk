@@ -24,23 +24,24 @@ private struct TrafficHistoryChecks {
             } catch { failed += 1; print("FAIL \(name): \(error)") }
         }
 
-        run("Device identity and traffic survive reload, address changes and separate connections") { folder in
+        run("Address and port totals survive reload and combine reconnects while separating routes") { folder in
             let store = TrafficHistoryStore(directory: folder, checkpointInterval: 60)
-            let id = DeviceIdentity(id: UUID(), name: "Home Mac")
+            let endpoint = try TrafficEndpoint(address: "home.example", port: 5908)
             for _ in 0..<2 {
                 let meter = TrafficMeter()
                 let session = TrafficSession(connectionID: meter.connectionID, onDelta: { store.record($0, delta: $1) })
                 meter.onUpdate = session.receive
                 meter.record(sentBytes: 15, receivedBytes: 100)
-                try session.bind(id)
+                try session.bind(endpoint)
                 session.receive(meter.snapshot())
             }
-            store.record(DeviceIdentity(id: UUID(), name: id.name), delta: .init(sentBytes: 3))
+            store.record(try TrafficEndpoint(address: "home.example", port: 5909), delta: .init(sentBytes: 3))
+            store.record(try TrafficEndpoint(address: "192.0.2.1", port: 5908), delta: .init(sentBytes: 5))
             store.flush()
             let records = store.snapshot().records
-            try require(records.count == 2, "Names were used to merge different devices")
-            try require(records.first(where: { $0.id == id.id })?.totals == TrafficTotals(sentBytes: 30, receivedBytes: 200),
-                        "Connections for one device were not combined exactly once")
+            try require(records.count == 3, "Distinct address/port routes were merged")
+            try require(records.first(where: { $0.endpoint == endpoint })?.totals == TrafficTotals(sentBytes: 30, receivedBytes: 200),
+                        "Reconnects for one endpoint were not combined exactly once")
             let reloaded = TrafficHistoryStore(directory: folder, checkpointInterval: 60)
             try require(store.localDeviceID != nil && reloaded.localDeviceID == store.localDeviceID, "Local identity changed across reload")
             try require(reloaded.snapshot().records == records && reloaded.snapshot().error == nil, "Persisted totals changed after reload")
@@ -48,11 +49,11 @@ private struct TrafficHistoryChecks {
 
         run("Checkpoint saves active and late-completing traffic without ending the session") { folder in
             let store = TrafficHistoryStore(directory: folder, checkpointInterval: 0.05)
-            let identity = DeviceIdentity(id: UUID(), name: "Remote")
+            let endpoint = try TrafficEndpoint(address: "remote.example", port: 5908)
             var owner: TrafficMeter? = TrafficMeter()
             let session = TrafficSession(connectionID: owner!.connectionID, onDelta: { store.record($0, delta: $1) })
             owner!.onUpdate = session.receive
-            try session.bind(identity)
+            try session.bind(endpoint)
             owner!.record(receivedBytes: 7)
             let completion = { [meter = owner!] in meter.record(sentBytes: 11) }
             owner = nil
@@ -67,10 +68,10 @@ private struct TrafficHistoryChecks {
             for (index, bytes) in [Data("broken-json".utf8), Data("{\"version\":99,\"records\":[]}".utf8)].enumerated() {
                 let directory = folder.appendingPathComponent("case-\(index)")
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-                let file = directory.appendingPathComponent("traffic-history.json")
+                let file = directory.appendingPathComponent("traffic-history-v2.json")
                 try bytes.write(to: file)
                 let store = TrafficHistoryStore(directory: directory, checkpointInterval: 60)
-                store.record(DeviceIdentity(id: UUID(), name: "new"), delta: .init(receivedBytes: 9))
+                store.record(try TrafficEndpoint(address: "new.example", port: 5908), delta: .init(receivedBytes: 9))
                 store.flush()
                 try require(store.snapshot().error != nil, "Unreadable history was silently accepted")
                 try require(try Data(contentsOf: file) == bytes, "Unreadable history was destroyed")
@@ -80,9 +81,9 @@ private struct TrafficHistoryChecks {
 
         run("Write errors retain pending counters and a later successful flush saves them once") { folder in
             let store = TrafficHistoryStore(directory: folder, checkpointInterval: 60)
-            let file = folder.appendingPathComponent("traffic-history.json")
+            let file = folder.appendingPathComponent("traffic-history-v2.json")
             try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
-            store.record(DeviceIdentity(id: UUID(), name: "Mac"), delta: .init(sentBytes: 15, receivedBytes: 25))
+            store.record(try TrafficEndpoint(address: "mac.example", port: 5908), delta: .init(sentBytes: 15, receivedBytes: 25))
             store.flush()
             try require(store.snapshot().error != nil && store.snapshot().records.first?.sentBytes == 15,
                         "A write failure lost counters or hid the error")
@@ -94,18 +95,18 @@ private struct TrafficHistoryChecks {
         }
 
         run("Protected unreadable history publishes a traffic change only once across checkpoints") { folder in
-            let file = folder.appendingPathComponent("traffic-history.json")
+            let file = folder.appendingPathComponent("traffic-history-v2.json")
             let bytes = Data("unreadable-history".utf8)
             try bytes.write(to: file)
             let store = TrafficHistoryStore(directory: folder, checkpointInterval: 0.05)
             let initial = DispatchSemaphore(value: 0), updated = DispatchSemaphore(value: 0)
             var updates = 0
-            store.observe { records, _ in
+            store.observe { records, _, _ in
                 if records.isEmpty { initial.signal() }
                 else { updates += 1; updated.signal() }
             }
             try require(initial.wait(timeout: .now() + 3) == .success, "Initial history was not published")
-            store.record(DeviceIdentity(id: UUID(), name: "new"), delta: .init(receivedBytes: 9))
+            store.record(try TrafficEndpoint(address: "new.example", port: 5908), delta: .init(receivedBytes: 9))
             try require(updated.wait(timeout: .now() + 3) == .success, "New in-memory traffic was not published")
             try require(updated.wait(timeout: .now() + 0.2) == .timedOut, "Unchanged protected history was republished")
             let snapshot = store.snapshot()
@@ -116,13 +117,13 @@ private struct TrafficHistoryChecks {
 
         run("Checkpoint write failures and recovery each publish their changed error state once") { folder in
             let store = TrafficHistoryStore(directory: folder, checkpointInterval: 0.05)
-            let file = folder.appendingPathComponent("traffic-history.json")
+            let file = folder.appendingPathComponent("traffic-history-v2.json")
             try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
             let updated = DispatchSemaphore(value: 0)
             var errors: [String?] = []
-            store.observe { _, error in errors.append(error); updated.signal() }
+            store.observe { _, _, error in errors.append(error); updated.signal() }
             try require(updated.wait(timeout: .now() + 3) == .success, "Initial history was not published")
-            store.record(DeviceIdentity(id: UUID(), name: "Mac"), delta: .init(sentBytes: 15))
+            store.record(try TrafficEndpoint(address: "mac.example", port: 5908), delta: .init(sentBytes: 15))
             try require(updated.wait(timeout: .now() + 3) == .success, "Write failure was not published")
             try require(store.snapshot().error != nil && errors.count == 2 && errors[0] == nil && errors[1] != nil,
                         "First write failure was hidden")
@@ -138,14 +139,14 @@ private struct TrafficHistoryChecks {
         run("Counting errors remain immediately observable between checkpoints") { folder in
             let store = TrafficHistoryStore(directory: folder, checkpointInterval: 60)
             let updated = DispatchSemaphore(value: 0)
-            store.observe { _, _ in updated.signal() }
+            store.observe { _, _, _ in updated.signal() }
             try require(updated.wait(timeout: .now() + 3) == .success, "Initial history was not published")
             store.reportCountingError("counting failed")
             try require(updated.wait(timeout: .now() + 3) == .success, "Reported counting error waited for a checkpoint")
             try require(store.snapshot().error == "counting failed", "Reported counting error disappeared")
-            let identity = DeviceIdentity(id: UUID(), name: "Mac")
-            store.record(identity, delta: .init(sentBytes: UInt64.max))
-            store.record(identity, delta: .init(sentBytes: 1))
+            let endpoint = try TrafficEndpoint(address: "mac.example", port: 5908)
+            store.record(endpoint, delta: .init(sentBytes: UInt64.max))
+            store.record(endpoint, delta: .init(sentBytes: 1))
             try require(updated.wait(timeout: .now() + 3) == .success, "Overflow error waited for a checkpoint")
             let snapshot = store.snapshot()
             try require(snapshot.error != nil && snapshot.error != "counting failed" && snapshot.records.first?.sentBytes == UInt64.max,
@@ -161,25 +162,63 @@ private struct TrafficHistoryChecks {
             try require(try Data(contentsOf: file) == bytes, "The original identity file was overwritten")
         }
 
-        run("History persists safe single-line labels without changing device identity") { folder in
-            let store = TrafficHistoryStore(directory: folder, checkpointInterval: 60)
+        run("Legacy device history remains separate and byte-for-byte unchanged while endpoints persist") { folder in
+            struct LegacyDocument: Encodable { let version: Int; let records: [DeviceTrafficRecord] }
+            let file = folder.appendingPathComponent("traffic-history.json")
             let id = UUID()
-            store.record(DeviceIdentity(id: id, name: "\n\t "), delta: .init(sentBytes: 1))
-            store.flush()
-            try require(store.snapshot().records.first?.name == "未命名 Mac", "Empty name was stored as a blank label")
-            store.record(DeviceIdentity(id: id, name: " Mac\n\u{0} 👨‍👩‍👧‍👦 "), delta: .init(receivedBytes: 2))
+            let records = [DeviceTrafficRecord(id: id, name: " Mac\n\u{0} 👨‍👩‍👧‍👦 ",
+                totals: .init(sentBytes: 123, receivedBytes: 456), firstSeen: Date(timeIntervalSince1970: 1), lastSeen: Date(timeIntervalSince1970: 2))]
+            let original = try JSONEncoder().encode(LegacyDocument(version: 1, records: records))
+            try original.write(to: file)
+            let store = TrafficHistoryStore(directory: folder, checkpointInterval: 60)
+            try require(store.snapshot().records.isEmpty && store.snapshot().legacyRecords.first?.id == id,
+                        "Legacy device traffic was attributed to an invented endpoint")
+            let endpoint = try TrafficEndpoint(address: "home.example", port: 5908)
+            store.record(endpoint, delta: .init(sentBytes: 7))
             store.flush()
             let reloaded = TrafficHistoryStore(directory: folder, checkpointInterval: 60)
-            try require(reloaded.snapshot().records.first?.name == "Mac 👨‍👩‍👧‍👦" && reloaded.snapshot().records.first?.id == id,
-                        "Label normalization changed identity or was not persisted")
+            let snapshot = reloaded.snapshot()
+            try require(snapshot.records.first?.totals == TrafficTotals(sentBytes: 7), "Endpoint traffic mixed old device totals")
+            try require(snapshot.legacyRecords.first?.totals == records[0].totals
+                        && snapshot.legacyRecords.first?.name == "Mac 👨‍👩‍👧‍👦"
+                        && snapshot.legacyRecords.first?.firstSeen == records[0].firstSeen, "Legacy totals, label or dates changed")
+            try require(try Data(contentsOf: file) == original, "Legacy file was modified")
+        }
+
+        run("Unreadable legacy history does not block persistence of new endpoint traffic") { folder in
+            let file = folder.appendingPathComponent("traffic-history.json")
+            let original = Data("damaged legacy history".utf8)
+            try original.write(to: file)
+            let store = TrafficHistoryStore(directory: folder, checkpointInterval: 60)
+            store.record(try TrafficEndpoint(address: "new.example", port: 5908), delta: .init(receivedBytes: 19))
+            store.flush()
+            let reloaded = TrafficHistoryStore(directory: folder, checkpointInterval: 60)
+            try require(reloaded.snapshot().records.first?.receivedBytes == 19 && reloaded.snapshot().error != nil,
+                        "A legacy read failure lost new endpoint traffic or its warning")
+            try require(try Data(contentsOf: file) == original, "Unreadable legacy history was overwritten")
+        }
+
+        run("Duplicate normalized endpoint keys are protected instead of silently overwriting history") { folder in
+            let endpoint = try TrafficEndpoint(address: "EXAMPLE.com", port: 5908)
+            let record = EndpointTrafficRecord(endpoint: endpoint, totals: .init(sentBytes: 11))
+            struct Document: Encodable { let version: Int; let records: [EndpointTrafficRecord] }
+            let bytes = try JSONEncoder().encode(Document(version: 2, records: [record, record]))
+            let file = folder.appendingPathComponent("traffic-history-v2.json")
+            try bytes.write(to: file)
+            let store = TrafficHistoryStore(directory: folder, checkpointInterval: 60)
+            store.record(endpoint, delta: .init(sentBytes: 1))
+            store.flush()
+            try require(store.snapshot().error != nil && store.snapshot().records.first?.sentBytes == 1,
+                        "Duplicate endpoint history was accepted or in-memory traffic lost")
+            try require(try Data(contentsOf: file) == bytes, "Duplicate endpoint history was overwritten")
         }
 
         run("An unreadable parent directory cannot be mistaken for missing history and overwritten after recovery") { folder in
             let directory = folder.appendingPathComponent("private")
             let original = TrafficHistoryStore(directory: directory, checkpointInterval: 60)
-            original.record(DeviceIdentity(id: UUID(), name: "original"), delta: .init(sentBytes: 123))
+            original.record(try TrafficEndpoint(address: "original.example", port: 5908), delta: .init(sentBytes: 123))
             original.flush()
-            let historyFile = directory.appendingPathComponent("traffic-history.json")
+            let historyFile = directory.appendingPathComponent("traffic-history-v2.json")
             let identityFile = directory.appendingPathComponent("device-identity.json")
             let historyBytes = try Data(contentsOf: historyFile)
             let identityBytes = try Data(contentsOf: identityFile)
@@ -189,7 +228,7 @@ private struct TrafficHistoryChecks {
             try require(inaccessible.localDeviceID == nil && inaccessible.snapshot().error != nil,
                         "An unreadable directory did not report protected loading failure")
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-            inaccessible.record(DeviceIdentity(id: UUID(), name: "pending"), delta: .init(receivedBytes: 9))
+            inaccessible.record(try TrafficEndpoint(address: "pending.example", port: 5908), delta: .init(receivedBytes: 9))
             inaccessible.flush()
             try require(try Data(contentsOf: historyFile) == historyBytes, "Restored directory access overwrote existing history")
             try require(try Data(contentsOf: identityFile) == identityBytes, "Restored directory access replaced device identity")
@@ -201,11 +240,11 @@ private struct TrafficHistoryChecks {
             let entered = DispatchSemaphore(value: 0), proceed = DispatchSemaphore(value: 0)
             let flushed = DispatchSemaphore(value: 0), counted = DispatchSemaphore(value: 0)
             defer { proceed.signal() }
-            let session = TrafficSession(connectionID: meter.connectionID, onDelta: { identity, delta in
+            let session = TrafficSession(connectionID: meter.connectionID, onDelta: { endpoint, delta in
                 if delta.sentBytes == 10 { entered.signal(); proceed.wait() }
-                store.record(identity, delta: delta)
+                store.record(endpoint, delta: delta)
             })
-            try session.bind(DeviceIdentity(id: UUID(), name: "Mac"))
+            try session.bind(try TrafficEndpoint(address: "mac.example", port: 5908))
             meter.onUpdate = session.receive
             DispatchQueue.global().async { meter.record(sentBytes: 10); counted.signal() }
             try require(entered.wait(timeout: .now() + 3) == .success, "No in-progress delta")

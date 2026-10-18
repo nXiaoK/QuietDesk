@@ -34,9 +34,10 @@ final class DeskModel: ObservableObject {
         return connectionError
     }
     @Published var traffic = "0.00 Mbps"
-    @Published private(set) var trafficHistory: [DeviceTrafficRecord] = []
+    @Published private(set) var trafficHistory: [EndpointTrafficRecord] = []
+    @Published private(set) var legacyTrafficHistory: [DeviceTrafficRecord] = []
     @Published private(set) var trafficHistoryError: String?
-    @Published private(set) var trafficHistoryStatus = "从本版开始按设备累计；旧版设备需双方升级。"
+    @Published private(set) var trafficHistoryStatus = "按网址/IP＋端口累计；旧版按设备统计单独保留。"
     @Published var frameRate = "0 fps"
     @Published var latency = "— ms"
     @Published private(set) var performanceDiagnosticsEnabled = false
@@ -135,6 +136,7 @@ final class DeskModel: ObservableObject {
         let port: UInt16
         let key: PairingKey
         let recordID: UUID?
+        let trafficEndpoint: TrafficEndpoint
     }
     private var target: Target?
     private var selectedConnectionID: UUID?
@@ -281,9 +283,10 @@ final class DeskModel: ObservableObject {
             }
         }
         if let permissionTimer { RunLoop.main.add(permissionTimer, forMode: .common) }
-        trafficHistoryStore.observe { [weak self] records, message in
+        trafficHistoryStore.observe { [weak self] records, legacyRecords, message in
             DispatchQueue.main.async {
                 self?.trafficHistory = records
+                self?.legacyTrafficHistory = legacyRecords
                 self?.trafficHistoryError = message
             }
         }
@@ -370,10 +373,10 @@ final class DeskModel: ObservableObject {
         trafficHistoryStore.flush()
     }
 
-    private func makeTrafficSession(for peer: Peer) -> TrafficSession {
+    private func makeTrafficSession(for peer: Peer, endpoint: TrafficEndpoint? = nil) -> TrafficSession {
         let history = trafficHistoryStore
-        let session = TrafficSession(connectionID: peer.trafficMeter.connectionID,
-            onDelta: { identity, delta in history.record(identity, delta: delta) },
+        let session = TrafficSession(connectionID: peer.trafficMeter.connectionID, endpoint: endpoint,
+            onDelta: { endpoint, delta in history.record(endpoint, delta: delta) },
             onError: { history.reportCountingError($0) })
         peer.trafficMeter.onUpdate = session.receive
         return session
@@ -634,7 +637,7 @@ final class DeskModel: ObservableObject {
                                 connection.cancel()
                                 return
                             }
-                            self.accept(connection, generation: token, admission: admission, id: id)
+                            self.accept(connection, generation: token, admission: admission, id: id, listeningPort: port.rawValue)
                         }
                     }
                     listener.stateUpdateHandler = { [weak self] state in
@@ -677,7 +680,7 @@ final class DeskModel: ObservableObject {
         }
     }
 
-    private func accept(_ connection: NWConnection, generation token: UUID, admission: PendingHandshakeGate, id: UUID) {
+    private func accept(_ connection: NWConnection, generation token: UUID, admission: PendingHandshakeGate, id: UUID, listeningPort: UInt16) {
         let diagnostics = PerformanceDiagnostics()
         let ackStretchingDisabled = (connection.parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options)?.disableAckStretching
         let candidate = Peer(connection: connection, handshakeTimeout: peer == nil ? 15 : 5, diagnostics: diagnostics)
@@ -697,7 +700,14 @@ final class DeskModel: ObservableObject {
                 self.attachPerformanceDiagnostics(diagnostics, role: .host)
                 self.dataChannel = channel
                 self.trafficSession = session
-                self.trafficHistoryStatus = "等待远端设备标识；旧版设备需双方升级后才能累计。"
+                do {
+                    let endpoint = try TrafficEndpoint(remoteEndpoint: connection.endpoint, listeningPort: listeningPort)
+                    try session.bind(endpoint)
+                    self.trafficHistoryStatus = "按控制端来源 IP＋本机监听端口累计：\(endpoint.label)"
+                } catch {
+                    self.trafficHistoryStatus = "当前连接的来源地址不可识别，未累计此连接的历史流量。"
+                    history.reportCountingError(error.localizedDescription)
+                }
                 self.status = "正在准备连接画面…"
                 let host = self.hostSession
                 host.captureTask = Task { [weak self, weak candidate, weak host] in
@@ -822,7 +832,8 @@ final class DeskModel: ObservableObject {
             UserDefaults.standard.set(address, forKey: "remoteAddress")
             UserDefaults.standard.set(self.port, forKey: "remotePort")
             let record = ConnectionStore.matching(connections, address: address, port: port.rawValue, preferredID: selectedConnectionID)
-            let target = Target(address: address, port: port.rawValue, key: key, recordID: record?.id)
+            let target = Target(address: address, port: port.rawValue, key: key, recordID: record?.id,
+                                trafficEndpoint: try TrafficEndpoint(address: address, port: port.rawValue))
             self.target = target
             idlePolicy = SessionIdlePolicy(now: SessionClock.now)
             _ = idlePolicy.focusChanged(now: SessionClock.now, focused: sessionWindowFocused, suppressWake: true)
@@ -877,9 +888,9 @@ final class DeskModel: ObservableObject {
         let candidate = Peer(connection: connection, diagnostics: diagnostics)
         attachPerformanceDiagnostics(diagnostics, role: .viewer)
         DiagnosticLog.shared.record(.connectionStarted, role: .viewer, state: .requested)
-        trafficSession = makeTrafficSession(for: candidate)
+        trafficSession = makeTrafficSession(for: candidate, endpoint: target.trafficEndpoint)
         let history = trafficHistoryStore
-        trafficHistoryStatus = "等待远端设备标识；旧版设备需双方升级后才能累计。"
+        trafficHistoryStatus = "按连接地址＋目标端口累计：\(target.trafficEndpoint.label)"
         peer = candidate
         let channel = makeDataChannel(for: candidate)
         dataChannel = channel
@@ -1032,13 +1043,14 @@ final class DeskModel: ObservableObject {
         case .sessionEffectsRequest:
             applyHostSessionEffects(try Wire.readJSON(SessionEffectsRequest.self, message.payload), peer: peer)
         case .deviceIdentity:
-            guard hostSession.deviceIdentityAdvertised, let trafficSession,
-                  trafficSession.connectionID == peer.trafficMeter.connectionID else {
+            guard hostSession.deviceIdentityAdvertised else {
                 throw DeskError.invalid("当前连接未启用设备标识交换")
             }
             let identity = try Wire.readJSON(DeviceIdentity.self, message.payload)
-            try trafficSession.bind(identity)
-            trafficHistoryStatus = "历史流量已按远端设备持续累计。"
+            if let previous = hostSession.remoteDeviceID, previous != identity.id {
+                throw DeskError.invalid("连接中的设备标识发生变化")
+            }
+            hostSession.remoteDeviceID = identity.id
         case .controlStatus:
             guard message.payload.isEmpty else { throw DeskError.invalid("控制权限订阅消息无效") }
             refreshPermissions()
@@ -1110,10 +1122,6 @@ final class DeskModel: ObservableObject {
             }
             if freshFrameRequiredOnReconnect { pauseTransmission.requireFreshFrame() }
             saveConnection(name: hello.name)
-            if let id = hello.deviceID, let trafficSession {
-                try trafficSession.bind(DeviceIdentity(id: id, name: hello.name))
-                trafficHistoryStatus = "历史流量已按远端设备持续累计。"
-            } else { trafficHistoryStatus = "对端没有设备标识，仅显示瞬时流量；双方升级后可累计历史。" }
             if hello.deviceIdentityExchange == true, let id = trafficHistoryStore.localDeviceID {
                 peer.send(try Wire.json(.deviceIdentity, DeviceIdentity(id: id, name: Host.current().localizedName ?? "这台 Mac")))
             }
@@ -1969,7 +1977,7 @@ final class DeskModel: ObservableObject {
         sessionEffectsStatus = ""
         flushTrafficHistory()
         trafficSession = nil
-        trafficHistoryStatus = "从本版开始按设备累计；旧版设备需双方升级。"
+        trafficHistoryStatus = "按网址/IP＋端口累计；旧版按设备统计单独保留。"
         controlStatusUpdatesEnabled = false
         capsLockRunning = false
         capsLockStartAttempted = false

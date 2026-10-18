@@ -41,30 +41,76 @@ func runTrafficChecks() {
                   "Existing protocol numbering changed")
     }
 
-    run("Traffic buffers before identity and counts duplicate, stale and late snapshots exactly once") {
+    run("Traffic endpoint keys normalize hosts but keep ports, domains and IP addresses separate") {
+        let domain = try TrafficEndpoint(address: "  EXAMPLE.com ", port: 5908)
+        try check(domain == TrafficEndpoint(address: "example.com", port: 5908), "Hostname case or whitespace split a route")
+        try check(domain != TrafficEndpoint(address: "example.com", port: 5909), "Different ports merged")
+        try check(domain != TrafficEndpoint(address: "192.0.2.1", port: 5908), "A domain was merged with an IP")
+        let ipv6 = try TrafficEndpoint(address: "[2001:0DB8:0:0:0:0:0:1]", port: 5908)
+        try check(ipv6 == TrafficEndpoint(address: "2001:db8::1", port: 5908)
+                  && ipv6.label == "[2001:db8::1]:5908", "IPv6 key or display is ambiguous")
+        try check(TrafficEndpoint(address: "fe80::1%en0", port: 5908) != TrafficEndpoint(address: "fe80::1%en1", port: 5908),
+                  "Different IPv6 scopes merged")
+    }
+    run("Traffic endpoint validation also applies when loading history") {
+        for address in ["", "https://example.com", "example.com/path", "a b", "bad\nname", "[not-an-ip]", "2001:broken::1", "::1%"] {
+            try rejects("Invalid address accepted: \(address)") { _ = try TrafficEndpoint(address: address, port: 5908) }
+        }
+        try rejects("Port zero accepted") { _ = try TrafficEndpoint(address: "example.com", port: 0) }
+        for value in ["{\"address\":\"example.com\",\"port\":0}", "{\"address\":\"example.com\",\"port\":65536}",
+                      "{\"address\":\"x/y\",\"port\":5908}"] {
+            try rejects("Invalid persisted endpoint accepted") { _ = try JSONDecoder().decode(TrafficEndpoint.self, from: Data(value.utf8)) }
+        }
+    }
+    run("Host traffic keys use the actual source IP and listening port instead of ephemeral source ports") {
+        let first = try TrafficEndpoint(remoteEndpoint: .hostPort(host: "192.0.2.5", port: 51001), listeningPort: 5908)
+        let retry = try TrafficEndpoint(remoteEndpoint: .hostPort(host: "192.0.2.5", port: 62002), listeningPort: 5908)
+        let otherPort = try TrafficEndpoint(remoteEndpoint: .hostPort(host: "192.0.2.5", port: 62002), listeningPort: 5909)
+        let otherIP = try TrafficEndpoint(remoteEndpoint: .hostPort(host: "192.0.2.6", port: 51001), listeningPort: 5908)
+        try check(first == retry && first != otherPort && first != otherIP, "Incoming connection attribution changed on retry or merged endpoints")
+        try rejects("A non-IP endpoint was assigned a made-up address") {
+            _ = try TrafficEndpoint(remoteEndpoint: .unix(path: "/tmp/fixture"), listeningPort: 5908)
+        }
+    }
+    run("A known target endpoint counts before Hello without depending on a peer device identifier") {
+        let endpoint = try TrafficEndpoint(address: "legacy.example", port: 5908)
+        let meter = TrafficMeter(), total = Box(TrafficTotals())
+        let session = TrafficSession(connectionID: meter.connectionID, endpoint: endpoint,
+            onDelta: { route, delta in
+                if route == endpoint { total.update { try! $0.add(delta) } }
+            })
+        meter.onUpdate = session.receive
+        meter.record(sentBytes: 17, receivedBytes: 23)
+        session.receive(meter.snapshot())
+        try check(total.read() == TrafficTotals(sentBytes: 17, receivedBytes: 23), "Legacy traffic required device identity or counted twice")
+        try session.bind(TrafficEndpoint(address: "LEGACY.example", port: 5908))
+        try check(total.read() == TrafficTotals(sentBytes: 17, receivedBytes: 23), "Rebinding the same endpoint duplicated bytes")
+    }
+
+    run("Traffic buffers before endpoint binding and counts duplicate, stale and late snapshots exactly once") {
         let meter = TrafficMeter()
         let accumulated = Box(TrafficTotals())
-        let identities = Box<[UUID]>([])
-        let session = TrafficSession(connectionID: meter.connectionID, onDelta: { identity, delta in
-            identities.update { $0.append(identity.id) }
+        let endpoints = Box<[TrafficEndpoint]>([])
+        let session = TrafficSession(connectionID: meter.connectionID, onDelta: { endpoint, delta in
+            endpoints.update { $0.append(endpoint) }
             accumulated.update { try! $0.add(delta) }
         })
         meter.onUpdate = session.receive
         meter.record(sentBytes: 5, receivedBytes: 120)
-        let beforeIdentity = meter.snapshot()
-        try check(accumulated.read() == TrafficTotals(), "Unknown device traffic was attributed early")
-        let identity = DeviceIdentity(id: UUID(), name: "same name")
-        try session.bind(identity)
-        try session.bind(identity)
-        session.receive(beforeIdentity)
+        let beforeBinding = meter.snapshot()
+        try check(accumulated.read() == TrafficTotals(), "Unbound endpoint traffic was attributed early")
+        let endpoint = try TrafficEndpoint(address: "example.com", port: 5908)
+        try session.bind(endpoint)
+        try session.bind(endpoint)
+        session.receive(beforeBinding)
         meter.record(sentBytes: 40, receivedBytes: 3)
-        session.receive(beforeIdentity)
+        session.receive(beforeBinding)
         session.receive(TrafficSnapshot(connectionID: UUID(), totals: .init(sentBytes: 9000)))
         try check(accumulated.read() == TrafficTotals(sentBytes: 45, receivedBytes: 123), "Snapshots were lost or counted twice")
-        try check(identities.read().allSatisfy { $0 == identity.id }, "Traffic moved to another device")
+        try check(endpoints.read().allSatisfy { $0 == endpoint }, "Traffic moved to another endpoint")
         DispatchQueue.concurrentPerform(iterations: 100) { _ in meter.record(sentBytes: 1, receivedBytes: 2) }
         try check(accumulated.read() == TrafficTotals(sentBytes: 145, receivedBytes: 323), "Concurrent snapshots duplicated or lost bytes")
-        try rejects("A session changed device identity") { try session.bind(DeviceIdentity(id: UUID(), name: identity.name)) }
+        try rejects("A session changed endpoint") { try session.bind(TrafficEndpoint(address: "example.com", port: 5909)) }
     }
 
     run("A send completion retains the meter after its connection owner is released") {
@@ -72,7 +118,7 @@ func runTrafficChecks() {
         let total = Box(TrafficTotals())
         var owner: TrafficMeter? = TrafficMeter()
         let session = TrafficSession(connectionID: owner!.connectionID, onDelta: { _, delta in total.update { try! $0.add(delta) } })
-        try session.bind(DeviceIdentity(id: UUID(), name: "Mac"))
+        try session.bind(TrafficEndpoint(address: "192.0.2.1", port: 5908))
         owner!.onUpdate = session.receive
         let completion = { [meter = owner!] in meter.record(sentBytes: UInt64(bytes)) }
         owner = nil
@@ -109,7 +155,10 @@ func runTrafficChecks() {
             listener.newConnectionHandler = { connection in
                 let peer = Peer(connection: connection, heartbeatInterval: 100)
                 server.set(peer)
-                peer.trafficMeter.onUpdate = { snapshot in serverTotals.set(snapshot.totals); examine() }
+                let endpoint = try! TrafficEndpoint(remoteEndpoint: connection.endpoint, listeningPort: port.rawValue)
+                let session = TrafficSession(connectionID: peer.trafficMeter.connectionID, endpoint: endpoint,
+                    onDelta: { _, delta in serverTotals.update { try! $0.add(delta) }; examine() })
+                peer.trafficMeter.onUpdate = session.receive
                 peer.onTraffic = { count in serverLegacy.update { $0 += count } }
                 peer.onMessage = { [weak peer] message in
                     guard message.kind == .clipboard, message.payload == Data(repeating: 7, count: 123) else {
@@ -121,7 +170,10 @@ func runTrafficChecks() {
             }
             let client = Peer(connection: NWConnection(host: "127.0.0.1", port: port, using: SecureTransport.parameters(key: key)), heartbeatInterval: 100)
             defer { client.close(); server.read()?.close(); listener.cancel() }
-            client.trafficMeter.onUpdate = { snapshot in clientTotals.set(snapshot.totals); examine() }
+            let endpoint = try TrafficEndpoint(address: "127.0.0.1", port: port.rawValue)
+            let session = TrafficSession(connectionID: client.trafficMeter.connectionID, endpoint: endpoint,
+                onDelta: { _, delta in clientTotals.update { try! $0.add(delta) }; examine() })
+            client.trafficMeter.onUpdate = session.receive
             client.onTraffic = { count in clientLegacy.update { $0 += count } }
             client.onReady = { [weak client] in client?.send(Message(.clipboard, Data(repeating: 7, count: 123))) }
             client.start()

@@ -90,7 +90,7 @@ python3 -m unittest discover -s scripts/tests -v
 | `run-video-checks.sh` | 编码丢帧恢复、三帧窗口和画质/暂停边界，CoreMedia 数据持有与合成 H.264 编解码；不采集屏幕 |
 | `run-session-data-checks.sh` | 后台数据路由、解码确认、新画面令牌、旧会话隔离与并发指标聚合 |
 | `run-session-effects-checks.sh` | 假音频、假遮罩及会话退出屏障，验证取消和恢复顺序 |
-| `run-traffic-checks.sh` | 临时目录中的设备身份、历史保存及错误处理 |
+| `run-traffic-checks.sh` | 临时目录中的地址/端口统计、旧设备历史保留、历史保存及错误处理 |
 | `run-log-checks.sh` | 临时目录中的日志轮转、并发聚合、隐私字段、文件权限与导出错误恢复 |
 | `run-credential-checks.sh` | 临时目录中的凭据往返、权限、损坏保留、原子写入失败、并发更新及连接记录匹配；不访问真实凭据或钥匙串 |
 | `run-permission-checks.sh` | 独立 bundle ID 的透明面板与合成权限，验证引导自动关闭、切换及手动关闭；检查设置入口不调用主动授权 API |

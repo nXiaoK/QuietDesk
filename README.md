@@ -22,7 +22,7 @@
 | 键盘与权限 | 全屏系统快捷键、Caps Lock 切换输入法、拖拽应用图标授权引导 |
 | 连接与省流 | 最近连接、断线重连、10 分钟空闲暂停，返回窗口恢复 |
 | 后台共享 | 登录后启动、后台共享、显示器变化自动恢复 |
-| 设备流量 | 按同一设备累计发送与接收，换地址仍合并 |
+| 地址流量 | 按网址/IP＋端口累计发送与接收，不同地址或端口分别统计 |
 | 会话设置 | 被控端静音与屏幕黑色遮罩，默认关闭 |
 
 <details>
@@ -33,8 +33,8 @@
 | <img src="docs/images/sharing.png" width="420" alt="共享端的权限、显示器和后台设置"> | <img src="docs/images/fullscreen.png" width="420" alt="全屏画面与悬浮控制菜单"> |
 | **画质与连接** | **文件接收确认** |
 | <img src="docs/images/quality.png" width="420" alt="原分辨率、60 fps 与 100 Mbps 设置"> | <img src="docs/images/clipboard.png" width="420" alt="文件名称、大小及接收确认"> |
-| **键盘与快捷键** | **设备历史流量** |
-| <img src="docs/images/keyboard.png" width="420" alt="系统快捷键与 Caps Lock 设置"> | <img src="docs/images/traffic.png" width="420" alt="按设备累计的收发流量"> |
+| **键盘与快捷键** | **历史流量（截图为旧版界面）** |
+| <img src="docs/images/keyboard.png" width="420" alt="系统快捷键与 Caps Lock 设置"> | <img src="docs/images/traffic.png" width="420" alt="历史流量（旧版按设备统计界面）"> |
 | **静音与黑屏遮罩** | **空闲暂停** |
 | <img src="docs/images/effects.png" width="420" alt="被控端静音与软件黑屏遮罩开关"> | <img src="docs/images/idle.png" width="420" alt="空闲暂停与恢复画面入口"> |
 | **拖拽授权引导** | |

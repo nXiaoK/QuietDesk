@@ -22,7 +22,7 @@ A native macOS remote desktop app for your own Macs. Connect directly over a LAN
 | Keyboard & permissions | Fullscreen system shortcuts, Caps Lock input-source switching, and permission guidance with a draggable app icon |
 | Connections & idle pause | Recent connections, automatic reconnect, and pause after 10 minutes without window input, resuming when you return to the window |
 | Background sharing | Launch after login, share in the background, and recover from display changes |
-| Device traffic | Persistent sent/received totals per device, including after address changes |
+| Endpoint traffic | Persistent sent/received totals by hostname/IP and port |
 | Session controls | Remote mute and a black-screen overlay on the host Mac, both off by default |
 
 <details>
@@ -33,8 +33,8 @@ A native macOS remote desktop app for your own Macs. Connect directly over a LAN
 | <img src="docs/images/sharing.png" width="420" alt="Host permissions, display and background settings"> | <img src="docs/images/fullscreen.png" width="420" alt="Fullscreen desktop with floating controls"> |
 | **Video & connection settings** | **File approval** |
 | <img src="docs/images/quality.png" width="420" alt="Native resolution, 60 fps and 100 Mbps settings"> | <img src="docs/images/clipboard.png" width="420" alt="File names, size and transfer approval"> |
-| **Keyboard & shortcuts** | **Device traffic history** |
-| <img src="docs/images/keyboard.png" width="420" alt="System shortcuts and Caps Lock settings"> | <img src="docs/images/traffic.png" width="420" alt="Per-device sent and received traffic totals"> |
+| **Keyboard & shortcuts** | **Traffic history (earlier UI)** |
+| <img src="docs/images/keyboard.png" width="420" alt="System shortcuts and Caps Lock settings"> | <img src="docs/images/traffic.png" width="420" alt="Traffic history in the earlier per-device UI"> |
 | **Mute & black-screen overlay** | **Idle pause** |
 | <img src="docs/images/effects.png" width="420" alt="Mute and black-screen overlay toggles for the host Mac"> | <img src="docs/images/idle.png" width="420" alt="Paused session with a resume action"> |
 | **Permission guide** | |

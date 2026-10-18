@@ -5,10 +5,10 @@ import SwiftUI
 struct TrafficStatisticsView: View {
     @ObservedObject var model: DeskModel
     let done: () -> Void
-    @State private var selectedDeviceID: UUID?
+    @State private var selectedEndpoint: TrafficEndpoint?
 
-    private var selectedDevice: DeviceTrafficRecord? {
-        model.trafficHistory.first { $0.id == selectedDeviceID }
+    private var selectedRecord: EndpointTrafficRecord? {
+        model.trafficHistory.first { $0.id == selectedEndpoint }
     }
 
     var body: some View {
@@ -17,7 +17,7 @@ struct TrafficStatisticsView: View {
                 Image(systemName: "chart.bar.xaxis")
                     .font(.system(size: 21)).foregroundStyle(.secondary)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("设备历史流量").font(.title3.weight(.semibold))
+                    Text("地址历史流量").font(.title3.weight(.semibold))
                     Text("本机视角 · 包含当前连接 · 1 KB = 1000 字节")
                         .font(.caption).foregroundStyle(.secondary)
                 }
@@ -43,24 +43,24 @@ struct TrafficStatisticsView: View {
 
             if model.trafficHistory.isEmpty {
                 ContentUnavailableView {
-                    Label("暂无设备流量", systemImage: "desktopcomputer")
+                    Label("暂无地址流量", systemImage: "desktopcomputer")
                 } description: {
                     Text(model.trafficHistoryError == nil
-                         ? "与新版 QuietDesk 设备建立连接后，会在这里持续累计。"
+                         ? "按网址/IP＋端口累计，建立连接后开始记录。"
                          : "当前没有可显示的统计，详细原因见上方提示。")
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                Table(model.trafficHistory, selection: $selectedDeviceID) {
-                    TableColumn("设备") { record in
+                Table(model.trafficHistory, selection: $selectedEndpoint) {
+                    TableColumn("网址/IP＋端口") { record in
                         Label {
-                            Text(record.name).lineLimit(1)
+                            Text(record.endpoint.label).textSelection(.enabled).lineLimit(1)
                         } icon: {
                             Image(systemName: "desktopcomputer").foregroundStyle(.secondary)
                         }
-                        .help("\(record.name)\n设备标识：\(record.id.uuidString)")
+                        .help(record.endpoint.label)
                     }
-                    .width(min: 140, ideal: 180, max: 220)
+                    .width(min: 200, ideal: 260, max: 360)
                     TableColumn("本机发送") { record in
                         Text(trafficAmount(Decimal(record.sentBytes)))
                             .monospacedDigit().frame(maxWidth: .infinity, alignment: .trailing)
@@ -85,15 +85,42 @@ struct TrafficStatisticsView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
+            if !model.legacyTrafficHistory.isEmpty {
+                DisclosureGroup("旧版按设备统计（\(model.legacyTrafficHistory.count) 项）") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("旧记录未保存连接地址，无法拆分到网址/IP＋端口；原文件保留，以下数值不混入新增地址统计。")
+                            .font(.caption).foregroundStyle(.secondary)
+                        ScrollView {
+                            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
+                                GridRow {
+                                    Text("设备").frame(maxWidth: .infinity, alignment: .leading)
+                                    Text("本机发送"); Text("本机接收"); Text("合计")
+                                }.font(.caption.weight(.medium))
+                                ForEach(model.legacyTrafficHistory) { record in
+                                    GridRow {
+                                        Text(record.name).lineLimit(1)
+                                            .help("\(record.name)\n首次统计：\(record.firstSeen.formatted(date: .abbreviated, time: .shortened))\n最近连接：\(record.lastSeen.formatted(date: .abbreviated, time: .shortened))")
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                        Text(trafficAmount(Decimal(record.sentBytes))).monospacedDigit()
+                                        Text(trafficAmount(Decimal(record.receivedBytes))).monospacedDigit()
+                                        Text(trafficAmount(record.totalBytes)).monospacedDigit()
+                                    }.font(.caption)
+                                }
+                            }
+                        }.frame(maxHeight: 130)
+                    }.padding(.top, 6)
+                }
+            }
+
             Group {
-                if let selectedDevice {
+                if let selectedRecord {
                     HStack(spacing: 16) {
-                        Text("首次统计：\(selectedDevice.firstSeen.formatted(date: .abbreviated, time: .shortened))")
+                        Text("首次统计：\(selectedRecord.firstSeen.formatted(date: .abbreviated, time: .shortened))")
                         Spacer(minLength: 0)
-                        Text("最近连接：\(selectedDevice.lastSeen.formatted(date: .abbreviated, time: .shortened))")
+                        Text("最近连接：\(selectedRecord.lastSeen.formatted(date: .abbreviated, time: .shortened))")
                     }
                 } else {
-                    Text(model.trafficHistory.isEmpty ? "从建立可识别的连接开始记录。" : "选择设备查看首次统计和最近连接时间。")
+                    Text(model.trafficHistory.isEmpty ? "从建立连接开始记录。" : "选择地址查看首次统计和最近连接时间。")
                         .foregroundStyle(.secondary)
                 }
             }
@@ -101,7 +128,7 @@ struct TrafficStatisticsView: View {
             .frame(height: 18, alignment: .topLeading)
 
             Divider()
-            Text("累计本机与该设备已识别连接的应用层收发，不含 TCP、TLS 等开销。旧版未记录的流量无法追溯，双方新版才能识别；同一设备更换地址仍持续累计，移除连接记录不影响此历史。")
+            Text("控制端按填写的地址＋目标端口累计；被控端按控制端来源 IP＋本机监听端口累计。不同端口分别统计，域名与 IP 不自动合并。仅含应用层收发，不含 TCP/TLS 开销；移除连接记录不删除历史。")
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
@@ -111,7 +138,7 @@ struct TrafficStatisticsView: View {
             }
         }
         .padding(20)
-        .frame(width: 650, height: 500)
+        .frame(width: 760, height: 560)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear { model.flushTrafficHistory() }
         .onDisappear { model.flushTrafficHistory() }

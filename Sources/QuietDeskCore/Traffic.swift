@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 public struct DeviceIdentity: Codable, Equatable, Sendable {
     public let id: UUID
@@ -8,6 +9,59 @@ public struct DeviceIdentity: Codable, Equatable, Sendable {
         let singleLine = name.unicodeScalars.map { $0.properties.generalCategory == .control ? " " : String($0) }.joined()
         let normalized = singleLine.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
         return normalized.isEmpty ? "未命名 Mac" : normalized
+    }
+}
+
+public struct TrafficEndpoint: Codable, Hashable, Sendable {
+    public let address: String
+    public let port: UInt16
+
+    public init(address: String, port: UInt16) throws {
+        var host = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        if host.hasPrefix("["), host.hasSuffix("]") {
+            host = String(host.dropFirst().dropLast())
+            guard host.contains(":") else { throw DeskError.invalid("流量统计的 IPv6 地址无效") }
+        }
+        guard !host.isEmpty, port > 0, !host.contains("/"), !host.contains("["), !host.contains("]"),
+              !host.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) }) else {
+            throw DeskError.invalid("流量统计的地址或端口无效")
+        }
+        if host.contains(":") {
+            let parts = host.split(separator: "%", omittingEmptySubsequences: false)
+            guard parts.count <= 2, let ip = IPv6Address(String(parts[0])),
+                  parts.count == 1 || !parts[1].isEmpty else { throw DeskError.invalid("流量统计的 IPv6 地址无效") }
+            host = ip.debugDescription.lowercased() + (parts.count == 2 ? "%" + parts[1] : "")
+        } else if let ip = IPv4Address(host) { host = ip.debugDescription }
+        else { host = host.lowercased() }
+        self.address = host
+        self.port = port
+    }
+
+    public init(remoteEndpoint: NWEndpoint, listeningPort: UInt16) throws {
+        guard case .hostPort(let host, _) = remoteEndpoint else { throw DeskError.invalid("无法识别连接的来源地址") }
+        try self.init(address: host.debugDescription, port: listeningPort)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(address: values.decode(String.self, forKey: .address), port: values.decode(UInt16.self, forKey: .port))
+    }
+
+    public var label: String { address.contains(":") ? "[\(address)]:\(port)" : "\(address):\(port)" }
+}
+
+public struct EndpointTrafficRecord: Codable, Identifiable, Equatable, Sendable {
+    public let endpoint: TrafficEndpoint
+    public var totals: TrafficTotals
+    public var firstSeen: Date
+    public var lastSeen: Date
+    public var id: TrafficEndpoint { endpoint }
+    public var sentBytes: UInt64 { totals.sentBytes }
+    public var receivedBytes: UInt64 { totals.receivedBytes }
+    public var totalBytes: Decimal { totals.totalBytes }
+
+    public init(endpoint: TrafficEndpoint, totals: TrafficTotals = .init(), firstSeen: Date = Date(), lastSeen: Date = Date()) {
+        self.endpoint = endpoint; self.totals = totals; self.firstSeen = firstSeen; self.lastSeen = lastSeen
     }
 }
 
@@ -66,25 +120,25 @@ public final class TrafficMeter: @unchecked Sendable {
 public final class TrafficSession: @unchecked Sendable {
     public let connectionID: UUID
     private let lock = NSLock()
-    private var identity: DeviceIdentity?
+    private var endpoint: TrafficEndpoint?
     private var latest = TrafficTotals()
     private var applied = TrafficTotals()
-    private let onDelta: (DeviceIdentity, TrafficTotals) -> Void
+    private let onDelta: (TrafficEndpoint, TrafficTotals) -> Void
     private let onError: (String) -> Void
 
     // onDelta enqueues persistence while this session is locked; it must not reenter the session.
-    public init(connectionID: UUID, onDelta: @escaping (DeviceIdentity, TrafficTotals) -> Void,
+    public init(connectionID: UUID, endpoint: TrafficEndpoint? = nil, onDelta: @escaping (TrafficEndpoint, TrafficTotals) -> Void,
                 onError: @escaping (String) -> Void = { _ in }) {
-        self.connectionID = connectionID; self.onDelta = onDelta; self.onError = onError
+        self.connectionID = connectionID; self.endpoint = endpoint; self.onDelta = onDelta; self.onError = onError
     }
 
-    public func bind(_ value: DeviceIdentity) throws {
+    public func bind(_ value: TrafficEndpoint) throws {
         try lock.withLock {
-            if let identity {
-                guard identity.id == value.id else { throw DeskError.invalid("连接中的设备标识发生变化") }
+            if let endpoint {
+                guard endpoint == value else { throw DeskError.invalid("连接中的流量统计地址发生变化") }
                 return
             }
-            identity = value
+            endpoint = value
             applied = latest
             onDelta(value, latest)
         }
@@ -95,12 +149,12 @@ public final class TrafficSession: @unchecked Sendable {
         lock.withLock {
             latest.sentBytes = max(latest.sentBytes, snapshot.totals.sentBytes)
             latest.receivedBytes = max(latest.receivedBytes, snapshot.totals.receivedBytes)
-            guard let identity else { return }
+            guard let endpoint else { return }
             let delta = TrafficTotals(sentBytes: latest.sentBytes - applied.sentBytes,
                                       receivedBytes: latest.receivedBytes - applied.receivedBytes)
             guard delta.sentBytes != 0 || delta.receivedBytes != 0 else { return }
             applied = latest
-            onDelta(identity, delta)
+            onDelta(endpoint, delta)
         }
         if let error = snapshot.error { onError(error) }
     }

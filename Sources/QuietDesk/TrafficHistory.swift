@@ -27,7 +27,8 @@ enum LocalDeviceIdentity {
 }
 
 final class TrafficHistoryStore: @unchecked Sendable {
-    private struct Document: Codable { let version: Int; let records: [DeviceTrafficRecord] }
+    private struct Document: Codable { let version: Int; let records: [EndpointTrafficRecord] }
+    private struct LegacyDocument: Decodable { let version: Int; let records: [DeviceTrafficRecord] }
     static var defaultDirectory: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(AppDataLocation.folderName(), isDirectory: true)
@@ -37,7 +38,9 @@ final class TrafficHistoryStore: @unchecked Sendable {
     private let queue = DispatchQueue(label: "quietdesk.traffic-history", qos: .utility)
     private let queueKey = DispatchSpecificKey<Bool>()
     private var timer: DispatchSourceTimer?
-    private var records: [UUID: DeviceTrafficRecord] = [:]
+    private var records: [TrafficEndpoint: EndpointTrafficRecord] = [:]
+    private var legacyRecords: [DeviceTrafficRecord] = []
+    private var legacyError: String?
     private var dirty = false
     private var unpublished = false
     private var protectsUnreadFile = false
@@ -45,10 +48,10 @@ final class TrafficHistoryStore: @unchecked Sendable {
     private var loadError: String?
     private var writeError: String?
     private var countingError: String?
-    private var observer: (([DeviceTrafficRecord], String?) -> Void)?
+    private var observer: (([EndpointTrafficRecord], [DeviceTrafficRecord], String?) -> Void)?
 
     init(directory: URL = TrafficHistoryStore.defaultDirectory, checkpointInterval: TimeInterval = 1) {
-        url = directory.appendingPathComponent("traffic-history.json")
+        url = directory.appendingPathComponent("traffic-history-v2.json")
         do { localDeviceID = try LocalDeviceIdentity.load(at: directory.appendingPathComponent("device-identity.json")) }
         catch {
             localDeviceID = nil
@@ -56,10 +59,9 @@ final class TrafficHistoryStore: @unchecked Sendable {
         }
         do {
             let document = try JSONDecoder().decode(Document.self, from: Data(contentsOf: url))
-            guard document.version == 1 else { throw DeskError.invalid("历史流量文件版本不受支持") }
-            for var record in document.records {
-                guard records[record.id] == nil else { throw DeskError.invalid("历史流量文件含重复设备标识") }
-                record.name = DeviceIdentity(id: record.id, name: record.name).displayName
+            guard document.version == 2 else { throw DeskError.invalid("地址流量文件版本不受支持") }
+            for record in document.records {
+                guard records[record.id] == nil else { throw DeskError.invalid("地址流量文件含重复地址和端口") }
                 records[record.id] = record
             }
         } catch {
@@ -67,6 +69,23 @@ final class TrafficHistoryStore: @unchecked Sendable {
                 records = [:]
                 protectsUnreadFile = true
                 loadError = "历史流量读取失败：\(error.localizedDescription)。已保留原文件，新增统计暂存内存，尚未写入磁盘。"
+            }
+        }
+        do {
+            let data = try Data(contentsOf: directory.appendingPathComponent("traffic-history.json"))
+            let document = try JSONDecoder().decode(LegacyDocument.self, from: data)
+            guard document.version == 1 else { throw DeskError.invalid("旧版设备流量文件版本不受支持") }
+            var identifiers = Set<UUID>()
+            for var record in document.records {
+                guard identifiers.insert(record.id).inserted else { throw DeskError.invalid("旧版设备流量含重复设备标识") }
+                record.name = DeviceIdentity(id: record.id, name: record.name).displayName
+                legacyRecords.append(record)
+            }
+            legacyRecords.sort { $0.lastSeen > $1.lastSeen }
+        } catch {
+            if !isMissingTrafficFile(error) {
+                legacyRecords = []
+                legacyError = "旧版设备流量读取失败：\(error.localizedDescription)。原文件保持不变，新增地址统计单独保存。"
             }
         }
         queue.setSpecific(key: queueKey, value: true)
@@ -77,20 +96,19 @@ final class TrafficHistoryStore: @unchecked Sendable {
         timer.resume()
     }
 
-    func observe(_ callback: @escaping ([DeviceTrafficRecord], String?) -> Void) {
+    func observe(_ callback: @escaping ([EndpointTrafficRecord], [DeviceTrafficRecord], String?) -> Void) {
         queue.async { self.observer = callback; self.publish() }
     }
 
-    func record(_ identity: DeviceIdentity, delta: TrafficTotals, at date: Date = Date()) {
+    func record(_ endpoint: TrafficEndpoint, delta: TrafficTotals, at date: Date = Date()) {
         queue.async {
             self.unpublished = true
-            var record = self.records[identity.id]
-                ?? DeviceTrafficRecord(id: identity.id, name: identity.displayName, firstSeen: date, lastSeen: date)
+            var record = self.records[endpoint]
+                ?? EndpointTrafficRecord(endpoint: endpoint, firstSeen: date, lastSeen: date)
             do { try record.totals.add(delta) }
             catch { self.countingError = error.localizedDescription; self.publish(); return }
-            record.name = identity.displayName
             record.lastSeen = max(record.lastSeen, date)
-            self.records[identity.id] = record
+            self.records[endpoint] = record
             self.dirty = true
         }
     }
@@ -108,16 +126,16 @@ final class TrafficHistoryStore: @unchecked Sendable {
         queue.async { self.checkpointAndPublish(forcePublish: true) }
     }
 
-    func snapshot() -> (records: [DeviceTrafficRecord], error: String?) {
-        if DispatchQueue.getSpecific(key: queueKey) == true { return (orderedRecords, combinedError) }
-        return queue.sync { (orderedRecords, combinedError) }
+    func snapshot() -> (records: [EndpointTrafficRecord], legacyRecords: [DeviceTrafficRecord], error: String?) {
+        if DispatchQueue.getSpecific(key: queueKey) == true { return (orderedRecords, legacyRecords, combinedError) }
+        return queue.sync { (orderedRecords, legacyRecords, combinedError) }
     }
 
-    private var orderedRecords: [DeviceTrafficRecord] {
-        records.values.sorted { $0.lastSeen == $1.lastSeen ? $0.id.uuidString < $1.id.uuidString : $0.lastSeen > $1.lastSeen }
+    private var orderedRecords: [EndpointTrafficRecord] {
+        records.values.sorted { $0.lastSeen == $1.lastSeen ? $0.endpoint.label < $1.endpoint.label : $0.lastSeen > $1.lastSeen }
     }
     private var combinedError: String? {
-        let messages = [identityError, loadError, writeError, countingError].compactMap { $0 }
+        let messages = [identityError, loadError, legacyError, writeError, countingError].compactMap { $0 }
         return messages.isEmpty ? nil : messages.joined(separator: "\n")
     }
 
@@ -126,7 +144,7 @@ final class TrafficHistoryStore: @unchecked Sendable {
         if dirty, !protectsUnreadFile {
             do {
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                let data = try JSONEncoder().encode(Document(version: 1, records: orderedRecords))
+                let data = try JSONEncoder().encode(Document(version: 2, records: orderedRecords))
                 try data.write(to: url, options: .atomic)
                 dirty = false
                 writeError = nil
@@ -138,7 +156,7 @@ final class TrafficHistoryStore: @unchecked Sendable {
 
     private func publish() {
         unpublished = false
-        observer?(orderedRecords, combinedError)
+        observer?(orderedRecords, legacyRecords, combinedError)
     }
     deinit { timer?.cancel() }
 }

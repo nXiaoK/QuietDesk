@@ -15,6 +15,7 @@ final class HostSession {
     var pauseTask: Task<Void, Never>?
     var paused = false
     var deviceIdentityAdvertised = false
+    var remoteDeviceID: UUID?
 }
 
 @MainActor

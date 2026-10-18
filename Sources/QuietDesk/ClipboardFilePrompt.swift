@@ -122,7 +122,7 @@ struct ClipboardFilePromptView: View {
                     }
                 }
                 Divider()
-                Text("共 \(offer.count) 项 · \(ByteCountFormatter.string(fromByteCount: Int64(clamping: offer.bytes), countStyle: .file))")
+                Text("共 \(offer.count) 项\(offer.entryCount == offer.count ? "" : "（含 \(offer.entryCount) 个文件和文件夹）") · \(ByteCountFormatter.string(fromByteCount: Int64(clamping: offer.bytes), countStyle: .file))")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .monospacedDigit()

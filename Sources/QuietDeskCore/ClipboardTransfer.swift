@@ -41,12 +41,14 @@ public struct ClipboardFileOffer: Identifiable {
     public let id: UUID
     public let names: [String]
     public let count: Int
+    public let entryCount: Int
     public let bytes: UInt64
     public let createdUptime: TimeInterval
 
-    public init(id: UUID, names: [String], count: Int, bytes: UInt64,
+    public init(id: UUID, names: [String], count: Int, bytes: UInt64, entryCount: Int? = nil,
                 createdUptime: TimeInterval = SessionClock.now) {
         self.id = id; self.names = names; self.count = count; self.bytes = bytes
+        self.entryCount = entryCount ?? count
         self.createdUptime = createdUptime
     }
 }
@@ -113,6 +115,12 @@ public enum ClipboardPaths {
 
 // File I/O, protocol ordering and mutable state are confined to queue.
 public final class ClipboardTransfer {
+    public static let maximumFileEntries = 200_000
+
+    public static func previewName(_ name: String) -> String {
+        String(decoding: name.utf8.prefix(120), as: UTF8.self)
+    }
+
     public var onSend: ((Message) -> Void)?
     public var onReceive: ((ClipboardPayload) -> Void)?
     public var onApply: ((ClipboardPayload, @escaping (Bool) -> Void) -> Void)?
@@ -267,7 +275,7 @@ public final class ClipboardTransfer {
                 let names: [String]?
                 let rootCount: Int?
                 if case .files(let urls) = payload {
-                    names = urls.prefix(3).map { String(decoding: $0.lastPathComponent.utf8.prefix(120), as: UTF8.self) }
+                    names = urls.prefix(3).map { Self.previewName($0.lastPathComponent) }
                     rootCount = urls.count
                 } else { names = nil; rootCount = nil }
                 sendJSON(.clipboardBegin, ClipboardBegin(revision: revision, sequence: 0, type: type, count: parts.count,
@@ -358,6 +366,7 @@ public final class ClipboardTransfer {
                                 modified: Date(), url: nil, data: data)])
         case .files(let urls):
             guard !urls.isEmpty else { throw DeskError.invalid("没有可同步的文件") }
+            guard urls.count <= Self.maximumFileEntries else { throw DeskError.invalid("文件数量超过 200000 项，请先压缩后再复制") }
             var parts: [Part] = []
             var roots = Set<String>()
             var pending: [(URL, String)] = []
@@ -380,6 +389,7 @@ public final class ClipboardTransfer {
                 parts.append(Part(path: relative, directory: directory, size: directory ? 0 : UInt64(max(0, values.fileSize ?? 0)),
                                   mode: (attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0o600,
                                   modified: values.contentModificationDate ?? Date(timeIntervalSince1970: 0), url: url, data: nil))
+                guard parts.count <= Self.maximumFileEntries else { throw DeskError.invalid("文件数量超过 200000 项，请先压缩后再复制") }
                 if directory {
                     let children = try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
                     pending.append(contentsOf: children.sorted { $0.lastPathComponent > $1.lastPathComponent }.map { ($0, relative + "/" + $0.lastPathComponent) })
@@ -478,10 +488,16 @@ public final class ClipboardTransfer {
         guard ["text", "png", "files"].contains(value.type), value.count > 0, value.sequence == 0,
               value.type == "files" || value.count == 1,
               value.names == nil || (value.names!.count <= 3 && value.names!.allSatisfy { $0.utf8.count <= 256 }),
+              value.type != "files" || value.names == nil || value.names!.count <= min(3, value.rootCount ?? value.count),
               value.rootCount == nil || (value.rootCount! > 0 && value.rootCount! <= value.count) else {
             throw DeskError.invalid("剪贴板传输信息无效")
         }
-        do { try ClipboardAutomaticLimits.validate(type: value.type, bytes: value.bytes) }
+        do {
+            if value.type == "files", value.count > Self.maximumFileEntries {
+                throw DeskError.invalid("文件数量超过 200000 项，请先压缩后再复制")
+            }
+            try ClipboardAutomaticLimits.validate(type: value.type, bytes: value.bytes)
+        }
         catch {
             sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: 0, reason: error.localizedDescription))
             onStatus?(error.localizedDescription)
@@ -497,7 +513,7 @@ public final class ClipboardTransfer {
             pendingFileOffer = (id, value, created)
             ensureTimer()
             onFileOffer?(ClipboardFileOffer(id: id, names: value.names ?? [], count: value.rootCount ?? value.count,
-                bytes: value.bytes, createdUptime: created))
+                bytes: value.bytes, entryCount: value.count, createdUptime: created))
             onStatus?("收到文件复制请求，确认接收后才会下载（90 秒内）")
             return
         }
@@ -534,14 +550,22 @@ public final class ClipboardTransfer {
         try incoming.handle?.close(); incoming.handle = nil
         let url = try ClipboardPaths.destination(root: incoming.directory, relative: value.path)
         guard !FileManager.default.fileExists(atPath: url.path) else { throw DeskError.invalid("接收的文件路径重复") }
+        let root = String(value.path.split(separator: "/")[0])
+        if incoming.roots.last != root {
+            guard !incoming.roots.contains(root), value.path == root,
+                  incoming.begin.rootCount == nil || incoming.roots.count < incoming.begin.rootCount!,
+                  incoming.begin.names == nil || incoming.roots.count >= incoming.begin.names!.count
+                    || Self.previewName(root) == incoming.begin.names![incoming.roots.count] else {
+                throw DeskError.invalid("文件内容与确认信息不一致")
+            }
+            incoming.roots.append(root)
+        }
         if value.directory { try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]) }
         else {
             let descriptor = Darwin.open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
             guard descriptor >= 0 else { throw DeskError.system("无法创建接收文件，请检查可用磁盘空间", errno) }
             incoming.handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         }
-        let root = String(value.path.split(separator: "/")[0])
-        if !incoming.roots.contains(root) { incoming.roots.append(root) }
         incoming.entries.append(value)
         incoming.remaining = value.bytes
         incoming.sequence = value.sequence
@@ -579,6 +603,9 @@ public final class ClipboardTransfer {
         guard let incoming, incoming.begin.revision == value.revision else { return }
         guard value.sequence == incoming.sequence + 1, incoming.remaining == 0,
               incoming.entries.count == incoming.begin.count, incoming.received == incoming.begin.bytes else { throw DeskError.invalid("文件传输尚未完整结束") }
+        if incoming.begin.type == "files", let rootCount = incoming.begin.rootCount {
+            guard incoming.roots.count == rootCount else { throw DeskError.invalid("文件传输尚未完整结束") }
+        }
         try incoming.handle?.close(); incoming.handle = nil
         for entry in incoming.entries.reversed() {
             let url = try ClipboardPaths.destination(root: incoming.directory, relative: entry.path)

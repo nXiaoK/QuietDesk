@@ -2,6 +2,167 @@ import Foundation
 import QuietDeskCore
 
 func runFileApprovalChecks() {
+    let invalidRoots: [(String, Int, Int, [String], [(String, Bool)], Bool)] = [
+        ("File roots must match the names shown in the confirmation", 1, 1, ["report.pdf"], [("other.pdf", false)], false),
+        ("File roots cannot exceed the confirmed root count", 2, 1, ["first"], [("first", false), ("second", false)], false),
+        ("File completion requires every confirmed root", 2, 2, ["folder"], [("folder", true), ("folder/child", false)], true),
+        ("File roots cannot interleave their entries", 3, 2, ["first", "second"], [("first", true), ("second", true), ("first/child", false)], false),
+        ("The first entry of each file root must describe the root itself", 1, 1, ["folder"], [("folder/child", false)], false)
+    ]
+    for (name, count, rootCount, names, entries, finish) in invalidRoots {
+        run(name) {
+            try withCheckFolder { folder in
+                let storage = folder.appendingPathComponent("receiver")
+                let receiver = ClipboardTransfer(storage: storage, requireFileApproval: true)
+                let revision: [String: Any] = ["counter": 1, "origin": UUID().uuidString]
+                let cancelled = DispatchSemaphore(value: 0), retried = DispatchSemaphore(value: 0), stopped = DispatchSemaphore(value: 0)
+                let published = Box(false), offered = Box(false)
+                receiver.onFileOffer = { [weak receiver] offer in
+                    if let offer {
+                        if offer.names == ["retry"] { retried.signal() }
+                        else { offered.set(true); receiver?.respondToFileOffer(id: offer.id, accept: true) }
+                    }
+                }
+                receiver.onReceive = { _ in published.set(true) }
+                receiver.onSend = { if $0.kind == .clipboardCancel { cancelled.signal() } }
+                defer { receiver.stop() }
+                let begin: [String: Any] = ["revision": revision, "sequence": 0, "type": "files", "count": count,
+                    "bytes": 0, "names": names, "rootCount": rootCount]
+                let approved = DispatchSemaphore(value: 0)
+                receiver.onStatus = { if $0.hasPrefix("正在接收剪贴板") { approved.signal() } }
+                receiver.receive(Message(.clipboardBegin, try JSONSerialization.data(withJSONObject: begin)))
+                try wait(approved, "Confirmed transfer did not start")
+                for (index, entry) in entries.enumerated() {
+                    let value: [String: Any] = ["revision": revision, "sequence": index + 1, "path": entry.0,
+                        "directory": entry.1, "bytes": 0, "mode": 0o700, "modified": 0]
+                    receiver.receive(Message(.clipboardEntry, try JSONSerialization.data(withJSONObject: value)))
+                }
+                if finish {
+                    let end: [String: Any] = ["revision": revision, "sequence": entries.count + 1]
+                    receiver.receive(Message(.clipboardEnd, try JSONSerialization.data(withJSONObject: end)))
+                }
+                try wait(cancelled, "Inconsistent confirmed roots were not cancelled")
+                let retry: [String: Any] = ["revision": ["counter": 2, "origin": UUID().uuidString], "sequence": 0,
+                    "type": "files", "count": 1, "rootCount": 1, "names": ["retry"], "bytes": 0]
+                receiver.receive(Message(.clipboardBegin, try JSONSerialization.data(withJSONObject: retry)))
+                try wait(retried, "Rejected roots prevented the next file offer")
+                try check(offered.read() && !published.read(), "Inconsistent file roots were published")
+                let partial = storage.appendingPathComponent("partial")
+                let instances = try FileManager.default.contentsOfDirectory(at: partial, includingPropertiesForKeys: nil)
+                try check(instances.allSatisfy { (try? FileManager.default.contentsOfDirectory(atPath: $0.path)) == [".lease"] }
+                          && !FileManager.default.fileExists(atPath: storage.appendingPathComponent("received").path),
+                          "Rejected transfer left file contents in storage")
+                receiver.stop { stopped.signal() }; try wait(stopped, "Receiver did not finish cleanup")
+            }
+        }
+    }
+
+    run("File offers over the entry limit only cancel and never request approval") {
+        try withCheckFolder { folder in
+            let receiver = ClipboardTransfer(storage: folder, requireFileApproval: true)
+            let cancelled = DispatchSemaphore(value: 0), stopped = DispatchSemaphore(value: 0)
+            let messages = Box<[MessageKind]>([]), offered = Box(false), status = Box("")
+            receiver.onFileOffer = { if $0 != nil { offered.set(true) } }
+            receiver.onStatus = { status.set($0) }
+            receiver.onSend = { message in messages.update { $0.append(message.kind) }; if message.kind == .clipboardCancel { cancelled.signal() } }
+            let begin: [String: Any] = ["revision": ["counter": 1, "origin": UUID().uuidString], "sequence": 0,
+                "type": "files", "count": ClipboardTransfer.maximumFileEntries + 1, "bytes": 0]
+            receiver.receive(Message(.clipboardBegin, try JSONSerialization.data(withJSONObject: begin)))
+            try wait(cancelled, "Oversized file offer did not cancel")
+            receiver.stop { stopped.signal() }; try wait(stopped, "Receiver did not stop")
+            try check(messages.read() == [.clipboardCancel] && !offered.read() && status.read().contains("200000"),
+                      "Oversized file offer prompted, acknowledged or lost its reason")
+        }
+    }
+
+    run("File preview names cannot outnumber the confirmed roots") {
+        try withCheckFolder { folder in
+            let receiver = ClipboardTransfer(storage: folder, requireFileApproval: true)
+            let rejected = DispatchSemaphore(value: 0), stopped = DispatchSemaphore(value: 0), offered = Box(false)
+            receiver.onStatus = { if $0.contains("剪贴板传输信息无效") { rejected.signal() } }
+            receiver.onFileOffer = { if $0 != nil { offered.set(true) } }
+            let begin: [String: Any] = ["revision": ["counter": 1, "origin": UUID().uuidString], "sequence": 0,
+                "type": "files", "count": 2, "rootCount": 1, "names": ["first", "second"], "bytes": 0]
+            receiver.receive(Message(.clipboardBegin, try JSONSerialization.data(withJSONObject: begin)))
+            try wait(rejected, "Inconsistent preview count was not rejected")
+            receiver.stop { stopped.signal() }; try wait(stopped, "Receiver did not stop")
+            try check(!offered.read(), "Inconsistent preview names reached confirmation")
+        }
+    }
+
+    run("Multiple roots preserve exact bytes when a preview truncates a Chinese character") {
+        try withCheckFolder { folder in
+            let longName = String(repeating: "文", count: 39) + "ab界长名称"
+            let root = folder.appendingPathComponent(longName), second = folder.appendingPathComponent("second.bin")
+            let childBytes = Data([0, 1, 254, 255]), secondBytes = Data(repeating: 73, count: 40_000)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try childBytes.write(to: root.appendingPathComponent("child.bin")); try secondBytes.write(to: second)
+            let sender = ClipboardTransfer(storage: folder.appendingPathComponent("sender"))
+            let receiver = ClipboardTransfer(storage: folder.appendingPathComponent("receiver"), requireFileApproval: true)
+            let done = DispatchSemaphore(value: 0), correct = Box(false), success = Box(false), offerValid = Box(false)
+            sender.onSend = { receiver.receive($0) }; receiver.onSend = { sender.receive($0) }
+            receiver.onFileOffer = { [weak receiver] offer in
+                if let offer {
+                    offerValid.set(offer.count == 2 && offer.entryCount == 3 && offer.names == [ClipboardTransfer.previewName(longName), "second.bin"]
+                                   && offer.names[0].contains("�"))
+                    receiver?.respondToFileOffer(id: offer.id, accept: true)
+                }
+            }
+            receiver.onReceive = { payload in
+                if case .files(let urls) = payload, urls.count == 2 {
+                    correct.set(urls[0].lastPathComponent == longName && (try? Data(contentsOf: urls[0].appendingPathComponent("child.bin"))) == childBytes
+                        && (try? Data(contentsOf: urls[1])) == secondBytes)
+                }
+            }
+            defer { stopTransfers(sender, receiver) }
+            sender.send(.files([root, second])) { success.set($0); done.signal() }
+            try wait(done, "Truncated-preview roots did not finish")
+            try check(success.read() && correct.read() && offerValid.read(), "Preview truncation changed names, root counts or bytes")
+        }
+    }
+
+    run("Legacy file transfers without names or root counts still complete after approval") {
+        try withCheckFolder { folder in
+            let file = folder.appendingPathComponent("legacy.bin"), bytes = Data([7, 8, 9])
+            try bytes.write(to: file)
+            let sender = ClipboardTransfer(storage: folder.appendingPathComponent("sender"))
+            let receiver = ClipboardTransfer(storage: folder.appendingPathComponent("receiver"), requireFileApproval: true)
+            let done = DispatchSemaphore(value: 0), correct = Box(false), success = Box(false), legacyOffer = Box(false)
+            sender.onSend = { message in
+                if message.kind == .clipboardBegin,
+                   var value = try? JSONSerialization.jsonObject(with: message.payload) as? [String: Any] {
+                    value.removeValue(forKey: "names"); value.removeValue(forKey: "rootCount")
+                    receiver.receive(Message(.clipboardBegin, try! JSONSerialization.data(withJSONObject: value)))
+                } else { receiver.receive(message) }
+            }
+            receiver.onSend = { sender.receive($0) }
+            receiver.onFileOffer = { [weak receiver] offer in
+                if let offer { legacyOffer.set(offer.names.isEmpty && offer.count == 1 && offer.entryCount == 1); receiver?.respondToFileOffer(id: offer.id, accept: true) }
+            }
+            receiver.onReceive = { if case .files(let urls) = $0 { correct.set((try? Data(contentsOf: urls[0])) == bytes) } }
+            defer { stopTransfers(sender, receiver) }
+            sender.send(.files([file])) { success.set($0); done.signal() }
+            try wait(done, "Legacy file transfer did not finish")
+            try check(success.read() && correct.read() && legacyOffer.read(), "Legacy transfer behavior changed")
+        }
+    }
+
+    run("Preparing too many file roots fails before any transfer begins") {
+        try withCheckFolder { folder in
+            let sender = ClipboardTransfer(storage: folder)
+            let done = DispatchSemaphore(value: 0), stopped = DispatchSemaphore(value: 0)
+            let messages = Box<[MessageKind]>([]), success = Box(true), status = Box("")
+            sender.onSend = { message in messages.update { $0.append(message.kind) } }
+            sender.onStatus = { status.set($0) }
+            sender.send(.files(Array(repeating: folder.appendingPathComponent("unused"), count: ClipboardTransfer.maximumFileEntries + 1))) {
+                success.set($0); done.signal()
+            }
+            try wait(done, "Oversized local file selection did not finish")
+            sender.stop { stopped.signal() }; try wait(stopped, "Sender did not stop")
+            try check(!success.read() && messages.read().isEmpty && status.read().contains("200000"), "Oversized selection sent a begin or failed for a different reason")
+        }
+    }
+
     run("File offers send metadata only, then transfer exact bytes after explicit acceptance") {
         try withCheckFolder { folder in
             let file = folder.appendingPathComponent("项目.bin")

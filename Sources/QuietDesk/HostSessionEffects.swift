@@ -234,6 +234,7 @@ final class SessionAudioExitBarrier {
 @MainActor
 private final class SessionAudioClient: SessionAudioControlling {
     static let watchdogArgument = "--quietdesk-session-audio-watchdog-v1"
+    private static let readerQueue = DispatchQueue(label: "quietdesk.session-audio.reader")
     private(set) var isMuted = false
     var onChange: ((Bool, String?) -> Void)?
     private var process: Process?
@@ -247,7 +248,6 @@ private final class SessionAudioClient: SessionAudioControlling {
     private let exitBarrier = SessionAudioExitBarrier()
     private var processHasExited = false
     private var outputHasEnded = false
-    private var outputReader: Task<Void, Never>?
     private struct Pending {
         let continuation: CheckedContinuation<SessionAudioReply, Error>
         let timeout: Task<Void, Never>
@@ -330,7 +330,6 @@ private final class SessionAudioClient: SessionAudioControlling {
         do { try process.run() }
         catch {
             self.process = nil
-            output?.readabilityHandler = nil
             try? output?.close(); try? input?.close()
             output = nil; input = nil
             exitBarrier.finish(token, error: error.localizedDescription)
@@ -339,13 +338,13 @@ private final class SessionAudioClient: SessionAudioControlling {
         try? incoming.fileHandleForReading.close()
         try? outgoing.fileHandleForWriting.close()
         let reader = outgoing.fileHandleForReading
-        outputReader = Task.detached { [weak self] in
+        Self.readerQueue.async { [weak self] in
             do {
                 while let data = try reader.read(upToCount: 65_536), !data.isEmpty {
-                    await self?.receive(data, token: token)
+                    DispatchQueue.main.async { MainActor.assumeIsolated { self?.receive(data, token: token) } }
                 }
             } catch {}
-            await self?.finishReading(token)
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.finishReading(token) } }
         }
     }
 
@@ -415,10 +414,8 @@ private final class SessionAudioClient: SessionAudioControlling {
     private func finishExitIfReady() {
         guard processHasExited, outputHasEnded, process != nil else { return }
         let token = processID
-        output?.readabilityHandler = nil
         try? output?.close(); try? input?.close()
         output = nil; input = nil; process = nil
-        outputReader = nil
         restoreTask = nil
         let expected = closing
         closing = false

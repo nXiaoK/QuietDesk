@@ -148,6 +148,14 @@ public struct MediaPathPolicy: Sendable {
         lastPongAt = now
     }
 
+    // The coordinator calls this only after an actual media attempt fails. A capture
+    // preparation rejection is not evidence that the network path cannot carry media.
+    public mutating func mediaFailed(epoch: UInt32, now: TimeInterval) -> [MediaPathAction] {
+        guard accept(now), !paused, self.epoch == epoch, targetPath == .udp,
+              phase == .trialUDP || phase == .udp else { return [] }
+        return fallBack(now: now, reason: .mediaTimeout)
+    }
+
     @discardableResult
     public mutating func mediaBecameUsable(epoch: UInt32, now: TimeInterval) -> Bool {
         guard accept(now), !paused, phase != .stopped, self.epoch == epoch else { return false }

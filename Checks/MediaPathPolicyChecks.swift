@@ -97,6 +97,40 @@ func runMediaPathPolicyChecks() {
                   "Pongs alone kept an unusable media path")
     }
 
+    run("A failed real UDP media trial immediately requests TCP and starts recovery cooldown") {
+        var policy = MediaPathPolicy(capable: true, now: 0)
+        try check(policy.mediaFailed(epoch: 0, now: 0).isEmpty, "Initial preparation failure selected a path")
+        _ = policy.tick(now: 0)
+        try check(policy.mediaFailed(epoch: 0, now: 0.1).isEmpty, "Probe-stage failure was treated as media failure")
+        guard let id = policy.probeID else { throw CheckFailure("No probe") }
+        _ = policy.probeSucceeded(id: id, now: 0.2)
+        let failedEpoch = policy.epoch
+        try check(policy.mediaFailed(epoch: failedEpoch - 1, now: 0.3).isEmpty, "A stale media failure changed the path")
+        let actions = policy.mediaFailed(epoch: failedEpoch, now: 0.4)
+        try check(actions == [.selectPath(.tcp, epoch: failedEpoch + 1, reason: .mediaTimeout)]
+                  && policy.nextRecoveryAt == 30.4 && policy.recoveryAttempt == 1,
+                  "A real-media failure retried UDP instead of entering TCP cooldown")
+        try check(policy.mediaFailed(epoch: failedEpoch, now: 0.5).isEmpty, "A repeated failure selected another epoch")
+        try check(policy.mediaBecameUsable(epoch: policy.epoch, now: 0.6), "TCP fallback could not commit")
+        try check(policy.tick(now: 30.39).isEmpty, "Media failure skipped recovery cooldown")
+        try check(policy.tick(now: 30.4).count == 1 && policy.phase == .probingRecovery,
+                  "Media failure did not allow a later bounded recovery probe")
+        var paused = try udp()
+        _ = paused.setPaused(true, now: 1)
+        try check(paused.mediaFailed(epoch: paused.epoch, now: 2).isEmpty, "Paused media was treated as a failed path")
+        var legacy = MediaPathPolicy(capable: false, now: 0)
+        try check(legacy.mediaFailed(epoch: 0, now: 1).isEmpty, "Legacy mode entered media recovery")
+        var stable = try udp()
+        for step in 1...5 {
+            let now = Double(step) + 0.2
+            stable.receivedPong(epoch: stable.epoch, now: now)
+            _ = stable.observe(sample(), epoch: stable.epoch, now: now)
+        }
+        try check(stable.phase == .udp
+                  && stable.mediaFailed(epoch: stable.epoch, now: 6.2) == [.selectPath(.tcp, epoch: 2, reason: .mediaTimeout)],
+                  "An already active UDP media failure did not request TCP")
+    }
+
     run("Network degradation requires three effective seconds, reduces load, then trials TCP") {
         var policy = try udp()
         var actions: [MediaPathAction] = []

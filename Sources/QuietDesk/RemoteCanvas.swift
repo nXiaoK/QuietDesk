@@ -167,7 +167,7 @@ final class MediaCanvasReceiver: @unchecked Sendable {
 @MainActor
 final class RemoteCanvas: NSView {
     private let videoLayer = AVSampleBufferDisplayLayer()
-    private var decoder = VideoDecoder()
+    private var decoder: MediaCanvasDecoding = VideoDecoder()
     private var mailbox = LatestFrameMailbox()
     private var diagnostics: PerformanceDiagnostics?
     private var mediaReceiver: MediaCanvasReceiver?
@@ -306,13 +306,14 @@ final class RemoteCanvas: NSView {
         addTrackingArea(area)
     }
 
-    func makeVideoReceiver(diagnostics: PerformanceDiagnostics? = nil) -> (VideoPacket, @escaping () -> Void) -> Void {
+    func makeVideoReceiver(diagnostics: PerformanceDiagnostics? = nil,
+                           makeDecoder: (PerformanceDiagnostics?) -> MediaCanvasDecoding = { VideoDecoder(diagnostics: $0) }) -> (VideoPacket, @escaping () -> Void) -> Void {
         mediaReceiverID = nil
         mediaReceiver?.stop()
         mediaReceiver = nil
         decoder.stop()
         mailbox.stopDiagnostics()
-        decoder = VideoDecoder(diagnostics: diagnostics)
+        decoder = makeDecoder(diagnostics)
         mailbox = LatestFrameMailbox(diagnostics: diagnostics)
         self.diagnostics = diagnostics
         let inbox = mailbox
@@ -342,15 +343,14 @@ final class RemoteCanvas: NSView {
     func makeMediaReceiver(diagnostics: PerformanceDiagnostics? = nil,
                            makeDecoder: @escaping (PerformanceDiagnostics?) -> MediaCanvasDecoding = { VideoDecoder(diagnostics: $0) }) -> MediaCanvasReceiver {
         mediaReceiver?.stop()
-        decoder.stop()
-        mailbox.stopDiagnostics()
-        mailbox = LatestFrameMailbox(diagnostics: diagnostics)
         self.diagnostics = diagnostics
         let token = UUID()
         mediaReceiverID = token
         let receiver = MediaCanvasReceiver(diagnostics: diagnostics, makeDecoder: makeDecoder) { [weak self] inbox in
             guard let self, self.mediaReceiverID == token else { return }
             if self.mailbox !== inbox {
+                self.decoder.stop()
+                self.mailbox.stopDiagnostics()
                 self.videoLayer.stopRequestingMediaData()
                 self.awaitingDisplay = false
                 self.videoLayer.flush()

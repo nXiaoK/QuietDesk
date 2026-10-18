@@ -246,6 +246,28 @@ private struct RemoteCanvasChecks {
             try require(!canvas.isInputTarget(of: otherWindow), "Another window's input reached the canvas")
         }
 
+        run("Preparing media keeps temporary legacy video live until the new stream commits") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            let legacyDecoder = CanvasDecoderProbe(), mediaDecoder = CanvasDecoderProbe()
+            let legacy = canvas.makeVideoReceiver(makeDecoder: { _ in legacyDecoder })
+            let receiver = canvas.makeMediaReceiver(makeDecoder: { _ in mediaDecoder })
+            defer { receiver.stop(); canvas.reset() }
+            let old = try mediaFrame(stream: .init(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1), id: 1, keyFrame: true)
+            let pixel = try canvasPixel()
+            var acknowledged = false
+            legacy(old.packet) { acknowledged = true }
+            try require(!legacyDecoder.stopped && legacyDecoder.pendingCount == 1,
+                        "UDP preparation stopped the temporary TCP decoder")
+            legacyDecoder.finish(old.packet.sequence, .success(pixel))
+            try require(acknowledged, "Temporary TCP video lost its decode acknowledgement")
+            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
+            receiver.receive(try mediaFrame(stream: stream, id: 1, keyFrame: true)) { _ in }
+            mediaDecoder.finish(1, .success(pixel))
+            try require(receiver.commit(stream: stream), "Decoded media candidate did not commit")
+            drainCanvasDisplay()
+            try require(legacyDecoder.stopped, "Committed media left the temporary TCP decoder running")
+        }
+
         run("Candidate media acknowledges off the main queue and draws only after a decoded IDR commit") {
             let decoder = CanvasDecoderProbe(), results = CanvasLocked<[Bool]>([])
             let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)

@@ -3,6 +3,13 @@ import Network
 import Security
 
 public enum SecureTransport {
+    static let pairingFailureCodes: [OSStatus] = [errSSLBadRecordMac, errSSLPeerDecryptError, errSSLPeerHandshakeFail]
+
+    public static func tlsFailure(code: OSStatus, description: String, afterReady: Bool) -> (reason: String, retryable: Bool) {
+        if afterReady { return ("连接加密校验失败：\(description)", true) }
+        return ("TLS 握手失败：\(description)", !pairingFailureCodes.contains(code))
+    }
+
     public static func connectionFailureReason(_ error: NWError) -> String? {
         guard case .posix(let code) = error else { return nil }
         switch code {
@@ -134,11 +141,12 @@ public final class Peer {
                     self.receiveHeader()
                 case .failed(let error):
                     if case .tls(let code) = error {
-                        self.finish("TLS 握手失败：\(error.localizedDescription)", retryable: ![errSSLBadRecordMac, errSSLPeerDecryptError, errSSLPeerHandshakeFail].contains(code))
+                        let failure = SecureTransport.tlsFailure(code: code, description: error.localizedDescription, afterReady: self.ready)
+                        self.finish(failure.reason, retryable: failure.retryable)
                     }
                     else { self.finish(SecureTransport.connectionFailureReason(error) ?? "连接失败：\(error.localizedDescription)") }
                 case .waiting(let error):
-                    if case .tls(let code) = error, [errSSLBadRecordMac, errSSLPeerDecryptError, errSSLPeerHandshakeFail].contains(code) {
+                    if case .tls(let code) = error, SecureTransport.pairingFailureCodes.contains(code) {
                         self.finish("TLS 配对验证失败：\(error.localizedDescription)", retryable: false)
                     } else if let reason = SecureTransport.connectionFailureReason(error) {
                         self.finish(reason)

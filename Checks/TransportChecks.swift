@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import Security
 import QuietDeskCore
 
 func runTransportChecks() {
@@ -9,6 +10,25 @@ func runTransportChecks() {
         }
         try check(SecureTransport.connectionFailureReason(.posix(.EAGAIN)) == nil, "Transient wait was classified as fatal")
         try check(SecureTransport.connectionFailureReason(.tls(-9800)) == nil, "TLS error was classified as network failure")
+    }
+
+    run("Pairing TLS failures before readiness stop reconnecting") {
+        for code in [errSSLBadRecordMac, errSSLPeerDecryptError, errSSLPeerHandshakeFail] {
+            let failure = SecureTransport.tlsFailure(code: code, description: "test", afterReady: false)
+            try check(!failure.retryable && failure.reason == "TLS 握手失败：test", "Pairing failure changed classification")
+        }
+    }
+
+    run("Other TLS failures before readiness remain retryable") {
+        let failure = SecureTransport.tlsFailure(code: errSSLProtocol, description: "test", afterReady: false)
+        try check(failure.retryable && failure.reason == "TLS 握手失败：test", "Transient handshake failure stopped reconnecting")
+    }
+
+    run("TLS failures in established sessions remain retryable with a session reason") {
+        for code in [errSSLBadRecordMac, errSSLPeerDecryptError, errSSLPeerHandshakeFail, errSSLProtocol] {
+            let failure = SecureTransport.tlsFailure(code: code, description: "test", afterReady: true)
+            try check(failure.retryable && failure.reason == "连接加密校验失败：test", "Session failure was classified as a pairing failure")
+        }
     }
 
     if CommandLine.arguments.contains("--skip-network") { return }

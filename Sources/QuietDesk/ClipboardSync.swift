@@ -156,6 +156,7 @@ final class ClipboardSync {
                 if self.imagePreparation != nil {
                     self.imagePreparation = nil
                     self.sendingChange = nil
+                    let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
                 }
                 let change = self.pasteboard.changeCount
                 self.pendingFileOffer = (offer.id, change)

@@ -830,6 +830,32 @@ private struct ClipboardFocusChecks {
                         "The old TIFF copy returned to the remote clipboard")
         }
 
+        run("A remote file offer settles TIFF paste waiters before conversion completes") { folder in
+            let probe = ImageConversionProbe()
+            let pair = ClipboardPair(storage: folder, localAllowed: true, remoteAllowed: true,
+                                     convertLocalTIFF: { probe.convert($0) })
+            defer { probe.release.signal(); pair.stop() }
+            let file = folder.appendingPathComponent("remote.bin")
+            try Data([7, 8, 9]).write(to: file)
+            var offer: ClipboardFileOffer?, results: [Bool] = []
+            pair.localSync.onFileOffer = { offer = $0 }
+            pair.local.copy(.text(Data("older local TIFF".utf8)))
+            pair.local.rawTIFF = Data([1, 2, 3])
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Local TIFF preparation did not start") { probe.state.began }
+            pair.localSync.prepareForPaste { results.append($0) }
+            try require(results.isEmpty, "TIFF paste did not wait for conversion")
+            pair.remote.copy(.files([file]))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("Remote file offer did not settle the TIFF paste") { offer != nil && results == [false] }
+            try require(pair.localMessages.isEmpty, "Superseded TIFF preparation started a transfer")
+            pair.localSync.respondToFileOffer(id: offer!.id, accept: false)
+            probe.release.signal()
+            pump(for: 0.15)
+            try require(results == [false] && !pair.localMessages.contains(.clipboardBegin) && pair.remote.writes == 0,
+                        "TIFF paste completed twice or the superseded image was sent")
+        }
+
         run("A newer local TIFF copy cancels an older receiving PNG before conversion completes") { folder in
             guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2,
                 bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,

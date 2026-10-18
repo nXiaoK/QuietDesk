@@ -51,6 +51,8 @@ private func mouse(_ type: CGEventType, button: CGMouseButton = .left,
 private struct RemoteCanvasChecks {
     @MainActor
     static func main() {
+        _ = NSApplication.shared
+        NSApp.setActivationPolicy(.accessory)
         var passed = 0, failed = 0
         func run(_ name: String, _ body: () throws -> Void) {
             do { try body(); passed += 1; print("PASS \(name)") }
@@ -124,6 +126,34 @@ private struct RemoteCanvasChecks {
             canvas.scrollWheel(with: try wheel(units: .pixel, x: 4000, y: -4000))
             try require(inputs.count == 1 && inputs[0].deltaX == 3000 && inputs[0].deltaY == -3000,
                         "Scroll deltas exceeded the protocol bounds")
+        }
+
+        run("Releasing a focused canvas notifies release and lost focus exactly once") {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+                                  styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            defer { window.close() }
+            let canvas = RemoteCanvas(frame: window.contentView!.bounds)
+            canvas.canControl = true
+            window.contentView = canvas
+            try require(window.makeFirstResponder(canvas), "Canvas could not become first responder")
+            var releases = 0
+            var focuses: [Bool] = []
+            canvas.onRelease = { releases += 1 }
+            canvas.onFocus = { focuses.append($0) }
+            canvas.releaseControl()
+            try require(window.firstResponder !== canvas, "Canvas retained focus after release")
+            try require(releases == 1 && focuses == [false], "Focused release notified more than once")
+        }
+
+        run("Releasing a canvas without focus still notifies exactly once") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            var releases = 0
+            var focuses: [Bool] = []
+            canvas.onRelease = { releases += 1 }
+            canvas.onFocus = { focuses.append($0) }
+            canvas.releaseControl()
+            try require(releases == 1 && focuses == [false], "Unfocused release notification changed")
         }
 
         print("\(passed) passed, \(failed) failed")

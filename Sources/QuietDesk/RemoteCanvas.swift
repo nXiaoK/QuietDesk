@@ -214,15 +214,15 @@ final class RemoteCanvas: NSView {
     }
 
     func releaseControl() {
+        interactionRevision &+= 1
+        if window?.firstResponder === self, window?.makeFirstResponder(nil) == true { return }
         systemShortcutMonitor.stop()
         shortcutStartAttempted = false
         publishShortcutStatus("全屏控制画面获得焦点后自动转发系统快捷键", running: false)
-        interactionRevision &+= 1
         capsLockMonitor.reset()
         localShortcutKeys.removeAll()
         onRelease?()
         onFocus?(false)
-        if window?.firstResponder === self { window?.makeFirstResponder(nil) }
     }
 
     override func becomeFirstResponder() -> Bool {
@@ -370,7 +370,6 @@ final class RemoteCanvas: NSView {
             return
         }
         if SystemShortcutRouting.localAction(keyCode: event.keyCode, flags: UInt64(event.modifierFlags.rawValue)) == .releaseControl {
-            localShortcutKeys.insert(event.keyCode)
             releaseControl()
             return
         }

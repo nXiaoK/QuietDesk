@@ -151,6 +151,7 @@ final class ClipboardSync {
         transfer.onFileOffer = { [weak self] offer in
             DispatchQueue.main.async {
                 guard let self, self.running, let offer else { return }
+                self.lastSharedMarker = nil
                 self.cancelImageApplication()
                 if self.imagePreparation != nil {
                     self.imagePreparation = nil

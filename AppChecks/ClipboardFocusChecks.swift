@@ -168,6 +168,45 @@ private struct ClipboardFocusChecks {
             try require(pair.localMessages.filter { $0 == .clipboardBegin }.count == 1, "Focus changes resent an unchanged copy")
         }
 
+        run("A fresh identical text copy resends after declining a remote file offer") { folder in
+            let pair = ClipboardPair(storage: folder, localAllowed: true)
+            defer { pair.stop() }
+            let file = folder.appendingPathComponent("remote.bin")
+            try Data([1, 2, 3]).write(to: file)
+            var events: [ClipboardSync.DiagnosticEvent] = [], offer: ClipboardFileOffer?
+            pair.localSync.onDiagnostic = { events.append($0) }
+            pair.localSync.onFileOffer = { offer = $0 }
+            pair.local.copy(.text(Data("hello".utf8)))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Initial text did not finish synchronizing") { events.contains(.sent(.text, fileCount: 0)) }
+            pair.remote.copy(.files([file]))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("Remote file did not request approval") { offer != nil }
+            pair.localSync.respondToFileOffer(id: offer!.id, accept: false)
+            try eventually("Declined file offer did not close") { offer == nil }
+            pair.local.copy(.text(Data("hello".utf8)))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Fresh identical text was suppressed after a remote file offer") {
+                pair.localMessages.filter { $0 == .clipboardBegin }.count == 2 && pair.remote.copiedText == "hello"
+            }
+            try require(pair.remote.writes == 2, "Fresh text did not replace the remote files")
+        }
+
+        run("Repeated identical text copies without a remote file offer still avoid duplicate sends") { folder in
+            let pair = ClipboardPair(storage: folder, localAllowed: true)
+            defer { pair.stop() }
+            var events: [ClipboardSync.DiagnosticEvent] = []
+            pair.localSync.onDiagnostic = { events.append($0) }
+            pair.local.copy(.text(Data("hello".utf8)))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Initial text did not finish synchronizing") { events.contains(.sent(.text, fileCount: 0)) }
+            pair.local.copy(.text(Data("hello".utf8)))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            pump(for: 0.65)
+            try require(pair.localMessages.filter { $0 == .clipboardBegin }.count == 1 && pair.remote.writes == 1,
+                        "An identical clipboard manager rewrite was sent again")
+        }
+
         run("Remote clipboard stays unread during control, then sends latest on release without echo") { folder in
             let pair = ClipboardPair(storage: folder)
             defer { pair.stop() }

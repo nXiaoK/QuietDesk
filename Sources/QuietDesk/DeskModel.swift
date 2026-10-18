@@ -37,11 +37,9 @@ final class DeskModel: ObservableObject {
     @Published private(set) var trafficHistory: [DeviceTrafficRecord] = []
     @Published private(set) var trafficHistoryError: String?
     @Published private(set) var trafficHistoryStatus = "从本版开始按设备累计；旧版设备需双方升级。"
-    @Published private(set) var currentTrafficDeviceID: UUID?
     @Published var frameRate = "0 fps"
     @Published var latency = "— ms"
     @Published private(set) var performanceDiagnosticsEnabled = false
-    @Published private(set) var roundTripMilliseconds: Double?
     @Published var showFullScreenStatistics = UserDefaults.standard.bool(forKey: "showFullScreenStatistics") {
         didSet { UserDefaults.standard.set(showFullScreenStatistics, forKey: "showFullScreenStatistics") }
     }
@@ -56,7 +54,7 @@ final class DeskModel: ObservableObject {
     @Published private(set) var capsLockRunning = false
     @Published var isFullScreen = false
     @Published private(set) var capsLockEnabled = UserDefaults.standard.bool(forKey: "capsLockActions")
-    @Published private(set) var supportsInputActions = false
+    private var supportsInputActions = false
     @Published private(set) var supportsLiveSettings = false
     @Published private(set) var supportsExtendedVideoSettings = false
     @Published private(set) var supportsHighRefreshVideoSettings = false
@@ -64,7 +62,7 @@ final class DeskModel: ObservableObject {
     @Published private(set) var sessionEffects = SessionEffectsState()
     @Published private(set) var sessionEffectsWorking = false
     @Published private(set) var sessionEffectsStatus = ""
-    @Published private(set) var supportsSessionPause = false
+    private var supportsSessionPause = false
     @Published private(set) var sessionPaused = false
     @Published private(set) var sessionPauseWorking = false
     @Published private(set) var sessionPauseStatus = ""
@@ -881,7 +879,6 @@ final class DeskModel: ObservableObject {
         DiagnosticLog.shared.record(.connectionStarted, role: .viewer, state: .requested)
         trafficSession = makeTrafficSession(for: candidate)
         let history = trafficHistoryStore
-        currentTrafficDeviceID = nil
         trafficHistoryStatus = "等待远端设备标识；旧版设备需双方升级后才能累计。"
         peer = candidate
         let channel = makeDataChannel(for: candidate)
@@ -893,7 +890,6 @@ final class DeskModel: ObservableObject {
         candidate.onRoundTripMilliseconds = { [weak self, weak candidate, weak viewer] milliseconds in
             DispatchQueue.main.async {
                 guard let self, let candidate, let viewer, self.peer === candidate, self.viewerSession === viewer else { return }
-                self.roundTripMilliseconds = milliseconds
                 if let microseconds = Int(exactly: (milliseconds * 1_000).rounded()), microseconds >= 0 {
                     DiagnosticLog.shared.record(.connectionMetrics, role: .viewer, values: [.roundTripMicroseconds: microseconds])
                 }
@@ -1042,7 +1038,6 @@ final class DeskModel: ObservableObject {
             }
             let identity = try Wire.readJSON(DeviceIdentity.self, message.payload)
             try trafficSession.bind(identity)
-            currentTrafficDeviceID = identity.id
             trafficHistoryStatus = "历史流量已按远端设备持续累计。"
         case .controlStatus:
             guard message.payload.isEmpty else { throw DeskError.invalid("控制权限订阅消息无效") }
@@ -1124,7 +1119,6 @@ final class DeskModel: ObservableObject {
             saveConnection(name: hello.name)
             if let id = hello.deviceID, let trafficSession {
                 try trafficSession.bind(DeviceIdentity(id: id, name: hello.name))
-                currentTrafficDeviceID = id
                 trafficHistoryStatus = "历史流量已按远端设备持续累计。"
             } else { trafficHistoryStatus = "对端没有设备标识，仅显示瞬时流量；双方升级后可累计历史。" }
             if hello.deviceIdentityExchange == true, let id = trafficHistoryStore.localDeviceID {
@@ -1741,7 +1735,7 @@ final class DeskModel: ObservableObject {
         } else if enabled {
             clipboardSync?.allowsFileSending = remoteFileApproval
             clipboardSync?.setAutomaticSendingAllowed(automaticClipboardSendingAllowed)
-        } else if !enabled {
+        } else {
             dataChannel?.configureClipboard(nil)
             clipboardSync?.stop(); clipboardSync = nil
             dismissClipboardPrompt(); clipboardFilePrompt = nil
@@ -1924,7 +1918,6 @@ final class DeskModel: ObservableObject {
                 self.frameRate = String(format: "%.0f fps", Double(metrics.frames) / seconds)
                 if let measured = self.viewerSession.lastLatencyAt, SessionClock.now - measured > 15 {
                     self.latency = "— ms"
-                    self.roundTripMilliseconds = nil
                 }
                 self.lastMetrics = SessionClock.now
             }
@@ -1980,14 +1973,12 @@ final class DeskModel: ObservableObject {
         sessionEffectsStatus = ""
         flushTrafficHistory()
         trafficSession = nil
-        currentTrafficDeviceID = nil
         trafficHistoryStatus = "从本版开始按设备累计；旧版设备需双方升级。"
         controlStatusUpdatesEnabled = false
         capsLockRunning = false
         capsLockStartAttempted = false
         resolution = ""
         latency = "— ms"
-        roundTripMilliseconds = nil
         viewerQualityPolicy.discardUnfinishedSample()
         supportsLiveSettings = false
         supportsExtendedVideoSettings = false
@@ -2034,7 +2025,6 @@ final class DeskModel: ObservableObject {
         hostPreparationTask?.cancel()
         hostPreparationTask = nil
         reconnectTask?.cancel()
-        viewerSession.stableTask?.cancel()
         target = nil
         reconnecting = false
         if mode == .viewer, isFullScreen { canvas.window?.toggleFullScreen(nil) }

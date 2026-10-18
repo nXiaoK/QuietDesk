@@ -14,7 +14,7 @@ enum QuietDeskEntry {
 }
 
 struct QuietDeskApp: App {
-    @StateObject private var model = DeskModel()
+    @StateObject private var model: DeskModel
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {
@@ -27,7 +27,6 @@ struct QuietDeskApp: App {
         Window("QuietDesk", id: "main") {
             DeskView(model: model)
                 .onAppear {
-                    appDelegate.model = model
                     model.initialLaunch(atLogin: appDelegate.launchedAtLogin)
                 }
         }

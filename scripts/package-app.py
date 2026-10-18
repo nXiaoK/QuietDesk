@@ -13,6 +13,11 @@ import zipfile
 from version import ROOT, build_number, parse_version
 
 
+def require_clean_tree(root):
+    if subprocess.check_output(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=normal"], text=True):
+        raise ValueError("Commit or stash changes before packaging source")
+
+
 def main():
     output = Path(os.environ.get("QUIETDESK_DIST_DIR", ROOT / "dist"))
     app = output / "QuietDesk.app"
@@ -41,6 +46,7 @@ def main():
         subprocess.run(["hdiutil", "create", "-volname", "QuietDesk", "-srcfolder", str(volume), "-format", "UDZO", "-ov", str(staging / names[0])], check=True)
         subprocess.run(["hdiutil", "verify", str(staging / names[0])], check=True)
         subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(app), str(staging / names[1])], check=True)
+        require_clean_tree(ROOT)
         tracked = subprocess.check_output(["git", "-C", str(ROOT), "ls-files", "-z"]).decode().split("\0")
         if "version.json" not in tracked or "Package.swift" not in tracked:
             raise ValueError("Source packaging requires tracked project files")

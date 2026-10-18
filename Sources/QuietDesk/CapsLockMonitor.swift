@@ -14,6 +14,8 @@ final class CapsLockMonitor {
     private var runLoopSource: CFRunLoopSource?
     private var gesture = CapsLockPress()
     private var pressedDevices = Set<UInt>()
+    private let permissionsGranted: () -> Bool
+    private let restoreTap: (CFMachPort?) -> Bool
     private(set) var generation = UUID()
     var isRunning: Bool {
         guard manager != nil, let tap else { return false }
@@ -24,6 +26,32 @@ final class CapsLockMonitor {
         mach_timebase_info(&info)
         return Double(info.numer) / Double(info.denom) / 1_000_000_000
     }()
+
+    init(permissionsGranted: @escaping () -> Bool = {
+        AXIsProcessTrusted() && IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted
+    }, restoreTap: @escaping (CFMachPort?) -> Bool = { tap in
+        guard let tap, CFMachPortIsValid(tap) else { return false }
+        CGEvent.tapEnable(tap: tap, enable: true)
+        return CGEvent.tapIsEnabled(tap: tap)
+    }) {
+        self.permissionsGranted = permissionsGranted
+        self.restoreTap = restoreTap
+    }
+
+    func handleTapInterruption(_ type: CGEventType) {
+        reset()
+        // A slow main-loop turn can disable a healthy tap. Restore only this transient
+        // timeout, with fresh permission checks, rather than permanently stopping HID input.
+        if type == .tapDisabledByTimeout, permissionsGranted(), restoreTap(tap) { return }
+        onFailure?("Caps Lock 捕获已被系统暂停，请重新启用")
+    }
+
+    func receiveCapsLockValue(device: UInt, isDown: Bool, time: TimeInterval) {
+        guard isActive() else { reset(); return }
+        if isDown { pressedDevices.insert(device) }
+        else { pressedDevices.remove(device) }
+        if let action = gesture.update(isDown: !pressedDevices.isEmpty, time: time) { onAction?(action) }
+    }
 
     func start() throws {
         if isRunning { return }
@@ -41,8 +69,7 @@ final class CapsLockMonitor {
                 return MainActor.assumeIsolated {
                     let monitor = Unmanaged<CapsLockMonitor>.fromOpaque(context).takeUnretainedValue()
                     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-                        monitor.reset()
-                        monitor.onFailure?("Caps Lock 捕获已被系统暂停，请重新启用")
+                        monitor.handleTapInterruption(type)
                         return Unmanaged.passUnretained(event)
                     }
                     guard event.getIntegerValueField(.keyboardEventKeycode) == 57,
@@ -75,18 +102,13 @@ final class CapsLockMonitor {
             guard let context, result == kIOReturnSuccess else { return }
             MainActor.assumeIsolated {
                 let monitor = Unmanaged<CapsLockMonitor>.fromOpaque(context).takeUnretainedValue()
-                guard monitor.isActive() else { monitor.reset(); return }
                 let element = IOHIDValueGetElement(value)
                 guard IOHIDElementGetUsagePage(element) == kHIDPage_KeyboardOrKeypad,
                       IOHIDElementGetUsage(element) == kHIDUsage_KeyboardCapsLock else { return }
                 let device = IOHIDElementGetDevice(element)
                 let id = UInt(bitPattern: Unmanaged.passUnretained(device).toOpaque())
-                if IOHIDValueGetIntegerValue(value) != 0 { monitor.pressedDevices.insert(id) }
-                else { monitor.pressedDevices.remove(id) }
-                if let action = monitor.gesture.update(isDown: !monitor.pressedDevices.isEmpty,
-                                                       time: Double(IOHIDValueGetTimeStamp(value)) * CapsLockMonitor.secondsPerTick) {
-                    monitor.onAction?(action)
-                }
+                monitor.receiveCapsLockValue(device: id, isDown: IOHIDValueGetIntegerValue(value) != 0,
+                    time: Double(IOHIDValueGetTimeStamp(value)) * CapsLockMonitor.secondsPerTick)
             }
         }, Unmanaged.passUnretained(self).toOpaque())
         IOHIDManagerRegisterDeviceRemovalCallback(manager, { context, _, _, _ in

@@ -34,21 +34,8 @@ jobs:
         env:
           INCREMENT: ${{ inputs.increment || 'auto' }}
         run: python3 scripts/version.py next --increment "$INCREMENT" --github-output
-      - name: Check version allocation
-        run: python3 -m unittest discover -s scripts/tests -v
-      - name: Check protocol, clipboard and video
-        run: swift run --disable-sandbox QuietDeskChecks
-      - name: Check application behavior without system permissions
-        run: |
-          ./scripts/run-app-checks.sh
-          ./scripts/run-input-checks.sh
-          ./scripts/run-video-checks.sh
-          ./scripts/run-session-data-checks.sh
-          ./scripts/run-session-effects-checks.sh
-          ./scripts/run-traffic-checks.sh
-          ./scripts/run-log-checks.sh
-          ./scripts/run-credential-checks.sh
-          ./scripts/run-permission-checks.sh
+      - name: Run project checks
+        run: ./scripts/run-all-checks.sh
       - name: Build Universal application
         env:
           QUIETDESK_VERSION: ${{ steps.version.outputs.version }}

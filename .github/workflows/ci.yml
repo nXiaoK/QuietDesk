@@ -20,21 +20,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Check version allocation
-        run: python3 -m unittest discover -s scripts/tests -v
-      - name: Check protocol, clipboard and video
-        run: swift run --disable-sandbox QuietDeskChecks
-      - name: Check application behavior without system permissions
-        run: |
-          ./scripts/run-app-checks.sh
-          ./scripts/run-input-checks.sh
-          ./scripts/run-video-checks.sh
-          ./scripts/run-session-data-checks.sh
-          ./scripts/run-session-effects-checks.sh
-          ./scripts/run-traffic-checks.sh
-          ./scripts/run-log-checks.sh
-          ./scripts/run-credential-checks.sh
-          ./scripts/run-permission-checks.sh
+      - name: Run project checks
+        run: ./scripts/run-all-checks.sh
       - name: Build Universal application
         run: ./build-app.sh
       - name: Check application metadata

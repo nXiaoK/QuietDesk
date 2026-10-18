@@ -130,6 +130,28 @@ func runMediaPathPolicyChecks() {
         }
     }
 
+    run("A load-reduction reconfiguration pause preserves the subsequent TCP trial decision") {
+        var policy = try udp()
+        var actions: [MediaPathAction] = []
+        for step in 1...3 {
+            let now = Double(step) + 0.2
+            policy.receivedPong(epoch: policy.epoch, now: now)
+            actions = policy.observe(sample(loss: 0.1), epoch: policy.epoch, now: now)
+        }
+        try check(actions == [.reduceLoad(.network)], "Initial reduction was not requested")
+        _ = policy.observe(sample(active: false, count: 0, frames: 0), epoch: policy.epoch, now: 4.2)
+        _ = policy.setPaused(true, now: 4.2)
+        _ = policy.setPaused(false, now: 10)
+        for step in 1...3 {
+            let now = 10 + Double(step)
+            policy.receivedPong(epoch: policy.epoch, now: now)
+            actions = policy.observe(sample(loss: 0.1), epoch: policy.epoch, now: now)
+            if step < 3 { try check(actions.isEmpty, "Pause retained the prior bad-time accumulator") }
+        }
+        try check(actions == [.selectPath(.tcp, epoch: 2, reason: .networkDegraded)],
+                  "A configuration pause repeatedly restarted load reduction instead of trying TCP")
+    }
+
     run("Sparse, invalid, duplicate and discontinuous observations cannot manufacture degradation") {
         var policy = try udp()
         let bad = sample(duration: 2, loss: 0.5)
@@ -213,6 +235,28 @@ func runMediaPathPolicyChecks() {
         try check(quality.confirmApplied(lower, now: 10) && quality.effective == lower && quality.pending == nil,
                   "Applied settings were not confirmed")
         try check(quality.preferred == .highest, "Confirmation persisted an automatic reduction")
+    }
+
+    run("Quality keeps actual applied settings separate from its ceiling and preserves newer pending recommendations") {
+        let initial = StreamSettings(longestEdge: 1920, framesPerSecond: 15, megabits: 3)
+        let initialQuality = try MediaQualityPolicy(hostDefault: .highest, preferred: .highest, applied: initial, now: 0)
+        try check(initialQuality.effective == initial && initialQuality.upperBound == .highest
+                  && initialQuality.preferred == .highest && initialQuality.pending == nil,
+                  "Initial preference was reported as already applied")
+        var quality = try MediaQualityPolicy(hostDefault: .highest, preferred: .highest, now: 0)
+        guard let next = quality.reduceLoad(for: .network, now: 3) else { throw CheckFailure("No recommendation") }
+        let previous = StreamSettings(longestEdge: 3840, framesPerSecond: 30, megabits: 30)
+        try quality.synchronizeApplied(previous, now: 4)
+        try check(quality.effective == previous && quality.pending == next
+                  && quality.preferred == .highest && quality.upperBound == .highest,
+                  "An older unmatched reply cleared a newer recommendation or changed preference")
+        try quality.synchronizeApplied(next, now: 5)
+        try check(quality.effective == next && quality.pending == nil && quality.upperBound == .highest,
+                  "A matching actual update did not clear its recommendation")
+        try rejects("Invalid actual settings were synchronized") {
+            try quality.synchronizeApplied(StreamSettings(framesPerSecond: 999), now: 6)
+        }
+        try check(quality.effective == next, "Invalid actual settings replaced the confirmed state")
     }
 
     run("Compute adaptation reduces actual pixel load while network adaptation reduces bitrate first") {

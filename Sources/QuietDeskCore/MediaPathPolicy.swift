@@ -167,10 +167,10 @@ public struct MediaPathPolicy: Sendable {
         guard accept(now), !paused, phase != .legacyTCP, phase != .stopped, self.epoch == epoch,
               sample.isValid else { return [] }
         let elapsed = min(sample.duration, max(0, now - lastObservationAt))
-        if now - lastObservationAt > sample.duration + 0.5 { resetEvidence() }
+        if now - lastObservationAt > sample.duration + 0.5 { resetEvidence(preservingReduction: true) }
         lastObservationAt = now
         guard elapsed > 0 else { return [] }
-        guard sample.mediaActive else { resetEvidence(); return [] }
+        guard sample.mediaActive else { resetEvidence(preservingReduction: true); return [] }
         guard phase == .trialUDP || phase == .udp || phase == .tcpTrial || phase == .tcp else { return [] }
         let cause = sample.bottleneck
         if cause == .encoder || cause == .decoder {
@@ -211,7 +211,7 @@ public struct MediaPathPolicy: Sendable {
 
     public mutating func setPaused(_ value: Bool, now: TimeInterval) -> [MediaPathAction] {
         guard accept(now), phase != .legacyTCP, phase != .stopped, paused != value else { return [] }
-        paused = value; resetEvidence(); lastObservationAt = now
+        paused = value; resetEvidence(preservingReduction: true); lastObservationAt = now
         if value {
             pausedAt = now
             if let id = probeID {
@@ -289,9 +289,10 @@ public struct MediaPathPolicy: Sendable {
         nextRecoveryAt = now + [30.0, 60, 120, 300][recoveryAttempt - 1]
     }
 
-    private mutating func resetEvidence() {
+    private mutating func resetEvidence(preservingReduction: Bool = false) {
         networkBadDuration = 0; computeBadDuration = 0; computeBottleneck = nil
-        loadReduced = false; healthyDuration = 0; trialDuration = 0
+        if !preservingReduction { loadReduced = false }
+        healthyDuration = 0; trialDuration = 0
     }
 }
 
@@ -310,13 +311,14 @@ public struct MediaQualityPolicy: Sendable {
     private var healthyDuration: TimeInterval = 0
     private var lastBottleneck: MediaBottleneck?
 
-    public init(hostDefault: StreamSettings, preferred: StreamSettings? = nil,
+    public init(hostDefault: StreamSettings, preferred: StreamSettings? = nil, applied: StreamSettings? = nil,
                 sourceLongestEdge: Int? = nil, now: TimeInterval) throws {
         try hostDefault.validateControlValues()
         if let preferred { try preferred.validateControlValues() }
+        if let applied { try applied.validateControlValues() }
         self.preferred = preferred
         upperBound = preferred ?? hostDefault
-        effective = upperBound
+        effective = applied ?? upperBound
         self.sourceLongestEdge = sourceLongestEdge.flatMap { (2...8192).contains($0) ? $0 : nil }
         lastNow = now.isFinite ? now : 0
         lastObservationAt = lastNow; lastChangeAt = lastNow
@@ -391,6 +393,15 @@ public struct MediaQualityPolicy: Sendable {
         effective = settings; pending = nil; lastChangeAt = now; lastObservationAt = now
         resetEvidence()
         return true
+    }
+
+    public mutating func synchronizeApplied(_ settings: StreamSettings, now: TimeInterval) throws {
+        try settings.validateControlValues()
+        guard accept(now) else { return }
+        effective = settings
+        if pending == settings { pending = nil }
+        lastChangeAt = now; lastObservationAt = now
+        resetEvidence()
     }
 
     public mutating func rejectPending(now: TimeInterval) {

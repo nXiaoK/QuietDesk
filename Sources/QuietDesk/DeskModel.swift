@@ -19,9 +19,8 @@ final class DeskModel: ObservableObject {
     @Published var settings = StreamSettings() {
         didSet { if let data = try? JSONEncoder().encode(settings) { UserDefaults.standard.set(data, forKey: "streamSettings") } }
     }
-    @Published var displayID = CGMainDisplayID() {
-        didSet { UserDefaults.standard.set(Int(displayID), forKey: "sharedDisplay") }
-    }
+    @Published var displayID = CGMainDisplayID()
+    @Published private(set) var displayFallbackNotice: String?
     @Published private(set) var screens: [(id: CGDirectDisplayID, name: String)] = []
     @Published var active = false
     @Published var working = false
@@ -143,6 +142,7 @@ final class DeskModel: ObservableObject {
     private var selectedConnectionID: UUID?
     private var savedTarget = false
     private var viewerQualityPolicy = ViewerQualityPolicy()
+    private var preferredDisplayID = CGMainDisplayID()
     private var screenObserver: NSObjectProtocol?
     private var powerObservers: [NSObjectProtocol] = []
     private var systemSleeping = false
@@ -166,7 +166,8 @@ final class DeskModel: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: "streamSettings"),
            let saved = try? JSONDecoder().decode(StreamSettings.self, from: data),
            (try? saved.validateControlValues()) != nil { settings = saved }
-        if let id = UserDefaults.standard.object(forKey: "sharedDisplay") as? Int { displayID = CGDirectDisplayID(clamping: id) }
+        if let id = UserDefaults.standard.object(forKey: "sharedDisplay") as? Int { preferredDisplayID = CGDirectDisplayID(clamping: id) }
+        displayID = preferredDisplayID
         refreshDisplays()
         screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
             object: nil, queue: .main) { [weak self] _ in
@@ -535,6 +536,19 @@ final class DeskModel: ObservableObject {
         ScreenStreamer.displaySnapshot(id)
     }
 
+    func chooseDisplay(_ id: CGDirectDisplayID) {
+        preferredDisplayID = id
+        UserDefaults.standard.set(Int(id), forKey: "sharedDisplay")
+        displayID = id
+        displayFallbackNotice = nil
+    }
+
+    private func updateDisplayFallbackNotice() {
+        guard displayID != preferredDisplayID else { displayFallbackNotice = nil; return }
+        let name = screens.first(where: { $0.id == displayID }).map { "「\($0.name)」" } ?? "备用显示器"
+        displayFallbackNotice = "首选显示器当前不可用，正在使用\(name)；恢复后下次开启共享时自动使用首选显示器"
+    }
+
     private func refreshDisplays() {
         let current = NSScreen.screens.compactMap { screen -> (id: CGDirectDisplayID, name: String)? in
             guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
@@ -542,8 +556,13 @@ final class DeskModel: ObservableObject {
         }
         screens = current
         let available = current.map { displaySnapshot($0.id) }
-        if let selection = DisplaySelection.select(preferred: displayID, main: CGMainDisplayID(), available: available),
-           selection.id != displayID { displayID = selection.id }
+        if mode == .host, hostingRequested, active, let capturedDisplay = hostSession.capturedDisplay,
+           !DisplaySelection.requiresRestart(captured: capturedDisplay, available: available) {
+            displayID = capturedDisplay.id
+        } else if let selection = DisplaySelection.select(preferred: preferredDisplayID, main: CGMainDisplayID(), available: available) {
+            displayID = selection.id
+        }
+        updateDisplayFallbackNotice()
         if mode == .host, hostingRequested, active, let capturedDisplay = hostSession.capturedDisplay,
            DisplaySelection.requiresRestart(captured: capturedDisplay, available: available) {
             DiagnosticLog.shared.record(.displayChanged, role: .host, state: .requested)
@@ -552,12 +571,13 @@ final class DeskModel: ObservableObject {
     }
 
     private func selectShareableDisplay(_ displays: [SCDisplay]) throws -> (display: SCDisplay, snapshot: DisplaySnapshot) {
-        guard let selection = DisplaySelection.select(preferred: displayID, main: CGMainDisplayID(),
+        guard let selection = DisplaySelection.select(preferred: preferredDisplayID, main: CGMainDisplayID(),
             available: displays.filter { CGDisplayIsActive($0.displayID) != 0 }.map { displaySnapshot($0.displayID) }),
               let display = displays.first(where: { $0.displayID == selection.id }) else {
             throw DeskError.invalid("当前没有可共享的显示器，等待显示器恢复")
         }
         if displayID != selection.id { displayID = selection.id }
+        updateDisplayFallbackNotice()
         return (display, selection)
     }
 

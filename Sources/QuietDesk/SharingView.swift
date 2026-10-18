@@ -227,7 +227,7 @@ struct SharingView: View {
                     HStack(spacing: 16) {
                         HStack(spacing: 8) {
                             Text("显示器")
-                            Picker("显示器", selection: $model.displayID) {
+                            Picker("显示器", selection: Binding(get: { model.displayID }, set: { model.chooseDisplay($0) })) {
                                 ForEach(model.screens, id: \.id) { screen in Text(screen.name).tag(screen.id) }
                             }
                             .labelsHidden()
@@ -240,6 +240,12 @@ struct SharingView: View {
                                 .frame(width: 72)
                                 .accessibilityLabel("监听端口")
                         }
+                    }
+                    if let notice = model.displayFallbackNotice {
+                        Text(notice)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     Divider()
                     HStack(spacing: 16) {

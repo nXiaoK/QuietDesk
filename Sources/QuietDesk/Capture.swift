@@ -496,6 +496,10 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 
 @MainActor
 final class InputInjector {
+    private static let modifierDeviceBits: [UInt16: UInt64] = [
+        59: 0x01, 56: 0x02, 60: 0x04, 55: 0x08,
+        54: 0x10, 58: 0x20, 61: 0x40, 62: 0x2000
+    ]
     let bounds: CGRect
     private var heldKeys = Set<UInt16>()
     private var heldButtons = Set<Int>()
@@ -566,7 +570,10 @@ final class InputInjector {
                 case 63: modifier = .maskSecondaryFn
                 default: return nil
                 }
-                let down = flags.contains(modifier)
+                let down: Bool
+                if input.flags & 0x207F != 0, let bit = Self.modifierDeviceBits[input.keyCode] {
+                    down = input.flags & bit != 0
+                } else { down = flags.contains(modifier) }
                 event = CGEvent(keyboardEventSource: source, virtualKey: input.keyCode, keyDown: down)
                 event?.type = .flagsChanged
                 if down { heldKeys.insert(input.keyCode) } else { heldKeys.remove(input.keyCode) }

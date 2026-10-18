@@ -167,6 +167,43 @@ private struct InputInjectorChecks {
                         "Keyboard flags, repeats or release stopped using the injected poster")
         }
 
+        run("Left and right Shift releases use their independent device bits") {
+            let recorder = EventRecorder()
+            let injector = InputInjector(bounds: .zero, isTrusted: { true }, postEvent: recorder.post)
+            for (key, bits): (UInt16, UInt64) in [(56, 0x02), (60, 0x06), (56, 0x04)] {
+                var input = RemoteInput(kind: .flags)
+                input.keyCode = key
+                input.flags = CGEventFlags.maskShift.rawValue | bits
+                _ = try injector.receive(input)
+            }
+            recorder.events.removeAll()
+            injector.releaseAll()
+            try require(recorder.events.count == 1 && recorder.events[0].type == .flagsChanged
+                        && recorder.events[0].flags.isEmpty
+                        && recorder.events[0].getIntegerValueField(.keyboardEventKeycode) == 60,
+                        "Left Shift stayed held after its independent release")
+        }
+
+        run("Legacy modifier flags without device bits retain aggregate behavior") {
+            let recorder = EventRecorder()
+            let injector = InputInjector(bounds: .zero, isTrusted: { true }, postEvent: recorder.post)
+            var input = RemoteInput(kind: .flags)
+            input.keyCode = 56
+            input.flags = CGEventFlags.maskShift.rawValue
+            _ = try injector.receive(input)
+            recorder.events.removeAll()
+            injector.releaseAll()
+            try require(recorder.events.count == 1
+                        && recorder.events[0].getIntegerValueField(.keyboardEventKeycode) == 56,
+                        "Legacy Shift press was no longer held")
+            _ = try injector.receive(input)
+            input.flags = 0
+            _ = try injector.receive(input)
+            recorder.events.removeAll()
+            injector.releaseAll()
+            try require(recorder.events.isEmpty, "Legacy Shift release retained a held key")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

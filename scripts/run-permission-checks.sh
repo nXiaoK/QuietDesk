@@ -5,10 +5,12 @@ cd "$(dirname "$0")/.."
 python3 - <<'PY'
 from pathlib import Path
 
-source = Path("Sources/QuietDesk/DeskModel.swift").read_text()
-for api in ("CGRequestScreenCaptureAccess", "AXIsProcessTrustedWithOptions", "IOHIDRequestAccess"):
-    if api in source:
-        raise SystemExit(f"Permission settings entry points must not trigger a system prompt: {api}")
+for path in Path("Sources").rglob("*.swift"):
+    source = path.read_text()
+    for api in ("CGRequestScreenCaptureAccess", "AXIsProcessTrustedWithOptions", "IOHIDRequestAccess",
+                "CGRequestListenEventAccess", "CGRequestPostEventAccess"):
+        if api in source:
+            raise SystemExit(f"Permission settings entry points must not trigger a system prompt: {path}: {api}")
 print("PASS Permission settings entry points do not call system prompt APIs")
 PY
 check_root="${QUIETDESK_PERMISSION_CHECK_BUILD_DIR:-$PWD/work/permission-checks}"

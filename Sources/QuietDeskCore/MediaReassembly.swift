@@ -71,10 +71,12 @@ public final class MediaFrameReassembler {
         let totalBytes: Int
         let fragmentCount: Int
         let firstReceivedAt: TimeInterval
+        var lastProgressAt: TimeInterval
         var lastNackAt: TimeInterval?
         var bytes: Data
         var received: [Bool]
         var receivedCount = 0
+        var highestReceivedIndex = -1
         var frame: MediaFrame?
 
         init(_ fragment: MediaFragment, now: TimeInterval) {
@@ -82,6 +84,7 @@ public final class MediaFrameReassembler {
             totalBytes = fragment.frameBytes
             fragmentCount = Int(fragment.fragmentCount)
             firstReceivedAt = now
+            lastProgressAt = now
             bytes = Data(count: totalBytes)
             received = Array(repeating: false, count: fragmentCount)
         }
@@ -91,19 +94,22 @@ public final class MediaFrameReassembler {
             totalBytes = bytes.count
             fragmentCount = (bytes.count + MediaFragment.maximumPayloadBytes - 1) / MediaFragment.maximumPayloadBytes
             firstReceivedAt = now
+            lastProgressAt = now
             self.bytes = bytes
             received = Array(repeating: true, count: fragmentCount)
             receivedCount = fragmentCount
+            highestReceivedIndex = fragmentCount - 1
             self.frame = frame
         }
 
-        func missingRanges() -> [MediaFragmentRange] {
+        func missingRanges(includeTail: Bool) -> [MediaFragmentRange] {
             var ranges: [MediaFragmentRange] = []
             var index = 0
-            while index < received.count, ranges.count < MediaFeedback.maximumMissingRanges {
+            let end = includeTail ? received.count : highestReceivedIndex + 1
+            while index < end, ranges.count < MediaFeedback.maximumMissingRanges {
                 if received[index] { index += 1; continue }
                 let first = index
-                while index < received.count, !received[index] { index += 1 }
+                while index < end, !received[index] { index += 1 }
                 ranges.append(MediaFragmentRange(first: UInt16(first), count: UInt16(index - first)))
             }
             return ranges
@@ -179,6 +185,8 @@ public final class MediaFrameReassembler {
             assembly.bytes.replaceSubrange(range, with: fragment.payload)
             assembly.received[index] = true
             assembly.receivedCount += 1
+            assembly.highestReceivedIndex = max(assembly.highestReceivedIndex, index)
+            assembly.lastProgressAt = now
             if assembly.receivedCount == assembly.fragmentCount {
                 do {
                     assembly.frame = try MediaFrame(header: assembly.header, packetBytes: assembly.bytes)
@@ -236,7 +244,10 @@ public final class MediaFrameReassembler {
             guard let assembly = assemblies[id], assembly.frame == nil,
                   now - assembly.firstReceivedAt >= limits.reorderDelay,
                   assembly.lastNackAt.map({ now - $0 >= limits.nackInterval }) ?? true else { continue }
-            let missing = assembly.missingRanges()
+            // A later fragment reveals a hole; an unseen tail may still be in the sender's
+            // pacer. Only ask for that tail after unique fragments stop making progress.
+            let includeTail = now - assembly.lastProgressAt >= max(limits.reorderDelay, limits.nackInterval)
+            let missing = assembly.missingRanges(includeTail: includeTail)
             if !missing.isEmpty, let feedback = try? MediaFeedback(kind: .nack, header: assembly.header, missingRanges: missing) {
                 assembly.lastNackAt = now
                 events.append(.feedback(feedback))

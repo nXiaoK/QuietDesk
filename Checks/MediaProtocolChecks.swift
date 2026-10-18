@@ -150,6 +150,86 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         try require(!feedback(receiver.poll(), .expired).isEmpty, "Repeated fragment extended frame lifetime")
     }
 
+    run("A paced 512 KiB IDR does not NACK fragments still ahead of receiving progress") {
+        let time = MediaCheckClock()
+        let receiver = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        let initial = try frame(1, idr: true, bytes: 512 * 1024)
+        let parts = try MediaFragment.fragment(frame: initial)
+        var completed: [MediaFrame] = []
+        for (index, fragment) in parts.enumerated() {
+            time.now = Double(index) * 0.001
+            completed += ready(try receiver.receive(fragment))
+            time.now += 0.0005
+            try require(feedback(receiver.poll(), .nack).isEmpty,
+                        "Continuous pacing requested an unsent tail at fragment \(index)")
+        }
+        try require(completed.count == 1 && completed[0].packet.avcc == initial.packet.avcc,
+                    "Paced IDR did not reconstruct its complete bytes")
+        try require(feedback(receiver.decoded(initial.header, success: true), .decoded).count == 1,
+                    "A complete paced IDR did not settle decode acknowledgement")
+    }
+
+    run("A later received fragment exposes an early hole without requesting the unseen tail") {
+        let time = MediaCheckClock()
+        let receiver = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        let parts = try MediaFragment.fragment(frame: frame(1, idr: true, bytes: 8_192))
+        _ = try receiver.receive(parts[0])
+        time.now = 0.001; _ = try receiver.receive(parts[2])
+        time.now = 0.002; _ = try receiver.receive(parts[3])
+        time.now = 0.004
+        let nacks = feedback(receiver.poll(), .nack)
+        try require(nacks.count == 1 && nacks[0].missingRanges == [.init(first: 1, count: 1)],
+                    "Reordering did not reveal only the hole below the highest received fragment")
+        time.now = 0.009; _ = try receiver.receive(parts[1])
+        time.now = 0.015
+        try require(feedback(receiver.poll(), .nack).isEmpty,
+                    "A new hole-filling fragment was not counted as real receiving progress")
+    }
+
+    run("A lost final fragment becomes repairable after receiving progress actually stalls") {
+        let time = MediaCheckClock()
+        let limits = MediaBufferLimits(reorderDelay: 0.02, nackInterval: 0.005)
+        let receiver = try MediaFrameReassembler(stream: stream, limits: limits, clock: { time.now })
+        let initial = try frame(1, idr: true, bytes: 8_192)
+        let parts = try MediaFragment.fragment(frame: initial)
+        for (index, fragment) in parts.dropLast().enumerated() {
+            time.now = Double(index) * 0.001
+            _ = try receiver.receive(fragment)
+        }
+        let lastProgress = time.now
+        time.now = lastProgress + 0.019
+        try require(feedback(receiver.poll(), .nack).isEmpty, "Tail repair ignored the longer reorder grace")
+        time.now = lastProgress + 0.021
+        let nacks = feedback(receiver.poll(), .nack)
+        try require(nacks.count == 1 && nacks[0].missingRanges == [.init(first: UInt16(parts.count - 1), count: 1)],
+                    "A stopped tail was never repaired or included already received fragments")
+        let recovered = ready(try receiver.receive(parts[parts.count - 1]))
+        try require(recovered.count == 1 && recovered[0].packet.avcc == initial.packet.avcc,
+                    "Repairing the final fragment did not reconstruct the IDR")
+        try require(feedback(receiver.decoded(initial.header, success: true), .decoded).count == 1
+                    && receiver.pendingFrameCount == 0 && receiver.bufferedBytes == 0,
+                    "Tail recovery could not complete the decode contract and release its buffer")
+    }
+
+    run("Duplicate fragments cannot postpone tail repair or extend the original frame deadline") {
+        let time = MediaCheckClock()
+        let receiver = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        let parts = try MediaFragment.fragment(frame: frame(1, idr: true, bytes: 8_192))
+        _ = try receiver.receive(parts[0])
+        time.now = 0.001; _ = try receiver.receive(parts[1])
+        time.now = 0.008; _ = try receiver.receive(parts[1])
+        time.now = 0.012
+        let nacks = feedback(receiver.poll(), .nack)
+        try require(nacks.count == 1 && nacks[0].missingRanges == [.init(first: 2, count: UInt16(parts.count - 2))],
+                    "A duplicate fragment postponed the stalled tail's repair")
+        time.now = 1.999; _ = try receiver.receive(parts[1])
+        time.now = 2.001
+        try require(feedback(receiver.poll(), .expired).count == 1 && receiver.requiresRecovery
+                    && receiver.bufferedBytes == 0 && receiver.pendingFrameCount == 0,
+                    "Duplicate traffic extended the finite frame lifetime")
+        try require(try receiver.receive(parts[parts.count - 1]).isEmpty, "A late tail revived an expired reference chain")
+    }
+
     run("Media decode failure and late callbacks require a fresh epoch") {
         let receiver = try MediaFrameReassembler(stream: stream)
         let initial = try frame(1, idr: true)

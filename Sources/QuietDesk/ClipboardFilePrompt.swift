@@ -136,7 +136,7 @@ struct ClipboardFilePromptView: View {
             VStack(alignment: .leading, spacing: 5) {
                 Label("保存到接收文件目录", systemImage: "folder")
                     .font(.system(size: 11, weight: .medium))
-                Text(verbatim: receivingDirectory)
+                Text(verbatim: ClipboardSync.receivingDirectory)
                     .font(.system(size: 10, design: .monospaced))
                     .fixedSize(horizontal: false, vertical: true)
                 Text("接收完成后会在此目录创建独立子目录。")
@@ -177,11 +177,5 @@ struct ClipboardFilePromptView: View {
         .foregroundStyle(.primary)
         .background(Color(nsColor: .windowBackgroundColor))
         .fixedSize(horizontal: false, vertical: true)
-    }
-
-    private var receivingDirectory: String {
-        let path = ClipboardSync.storageURL.appendingPathComponent("received", isDirectory: true).path
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return path.hasPrefix(home + "/") ? "~" + String(path.dropFirst(home.count)) + "/" : path + "/"
     }
 }

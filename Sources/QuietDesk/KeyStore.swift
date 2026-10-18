@@ -5,7 +5,7 @@ import QuietDeskCore
 enum KeyStore {
     private static let store = LocalCredentialStore(directory:
         FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/QuietDesk/Credentials", isDirectory: true))
+            .appendingPathComponent("Library/Application Support/\(AppDataLocation.folderName())/Credentials", isDirectory: true))
 
     static func load(account: String = "host") throws -> PairingKey? {
         try store.load(account: account)

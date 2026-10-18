@@ -30,7 +30,7 @@ final class TrafficHistoryStore: @unchecked Sendable {
     private struct Document: Codable { let version: Int; let records: [DeviceTrafficRecord] }
     static var defaultDirectory: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("QuietDesk", isDirectory: true)
+            .appendingPathComponent(AppDataLocation.folderName(), isDirectory: true)
     }
     let localDeviceID: UUID?
     private let url: URL

@@ -40,7 +40,7 @@ final class DiagnosticLog: @unchecked Sendable {
     }
 
     static let shared = DiagnosticLog(directory: FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("Logs/QuietDesk", isDirectory: true))
+        .appendingPathComponent("Logs/\(AppDataLocation.folderName())", isDirectory: true))
 
     private struct SafeError: Codable {
         let domain: String

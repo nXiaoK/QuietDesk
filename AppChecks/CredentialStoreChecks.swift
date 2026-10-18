@@ -77,6 +77,14 @@ private struct CredentialStoreChecks {
             }
         }
 
+        run("Bundle-specific data folders preserve production paths") { _ in
+            try require(AppDataLocation.folderName(bundleIdentifier: nil) == "QuietDesk", "Unbundled path changed")
+            try require(AppDataLocation.folderName(bundleIdentifier: "local.quietdesk.app") == "QuietDesk", "Production path changed")
+            try require(AppDataLocation.folderName(bundleIdentifier: "") == "QuietDesk", "Empty bundle path changed")
+            try require(AppDataLocation.folderName(bundleIdentifier: "local.quietdesk.preview") == "QuietDesk-local.quietdesk.preview", "Preview is not isolated")
+            try require(AppDataLocation.folderName(bundleIdentifier: "preview/a b") == "QuietDesk-preview_a_b", "Unsafe path characters survived")
+        }
+
         run("Empty storage and absent removal preserve unrelated files") { folder in
             let marker = folder.appendingPathComponent("existing-metadata.json")
             let original = Data("unchanged metadata".utf8)

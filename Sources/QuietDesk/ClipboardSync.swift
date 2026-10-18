@@ -87,8 +87,14 @@ final class ClipboardSync {
         case fileOfferAccepted, fileOfferRejected, staleFilesSuppressed
     }
 
+    static var receivingDirectory: String {
+        let path = storageURL.appendingPathComponent("received", isDirectory: true).path
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return path.hasPrefix(home + "/") ? "~" + String(path.dropFirst(home.count)) + "/" : path + "/"
+    }
+
     static let storageURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("QuietDesk/Clipboard", isDirectory: true)
+        .appendingPathComponent("\(AppDataLocation.folderName())/Clipboard", isDirectory: true)
     var onStatus: ((String) -> Void)?
     var onFileOffer: ((ClipboardFileOffer?) -> Void)?
     var onDiagnostic: ((DiagnosticEvent) -> Void)?

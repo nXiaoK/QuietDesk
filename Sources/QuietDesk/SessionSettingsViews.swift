@@ -31,7 +31,7 @@ struct ConnectionSettingsView: View {
                     Button { model.openReceivedFiles() } label: {
                         Label("打开接收文件目录", systemImage: "folder")
                     }
-                    .help("~/Library/Application Support/QuietDesk/Clipboard/received/")
+                    .help(ClipboardSync.receivingDirectory)
                 }
                 Divider()
                 HStack(spacing: 8) {
@@ -180,7 +180,7 @@ struct FullScreenSettingsView: View {
                                     Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
                                 }.frame(minHeight: 28)
                             }
-                            .help("~/Library/Application Support/QuietDesk/Clipboard/received/")
+                            .help(ClipboardSync.receivingDirectory)
                             Button {
                                 showingCaps = true
                                 model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)

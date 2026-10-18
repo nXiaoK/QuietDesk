@@ -9,13 +9,13 @@ final class DiagnosticLog: @unchecked Sendable {
         case hostStarted, hostStopped, captureStarted, captureStopped, captureFailed
         case streamConfigured, displayChanged, sessionPaused, sessionResumed, sessionEffectsChanged
         case clipboardOffered, clipboardOfferReceived, clipboardAccepted, clipboardRejected
-        case clipboardCompleted, clipboardCancelled, clipboardFailed, clipboardEchoSuppressed
+        case clipboardCompleted, clipboardFailed, clipboardEchoSuppressed
         case permissionChanged, exportRequested, exportCompleted, exportFailed, counters
         case performanceDiagnosticsChanged, performanceWindow
     }
     enum Role: String, Codable { case viewer, host }
     enum State: String, Codable {
-        case requested, ready, succeeded, failed, cancelled, enabled, disabled, retryable, permanent
+        case requested, ready, succeeded, failed, cancelled, enabled, disabled
         case accepted, rejected, local, remote
     }
     enum Field: String {
@@ -23,7 +23,7 @@ final class DiagnosticLog: @unchecked Sendable {
         case fps, targetBitrate, roundTripMicroseconds, fileCount, totalBytes, statusCode
         case payloadType, accessibilityGranted, inputMonitoringGranted, screenRecordingGranted
         case eventCount, scrollObserved, scrollSent, scrollReceived, scrollSuppressed, entriesDropped
-        case pendingBytes, scaleTimes1000, retryAttempt, maximumDimension
+        case pendingBytes, retryAttempt, maximumDimension
         case tcpAckStretchingDisabled
     }
     enum Counter: String {

@@ -32,7 +32,7 @@ OTHER_EVENTS = set((
     "connectionMetrics reconnectScheduled inputFailed hostStarted hostStopped captureStarted captureStopped "
     "captureFailed streamConfigured displayChanged sessionPaused sessionResumed sessionEffectsChanged "
     "clipboardOffered clipboardOfferReceived clipboardAccepted clipboardRejected clipboardCompleted "
-    "clipboardCancelled clipboardFailed clipboardEchoSuppressed permissionChanged exportRequested "
+    "clipboardFailed clipboardEchoSuppressed permissionChanged exportRequested "
     "exportCompleted exportFailed counters performanceDiagnosticsChanged"
 ).split())
 SUMMARY_FIELDS = {"metric", "messageKind", "unit", "count", "minimum", "maximum", "mean",

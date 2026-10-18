@@ -235,7 +235,16 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
         do {
             try await stream.startCapture()
-            queue.sync { if self.stream === stream, running { captureStarted = true } }
+            let current = queue.sync { () -> Bool in
+                guard self.stream === stream, running else { return false }
+                captureStarted = true
+                return true
+            }
+            guard current else {
+                try? stream.removeStreamOutput(self, type: .screen)
+                try? await stream.stopCapture()
+                throw CancellationError()
+            }
         } catch { await stop(); throw error }
     }
 

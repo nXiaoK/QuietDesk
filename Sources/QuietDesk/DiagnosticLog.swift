@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import QuietDeskCore
 
 final class DiagnosticLog: @unchecked Sendable {
@@ -178,10 +179,25 @@ final class DiagnosticLog: @unchecked Sendable {
                     try prepareDirectory()
                     let header = Entry(timestamp: Date(), event: .exportCompleted, environment: Metadata())
                     var data = try encoder.encode(header); data.append(0x0A)
-                    for index in (0..<retainedFileCount).reversed() {
-                        let source = file(index)
-                        guard try regularFileSize(source) != nil else { continue }
-                        data.append(try Data(contentsOf: source, options: .mappedIfSafe))
+                    try withLogLock { _ in
+                        for index in (0..<retainedFileCount).reversed() {
+                            let source = file(index)
+                            guard try regularFileSize(source) != nil else { continue }
+                            let descriptor = open(source.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+                            guard descriptor >= 0 else { throw Failure.exportFailed }
+                            let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+                            defer { try? handle.close() }
+                            var info = stat()
+                            guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { throw Failure.exportFailed }
+                            let oversized = info.st_size > maximumFileBytes
+                            if oversized { try handle.seek(toOffset: UInt64(info.st_size - off_t(maximumFileBytes))) }
+                            var tail = try handle.read(upToCount: maximumFileBytes) ?? Data()
+                            if oversized {
+                                if let newline = tail.firstIndex(of: 0x0A) { tail.removeSubrange(...newline) }
+                                else { tail.removeAll() }
+                            }
+                            data.append(tail)
+                        }
                     }
                     try data.write(to: destination, options: .atomic)
                     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
@@ -206,19 +222,35 @@ final class DiagnosticLog: @unchecked Sendable {
             var data = try encoder.encode(entry); data.append(0x0A)
             guard data.count <= maximumFileBytes else { throw Failure.storageUnavailable }
             try prepareDirectory()
-            if let size = try regularFileSize(file(0)), size + data.count > maximumFileBytes { try rotate() }
-            if try regularFileSize(file(0)) == nil {
-                guard FileManager.default.createFile(atPath: file(0).path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
-                    throw Failure.storageUnavailable
-                }
+            try withLogLock { locked in
+                if locked, let size = try regularFileSize(file(0)), size > maximumFileBytes - data.count { try rotate() }
+                let descriptor = open(file(0).path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, mode_t(0o600))
+                guard descriptor >= 0 else { throw Failure.storageUnavailable }
+                let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+                defer { try? handle.close() }
+                var info = stat()
+                guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+                      fchmod(descriptor, mode_t(0o600)) == 0 else { throw Failure.storageUnavailable }
+                try handle.write(contentsOf: data)
             }
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file(0).path)
-            let handle = try FileHandle(forWritingTo: file(0))
-            defer { try? handle.close() }
-            try handle.seekToEnd()
-            try handle.write(contentsOf: data)
             failure = nil
         } catch { failure = .storageUnavailable }
+    }
+
+    private func withLogLock<T>(_ body: (Bool) throws -> T) rethrows -> T {
+        let descriptor = open(directory.appendingPathComponent(".quietdesk-log.lock").path,
+                              O_RDWR | O_CREAT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, mode_t(0o600))
+        guard descriptor >= 0 else { return try body(false) }
+        defer { close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
+              info.st_uid == geteuid(), info.st_nlink == 1,
+              fchmod(descriptor, mode_t(0o600)) == 0 else { return try body(false) }
+        while flock(descriptor, LOCK_EX) != 0 {
+            if errno != EINTR { return try body(false) }
+        }
+        defer { flock(descriptor, LOCK_UN) }
+        return try body(true)
     }
 
     private func file(_ index: Int) -> URL {
@@ -238,7 +270,6 @@ final class DiagnosticLog: @unchecked Sendable {
             let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
             guard attributes[.type] as? FileAttributeType == .typeRegular else { throw Failure.storageUnavailable }
             let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
-            guard size <= maximumFileBytes else { throw Failure.storageUnavailable }
             return size
         } catch let error as NSError where error.domain == NSCocoaErrorDomain
             && (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError) {

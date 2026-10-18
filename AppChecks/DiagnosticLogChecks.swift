@@ -60,7 +60,7 @@ private struct DiagnosticLogChecks {
                 log.record(.streamConfigured, values: [.eventCount: index])
                 try require(log.flush() == nil, "Rotation write failed")
             }
-            let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])
+            let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey]).filter { $0.pathExtension == "jsonl" }
             try require(files.count == 3, "Rotation retained too many or too few files")
             for file in files {
                 let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
@@ -75,8 +75,68 @@ private struct DiagnosticLogChecks {
             let restarted = DiagnosticLog(directory: directory, maximumFileBytes: 512, retainedFileCount: 3)
             restarted.record(.applicationStopped)
             try require(restarted.flush() == nil, "Existing logs were not reusable after restart")
-            try require(try FileManager.default.contentsOfDirectory(atPath: directory.path).count == 3,
+            try require(try FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0.hasSuffix(".jsonl") }.count == 3,
                         "Restart exceeded the retention cap")
+        }
+
+        await run("Oversized logs rotate again and export only bounded complete records") { folder in
+            let directory = folder.appendingPathComponent("logs")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let source = directory.appendingPathComponent("quietdesk-current.jsonl")
+            let line = Data("{\"event\":\"applicationStarted\"}\n".utf8)
+            var oversized = Data()
+            while oversized.count < 3_072 { oversized.append(line) }
+            try oversized.write(to: source)
+            let log = DiagnosticLog(directory: directory, maximumFileBytes: 1_024, retainedFileCount: 3)
+            log.record(.connectionReady)
+            try require(log.flush() == nil, "Oversized log prevented recovery")
+            try require(try source.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0 <= 1_024,
+                        "Current log was not rotated")
+            try require(FileManager.default.fileExists(atPath: directory.appendingPathComponent("quietdesk-1.jsonl").path),
+                        "Oversized log was not retained")
+            let output = folder.appendingPathComponent("bounded.txt")
+            try await log.export(to: output)
+            let data = try Data(contentsOf: output)
+            let headerSize = (data.firstIndex(of: 10) ?? 0) + 1
+            try require(data.count <= headerSize + 3 * 1_024, "Export exceeded its bounded tail budget")
+            _ = try entries(at: output)
+        }
+
+        await run("Independent log writers serialize rotation and preserve valid JSON lines") { folder in
+            let directory = folder.appendingPathComponent("logs")
+            let logs = (0..<2).map { _ in DiagnosticLog(directory: directory, maximumFileBytes: 1_024, counterInterval: 60) }
+            DispatchQueue.concurrentPerform(iterations: 2) { writer in
+                for index in 0..<500 {
+                    logs[writer].record(.connectionReady, values: [.eventCount: index])
+                    logs[writer].flush()
+                }
+            }
+            for log in logs { try require(log.flush() == nil, "Concurrent writer failed") }
+            let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])
+                .filter { $0.pathExtension == "jsonl" }
+            try require(files.count == 4, "Concurrent rotation changed retention")
+            for file in files {
+                try require(try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0 <= 1_024,
+                            "Concurrent log exceeded its byte limit")
+                _ = try entries(at: file)
+            }
+        }
+
+        await run("An unavailable log lock falls back to append without following its symlink") { folder in
+            let directory = folder.appendingPathComponent("logs")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let untouched = folder.appendingPathComponent("private.txt")
+            let original = Data("unchanged".utf8)
+            try original.write(to: untouched)
+            try FileManager.default.createSymbolicLink(at: directory.appendingPathComponent(".quietdesk-log.lock"),
+                                                      withDestinationURL: untouched)
+            let log = DiagnosticLog(directory: directory)
+            log.record(.connectionReady)
+            log.record(.connectionClosed)
+            try require(log.flush() == nil, "Lock failure stopped logging")
+            try require(try entries(at: directory.appendingPathComponent("quietdesk-current.jsonl")).count == 2,
+                        "Fallback overwrote earlier records")
+            try require(try Data(contentsOf: untouched) == original, "Lock symlink target changed")
         }
 
         await run("Concurrent events have bounded pending work and aggregate scroll counts exactly") { folder in
@@ -164,7 +224,7 @@ private struct DiagnosticLogChecks {
             }
             let output = folder.appendingPathComponent("rotated.txt")
             try await log.export(to: output)
-            let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey])
+            let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.fileSizeKey]).filter { $0.pathExtension == "jsonl" }
             try require(files.count == 2, "Performance windows exceeded the retained file limit")
             for file in files {
                 try require(try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0 <= 512,

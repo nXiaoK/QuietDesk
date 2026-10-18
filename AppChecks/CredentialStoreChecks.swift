@@ -116,6 +116,31 @@ private struct CredentialStoreChecks {
             try require(try reopened.load(account: "../literal-account") != nil, "Host removal lost another code")
         }
 
+        run("Saves and removals clean only stale regular pairing temp files") { folder in
+            let store = LocalCredentialStore(directory: folder)
+            try store.save(testKey())
+            for removing in [false, true] {
+                let stale = folder.appendingPathComponent(".pairing-" + UUID().uuidString + ".tmp")
+                let similar = folder.appendingPathComponent(".pairing-00000000-0000-0000-0000-00000000000G.tmp")
+                let link = folder.appendingPathComponent(".pairing-" + UUID().uuidString + ".tmp")
+                let directory = folder.appendingPathComponent(".pairing-" + UUID().uuidString + ".tmp")
+                let target = folder.appendingPathComponent("target-" + UUID().uuidString)
+                let original = Data("preserved fixture".utf8)
+                try original.write(to: stale)
+                try original.write(to: similar)
+                try original.write(to: target)
+                try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+                if removing { try store.remove() } else { try store.save(testKey()) }
+                try require(!FileManager.default.fileExists(atPath: stale.path), "Stale pairing temp file survived")
+                try require(try Data(contentsOf: similar) == original, "A similar non-UUID filename was removed")
+                try require(try FileManager.default.destinationOfSymbolicLink(atPath: link.path) == target.path,
+                            "A pairing temp symlink was removed")
+                try require(try Data(contentsOf: target) == original, "A pairing temp symlink target was changed")
+                try require(FileManager.default.fileExists(atPath: directory.path), "A pairing temp directory was removed")
+            }
+        }
+
         run("Storage is explicitly plaintext JSON with private directory, document and lock permissions") { folder in
             let directory = folder.appendingPathComponent("Credentials", isDirectory: true)
             let store = LocalCredentialStore(directory: directory)

@@ -51,6 +51,7 @@ struct LocalCredentialStore: Sendable {
 
     func save(_ key: PairingKey, account: String = "host") throws {
         try withLockedDirectory { descriptor in
+            removeStaleTemporaryFiles(in: descriptor)
             var snapshot = try read(descriptor)
             guard snapshot.document.codes[account] != key.code else { return }
             snapshot.document.codes[account] = key.code
@@ -60,6 +61,7 @@ struct LocalCredentialStore: Sendable {
 
     func remove(account: String = "host") throws {
         try withLockedDirectory { descriptor in
+            removeStaleTemporaryFiles(in: descriptor)
             var snapshot = try read(descriptor)
             guard snapshot.document.codes.removeValue(forKey: account) != nil else { return }
             try write(snapshot, to: descriptor)
@@ -174,6 +176,28 @@ struct LocalCredentialStore: Sendable {
             throw damagedFile()
         }
         return Snapshot(document: document, identity: identity)
+    }
+
+    private func removeStaleTemporaryFiles(in directoryDescriptor: Int32) {
+        let descriptor = dup(directoryDescriptor)
+        guard descriptor >= 0 else { return }
+        guard let directory = fdopendir(descriptor) else { close(descriptor); return }
+        defer { closedir(directory) }
+        while let entry = readdir(directory) {
+            var bytes = entry.pointee.d_name
+            let name = withUnsafePointer(to: &bytes) { pointer in
+                pointer.withMemoryRebound(to: CChar.self, capacity: Int(entry.pointee.d_namlen) + 1) {
+                    String(cString: $0)
+                }
+            }
+            guard name.hasPrefix(".pairing-"), name.hasSuffix(".tmp") else { continue }
+            let identifier = name.dropFirst(".pairing-".count).dropLast(".tmp".count)
+            guard identifier.utf8.count == 36, UUID(uuidString: String(identifier)) != nil else { continue }
+            var info = stat()
+            guard fstatat(directoryDescriptor, name, &info, AT_SYMLINK_NOFOLLOW) == 0,
+                  (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == geteuid() else { continue }
+            _ = unlinkat(directoryDescriptor, name, 0)
+        }
     }
 
     private func write(_ snapshot: Snapshot, to directoryDescriptor: Int32) throws {

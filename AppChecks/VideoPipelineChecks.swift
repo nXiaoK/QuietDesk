@@ -14,8 +14,25 @@ private func require(_ condition: @autoclosure () -> Bool, _ message: String) th
 private final class EncodedRecoveryPacket: @unchecked Sendable {
     private let lock = NSLock()
     private var result: Result<VideoPacket, Error>?
-    func set(_ result: Result<VideoPacket, Error>) { lock.withLock { self.result = result } }
-    func get() -> Result<VideoPacket, Error>? { lock.withLock { result } }
+    private var timing = VideoEncodeTiming()
+    private var callbacks = 0
+    private var duration: TimeInterval?
+    func begin(encoderID: UUID, sequence: UInt32) {
+        lock.withLock { timing.begin(encoderID: encoderID, sequence: sequence, at: SessionClock.now) }
+    }
+    func set(_ result: Result<VideoPacket, Error>, encoderID: UUID) {
+        let callbackAt = SessionClock.now
+        lock.withLock {
+            self.result = result
+            callbacks += 1
+            if case .success(let packet) = result {
+                duration = timing.complete(encoderID: encoderID, sequence: packet.sequence, at: callbackAt)
+            } else { timing.cancel(encoderID: encoderID) }
+        }
+    }
+    func get() -> (result: Result<VideoPacket, Error>?, callbacks: Int, duration: TimeInterval?) {
+        lock.withLock { (result, callbacks, duration) }
+    }
 }
 
 @main
@@ -229,6 +246,44 @@ private struct VideoPipelineChecks {
             try require(flow.begin(at: 4) == nil && !flow.resumeMediaFrames(), "Abort reused the candidate reference chain")
         }
 
+        run("Encode duration is independent of diagnostics and matches one encoder generation and sequence") {
+            var timing = VideoEncodeTiming()
+            let old = UUID(), replacement = UUID()
+            timing.begin(encoderID: old, sequence: UInt32.max, at: 10)
+            timing.cancel()
+            timing.begin(encoderID: replacement, sequence: 0, at: 20)
+            try require(timing.complete(encoderID: old, sequence: UInt32.max, at: 21) == nil,
+                        "Old generation produced a new-session duration")
+            timing.cancel(encoderID: old)
+            try require(timing.complete(encoderID: replacement, sequence: 1, at: 21) == nil,
+                        "Wrong capture sequence consumed the active timing")
+            let duration = timing.complete(encoderID: replacement, sequence: 0, at: 20.025)
+            try require(duration.map({ abs($0 - 0.025) < 0.000_001 }) == true,
+                        "Duration included queueing after its callback or an unrelated frame")
+            try require(timing.complete(encoderID: replacement, sequence: 0, at: 21) == nil,
+                        "Duplicate output reported duration twice")
+        }
+
+        run("Encode duration cancellation and invalid clock readings cannot leave a stale sample") {
+            var timing = VideoEncodeTiming()
+            let id = UUID()
+            timing.begin(encoderID: id, sequence: 1, at: 10)
+            try require(timing.complete(encoderID: id, sequence: 1, at: 9) == nil,
+                        "A backwards clock produced negative duration")
+            try require(timing.complete(encoderID: id, sequence: 1, at: 11) == nil,
+                        "An invalid completion kept a stale timing slot")
+            timing.begin(encoderID: id, sequence: 2, at: 10)
+            try require(timing.complete(encoderID: id, sequence: 2, at: .infinity) == nil,
+                        "An infinite duration escaped validation")
+            timing.begin(encoderID: id, sequence: 3, at: .nan)
+            try require(timing.complete(encoderID: id, sequence: 3, at: 11) == nil,
+                        "An invalid start time produced a duration")
+            timing.begin(encoderID: id, sequence: 4, at: 10)
+            timing.cancel(encoderID: id)
+            try require(timing.complete(encoderID: id, sequence: 4, at: 11) == nil,
+                        "Stopped encoder still produced a duration")
+        }
+
         run("Fresh encoders produce real IDR frames when replaying the same retained pixel buffer") {
             var pixelBuffer: CVPixelBuffer?
             let status = CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nil, &pixelBuffer)
@@ -244,18 +299,25 @@ private struct VideoPipelineChecks {
             for sequence: UInt32 in [UInt32.max, 0] {
                 let output = EncodedRecoveryPacket()
                 let done = DispatchSemaphore(value: 0)
+                let encoderID = UUID()
                 let encoder = try VideoEncoder(width: 64, height: 64, settings: StreamSettings(framesPerSecond: 60, megabits: 3))
-                encoder.onOutput = { result in output.set(result); done.signal() }
+                encoder.onOutput = { result in output.set(result, encoderID: encoderID); done.signal() }
                 encoder.onDropped = { _ in done.signal() }
                 defer { encoder.stop() }
+                output.begin(encoderID: encoderID, sequence: sequence)
                 try encoder.encode(pixelBuffer, time: CMTime(value: 1, timescale: 60), sequence: sequence, forceKeyFrame: true)
-                guard done.wait(timeout: .now() + 10) == .success, let result = output.get() else {
+                guard done.wait(timeout: .now() + 10) == .success else {
                     throw VideoCheckFailure("Fresh encoder did not output the retained recovery frame")
                 }
+                encoder.stop()
+                let observation = output.get()
+                guard let result = observation.result else { throw VideoCheckFailure("Native recovery frame was dropped") }
                 let packet = try result.get()
                 let idr = try MediaFrame.containsIDR(packet.avcc)
                 try require(idr && !packet.sps.isEmpty && !packet.pps.isEmpty && packet.sequence == sequence,
                             "Recovery output was not a real IDR with its original capture identity")
+                try require(observation.callbacks == 1 && observation.duration.map({ $0.isFinite && $0 >= 0 }) == true,
+                            "Native output was counted twice or did not produce a finite independent duration")
             }
         }
 

@@ -486,7 +486,6 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         catch {
             encodingTimingLock.withLock { encodingStarted = nil }
             frameFlow.cancelEncoding()
-            if let waiter = idleWaiter { idleWaiter = nil; waiter.1.resume(throwing: error) }
             reportError(error)
         }
     }

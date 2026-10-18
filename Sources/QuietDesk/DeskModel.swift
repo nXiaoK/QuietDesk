@@ -1045,10 +1045,7 @@ final class DeskModel: ObservableObject {
             controlStatusUpdatesEnabled = true
             status = canControl ? "正在共享 · 允许键盘鼠标控制" : "正在共享 · 仅观看（辅助功能未生效）"
             peer.send(try Wire.json(.controlStatus, ControlStatus(canControl: canControl)))
-        case .acknowledgement:
-            guard message.payload.count == 4 else { throw DeskError.invalid("画面确认无效") }
-            var reader = ByteReader(message.payload)
-            hostSession.streamer?.acknowledge(try reader.take() as UInt32)
+        case .acknowledgement: break // Routed through SessionDataChannel; a late one has no frame to release.
         case .input:
             let input = try Wire.readJSON(RemoteInput.self, message.payload)
             try input.validate()

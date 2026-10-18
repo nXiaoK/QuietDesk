@@ -6,6 +6,7 @@ struct SharingView: View {
     @ObservedObject var model: DeskModel
     let openTraffic: () -> Void
     @State private var showCode = false
+    @State private var confirmingRegeneration = false
     @State private var previousCode = ""
 
     private var locked: Bool { model.active || model.working }
@@ -196,9 +197,18 @@ struct SharingView: View {
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                         Spacer(minLength: 0)
-                        Button(model.hostCode.isEmpty ? "生成新配对码" : "重新生成…") { model.regenerateKey() }
-                            .controlSize(.small)
-                            .disabled(locked)
+                        Button(model.hostCode.isEmpty ? "生成新配对码" : "重新生成…") {
+                            if model.hostCode.isEmpty { model.regenerateKey() }
+                            else { confirmingRegeneration = true }
+                        }
+                        .controlSize(.small)
+                        .disabled(locked)
+                        .confirmationDialog("重新生成配对码？", isPresented: $confirmingRegeneration, titleVisibility: .visible) {
+                            Button("重新生成", role: .destructive) { model.regenerateKey() }
+                            Button("取消", role: .cancel) {}
+                        } message: {
+                            Text("旧配对码会立即失效，所有已配对的控制端都需要输入新配对码才能连接。")
+                        }
                     }
                 }
             }

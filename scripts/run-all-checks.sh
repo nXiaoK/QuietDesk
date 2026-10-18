@@ -15,6 +15,6 @@ swift_build=(swift build --scratch-path "$check_root" --disable-sandbox --cache-
 "${swift_build[@]}" --product QuietDeskChecks
 build_directory="$("${swift_build[@]}" --show-bin-path)"
 "$build_directory/QuietDeskChecks"
-for script in app input video cursor session-data session-effects traffic log credential permission media-transport media-session media-blackhole; do
+for script in app input caps-lock video cursor session-data session-effects traffic log credential permission media-transport media-session media-blackhole; do
     "./scripts/run-$script-checks.sh"
 done

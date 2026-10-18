@@ -931,25 +931,30 @@ final class InputInjector {
     private var lastPoint = CGPoint.zero
     private var scroll = ScrollAccumulator()
     private let source = CGEventSource(stateID: .hidSystemState)
-    private let inputSources = InputSources()
+    private let inputSources: InputSources
     private var remoteCapsLock: Bool?
     private let isTrusted: () -> Bool
     private let postEvent: (CGEvent) -> Void
+    private let capsLockState: () -> Bool
 
     convenience init(displayID: CGDirectDisplayID) { self.init(bounds: CGDisplayBounds(displayID)) }
 
     init(bounds: CGRect, isTrusted: @escaping () -> Bool = { AXIsProcessTrusted() },
-         postEvent: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) }) {
+         postEvent: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
+         inputSources: InputSources? = nil,
+         capsLockState: @escaping () -> Bool = { CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift) }) {
         self.bounds = bounds
         self.isTrusted = isTrusted
         self.postEvent = postEvent
+        self.inputSources = inputSources ?? InputSources()
+        self.capsLockState = capsLockState
     }
 
-    func receive(_ input: RemoteInput) throws -> InputFeedback? {
+    func receive(_ input: RemoteInput) async throws -> InputFeedback? {
         try input.validate()
         guard isTrusted() else { releaseAll(); return nil }
         if input.independentCapsLock == true || input.kind == .switchInputSource || input.kind == .toggleCapsLock {
-            if remoteCapsLock == nil { remoteCapsLock = CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift) }
+            if remoteCapsLock == nil { remoteCapsLock = capsLockState() }
         }
         if input.kind == .switchInputSource || input.kind == .toggleCapsLock {
             if input.kind == .toggleCapsLock || remoteCapsLock == true {
@@ -965,7 +970,11 @@ final class InputInjector {
                                      capsLocked: remoteCapsLock == true)
             }
             do {
-                return InputFeedback(message: "远端输入法：\(try inputSources.toggle())", capsLocked: false)
+                let selected = try await inputSources.toggle()
+                guard isTrusted() else { releaseAll(); return nil }
+                return InputFeedback(message: "远端输入源已确认：\(selected)", capsLocked: false)
+            } catch is CancellationError {
+                return nil
             } catch {
                 return InputFeedback(message: error.localizedDescription, capsLocked: remoteCapsLock == true)
             }
@@ -1049,6 +1058,7 @@ final class InputInjector {
     }
 
     func releaseAll() {
+        inputSources.cancel()
         scroll.reset()
         for key in heldKeys {
             let event = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false)

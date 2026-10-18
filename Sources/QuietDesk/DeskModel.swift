@@ -847,14 +847,14 @@ final class DeskModel: ObservableObject {
             do {
                 if try channel.receive(message) { resume(); return }
             } catch { candidate?.close(error.localizedDescription); resume(); return }
-            DispatchQueue.main.async {
+            Task { @MainActor in
                 defer { resume() }
                 guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
                 guard self.connected else {
                     if message.kind != .releaseInput { candidate.close("屏幕共享尚未就绪", retryable: true) }
                     return
                 }
-                do { try self.handleHost(message, peer: candidate) }
+                do { try await self.handleHost(message, peer: candidate) }
                 catch {
                     self.recordDiagnosticFailure(.connectionFailed, error: error)
                     candidate.close(error.localizedDescription)
@@ -1264,7 +1264,7 @@ final class DeskModel: ObservableObject {
         UserDefaults.standard.set(lastDisconnect, forKey: "lastDisconnect")
     }
 
-    private func handleHost(_ message: Message, peer: Peer) throws {
+    private func handleHost(_ message: Message, peer: Peer) async throws {
         switch message.kind {
         case .cursorControl:
             let request = try CursorControl.read(message.payload)
@@ -1297,7 +1297,9 @@ final class DeskModel: ObservableObject {
                 DiagnosticLog.shared.count(.scrollReceived)
                 if !canControl || hostSession.paused || hostSession.pauseTask != nil { DiagnosticLog.shared.count(.scrollSuppressed) }
             }
-            if canControl, !hostSession.paused, hostSession.pauseTask == nil, let feedback = try hostSession.injector?.receive(input) {
+            let host = hostSession
+            if canControl, !host.paused, host.pauseTask == nil, let feedback = try await host.injector?.receive(input),
+               self.hostSession === host, self.peer === peer, canControl, !host.paused, host.pauseTask == nil {
                 peer.send(try Wire.json(.inputStatus, feedback))
             }
         case .releaseInput: hostSession.injector?.releaseAll()

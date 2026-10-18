@@ -156,7 +156,7 @@ final class ClipboardSync {
                 if self.imagePreparation != nil {
                     self.imagePreparation = nil
                     self.sendingChange = nil
-                    let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
+                    self.settleWaiters(false)
                 }
                 let change = self.pasteboard.changeCount
                 self.pendingFileOffer = (offer.id, change)
@@ -199,7 +199,7 @@ final class ClipboardSync {
             imagePreparation = nil
             sendingChange = nil
             observedChange = Int.min
-            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+            settleWaiters(false)
         }
         if allowed { poll() }
     }
@@ -252,8 +252,13 @@ final class ClipboardSync {
         imagePreparation = nil
         timer?.invalidate(); timer = nil
         transfer.stop()
-        let callbacks = waiters; waiters.removeAll()
-        callbacks.forEach { $0(false) }
+        settleWaiters(false)
+    }
+
+    private func settleWaiters(_ result: Bool) {
+        let callbacks = waiters
+        waiters.removeAll()
+        callbacks.forEach { $0(result) }
     }
 
     private func poll() {
@@ -272,7 +277,7 @@ final class ClipboardSync {
         guard !pasteboard.isSensitive else {
             sendingChange = nil
             onStatus?("剪贴板内容已标记为敏感，未同步到对端")
-            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+            settleWaiters(false)
             return
         }
         let payload: ClipboardPayload
@@ -282,7 +287,7 @@ final class ClipboardSync {
         else if let tiff = pasteboard.tiffData {
             guard UInt64(tiff.count) <= ClipboardAutomaticLimits.imageBytes else {
                 onStatus?("图片超过 64 MiB，未自动同步，请保存为文件后复制")
-                let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+                settleWaiters(false)
                 return
             }
             let token = UUID()
@@ -299,13 +304,13 @@ final class ClipboardSync {
                         self.imagePreparation = nil
                         self.sendingChange = nil
                         guard self.allowsAutomaticSending, self.pasteboard.changeCount == change else {
-                            let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
+                            self.settleWaiters(false)
                             self.poll()
                             return
                         }
                         guard let png else {
                             self.onStatus?("剪贴板图片无法转换为 PNG")
-                            let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
+                            self.settleWaiters(false)
                             return
                         }
                         self.sendPrepared(.png(png), change: change, preparation: preparation)
@@ -317,7 +322,7 @@ final class ClipboardSync {
         else if let text = pasteboard.text { payload = .text(Data(text.utf8)) }
         else {
             onStatus?("此剪贴板类型暂不能同步")
-            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+            settleWaiters(false)
             return
         }
         sendPrepared(payload, change: change)
@@ -332,20 +337,20 @@ final class ClipboardSync {
             }
         } catch {
             onStatus?(error.localizedDescription)
-            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+            settleWaiters(false)
             return
         }
         // 文件来自通用剪贴板（另一台 Mac 复制后由系统同步过来），对端本身就是来源，转发只会形成回环。
         if case .files = payload, pasteboard.isRelayedFromOtherDevice {
             onDiagnostic?(.staleFilesSuppressed)
             onStatus?("剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传")
-            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+            settleWaiters(false)
             return
         }
         // Closing a remote prompt can restore focus without a new local file copy.
         if case .files = payload, staleFileChange == change {
             onDiagnostic?(.staleFilesSuppressed)
-            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+            settleWaiters(false)
             return
         }
         staleFileChange = nil
@@ -353,19 +358,19 @@ final class ClipboardSync {
         let isFile: Bool
         if case .files = payload { isFile = true } else { isFile = false }
         if isFile {
-            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+            settleWaiters(false)
         }
         if (!isFile && lastSharedMarker == contentMarker) || ((hasSharedState || sendingChange != nil) && pasteboard.contentMarker == contentMarker) {
             hasSharedState = true
             lastSharedMarker = contentMarker
             sharedChange = change
             sendingChange = nil
-            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(true) }
+            settleWaiters(true)
             return
         }
         if isFile, !allowsFileSending {
             onStatus?("对端需更新到 0.5.0 才能确认接收文件，未发送文件内容")
-            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+            settleWaiters(false)
             return
         }
         sendingChange = change
@@ -378,8 +383,7 @@ final class ClipboardSync {
                 guard self.sendingChange == change else { return }
                 self.sendingChange = nil
                 if success { self.sharedChange = change; self.hasSharedState = true; self.lastSharedMarker = contentMarker }
-                let callbacks = self.waiters; self.waiters.removeAll()
-                callbacks.forEach { $0(success) }
+                self.settleWaiters(success)
             }
         }
     }
@@ -388,7 +392,7 @@ final class ClipboardSync {
         guard let pending = imageApplication else { return }
         imageApplication = nil
         pending.completion(false)
-        let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+        settleWaiters(false)
     }
 
     private func prepareApplication(_ payload: ClipboardPayload, permit: ClipboardApplyPermit,
@@ -397,7 +401,7 @@ final class ClipboardSync {
         if imagePreparation != nil {
             imagePreparation = nil
             sendingChange = nil
-            let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(false) }
+            settleWaiters(false)
         }
         cancelImageApplication()
         guard case .png(let bytes) = payload else {
@@ -415,20 +419,20 @@ final class ClipboardSync {
                 self.imageApplication = nil
                 guard self.running, self.pasteboard.changeCount == change else {
                     completion(false)
-                    let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
+                    self.settleWaiters(false)
                     return
                 }
                 guard let contentMarker else {
                     self.onDiagnostic?(.applyFailed(.png, fileCount: 0))
                     self.onStatus?("接收的图片无效")
                     completion(false)
-                    let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
+                    self.settleWaiters(false)
                     return
                 }
                 let accepted = permit.performIfValid { self.apply(payload, contentMarker: contentMarker) }
                 completion(accepted)
                 if !accepted {
-                    let callbacks = self.waiters; self.waiters.removeAll(); callbacks.forEach { $0(false) }
+                    self.settleWaiters(false)
                 }
             }
         }
@@ -461,7 +465,7 @@ final class ClipboardSync {
         lastSharedMarker = contentMarker
         sendingChange = nil
         onDiagnostic?(.applied(summary.kind, fileCount: summary.fileCount))
-        let callbacks = waiters; waiters.removeAll(); callbacks.forEach { $0(true) }
+        settleWaiters(true)
         return true
     }
 

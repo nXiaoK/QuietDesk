@@ -146,7 +146,7 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         try require(feedback(receiver.poll(), .nack).isEmpty, "NACK rate limit was ignored")
         time.now = 0.14
         _ = try receiver.receive(parts[0])
-        time.now = 0.151
+        time.now = 2.001
         try require(!feedback(receiver.poll(), .expired).isEmpty, "Repeated fragment extended frame lifetime")
     }
 
@@ -242,5 +242,37 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         time.now = 0.16
         try require(feedback(receiver.poll(), .expired).map(\.header.frameID) == [2], "Slow TCP decode escaped its finite epoch lifetime")
         try require(receiver.decoded(second.header, success: true).isEmpty, "Late decode revived an expired epoch")
+    }
+
+    run("Media IDR assembly and initial gap have a separate finite recovery budget") {
+        let time = MediaCheckClock()
+        let receiver = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        let parts = try MediaFragment.fragment(frame: frame(1, idr: true, bytes: 3_000))
+        _ = try receiver.receive(parts[0])
+        time.now = 0.16
+        try require(feedback(receiver.poll(), .expired).isEmpty, "A recovery IDR inherited the short P-frame budget")
+        time.now = 2.001
+        try require(feedback(receiver.poll(), .expired).count == 1, "IDR reassembly had no finite lifetime")
+        receiver.replaceStream(nextStream)
+        _ = try receiver.receive(frame(2, idr: true, stream: nextStream))
+        time.now = 2.2
+        try require(feedback(receiver.poll(), .expired).isEmpty, "Initial missing IDR used the short gap budget")
+        time.now = 4.002
+        try require(feedback(receiver.poll(), .expired).map(\.header.frameID) == [1], "Initial IDR gap did not expire")
+    }
+
+    run("Media whole-frame expiry can retire a missing native IDR without knowing its frame flag") {
+        let cache = try MediaRetransmissionCache(stream: stream, clock: { 0 })
+        let first = try frame(1, idr: true, sequence: 10)
+        _ = try cache.insert(first, deadline: 2)
+        _ = cache.handle(try MediaFeedback(kind: .decoded, header: first.header), estimatedRoundTrip: 0)
+        let second = try frame(2, idr: true, sequence: 11)
+        _ = try cache.insert(second, deadline: 2)
+        let unknownFlag = MediaFrameHeader(stream: stream, frameID: 2, isIDR: false)
+        let events = cache.handle(try MediaFeedback(kind: .expired, header: unknownFlag), estimatedRoundTrip: 0)
+        try require(terminal(events) == [11] && cache.requiresRecovery, "Missing-frame status could not retire an unknown IDR")
+        try rejects { _ = try MediaFrameReassembler(stream: stream, limits: MediaBufferLimits(keyFrameTimeToLive: .nan)) }
+        try rejects { _ = try MediaFrameReassembler(stream: stream, firstFrameID: UInt64.max) }
+        try rejects { _ = try MediaRetransmissionCache(stream: stream, firstFrameID: UInt64.max) }
     }
 }

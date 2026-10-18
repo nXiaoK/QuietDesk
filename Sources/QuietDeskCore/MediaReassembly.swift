@@ -5,6 +5,7 @@ public struct MediaBufferLimits: Sendable {
     public let maximumBufferedBytes: Int
     public let maximumFrames: Int
     public let frameTimeToLive: TimeInterval
+    public let keyFrameTimeToLive: TimeInterval
     public let reorderDelay: TimeInterval
     public let nackInterval: TimeInterval
     public let acknowledgementRepeatInterval: TimeInterval
@@ -13,13 +14,15 @@ public struct MediaBufferLimits: Sendable {
 
     public init(maximumFrameBytes: Int = MediaFrame.maximumPacketBytes,
                 maximumBufferedBytes: Int = 32 * 1_024 * 1_024, maximumFrames: Int = 3,
-                frameTimeToLive: TimeInterval = 0.15, reorderDelay: TimeInterval = 0.003,
+                frameTimeToLive: TimeInterval = 0.15, keyFrameTimeToLive: TimeInterval = 2.0,
+                reorderDelay: TimeInterval = 0.003,
                 nackInterval: TimeInterval = 0.01, acknowledgementRepeatInterval: TimeInterval = 0.02,
                 maximumRepairRounds: Int = 2, repairSafetyMargin: TimeInterval = 0.005) {
         self.maximumFrameBytes = maximumFrameBytes
         self.maximumBufferedBytes = maximumBufferedBytes
         self.maximumFrames = maximumFrames
         self.frameTimeToLive = frameTimeToLive
+        self.keyFrameTimeToLive = keyFrameTimeToLive
         self.reorderDelay = reorderDelay
         self.nackInterval = nackInterval
         self.acknowledgementRepeatInterval = acknowledgementRepeatInterval
@@ -30,7 +33,8 @@ public struct MediaBufferLimits: Sendable {
     fileprivate func validate() throws {
         guard (1...MediaFrame.maximumPacketBytes).contains(maximumFrameBytes), maximumBufferedBytes > 0,
               (1...64).contains(maximumFrames), frameTimeToLive.isFinite, frameTimeToLive > 0,
-              reorderDelay.isFinite, reorderDelay >= 0, reorderDelay < frameTimeToLive,
+              keyFrameTimeToLive.isFinite, keyFrameTimeToLive > 0,
+              reorderDelay.isFinite, reorderDelay >= 0, reorderDelay < min(frameTimeToLive, keyFrameTimeToLive),
               nackInterval.isFinite, nackInterval > 0,
               acknowledgementRepeatInterval.isFinite, acknowledgementRepeatInterval > 0,
               (0...16).contains(maximumRepairRounds), repairSafetyMargin.isFinite, repairSafetyMargin >= 0 else {
@@ -286,10 +290,13 @@ public final class MediaFrameReassembler {
 
     private func expire(at now: TimeInterval) -> [MediaReceiveEvent] {
         guard !requiresRecovery else { return [] }
-        if let gapStartedAt, now - gapStartedAt >= limits.frameTimeToLive {
+        let gapTimeToLive = waitingForFirstIDR ? limits.keyFrameTimeToLive : limits.frameTimeToLive
+        if let gapStartedAt, now - gapStartedAt >= gapTimeToLive {
             return invalidate(at: MediaFrameHeader(stream: stream, frameID: expectedFrameID, isIDR: waitingForFirstIDR))
         }
-        if let oldest = assemblies.values.filter({ now - $0.firstReceivedAt >= limits.frameTimeToLive })
+        if let oldest = assemblies.values.filter({
+            now - $0.firstReceivedAt >= ($0.header.isIDR ? limits.keyFrameTimeToLive : limits.frameTimeToLive)
+        })
             .min(by: { $0.header.frameID < $1.header.frameID }) {
             return invalidate(at: oldest.header)
         }
@@ -387,7 +394,8 @@ public final class MediaRetransmissionCache {
         var events = expire(at: now)
         guard !requiresRecovery else { return events }
         guard let inserted = highestInserted, feedback.header.frameID <= inserted else { return events }
-        if let cached = frames[feedback.header.frameID], cached.header != feedback.header { return events }
+        // A receiver detecting a wholly missing frame cannot know whether it happened to be an IDR.
+        if feedback.kind != .expired, let cached = frames[feedback.header.frameID], cached.header != feedback.header { return events }
         switch feedback.kind {
         case .decoded:
             // Repeated cumulative decode status recovers a lost earlier ACK without retransmitting video.

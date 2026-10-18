@@ -15,18 +15,20 @@ METRIC_UNITS = {
     **dict.fromkeys(("sendQueue", "sendCompletion", "receiveHeaderWait", "receiveBody", "messageHandler", "roundTrip",
                      "tcpSmoothedRTT", "tcpMinimumRTT", "tcpRTTVariance", "tcpReportDuration",
                      "captureAge", "encode", "encodeCallbackQueue", "videoAck", "decodeQueue",
-                     "decodePrepare", "decode", "decodeToDisplay", "displayEnqueue"), "microseconds"),
+                     "decodePrepare", "decode", "decodeToDisplay", "displayEnqueue", "mediaRoundTrip",
+                     "mediaReassembly", "mediaSwitch", "mediaDecodeInterval"), "microseconds"),
     **dict.fromkeys(("encodedBytes", "keyframeBytes", "pendingSendBytes", "tcpRetransmittedBytes", "tcpOutOfOrderBytes",
-                     "tcpSentBytes", "tcpReceivedBytes"), "bytes"),
+                     "tcpSentBytes", "tcpReceivedBytes", "mediaDatagramSentBytes", "mediaDatagramReceivedBytes",
+                     "mediaRepairBytes"), "bytes"),
     **dict.fromkeys(("captureReplaced", "displayReplaced", "encoderHardware", "decoderHardware",
-                     "videoOutstanding"), "count"),
+                     "videoOutstanding", "mediaExpired", "mediaRecovery", "mediaTransport"), "count"),
 }
 MESSAGE_KINDS = dict(enumerate((
     "hello", "video", "acknowledgement", "input", "ping", "pong", "clipboard", "requestClipboard",
     "releaseInput", "inputStatus", "clipboardSettings", "clipboardBegin", "clipboardEntry", "clipboardChunk",
     "clipboardEnd", "clipboardReceipt", "clipboardCancel", "streamSettingsRequest", "streamSettingsResult",
     "controlStatus", "deviceIdentity", "sessionEffectsRequest", "sessionEffectsResult", "sessionPauseRequest",
-    "sessionPauseResult"), start=1))
+    "sessionPauseResult", "mediaControl", "mediaFrame", "mediaFeedback"), start=1))
 OTHER_EVENTS = set((
     "applicationStarted applicationStopped connectionStarted connectionReady connectionClosed connectionFailed "
     "connectionMetrics reconnectScheduled inputFailed hostStarted hostStopped captureStarted captureStopped "

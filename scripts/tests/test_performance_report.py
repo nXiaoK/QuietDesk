@@ -58,6 +58,25 @@ class PerformanceReportTests(unittest.TestCase):
         self.assertIn("不是全会话 P95", text)
         self.assertIn("31 / 第 2 行", text)
 
+    def test_negotiated_media_metrics_and_message_kinds_are_preserved(self):
+        records = [window(metric="mediaRoundTrip", messageKind=26),
+                   window(metric="mediaReassembly", messageKind=27),
+                   window(metric="mediaSwitch", messageKind=26),
+                   window(metric="mediaDecodeInterval", messageKind=27),
+                   window(metric="mediaRepairBytes", messageKind=28, unit="bytes"),
+                   window(metric="mediaDatagramSentBytes", messageKind=27, unit="bytes"),
+                   window(metric="mediaDatagramReceivedBytes", messageKind=27, unit="bytes"),
+                   window(metric="mediaExpired", messageKind=27, unit="count"),
+                   window(metric="mediaRecovery", messageKind=26, unit="count"),
+                   window(metric="mediaTransport", messageKind=26, unit="count")]
+        report = report_module.read_report(self.write(records))
+        self.assertEqual(report.valid_windows, len(records))
+        self.assertEqual(report.skipped_lines, 0)
+        text = report_module.render_report([report])
+        self.assertIn("mediaControl (26)", text)
+        self.assertIn("mediaFrame (27)", text)
+        self.assertIn("mediaFeedback (28)", text)
+
     def test_roles_connections_kinds_files_and_application_runs_stay_separate(self):
         host = window()
         host["role"] = "host"

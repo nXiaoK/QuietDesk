@@ -11,12 +11,17 @@ public enum PerformanceMetric: String, Codable, CaseIterable, Sendable {
     case captureAge, encode, encodeCallbackQueue, videoAck, decodeQueue, decodePrepare, decode, decodeToDisplay, displayEnqueue
     case encodedBytes, keyframeBytes, pendingSendBytes
     case captureReplaced, displayReplaced, encoderHardware, decoderHardware, videoOutstanding
+    case mediaRoundTrip, mediaReassembly, mediaSwitch, mediaDecodeInterval
+    case mediaDatagramSentBytes, mediaDatagramReceivedBytes, mediaRepairBytes
+    case mediaExpired, mediaRecovery, mediaTransport
 
     public var unit: PerformanceUnit {
         switch self {
         case .encodedBytes, .keyframeBytes, .pendingSendBytes, .tcpRetransmittedBytes, .tcpOutOfOrderBytes,
-             .tcpSentBytes, .tcpReceivedBytes: return .bytes
-        case .captureReplaced, .displayReplaced, .encoderHardware, .decoderHardware, .videoOutstanding: return .count
+             .tcpSentBytes, .tcpReceivedBytes, .mediaDatagramSentBytes, .mediaDatagramReceivedBytes,
+             .mediaRepairBytes: return .bytes
+        case .captureReplaced, .displayReplaced, .encoderHardware, .decoderHardware, .videoOutstanding,
+             .mediaExpired, .mediaRecovery, .mediaTransport: return .count
         default: return .microseconds
         }
     }

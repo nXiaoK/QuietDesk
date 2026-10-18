@@ -1071,11 +1071,7 @@ final class DeskModel: ObservableObject {
             clipboardSession = session
             let first = !supportsClipboard
             supportsClipboard = true
-            remoteClipboardEnabled = preference.enabled
-            remoteFileApproval = preference.fileApproval == true
-            remoteClipboardChunkWindow = preference.chunkWindow == true
-            remoteReceivesAutomaticClipboard = preference.receivesAutomaticUpdates ?? true
-            remoteClipboardFocusAware = preference.receivesAutomaticUpdates != nil
+            applyRemoteClipboardPreference(preference)
             if first { try sendClipboardPreference(to: peer) }
             updateClipboardSync()
         case .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel:
@@ -1217,11 +1213,7 @@ final class DeskModel: ObservableObject {
             guard supportsClipboard else { throw DeskError.invalid("对端不支持自动剪贴板") }
             let preference = try Wire.readJSON(ClipboardPreference.self, message.payload)
             guard preference.session == clipboardSession else { throw DeskError.invalid("剪贴板会话不匹配") }
-            remoteClipboardEnabled = preference.enabled
-            remoteFileApproval = preference.fileApproval == true
-            remoteClipboardChunkWindow = preference.chunkWindow == true
-            remoteReceivesAutomaticClipboard = preference.receivesAutomaticUpdates ?? true
-            remoteClipboardFocusAware = preference.receivesAutomaticUpdates != nil
+            applyRemoteClipboardPreference(preference)
             updateClipboardSync()
         case .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel:
             clipboardSync?.receive(message)
@@ -1693,6 +1685,14 @@ final class DeskModel: ObservableObject {
               lastClipboardReceivePreference != receives else { return }
         do { try sendClipboardPreference(to: peer) }
         catch { clipboardStatus = error.localizedDescription }
+    }
+
+    private func applyRemoteClipboardPreference(_ preference: ClipboardPreference) {
+        remoteClipboardEnabled = preference.enabled
+        remoteFileApproval = preference.fileApproval == true
+        remoteClipboardChunkWindow = preference.chunkWindow == true
+        remoteReceivesAutomaticClipboard = preference.receivesAutomaticUpdates ?? true
+        remoteClipboardFocusAware = preference.receivesAutomaticUpdates != nil
     }
 
     private func updateClipboardSync() {

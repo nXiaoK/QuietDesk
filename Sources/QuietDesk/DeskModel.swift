@@ -1437,8 +1437,7 @@ final class DeskModel: ObservableObject {
         }
         input.flags = UInt64(event.modifierFlags.rawValue)
         let allowed = wakeInputGate.allows(input, suspended: wasSuspended || sessionInputSuspended || !connected)
-        let remoteTarget = keyboard ? window.firstResponder === canvas
-            : canvas.window === window && canvas.bounds.contains(canvas.convert(event.locationInWindow, from: nil))
+        let remoteTarget = canvas.isInputTarget(of: event)
         // AppKit must still receive the click that activates an inactive window.
         if !allowed && remoteTarget && windowWasFocused && kind == .scroll { DiagnosticLog.shared.count(.scrollSuppressed) }
         return !allowed && remoteTarget && windowWasFocused ? nil : event

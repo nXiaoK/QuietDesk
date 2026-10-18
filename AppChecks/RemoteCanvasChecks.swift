@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import QuietDeskCore
 
 private struct CanvasCheckFailure: Error, CustomStringConvertible {
@@ -154,6 +155,49 @@ private struct RemoteCanvasChecks {
             canvas.onFocus = { focuses.append($0) }
             canvas.releaseControl()
             try require(releases == 1 && focuses == [false], "Unfocused release notification changed")
+        }
+
+        run("A SwiftUI reconnect button above the canvas is a local target while exposed video remains remote") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            let window = NSWindow(contentRect: canvas.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            defer { window.close() }
+            let hosting = NSHostingView(rootView: ZStack {
+                CanvasView(canvas: canvas)
+                Button("停止重连") {}.frame(width: 160, height: 60)
+            }.frame(width: 400, height: 300))
+            window.contentView = hosting
+            hosting.layoutSubtreeIfNeeded()
+            try require(canvas.window === window, "SwiftUI did not attach the canvas fixture")
+            for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+                guard let local = NSEvent.mouseEvent(with: type, location: CGPoint(x: 200, y: 150), modifierFlags: [],
+                    timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1),
+                      let remote = NSEvent.mouseEvent(with: type, location: CGPoint(x: 20, y: 20), modifierFlags: [],
+                    timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) else {
+                    throw CanvasCheckFailure("Could not create local pointer events")
+                }
+                try require(!canvas.isInputTarget(of: local), "Reconnect button click was classified as remote canvas input")
+                try require(canvas.isInputTarget(of: remote), "An exposed canvas click lost remote input routing")
+            }
+        }
+
+        run("Keyboard routing follows the actual first responder and rejects other windows") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            let window = NSWindow(contentRect: canvas.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            defer { window.close() }
+            window.contentView = canvas
+            canvas.canControl = true
+            guard let key = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, characters: "x", charactersIgnoringModifiers: "x",
+                isARepeat: false, keyCode: 7),
+                  let otherWindow = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: 0, context: nil, characters: "x", charactersIgnoringModifiers: "x",
+                isARepeat: false, keyCode: 7) else { throw CanvasCheckFailure("Could not create keyboard events") }
+            try require(!canvas.isInputTarget(of: key), "An unfocused canvas intercepted local keyboard input")
+            try require(window.makeFirstResponder(canvas), "Canvas did not take fixture focus")
+            try require(canvas.isInputTarget(of: key), "Focused canvas lost keyboard routing")
+            try require(!canvas.isInputTarget(of: otherWindow), "Another window's input reached the canvas")
         }
 
         print("\(passed) passed, \(failed) failed")

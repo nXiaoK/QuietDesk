@@ -76,6 +76,18 @@ final class RemoteCanvas: NSView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    func isInputTarget(of event: NSEvent) -> Bool {
+        guard let window, event.window === window else { return false }
+        switch event.type {
+        case .keyDown, .keyUp, .flagsChanged:
+            return window.firstResponder === self
+        default:
+            guard let content = window.contentView,
+                  let hit = content.hitTest(content.superview?.convert(event.locationInWindow, from: nil) ?? event.locationInWindow) else { return false }
+            return hit === self || hit.isDescendant(of: self)
+        }
+    }
+
     override func layout() {
         super.layout()
         CATransaction.begin()

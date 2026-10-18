@@ -157,7 +157,6 @@ struct SharingView: View {
                     HStack(spacing: 12) {
                         Text(model.hostCode.isEmpty ? "尚未配置" : showCode ? model.hostCode : "••••-••••-••••-••••")
                             .font(.system(.callout, design: .monospaced))
-                            .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                         Button {
                             model.prepareHostCode()

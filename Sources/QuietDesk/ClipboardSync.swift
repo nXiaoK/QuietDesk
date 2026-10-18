@@ -224,6 +224,11 @@ final class ClipboardSync {
         let change = pasteboard.changeCount
         if change == sharedChange { completion(true); return }
         if let files = pasteboard.fileURLs, !files.isEmpty {
+            if pasteboard.isRelayedFromOtherDevice {
+                completion(false)
+                onStatus?("剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传")
+                return
+            }
             guard staleFileChange != change else {
                 onDiagnostic?(.staleFilesSuppressed)
                 completion(false)

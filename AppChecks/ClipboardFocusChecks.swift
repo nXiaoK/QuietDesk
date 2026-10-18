@@ -248,6 +248,23 @@ private struct ClipboardFocusChecks {
             try eventually("The fresh local file was not published") { pair.local.writes == 1 }
         }
 
+        run("Pasting system-relayed files keeps the relay notice and sends no messages") { folder in
+            let pasteboard = MemoryPasteboard()
+            var messages: [MessageKind] = [], statuses: [String] = [], paste: Bool?
+            let sync = ClipboardSync(session: UUID(), allowsFileSending: true, pasteboard: pasteboard, storage: folder) {
+                message in DispatchQueue.main.async { messages.append(message.kind) }
+            }
+            defer { sync.stop() }
+            sync.onStatus = { statuses.append($0) }
+            pasteboard.copy(.files([folder.appendingPathComponent("relayed.bin")]))
+            pasteboard.isRelayedFromOtherDevice = true
+            sync.prepareForPaste { paste = $0 }
+            pump(for: 0.35)
+            try require(paste == false && messages.isEmpty
+                        && statuses.last == "剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传",
+                        "Relay notice was overwritten, a transfer began or the paste became ready")
+        }
+
         run("In-flight paste preparation, chunks and receipts complete after focus loss") { folder in
             let pair = ClipboardPair(storage: folder, localAllowed: true)
             defer { pair.stop() }

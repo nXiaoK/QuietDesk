@@ -1,10 +1,56 @@
 import AppKit
+import CoreVideo
 import SwiftUI
 import QuietDeskCore
 
 private struct CanvasCheckFailure: Error, CustomStringConvertible {
     let description: String
     init(_ description: String) { self.description = description }
+}
+
+private final class CanvasLocked<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+    init(_ value: Value) { self.value = value }
+    func read() -> Value { lock.withLock { value } }
+    func update(_ body: (inout Value) -> Void) { lock.withLock { body(&value) } }
+}
+
+private final class CanvasDecoderProbe: MediaCanvasDecoding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [(UInt32, (Result<CVPixelBuffer, Error>) -> Void)] = []
+    private(set) var stopped = false
+    var pendingCount: Int { lock.withLock { pending.count } }
+    func decode(_ packet: VideoPacket, completion: @escaping (Result<CVPixelBuffer, Error>) -> Void) {
+        lock.withLock { pending.append((packet.sequence, completion)) }
+    }
+    func stop() { lock.withLock { stopped = true } }
+    func finish(_ sequence: UInt32, _ result: Result<CVPixelBuffer, Error>) {
+        let callback = lock.withLock { () -> ((Result<CVPixelBuffer, Error>) -> Void)? in
+            guard let index = pending.firstIndex(where: { $0.0 == sequence }) else { return nil }
+            return pending.remove(at: index).1
+        }
+        callback?(result)
+    }
+}
+
+private func mediaFrame(stream: MediaStreamID, id: UInt64, keyFrame: Bool) throws -> MediaFrame {
+    let packet = VideoPacket(sequence: UInt32(truncatingIfNeeded: id),
+        sps: keyFrame ? Data([0x67, 0x64]) : Data(), pps: keyFrame ? Data([0x68]) : Data(),
+        avcc: Data([0, 0, 0, 2, keyFrame ? 0x65 : 0x41, 0x88]))
+    return try MediaFrame(header: .init(stream: stream, frameID: id, isIDR: keyFrame), packet: packet)
+}
+
+private func canvasPixel() throws -> CVPixelBuffer {
+    var pixel: CVPixelBuffer?
+    guard CVPixelBufferCreate(nil, 16, 16, kCVPixelFormatType_32ARGB, nil, &pixel) == kCVReturnSuccess,
+          let pixel else { throw CanvasCheckFailure("Could not create a synthetic pixel buffer") }
+    return pixel
+}
+
+@MainActor
+private func drainCanvasDisplay() {
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.03))
 }
 
 @MainActor
@@ -198,6 +244,174 @@ private struct RemoteCanvasChecks {
             try require(window.makeFirstResponder(canvas), "Canvas did not take fixture focus")
             try require(canvas.isInputTarget(of: key), "Focused canvas lost keyboard routing")
             try require(!canvas.isInputTarget(of: otherWindow), "Another window's input reached the canvas")
+        }
+
+        run("Candidate media acknowledges off the main queue and draws only after a decoded IDR commit") {
+            let decoder = CanvasDecoderProbe(), results = CanvasLocked<[Bool]>([])
+            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
+            let pixel = try canvasPixel()
+            var displayed: [CVPixelBuffer] = []
+            let receiver = MediaCanvasReceiver(makeDecoder: { _ in decoder }) { inbox in
+                if let image = inbox.take() { displayed.append(image) }
+            }
+            defer { receiver.stop() }
+            receiver.receive(try mediaFrame(stream: stream, id: 1, keyFrame: true)) { value in results.update { $0.append(value) } }
+            try require(!receiver.commit(stream: stream), "A candidate committed before its keyframe decoded")
+            let finished = DispatchSemaphore(value: 0), background = CanvasLocked(false), decodedPixel = CanvasLocked(pixel)
+            DispatchQueue.global().async {
+                background.update { $0 = !Thread.isMainThread }
+                decoder.finish(1, .success(decodedPixel.read()))
+                finished.signal()
+            }
+            try require(finished.wait(timeout: .now() + 1) == .success && background.read() && results.read() == [true],
+                        "Decode acknowledgement waited for the blocked main thread")
+            drainCanvasDisplay()
+            try require(displayed.isEmpty, "A candidate drew before commit")
+            try require(receiver.commit(stream: stream), "A decoded candidate could not commit")
+            drainCanvasDisplay()
+            try require(displayed.count == 1 && displayed[0] === pixel, "Commit did not publish the candidate frame")
+            try require(receiver.commit(stream: stream), "A duplicate active commit was rejected")
+            drainCanvasDisplay()
+            try require(displayed.count == 1, "A duplicate commit enqueued the same frame again")
+        }
+
+        run("Media display coalesces pending frames and uses the envelope frame ID for ordering") {
+            let decoder = CanvasDecoderProbe()
+            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
+            let first = try canvasPixel(), newest = try canvasPixel()
+            var displayed: [CVPixelBuffer] = []
+            let receiver = MediaCanvasReceiver(makeDecoder: { _ in decoder }) { inbox in
+                if let image = inbox.take() { displayed.append(image) }
+            }
+            defer { receiver.stop() }
+            receiver.receive(try mediaFrame(stream: stream, id: 1, keyFrame: true)) { _ in }
+            decoder.finish(1, .success(first))
+            try require(receiver.commit(stream: stream), "Initial frame failed to commit")
+            for id in UInt64(2)...40 {
+                receiver.receive(try mediaFrame(stream: stream, id: id, keyFrame: false)) { _ in }
+                decoder.finish(UInt32(id), .success(id == 40 ? newest : first))
+            }
+            drainCanvasDisplay()
+            try require(displayed.count == 1 && displayed[0] === newest,
+                        "Pending display callbacks queued pixel buffers instead of replacing the latest frame")
+        }
+
+        run("Out-of-order decoder callbacks cannot regress the candidate's newest image") {
+            let decoder = CanvasDecoderProbe()
+            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
+            let first = try canvasPixel(), newer = try canvasPixel()
+            var displayed: CVPixelBuffer?
+            let receiver = MediaCanvasReceiver(makeDecoder: { _ in decoder }) { displayed = $0.take() }
+            defer { receiver.stop() }
+            receiver.receive(try mediaFrame(stream: stream, id: 1, keyFrame: true)) { _ in }
+            receiver.receive(try mediaFrame(stream: stream, id: 2, keyFrame: false)) { _ in }
+            decoder.finish(2, .success(newer))
+            try require(!receiver.commit(stream: stream), "A P frame confirmed the candidate before its IDR")
+            decoder.finish(1, .success(first))
+            try require(receiver.commit(stream: stream), "Late IDR completion did not confirm the candidate")
+            drainCanvasDisplay()
+            try require(displayed === newer, "Late keyframe callback overwrote a newer decoded image")
+        }
+
+        run("Replacing a candidate or active stream settles pending decodes and fences late callbacks") {
+            let probes = CanvasLocked<[CanvasDecoderProbe]>([]), outcomes = CanvasLocked<[Int: [Bool]]>([:])
+            let session = UUID(), pixel = try canvasPixel()
+            let streams = (1...3).map { MediaStreamID(sessionID: session, transportEpoch: UInt32($0), codecEpoch: 1) }
+            var displays = 0
+            let receiver = MediaCanvasReceiver(makeDecoder: { _ in
+                let probe = CanvasDecoderProbe(); probes.update { $0.append(probe) }; return probe
+            }) { inbox in _ = inbox.take(); displays += 1 }
+            defer { receiver.stop() }
+            receiver.receive(try mediaFrame(stream: streams[0], id: 1, keyFrame: true)) { value in outcomes.update { $0[1, default: []].append(value) } }
+            probes.read()[0].finish(1, .success(pixel))
+            try require(receiver.commit(stream: streams[0]), "First stream could not commit")
+            drainCanvasDisplay()
+            receiver.receive(try mediaFrame(stream: streams[0], id: 2, keyFrame: false)) { value in outcomes.update { $0[2, default: []].append(value) } }
+            receiver.receive(try mediaFrame(stream: streams[1], id: 3, keyFrame: true)) { value in outcomes.update { $0[3, default: []].append(value) } }
+            receiver.receive(try mediaFrame(stream: streams[2], id: 4, keyFrame: true)) { value in outcomes.update { $0[4, default: []].append(value) } }
+            try require(probes.read().count == 3 && probes.read()[1].stopped && outcomes.read()[3] == [false],
+                        "Superseding a candidate retained its decoder or pending callback")
+            probes.read()[1].finish(3, .success(pixel))
+            try require(!receiver.commit(stream: streams[1]), "A retired candidate committed")
+            probes.read()[2].finish(4, .success(pixel))
+            try require(receiver.commit(stream: streams[2]), "Newest candidate did not commit")
+            try require(probes.read()[0].stopped && outcomes.read()[2] == [false], "Old active decoder was not drained")
+            probes.read()[0].finish(2, .success(pixel))
+            drainCanvasDisplay()
+            try require(displays == 2 && outcomes.read()[2] == [false] && outcomes.read()[3] == [false],
+                        "A late retired callback displayed or acknowledged a second time")
+            var rejected: [Bool] = []
+            receiver.receive(try mediaFrame(stream: streams[0], id: 5, keyFrame: true)) { rejected.append($0) }
+            receiver.receive(try mediaFrame(stream: .init(sessionID: UUID(), transportEpoch: 4, codecEpoch: 1), id: 6, keyFrame: true)) { rejected.append($0) }
+            try require(rejected == [false, false] && probes.read().count == 3, "A stale epoch or different session allocated a decoder")
+        }
+
+        run("Media decode credit is bounded and stop completes every pending frame exactly once") {
+            let decoder = CanvasDecoderProbe(), outcomes = CanvasLocked<[Bool]>([])
+            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1), pixel = try canvasPixel()
+            var displays = 0
+            let receiver = MediaCanvasReceiver(makeDecoder: { _ in decoder }) { _ in displays += 1 }
+            for id in UInt64(1)...4 {
+                receiver.receive(try mediaFrame(stream: stream, id: id, keyFrame: id == 1)) { value in outcomes.update { $0.append(value) } }
+            }
+            try require(decoder.pendingCount == 3 && outcomes.read() == [false], "Receiver exceeded three pending decodes")
+            receiver.stop(); receiver.stop()
+            try require(outcomes.read() == [false, false, false, false] && decoder.stopped,
+                        "Stop lost or duplicated a pending completion")
+            for id in UInt32(1)...3 { decoder.finish(id, .success(pixel)) }
+            drainCanvasDisplay()
+            try require(outcomes.read().count == 4 && displays == 0 && !receiver.commit(stream: stream),
+                        "A stopped receiver displayed or completed a late decode")
+        }
+
+        run("A queued display from an older commit cannot draw after the next commit or stop") {
+            let probes = CanvasLocked<[CanvasDecoderProbe]>([]), session = UUID(), pixel = try canvasPixel()
+            var displays = 0
+            let receiver = MediaCanvasReceiver(makeDecoder: { _ in
+                let probe = CanvasDecoderProbe(); probes.update { $0.append(probe) }; return probe
+            }) { inbox in _ = inbox.take(); displays += 1 }
+            for epoch in UInt32(1)...2 {
+                let stream = MediaStreamID(sessionID: session, transportEpoch: epoch, codecEpoch: 1)
+                receiver.receive(try mediaFrame(stream: stream, id: 1, keyFrame: true)) { _ in }
+                probes.read()[Int(epoch - 1)].finish(1, .success(pixel))
+                try require(receiver.commit(stream: stream), "Fixture stream did not commit")
+            }
+            drainCanvasDisplay()
+            try require(displays == 1, "An already queued old callback drew after a newer commit")
+            let stream = MediaStreamID(sessionID: session, transportEpoch: 2, codecEpoch: 1)
+            receiver.receive(try mediaFrame(stream: stream, id: 2, keyFrame: false)) { _ in }
+            probes.read()[1].finish(2, .success(pixel))
+            receiver.stop()
+            drainCanvasDisplay()
+            try require(displays == 1, "An already queued display callback drew after stop")
+        }
+
+        run("Media decode failures stay local and commits preserve canvas focus and input ownership") {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+                                  styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            defer { window.close() }
+            let canvas = RemoteCanvas(frame: window.contentView!.bounds), decoder = CanvasDecoderProbe()
+            canvas.canControl = true
+            window.contentView = canvas
+            try require(window.makeFirstResponder(canvas), "Canvas fixture did not acquire focus")
+            var releases = 0, fatalFailures = 0, outcomes: [Bool] = []
+            canvas.onRelease = { releases += 1 }
+            canvas.onFailure = { _ in fatalFailures += 1 }
+            let receiver = canvas.makeMediaReceiver(makeDecoder: { _ in decoder })
+            defer { receiver.stop() }
+            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
+            receiver.receive(try mediaFrame(stream: stream, id: 1, keyFrame: true)) { outcomes.append($0) }
+            decoder.finish(1, .success(try canvasPixel()))
+            try require(receiver.commit(stream: stream), "Canvas media stream could not commit")
+            drainCanvasDisplay()
+            try require(canvas.canControl && window.firstResponder === canvas && releases == 0,
+                        "A video commit reset keyboard focus or released input")
+            receiver.receive(try mediaFrame(stream: stream, id: 2, keyFrame: false)) { outcomes.append($0) }
+            decoder.finish(2, .failure(CanvasCheckFailure("Synthetic decode failure")))
+            drainCanvasDisplay()
+            try require(outcomes == [true, false] && fatalFailures == 0 && releases == 0,
+                        "Media decode failure closed the whole session or released input")
         }
 
         print("\(passed) passed, \(failed) failed")

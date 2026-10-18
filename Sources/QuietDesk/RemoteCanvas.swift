@@ -3,12 +3,175 @@ import AVFoundation
 import QuietDeskCore
 import SwiftUI
 
+protocol MediaCanvasDecoding: AnyObject {
+    func decode(_ packet: VideoPacket, completion: @escaping (Result<CVPixelBuffer, Error>) -> Void)
+    func stop()
+}
+
+extension VideoDecoder: MediaCanvasDecoding {}
+
+// The authenticated media coordinator supplies ordered, complete frames. Each stream has
+// its own decoder; an uncommitted candidate can decode and acknowledge without drawing.
+final class MediaCanvasReceiver: @unchecked Sendable {
+    private final class Stream {
+        let id: MediaStreamID
+        let decoder: MediaCanvasDecoding
+        let mailbox: LatestFrameMailbox
+        var pending: [UUID: (Bool) -> Void] = [:]
+        var lastSubmitted: UInt64?
+        var lastDecoded: UInt64?
+        var hasDecodedIDR = false
+        var displayScheduled = false
+
+        init(id: MediaStreamID, decoder: MediaCanvasDecoding, diagnostics: PerformanceDiagnostics?) {
+            self.id = id; self.decoder = decoder
+            mailbox = LatestFrameMailbox(diagnostics: diagnostics)
+        }
+    }
+
+    private let lock = NSLock()
+    private let diagnostics: PerformanceDiagnostics?
+    private let makeDecoder: (PerformanceDiagnostics?) -> MediaCanvasDecoding
+    private let display: @MainActor (LatestFrameMailbox) -> Void
+    private var active: Stream?
+    private var candidate: Stream?
+    private var newestStream: MediaStreamID?
+    private var stopped = false
+
+    init(diagnostics: PerformanceDiagnostics? = nil,
+         makeDecoder: @escaping (PerformanceDiagnostics?) -> MediaCanvasDecoding = { VideoDecoder(diagnostics: $0) },
+         display: @escaping @MainActor (LatestFrameMailbox) -> Void) {
+        self.diagnostics = diagnostics; self.makeDecoder = makeDecoder; self.display = display
+    }
+
+    func receive(_ frame: MediaFrame, completion: @escaping (Bool) -> Void) {
+        var retired: Stream?
+        let submission: (Stream, UUID)? = lock.withLock {
+            guard !stopped else { return nil }
+            let stream: Stream
+            let id = frame.header.stream
+            if let active, active.id == id { stream = active }
+            else if let candidate, candidate.id == id { stream = candidate }
+            else {
+                guard frame.header.isIDR else { return nil }
+                if let newestStream {
+                    guard id.sessionID == newestStream.sessionID,
+                          id.transportEpoch > newestStream.transportEpoch
+                            || (id.transportEpoch == newestStream.transportEpoch && id.codecEpoch > newestStream.codecEpoch) else { return nil }
+                }
+                stream = Stream(id: id, decoder: makeDecoder(diagnostics), diagnostics: diagnostics)
+                retired = candidate
+                candidate = stream; newestStream = id
+            }
+            guard stream.pending.count < 3,
+                  stream.lastSubmitted.map({ frame.header.frameID > $0 }) ?? true else { return nil }
+            let token = UUID()
+            stream.lastSubmitted = frame.header.frameID
+            stream.pending[token] = completion
+            return (stream, token)
+        }
+        if let retired { retire(retired) }
+        guard let (stream, token) = submission else { completion(false); return }
+        stream.decoder.decode(frame.packet) { [weak self, stream] result in
+            self?.decoded(result, frame: frame, stream: stream, token: token)
+        }
+    }
+
+    @discardableResult
+    func commit(stream id: MediaStreamID) -> Bool {
+        var retired: Stream?
+        var alreadyActive = false
+        let committed: Stream? = lock.withLock {
+            guard !stopped else { return nil }
+            if let active, active.id == id { alreadyActive = true; return nil }
+            guard let candidate, candidate.id == id, candidate.hasDecodedIDR else { return nil }
+            retired = active; active = candidate; self.candidate = nil
+            return candidate
+        }
+        if let retired { retire(retired) }
+        guard let committed else { return alreadyActive }
+        scheduleDisplay(committed)
+        return true
+    }
+
+    func stop() {
+        let retired: [Stream] = lock.withLock {
+            guard !stopped else { return [] }
+            stopped = true
+            let streams = [active, candidate].compactMap { $0 }
+            active = nil; candidate = nil; newestStream = nil
+            return streams
+        }
+        for stream in retired { retire(stream) }
+    }
+
+    private func decoded(_ result: Result<CVPixelBuffer, Error>, frame: MediaFrame, stream: Stream, token: UUID) {
+        var success = false
+        var shouldDisplay = false
+        let completion: ((Bool) -> Void)? = lock.withLock {
+            guard let completion = stream.pending.removeValue(forKey: token) else { return nil }
+            guard !stopped, active === stream || candidate === stream else { return completion }
+            if case .success(let image) = result {
+                success = true
+                if frame.header.isIDR { stream.hasDecodedIDR = true }
+                if stream.lastDecoded.map({ frame.header.frameID > $0 }) ?? true {
+                    stream.lastDecoded = frame.header.frameID
+                    // The media envelope has a 64-bit frame ID. Its watermark above owns
+                    // ordering; the legacy packet's independent 32-bit sequence is not reused.
+                    let offered = stream.mailbox.offer(image)
+                    shouldDisplay = active === stream && offered
+                }
+            }
+            return completion
+        }
+        // ACK/failure delivery does not wait for the main queue, visibility or layer readiness.
+        completion?(success)
+        if shouldDisplay { scheduleDisplay(stream) }
+    }
+
+    private func scheduleDisplay(_ stream: Stream) {
+        let scheduled = lock.withLock {
+            guard !stopped, active === stream, !stream.displayScheduled else { return false }
+            stream.displayScheduled = true
+            return true
+        }
+        guard scheduled else { return }
+        DispatchQueue.main.async { [weak self, stream] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                // Keep commit/stop behind this short enqueue boundary. An old callback
+                // cannot enqueue after a newer commit has returned to the coordinator.
+                self.lock.withLock {
+                    stream.displayScheduled = false
+                    guard !self.stopped, self.active === stream else { return }
+                    self.display(stream.mailbox)
+                }
+            }
+        }
+    }
+
+    private func retire(_ stream: Stream) {
+        let completions = lock.withLock {
+            let pending = Array(stream.pending.values)
+            stream.pending.removeAll()
+            return pending
+        }
+        stream.mailbox.stopDiagnostics()
+        stream.decoder.stop()
+        for completion in completions { completion(false) }
+    }
+
+    deinit { stop() }
+}
+
 @MainActor
 final class RemoteCanvas: NSView {
     private let videoLayer = AVSampleBufferDisplayLayer()
     private var decoder = VideoDecoder()
     private var mailbox = LatestFrameMailbox()
     private var diagnostics: PerformanceDiagnostics?
+    private var mediaReceiver: MediaCanvasReceiver?
+    private var mediaReceiverID: UUID?
     private var awaitingDisplay = false
     private var tracking: NSTrackingArea?
     private var observers: [NSObjectProtocol] = []
@@ -144,6 +307,9 @@ final class RemoteCanvas: NSView {
     }
 
     func makeVideoReceiver(diagnostics: PerformanceDiagnostics? = nil) -> (VideoPacket, @escaping () -> Void) -> Void {
+        mediaReceiverID = nil
+        mediaReceiver?.stop()
+        mediaReceiver = nil
         decoder.stop()
         mailbox.stopDiagnostics()
         decoder = VideoDecoder(diagnostics: diagnostics)
@@ -171,6 +337,29 @@ final class RemoteCanvas: NSView {
                 }
             }
         }
+    }
+
+    func makeMediaReceiver(diagnostics: PerformanceDiagnostics? = nil,
+                           makeDecoder: @escaping (PerformanceDiagnostics?) -> MediaCanvasDecoding = { VideoDecoder(diagnostics: $0) }) -> MediaCanvasReceiver {
+        mediaReceiver?.stop()
+        decoder.stop()
+        mailbox.stopDiagnostics()
+        mailbox = LatestFrameMailbox(diagnostics: diagnostics)
+        self.diagnostics = diagnostics
+        let token = UUID()
+        mediaReceiverID = token
+        let receiver = MediaCanvasReceiver(diagnostics: diagnostics, makeDecoder: makeDecoder) { [weak self] inbox in
+            guard let self, self.mediaReceiverID == token else { return }
+            if self.mailbox !== inbox {
+                self.videoLayer.stopRequestingMediaData()
+                self.awaitingDisplay = false
+                self.videoLayer.flush()
+                self.mailbox = inbox
+            }
+            self.showLatestFrame()
+        }
+        mediaReceiver = receiver
+        return receiver
     }
 
     private func showLatestFrame() {
@@ -215,6 +404,9 @@ final class RemoteCanvas: NSView {
         shortcutSessionActive = false
         releaseControl()
         canControl = false
+        mediaReceiverID = nil
+        mediaReceiver?.stop()
+        mediaReceiver = nil
         decoder.stop()
         mailbox.stopDiagnostics()
         decoder = VideoDecoder()

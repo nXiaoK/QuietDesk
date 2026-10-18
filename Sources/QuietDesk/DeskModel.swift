@@ -592,6 +592,7 @@ final class DeskModel: ObservableObject {
             status = hostCodeNeedsSetup ? "请先补录原配对码，或明确选择生成新配对码，再开启共享" : "配对码未能读取，请检查本机凭据文件"
             return
         }
+        if interactive { hostBackoff.reset() }
         DiagnosticLog.shared.record(.hostStarted, role: .host, state: .requested)
         hostRetryTask?.cancel()
         do {

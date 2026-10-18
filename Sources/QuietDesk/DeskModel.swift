@@ -40,6 +40,11 @@ final class DeskModel: ObservableObject {
     @Published private(set) var trafficHistoryStatus = "按网址/IP＋端口累计；旧版按设备统计单独保留。"
     @Published var frameRate = "0 fps"
     @Published var latency = "— ms"
+    @Published private(set) var mediaTransportStatus = "TCP 兼容模式"
+    @Published private(set) var supportsMediaTransport = false
+    @Published var mediaTCPOnly = UserDefaults.standard.bool(forKey: "mediaTCPOnly") {
+        didSet { UserDefaults.standard.set(mediaTCPOnly, forKey: "mediaTCPOnly") }
+    }
     @Published private(set) var performanceDiagnosticsEnabled = false
     @Published var showFullScreenStatistics = UserDefaults.standard.bool(forKey: "showFullScreenStatistics") {
         didSet { UserDefaults.standard.set(showFullScreenStatistics, forKey: "showFullScreenStatistics") }
@@ -71,7 +76,7 @@ final class DeskModel: ObservableObject {
     @Published private(set) var activeVideoState: VideoStreamState?
     @Published private(set) var videoTuning: VideoTuningSession?
     @Published private(set) var videoSettingsStatus = ""
-    var viewerSettings: StreamSettings { videoTuning?.desired ?? activeVideoState?.settings ?? StreamSettings() }
+    var viewerSettings: StreamSettings { viewerSession.mediaQuality?.upperBound ?? videoTuning?.desired ?? activeVideoState?.settings ?? StreamSettings() }
     var viewerLongestEdges: [Int] { supportsExtendedVideoSettings ? StreamSettings.longestEdges : StreamSettings.legacyLongestEdges }
     var viewerFrameRates: [Int] { supportsHighRefreshVideoSettings ? StreamSettings.frameRates : StreamSettings.legacyFrameRates }
     var viewerBitRates: [Int] { supportsHighRefreshVideoSettings ? StreamSettings.bitRates : supportsExtendedVideoSettings ? StreamSettings.extendedBitRates : StreamSettings.legacyBitRates }
@@ -621,7 +626,7 @@ final class DeskModel: ObservableObject {
                     guard self.generation == token, self.hostingRequested, !Task.isCancelled else { return }
                     self.refreshDisplays()
                     _ = try self.selectShareableDisplay(content.displays)
-                    let listener = try NWListener(using: SecureTransport.parameters(key: key, responsiveAcknowledgements: true), on: port)
+                    let listener = try NWListener(using: MediaSecureTransport.tlsParameters(key: key, roles: MediaChannelRole.allCases), on: port)
                     let admission = PendingHandshakeGate()
                     listener.newConnectionHandler = { [weak self] connection in
                         let address: String?
@@ -637,7 +642,7 @@ final class DeskModel: ObservableObject {
                                 connection.cancel()
                                 return
                             }
-                            self.accept(connection, generation: token, admission: admission, id: id, listeningPort: port.rawValue)
+                            self.accept(connection, generation: token, admission: admission, id: id, listeningPort: port.rawValue, key: key)
                         }
                     }
                     listener.stateUpdateHandler = { [weak self] state in
@@ -680,16 +685,23 @@ final class DeskModel: ObservableObject {
         }
     }
 
-    private func accept(_ connection: NWConnection, generation token: UUID, admission: PendingHandshakeGate, id: UUID, listeningPort: UInt16) {
+    private func accept(_ connection: NWConnection, generation token: UUID, admission: PendingHandshakeGate, id: UUID, listeningPort: UInt16, key: PairingKey) {
         let diagnostics = PerformanceDiagnostics()
         let ackStretchingDisabled = (connection.parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options)?.disableAckStretching
         let candidate = Peer(connection: connection, handshakeTimeout: peer == nil ? 15 : 5, diagnostics: diagnostics)
         let channel = makeDataChannel(for: candidate)
         let session = makeTrafficSession(for: candidate)
         let history = trafficHistoryStore
+        let auxiliarySession = hostSession.media
         pending[id] = candidate
         candidate.onReady = { [weak self, weak candidate] in
             admission.release(id)
+            if let role = MediaSecureTransport.negotiatedRole(on: connection), role != .control {
+                guard let candidate, let auxiliarySession else { candidate?.close("媒体控制会话不存在"); return }
+                auxiliarySession.acceptAuxiliary(candidate, role: role)
+                DispatchQueue.main.async { self?.pending.removeValue(forKey: id) }
+                return
+            }
             DispatchQueue.main.async {
                 guard let self, let candidate, self.pending.removeValue(forKey: id) != nil,
                       self.generation == token, self.active, self.hostingRequested else { return }
@@ -734,23 +746,45 @@ final class DeskModel: ObservableObject {
                         self.recordVideoConfiguration(state)
                         host.injector = InputInjector(displayID: display.displayID)
                         host.deviceIdentityAdvertised = self.trafficHistoryStore.localDeviceID != nil
+                        let streamer = ScreenStreamer(diagnostics: diagnostics)
+                        host.streamer = streamer
+                        let media = try MediaSession.host(control: candidate, key: key, port: listeningPort, settings: settings)
+                        media.diagnostics = diagnostics
+                        host.media = media
+                        channel.configureMedia { [weak media] in media?.receive($0) ?? false }
+                        channel.configureReliableData { [weak media] in media?.sendReliableData($0) }
+                        media.onReliableData = { [weak candidate] message in
+                            do { _ = try channel.receive(message) }
+                            catch { candidate?.close(error.localizedDescription) }
+                        }
+                        media.onPrepareRecovery = { [weak streamer] completion in
+                            guard let streamer else { completion(false); return }
+                            streamer.prepareMediaRecovery(completion: completion)
+                        }
+                        media.onProduceRecoveryFrame = { [weak streamer] in streamer?.produceMediaRecoveryFrame() }
+                        media.onResumeFrames = { [weak streamer] in streamer?.resumeMediaFrames() }
+                        media.onAcknowledged = { [weak streamer] in streamer?.acknowledge($0) }
+                        streamer.onEncodeDuration = { [weak media] seconds in
+                            media?.recordComputeTiming(encodeMilliseconds: seconds * 1000)
+                        }
+                        media.onBytes = { channel.recordBytes($0) }
+                        media.onFrameSent = { channel.recordFrame() }
+                        media.onState = { [weak self, weak host] value in
+                            DispatchQueue.main.async {
+                                guard let self, let host, self.hostSession === host else { return }
+                                self.mediaTransportStatus = value
+                            }
+                        }
+                        media.start()
                         candidate.send(try Wire.json(.hello, Hello(name: Host.current().localizedName ?? "家里 Mac",
                             width: width, height: height, settings: settings, canControl: self.canControl,
                             preferredSettings: preferredSettings.extendedCompatible, deviceID: self.trafficHistoryStore.localDeviceID,
                             deviceIdentityExchange: host.deviceIdentityAdvertised ? true : nil,
                             highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings,
-                            sessionEffects: true, sessionPause: true)))
+                            sessionEffects: true, sessionPause: true, mediaTransportV1: true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
-                        let streamer = ScreenStreamer(diagnostics: diagnostics)
-                        host.streamer = streamer
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
-                        streamer.onFrame = { [weak candidate] packet in
-                            guard let candidate else { return }
-                            do {
-                                candidate.send(Message(.video, try packet.encode()))
-                                channel.recordFrame()
-                            } catch { candidate.close(error.localizedDescription) }
-                        }
+                        streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
                         streamer.onDiagnosticError = { [weak self, weak candidate, weak host] error in
                             DispatchQueue.main.async {
                                 guard let self, let candidate, let host, self.peer === candidate, self.hostSession === host else { return }
@@ -873,6 +907,77 @@ final class DeskModel: ObservableObject {
                 viewer.restoreCanvasFocusAfterIdle = false
             }
         }
+    }
+
+    private func configureViewerMedia(peer: Peer, settings: StreamSettings, preferred: StreamSettings) throws {
+        guard let target, let channel = dataChannel else { return }
+        let viewer = viewerSession
+        let renderer = canvas.makeMediaReceiver(diagnostics: performanceDiagnostics)
+        let media = try MediaSession.viewer(control: peer, key: target.key, host: target.address, port: target.port,
+                                            settings: settings, udpEnabled: !mediaTCPOnly)
+        media.diagnostics = performanceDiagnostics
+        viewer.media = media
+        viewer.mediaReceiver = renderer
+        supportsMediaTransport = true
+        viewer.mediaQuality = try MediaQualityPolicy(hostDefault: preferred, preferred: viewerQualityPolicy.preferred,
+                                                   applied: settings, now: SessionClock.now)
+        channel.configureMedia { [weak media] in media?.receive($0) ?? false }
+        channel.configureReliableData { [weak media] in media?.sendReliableData($0) }
+        media.onVideo = { [weak renderer, weak media] frame, completion in
+            guard let renderer else { completion(false); return }
+            channel.mediaFrameReceived(frame.header)
+            let submittedAt = SessionClock.now
+            renderer.receive(frame) { succeeded in
+                if succeeded {
+                    channel.recordFrame()
+                    media?.recordComputeTiming(decodeMilliseconds: max(0, SessionClock.now - submittedAt) * 1000)
+                }
+                completion(succeeded)
+            }
+        }
+        media.onCommitStream = { [weak renderer] stream, _ in
+            renderer?.commit(stream: stream)
+            channel.mediaStreamCommitted(stream)
+        }
+        media.onBytes = { channel.recordBytes($0) }
+        media.onReliableData = { [weak peer] message in
+            do { _ = try channel.receive(message) }
+            catch { peer?.close(error.localizedDescription) }
+        }
+        media.onState = { [weak self, weak viewer] value in
+            DispatchQueue.main.async {
+                guard let self, let viewer, self.viewerSession === viewer else { return }
+                self.mediaTransportStatus = value
+            }
+        }
+        media.onReduceLoad = { [weak self, weak viewer] cause in
+            DispatchQueue.main.async {
+                guard let self, let viewer, self.viewerSession === viewer,
+                      let next = viewer.mediaQuality?.reduceLoad(for: cause, now: SessionClock.now) else { return }
+                self.applyAutomaticMediaSettings(next)
+            }
+        }
+        media.onSample = { [weak self, weak viewer] sample in
+            DispatchQueue.main.async {
+                guard let self, let viewer, self.viewerSession === viewer,
+                      let next = viewer.mediaQuality?.observe(sample, now: SessionClock.now) else { return }
+                self.applyAutomaticMediaSettings(next)
+            }
+        }
+        media.start()
+    }
+
+    private func applyAutomaticMediaSettings(_ settings: StreamSettings) {
+        guard connected, supportsLiveSettings, var tuning = videoTuning,
+              tuning.pending == nil, tuning.desired == tuning.applied.settings else {
+            viewerSession.mediaQuality?.rejectPending(now: SessionClock.now)
+            return
+        }
+        do { try tuning.choose(settings) }
+        catch { viewerSession.mediaQuality?.rejectPending(now: SessionClock.now); return }
+        viewerSession.automaticVideoSettings = settings
+        videoTuning = tuning
+        sendNextVideoSettings()
     }
 
     private func beginConnection(_ target: Target) {
@@ -1162,6 +1267,10 @@ final class DeskModel: ObservableObject {
                                                                          supportsHighRefresh: supportsHighRefreshVideoSettings)
                 videoTuning = try VideoTuningSession(applied: state, preferred: preferred)
                 videoSettingsStatus = "当前生效：\(state.settings.summary)"
+                if hello.mediaTransportV1 == true {
+                    viewerQualityPolicy.chooseManually()
+                    try configureViewerMedia(peer: peer, settings: state.settings, preferred: preferred)
+                }
                 applyInitialVideoQualityIfReady()
                 sendNextVideoSettings()
             } else { videoSettingsStatus = "主机需更新到 0.4.0 才能动态调整画质" }
@@ -1173,6 +1282,8 @@ final class DeskModel: ObservableObject {
             let result = try Wire.readJSON(SessionPauseResult.self, message.payload)
             let oldRequest = pauseTransmission.pending
             guard pauseTransmission.receive(result) else { return }
+            viewerSession.media?.setPaused(result.paused)
+            viewerSession.mediaQuality?.resetObservation(now: SessionClock.now)
             DiagnosticLog.shared.record(result.paused ? .sessionPaused : .sessionResumed, role: .viewer,
                 state: result.error == nil ? .succeeded : .failed)
             viewerSession.pauseRequestTimeout?.cancel()
@@ -1235,6 +1346,14 @@ final class DeskModel: ObservableObject {
             viewerSession.videoRequestTimeout?.cancel()
             videoTuning = tuning
             activeVideoState = result.state
+            viewerSession.media?.updateSettings(result.state.settings)
+            if result.error == nil {
+                _ = viewerSession.mediaQuality?.confirmApplied(result.state.settings, now: SessionClock.now)
+            } else { viewerSession.mediaQuality?.rejectPending(now: SessionClock.now) }
+            try viewerSession.mediaQuality?.synchronizeApplied(result.state.settings, now: SessionClock.now)
+            if viewerSession.automaticVideoSettings == result.state.settings || result.error != nil {
+                viewerSession.automaticVideoSettings = nil
+            }
             recordVideoConfiguration(result.state, succeeded: result.error == nil)
             canvas.remoteSize = CGSize(width: result.state.width, height: result.state.height)
             resolution = "\(result.state.width) × \(result.state.height)"
@@ -1263,6 +1382,8 @@ final class DeskModel: ObservableObject {
         do { try tuning.choose(settings) }
         catch { videoSettingsStatus = error.localizedDescription; return }
         viewerQualityPolicy.chooseManually()
+        viewerSession.automaticVideoSettings = nil
+        _ = try? viewerSession.mediaQuality?.chooseManually(settings, now: SessionClock.now)
         if tuning.pending?.settings == settings { viewerSession.pendingVideoPreferenceCanSave = true }
         videoTuning = tuning
         viewerSession.videoDebounceTask?.cancel()
@@ -1377,7 +1498,7 @@ final class DeskModel: ObservableObject {
         guard connected, supportsLiveSettings, let peer, var tuning = videoTuning,
               let request = tuning.nextRequest() else { return }
         videoTuning = tuning
-        viewerSession.pendingVideoPreferenceCanSave = viewerQualityPolicy.maySaveCurrentChoice
+        viewerSession.pendingVideoPreferenceCanSave = viewerQualityPolicy.maySaveCurrentChoice && viewerSession.automaticVideoSettings != request.settings
         videoSettingsStatus = "正在应用：\(request.settings.summary)"
         do { peer.send(try Wire.json(.streamSettingsRequest, request)) }
         catch { videoSettingsStatus = error.localizedDescription; peer.close(error.localizedDescription); return }
@@ -1552,6 +1673,8 @@ final class DeskModel: ObservableObject {
             await capture?.value
             await video?.value
             guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer, !Task.isCancelled else { return }
+            await self.suspendMediaForConfiguration(host.media)
+            guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
             var failure: String?
             do { host.paused = try await streamer.setSessionPaused(request.paused) }
             catch { failure = error.localizedDescription }
@@ -1562,7 +1685,11 @@ final class DeskModel: ObservableObject {
             if let reply = try? Wire.json(.sessionPauseResult, SessionPauseResult(id: request.id, paused: host.paused, error: failure)) {
                 peer.send(reply)
             }
-            if !host.paused, failure == nil { streamer.resumeAfterReconfiguration() }
+            host.media?.setPaused(host.paused)
+            if !host.paused {
+                if failure == nil { streamer.resumeAfterReconfiguration() }
+                host.media?.resumeAfterConfiguration()
+            }
         }
         publishSessionPause()
     }
@@ -1600,6 +1727,8 @@ final class DeskModel: ObservableObject {
                 await pause?.value
                 guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
                       host.settingsRequestID == request.id, !Task.isCancelled else { return }
+                await self.suspendMediaForConfiguration(host.media)
+                guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
                 let updated = try await streamer.reconfigure(request.settings)
                 guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
                       host.settingsRequestID == request.id, !Task.isCancelled else { return }
@@ -1608,14 +1737,24 @@ final class DeskModel: ObservableObject {
                 self.resolution = "\(updated.width) × \(updated.height)"
                 self.videoSettingsStatus = "控制端已调整：\(updated.settings.summary)"
                 peer.setVideoPacing(VideoSendPacing(megabits: updated.settings.megabits))
+                host.media?.updateSettings(updated.settings)
                 peer.send(try Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: updated)))
                 streamer.resumeAfterReconfiguration()
+                if !host.paused { host.media?.resumeAfterConfiguration() }
             } catch {
                 guard self.generation == token, self.peer === peer, self.hostSession === host, host.settingsRequestID == request.id,
                       !Task.isCancelled, let actual = self.activeVideoState else { return }
                 self.recordDiagnosticFailure(.streamConfigured, error: error)
+                if !host.paused { host.media?.resumeAfterConfiguration() }
                 if let result = try? Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: actual, error: error.localizedDescription)) { peer.send(result) }
             }
+        }
+    }
+
+    private func suspendMediaForConfiguration(_ media: MediaSession?) async {
+        guard let media else { return }
+        await withCheckedContinuation { continuation in
+            media.suspendForConfiguration { continuation.resume() }
         }
     }
 
@@ -1706,8 +1845,12 @@ final class DeskModel: ObservableObject {
         let enabled = connected && supportsClipboard && clipboardEnabled && remoteClipboardEnabled
         canvas.synchronizesClipboard = enabled
         if enabled, clipboardSync == nil, let peer, let clipboardSession {
+            let channel = dataChannel
             let sync = ClipboardSync(session: clipboardSession, allowsFileSending: remoteFileApproval,
-                allowsAutomaticSending: automaticClipboardSendingAllowed, allowsChunkWindow: remoteClipboardChunkWindow) { [weak peer] in peer?.send($0) }
+                allowsAutomaticSending: automaticClipboardSendingAllowed, allowsChunkWindow: remoteClipboardChunkWindow) { [weak peer, weak channel] message in
+                    if let channel { channel.sendReliableData(message) }
+                    else { peer?.send(message) }
+                }
             clipboardSync = sync
             dataChannel?.configureClipboard(sync.receiveMessage)
             sync.onDiagnostic = { [weak self, weak sync] event in
@@ -1941,6 +2084,11 @@ final class DeskModel: ObservableObject {
         if mode == .viewer, target != nil, sessionInputSuspended { freshFrameRequiredOnReconnect = true }
         let oldHost = hostSession
         let oldViewer = viewerSession
+        oldHost.media?.stop()
+        oldViewer.media?.stop()
+        oldViewer.mediaReceiver?.stop()
+        mediaTransportStatus = "TCP 兼容模式"
+        supportsMediaTransport = false
         oldHost.pauseTask?.cancel()
         oldHost.effectsTask?.cancel()
         oldHost.settingsTask?.cancel()

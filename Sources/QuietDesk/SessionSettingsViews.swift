@@ -15,9 +15,12 @@ struct ConnectionSettingsView: View {
                 Divider()
                 VStack(alignment: .leading, spacing: 8) {
                     Text("连接").font(.headline)
+                    Toggle("仅使用 TCP（下次连接生效）", isOn: $model.mediaTCPOnly)
+                    Text(model.connected ? model.mediaTransportStatus : (model.mediaTCPOnly ? "视频使用 TCP" : "视频优先 UDP，不可用时自动使用 TCP"))
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
                     Toggle(isOn: $model.showFullScreenStatistics) { Text("全屏显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
-                    Text("显示往返延迟、分辨率、视频 FPS 和收发流量。往返延迟约每 5 秒更新，FPS 与流量每秒更新；静止画面 FPS 可能为 0。")
+                    Text("显示控制通道往返延迟、分辨率、解码 FPS 和收发流量。往返延迟约每 5 秒更新；不代表画面上屏延迟。静止画面 FPS 可能为 0。")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     Button(action: openTraffic) { Label("设备历史流量…", systemImage: "chart.bar.xaxis") }
                     Button(action: openEffects) { Label("被控端静音与防窥…", systemImage: "display.trianglebadge.exclamationmark") }
@@ -149,7 +152,8 @@ struct FullScreenSettingsView: View {
                         Divider()
                         VStack(spacing: 6) {
                             Toggle(isOn: $model.showFullScreenStatistics) { Text("显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
-                                .help("显示往返延迟、分辨率、视频 FPS 和收发流量。往返延迟约每 5 秒更新，FPS 与流量每秒更新；静止画面 FPS 可能为 0。")
+                                .help("显示控制通道 RTT、分辨率、解码 FPS 和流量；不代表画面上屏延迟。")
+                            Text(model.mediaTransportStatus).font(.caption).foregroundStyle(.secondary)
                             Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
                             Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) { Text("双向同步文字、图片和文件").frame(maxWidth: .infinity, alignment: .leading) }
                                 .help("文字和图片按控制端焦点同步；文件需逐次确认后下载，完成后再粘贴。")
@@ -231,7 +235,8 @@ private struct SessionQualitySection: View {
     let compact: Bool
 
     private var changing: Bool {
-        model.videoTuning?.pending != nil || (model.connected && model.supportsLiveSettings && model.viewerSettings != model.activeVideoState?.settings)
+        guard model.connected, model.supportsLiveSettings, let tuning = model.videoTuning else { return false }
+        return tuning.pending != nil || tuning.desired != tuning.applied.settings
     }
 
     private var settingsMessage: String? {
@@ -313,14 +318,17 @@ private struct SessionQualitySection: View {
                     Spacer(minLength: 0)
                     Text("视频尺寸 \(state.width) × \(state.height)").foregroundStyle(.secondary).monospacedDigit()
                 }
+                if model.supportsMediaTransport {
+                    Text("实际生效：\(state.settings.summary)").foregroundStyle(.secondary).monospacedDigit()
+                }
             }
             if !compact {
-                Text(model.supportsExtendedVideoSettings ? "已保存画质与手动选择优先；首次 RTT <10 ms 的低延迟新连接默认最高画质。" : "已保存的连接会恢复画质；原分辨率和 30 Mbps 需共享端更新后使用。")
+                Text(model.supportsMediaTransport ? "已保存画质与手动选择作为自动调节上限；实际画质随网络负载调整。" : model.supportsExtendedVideoSettings ? "已保存画质与手动选择优先；旧传输首次 RTT <10 ms 的新连接默认最高画质。" : "已保存的连接会恢复画质；原分辨率和 30 Mbps 需共享端更新后使用。")
                     .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
         }
         .font(.system(size: compact ? 11 : 12))
-        .help("画质调整只改变当前共享会话，不修改共享端默认值；同一连接记录会恢复上次确认的画质。无已保存画质时，首次 RTT 低于 10 ms 默认选最高画质，手动选择优先。RTT 不代表网络类型。原分辨率不放大，上限单边 8192 像素、总计 3600 万像素。60 fps 与 60/100 Mbps 需两端更新；H.264 / 4:2:0 仍为有损，窗口缩放也会影响细节。可连续选择，等待时会合并为最新设置。")
+        .help("画质调整只改变当前共享会话，不修改共享端默认值；同一连接记录会恢复手动确认的画质。自动调节不覆盖已保存选择。RTT 不代表网络类型或画面上屏延迟。原分辨率不放大，上限单边 8192 像素、总计 3600 万像素。60 fps 与 60/100 Mbps 需两端更新；H.264 / 4:2:0 仍为有损。可连续选择，等待时合并为最新设置。")
     }
 }
 

@@ -10,7 +10,10 @@ final class SessionDataChannel: @unchecked Sendable {
     private var video: VideoReceiver?
     private var acknowledgement: ((UInt32) -> Void)?
     private var clipboard: ((Message) -> Void)?
+    private var media: ((Message) -> Bool)?
+    private var reliableData: ((Message) -> Void)?
     private var freshFrameToken: UUID?
+    private var mediaFreshFrame: (stream: MediaStreamID, token: UUID?)?
     private var bytes = 0
     private var frames = 0
     private let onFreshFrame: (UUID) -> Void
@@ -23,11 +26,18 @@ final class SessionDataChannel: @unchecked Sendable {
     func configureVideo(_ receiver: @escaping VideoReceiver) { lock.withLock { if valid { video = receiver } } }
     func configureAcknowledgement(_ handler: @escaping (UInt32) -> Void) { lock.withLock { if valid { acknowledgement = handler } } }
     func configureClipboard(_ handler: ((Message) -> Void)?) { lock.withLock { if valid { clipboard = handler } } }
+    func configureMedia(_ handler: @escaping (Message) -> Bool) { lock.withLock { if valid { media = handler } } }
+    func configureReliableData(_ handler: @escaping (Message) -> Void) { lock.withLock { if valid { reliableData = handler } } }
+    func sendReliableData(_ message: Message) {
+        let handler = lock.withLock { valid ? (reliableData ?? send) : nil }
+        handler?(message)
+    }
     func expectFreshFrame(_ token: UUID?) { lock.withLock { if valid { freshFrameToken = token } } }
 
     func receive(_ message: Message) throws -> Bool {
-        let handlers = lock.withLock { (valid, video, acknowledgement, clipboard, freshFrameToken) }
+        let handlers = lock.withLock { (valid, video, acknowledgement, clipboard, freshFrameToken, media) }
         guard handlers.0 else { return true }
+        if handlers.5?(message) == true { return true }
         switch message.kind {
         case .video:
             guard let video = handlers.1 else { return false }
@@ -63,6 +73,19 @@ final class SessionDataChannel: @unchecked Sendable {
 
     func recordBytes(_ count: Int) { lock.withLock { if valid { bytes += count } } }
     func recordFrame() { lock.withLock { if valid { frames += 1 } } }
+    func mediaFrameReceived(_ header: MediaFrameHeader) {
+        lock.withLock {
+            if valid, header.isIDR { mediaFreshFrame = (header.stream, freshFrameToken) }
+        }
+    }
+    func mediaStreamCommitted(_ stream: MediaStreamID) {
+        let token = lock.withLock { () -> UUID? in
+            guard valid, let received = mediaFreshFrame, received.stream == stream,
+                  received.token == freshFrameToken else { return nil }
+            return received.token
+        }
+        if let token { onFreshFrame(token) }
+    }
     func takeMetrics() -> (bytes: Int, frames: Int) {
         lock.withLock { defer { bytes = 0; frames = 0 }; return (bytes, frames) }
     }
@@ -73,6 +96,9 @@ final class SessionDataChannel: @unchecked Sendable {
             video = nil
             acknowledgement = nil
             clipboard = nil
+            media = nil
+            reliableData = nil
+            mediaFreshFrame = nil
             freshFrameToken = nil
             bytes = 0; frames = 0
         }

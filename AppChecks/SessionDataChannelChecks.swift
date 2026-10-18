@@ -133,6 +133,69 @@ private struct SessionDataChannelChecks {
                         "Unconfigured data endpoints changed fallback behavior")
         }
 
+        run("Negotiated media routing preserves legacy fallback and invalidation") {
+            let routed = ChannelBox<[MessageKind]>([])
+            let channel = SessionDataChannel(send: { _ in }, onFreshFrame: { _ in })
+            channel.configureMedia { message in
+                guard message.kind == .mediaControl else { return false }
+                routed.update { $0.append(message.kind) }
+                return true
+            }
+            try onBackground {
+                try require(channel.receive(Message(.mediaControl)), "Media negotiation missed its endpoint")
+                try require(!channel.receive(Message(.hello)), "Media swallowed a legacy control message")
+                channel.invalidate()
+                try require(channel.receive(Message(.mediaControl)), "Closed endpoint did not consume a late packet")
+            }
+            try require(routed.read() == [.mediaControl], "Invalidation allowed late media negotiation")
+        }
+
+        run("Reliable data can bind after clipboard creation without changing legacy sends") {
+            let legacy = ChannelBox<[MessageKind]>([]), media = ChannelBox<[MessageKind]>([])
+            let channel = SessionDataChannel(send: { message in legacy.update { $0.append(message.kind) } }, onFreshFrame: { _ in })
+            try onBackground {
+                channel.sendReliableData(Message(.clipboardBegin))
+                channel.configureReliableData { message in media.update { $0.append(message.kind) } }
+                channel.sendReliableData(Message(.clipboardChunk))
+                channel.invalidate()
+                channel.sendReliableData(Message(.clipboardEnd))
+            }
+            try require(legacy.read() == [.clipboardBegin] && media.read() == [.clipboardChunk],
+                        "Late binding changed the default transport or sent data after invalidation")
+        }
+
+        run("Candidate decode metrics do not complete the fresh-frame token before media commit") {
+            let fresh = ChannelBox<[UUID]>([]), sent = ChannelBox<[Message]>([])
+            let channel = SessionDataChannel(send: { message in sent.update { $0.append(message) } },
+                                             onFreshFrame: { token in fresh.update { $0.append(token) } })
+            let token = UUID()
+            channel.expectFreshFrame(token)
+            channel.recordFrame()
+            try require(fresh.read().isEmpty, "Decoded candidate completed the commit barrier")
+            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
+            channel.mediaFrameReceived(MediaFrameHeader(stream: stream, frameID: 1, isIDR: true))
+            channel.mediaStreamCommitted(stream)
+            try require(fresh.read() == [token] && sent.read().isEmpty, "Media commit sent a duplicate legacy ACK or lost its barrier")
+            channel.invalidate()
+            channel.mediaStreamCommitted(stream)
+            try require(fresh.read() == [token], "Late commit completed a closed barrier")
+        }
+
+        run("An older candidate cannot complete a newly requested fresh-frame token") {
+            let fresh = ChannelBox<[UUID]>([])
+            let channel = SessionDataChannel(send: { _ in }, onFreshFrame: { token in fresh.update { $0.append(token) } })
+            let old = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
+            channel.mediaFrameReceived(MediaFrameHeader(stream: old, frameID: 1, isIDR: true))
+            let token = UUID()
+            channel.expectFreshFrame(token)
+            channel.mediaStreamCommitted(old)
+            try require(fresh.read().isEmpty, "Old candidate unlocked a later recovery token")
+            let next = MediaStreamID(sessionID: old.sessionID, transportEpoch: 2, codecEpoch: 2)
+            channel.mediaFrameReceived(MediaFrameHeader(stream: next, frameID: 1, isIDR: true))
+            channel.mediaStreamCommitted(next)
+            try require(fresh.read() == [token], "New candidate failed to unlock its token")
+        }
+
         run("Invalidation fences late decode completions, endpoints and drained session metrics") {
             let sent = ChannelBox<[Message]>([]), fresh = ChannelBox<[UUID]>([])
             let completions = ChannelBox<[() -> Void]>([]), endpointCalls = ChannelBox(0)

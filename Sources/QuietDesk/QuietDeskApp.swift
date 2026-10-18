@@ -346,8 +346,9 @@ struct DeskView: View {
     @ViewBuilder private var metrics: some View {
         if model.connected {
             if !model.resolution.isEmpty { Text(model.resolution) }
-            Text(model.latency).help("网络往返延迟（RTT），约每 5 秒更新")
-            Text(model.frameRate).help("静止画面不重复编码，0 fps 正常")
+            Text(model.mediaTransportStatus)
+            Text(model.latency).help("控制通道往返延迟（RTT），约每 5 秒更新；不代表画面上屏延迟")
+            Text(model.frameRate).help("解码完成 FPS；静止画面不重复编码，0 fps 正常")
             Text(model.traffic).help("视频、控制和剪贴板的收发流量")
         } else { Text(model.sessionPaused ? "空闲暂停" : model.reconnecting ? "正在重连" : "未连接") }
     }

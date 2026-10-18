@@ -565,11 +565,11 @@ final class DeskModel: ObservableObject {
         guard !active, !working, !systemSleeping else { return }
         prepareHostCode()
         guard !hostCode.isEmpty else {
+            hostingRequested = false
             status = hostCodeNeedsSetup ? "请先补录原配对码，或明确选择生成新配对码，再开启共享" : "配对码未能读取，请检查本机凭据文件"
             return
         }
         DiagnosticLog.shared.record(.hostStarted, role: .host, state: .requested)
-        hostingRequested = true
         hostRetryTask?.cancel()
         do {
             let key = try PairingKey(code: hostCode)
@@ -580,8 +580,10 @@ final class DeskModel: ObservableObject {
                 recordDiagnosticFailure(.hostStopped, error: failure)
                 status = "共享未启动：\(failure.localizedDescription)"
                 if interactive { openScreenPermission() }
+                hostingRequested = false
                 return
             }
+            hostingRequested = true
             working = true
             status = "正在准备共享…"
             let token = UUID()
@@ -645,6 +647,7 @@ final class DeskModel: ObservableObject {
                 }
             }
         } catch {
+            hostingRequested = false
             working = false
             recordDiagnosticFailure(.hostStopped, error: error)
             status = "共享未启动：\(error.localizedDescription)"

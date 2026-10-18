@@ -39,6 +39,7 @@ final class TrafficHistoryStore: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private var records: [UUID: DeviceTrafficRecord] = [:]
     private var dirty = false
+    private var unpublished = false
     private var protectsUnreadFile = false
     private var identityError: String?
     private var loadError: String?
@@ -82,6 +83,7 @@ final class TrafficHistoryStore: @unchecked Sendable {
 
     func record(_ identity: DeviceIdentity, delta: TrafficTotals, at date: Date = Date()) {
         queue.async {
+            self.unpublished = true
             var record = self.records[identity.id]
                 ?? DeviceTrafficRecord(id: identity.id, name: identity.displayName, firstSeen: date, lastSeen: date)
             do { try record.totals.add(delta) }
@@ -94,7 +96,7 @@ final class TrafficHistoryStore: @unchecked Sendable {
     }
 
     func reportCountingError(_ message: String) {
-        queue.async { self.countingError = message; self.publish() }
+        queue.async { self.countingError = message; self.unpublished = true; self.publish() }
     }
 
     func flush() {
@@ -120,8 +122,8 @@ final class TrafficHistoryStore: @unchecked Sendable {
     }
 
     private func checkpointAndPublish(forcePublish: Bool = false) {
-        guard dirty else { if forcePublish { publish() }; return }
-        if !protectsUnreadFile {
+        let previousWriteError = writeError
+        if dirty, !protectsUnreadFile {
             do {
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
                 let data = try JSONEncoder().encode(Document(version: 1, records: orderedRecords))
@@ -130,9 +132,13 @@ final class TrafficHistoryStore: @unchecked Sendable {
                 writeError = nil
             } catch { writeError = "历史流量尚未保存：\(error.localizedDescription)。正在保留内存统计并重试。" }
         }
-        publish()
+        if writeError != previousWriteError { unpublished = true }
+        if unpublished || forcePublish { publish() }
     }
 
-    private func publish() { observer?(orderedRecords, combinedError) }
+    private func publish() {
+        unpublished = false
+        observer?(orderedRecords, combinedError)
+    }
     deinit { timer?.cancel() }
 }

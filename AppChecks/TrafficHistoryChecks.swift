@@ -93,6 +93,65 @@ private struct TrafficHistoryChecks {
                         "A retry duplicated or lost pending counters")
         }
 
+        run("Protected unreadable history publishes a traffic change only once across checkpoints") { folder in
+            let file = folder.appendingPathComponent("traffic-history.json")
+            let bytes = Data("unreadable-history".utf8)
+            try bytes.write(to: file)
+            let store = TrafficHistoryStore(directory: folder, checkpointInterval: 0.05)
+            let initial = DispatchSemaphore(value: 0), updated = DispatchSemaphore(value: 0)
+            var updates = 0
+            store.observe { records, _ in
+                if records.isEmpty { initial.signal() }
+                else { updates += 1; updated.signal() }
+            }
+            try require(initial.wait(timeout: .now() + 3) == .success, "Initial history was not published")
+            store.record(DeviceIdentity(id: UUID(), name: "new"), delta: .init(receivedBytes: 9))
+            try require(updated.wait(timeout: .now() + 3) == .success, "New in-memory traffic was not published")
+            try require(updated.wait(timeout: .now() + 0.2) == .timedOut, "Unchanged protected history was republished")
+            let snapshot = store.snapshot()
+            try require(updates == 1 && snapshot.records.first?.receivedBytes == 9 && snapshot.error != nil,
+                        "Protected history changed its notification or retained state")
+            try require(try Data(contentsOf: file) == bytes, "Protected history was overwritten")
+        }
+
+        run("Checkpoint write failures and recovery each publish their changed error state once") { folder in
+            let store = TrafficHistoryStore(directory: folder, checkpointInterval: 0.05)
+            let file = folder.appendingPathComponent("traffic-history.json")
+            try FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
+            let updated = DispatchSemaphore(value: 0)
+            var errors: [String?] = []
+            store.observe { _, error in errors.append(error); updated.signal() }
+            try require(updated.wait(timeout: .now() + 3) == .success, "Initial history was not published")
+            store.record(DeviceIdentity(id: UUID(), name: "Mac"), delta: .init(sentBytes: 15))
+            try require(updated.wait(timeout: .now() + 3) == .success, "Write failure was not published")
+            try require(store.snapshot().error != nil && errors.count == 2 && errors[0] == nil && errors[1] != nil,
+                        "First write failure was hidden")
+            try require(updated.wait(timeout: .now() + 0.2) == .timedOut, "Unchanged write failure was republished")
+            try FileManager.default.removeItem(at: file)
+            try require(updated.wait(timeout: .now() + 3) == .success, "Write recovery was not published")
+            try require(store.snapshot().error == nil && errors.count == 3 && errors[2] == nil,
+                        "Write recovery left a stale error")
+            let reloaded = TrafficHistoryStore(directory: folder, checkpointInterval: 60)
+            try require(reloaded.snapshot().records.first?.sentBytes == 15, "Automatic write retry lost pending counters")
+        }
+
+        run("Counting errors remain immediately observable between checkpoints") { folder in
+            let store = TrafficHistoryStore(directory: folder, checkpointInterval: 60)
+            let updated = DispatchSemaphore(value: 0)
+            store.observe { _, _ in updated.signal() }
+            try require(updated.wait(timeout: .now() + 3) == .success, "Initial history was not published")
+            store.reportCountingError("counting failed")
+            try require(updated.wait(timeout: .now() + 3) == .success, "Reported counting error waited for a checkpoint")
+            try require(store.snapshot().error == "counting failed", "Reported counting error disappeared")
+            let identity = DeviceIdentity(id: UUID(), name: "Mac")
+            store.record(identity, delta: .init(sentBytes: UInt64.max))
+            store.record(identity, delta: .init(sentBytes: 1))
+            try require(updated.wait(timeout: .now() + 3) == .success, "Overflow error waited for a checkpoint")
+            let snapshot = store.snapshot()
+            try require(snapshot.error != nil && snapshot.error != "counting failed" && snapshot.records.first?.sentBytes == UInt64.max,
+                        "Overflow lost counters or its changed error")
+        }
+
         run("A damaged local identity is preserved and disables identity exchange") { folder in
             let file = folder.appendingPathComponent("device-identity.json")
             let bytes = Data("damaged identity".utf8)

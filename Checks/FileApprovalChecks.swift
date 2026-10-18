@@ -2,6 +2,43 @@ import Foundation
 import QuietDeskCore
 
 func runFileApprovalChecks() {
+    run("Received mode-zero files and directories remain readable, writable and removable by their owner") {
+        try withCheckFolder { folder in
+            let root = folder.appendingPathComponent("folder"), bytes = Data([0, 1, 2, 255])
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            try bytes.write(to: root.appendingPathComponent("file.bin"))
+            let sender = ClipboardTransfer(storage: folder.appendingPathComponent("sender"))
+            let receiver = ClipboardTransfer(storage: folder.appendingPathComponent("receiver"), requireFileApproval: true)
+            let done = DispatchSemaphore(value: 0), success = Box(false), usable = Box(false)
+            sender.onSend = { message in
+                if message.kind == .clipboardEntry,
+                   var value = try? JSONSerialization.jsonObject(with: message.payload) as? [String: Any] {
+                    value["mode"] = 0
+                    receiver.receive(Message(.clipboardEntry, try! JSONSerialization.data(withJSONObject: value)))
+                } else { receiver.receive(message) }
+            }
+            receiver.onSend = { sender.receive($0) }
+            receiver.onFileOffer = { [weak receiver] in if let offer = $0 { receiver?.respondToFileOffer(id: offer.id, accept: true) } }
+            receiver.onReceive = { payload in
+                guard case .files(let urls) = payload, let root = urls.first else { return }
+                do {
+                    let file = root.appendingPathComponent("file.bin")
+                    let rootMode = try FileManager.default.attributesOfItem(atPath: root.path)[.posixPermissions] as? NSNumber
+                    let fileMode = try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? NSNumber
+                    let readable = try Data(contentsOf: file) == bytes
+                    try bytes.write(to: file)
+                    try FileManager.default.removeItem(at: root)
+                    usable.set(readable && (rootMode?.intValue ?? 0) & 0o700 == 0o700 && (fileMode?.intValue ?? 0) & 0o600 == 0o600
+                               && !FileManager.default.fileExists(atPath: root.path))
+                } catch { usable.set(false) }
+            }
+            defer { stopTransfers(sender, receiver) }
+            sender.send(.files([root])) { success.set($0); done.signal() }
+            try wait(done, "Mode-zero file transfer did not finish")
+            try check(success.read() && usable.read(), "Peer permissions prevented owner access or cleanup")
+        }
+    }
+
     let invalidRoots: [(String, Int, Int, [String], [(String, Bool)], Bool)] = [
         ("File roots must match the names shown in the confirmation", 1, 1, ["report.pdf"], [("other.pdf", false)], false),
         ("File roots cannot exceed the confirmed root count", 2, 1, ["first"], [("first", false), ("second", false)], false),

@@ -609,7 +609,8 @@ public final class ClipboardTransfer {
         try incoming.handle?.close(); incoming.handle = nil
         for entry in incoming.entries.reversed() {
             let url = try ClipboardPaths.destination(root: incoming.directory, relative: entry.path)
-            try FileManager.default.setAttributes([.posixPermissions: entry.mode & 0o777, .modificationDate: Date(timeIntervalSince1970: entry.modified)], ofItemAtPath: url.path)
+            let mode = (entry.mode & 0o777) | (entry.directory ? 0o700 : 0o600)
+            try FileManager.default.setAttributes([.posixPermissions: mode, .modificationDate: Date(timeIntervalSince1970: entry.modified)], ofItemAtPath: url.path)
         }
         let payload: ClipboardPayload
         if incoming.begin.type == "files" {

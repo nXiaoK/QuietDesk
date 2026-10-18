@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import ImageIO
 import QuietDeskCore
 import SwiftUI
 
@@ -9,6 +10,66 @@ protocol MediaCanvasDecoding: AnyObject {
 }
 
 extension VideoDecoder: MediaCanvasDecoding {}
+
+@MainActor
+enum CursorBitmap {
+    private static let crcTable: [UInt32] = (0...255).map { value in
+        var crc = UInt32(value)
+        for _ in 0..<8 { crc = crc & 1 == 0 ? crc >> 1 : (crc >> 1) ^ 0xEDB88320 }
+        return crc
+    }
+
+    // ImageIO may return a partial image even when compressed pixels are damaged.
+    // Verify bounded PNG chunks before accepting it as a known cursor shape.
+    private static func validChunks(_ data: Data) -> Bool {
+        var reader = ByteReader(Data(data.dropFirst(8)))
+        var header = false, pixels = false
+        do {
+            while reader.remaining >= 12 {
+                let length: UInt32 = try reader.take()
+                guard Int(length) <= reader.remaining - 8 else { return false }
+                let kind = try reader.bytes(4), payload = try reader.bytes(Int(length))
+                let expected: UInt32 = try reader.take()
+                var crc = UInt32.max
+                for bytes in [kind, payload] {
+                    for byte in bytes { crc = crcTable[Int((crc ^ UInt32(byte)) & 0xFF)] ^ (crc >> 8) }
+                }
+                guard crc ^ UInt32.max == expected else { return false }
+                if kind == Data("IHDR".utf8) {
+                    guard !header, length == 13 else { return false }
+                    header = true
+                } else if !header { return false }
+                if kind == Data("IDAT".utf8) { pixels = true }
+                if kind == Data("IEND".utf8) { return pixels && length == 0 && reader.remaining == 0 }
+            }
+        } catch { return false }
+        return false
+    }
+
+    static func image(_ value: CursorImage) -> NSImage? {
+        guard validChunks(value.png),
+              let source = CGImageSourceCreateWithData(value.png as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+              CGImageSourceGetCount(source) == 1,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue == value.pixelWidth,
+              (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue == value.pixelHeight,
+              let image = CGImageSourceCreateImageAtIndex(source, 0,
+                  [kCGImageSourceShouldCache: true, kCGImageSourceShouldCacheImmediately: true] as CFDictionary),
+              CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
+              image.width == value.pixelWidth, image.height == value.pixelHeight else { return nil }
+        return NSImage(cgImage: image, size: NSSize(width: value.logicalWidth, height: value.logicalHeight))
+    }
+}
+
+@MainActor
+private final class CursorOverlayView: NSView {
+    var image: NSImage? { didSet { needsDisplay = true } }
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        image?.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+    }
+}
 
 // The authenticated media coordinator supplies ordered, complete frames. Each stream has
 // its own decoder; an uncommitted candidate can decode and acknowledge without drawing.
@@ -33,6 +94,7 @@ final class MediaCanvasReceiver: @unchecked Sendable {
     private let diagnostics: PerformanceDiagnostics?
     private let makeDecoder: (PerformanceDiagnostics?) -> MediaCanvasDecoding
     private let display: @MainActor (LatestFrameMailbox) -> Void
+    private let willDisplay: @MainActor (MediaStreamID) -> Void
     private var active: Stream?
     private var candidate: Stream?
     private var newestStream: MediaStreamID?
@@ -40,8 +102,9 @@ final class MediaCanvasReceiver: @unchecked Sendable {
 
     init(diagnostics: PerformanceDiagnostics? = nil,
          makeDecoder: @escaping (PerformanceDiagnostics?) -> MediaCanvasDecoding = { VideoDecoder(diagnostics: $0) },
+         willDisplay: @escaping @MainActor (MediaStreamID) -> Void = { _ in },
          display: @escaping @MainActor (LatestFrameMailbox) -> Void) {
-        self.diagnostics = diagnostics; self.makeDecoder = makeDecoder; self.display = display
+        self.diagnostics = diagnostics; self.makeDecoder = makeDecoder; self.display = display; self.willDisplay = willDisplay
     }
 
     func receive(_ frame: MediaFrame, completion: @escaping (Bool) -> Void) {
@@ -144,6 +207,7 @@ final class MediaCanvasReceiver: @unchecked Sendable {
                 self.lock.withLock {
                     stream.displayScheduled = false
                     guard !self.stopped, self.active === stream else { return }
+                    self.willDisplay(stream.id)
                     self.display(stream.mailbox)
                 }
             }
@@ -172,10 +236,28 @@ final class RemoteCanvas: NSView {
     private var diagnostics: PerformanceDiagnostics?
     private var mediaReceiver: MediaCanvasReceiver?
     private var mediaReceiverID: UUID?
+    private var displayStream: MediaStreamID?
     private var awaitingDisplay = false
     private var tracking: NSTrackingArea?
     private var observers: [NSObjectProtocol] = []
-    private var lastMove: TimeInterval = 0
+    private var movePacer = PointerMovePacer()
+    private var moveTimer: Timer?
+    private var moveGeneration = UUID()
+    private var cursorState = CursorPresentationState()
+    private var cursorImage: NSImage?
+    private var localCursor = NSCursor.arrow
+    private var cursorHotSpot = NSCursor.arrow.hotSpot
+    private let remoteCursorView = CursorOverlayView()
+    private var localPointerInside = false
+    private var cursorPublished: (Bool, Bool)?
+    var onCursorPresentation: ((Bool, Bool) -> Void)?
+    var pointerInputSuspended = false {
+        didSet {
+            if pointerInputSuspended { cancelPointerMoves() }
+            window?.invalidateCursorRects(for: self)
+            updateCursorPresentation()
+        }
+    }
     private var localShortcutKeys = Set<UInt16>()
     let capsLockMonitor = CapsLockMonitor()
     private let systemShortcutMonitor = SystemShortcutMonitor()
@@ -198,7 +280,14 @@ final class RemoteCanvas: NSView {
     var onFullScreen: ((Bool) -> Void)?
     var onToggleFullScreen: (() -> Void)?
     var remoteSize = CGSize(width: 16, height: 10)
-    var canControl = false { didSet { reconcileSystemShortcutCapture() } }
+    var canControl = false {
+        didSet {
+            if !canControl { cancelPointerMoves() }
+            reconcileSystemShortcutCapture()
+            window?.invalidateCursorRects(for: self)
+            updateCursorPresentation()
+        }
+    }
     var usesCapsLockActions = false
 
     override var acceptsFirstResponder: Bool { canControl }
@@ -210,6 +299,10 @@ final class RemoteCanvas: NSView {
         layer?.backgroundColor = NSColor.black.cgColor
         videoLayer.videoGravity = .resizeAspect
         layer?.addSublayer(videoLayer)
+        remoteCursorView.isHidden = true
+        remoteCursorView.wantsLayer = true
+        remoteCursorView.layer?.zPosition = 1
+        addSubview(remoteCursorView)
         capsLockMonitor.isActive = { [weak self] in
             guard let self else { return false }
             return self.usesCapsLockActions && self.canControl && self.window?.isKeyWindow == true
@@ -259,6 +352,7 @@ final class RemoteCanvas: NSView {
         videoLayer.contentsScale = window?.backingScaleFactor ?? 1
         CATransaction.commit()
         showLatestFrame()
+        updateCursorPresentation()
     }
 
     override func viewDidChangeBackingProperties() {
@@ -268,6 +362,7 @@ final class RemoteCanvas: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        cancelPointerMoves()
         needsLayout = true
         if systemShortcutMonitor.isRunning { releaseControl() }
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
@@ -278,11 +373,11 @@ final class RemoteCanvas: NSView {
         window.acceptsMouseMovedEvents = true
         observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification,
             object: window, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.releaseControl() }
+                MainActor.assumeIsolated { self?.releaseControl(); self?.updateCursorPresentation() }
             })
         observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification,
             object: window, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.reconcileSystemShortcutCapture() }
+                MainActor.assumeIsolated { self?.reconcileSystemShortcutCapture(); self?.updateCursorPresentation() }
             })
         for name in [NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
@@ -301,14 +396,86 @@ final class RemoteCanvas: NSView {
         super.updateTrackingAreas()
         if let tracking { removeTrackingArea(tracking) }
         let area = NSTrackingArea(rect: .zero,
-            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect], owner: self)
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self)
         tracking = area
         addTrackingArea(area)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if cursorState.enabled, canControl, !pointerInputSuspended {
+            addCursorRect(pictureRect, cursor: localCursor)
+        }
+    }
+
+    func receiveCursorStatus(_ control: CursorControl) { if cursorState.status(control) { refreshCursorImage() } }
+    func receiveCursorBinding(_ control: CursorControl) { _ = cursorState.bind(control) }
+    func receiveCursorShape(_ shape: CursorShape) { if cursorState.update(shape) { refreshCursorImage() } }
+    func receiveCursorPosition(_ position: CursorPosition) { if cursorState.update(position) { updateCursorPresentation() } }
+
+    private func refreshCursorImage(forcePublish: Bool = false) {
+        let decoded = cursorState.image.flatMap(CursorBitmap.image)
+        cursorImage = decoded ?? NSCursor.arrow.image
+        if let value = cursorState.image, let decoded {
+            cursorHotSpot = NSPoint(x: value.hotSpotX, y: value.hotSpotY)
+            localCursor = NSCursor(image: decoded, hotSpot: cursorHotSpot)
+        } else { localCursor = .arrow; cursorHotSpot = NSCursor.arrow.hotSpot }
+        let flags = (cursorState.enabled, decoded != nil)
+        if forcePublish || cursorPublished?.0 != flags.0 || cursorPublished?.1 != flags.1 {
+            cursorPublished = flags
+            onCursorPresentation?(flags.0, flags.1)
+        }
+        window?.invalidateCursorRects(for: self)
+        updateCursorPresentation()
+    }
+
+    private func updateCursorPresentation() {
+        let localOwnsPointer = localPointerInside && window?.isKeyWindow == true && canControl && !pointerInputSuspended
+        guard cursorState.enabled, !localOwnsPointer, let position = cursorState.position, position.insideDisplay else {
+            remoteCursorView.isHidden = true
+            return
+        }
+        let image = cursorImage ?? NSCursor.arrow.image
+        let hotSpot = cursorHotSpot
+        let rect = pictureRect
+        remoteCursorView.image = image
+        remoteCursorView.frame = NSRect(x: rect.minX + position.x * rect.width - hotSpot.x,
+                                       y: rect.minY + position.y * rect.height - hotSpot.y,
+                                       width: image.size.width, height: image.size.height)
+        remoteCursorView.isHidden = false
+    }
+
+    private func schedulePointerMove() {
+        guard moveTimer == nil, let delay = movePacer.nextDelay(now: SessionClock.now) else { return }
+        let token = moveGeneration
+        let timer = Timer(timeInterval: max(0.0001, delay), repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.moveGeneration == token else { return }
+                self.moveTimer = nil
+                if let input = self.movePacer.takeDue(now: SessionClock.now), self.canControl, !self.pointerInputSuspended {
+                    self.onInput?(input)
+                }
+                self.schedulePointerMove()
+            }
+        }
+        timer.tolerance = 0.001
+        moveTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func flushPointerMoves() {
+        moveTimer?.invalidate(); moveTimer = nil; moveGeneration = UUID()
+        if let input = movePacer.flush(now: SessionClock.now), canControl, !pointerInputSuspended { onInput?(input) }
+    }
+
+    private func cancelPointerMoves() {
+        moveTimer?.invalidate(); moveTimer = nil; moveGeneration = UUID(); movePacer.cancel()
     }
 
     func makeVideoReceiver(diagnostics: PerformanceDiagnostics? = nil,
                            makeDecoder: (PerformanceDiagnostics?) -> MediaCanvasDecoding = { VideoDecoder(diagnostics: $0) }) -> (VideoPacket, @escaping () -> Void) -> Void {
         mediaReceiverID = nil
+        displayStream = nil
         mediaReceiver?.stop()
         mediaReceiver = nil
         decoder.stop()
@@ -346,7 +513,10 @@ final class RemoteCanvas: NSView {
         self.diagnostics = diagnostics
         let token = UUID()
         mediaReceiverID = token
-        let receiver = MediaCanvasReceiver(diagnostics: diagnostics, makeDecoder: makeDecoder) { [weak self] inbox in
+        let receiver = MediaCanvasReceiver(diagnostics: diagnostics, makeDecoder: makeDecoder, willDisplay: { [weak self] stream in
+            guard let self, self.mediaReceiverID == token else { return }
+            self.displayStream = stream
+        }) { [weak self] inbox in
             guard let self, self.mediaReceiverID == token else { return }
             if self.mailbox !== inbox {
                 self.decoder.stop()
@@ -394,6 +564,13 @@ final class RemoteCanvas: NSView {
             CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
                                  Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
         }
+        // Keep the old cursor mode while the layer is busy or sample creation fails.
+        // Clear its retained image before changing modes so a burned-in old cursor
+        // cannot remain visible underneath the immediate local cursor.
+        if let displayStream, cursorState.commit(displayStream) {
+            videoLayer.flushAndRemoveImage()
+            refreshCursorImage(forcePublish: true)
+        }
         videoLayer.enqueue(sample)
         // Enqueue completion does not confirm that the frame has reached the screen.
         diagnostics?.record(.decodeToDisplay, since: received.decodedAt, kind: .video, identifier: received.sequence.map(UInt64.init))
@@ -401,10 +578,15 @@ final class RemoteCanvas: NSView {
     }
 
     func reset() {
+        cancelPointerMoves()
+        cursorState = CursorPresentationState(); cursorImage = nil; localCursor = .arrow
+        cursorPublished = nil; localPointerInside = false
+        refreshCursorImage()
         shortcutSessionActive = false
         releaseControl()
         canControl = false
         mediaReceiverID = nil
+        displayStream = nil
         mediaReceiver?.stop()
         mediaReceiver = nil
         decoder.stop()
@@ -418,6 +600,7 @@ final class RemoteCanvas: NSView {
     }
 
     func releaseControl() {
+        cancelPointerMoves()
         interactionRevision &+= 1
         if window?.firstResponder === self, window?.makeFirstResponder(nil) == true { return }
         systemShortcutMonitor.stop()
@@ -436,6 +619,7 @@ final class RemoteCanvas: NSView {
         return true
     }
     override func resignFirstResponder() -> Bool {
+        cancelPointerMoves()
         systemShortcutMonitor.stop()
         shortcutStartAttempted = false
         publishShortcutStatus("全屏控制画面获得焦点后自动转发系统快捷键", running: false)
@@ -512,9 +696,12 @@ final class RemoteCanvas: NSView {
     }
 
     private func pointer(_ event: NSEvent, _ kind: RemoteInput.Kind) {
-        guard canControl else { return }
+        guard canControl, !pointerInputSuspended else { return }
+        if kind != .move { flushPointerMoves() }
         let point = convert(event.locationInWindow, from: nil)
         let rect = pictureRect
+        localPointerInside = rect.contains(point)
+        updateCursorPresentation()
         guard rect.width > 0, rect.height > 0 else { return }
         if kind != .up && kind != .drag && !rect.contains(point) { return }
         onUserActivity?()
@@ -532,7 +719,10 @@ final class RemoteCanvas: NSView {
             input.deltaX = min(3000, max(-3000, event.scrollingDeltaX * multiplier))
             input.deltaY = min(3000, max(-3000, event.scrollingDeltaY * multiplier))
         }
-        onInput?(input)
+        if kind == .move {
+            if let ready = movePacer.offer(input, now: SessionClock.now) { onInput?(ready) }
+            schedulePointerMove()
+        } else { onInput?(input) }
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -550,13 +740,18 @@ final class RemoteCanvas: NSView {
     override func otherMouseDragged(with event: NSEvent) { pointer(event, .drag) }
     override func scrollWheel(with event: NSEvent) { pointer(event, .scroll) }
     override func mouseMoved(with event: NSEvent) {
-        guard event.timestamp - lastMove >= 1.0 / 60 else { return }
-        lastMove = event.timestamp
         pointer(event, .move)
+    }
+    override func mouseEntered(with event: NSEvent) {
+        localPointerInside = pictureRect.contains(convert(event.locationInWindow, from: nil)); updateCursorPresentation()
+    }
+    override func mouseExited(with event: NSEvent) {
+        localPointerInside = false; flushPointerMoves(); updateCursorPresentation()
     }
 
     private func keyboard(_ event: NSEvent, _ kind: RemoteInput.Kind) {
         guard canControl, window?.firstResponder === self, event.keyCode <= 127 else { return }
+        flushPointerMoves()
         var input = RemoteInput(kind: kind)
         input.keyCode = event.keyCode
         input.flags = UInt64(event.modifierFlags.rawValue)
@@ -609,7 +804,7 @@ final class RemoteCanvas: NSView {
         return true
     }
 
-    deinit { for observer in observers { NotificationCenter.default.removeObserver(observer) } }
+    deinit { moveTimer?.invalidate(); for observer in observers { NotificationCenter.default.removeObserver(observer) } }
 }
 
 struct CanvasView: NSViewRepresentable {

@@ -5,6 +5,15 @@ import QuietDeskCore
 @MainActor
 final class HostSession {
     var media: MediaSession?
+    var mediaPrepared = false
+    let cursorID = UUID()
+    var cursorEpoch: UInt32 = 0
+    var cursorEnabled = false
+    var cursorSubscribed = false
+    var cursorTask: Task<Void, Never>?
+    var cursorSampler: HostCursorSampler?
+    var cursorShapeRevision: UInt64 = 0
+    var cursorPositionSequence: UInt64 = 0
     var streamer: ScreenStreamer?
     var injector: InputInjector?
     var captureTask: Task<Void, Never>?
@@ -21,8 +30,12 @@ final class HostSession {
 
 @MainActor
 final class ViewerSession {
+    var cursorRequestID: UUID?
+    var cursorRequestedEnabled = false
+    var cursorTimeout: Task<Void, Never>?
     var media: MediaSession?
     var mediaReceiver: MediaCanvasReceiver?
+    var mediaCommitted = false
     var mediaQuality: MediaQualityPolicy?
     var automaticVideoSettings: StreamSettings?
     var helloReceived = false

@@ -15,6 +15,13 @@ struct ConnectionSettingsView: View {
                 Divider()
                 VStack(alignment: .leading, spacing: 8) {
                     Text("连接").font(.headline)
+                    Toggle("本地即时光标", isOn: $model.lowLatencyCursorEnabled)
+                        .disabled(model.connected && !model.supportsIndependentCursor)
+                        .help("减少双光标跟随；远端形状不可用时使用通用指针。")
+                    if model.connected {
+                        Text(model.supportsIndependentCursor ? model.cursorStatus : "对端版本不支持独立光标")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     Toggle("仅使用 TCP（下次连接生效）", isOn: $model.mediaTCPOnly)
                     Text(model.connected ? model.mediaTransportStatus : (model.mediaTCPOnly ? "视频使用 TCP" : "视频优先 UDP，不可用时自动使用 TCP"))
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -151,6 +158,9 @@ struct FullScreenSettingsView: View {
                         SessionQualitySection(model: model, compact: true)
                         Divider()
                         VStack(spacing: 6) {
+                            Toggle("本地即时光标", isOn: $model.lowLatencyCursorEnabled)
+                                .disabled(!model.supportsIndependentCursor)
+                            Text(model.cursorStatus).font(.caption).foregroundStyle(.secondary)
                             Toggle(isOn: $model.showFullScreenStatistics) { Text("显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
                                 .help("显示控制通道 RTT、分辨率、解码 FPS 和流量；不代表画面上屏延迟。")
                             Text(model.mediaTransportStatus).font(.caption).foregroundStyle(.secondary)

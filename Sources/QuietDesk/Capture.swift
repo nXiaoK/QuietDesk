@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import ScreenCaptureKit
 import QuietDeskCore
 
@@ -111,8 +112,77 @@ struct VideoEncodeTiming {
     }
 }
 
+// displayTime is in mach absolute ticks; PTS is compared only with other SCK sample timestamps.
+struct CursorCaptureGate {
+    private(set) var included = true
+    private(set) var needsFreshFrame = false
+    private(set) var requestID: UUID?
+    private(set) var configurationApplied = false
+    private var presentationWatermark: CMTime?
+    private var minimumPresentationTime: CMTime?
+    private var minimumDisplayTime: UInt64?
+    private var expectedDimensions: (Int, Int)?
+
+    @discardableResult
+    mutating func request(included: Bool, id: UUID = UUID()) -> UUID {
+        self.included = included
+        needsFreshFrame = true
+        requestID = id
+        configurationApplied = false
+        minimumPresentationTime = nil
+        minimumDisplayTime = nil
+        expectedDimensions = nil
+        return id
+    }
+
+    mutating func arm(id: UUID, afterDisplayTime: UInt64, width: Int, height: Int) -> Bool {
+        guard requestID == id, needsFreshFrame, width > 0, height > 0 else { return false }
+        configurationApplied = true
+        minimumPresentationTime = presentationWatermark
+        minimumDisplayTime = afterDisplayTime
+        expectedDimensions = (width, height)
+        return true
+    }
+
+    mutating func observe(_ sample: CMSampleBuffer, displayTime: UInt64?) -> (retain: Bool, completed: UUID?) {
+        let time = CMSampleBufferGetPresentationTimeStamp(sample)
+        if time.isNumeric, presentationWatermark.map({ CMTimeCompare(time, $0) > 0 }) ?? true {
+            presentationWatermark = time
+        }
+        guard needsFreshFrame else { return (true, nil) }
+        guard let id = requestID, configurationApplied, time.isNumeric,
+              minimumPresentationTime.map({ CMTimeCompare(time, $0) > 0 }) ?? true,
+              let minimumDisplayTime, let displayTime, displayTime > minimumDisplayTime,
+              let expectedDimensions, let image = CMSampleBufferGetImageBuffer(sample),
+              CVPixelBufferGetWidth(image) == expectedDimensions.0,
+              CVPixelBufferGetHeight(image) == expectedDimensions.1 else { return (false, nil) }
+        needsFreshFrame = false
+        requestID = nil
+        configurationApplied = false
+        return (true, id)
+    }
+
+    @discardableResult
+    mutating func cancel(id: UUID) -> Bool {
+        guard requestID == id else { return false }
+        requestID = nil
+        configurationApplied = false
+        return true
+    }
+}
+
 // Capture state is confined to queue; callbacks are installed before start.
 final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+    enum CursorConfigurationError: LocalizedError {
+        case configurationTimeout, freshFrameTimeout, rollbackFailed(String)
+        var errorDescription: String? {
+            switch self {
+            case .configurationTimeout: return "光标采集配置超过 2 秒未确认，需要重建共享"
+            case .freshFrameTimeout: return "光标采集配置后超过 2 秒未收到可确认的新画面"
+            case .rollbackFailed(let detail): return "光标采集无法恢复原配置及新画面，需要重建共享：\(detail)"
+            }
+        }
+    }
     struct CapturePlan {
         fileprivate let filter: SCContentFilter
         fileprivate let displayID: CGDirectDisplayID
@@ -153,6 +223,16 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var excludesCurrentApplication = false
     private var reconfiguring = false
     private var sessionPaused = false
+    private var cursorGate = CursorCaptureGate()
+    private var appliedCursorIncluded: Bool? = true
+    private var lastConfirmedCursorIncluded = true
+    private var cursorOperationID: UUID?
+    private var cancelledCursorOperationID: UUID?
+    private var cancelledCursorRequestID: UUID?
+    private var cursorRollingBack = false
+    private var cursorFrameWaiter: (id: UUID, continuation: CheckedContinuation<Void, Error>)?
+    private var cursorFrameTimeout: DispatchSourceTimer?
+    private let queueIdentity = DispatchSpecificKey<Bool>()
     private var idleWaiter: (UUID, CheckedContinuation<Void, Error>)?
     private var watchdog: DispatchSourceTimer?
     private let encoderCleanupQueue = DispatchQueue(label: "quietdesk.capture.encoder-cleanup", qos: .userInitiated)
@@ -160,6 +240,17 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     init(diagnostics: PerformanceDiagnostics? = nil) {
         self.diagnostics = diagnostics
         super.init()
+        queue.setSpecific(key: queueIdentity, value: true)
+    }
+
+    var currentCursorIncluded: Bool? { cursorState().actual }
+    var targetCursorIncluded: Bool? { cursorState().target }
+
+    private func cursorState() -> (actual: Bool?, target: Bool?) {
+        let read = { [self] in
+            (actual: running && captureStarted ? appliedCursorIncluded : nil, target: running ? cursorGate.included : nil)
+        }
+        return DispatchQueue.getSpecific(key: queueIdentity) == true ? read() : queue.sync(execute: read)
     }
 
     static func displaySnapshot(_ id: CGDirectDisplayID) -> DisplaySnapshot {
@@ -187,7 +278,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             fallbackHeight: fallback.pixelHeight)
     }
 
-    private static func configuration(width: Int, height: Int, settings: StreamSettings) -> SCStreamConfiguration {
+    static func configuration(width: Int, height: Int, settings: StreamSettings, includesCursor: Bool = true) -> SCStreamConfiguration {
         let configuration = SCStreamConfiguration()
         configuration.width = width
         configuration.height = height
@@ -195,7 +286,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: Int32(settings.framesPerSecond))
         configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         configuration.queueDepth = 3
-        configuration.showsCursor = true
+        configuration.showsCursor = includesCursor
         configuration.capturesAudio = false
         configuration.colorSpaceName = CGColorSpace.sRGB
         configuration.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
@@ -299,6 +390,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             sourceWidth = capture.sourceWidth
             sourceHeight = capture.sourceHeight
             currentSettings = settings
+            cursorGate = CursorCaptureGate()
+            appliedCursorIncluded = true
+            lastConfirmedCursorIncluded = true
             running = true
             let watchdog = DispatchSource.makeTimerSource(queue: queue)
             watchdog.schedule(deadline: .now() + 2, repeating: 2)
@@ -325,11 +419,167 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         } catch { await stop(); throw error }
     }
 
+    // The media coordinator suspends delivery first and resumes this reconfiguration before requesting a new IDR.
+    // While paused only the target changes; currentCursorIncluded remains the last verified capture mode.
+    func setCursorIncluded(_ included: Bool) async throws {
+        try Task.checkCancellation()
+        let operation = UUID()
+        let snapshot = try queue.sync { () throws -> (stream: SCStream, previous: Bool, paused: Bool)? in
+            guard running, captureStarted, let stream else { throw DeskError.invalid("屏幕采集尚未就绪") }
+            guard cursorOperationID == nil, !reconfiguring, cursorFrameWaiter == nil else {
+                throw DeskError.invalid("正在调整采集配置，请稍后重试光标切换")
+            }
+            guard included != cursorGate.included || cursorGate.needsFreshFrame else { return nil }
+            cursorOperationID = operation
+            cancelledCursorOperationID = nil
+            cursorGate.request(included: included)
+            latest = nil
+            lastCapture = nil
+            return (stream, appliedCursorIncluded ?? lastConfirmedCursorIncluded, sessionPaused)
+        }
+        guard let snapshot else { return }
+        defer {
+            queue.sync {
+                if cursorOperationID == operation { cursorOperationID = nil; cancelledCursorOperationID = nil }
+            }
+        }
+        if snapshot.paused { return }
+        do {
+            try await withTaskCancellationHandler {
+                try Task.checkCancellation()
+                try await pauseAtFrameBoundary(cursorOperation: operation)
+                try await applyCursorConfiguration(included, stream: snapshot.stream, operation: operation)
+                try Task.checkCancellation()
+                try queue.sync {
+                    if cancelledCursorOperationID == operation { throw CancellationError() }
+                }
+            } onCancel: { [weak self] in
+                self?.queue.async { [weak self] in self?.cancelCursorOperation(operation) }
+            }
+        } catch {
+            let original = error
+            guard queue.sync(execute: { running && stream === snapshot.stream }) else { throw CancellationError() }
+            if case CursorConfigurationError.configurationTimeout = original {
+                queue.sync { reconfiguring = false }
+                throw original
+            }
+            do { try await restoreCursorConfiguration(snapshot.previous, stream: snapshot.stream) }
+            catch {
+                queue.sync { if stream === snapshot.stream { reconfiguring = false } }
+                throw error
+            }
+            queue.sync { if stream === snapshot.stream { reconfiguring = false } }
+            throw original
+        }
+        // Keep reconfiguring true until the coordinator sends its result and calls resumeAfterReconfiguration.
+    }
+
+    private func applyCursorConfiguration(_ included: Bool, stream expectedStream: SCStream,
+                                          operation: UUID? = nil, ignoringCancellation: Bool = false) async throws {
+        let request = UUID()
+        let expectedStreamID = ObjectIdentifier(expectedStream)
+        try await withTaskCancellationHandler {
+            let alreadyCancelled = Task.isCancelled
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                queue.async { [self] in
+                    guard running, let activeStream = stream, ObjectIdentifier(activeStream) == expectedStreamID else {
+                        continuation.resume(throwing: CancellationError()); return
+                    }
+                    guard cursorFrameWaiter == nil else {
+                        continuation.resume(throwing: DeskError.invalid("另一个光标采集更新尚未完成")); return
+                    }
+                    if !ignoringCancellation,
+                       alreadyCancelled || cancelledCursorRequestID == request || operation.map({ cancelledCursorOperationID == $0 }) == true {
+                        continuation.resume(throwing: CancellationError()); return
+                    }
+                    cursorGate.request(included: included, id: request)
+                    appliedCursorIncluded = nil
+                    latest = nil
+                    lastCapture = nil
+                    cursorFrameWaiter = (request, continuation)
+                    let timer = DispatchSource.makeTimerSource(queue: queue)
+                    timer.schedule(deadline: .now() + 2)
+                    timer.setEventHandler { [weak self] in
+                        guard let self, self.cursorFrameWaiter?.id == request else { return }
+                        let error: CursorConfigurationError = self.cursorGate.configurationApplied ? .freshFrameTimeout : .configurationTimeout
+                        self.finishCursorFrameWaiter(request, result: .failure(error))
+                    }
+                    cursorFrameTimeout = timer
+                    timer.resume()
+                    let width = outputWidth, height = outputHeight
+                    activeStream.updateConfiguration(Self.configuration(width: width, height: height,
+                        settings: currentSettings, includesCursor: included), completionHandler: { [weak self] error in
+                            self?.queue.async { [weak self] in
+                                guard let self, self.running, self.stream.map(ObjectIdentifier.init) == expectedStreamID,
+                                      self.cursorFrameWaiter?.id == request else { return }
+                                if let error { self.finishCursorFrameWaiter(request, result: .failure(error)); return }
+                                // This queue barrier drains already delivered samples. displayTime uses the documented mach clock.
+                                guard self.cursorGate.arm(id: request, afterDisplayTime: mach_absolute_time(), width: width, height: height) else {
+                                    self.finishCursorFrameWaiter(request, result: .failure(CancellationError())); return
+                                }
+                                if !ignoringCancellation, self.cancelledCursorRequestID == request
+                                    || operation.map({ self.cancelledCursorOperationID == $0 }) == true {
+                                    self.finishCursorFrameWaiter(request, result: .failure(CancellationError()))
+                                }
+                            }
+                        })
+                }
+            }
+        } onCancel: { [weak self] in
+            guard !ignoringCancellation else { return }
+            self?.queue.async { [weak self] in self?.cancelCursorRequest(request) }
+        }
+    }
+
+    private func restoreCursorConfiguration(_ included: Bool, stream: SCStream) async throws {
+        queue.sync { cursorRollingBack = true }
+        defer { queue.sync { if self.stream === stream { cursorRollingBack = false } } }
+        do { try await applyCursorConfiguration(included, stream: stream, ignoringCancellation: true) }
+        catch {
+            guard queue.sync(execute: { running && self.stream === stream }) else { throw CancellationError() }
+            throw CursorConfigurationError.rollbackFailed(error.localizedDescription)
+        }
+    }
+
+    private func cancelCursorOperation(_ operation: UUID) {
+        guard cursorOperationID == operation else { return }
+        cancelledCursorOperationID = operation
+        guard !cursorRollingBack else { return }
+        if let waiter = cursorFrameWaiter { cancelCursorRequest(waiter.id) }
+        if let waiter = idleWaiter {
+            idleWaiter = nil
+            reconfiguring = false
+            waiter.1.resume(throwing: CancellationError())
+        }
+    }
+
+    private func cancelCursorRequest(_ request: UUID) {
+        cancelledCursorRequestID = request
+        // Let an in-flight SCK update settle before rollback. If it never returns, its bounded timer forces reconnect.
+        if cursorFrameWaiter?.id == request, cursorGate.configurationApplied {
+            finishCursorFrameWaiter(request, result: .failure(CancellationError()))
+        }
+    }
+
+    private func finishCursorFrameWaiter(_ request: UUID, result: Result<Void, Error>) {
+        guard let waiter = cursorFrameWaiter, waiter.id == request else { return }
+        cursorFrameWaiter = nil
+        cursorFrameTimeout?.cancel()
+        cursorFrameTimeout = nil
+        if case .failure = result { cursorGate.cancel(id: request) }
+        waiter.continuation.resume(with: result)
+    }
+
     func reconfigure(_ settings: StreamSettings) async throws -> VideoStreamState {
         try settings.validateControlValues()
-        let snapshot = try queue.sync { () throws -> (SCStream, Int, Int, Int, Int, StreamSettings) in
+        let snapshot = try queue.sync { () throws -> (SCStream, Int, Int, Int, Int, StreamSettings, Bool) in
             guard running, captureStarted, let stream, displayID != nil else { throw DeskError.invalid("屏幕采集尚未就绪，请稍后调整") }
-            return (stream, sourceWidth, sourceHeight, outputWidth, outputHeight, currentSettings)
+            if let operation = cursorOperationID { cancelCursorOperation(operation); throw DeskError.invalid("光标采集正在更新，请稍后调整画质") }
+            if let waiter = cursorFrameWaiter {
+                cancelCursorRequest(waiter.id)
+                throw DeskError.invalid("正在等待光标采集的新画面")
+            }
+            return (stream, sourceWidth, sourceHeight, outputWidth, outputHeight, currentSettings, cursorGate.included)
         }
         let (width, height) = settings.dimensions(width: snapshot.1, height: snapshot.2)
         let id = UUID()
@@ -338,7 +588,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         catch { replacement.stop(); throw error }
         do {
             try Task.checkCancellation()
-            try await snapshot.0.updateConfiguration(Self.configuration(width: width, height: height, settings: settings))
+            try await snapshot.0.updateConfiguration(Self.configuration(width: width, height: height, settings: settings, includesCursor: snapshot.6))
             try Task.checkCancellation()
             try queue.sync {
                 guard running, stream === snapshot.0 else { throw CancellationError() }
@@ -352,7 +602,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 outputHeight = height
                 currentSettings = settings
                 frameFlow.requestKeyFrame()
-                latest = lastCapture
+                latest = cursorGate.needsFreshFrame ? nil : lastCapture
+                if cursorGate.needsFreshFrame { lastCapture = nil; appliedCursorIncluded = nil }
                 // Replaying a retained frame is intentional, not capture-queue congestion.
                 latest?.2 = nil
                 discardMismatchedFrame()
@@ -364,7 +615,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             replacement.stop()
             if queue.sync(execute: { running && stream === snapshot.0 }) {
                 do {
-                    try await snapshot.0.updateConfiguration(Self.configuration(width: snapshot.3, height: snapshot.4, settings: snapshot.5))
+                    try await snapshot.0.updateConfiguration(Self.configuration(width: snapshot.3, height: snapshot.4, settings: snapshot.5, includesCursor: snapshot.6))
                     queue.sync {
                         guard running, stream === snapshot.0 else { return }
                         frameFlow.requestKeyFrame()
@@ -383,22 +634,38 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     func setSessionPaused(_ paused: Bool) async throws -> Bool {
-        let current = try queue.sync { () throws -> SCStream in
+        let snapshot = try queue.sync { () throws -> (SCStream, Bool, Bool) in
             guard running, captureStarted, let stream else { throw DeskError.invalid("屏幕采集尚未就绪") }
-            return stream
+            if let operation = cursorOperationID { cancelCursorOperation(operation); throw DeskError.invalid("光标采集正在更新，请稍后暂停或恢复") }
+            if let waiter = cursorFrameWaiter {
+                cancelCursorRequest(waiter.id)
+                throw DeskError.invalid("正在等待光标采集的新画面")
+            }
+            return (stream, sessionPaused, appliedCursorIncluded ?? lastConfirmedCursorIncluded)
         }
+        let current = snapshot.0
         try await pauseAtFrameBoundary()
         do {
             try Task.checkCancellation()
-            try queue.sync {
+            let pendingCursor = try queue.sync { () throws -> Bool? in
                 guard running, stream === current else { throw CancellationError() }
                 sessionPaused = paused
                 if paused { reconfiguring = false }
                 else {
                     frameFlow.requestKeyFrame()
+                    if cursorGate.needsFreshFrame { return cursorGate.included }
                     latest = lastCapture
                     latest?.2 = nil
                     discardMismatchedFrame()
+                }
+                return nil
+            }
+            if let pendingCursor {
+                do { try await applyCursorConfiguration(pendingCursor, stream: current) }
+                catch {
+                    if case CursorConfigurationError.configurationTimeout = error { throw error }
+                    try await restoreCursorConfiguration(snapshot.2, stream: current)
+                    throw error
                 }
             }
             // The caller sends the resume result before releasing the new keyframe.
@@ -406,6 +673,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         } catch {
             queue.sync {
                 guard running, stream === current else { return }
+                sessionPaused = snapshot.1
                 reconfiguring = false
                 pump()
             }
@@ -416,6 +684,11 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     func setExcludesCurrentApplication(_ enabled: Bool) async throws {
         let snapshot = try queue.sync { () throws -> (SCStream, CGDirectDisplayID)? in
             guard running, let stream, let displayID else { throw DeskError.invalid("屏幕采集尚未就绪") }
+            if let operation = cursorOperationID { cancelCursorOperation(operation); throw DeskError.invalid("光标采集正在更新，请稍后调整防窥") }
+            if let waiter = cursorFrameWaiter {
+                cancelCursorRequest(waiter.id)
+                throw DeskError.invalid("正在等待光标采集的新画面")
+            }
             guard excludesCurrentApplication != enabled else { return nil }
             return (stream, displayID)
         }
@@ -441,9 +714,14 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
-    private func pauseAtFrameBoundary() async throws {
+    private func pauseAtFrameBoundary(cursorOperation: UUID? = nil) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async { [self] in
+                if let cursorOperation,
+                   cursorOperationID != cursorOperation || cancelledCursorOperationID == cursorOperation {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
                 guard running, captureStarted, !reconfiguring else {
                     continuation.resume(throwing: DeskError.invalid("共享未就绪或正在调整画质"))
                     return
@@ -548,6 +826,14 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             reconfiguring = false
             latest = nil
             lastCapture = nil
+            if let waiter = cursorFrameWaiter { finishCursorFrameWaiter(waiter.id, result: .failure(CancellationError())) }
+            cursorGate = CursorCaptureGate()
+            appliedCursorIncluded = nil
+            lastConfirmedCursorIncluded = true
+            cursorOperationID = nil
+            cancelledCursorOperationID = nil
+            cancelledCursorRequestID = nil
+            cursorRollingBack = false
             encodingTimingLock.withLock { encodingStarted = nil; encodeTiming.cancel() }
             acknowledgements.removeAll()
             frameFlow = VideoFrameFlow(sequence: frameFlow.sequence)
@@ -566,6 +852,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         queue.async { [weak self] in
             guard let self, self.running else { return }
+            if let waiter = self.cursorFrameWaiter { self.finishCursorFrameWaiter(waiter.id, result: .failure(error)) }
             if (error as NSError).domain == SCStreamErrorDomain,
                (error as NSError).code == SCStreamError.Code.userStopped.rawValue {
                 self.onUserStop?()
@@ -576,16 +863,23 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard running, type == .screen, CMSampleBufferIsValid(sampleBuffer),
+        guard running, self.stream === stream, type == .screen, CMSampleBufferIsValid(sampleBuffer),
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let status = attachments.first?[.status] as? Int,
               status == SCFrameStatus.complete.rawValue,
               let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         if !reconfiguring, (CVPixelBufferGetWidth(buffer) != outputWidth || CVPixelBufferGetHeight(buffer) != outputHeight) { return }
+        let cursorFrame = cursorGate.observe(sampleBuffer, displayTime: attachments.first?[.displayTime] as? UInt64)
+        guard cursorFrame.retain else { return }
         if latest != nil, !sessionPaused, !reconfiguring { diagnostics?.recordValue(.captureReplaced, 1) }
         // SCK presentation time is not in the SessionClock domain.
         latest = (buffer, CMSampleBufferGetPresentationTimeStamp(sampleBuffer), diagnostics?.start())
         lastCapture = latest
+        if let request = cursorFrame.completed {
+            appliedCursorIncluded = cursorGate.included
+            lastConfirmedCursorIncluded = cursorGate.included
+            finishCursorFrameWaiter(request, result: .success(()))
+        }
         pump()
     }
 
@@ -594,7 +888,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     private func pump() {
-        guard running, !reconfiguring, !sessionPaused else { return }
+        guard running, !reconfiguring, !sessionPaused, !cursorGate.needsFreshFrame else { return }
         discardMismatchedFrame()
         guard let latest, let encoder,
               let frame = frameFlow.begin(at: SessionClock.now) else { return }

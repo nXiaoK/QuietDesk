@@ -1,5 +1,6 @@
 import AppKit
 import VideoToolbox
+import ScreenCaptureKit
 @testable import QuietDeskCore
 
 private struct VideoCheckFailure: Error, CustomStringConvertible {
@@ -9,6 +10,21 @@ private struct VideoCheckFailure: Error, CustomStringConvertible {
 
 private func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     guard condition() else { throw VideoCheckFailure(message) }
+}
+
+private func cursorSample(_ time: CMTime, width: Int = 64, height: Int = 64) throws -> CMSampleBuffer {
+    var pixelBuffer: CVPixelBuffer?
+    let created = CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, nil, &pixelBuffer)
+    guard created == kCVReturnSuccess, let pixelBuffer else { throw VideoCheckFailure("Could not create synthetic cursor sample pixels") }
+    var format: CMVideoFormatDescription?
+    let described = CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pixelBuffer, formatDescriptionOut: &format)
+    guard described == noErr, let format else { throw VideoCheckFailure("Could not describe synthetic cursor sample") }
+    var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: time, decodeTimeStamp: .invalid)
+    var sample: CMSampleBuffer?
+    let status = CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pixelBuffer, formatDescription: format,
+                                                         sampleTiming: &timing, sampleBufferOut: &sample)
+    guard status == noErr, let sample else { throw VideoCheckFailure("Could not create synthetic cursor sample") }
+    return sample
 }
 
 private final class EncodedRecoveryPacket: @unchecked Sendable {
@@ -282,6 +298,91 @@ private struct VideoPipelineChecks {
             timing.cancel(encoderID: id)
             try require(timing.complete(encoderID: id, sequence: 4, at: 11) == nil,
                         "Stopped encoder still produced a duration")
+        }
+
+        run("Cursor capture keeps the old default and each explicit configuration inherits its selected mode") {
+            let settings = StreamSettings(framesPerSecond: 60, megabits: 12)
+            let original = ScreenStreamer.configuration(width: 1920, height: 1080, settings: settings)
+            let separate = ScreenStreamer.configuration(width: 1920, height: 1080, settings: settings, includesCursor: false)
+            let restored = ScreenStreamer.configuration(width: 1280, height: 720, settings: settings, includesCursor: true)
+            try require(original.showsCursor && !separate.showsCursor && restored.showsCursor,
+                        "Cursor configuration changed the legacy default or ignored its session mode")
+            let streamer = ScreenStreamer()
+            try require(streamer.currentCursorIncluded == nil && streamer.targetCursorIncluded == nil,
+                        "An unstarted stream claimed an actual cursor capture mode")
+            let onQueue = streamer.queue.sync { (streamer.currentCursorIncluded, streamer.targetCursorIncluded) }
+            try require(onQueue.0 == nil && onQueue.1 == nil, "Reading cursor state from the capture queue was not reentrant")
+        }
+
+        run("Cursor freshness blocks old and in-flight samples until configuration acknowledgement") {
+            var gate = CursorCaptureGate()
+            let original = try cursorSample(CMTime(value: 10, timescale: 60))
+            try require(gate.included && gate.observe(original, displayTime: nil).retain,
+                        "Legacy sampling unexpectedly required cursor metadata")
+            let request = gate.request(included: false)
+            let inFlight = try cursorSample(CMTime(value: 20, timescale: 60))
+            try require(!gate.observe(inFlight, displayTime: 150).retain && gate.needsFreshFrame,
+                        "An in-flight sample was retained before SCK configuration completed")
+            try require(gate.arm(id: request, afterDisplayTime: 200, width: 64, height: 64), "Fresh cursor gate could not arm")
+            try require(!gate.observe(original, displayTime: 201).retain, "A sample below the SCK PTS watermark was reused")
+            let next = try cursorSample(CMTime(value: 21, timescale: 60))
+            try require(!gate.observe(next, displayTime: 199).retain && !gate.observe(next, displayTime: 200).retain,
+                        "A frame displayed before the configuration barrier was accepted")
+            let fresh = try cursorSample(CMTime(value: 22, timescale: 60))
+            let accepted = gate.observe(fresh, displayTime: 201)
+            try require(accepted.retain && accepted.completed == request && !gate.needsFreshFrame && !gate.included,
+                        "A verified post-configuration sample did not complete its generation")
+            try require(gate.observe(fresh, displayTime: 201).completed == nil, "The same fresh-frame request completed twice")
+            try require(!gate.cancel(id: request), "A late timeout consumed an already completed cursor generation")
+        }
+
+        run("Cursor freshness fails closed on missing timestamps, invalid PTS and wrong dimensions") {
+            var gate = CursorCaptureGate()
+            let request = gate.request(included: false)
+            _ = gate.arm(id: request, afterDisplayTime: 100, width: 64, height: 64)
+            let valid = try cursorSample(CMTime(value: 10, timescale: 60))
+            let wrongSize = try cursorSample(CMTime(value: 11, timescale: 60), width: 128)
+            let invalidTime = try cursorSample(.invalid)
+            try require(!gate.observe(valid, displayTime: nil).retain, "A missing display timestamp was guessed to be fresh")
+            try require(!gate.observe(wrongSize, displayTime: 101).retain, "Old-size output crossed a configuration fence")
+            try require(!gate.observe(invalidTime, displayTime: 102).retain && gate.needsFreshFrame,
+                        "A nonnumeric timestamp released the capture pump")
+            try require(gate.cancel(id: request) && !gate.cancel(id: request), "Timeout/cancel could consume one request twice")
+            try require(!gate.observe(valid, displayTime: 103).retain, "A late frame revived a canceled cursor request")
+        }
+
+        run("Paused cursor changes defer freshness and rollback also requires a new captured frame") {
+            var gate = CursorCaptureGate()
+            let deferred = gate.request(included: false)
+            let old = try cursorSample(CMTime(value: 10, timescale: 60))
+            try require(!gate.configurationApplied && !gate.observe(old, displayTime: 100).retain,
+                        "A paused target was treated as an applied cursor mode")
+            _ = gate.arm(id: deferred, afterDisplayTime: 200, width: 64, height: 64)
+            let new = try cursorSample(CMTime(value: 11, timescale: 60))
+            try require(gate.observe(new, displayTime: 201).completed == deferred, "Resume did not require a post-configuration frame")
+            let rollback = gate.request(included: true)
+            _ = gate.arm(id: rollback, afterDisplayTime: 300, width: 64, height: 64)
+            try require(!gate.observe(new, displayTime: 301).retain, "Rollback reused the previous cursor mode's retained frame")
+            let restored = try cursorSample(CMTime(value: 12, timescale: 60))
+            try require(gate.observe(restored, displayTime: 302).completed == rollback && gate.included,
+                        "Rollback could not verify a fresh frame with its restored mode")
+        }
+
+        run("Cursor request replacement fences old completions and stop resets the capture gate") {
+            var gate = CursorCaptureGate()
+            let old = gate.request(included: false)
+            _ = gate.arm(id: old, afterDisplayTime: 100, width: 64, height: 64)
+            let replacement = gate.request(included: true)
+            try require(!gate.arm(id: old, afterDisplayTime: 200, width: 64, height: 64)
+                        && !gate.cancel(id: old) && gate.requestID == replacement,
+                        "An old SCK callback changed the replacement request")
+            _ = gate.arm(id: replacement, afterDisplayTime: 200, width: 64, height: 64)
+            let fresh = try cursorSample(CMTime(value: 2, timescale: 60))
+            try require(gate.observe(fresh, displayTime: 201).completed == replacement,
+                        "The replacement cursor request did not complete once")
+            gate = CursorCaptureGate()
+            try require(gate.included && !gate.needsFreshFrame && gate.requestID == nil,
+                        "Stopped capture retained a cursor generation or changed the next session default")
         }
 
         run("Fresh encoders produce real IDR frames when replaying the same retained pixel buffer") {

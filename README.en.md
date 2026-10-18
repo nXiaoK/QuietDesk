@@ -18,6 +18,7 @@ A native macOS remote desktop app for your own Macs. Connect directly over a LAN
 | --- | --- |
 | Remote control | Mouse, keyboard, drag, scroll, and floating fullscreen controls |
 | Video transport | Updated peers prefer encrypted UDP, recover or fall back to TCP automatically, and keep input on a reliable channel |
+| Immediate cursor | Updated peers separate the cursor from video to reduce duplicate pointers; optional system shape synchronization falls back to a generic arrow |
 | Video settings | Manual choices cap automatic adaptation in the new media mode; up to 60 fps and a 100 Mbps target bitrate |
 | Clipboard & files | Focus-aware text and image sync; confirmation before transferring files or folders |
 | Keyboard & permissions | Fullscreen system shortcuts, Caps Lock input-source switching, and permission guidance with a draggable app icon |

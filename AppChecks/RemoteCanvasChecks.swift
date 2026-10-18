@@ -49,6 +49,44 @@ private func canvasPixel() throws -> CVPixelBuffer {
 }
 
 @MainActor
+private func canvasCursorPNG() throws -> Data {
+    guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1, pixelsHigh: 1,
+        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+        bytesPerRow: 4, bitsPerPixel: 32), let pixel = bitmap.bitmapData else {
+        throw CanvasCheckFailure("Could not create a synthetic cursor bitmap")
+    }
+    pixel[0] = 42; pixel[1] = 84; pixel[2] = 126; pixel[3] = 255
+    guard let png = bitmap.representation(using: .png, properties: [:]) else {
+        throw CanvasCheckFailure("Could not encode the synthetic cursor bitmap")
+    }
+    return png
+}
+
+@MainActor
+private func canvasCursorImage(_ png: Data) throws -> CursorImage {
+    try CursorImage(png: png, pixelWidth: 1, pixelHeight: 1, logicalWidth: 8, logicalHeight: 6,
+                    hotSpotX: 1, hotSpotY: 2)
+}
+
+private func corruptCursorPixels(_ png: Data) throws -> Data {
+    var reader = ByteReader(Data(png.dropFirst(8)))
+    var offset = 8
+    while reader.remaining >= 12 {
+        let length: UInt32 = try reader.take()
+        let kind = try reader.bytes(4)
+        guard Int(length) <= reader.remaining - 4 else { throw CanvasCheckFailure("Synthetic PNG chunk was truncated") }
+        if kind == Data("IDAT".utf8), length > 0 {
+            var corrupted = png
+            corrupted.replaceSubrange((offset + 8)..<(offset + 8 + Int(length)), with: Data(repeating: 0xFF, count: Int(length)))
+            return corrupted
+        }
+        try reader.skip(Int(length) + 4)
+        offset += Int(length) + 12
+    }
+    throw CanvasCheckFailure("Synthetic PNG had no pixel data")
+}
+
+@MainActor
 private func drainCanvasDisplay() {
     RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.03))
 }
@@ -434,6 +472,177 @@ private struct RemoteCanvasChecks {
             drainCanvasDisplay()
             try require(outcomes == [true, false] && fatalFailures == 0 && releases == 0,
                         "Media decode failure closed the whole session or released input")
+        }
+
+        run("CursorBitmap decodes real PNG pixels at logical point size and rejects header-only or corrupt images") {
+            let png = try canvasCursorPNG(), value = try canvasCursorImage(png)
+            guard let image = CursorBitmap.image(value) else { throw CanvasCheckFailure("A real synthetic PNG was rejected") }
+            let bitmap = NSBitmapImageRep(data: png)
+            try require(image.size == NSSize(width: 8, height: 6) && bitmap?.pixelsWide == 1 && bitmap?.pixelsHigh == 1,
+                        "Cursor point size was confused with PNG pixel dimensions")
+            let headerOnly = try canvasCursorImage(Data(png.prefix(33)))
+            let damaged = try canvasCursorImage(corruptCursorPixels(png))
+            let acceptedHeader = CursorBitmap.image(headerOnly) != nil, acceptedPixels = CursorBitmap.image(damaged) != nil
+            try require(!acceptedHeader && !acceptedPixels,
+                        "Invalid pixel decode accepted: header-only=\(acceptedHeader), damaged IDAT=\(acceptedPixels)")
+        }
+
+        run("Cursor metadata activates only with its displayed media binding and unknown shape keeps the mode active") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            canvas.remoteSize = CGSize(width: 400, height: 200)
+            let probes = CanvasLocked<[CanvasDecoderProbe]>([])
+            let receiver = canvas.makeMediaReceiver(makeDecoder: { _ in
+                let probe = CanvasDecoderProbe(); probes.update { $0.append(probe) }; return probe
+            })
+            defer { receiver.stop(); canvas.reset() }
+            let cursorID = UUID(), requestID = UUID(), sessionID = UUID()
+            let first = MediaStreamID(sessionID: sessionID, transportEpoch: 1, codecEpoch: 1)
+            let second = MediaStreamID(sessionID: sessionID, transportEpoch: 2, codecEpoch: 2)
+            var presentation: [(Bool, Bool)] = []
+            canvas.onCursorPresentation = { presentation.append(($0, $1)) }
+            canvas.receiveCursorStatus(CursorControl(.status, requestID: requestID, cursorID: cursorID, epoch: 1, enabled: true))
+            canvas.receiveCursorBinding(CursorControl(.binding, cursorID: cursorID, epoch: 1, enabled: true, stream: first))
+            canvas.receiveCursorShape(try CursorShape(cursorID: cursorID, epoch: 1, revision: 1, image: canvasCursorImage(canvasCursorPNG())))
+            canvas.receiveCursorPosition(try CursorPosition(cursorID: cursorID, epoch: 1, sequence: 1, insideDisplay: true, x: 0.25, y: 0.25))
+            drainCanvasDisplay()
+            try require(!presentation.isEmpty && presentation.allSatisfy { !$0.0 }, "Metadata enabled a cursor before media committed")
+            receiver.receive(try mediaFrame(stream: first, id: 1, keyFrame: true)) { _ in }
+            probes.read()[0].finish(1, .success(try canvasPixel()))
+            try require(receiver.commit(stream: first), "Cursor fixture media did not commit")
+            try require(presentation.last?.0 == false, "Cursor mode changed before the queued display boundary")
+            drainCanvasDisplay()
+            try require(presentation.last?.0 == true && presentation.last?.1 == true,
+                        "Matching displayed stream did not activate its known cursor")
+            guard let overlay = canvas.subviews.first(where: { !$0.isHidden }) else {
+                throw CanvasCheckFailure("Remote cursor overlay was not visible")
+            }
+            try require(overlay.frame == NSRect(x: 99, y: 98, width: 8, height: 6) && overlay.hitTest(.zero) == nil,
+                        "Overlay ignored letterboxing/hotspot or intercepted input")
+            canvas.receiveCursorShape(try CursorShape(cursorID: cursorID, epoch: 1, revision: 2, image: nil))
+            try require(presentation.last?.0 == true && presentation.last?.1 == false && !overlay.isHidden,
+                        "Unknown cursor shape hid the cursor or disabled independent mode")
+            canvas.receiveCursorStatus(CursorControl(.status, requestID: UUID(), cursorID: cursorID, epoch: 2, enabled: false))
+            canvas.receiveCursorBinding(CursorControl(.binding, cursorID: cursorID, epoch: 2, enabled: false, stream: second))
+            try require(presentation.last?.0 == true, "Disable metadata changed the old displayed stream")
+            receiver.receive(try mediaFrame(stream: second, id: 1, keyFrame: true)) { _ in }
+            probes.read()[1].finish(1, .success(try canvasPixel()))
+            try require(receiver.commit(stream: second), "Disable fixture stream did not commit")
+            drainCanvasDisplay()
+            try require(presentation.last?.0 == false && overlay.isHidden, "Disabled cursor mode did not follow its matching stream")
+            canvas.receiveCursorBinding(CursorControl(.binding, cursorID: cursorID, epoch: 2, enabled: true, stream: first))
+            try require(!receiver.commit(stream: first), "Old media stream committed again")
+            drainCanvasDisplay()
+            try require(presentation.last?.0 == false, "Late binding or old commit rolled cursor mode back")
+        }
+
+        run("Corrupted cursor pixels fall back to unknown while the committed mode stays enabled") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300)), decoder = CanvasDecoderProbe()
+            let receiver = canvas.makeMediaReceiver(makeDecoder: { _ in decoder })
+            defer { receiver.stop(); canvas.reset() }
+            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1), cursorID = UUID()
+            var flags: (Bool, Bool)?
+            canvas.onCursorPresentation = { flags = ($0, $1) }
+            canvas.receiveCursorStatus(CursorControl(.status, requestID: UUID(), cursorID: cursorID, epoch: 1, enabled: true))
+            canvas.receiveCursorBinding(CursorControl(.binding, cursorID: cursorID, epoch: 1, enabled: true, stream: stream))
+            canvas.receiveCursorShape(try CursorShape(cursorID: cursorID, epoch: 1, revision: 1,
+                image: canvasCursorImage(corruptCursorPixels(canvasCursorPNG()))))
+            receiver.receive(try mediaFrame(stream: stream, id: 1, keyFrame: true)) { _ in }
+            decoder.finish(1, .success(try canvasPixel()))
+            try require(receiver.commit(stream: stream), "Corrupt-image fixture stream could not commit")
+            drainCanvasDisplay()
+            try require(flags?.0 == true && flags?.1 == false,
+                        "Failed pixel decode did not use the enabled/unknown fallback: \(String(describing: flags))")
+        }
+
+        run("Native mouse moves use a monotonic pacing timer and retain the final position with identical event timestamps") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            canvas.remoteSize = CGSize(width: 400, height: 300); canvas.canControl = true
+            defer { canvas.reset() }
+            let first = try mouse(.mouseMoved, point: CGPoint(x: 40, y: 60))
+            let final = try mouse(.mouseMoved, point: CGPoint(x: 320, y: 240))
+            let finalPoint = canvas.convert(final.locationInWindow, from: nil)
+            try require(first.timestamp == final.timestamp, "Synthetic moves did not use identical timestamps")
+            var inputs: [RemoteInput] = []
+            canvas.onInput = { inputs.append($0) }
+            canvas.mouseMoved(with: first)
+            canvas.mouseMoved(with: final)
+            try require(inputs.count == 1 && inputs[0].x == 0.1, "The first move was delayed or back-to-back moves were not paced")
+            drainCanvasDisplay()
+            try require(inputs.count == 2 && inputs[1].kind == .move && inputs[1].x == finalPoint.x / 400 && inputs[1].y == finalPoint.y / 300,
+                        "A stopped mouse lost its final position: \(inputs.map { ($0.x, $0.y) }), expected \(finalPoint)")
+        }
+
+        run("Pending native moves flush before keyboard and drag events without a later replay") {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+                                  styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            defer { window.close() }
+            let canvas = RemoteCanvas(frame: window.contentView!.bounds)
+            canvas.remoteSize = CGSize(width: 400, height: 300); canvas.canControl = true; window.contentView = canvas
+            try require(window.makeFirstResponder(canvas), "Keyboard pacing fixture did not acquire focus")
+            guard let key = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: window.windowNumber, context: nil, characters: "x", charactersIgnoringModifiers: "x",
+                isARepeat: false, keyCode: 7) else { throw CanvasCheckFailure("Could not create a synthetic pacing key") }
+            let first = try mouse(.mouseMoved, point: CGPoint(x: 40, y: 60))
+            let second = try mouse(.mouseMoved, point: CGPoint(x: 320, y: 240))
+            var inputs: [RemoteInput] = []
+            canvas.onInput = { inputs.append($0) }
+            canvas.mouseMoved(with: first); canvas.mouseMoved(with: second); canvas.keyDown(with: key)
+            try require(inputs.map(\.kind) == [.move, .move, .keyDown] && inputs[1].x == 0.8,
+                        "A pending move crossed the reliable key-down boundary")
+            drainCanvasDisplay()
+            try require(inputs.count == 3, "A flushed move replayed after key-down")
+            canvas.releaseControl()
+            inputs.removeAll()
+            let drag = try mouse(.leftMouseDragged, point: CGPoint(x: 280, y: 210))
+            canvas.mouseMoved(with: first); canvas.mouseMoved(with: second); canvas.mouseDragged(with: drag)
+            try require(inputs.map(\.kind) == [.move, .move, .drag] && inputs[1].x == 0.8,
+                        "A pending move crossed the drag boundary")
+            drainCanvasDisplay()
+            try require(inputs.count == 3, "A flushed move replayed after dragging")
+        }
+
+        run("Releasing, suspending, losing permission and resetting cancel old native move timers") {
+            for action in ["release", "suspend", "permission", "reset", "focus"] {
+                let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+                canvas.remoteSize = CGSize(width: 400, height: 300); canvas.canControl = true
+                defer { canvas.reset() }
+                let first = try mouse(.mouseMoved, point: CGPoint(x: 40, y: 60))
+                let pending = try mouse(.mouseMoved, point: CGPoint(x: 320, y: 240))
+                var inputs: [RemoteInput] = []
+                canvas.onInput = { inputs.append($0) }
+                canvas.mouseMoved(with: first); canvas.mouseMoved(with: pending)
+                switch action {
+                case "release": canvas.releaseControl()
+                case "suspend": canvas.pointerInputSuspended = true
+                case "permission": canvas.canControl = false
+                case "focus": _ = canvas.resignFirstResponder()
+                default: canvas.reset()
+                }
+                drainCanvasDisplay()
+                try require(inputs.count == 1, "Old movement replayed after \(action)")
+                canvas.pointerInputSuspended = false; canvas.canControl = true
+                canvas.mouseMoved(with: first)
+                try require(inputs.count == 2 && inputs[1].x == 0.1, "Reentry after \(action) kept the old pacing state")
+            }
+        }
+
+        run("Cursor metadata cannot enable independent mode without a successfully decoded media sample") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300)), decoder = CanvasDecoderProbe()
+            let receiver = canvas.makeMediaReceiver(makeDecoder: { _ in decoder })
+            defer { receiver.stop(); canvas.reset() }
+            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1), cursorID = UUID()
+            var presentation: [(Bool, Bool)] = []
+            canvas.onCursorPresentation = { presentation.append(($0, $1)) }
+            canvas.receiveCursorStatus(CursorControl(.status, requestID: UUID(), cursorID: cursorID, epoch: 1, enabled: true))
+            canvas.receiveCursorBinding(CursorControl(.binding, cursorID: cursorID, epoch: 1, enabled: true, stream: stream))
+            try require(!receiver.commit(stream: stream), "Metadata allowed a commit without any media sample")
+            receiver.receive(try mediaFrame(stream: stream, id: 1, keyFrame: true)) { _ in }
+            try require(!receiver.commit(stream: stream), "An undecoded candidate activated cursor mode")
+            decoder.finish(1, .failure(CanvasCheckFailure("Synthetic IDR decode failure")))
+            try require(!receiver.commit(stream: stream), "A failed IDR decode committed its cursor binding")
+            drainCanvasDisplay()
+            try require(!presentation.isEmpty && presentation.allSatisfy { !$0.0 }, "Missing or failed media enabled independent cursor mode")
         }
 
         print("\(passed) passed, \(failed) failed")

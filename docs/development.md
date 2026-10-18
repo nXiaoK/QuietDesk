@@ -73,6 +73,7 @@ swift run --disable-sandbox QuietDeskChecks
 ./scripts/run-app-checks.sh
 ./scripts/run-input-checks.sh
 ./scripts/run-video-checks.sh
+./scripts/run-cursor-checks.sh
 ./scripts/run-session-data-checks.sh
 ./scripts/run-session-effects-checks.sh
 ./scripts/run-traffic-checks.sh
@@ -88,6 +89,7 @@ python3 -m unittest discover -s scripts/tests -v
 | `run-app-checks.sh` | 实际 `ClipboardSync` 配合内存剪贴板和临时目录，验证焦点与传输顺序 |
 | `run-input-checks.sh` | 验证真实 AppKit 鼠标、滚轮事件到远程输入的转换，以及被控端 CGEvent 字段；使用离屏画布与假提交器，不向系统注入输入 |
 | `run-video-checks.sh` | 编码丢帧恢复、三帧窗口和画质/暂停边界，CoreMedia 数据持有与合成 H.264 编解码；不采集屏幕 |
+| `run-cursor-checks.sh` | 假光标、位置与显示器提供者，验证坐标、热点、图片边界、形状变化、未知回退及停止隔离；不读取真实光标 |
 | `run-session-data-checks.sh` | 后台数据路由、解码确认、新画面令牌、旧会话隔离与并发指标聚合 |
 | `run-session-effects-checks.sh` | 假音频、假遮罩及会话退出屏障，验证取消和恢复顺序 |
 | `run-traffic-checks.sh` | 临时目录中的地址/端口统计、旧设备历史保留、历史保存及错误处理 |

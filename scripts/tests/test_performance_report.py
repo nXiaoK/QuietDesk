@@ -97,6 +97,14 @@ class PerformanceReportTests(unittest.TestCase):
         self.assertIn("共享端 host", text)
         self.assertIn("acknowledgement (3)", text)
 
+    def test_independent_cursor_messages_are_preserved(self):
+        report = report_module.read_report(self.write([window(messageKind=kind) for kind in (29, 30, 31)]))
+        self.assertEqual(report.valid_windows, 3)
+        self.assertEqual(report.skipped_lines, 0)
+        text = report_module.render_report([report])
+        for label in ("cursorControl (29)", "cursorShape (30)", "cursorPosition (31)"):
+            self.assertIn(label, text)
+
     def test_malformed_unknown_and_boolean_fields_are_skipped_without_payload_reflection(self):
         invalid = ["{broken", "null", "[]", "{\"event\":\"performanceWindow\",\"event\":\"exportCompleted\"}"]
         for changes in ({"metric": "PRIVATE_METRIC"}, {"unit": "seconds"}, {"unit": "bytes"},

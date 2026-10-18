@@ -42,6 +42,14 @@ final class DeskModel: ObservableObject {
     @Published var latency = "— ms"
     @Published private(set) var mediaTransportStatus = "TCP 兼容模式"
     @Published private(set) var supportsMediaTransport = false
+    @Published private(set) var supportsIndependentCursor = false
+    @Published private(set) var cursorStatus = "视频光标"
+    @Published var lowLatencyCursorEnabled = UserDefaults.standard.object(forKey: "lowLatencyCursorEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(lowLatencyCursorEnabled, forKey: "lowLatencyCursorEnabled")
+            if oldValue != lowLatencyCursorEnabled { sendCursorRequest() }
+        }
+    }
     @Published var mediaTCPOnly = UserDefaults.standard.bool(forKey: "mediaTCPOnly") {
         didSet { UserDefaults.standard.set(mediaTCPOnly, forKey: "mediaTCPOnly") }
     }
@@ -761,6 +769,24 @@ final class DeskModel: ObservableObject {
                             guard let streamer else { completion(false); return }
                             streamer.prepareMediaRecovery(completion: completion)
                         }
+                        media.onPrepareStream = { [weak self, weak streamer, weak host, weak candidate] stream, completion in
+                            guard let streamer else { completion(false); return }
+                            streamer.prepareMediaRecovery { ready in
+                                DispatchQueue.main.async {
+                                    guard let self, let host, let candidate, self.hostSession === host,
+                                          self.peer === candidate, ready else { completion(false); return }
+                                    host.mediaPrepared = true
+                                    if host.cursorSubscribed {
+                                        guard let included = streamer.currentCursorIncluded else { completion(false); return }
+                                        do {
+                                            candidate.send(try CursorControl(.binding, cursorID: host.cursorID,
+                                                epoch: host.cursorEpoch, enabled: !included, stream: stream).message())
+                                        } catch { candidate.close(error.localizedDescription); completion(false); return }
+                                    }
+                                    completion(true)
+                                }
+                            }
+                        }
                         media.onProduceRecoveryFrame = { [weak streamer] in streamer?.produceMediaRecoveryFrame() }
                         media.onResumeFrames = { [weak streamer] in streamer?.resumeMediaFrames() }
                         media.onAcknowledged = { [weak streamer] in streamer?.acknowledge($0) }
@@ -781,7 +807,7 @@ final class DeskModel: ObservableObject {
                             preferredSettings: preferredSettings.extendedCompatible, deviceID: self.trafficHistoryStore.localDeviceID,
                             deviceIdentityExchange: host.deviceIdentityAdvertised ? true : nil,
                             highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings,
-                            sessionEffects: true, sessionPause: true, mediaTransportV1: true)))
+                            sessionEffects: true, sessionPause: true, mediaTransportV1: true, independentCursorV1: true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -918,6 +944,10 @@ final class DeskModel: ObservableObject {
         media.diagnostics = performanceDiagnostics
         viewer.media = media
         viewer.mediaReceiver = renderer
+        canvas.onCursorPresentation = { [weak self, weak viewer] enabled, known in
+            guard let self, let viewer, self.viewerSession === viewer else { return }
+            self.cursorStatus = enabled ? (known ? "本地即时光标" : "本地即时光标 · 通用指针") : "视频光标"
+        }
         supportsMediaTransport = true
         viewer.mediaQuality = try MediaQualityPolicy(hostDefault: preferred, preferred: viewerQualityPolicy.preferred,
                                                    applied: settings, now: SessionClock.now)
@@ -935,9 +965,14 @@ final class DeskModel: ObservableObject {
                 completion(succeeded)
             }
         }
-        media.onCommitStream = { [weak renderer] stream, _ in
+        media.onCommitStream = { [weak self, weak viewer, weak renderer] stream, _ in
             renderer?.commit(stream: stream)
             channel.mediaStreamCommitted(stream)
+            DispatchQueue.main.async {
+                guard let self, let viewer, self.viewerSession === viewer, !viewer.mediaCommitted else { return }
+                viewer.mediaCommitted = true
+                self.sendCursorRequest()
+            }
         }
         media.onBytes = { channel.recordBytes($0) }
         media.onReliableData = { [weak peer] message in
@@ -978,6 +1013,94 @@ final class DeskModel: ObservableObject {
         viewerSession.automaticVideoSettings = settings
         videoTuning = tuning
         sendNextVideoSettings()
+    }
+
+    private func sendCursorRequest() {
+        guard mode == .viewer, connected, supportsIndependentCursor, let peer,
+              viewerSession.mediaCommitted, viewerSession.cursorRequestID == nil else { return }
+        let viewer = viewerSession, id = UUID()
+        viewer.cursorRequestID = id
+        viewer.cursorRequestedEnabled = lowLatencyCursorEnabled
+        cursorStatus = "正在切换光标…"
+        do { peer.send(try CursorControl(.request, requestID: id, enabled: lowLatencyCursorEnabled).message()) }
+        catch { peer.close(error.localizedDescription); return }
+        viewer.cursorTimeout?.cancel()
+        viewer.cursorTimeout = Task { [weak self, weak viewer, weak peer] in
+            do { try await Task.sleep(for: .seconds(25)) } catch { return }
+            guard let self, let viewer, let peer, self.viewerSession === viewer,
+                  viewer.cursorRequestID == id else { return }
+            peer.close("光标模式切换超时，重新建立会话", retryable: true)
+        }
+    }
+
+    private func applyHostCursorRequest(_ request: CursorControl, peer: Peer) {
+        let host = hostSession
+        guard let id = request.requestID, host.cursorTask == nil, let streamer = host.streamer else { return }
+        let capture = host.captureTask, settings = host.settingsTask, pause = host.pauseTask, effects = host.effectsTask
+        let token = generation
+        host.cursorTask = Task { [weak self, weak host, weak peer] in
+            guard let self, let host, let peer else { return }
+            defer { if self.hostSession === host { host.cursorTask = nil } }
+            await capture?.value; await settings?.value; await pause?.value; await effects?.value
+            guard self.hostSession === host, self.peer === peer, self.generation == token, !Task.isCancelled else { return }
+            guard host.cursorEpoch < UInt32.max else { peer.close("光标模式代次已耗尽，请重新连接", retryable: true); return }
+            await self.suspendMediaForConfiguration(host.media)
+            guard self.hostSession === host, self.peer === peer, !Task.isCancelled else { return }
+            host.cursorSampler?.stop()
+            var reason: CursorControl.Reason?
+            do {
+                try await streamer.setCursorIncluded(!request.enabled)
+                host.cursorEnabled = request.enabled
+                if host.paused { reason = .waitingForResume }
+            } catch {
+                guard self.hostSession === host, self.peer === peer, !Task.isCancelled else { return }
+                guard let actual = streamer.currentCursorIncluded else {
+                    peer.close("无法确认光标采集状态，重新建立会话", retryable: true)
+                    return
+                }
+                host.cursorEnabled = !actual
+                reason = .unavailable
+            }
+            guard self.hostSession === host, self.peer === peer, !Task.isCancelled else { return }
+            host.cursorEpoch += 1
+            host.cursorSubscribed = true
+            host.cursorShapeRevision = 0; host.cursorPositionSequence = 0
+            do {
+                peer.send(try CursorControl(.status, requestID: id, cursorID: host.cursorID,
+                    epoch: host.cursorEpoch, enabled: host.cursorEnabled, reason: reason).message())
+            } catch { peer.close(error.localizedDescription); return }
+            self.startHostCursorSampler(host, peer: peer)
+            streamer.resumeAfterReconfiguration()
+            if !host.paused { host.media?.resumeAfterConfiguration() }
+        }
+    }
+
+    private func startHostCursorSampler(_ host: HostSession, peer: Peer) {
+        host.cursorSampler?.stop()
+        guard host.cursorSubscribed, host.cursorEnabled, !host.paused, let display = host.capturedDisplay else { return }
+        let epoch = host.cursorEpoch
+        let sampler = HostCursorSampler(display: display)
+        host.cursorSampler = sampler
+        sampler.onSample = { [weak self, weak host, weak peer] sample in
+            guard let self, let host, let peer, self.hostSession === host, self.peer === peer,
+                  host.cursorEpoch == epoch, host.cursorEnabled, !host.paused else { return }
+            guard host.cursorShapeRevision < UInt64.max, host.cursorPositionSequence < UInt64.max else {
+                peer.close("光标消息序号已耗尽，请重新连接", retryable: true); return
+            }
+            do {
+                if sample.shapeChanged {
+                    host.cursorShapeRevision += 1
+                    let shape = try CursorShape(cursorID: host.cursorID, epoch: epoch,
+                                                revision: host.cursorShapeRevision, image: sample.image)
+                    peer.send(Message(.cursorShape, shape.encode()))
+                }
+                host.cursorPositionSequence += 1
+                let position = try CursorPosition(cursorID: host.cursorID, epoch: epoch,
+                    sequence: host.cursorPositionSequence, insideDisplay: sample.insideDisplay, x: sample.x, y: sample.y)
+                peer.send(Message(.cursorPosition, position.encode()))
+            } catch { peer.close(error.localizedDescription) }
+        }
+        sampler.start()
     }
 
     private func beginConnection(_ target: Target) {
@@ -1143,6 +1266,10 @@ final class DeskModel: ObservableObject {
 
     private func handleHost(_ message: Message, peer: Peer) throws {
         switch message.kind {
+        case .cursorControl:
+            let request = try CursorControl.read(message.payload)
+            guard request.operation == .request, hostSession.mediaPrepared else { throw DeskError.invalid("光标功能未协商") }
+            applyHostCursorRequest(request, peer: peer)
         case .sessionPauseRequest:
             applyHostSessionPause(try Wire.readJSON(SessionPauseRequest.self, message.payload), peer: peer)
         case .sessionEffectsRequest:
@@ -1202,6 +1329,26 @@ final class DeskModel: ObservableObject {
 
     private func handleViewer(_ message: Message, peer: Peer) throws {
         switch message.kind {
+        case .cursorControl:
+            guard supportsIndependentCursor else { throw DeskError.invalid("光标功能未协商") }
+            let control = try CursorControl.read(message.payload)
+            if control.operation == .status {
+                guard control.requestID == viewerSession.cursorRequestID else { return }
+                let requested = viewerSession.cursorRequestedEnabled
+                viewerSession.cursorRequestID = nil
+                viewerSession.cursorTimeout?.cancel()
+                canvas.receiveCursorStatus(control)
+                cursorStatus = control.reason == .unavailable ? "切换失败，保持原光标模式"
+                    : control.reason == .waitingForResume ? "恢复画面后启用光标模式" : "正在切换光标…"
+                if requested != lowLatencyCursorEnabled { sendCursorRequest() }
+            } else if control.operation == .binding { canvas.receiveCursorBinding(control) }
+            else { throw DeskError.invalid("光标控制方向无效") }
+        case .cursorShape:
+            guard supportsIndependentCursor else { throw DeskError.invalid("光标功能未协商") }
+            canvas.receiveCursorShape(try CursorShape.decode(message.payload))
+        case .cursorPosition:
+            guard supportsIndependentCursor else { throw DeskError.invalid("光标功能未协商") }
+            canvas.receiveCursorPosition(try CursorPosition.decode(message.payload))
         case .hello:
             guard !viewerSession.helloReceived else { throw DeskError.invalid("重复的会话信息") }
             let hello = try Wire.readJSON(Hello.self, message.payload)
@@ -1274,6 +1421,8 @@ final class DeskModel: ObservableObject {
                 applyInitialVideoQualityIfReady()
                 sendNextVideoSettings()
             } else { videoSettingsStatus = "主机需更新到 0.4.0 才能动态调整画质" }
+            supportsIndependentCursor = viewerSession.media != nil && hello.independentCursorV1 == true
+            sendCursorRequest()
             publishSessionPause()
             sendNextSessionPause()
             if let token = pauseTransmission.freshFrameToken { scheduleFreshFrameTimeout(token, peer: peer) }
@@ -1447,10 +1596,15 @@ final class DeskModel: ObservableObject {
             if let result = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(state: state, error: message)) { peer.send(result) }
             if !state.privacy, host.effectsTask == nil, let streamer = host.streamer {
                 let token = self.generation
+                let cursor = host.cursorTask
                 host.effectsTask = Task { [weak self, weak peer, weak host] in
                     guard let self, let peer, let host, self.hostSession === host else { return }
                     defer { if self.generation == token, self.peer === peer, self.hostSession === host { host.effectsTask = nil } }
-                    do { try await streamer.setExcludesCurrentApplication(false) }
+                    do {
+                        await cursor?.value
+                        guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
+                        try await streamer.setExcludesCurrentApplication(false)
+                    }
                     catch {
                         guard self.generation == token, self.peer === peer, self.hostSession === host else { return }
                         self.sessionEffectsStatus = error.localizedDescription
@@ -1470,7 +1624,7 @@ final class DeskModel: ObservableObject {
             return
         }
         let token = generation
-        let capture = host.captureTask
+        let capture = host.captureTask, cursor = host.cursorTask
         host.effectsTask = Task { [weak self, weak peer, weak host] in
             guard let self, let peer, let host, self.hostSession === host else { return }
             defer { if self.generation == token, self.peer === peer, self.hostSession === host { host.effectsTask = nil } }
@@ -1478,6 +1632,7 @@ final class DeskModel: ObservableObject {
             var filterRestoreFailed = false
             do {
                 await capture?.value
+                await cursor?.value
                 try Task.checkCancellation()
                 _ = try await effects.apply(request.state) { try await streamer.setExcludesCurrentApplication(true) }
             } catch { failure = error.localizedDescription }
@@ -1620,6 +1775,7 @@ final class DeskModel: ObservableObject {
         canvas.updateSystemShortcutCapture(sessionActive: mode == .viewer && connected && canControl && !sessionInputSuspended,
             accessibility: localAccessibility, inputMonitoring: localInputMonitoring)
         canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && canControl && !sessionInputSuspended
+        canvas.pointerInputSuspended = sessionInputSuspended
         refreshClipboardFocus()
     }
 
@@ -1661,7 +1817,7 @@ final class DeskModel: ObservableObject {
         }
         host.injector?.releaseAll()
         let token = generation
-        let capture = host.captureTask, video = host.settingsTask
+        let capture = host.captureTask, video = host.settingsTask, cursor = host.cursorTask
         host.pauseTask = Task { [weak self, weak peer, weak host] in
             guard let self, let peer, let host, self.hostSession === host else { return }
             defer {
@@ -1672,6 +1828,7 @@ final class DeskModel: ObservableObject {
             }
             await capture?.value
             await video?.value
+            await cursor?.value
             guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer, !Task.isCancelled else { return }
             await self.suspendMediaForConfiguration(host.media)
             guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
@@ -1679,6 +1836,16 @@ final class DeskModel: ObservableObject {
             do { host.paused = try await streamer.setSessionPaused(request.paused) }
             catch { failure = error.localizedDescription }
             guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer, !Task.isCancelled else { return }
+            if host.cursorSubscribed {
+                guard let actual = streamer.currentCursorIncluded else {
+                    peer.close("无法确认恢复后的光标采集状态，重新建立会话", retryable: true)
+                    return
+                }
+                // A verified rollback can restore the previous cursor mode. Sampling
+                // must follow the actual capture mode rather than the paused request.
+                if failure != nil || !host.paused { host.cursorEnabled = !actual }
+                if let message = failure { failure = "\(message)；保持已确认的光标模式" }
+            }
             self.sessionPauseStatus = failure ?? (host.paused ? "控制端空闲暂停，保留加密会话" : "画面传输已恢复")
             DiagnosticLog.shared.record(host.paused ? .sessionPaused : .sessionResumed, role: .host,
                 state: failure == nil ? .succeeded : .failed)
@@ -1686,6 +1853,8 @@ final class DeskModel: ObservableObject {
                 peer.send(reply)
             }
             host.media?.setPaused(host.paused)
+            if host.paused { host.cursorSampler?.stop() }
+            else { self.startHostCursorSampler(host, peer: peer) }
             if !host.paused {
                 if failure == nil { streamer.resumeAfterReconfiguration() }
                 host.media?.resumeAfterConfiguration()
@@ -1715,6 +1884,7 @@ final class DeskModel: ObservableObject {
         let token = generation
         let capture = host.captureTask
         let pause = host.pauseTask
+        let cursor = host.cursorTask
         host.settingsTask = Task { [weak self, weak peer, weak host] in
             guard let self, let peer, let host, self.hostSession === host else { return }
             defer {
@@ -1725,6 +1895,7 @@ final class DeskModel: ObservableObject {
             do {
                 await capture?.value
                 await pause?.value
+                await cursor?.value
                 guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
                       host.settingsRequestID == request.id, !Task.isCancelled else { return }
                 await self.suspendMediaForConfiguration(host.media)
@@ -2089,6 +2260,12 @@ final class DeskModel: ObservableObject {
         oldViewer.mediaReceiver?.stop()
         mediaTransportStatus = "TCP 兼容模式"
         supportsMediaTransport = false
+        supportsIndependentCursor = false
+        cursorStatus = "视频光标"
+        canvas.onCursorPresentation = nil
+        oldHost.cursorTask?.cancel()
+        oldHost.cursorSampler?.stop()
+        oldViewer.cursorTimeout?.cancel()
         oldHost.pauseTask?.cancel()
         oldHost.effectsTask?.cancel()
         oldHost.settingsTask?.cancel()

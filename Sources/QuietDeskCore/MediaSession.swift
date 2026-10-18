@@ -32,6 +32,7 @@ public final class MediaSession: @unchecked Sendable {
     public var onVideo: ((MediaFrame, @escaping (Bool) -> Void) -> Void)?
     public var onCommitStream: ((MediaStreamID, VideoPacket) -> Void)?
     public var onPrepareRecovery: ((@escaping (Bool) -> Void) -> Void)?
+    public var onPrepareStream: ((MediaStreamID, @escaping (Bool) -> Void) -> Void)?
     public var onProduceRecoveryFrame: (() -> Void)?
     public var onResumeFrames: (() -> Void)?
     public var onAcknowledged: ((UInt32) -> Void)?
@@ -432,7 +433,10 @@ public final class MediaSession: @unchecked Sendable {
             var pending = Transaction(id: id, stream: stream, path: path, started: SessionClock.now)
             pending.diagnostic = diagnostics?.start()
             transaction = pending
-            guard let prepare = onPrepareRecovery else { abortTransaction(retry: true); return }
+            let prepare: ((@escaping (Bool) -> Void) -> Void)?
+            if let onPrepareStream { prepare = { complete in onPrepareStream(stream, complete) } }
+            else { prepare = onPrepareRecovery }
+            guard let prepare else { abortTransaction(retry: true); return }
             prepare { [weak self] success in
                 self?.queue.async { [weak self] in
                     guard let self, !self.stopped, self.transaction?.id == id,

@@ -22,8 +22,9 @@ func packet(_ seq: UInt32, idr: Bool, largeIDR: Bool = false) -> VideoPacket {
     return VideoPacket(sequence:seq,sps:idr ? Data([0x67,0x42,0x00,0x1f]):Data(),pps:idr ? Data([0x68,0xce,0x06]):Data(),
         avcc:avcc)
 }
+enum PrepareHookCheck { case unchecked, boundStream, fallback }
 func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
-              failRecoveryCandidate: Bool = false, pauseResume: Bool = false, stopCandidate: Bool = false, pathFailure: Bool = false, legacy: Bool = false, restoreUDP: Bool = false, inspectDiagnostics: Bool = false, largeIDR: Bool = false, overlapPrepare: Bool = false) throws {
+              failRecoveryCandidate: Bool = false, pauseResume: Bool = false, stopCandidate: Bool = false, pathFailure: Bool = false, legacy: Bool = false, restoreUDP: Bool = false, inspectDiagnostics: Bool = false, largeIDR: Bool = false, overlapPrepare: Bool = false, prepareHook: PrepareHookCheck = .unchecked) throws {
     let key = try PairingKey.generate(), settings = StreamSettings(longestEdge:1920,framesPerSecond:60,megabits:12)
     let queue = DispatchQueue(label:"session.loopback-listener")
     let params = try MediaSecureTransport.tlsParameters(key:key,roles:MediaChannelRole.allCases)
@@ -39,6 +40,9 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     let sampledCompute = DispatchSemaphore(value:0)
     let reductions=Box<[MediaBottleneck]>([])
     let overlapSent=Box(false)
+    let cursorID = UUID()
+    let streamPreparations = Box<[MediaStreamID]>([]), streamBindings = Box<[MediaStreamID]>([])
+    let streamVideos = Box<[MediaStreamID]>([]), streamCommits = Box<[MediaStreamID]>([])
     func nextPacket(_ idr: Bool) -> VideoPacket { sequence.update{$0 += 1}; return packet(sequence.get(),idr:idr,largeIDR:largeIDR) }
     listener.newConnectionHandler = { connection in
         let peer = Peer(connection:connection); peers.update{$0.append(peer)}
@@ -58,6 +62,17 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
                 session.onPrepareRecovery={ complete in
                     prepared.update{$0 += 1}
                     complete(!rejectFirst || prepared.get()>1)
+                }
+                try require(session.onPrepareStream == nil, "Optional stream preparation was enabled by default")
+                if prepareHook == .boundStream {
+                    session.onPrepareStream = { stream, complete in
+                        streamPreparations.update { $0.append(stream) }
+                        do {
+                            peer.send(try CursorControl(.binding, cursorID: cursorID, epoch: 1,
+                                                        enabled: true, stream: stream).message())
+                            complete(true)
+                        } catch { errors.update { $0.append("Prepare-stream binding failed: \(error)") }; complete(false) }
+                    }
                 }
                 session.onProduceRecoveryFrame={ [weak session] in session?.sendVideo(nextPacket(true)) }
                 session.onResumeFrames={ [weak session] in session?.sendVideo(nextPacket(false)) }
@@ -96,6 +111,12 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             session.onSample={ sample in if (sample.encodeMilliseconds ?? 0)>=45 && (sample.decodeMilliseconds ?? 0)>=2 { sampledCompute.signal() } }
             session.onVideo={ frame,complete in
                 decoded.update{$0.append(frame.header.frameID)}
+                if prepareHook != .unchecked, frame.header.isIDR {
+                    if prepareHook == .boundStream, !streamBindings.get().contains(frame.header.stream) {
+                        errors.update { $0.append("Candidate video arrived before its exact stream binding") }
+                    }
+                    streamVideos.update { $0.append(frame.header.stream) }
+                }
                 if overlapPrepare, frame.header.isIDR, !overlapSent.get() {
                     overlapSent.update{$0=true}
                     do {
@@ -113,9 +134,29 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
                 complete(true)
                 complete(true) // A duplicate decoder completion must not duplicate a commit or credit.
             }
-            session.onCommitStream={ _,_ in committedCount.update{$0 += 1};committed.signal() }
+            session.onCommitStream={ stream,_ in
+                if prepareHook != .unchecked {
+                    if prepareHook == .boundStream, !streamBindings.get().contains(stream) {
+                        errors.update { $0.append("Media commit preceded its exact stream binding") }
+                    }
+                    streamCommits.update { $0.append(stream) }
+                }
+                committedCount.update{$0 += 1};committed.signal()
+            }
             session.onState={ state in states.update{$0.append(state)};if ["UDP 视频","TCP 视频","TCP 兼容模式"].contains(state) { pathStable.signal() };print("VIEWER",state) }
-            client.onMessageHandled={ message,resume in _=session.receive(message);resume() }
+            client.onMessageHandled={ message,resume in
+                if message.kind == .cursorControl, prepareHook != .unchecked {
+                    do {
+                        let binding = try CursorControl.read(message.payload)
+                        guard binding.operation == .binding, binding.cursorID == cursorID, binding.epoch == 1,
+                              binding.enabled, let stream = binding.stream?.stream else {
+                            throw Failure(message: "Prepare-stream binding identity changed")
+                        }
+                        streamBindings.update { $0.append(stream) }
+                    } catch { errors.update { $0.append("Invalid prepare-stream binding: \(error)") } }
+                } else { _=session.receive(message) }
+                resume()
+            }
             session.start()
         } catch { errors.update{$0.append("viewer init \(error)")} }
     }
@@ -155,6 +196,10 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     let expected = udp ? "UDP 视频" : auxiliary ? "TCP 视频" : "TCP 兼容模式"
     try require(states.get().contains(expected),"wrong selected path \(states.get())")
     try require(!decoded.get().isEmpty,"No decoded media frame")
+    if prepareHook == .boundStream {
+        try require(prepared.get() == 0 && streamPreparations.get().count == 1,
+                    "The optional stream hook did not replace default candidate preparation")
+    }
     if overlapPrepare { try require(overlapSent.get() && prepared.get()==1 && committedCount.get()==1,"Overlapping prepare replaced the current transaction") }
     if rejectFirst { try require(prepared.get()>=2,"transient capture readiness did not retry") }
     if auxiliary {
@@ -225,6 +270,23 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
         }
     }
     if largeIDR { try require(committedCount.get()==1 && prepared.get()==1,"A decoded large IDR unnecessarily restarted its reference chain") }
+    if prepareHook != .unchecked {
+        let committedStreams = streamCommits.get()
+        try require(committedStreams.count == 2 && streamVideos.get() == committedStreams,
+                    "Configuration did not decode and commit one IDR for each media generation")
+        try require(committedStreams[0].sessionID == committedStreams[1].sessionID
+                    && committedStreams[1].transportEpoch > committedStreams[0].transportEpoch
+                    && committedStreams[1].codecEpoch > committedStreams[0].codecEpoch,
+                    "Configuration reused the first prepared stream identity")
+        if prepareHook == .boundStream {
+            try require(streamPreparations.get() == committedStreams && streamBindings.get() == committedStreams,
+                        "Prepared, bound, decoded and committed stream identities diverged")
+            try require(prepared.get() == 1, "Configuration hold bypassed default recovery or stream preparation ran twice")
+        } else {
+            try require(prepared.get() == 3 && streamPreparations.get().isEmpty && streamBindings.get().isEmpty,
+                        "Absent optional stream hook changed default candidate/configuration recovery behavior")
+        }
+    }
     try require(errors.get().isEmpty,"Session reported errors: \(errors.get())")
     if auxiliary, let meter=auxiliaryMeters.get().first, let parent=peers.get().first?.trafficMeter {
         let stopped=DispatchSemaphore(value:0)
@@ -242,6 +304,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
   var passed=0,failed=0
   func run(_ name: String, _ body: () throws -> Void) {
    if CommandLine.arguments.contains("--large-only") && !name.contains("512 KiB") { return }
+   if CommandLine.arguments.contains("--prepare-only") && !name.contains("onPrepare") { return }
    do { try body();passed += 1;print("PASS",name) }
    catch { failed += 1;print("FAIL",name,error) }
   }
@@ -258,6 +321,8 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     throw Failure(message:"Zero media port was accepted")
   }
   if !CommandLine.arguments.contains("--skip-network") {
+   run("Optional onPrepareStream binds each exact generation before candidate video and commit") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true,prepareHook:.boundStream) }
+   run("Absent onPrepareStream preserves default onPrepareRecovery for candidates and configuration hold") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true,prepareHook:.fallback) }
    run("Legacy peers keep configuration and pause recovery unchanged") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false,legacy:true) }
    run("UDP first choice, bulk binding and configuration cutover") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true) }
    run("TCP-only choice uses its independent media connection") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false) }

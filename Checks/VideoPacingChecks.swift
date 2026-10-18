@@ -38,7 +38,8 @@ func runVideoPacingChecks() {
     }
 
     if CommandLine.arguments.contains("--skip-network") { return }
-    run("Paced video keeps bytes and order, spreads large frames and completes once") {
+    for videoKind: MessageKind in [.video, .mediaFrame] {
+    run("Paced \(videoKind) keeps bytes and order, spreads large frames and completes once") {
         let key = try PairingKey.generate()
         let listener = try makeListener(key, queue: DispatchQueue(label: "checks.video-pacing"))
         let server = Box<Peer?>(nil), received = Box<[(Message, TimeInterval)]>([])
@@ -64,7 +65,7 @@ func runVideoPacingChecks() {
         client.setVideoPacing(pacing)
         client.onReady = {
             started.set(SessionClock.now)
-            client.send(Message(.video, video)) { success in completions.update { $0.append(success) }; completed.signal() }
+            client.send(Message(videoKind, video)) { success in completions.update { $0.append(success) }; completed.signal() }
             client.send(Message(.clipboardChunk, clipboard))
             client.send(Message(.acknowledgement, acknowledgement))
         }
@@ -72,7 +73,7 @@ func runVideoPacingChecks() {
         try wait(done, "Paced messages were not delivered")
         try wait(completed, "Paced video did not complete")
         let messages = received.read()
-        try check(messages.map(\.0.kind) == [.video, .clipboardChunk, .acknowledgement]
+        try check(messages.map(\.0.kind) == [videoKind, .clipboardChunk, .acknowledgement]
             && messages[0].0.payload == video && messages[1].0.payload == clipboard && messages[2].0.payload == acknowledgement,
             "Pacing changed message bytes or order")
         let minimum = Double(video.count + 5 - VideoSendPacing.burstBytes) / pacing.bytesPerSecond
@@ -85,6 +86,7 @@ func runVideoPacingChecks() {
         client.queue.sync {}
         try check(client.trafficMeter.snapshot().totals.sentBytes >= UInt64(video.count + clipboard.count),
             "Paced slices were not counted as sent traffic")
+    }
     }
 
     run("Removing pacing flushes a waiting frame and closing fails unsent messages once") {

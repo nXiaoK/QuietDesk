@@ -255,7 +255,7 @@ public final class Peer {
     private func submitOutgoing() {
         while !closed, let message = outgoing.first {
             var count = message.data.count - message.offset
-            if message.kind == .video, var pacer = videoPacer {
+            if message.kind == .video || message.kind == .mediaFrame, var pacer = videoPacer {
                 let step = pacer.next(remaining: count, now: SessionClock.now)
                 videoPacer = pacer
                 guard step.bytes > 0 else { schedulePacing(after: step.delay); return }
@@ -408,6 +408,8 @@ public final class Peer {
         case .video:
             guard message.payload.count >= 13, let sequence: UInt32 = try? reader.take() else { return nil }
             return UInt64(sequence)
+        case .mediaFrame:
+            return try? MediaFrame.decode(message.payload).header.frameID
         case .acknowledgement:
             guard message.payload.count == 4, let sequence: UInt32 = try? reader.take() else { return nil }
             return UInt64(sequence)

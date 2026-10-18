@@ -74,7 +74,7 @@ jobs:
           RELEASE_LATEST: ${{ steps.version.outputs.latest }}
         run: |
           if ! git rev-parse --verify "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
-            remote_head="$(git ls-remote --heads origin main | cut -f1)"
+            remote_head="$(git ls-remote origin refs/heads/main | cut -f1)"
             if [[ "$remote_head" != "$(git rev-parse HEAD)" ]]; then
               echo '::notice::A newer main commit exists; its workflow will publish the next release.'
               exit 0

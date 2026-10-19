@@ -6,6 +6,8 @@ public struct MediaBufferLimits: Sendable {
     public let maximumFrames: Int
     public let frameTimeToLive: TimeInterval
     public let keyFrameTimeToLive: TimeInterval
+    // Optional decode/confirmation budget after full receipt; nil preserves the delivery deadline.
+    public let completedFrameTimeToLive: TimeInterval?
     public let reorderDelay: TimeInterval
     public let nackInterval: TimeInterval
     public let acknowledgementRepeatInterval: TimeInterval
@@ -17,12 +19,14 @@ public struct MediaBufferLimits: Sendable {
                 frameTimeToLive: TimeInterval = 0.15, keyFrameTimeToLive: TimeInterval = 2.0,
                 reorderDelay: TimeInterval = 0.003,
                 nackInterval: TimeInterval = 0.01, acknowledgementRepeatInterval: TimeInterval = 0.02,
-                maximumRepairRounds: Int = 2, repairSafetyMargin: TimeInterval = 0.005) {
+                maximumRepairRounds: Int = 2, repairSafetyMargin: TimeInterval = 0.005,
+                completedFrameTimeToLive: TimeInterval? = nil) {
         self.maximumFrameBytes = maximumFrameBytes
         self.maximumBufferedBytes = maximumBufferedBytes
         self.maximumFrames = maximumFrames
         self.frameTimeToLive = frameTimeToLive
         self.keyFrameTimeToLive = keyFrameTimeToLive
+        self.completedFrameTimeToLive = completedFrameTimeToLive
         self.reorderDelay = reorderDelay
         self.nackInterval = nackInterval
         self.acknowledgementRepeatInterval = acknowledgementRepeatInterval
@@ -34,6 +38,7 @@ public struct MediaBufferLimits: Sendable {
         guard (1...MediaFrame.maximumPacketBytes).contains(maximumFrameBytes), maximumBufferedBytes > 0,
               (1...64).contains(maximumFrames), frameTimeToLive.isFinite, frameTimeToLive > 0,
               keyFrameTimeToLive.isFinite, keyFrameTimeToLive > 0,
+              completedFrameTimeToLive.map({ $0.isFinite && $0 > 0 }) ?? true,
               reorderDelay.isFinite, reorderDelay >= 0, reorderDelay < min(frameTimeToLive, keyFrameTimeToLive),
               nackInterval.isFinite, nackInterval > 0,
               acknowledgementRepeatInterval.isFinite, acknowledgementRepeatInterval > 0,
@@ -78,6 +83,7 @@ public final class MediaFrameReassembler {
         var receivedCount = 0
         var highestReceivedIndex = -1
         var frame: MediaFrame?
+        var completedAt: TimeInterval?
 
         init(_ fragment: MediaFragment, now: TimeInterval) {
             header = fragment.header
@@ -100,6 +106,7 @@ public final class MediaFrameReassembler {
             receivedCount = fragmentCount
             highestReceivedIndex = fragmentCount - 1
             self.frame = frame
+            completedAt = now
         }
 
         func missingRanges(includeTail: Bool) -> [MediaFragmentRange] {
@@ -190,6 +197,7 @@ public final class MediaFrameReassembler {
             if assembly.receivedCount == assembly.fragmentCount {
                 do {
                     assembly.frame = try MediaFrame(header: assembly.header, packetBytes: assembly.bytes)
+                    assembly.completedAt = now
                 } catch {
                     _ = invalidate(at: fragment.header)
                     throw error
@@ -306,7 +314,10 @@ public final class MediaFrameReassembler {
             return invalidate(at: MediaFrameHeader(stream: stream, frameID: expectedFrameID, isIDR: waitingForFirstIDR))
         }
         if let oldest = assemblies.values.filter({
-            now - $0.firstReceivedAt >= ($0.header.isIDR ? limits.keyFrameTimeToLive : limits.frameTimeToLive)
+            if let completedAt = $0.completedAt, let timeout = limits.completedFrameTimeToLive {
+                return now - completedAt >= timeout
+            }
+            return now - $0.firstReceivedAt >= ($0.header.isIDR ? limits.keyFrameTimeToLive : limits.frameTimeToLive)
         })
             .min(by: { $0.header.frameID < $1.header.frameID }) {
             return invalidate(at: oldest.header)
@@ -354,7 +365,7 @@ public final class MediaRetransmissionCache {
         let sequence: UInt32
         let fragments: [MediaFragment]
         let bytes: Int
-        let deadline: TimeInterval
+        var deadline: TimeInterval
         var reassembled = false
         var repairRounds = 0
         var lastRepairAt: TimeInterval?
@@ -424,6 +435,9 @@ public final class MediaRetransmissionCache {
             if frames[feedback.header.frameID] != nil { events += invalidate(at: feedback.header) }
         case .reassembled:
             if var cached = frames[feedback.header.frameID] {
+                if !cached.reassembled, let timeout = limits.completedFrameTimeToLive {
+                    cached.deadline = max(cached.deadline, now + timeout)
+                }
                 cached.reassembled = true
                 frames[feedback.header.frameID] = cached
             }

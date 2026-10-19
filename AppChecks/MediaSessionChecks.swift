@@ -24,7 +24,8 @@ func packet(_ seq: UInt32, idr: Bool, largeIDR: Bool = false) -> VideoPacket {
 }
 enum PrepareHookCheck { case unchecked, boundStream, fallback }
 func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
-              failRecoveryCandidate: Bool = false, pauseResume: Bool = false, stopCandidate: Bool = false, pathFailure: Bool = false, legacy: Bool = false, restoreUDP: Bool = false, inspectDiagnostics: Bool = false, largeIDR: Bool = false, overlapPrepare: Bool = false, prepareHook: PrepareHookCheck = .unchecked) throws {
+              failRecoveryCandidate: Bool = false, pauseResume: Bool = false, stopCandidate: Bool = false, pathFailure: Bool = false, legacy: Bool = false, restoreUDP: Bool = false, inspectDiagnostics: Bool = false, largeIDR: Bool = false, overlapPrepare: Bool = false, prepareHook: PrepareHookCheck = .unchecked,
+              delayedDecode: Bool = false, stalledDecode: Bool = false) throws {
     let key = try PairingKey.generate(), settings = StreamSettings(longestEdge:1920,framesPerSecond:60,megabits:12)
     let queue = DispatchQueue(label:"session.loopback-listener")
     let params = try MediaSecureTransport.tlsParameters(key:key,roles:MediaChannelRole.allCases)
@@ -35,6 +36,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     let states=Box<[String]>([]), errors=Box<[String]>([]), decoded=Box<[UInt64]>([]), sequence=Box<UInt32>(0), prepared=Box(0), committedCount=Box(0)
     let rejectedCandidate = Box(false), candidateSeen = DispatchSemaphore(value:0)
     let lateDecode = Box<((Bool)->Void)?>(nil)
+    let delayedFrameDone = DispatchSemaphore(value: 0), stalledFrameSeen = DispatchSemaphore(value: 0)
     let auxiliaryMeters = Box<[TrafficMeter]>([])
     let diagnostics = inspectDiagnostics ? PerformanceDiagnostics(enabled:true) : nil
     let sampledCompute = DispatchSemaphore(value:0)
@@ -128,6 +130,15 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
                     errors.update{$0.append("Large IDR payload changed across fragments")};complete(false);return
                 }
                 if stopCandidate { lateDecode.update{$0=complete};candidateSeen.signal();return }
+                if !frame.header.isIDR, stalledDecode, lateDecode.get() == nil {
+                    lateDecode.update { $0 = complete }; stalledFrameSeen.signal(); return
+                }
+                if !frame.header.isIDR, delayedDecode {
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.35) {
+                        complete(true); delayedFrameDone.signal()
+                    }
+                    return
+                }
                 if failRecoveryCandidate, frame.header.frameID == 1, committedCount.get() > 0, !rejectedCandidate.get() {
                     rejectedCandidate.update{$0=true};complete(false);return
                 }
@@ -196,6 +207,23 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     let expected = udp ? "UDP 视频" : auxiliary ? "TCP 视频" : "TCP 兼容模式"
     try require(states.get().contains(expected),"wrong selected path \(states.get())")
     try require(!decoded.get().isEmpty,"No decoded media frame")
+    if delayedDecode {
+        try wait(delayedFrameDone, "A delayed complete frame did not finish decoding")
+        Thread.sleep(forTimeInterval: 0.3)
+        try require(committedCount.get() == 1 && !states.get().contains("正在恢复画面"),
+                    "A 350 ms complete-frame decode restarted the media stream: \(states.get())")
+    }
+    if stalledDecode {
+        try wait(stalledFrameSeen, "The stalled P-frame never reached the decoder")
+        try require(committed.wait(timeout: .now() + 0.5) == .timedOut,
+                    "A stalled complete frame still used the short delivery deadline")
+        try wait(committed, "A stalled decoder disabled finite recovery", seconds: 7)
+        try wait(pathStable, "Recovered TCP state was not published")
+        lateDecode.get()?(true)
+        Thread.sleep(forTimeInterval: 0.2)
+        try require(committedCount.get() == 2 && states.get().last == expected,
+                    "Stall recovery or a late decode caused repeated stream commits")
+    }
     if prepareHook == .boundStream {
         try require(prepared.get() == 0 && streamPreparations.get().count == 1,
                     "The optional stream hook did not replace default candidate preparation")
@@ -326,6 +354,10 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
    run("Legacy peers keep configuration and pause recovery unchanged") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false,legacy:true) }
    run("UDP first choice, bulk binding and configuration cutover") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true) }
    run("TCP-only choice uses its independent media connection") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false) }
+   run("Independent TCP tolerates a 350 ms complete-frame decode without recovery") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false,delayedDecode:true) }
+   run("Shared TCP tolerates a 350 ms complete-frame decode without recovery") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false,delayedDecode:true) }
+   run("Reassembled UDP tolerates a 350 ms complete-frame decode without recovery") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,delayedDecode:true) }
+   run("Stalled TCP decode still recovers once and fences its late callback") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false,stalledDecode:true) }
    run("Auxiliary refusal falls back to framed shared TCP") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false) }
    run("Transient capture readiness retries UDP") { try exercise(udp:true,auxiliary:true,rejectFirst:true,reconfigure:false) }
    run("Aborting after candidate IDR requires a fresh epoch and IDR") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true,failRecoveryCandidate:true) }

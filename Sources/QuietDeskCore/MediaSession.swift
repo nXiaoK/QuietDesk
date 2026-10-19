@@ -679,8 +679,16 @@ public final class MediaSession: @unchecked Sendable {
     }
 
     private func sendPing() {
-        guard !paused, udpPeer != nil, let nonce = try? randomBytes(16) else { return }
-        challenge = nonce; challengeSentAt = SessionClock.now; lastPingAt = challengeSentAt
+        guard !paused, udpPeer != nil else { return }
+        let now = SessionClock.now
+        // Retransmit the outstanding challenge without invalidating a pong taking
+        // longer than the 200 ms send interval, but never extend its one-second lifetime.
+        if challenge == nil || now - challengeSentAt >= 1 {
+            guard let nonce = try? randomBytes(16) else { return }
+            challenge = nonce; challengeSentAt = now
+        }
+        guard let nonce = challenge else { return }
+        lastPingAt = now
         var payload = Data([1]); payload.append(nonce); payload.append(Data(count: 1024 - payload.count))
         sendDatagram(payload)
     }
@@ -699,8 +707,11 @@ public final class MediaSession: @unchecked Sendable {
                 }
             case 2:
                 guard data.count == 1024, let challenge, data.dropFirst().prefix(16) == challenge else { return }
-                lastPongAt = SessionClock.now
-                let measured = lastPongAt - challengeSentAt
+                let now = SessionClock.now
+                let measured = now - challengeSentAt
+                guard measured >= 0, measured < 1 else { return }
+                self.challenge = nil
+                lastPongAt = now
                 roundTrip = max(0.001, min(2, measured))
                 recordDuration(.mediaRoundTrip, seconds: measured)
                 if receivedChallenge { verifiedUDP() }
@@ -766,7 +777,8 @@ public final class MediaSession: @unchecked Sendable {
 
     private var expectedStream: MediaStreamID? { transaction?.stream ?? active?.stream }
     private var bufferLimits: MediaBufferLimits {
-        MediaBufferLimits(frameTimeToLive: max(0.15, roundTrip * 3 + 0.05), keyFrameTimeToLive: 5)
+        MediaBufferLimits(frameTimeToLive: (transaction?.path ?? active?.path) == .udp ? max(0.15, roundTrip * 3 + 0.05) : 5,
+                          keyFrameTimeToLive: 5, completedFrameTimeToLive: 5)
     }
 
     private func sendFrame(_ packet: VideoPacket) {
@@ -786,7 +798,8 @@ public final class MediaSession: @unchecked Sendable {
             let header = MediaFrameHeader(stream: target.0, frameID: nextFrameID, isIDR: isIDR)
             let frame = try MediaFrame(header: header, packet: packet)
             let bytes = try packet.encode().count
-            let budget = isIDR ? max(1, Double(bytes) / bytesPerSecond + roundTrip * 2 + 0.2) : max(0.2, roundTrip * 3 + 0.05)
+            let budget = target.1 != .udp ? 5
+                : isIDR ? max(1, Double(bytes) / bytesPerSecond + roundTrip * 2 + 0.2) : max(0.2, roundTrip * 3 + 0.05)
             let fragments = try cache!.insert(frame, deadline: SessionClock.now + min(5, budget))
             sentHeaders.insert(header)
             if transaction != nil { transaction?.frameSubmitted = true }

@@ -324,6 +324,54 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         try require(receiver.decoded(second.header, success: true).isEmpty, "Late decode revived an expired epoch")
     }
 
+    run("Completed UDP frames keep a separate decode budget without extending incomplete frames") {
+        let time = MediaCheckClock()
+        let receiver = try MediaFrameReassembler(stream: stream,
+            limits: MediaBufferLimits(completedFrameTimeToLive: 5), clock: { time.now })
+        let first = try frame(1, idr: true)
+        _ = try receiver.receive(first)
+        _ = receiver.decoded(first.header, success: true)
+        let second = try frame(2)
+        for fragment in try MediaFragment.fragment(frame: second) { _ = try receiver.receive(fragment) }
+        time.now = 0.25
+        try require(!receiver.requiresRecovery && feedback(receiver.poll(), .expired).isEmpty,
+                    "A complete frame inherited the UDP delivery deadline")
+        try require(feedback(receiver.decoded(second.header, success: true), .decoded).count == 1,
+                    "A complete frame could not acknowledge its delayed decode")
+        let parts = try MediaFragment.fragment(frame: frame(3, bytes: 3_000))
+        _ = try receiver.receive(parts[0])
+        time.now = 0.41
+        try require(feedback(receiver.poll(), .expired).count == 1 && receiver.requiresRecovery,
+                    "The decode budget prolonged an incomplete UDP frame")
+    }
+
+    run("Complete frames and reassembly acknowledgements cannot extend a stalled decoder indefinitely") {
+        let time = MediaCheckClock()
+        let limits = MediaBufferLimits(completedFrameTimeToLive: 5)
+        let cache = try MediaRetransmissionCache(stream: stream, limits: limits, clock: { time.now })
+        let receiver = try MediaFrameReassembler(stream: stream, limits: limits, clock: { time.now })
+        let first = try frame(1, idr: true)
+        _ = try cache.insert(first, deadline: 1)
+        _ = cache.handle(try MediaFeedback(kind: .decoded, header: first.header), estimatedRoundTrip: 0.01)
+        let second = try frame(2)
+        _ = try cache.insert(second, deadline: 0.2)
+        let assembled = try MediaFeedback(kind: .reassembled, header: second.header)
+        _ = cache.handle(assembled, estimatedRoundTrip: 0.01)
+        _ = try receiver.receive(first)
+        _ = receiver.decoded(first.header, success: true)
+        _ = try receiver.receive(second)
+        time.now = 0.25
+        try require(cache.expire().isEmpty && !cache.requiresRecovery, "Reassembled sender credit expired before decoding")
+        time.now = 4.9
+        _ = cache.handle(assembled, estimatedRoundTrip: 0.01)
+        _ = try receiver.receive(second)
+        time.now = 5.01
+        try require(terminal(cache.expire()) == [77] && cache.requiresRecovery,
+                    "Repeated reassembly ACK prolonged sender credit")
+        try require(feedback(receiver.poll(), .expired).count == 1 && receiver.requiresRecovery,
+                    "Repeated complete frame prolonged the decoder deadline")
+    }
+
     run("Media IDR assembly and initial gap have a separate finite recovery budget") {
         let time = MediaCheckClock()
         let receiver = try MediaFrameReassembler(stream: stream, clock: { time.now })
@@ -352,6 +400,8 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         let events = cache.handle(try MediaFeedback(kind: .expired, header: unknownFlag), estimatedRoundTrip: 0)
         try require(terminal(events) == [11] && cache.requiresRecovery, "Missing-frame status could not retire an unknown IDR")
         try rejects { _ = try MediaFrameReassembler(stream: stream, limits: MediaBufferLimits(keyFrameTimeToLive: .nan)) }
+        try rejects { _ = try MediaFrameReassembler(stream: stream, limits: MediaBufferLimits(completedFrameTimeToLive: .infinity)) }
+        try rejects { _ = try MediaFrameReassembler(stream: stream, limits: MediaBufferLimits(completedFrameTimeToLive: 0)) }
         try rejects { _ = try MediaFrameReassembler(stream: stream, firstFrameID: UInt64.max) }
         try rejects { _ = try MediaRetransmissionCache(stream: stream, firstFrameID: UInt64.max) }
     }

@@ -103,6 +103,8 @@ private final class CiphertextUDPRelay {
     private var closed = false
     var shouldForwardHostDatagram: ((Data) -> Bool)?
     var shouldForwardClientDatagram: ((Data) -> Bool)?
+    var hostProbeDelay: TimeInterval = 0
+    private var delayedDatagrams = 0
     var onClosed: (() -> Void)?
 
     init(incoming: NWConnection, hostPort: NWEndpoint.Port, queue: DispatchQueue) {
@@ -156,6 +158,19 @@ private final class CiphertextUDPRelay {
                 self.forward(from: source, to: destination, fromHost: fromHost)
                 return
             }
+            if fromHost, self.hostProbeDelay > 0, data.first == 23, (1_024...1_080).contains(data.count) {
+                guard self.delayedDatagrams < 8 else { self.stop(); return }
+                self.delayedDatagrams += 1
+                self.queue.asyncAfter(deadline: .now() + self.hostProbeDelay) { [weak self] in
+                    guard let self, !self.closed else { return }
+                    self.delayedDatagrams -= 1
+                    destination.send(content: data, completion: .contentProcessed { [weak self] error in
+                        if error != nil { self?.stop() }
+                    })
+                }
+                self.forward(from: source, to: destination, fromHost: fromHost)
+                return
+            }
             destination.send(content: data, completion: .contentProcessed { [weak self] sendError in
                 guard let self, !self.closed else { return }
                 guard sendError == nil else { self.stop(); return }
@@ -183,6 +198,7 @@ private final class LoopbackMediaBlackhole {
     private let queue = DispatchQueue(label: "checks.media-blackhole.proxy")
     private let hostPort: NWEndpoint.Port
     private let blockAllUDP: Bool
+    private let probeDelay: TimeInterval
     private var tcpListener: NWListener?
     private var udpListener: NWListener?
     private var tcpRelays: [UUID: CiphertextTCPRelay] = [:]
@@ -190,9 +206,10 @@ private final class LoopbackMediaBlackhole {
     private var statistics = Statistics()
     private var stopped = false
 
-    init(hostPort: NWEndpoint.Port, blockAllUDP: Bool = false) {
+    init(hostPort: NWEndpoint.Port, blockAllUDP: Bool = false, probeDelay: TimeInterval = 0) {
         self.hostPort = hostPort
         self.blockAllUDP = blockAllUDP
+        self.probeDelay = probeDelay
     }
 
     func start() throws -> NWEndpoint.Port {
@@ -258,6 +275,7 @@ private final class LoopbackMediaBlackhole {
         guard !stopped, udpRelays.count < 2 else { connection.cancel(); return }
         let id = UUID()
         let relay = CiphertextUDPRelay(incoming: connection, hostPort: hostPort, queue: queue)
+        relay.hostProbeDelay = probeDelay
         relay.shouldForwardHostDatagram = { [weak self] data in
             guard let self, !self.stopped else { return false }
             if self.blockAllUDP || data.count > 1_080 {
@@ -303,7 +321,7 @@ private func blackholePacket(sequence: UInt32, idr: Bool) -> VideoPacket {
                        pps: idr ? Data([0x68, 0xCE, 0x06]) : Data(), avcc: avcc)
 }
 
-private func exerciseMediaBlackhole(blockAllUDP: Bool = false) throws {
+private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeInterval = 0) throws {
     let key = try PairingKey.generate()
     let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 12)
     let diagnostics = PerformanceDiagnostics(enabled: true)
@@ -366,7 +384,7 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false) throws {
     listener.start(queue: hostQueue)
     try waitBlackhole(listenerReady, "Host TLS listener did not bind loopback")
     guard let hostPort = listener.port else { throw BlackholeCheckFailure(description: "Host TLS port is missing") }
-    let proxy = LoopbackMediaBlackhole(hostPort: hostPort, blockAllUDP: blockAllUDP)
+    let proxy = LoopbackMediaBlackhole(hostPort: hostPort, blockAllUDP: blockAllUDP, probeDelay: probeDelay)
     defer {
         teardown.update { $0 = true }
         viewerSession.get()?.stop()
@@ -458,12 +476,12 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false) throws {
 private struct MediaBlackholeChecks {
     static func main() {
         var failures = 0
-        for blockAllUDP in [false, true] {
+        for (blockAllUDP, probeDelay) in [(false, 0.0), (true, 0.0), (false, 0.3)] {
             let name = blockAllUDP ? "Fully blocked UDP probes fall back to independent TCP without preparing UDP video"
                 : "Live UDP pongs with dropped large media fall back to independent TCP"
             do {
-                try exerciseMediaBlackhole(blockAllUDP: blockAllUDP)
-                print("PASS \(name)")
+                try exerciseMediaBlackhole(blockAllUDP: blockAllUDP, probeDelay: probeDelay)
+                print("PASS \(name), probe delay \(probeDelay)s")
             } catch {
                 failures += 1
                 print("FAIL \(name): \(error)")

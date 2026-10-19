@@ -13,6 +13,7 @@ final class DiagnosticLog: @unchecked Sendable {
         case permissionChanged, exportRequested, exportCompleted, exportFailed, counters
         case performanceDiagnosticsChanged, performanceWindow
         case relayRegistration, mediaRouteChanged
+        case updateCheck, updatePreferenceChanged, updateDownload, updateInstall, updateCancelled
     }
     enum Role: String, Codable { case viewer, host }
     enum State: String, Codable {

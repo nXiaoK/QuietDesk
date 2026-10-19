@@ -15,25 +15,41 @@ enum QuietDeskEntry {
 
 struct QuietDeskApp: App {
     @StateObject private var model: DeskModel
+    @StateObject private var updates: UpdateController
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {
         let state = DeskModel()
         _model = StateObject(wrappedValue: state)
+        let updater = UpdateController(sessionContext: { [weak state] in
+            guard let state else { return .init() }
+            return UpdateSessionContext(mainWindowVisible: state.mainWindow?.isVisible == true && state.mainWindow?.isMiniaturized == false,
+                applicationActive: NSApp.isActive, isControlling: state.mode == .viewer && (state.connected || state.working || state.reconnecting),
+                isFullScreen: state.isFullScreen, hasHostConnection: state.mode == .host && state.connected,
+                isSharing: state.mode == .host && (state.active || state.working), hasActiveConnection: state.connected,
+                autoStartSharing: state.autoStartSharing, hasOtherPrompt: state.updatePromptBlocked)
+        }, mainWindow: { [weak state] in state?.mainWindow }, releaseControl: { [weak state] in state?.canvas.releaseControl() },
+            contextChanges: state.objectWillChange.eraseToAnyPublisher())
+        _updates = StateObject(wrappedValue: updater)
         appDelegate.model = state
+        appDelegate.updates = updater
     }
 
     var body: some Scene {
         Window("QuietDesk", id: "main") {
-            DeskView(model: model)
+            DeskView(model: model, updates: updates)
                 .onAppear {
                     model.initialLaunch(atLogin: appDelegate.launchedAtLogin)
+                    updates.start()
                 }
         }
         .defaultSize(width: 1080, height: 760)
         .windowToolbarStyle(.unified)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            CommandGroup(after: .appInfo) {
+                if updates.enabled { Button("检查更新…") { updates.check() } }
+            }
             CommandMenu("远程控制") {
                 Button(model.isFullScreen ? "退出全屏" : "进入全屏") { model.toggleFullScreen() }
                     .keyboardShortcut("f", modifiers: [.control, .command])
@@ -43,7 +59,7 @@ struct QuietDeskApp: App {
             }
         }
         MenuBarExtra("QuietDesk", systemImage: "display.2") {
-            TrayView(model: model)
+            TrayView(model: model, updates: updates)
         }
     }
 }
@@ -51,6 +67,7 @@ struct QuietDeskApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: DeskModel?
+    weak var updates: UpdateController?
     private(set) var launchedAtLogin = false
     func applicationWillFinishLaunching(_ notification: Notification) {
         launchedAtLogin = NSAppleEventManager.shared().currentAppleEvent?
@@ -63,6 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         launchedAtLogin = launchedAtLogin || NSAppleEventManager.shared().currentAppleEvent?
             .paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem))?.booleanValue == true
         model?.initialLaunch(atLogin: launchedAtLogin)
+        updates?.start()
     }
     func applicationDidBecomeActive(_ notification: Notification) {
         model?.refreshLoginStatus()
@@ -80,6 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
     func applicationWillTerminate(_ notification: Notification) {
+        updates?.shutdown()
         model?.stop()
         DiagnosticLog.shared.record(.applicationStopped)
         DiagnosticLog.shared.flush()
@@ -88,6 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct DeskView: View {
     @ObservedObject var model: DeskModel
+    @ObservedObject var updates: UpdateController
     @State private var showCapsSettings = false
     @State private var showOptions = false
     @State private var showFullScreenMenu = false
@@ -109,6 +129,7 @@ struct DeskView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if updates.showBanner { UpdateBanner(controller: updates) }
             if model.mode == .host {
                 SharingView(model: model, openTraffic: openTrafficStatistics)
             } else if sessionLayout || immersive {
@@ -376,6 +397,7 @@ struct DeskView: View {
 
 private struct TrayView: View {
     @ObservedObject var model: DeskModel
+    @ObservedObject var updates: UpdateController
     @Environment(\.openWindow) private var openWindow
     @State private var exportingLogs = false
     var body: some View {
@@ -393,6 +415,12 @@ private struct TrayView: View {
             }
         }
         Divider()
+        if updates.enabled {
+            Button(updates.menuTitle) { updates.check() }
+            Toggle("自动检查更新", isOn: Binding(get: { updates.autoCheckPreference == true },
+                set: { updates.setAutomaticChecks($0) }))
+            Divider()
+        }
         Toggle("性能诊断", isOn: Binding(get: { model.performanceDiagnosticsEnabled },
             set: { model.setPerformanceDiagnosticsEnabled($0) }))
             .help("记录视频与传输耗时，导出诊断日志后发送两端日志")

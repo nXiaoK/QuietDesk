@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import CoreVideo
 import SwiftUI
 import QuietDeskCore
@@ -31,6 +32,25 @@ private final class CanvasDecoderProbe: MediaCanvasDecoding, @unchecked Sendable
             return pending.remove(at: index).1
         }
         callback?(result)
+    }
+}
+
+private final class CanvasDisplayLayerProbe: AVSampleBufferDisplayLayer, @unchecked Sendable {
+    var acceptsFrames = true
+    private(set) var displayedImage: CVPixelBuffer?
+    private(set) var removals = 0
+    private var readyRequest: (DispatchQueue, @Sendable () -> Void)?
+    override var isReadyForMoreMediaData: Bool { acceptsFrames }
+    override func enqueue(_ sampleBuffer: CMSampleBuffer) { displayedImage = CMSampleBufferGetImageBuffer(sampleBuffer) }
+    override func flush() {}
+    override func flushAndRemoveImage() { removals += 1; displayedImage = nil }
+    override func requestMediaDataWhenReady(on queue: DispatchQueue, using block: @escaping @Sendable () -> Void) {
+        readyRequest = (queue, block)
+    }
+    override func stopRequestingMediaData() { readyRequest = nil }
+    func becomeReady() {
+        acceptsFrames = true
+        if let (queue, block) = readyRequest { readyRequest = nil; queue.async(execute: block) }
     }
 }
 
@@ -404,6 +424,61 @@ private struct RemoteCanvasChecks {
             receiver.receive(try mediaFrame(stream: streams[0], id: 5, keyFrame: true)) { rejected.append($0) }
             receiver.receive(try mediaFrame(stream: .init(sessionID: UUID(), transportEpoch: 4, codecEpoch: 1), id: 6, keyFrame: true)) { rejected.append($0) }
             try require(rejected == [false, false] && probes.read().count == 3, "A stale epoch or different session allocated a decoder")
+        }
+
+        run("Recovery preserves the old image through failed candidates and display backpressure without clearing an unchanged cursor mode") {
+            let display = CanvasDisplayLayerProbe()
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300), videoLayer: display)
+            let probes = CanvasLocked<[CanvasDecoderProbe]>([])
+            let receiver = canvas.makeMediaReceiver(makeDecoder: { _ in
+                let probe = CanvasDecoderProbe(); probes.update { $0.append(probe) }; return probe
+            })
+            defer { canvas.reset() }
+            let session = UUID(), cursor = UUID(), oldImage = try canvasPixel(), newImage = try canvasPixel()
+            let streams = (1...4).map { MediaStreamID(sessionID: session, transportEpoch: UInt32($0), codecEpoch: UInt32($0)) }
+            canvas.receiveCursorStatus(CursorControl(.status, requestID: UUID(), cursorID: cursor, epoch: 1, enabled: true))
+            @MainActor func bind(_ index: Int) {
+                canvas.receiveCursorBinding(CursorControl(.binding, cursorID: cursor, epoch: 1, enabled: true, stream: streams[index]))
+            }
+            bind(0)
+            receiver.receive(try mediaFrame(stream: streams[0], id: 1, keyFrame: true)) { _ in }
+            probes.read()[0].finish(1, .success(oldImage))
+            try require(receiver.commit(stream: streams[0]), "Initial displayed stream did not commit")
+            drainCanvasDisplay()
+            let removals = display.removals
+            try require(display.displayedImage === oldImage, "Initial synthetic image was not retained")
+            bind(1)
+            receiver.receive(try mediaFrame(stream: streams[1], id: 1, keyFrame: true)) { _ in }
+            drainCanvasDisplay()
+            try require(display.displayedImage === oldImage && display.removals == removals,
+                        "Preparing a recovery candidate removed the old image")
+            probes.read()[1].finish(1, .failure(CanvasCheckFailure("Synthetic failed recovery")))
+            try require(!receiver.commit(stream: streams[1]), "A failed recovery candidate committed")
+            drainCanvasDisplay()
+            try require(display.displayedImage === oldImage && !probes.read()[0].stopped,
+                        "A failed candidate replaced the old image or stopped its decoder")
+            bind(2)
+            receiver.receive(try mediaFrame(stream: streams[2], id: 1, keyFrame: true)) { _ in }
+            probes.read()[2].finish(1, .success(newImage))
+            display.acceptsFrames = false
+            try require(receiver.commit(stream: streams[2]), "Decoded recovery did not commit")
+            drainCanvasDisplay()
+            try require(display.displayedImage === oldImage && display.removals == removals,
+                        "Display backpressure cleared the retained image")
+            display.becomeReady(); drainCanvasDisplay()
+            try require(display.displayedImage === newImage && display.removals == removals,
+                        "An unchanged cursor binding cleared the image during recovery")
+            canvas.receiveCursorStatus(CursorControl(.status, requestID: UUID(), cursorID: cursor, epoch: 2, enabled: false))
+            canvas.receiveCursorBinding(CursorControl(.binding, cursorID: cursor, epoch: 2, enabled: false, stream: streams[3]))
+            receiver.receive(try mediaFrame(stream: streams[3], id: 1, keyFrame: true)) { _ in }
+            probes.read()[3].finish(1, .success(oldImage))
+            try require(receiver.commit(stream: streams[3]), "Real cursor-mode change did not commit")
+            drainCanvasDisplay()
+            try require(display.displayedImage === oldImage && display.removals == removals + 1,
+                        "A real cursor-mode change lost its previous clearing behavior")
+            canvas.reset()
+            try require(display.displayedImage == nil && display.removals == removals + 2,
+                        "Explicit session reset retained the old session image")
         }
 
         run("Media decode credit is bounded and stop completes every pending frame exactly once") {

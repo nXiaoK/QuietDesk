@@ -230,7 +230,7 @@ final class MediaCanvasReceiver: @unchecked Sendable {
 
 @MainActor
 final class RemoteCanvas: NSView {
-    private let videoLayer = AVSampleBufferDisplayLayer()
+    private let videoLayer: AVSampleBufferDisplayLayer
     private var decoder: MediaCanvasDecoding = VideoDecoder()
     private var mailbox = LatestFrameMailbox()
     private var diagnostics: PerformanceDiagnostics?
@@ -293,7 +293,12 @@ final class RemoteCanvas: NSView {
     override var acceptsFirstResponder: Bool { canControl }
     override var isFlipped: Bool { true }
 
-    override init(frame frameRect: NSRect) {
+    override convenience init(frame frameRect: NSRect) {
+        self.init(frame: frameRect, videoLayer: AVSampleBufferDisplayLayer())
+    }
+
+    init(frame frameRect: NSRect, videoLayer: AVSampleBufferDisplayLayer) {
+        self.videoLayer = videoLayer
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
@@ -567,8 +572,9 @@ final class RemoteCanvas: NSView {
         // Keep the old cursor mode while the layer is busy or sample creation fails.
         // Clear its retained image before changing modes so a burned-in old cursor
         // cannot remain visible underneath the immediate local cursor.
+        let previousCursorMode = cursorState.enabled
         if let displayStream, cursorState.commit(displayStream) {
-            videoLayer.flushAndRemoveImage()
+            if cursorState.enabled != previousCursorMode { videoLayer.flushAndRemoveImage() }
             refreshCursorImage(forcePublish: true)
         }
         videoLayer.enqueue(sample)

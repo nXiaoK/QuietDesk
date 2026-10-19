@@ -1,4 +1,6 @@
 {
   "feedURL": "https://github.com/nXiaoK/QuietDesk/releases/latest/download/QuietDesk-update.json",
-  "publicKeys": []
+  "publicKeys": [
+    { "id": "2026-10", "key": "ueDroPJcWmJL/PsEUaPEuesYwELXupcR96O7E2wgq/A=" }
+  ]
 }

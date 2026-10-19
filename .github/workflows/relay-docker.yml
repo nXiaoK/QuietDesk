@@ -1,0 +1,26 @@
+name: Check relay Docker deployment
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check isolated Docker deployment
+        run: python3 scripts/check-relay-docker.py
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+      - name: Cross-build both image architectures
+        run: |
+          docker buildx create --use --driver docker-container
+          docker buildx build --platform linux/amd64,linux/arm64 --output type=oci,dest=work/quietdesk-relay.oci.tar relay

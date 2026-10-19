@@ -2,6 +2,58 @@
 
 节点使用 Go 标准库，可编译成 Linux 单一可执行文件，不在 Mac 客户端引入 Go 或第三方运行时。当前协议版本为 1。两端配置和连接策略见 [Mac 中继指南](../docs/relay.md)；独立安装包内按下文配置节点，再在两台 Mac 的“中继设置”保存同一节点地址和接入码。
 
+## Docker 单命令部署（推荐）
+
+准备一台双方可访问的 Linux 服务器（amd64 或 arm64）、Docker Engine、Docker Compose v2.20+，以及匹配中继域名的有效 TLS 证书链和无密码私钥。域名解析到此服务器，在云安全组和防火墙放行 **7443/TCP 与 7443/UDP**。证书可使用已有的 ACME/Let's Encrypt 签发流程；部署脚本不自动申请证书，不修改防火墙。
+
+下载并解压 `QuietDesk-Relay-版本-Docker.tar.gz`，进入解压目录，执行：
+
+```sh
+./deploy.sh /etc/letsencrypt/live/relay.example.com/fullchain.pem \
+  /etc/letsencrypt/live/relay.example.com/privkey.pem
+```
+
+从源码部署时，在仓库根目录使用 `./relay/deploy.sh`，参数相同。执行账户须能读取证书私钥、访问 Docker 引擎，并能联网拉取基础镜像；服务器不需要安装 Go、Swift 或 Python。首次会从源码构建本机架构的镜像，安装证书、随机生成节点接入码、启动服务并等待真实健康检查通过。证书路径允许使用证书管理器创建的符号链接。脚本只通过标准输入传入证书，不将宿主机目录或 Docker socket 挂进容器，不输出密钥。
+
+启动后进入包含 `compose.yaml` 的目录，**在私人终端**获取节点接入码：
+
+```sh
+docker compose exec -T relay cat /var/lib/quietdesk-relay/access.key
+```
+
+两台 Mac 的“中继设置”均填写 `tls://relay.example.com:7443` 与此接入码。被控端开启共享，控制端选择“仅中继”，填写被控端设备标识和原有 Mac 配对码。接入码不能代替 Mac 配对码。
+
+如需公网端口 443，在每次部署或运维前设置同一环境变量；它同时映射 TCP 和 UDP，容器内仍监听 7443：
+
+```sh
+export QUIETDESK_RELAY_PORT=443
+./deploy.sh /path/to/fullchain.pem /path/to/privkey.pem
+```
+
+此时客户端地址为 `tls://relay.example.com:443`。普通 HTTP/Nginx `location` 反向代理不能转发此协议。健康端点只在容器回环监听，没有向宿主机发布 9091 端口：
+
+```sh
+docker compose ps
+docker compose logs --tail 100 relay
+docker compose exec -T relay wget -qO- http://127.0.0.1:9091/healthz
+docker compose stop relay
+docker compose start relay
+```
+
+容器以固定 UID/GID `65532:65532` 运行，根文件系统只读且移除 Linux capabilities。首次创建的 Docker 命名卷自动使用正确属主与私有权限：`quietdesk-relay_state` 保存接入密钥和 `devices.json`，`quietdesk-relay_tls` 保存证书链与私钥；不写入镜像或安装包。日志自动轮转。默认项目名固定为 `quietdesk-relay`，换目录升级仍复用原卷；如使用 `COMPOSE_PROJECT_NAME` 隔离多个节点，后续所有命令必须保持相同项目名。
+
+**更新、证书续期与回退：**先停止服务并备份这两个命名卷（含属主和权限），保留旧镜像及其源码/Compose 配置。更新源码或解压新 Docker 包后重跑同一部署命令；它保留已有接入密钥和登记表，更新证书并重建容器。此操作和重启会中断中继会话。证书管理器续期不会自动更新容器里的证书副本，需再次执行部署命令。证书不匹配、过期、密钥丢失且仍有登记表、状态损坏或不兼容会报错，不自动清空旧状态。
+
+可在升级前用 `docker image tag quietdesk-relay:local quietdesk-relay:previous` 保留镜像。回退时先停止服务，恢复旧版源码/Compose 配置及必要的卷备份，再执行：
+
+```sh
+QUIETDESK_RELAY_IMAGE=quietdesk-relay:previous docker compose up -d --no-build --force-recreate --wait relay
+```
+
+同一状态格式可继续使用原卷；跨格式回退必须遵循对应版本迁移说明。`docker compose down` 保留卷；**不要执行 `down -v`、删除卷或清空登记表来排障**。从原 systemd 安装迁移时，先停旧节点，将原接入密钥和登记表一起导入 state 卷，保持目录 `0700`、文件 `0600`、属主 `65532:65532`，再部署；不要用全新节点覆盖旧身份数据。
+
+镜像可用 Buildx 交叉构建：`docker buildx build --platform linux/amd64,linux/arm64 -o type=oci,dest=quietdesk-relay.oci.tar .`。本项目提供本地构建流程，未自动推送镜像或发布到镜像仓库。
+
 ## 构建
 
 开发环境需 Go 1.25+。在仓库根目录执行：
@@ -11,7 +63,7 @@
 ./scripts/run-relay-server-checks.sh
 ```
 
-默认在 `outputs/relay/` 生成 Linux amd64、arm64 两份静态程序，以及各架构的 `.tar.gz` 安装包和 `SHA256SUMS.txt`。归档包含程序、部署说明、systemd 模板、许可证和含程序 SHA-256 的清单；不包含证书、私钥、接入码或设备状态。解压后可将 `quietdesk-relay` 安装到模板指定位置。构建使用 Python 3 打包，服务器运行只需要程序本身。编译缓存保留在 `work/relay-build/`。只构建节点不需要 Swift。只构建原有 Mac 客户端不需要 Go。
+默认在 `outputs/relay/` 生成 Linux amd64、arm64 两份静态程序，以及各架构的 `.tar.gz` 安装包、独立 Docker 源码部署包和 `SHA256SUMS.txt`。程序归档包含程序、部署说明、systemd 模板、许可证和含程序 SHA-256 的清单；Docker 包包含独立构建所需的 Go 源码、Compose 和部署脚本。均不包含证书、私钥、接入码或设备状态。程序包解压后可将 `quietdesk-relay` 安装到模板指定位置。构建使用 Python 3 打包，服务器运行只需要程序本身。编译缓存保留在 `work/relay-build/`。只构建节点不需要 Swift。只构建原有 Mac 客户端不需要 Go。
 
 ## 配置与启动
 

@@ -1,0 +1,8 @@
+**
+!go.mod
+!*.go
+!cmd/
+!cmd/quietdesk-relay/
+!cmd/quietdesk-relay/*.go
+!docker/
+!docker/provision.sh

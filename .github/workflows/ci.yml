@@ -13,6 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  relay-docker:
+    uses: ./.github/workflows/relay-docker.yml
   check:
     runs-on: macos-15
     timeout-minutes: 30

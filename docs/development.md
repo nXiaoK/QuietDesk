@@ -126,6 +126,16 @@ QUIETDESK_CHECK_BUILD_DIR="$PWD/.build/clipboard-checks" ./scripts/run-app-check
 ./scripts/build-relay.sh
 ```
 
+Docker 部署检查需要已运行的 Docker Engine、Compose v2.20+、Python 3 和 OpenSSL：
+
+```sh
+python3 scripts/check-relay-docker.py
+```
+
+它使用随机项目名、临时自签名证书和独立命名卷，检查非 root 运行、TLS/接入鉴权、TCP 与 UDP 双向转发、重复部署后的登记归属和接入码保留，以及无效证书拒绝。结束只删除该测试项目的卷和镜像，不接触正式节点；端口使用临时空闲端口。CI 和发布流程复用 Linux Docker 检查，发布任务在检查通过后继续；另用 Buildx/QEMU 交叉构建 Linux amd64、arm64 镜像，不自动发布镜像。模拟证书仅用于本机回环，不能用于正式客户端。
+
+`build-relay.sh` 除两份 Linux 程序包外，还会生成独立的 `QuietDesk-Relay-版本-Docker.tar.gz`。Docker 包只从 Git 跟踪清单选入中继 Go 源码、公开部署文件和许可证，包含各文件的 SHA-256、版本、源码提交及脏状态；证书、接入码、卷数据、构建缓存和本机配置不进入包。解压后无需完整 Mac 项目即可执行部署脚本。
+
 `--build-only` 只编译原生测试，不运行网络。混合路径测试的专用密文代理仅通过 ClientHello 中的 ALPN 区分视频角色，不持有桌面密钥；丢弃真实 TLS 视频记录，控制和可靠数据仍由真实 Peer 处理。节点测试只在显式临时 fixture 目录下生成测试证书与凭据，结束清理服务；不要把该目录放进源码包。
 
 实现位于 `relay/`、Core 的 `Relay*` 传输桥，以及可选的媒体能力协商。所有新增媒体字段可选，默认不启用混合恢复；业务模型只在显式配置并匹配目标标识后提供候选。协议细节见 [中继协议](relay-protocol.md)。

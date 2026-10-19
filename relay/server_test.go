@@ -44,6 +44,20 @@ func randomKey(t *testing.T) []byte {
 }
 
 func newFixture(t *testing.T, cfg Config) *fixture {
+	return newFixtureWithDatagrams(t, cfg, false)
+}
+
+type blockedDatagramSocket struct{ net.PacketConn }
+
+func (socket blockedDatagramSocket) ReadFrom(data []byte) (int, net.Addr, error) {
+	for {
+		if _, _, err := socket.PacketConn.ReadFrom(data); err != nil {
+			return 0, nil, err
+		}
+	}
+}
+
+func newFixtureWithDatagrams(t *testing.T, cfg Config, blocked bool) *fixture {
 	t.Helper()
 	if cfg.AccessKey == nil {
 		cfg.AccessKey = randomKey(t)
@@ -82,8 +96,12 @@ func newFixture(t *testing.T, cfg Config) *fixture {
 		t.Fatal(err)
 	}
 	f := &fixture{server, listener.Addr().String(), udp.LocalAddr().(*net.UDPAddr), cfg.AccessKey, &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}, certificate}
+	var packets net.PacketConn = udp
+	if blocked {
+		packets = blockedDatagramSocket{udp}
+	}
 	go func() {
-		if err := server.Serve(listener, udp); err != nil {
+		if err := server.Serve(listener, packets); err != nil {
 			t.Errorf("serve: %v", err)
 		}
 	}()
@@ -287,10 +305,6 @@ func TestDatagramAuthReorderingRebindingAndClose(t *testing.T) {
 	lease := f.dial(t)
 	write(t, lease, Message{Op: "datagram", DeviceID: deviceA, AccessKey: f.access})
 	host := read(t, registration, "incomingDatagram")
-	viewer := read(t, lease, "datagramReady")
-	if !bytes.Equal(host.DatagramID, viewer.DatagramID) || bytes.Equal(host.DatagramKey, viewer.DatagramKey) {
-		t.Fatal("datagram sides were not isolated")
-	}
 	var id [16]byte
 	copy(id[:], host.DatagramID)
 	openUDP := func() *net.UDPConn {
@@ -314,6 +328,10 @@ func TestDatagramAuthReorderingRebindingAndClose(t *testing.T) {
 		return data
 	}
 	send(hostSocket, 1, 1, nil, host.DatagramKey)
+	viewer := read(t, lease, "datagramReady")
+	if !bytes.Equal(host.DatagramID, viewer.DatagramID) || bytes.Equal(host.DatagramKey, viewer.DatagramKey) {
+		t.Fatal("datagram sides were not isolated")
+	}
 	send(viewerSocket, 0, 1, nil, viewer.DatagramKey)
 	until(t, func() bool {
 		f.server.mu.Lock()
@@ -403,7 +421,7 @@ func TestNativeInteropFixture(t *testing.T) {
 	if directory == "" {
 		t.Skip("native interoperability fixture is opt-in")
 	}
-	f := newFixture(t, Config{})
+	f := newFixtureWithDatagrams(t, Config{}, os.Getenv("QUIETDESK_RELAY_FIXTURE_BLOCK_UDP") == "1")
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		t.Fatal(err)
 	}

@@ -10,7 +10,8 @@ func runRelayProtocolChecks() {
         let encoded = try JSONEncoder().encode(first)
         try check(try JSONDecoder().decode(RelayEndpoint.self, from: encoded) == first, "Saved relay node changed")
         for address in ["", "http://relay.example.com", "tls://user:secret@relay.example.com", "tls://relay.example.com/path",
-                        "tls://relay.example.com?secret=value", "tls://relay.example.com:0", "tls://relay.example.com:65536"] {
+                        "tls://relay.example.com?secret=value", "tls://relay.example.com:0", "tls://relay.example.com:65536",
+                        "tls://relay%40other.example.com", "tls://relay%2fother.example.com"] {
             try rejects("Invalid relay endpoint accepted") { _ = try RelayEndpoint(address: address) }
         }
     }

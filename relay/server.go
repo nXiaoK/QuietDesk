@@ -82,6 +82,7 @@ type datagramLease struct {
 	replay    [2]ReplayWindow
 	sequences [2]uint64
 	viewer    net.Conn
+	hostReady chan struct{}
 }
 
 var devicePattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -497,7 +498,7 @@ func (s *Server) accept(conn net.Conn, message Message) {
 
 func (s *Server) openDatagram(conn net.Conn, message Message) {
 	var id [16]byte
-	lease := &datagramLease{viewer: conn}
+	lease := &datagramLease{viewer: conn, hostReady: make(chan struct{})}
 	if _, err := rand.Read(id[:]); err != nil {
 		return
 	}
@@ -530,6 +531,14 @@ func (s *Server) openDatagram(conn net.Conn, message Message) {
 		h.send(Message{Op: "datagramClosed", DatagramID: id[:]})
 	}()
 	if h.send(Message{Op: "incomingDatagram", DatagramID: id[:], DatagramKey: lease.keys[1][:], UDPPort: port}) != nil {
+		return
+	}
+	select {
+	case <-lease.hostReady:
+	case <-h.done:
+		return
+	case <-time.After(time.Second):
+		WriteMessage(conn, Message{Op: "error", Error: "timeout"})
 		return
 	}
 	if WriteMessage(conn, Message{Op: "datagramReady", DatagramID: id[:], DatagramKey: lease.keys[0][:], UDPPort: port}) != nil {
@@ -574,6 +583,9 @@ func (s *Server) serveUDP(conn net.PacketConn) {
 			s.mu.Unlock()
 			s.rejected.Add(1)
 			continue
+		}
+		if side == 1 && lease.addresses[side] == nil {
+			close(lease.hostReady)
 		}
 		lease.addresses[side] = address
 		other := byte(1) - side

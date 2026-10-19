@@ -14,6 +14,7 @@ public struct RelayEndpoint: Codable, Equatable, Hashable, Sendable {
             throw DeskError.invalid("中继地址应为 tls://域名:端口，不包含路径、账户或密码")
         }
         let endpoint = try TrafficEndpoint(address: host, port: UInt16(parts.port ?? 443))
+        guard !endpoint.address.contains(where: { "/@?#\\%".contains($0) }) else { throw RelayServiceError.invalid }
         self.host = endpoint.address; port = endpoint.port
     }
 

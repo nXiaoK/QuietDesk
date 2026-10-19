@@ -134,7 +134,7 @@ python3 scripts/check-relay-docker.py
 python3 scripts/check-relay-docker.py --self-signed
 ```
 
-`--self-signed` 使用 `deploy.sh --ip 127.0.0.1` 自动发证，并检查重复部署保留原证书、错误 IP 不会覆盖身份。Python 检查还会把实际 provisioner 的两个卷路径隔离到临时目录，使用真实 OpenSSL 检查 IPv4/IPv6、证书有效期、缺失身份与接入码、私钥不匹配和凭据不输出。
+`--self-signed` 使用 `deploy.sh --ip 127.0.0.1` 自动发证，并检查重复部署保留原证书、错误 IP 不会覆盖身份。Python 检查还会把实际 provisioner 的两个卷路径隔离到临时目录，使用真实 OpenSSL 检查 IPv4/IPv6、证书有效期、缺失身份与接入码、私钥不匹配和凭据不输出。这组检查需要支持 `x509 -checkip` 的 OpenSSL，优先使用 PATH 中的工具，否则尝试已安装的 Homebrew `openssl@3`；只有系统 LibreSSL 且没有等价工具时会明确跳过。Docker 镜像内使用 OpenSSL，不依赖宿主机 LibreSSL。
 
 `run-relay-certificate-checks.sh` 使用临时自签的非 CA 服务端证书和独立偏好域，检查 PEM/DER、SHA-256、IP/域名、有效期、服务端用途、按节点保存与损坏拒绝。原生回环检查增加证书获取、替换拒绝、取消及使用固定证书的控制/视频/数据路径；混合路径和 UDP 受阻模式也使用固定证书。不会更改系统信任或访问真实应用的偏好/凭据。系统信任服务、回环端口或视频服务受限时须单独报告限制。
 

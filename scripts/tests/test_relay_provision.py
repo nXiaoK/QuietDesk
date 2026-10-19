@@ -1,6 +1,8 @@
 import hashlib
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -11,6 +13,23 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class RelayProvisionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        candidates = [shutil.which("openssl")]
+        if shutil.which("brew"):
+            prefix = subprocess.run(["brew", "--prefix", "openssl@3"], capture_output=True, text=True)
+            if prefix.returncode == 0:
+                candidates.append(str(Path(prefix.stdout.strip()) / "bin/openssl"))
+        for candidate in filter(None, candidates):
+            if not Path(candidate).is_file():
+                continue
+            help_text = subprocess.run([candidate, "x509", "-help"], capture_output=True, text=True)
+            if "-checkip" in help_text.stdout + help_text.stderr:
+                cls.openssl_binary = candidate
+                cls.openssl_environment = {**os.environ, "PATH": str(Path(candidate).parent) + os.pathsep + os.environ.get("PATH", "")}
+                return
+        raise unittest.SkipTest("Relay provisioner checks require OpenSSL with x509 -checkip (OpenSSL 3 recommended)")
+
     def setUp(self):
         (ROOT / "work").mkdir(exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(prefix="relay-provision-check-", dir=ROOT / "work")
@@ -27,12 +46,12 @@ class RelayProvisionTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def provision(self, *arguments, success=True, archive=None):
-        result = subprocess.run(["sh", str(self.script), *arguments], input=archive, capture_output=True)
+        result = subprocess.run(["sh", str(self.script), *arguments], input=archive, capture_output=True, env=self.openssl_environment)
         self.assertEqual(result.returncode == 0, success, result.stderr.decode())
         return result
 
     def openssl(self, *arguments):
-        return subprocess.check_output(["openssl", *arguments], stderr=subprocess.DEVNULL)
+        return subprocess.check_output([self.openssl_binary, *arguments], stderr=subprocess.DEVNULL)
 
     def test_first_ip_deployment_generates_valid_identity_and_reuses_it(self):
         result = self.provision("--ip", "192.0.2.10")

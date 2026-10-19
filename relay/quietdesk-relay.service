@@ -1,0 +1,22 @@
+[Unit]
+Description=QuietDesk relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=quietdesk-relay
+Group=quietdesk-relay
+StateDirectory=quietdesk-relay
+StateDirectoryMode=0700
+ExecStart=/opt/quietdesk-relay/quietdesk-relay --listen :7443 --cert /etc/quietdesk-relay/fullchain.pem --key /etc/quietdesk-relay/privkey.pem --access-key-file /var/lib/quietdesk-relay/access.key --state /var/lib/quietdesk-relay/devices.json
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

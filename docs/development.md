@@ -65,6 +65,10 @@ python3 scripts/version.py current
 - **CI**：PR 面向 `main` 时运行 Python 版本检查、`QuietDeskChecks`、下方独立 App 检查、Universal 构建及应用元数据检查，也支持手动运行，不发布安装包。
 - **Build and release macOS**：推送 `main` 会触发；手动运行仅从 `main` 发布。它执行版本、Core 与独立 App 检查、Universal 构建、打包，随后创建标签并发布 Release。默认仍为临时签名、未公证。
 
+该推送流程也在 Linux 节点检查通过后调用 **Publish relay image**，用 `GITHUB_TOKEN` 和镜像 job 的 `packages: write` 权限向 GHCR 发布 Linux amd64、arm64 镜像。镜像名按仓库路径转成小写并追加 `-relay`，本仓库为 `ghcr.io/nxiaok/quietdesk-relay`。先发布 `sha-完整提交号`，再以构建产物的 digest 拉取，使用仅两个部署文件的临时目录验证手动证书、自签证书、TCP/UDP、身份保留和失败路径；全部通过后才把同一镜像标为 `latest` 与 `main`。摘要记录源码提交和可固定使用的 digest。源码提交标签表示构建来源，重新构建可能更新基础镜像，严格固定内容应使用 digest。
+
+镜像发布与 Mac 构建是同一推送流程中独立的后续 job，都等待原有节点检查；镜像 job 失败不绕过检查去更新 `latest`，也不改变 Mac job 原有的依赖和发布条件。PR CI 只检查，不登录 GHCR 或发布镜像。首次发布后如果包默认私有，维护者需在 GitHub Packages 设置为 Public 才能匿名拉取；已有同名包则需授予此仓库写入该包的 Actions 权限。无需增加 Docker Hub 密码或上传部署节点的私密材料。
+
 自动发布按正式版本标签分配版本：`auto` 首次使用配置的版本下限，之后递增补丁号；手动运行可选 `patch`、`minor`、`major`。构建号由基础值加工作流运行序号生成。流程串行执行，同次运行重跑会复用已分配标签；文件先上传到草稿后公开。发布前若 `main` 已有更新提交，旧任务跳过正式发布，由新提交继续处理。
 
 ## 运行检查
@@ -132,15 +136,16 @@ Docker 部署检查需要已运行的 Docker Engine、Compose v2.20+、Python 3 
 ```sh
 python3 scripts/check-relay-docker.py
 python3 scripts/check-relay-docker.py --self-signed
+python3 scripts/check-relay-docker.py --self-signed --image ghcr.io/nxiaok/quietdesk-relay@sha256:镜像摘要
 ```
 
 `--self-signed` 使用 `deploy.sh --ip 127.0.0.1` 自动发证，并检查重复部署保留原证书、错误 IP 不会覆盖身份。Python 检查还会把实际 provisioner 的两个卷路径隔离到临时目录，使用真实 OpenSSL 检查 IPv4/IPv6、证书有效期、缺失身份与接入码、私钥不匹配和凭据不输出。这组检查需要支持 `x509 -checkip` 的 OpenSSL，优先使用 PATH 中的工具，否则尝试已安装的 Homebrew `openssl@3`；只有系统 LibreSSL 且没有等价工具时会明确跳过。Docker 镜像内使用 OpenSSL，不依赖宿主机 LibreSSL。
 
 `run-relay-certificate-checks.sh` 使用临时自签的非 CA 服务端证书和独立偏好域，检查 PEM/DER、SHA-256、IP/域名、有效期、服务端用途、按节点保存与损坏拒绝。原生回环检查增加证书获取、替换拒绝、取消及使用固定证书的控制/视频/数据路径；混合路径和 UDP 受阻模式也使用固定证书。不会更改系统信任或访问真实应用的偏好/凭据。系统信任服务、回环端口或视频服务受限时须单独报告限制。
 
-它使用随机项目名、临时自签名证书和独立命名卷，检查非 root 运行、TLS/接入鉴权、TCP 与 UDP 双向转发、重复部署后的登记归属和接入码保留，以及无效证书拒绝。结束只删除该测试项目的卷和镜像，不接触正式节点；端口使用临时空闲端口。CI 和发布流程复用 Linux Docker 检查，发布任务在检查通过后继续；另用 Buildx/QEMU 交叉构建 Linux amd64、arm64 镜像，不自动发布镜像。模拟证书仅用于本机回环，不能用于正式客户端。
+Docker 检查使用随机项目名、临时自签名证书和独立命名卷，检查非 root 运行、TLS/接入鉴权、TCP 与 UDP 双向转发、重复部署后的登记归属和接入码保留，以及无效证书拒绝。默认从源码构建；`--image` 只复制 `deploy.sh` 和 `compose.image.yaml`，实际拉取指定镜像并验证无需 Go 源码。结束只删除该测试项目的卷，本地构建时还删除其测试镜像；外部传入的镜像保留，不接触正式节点。端口使用临时空闲端口。CI 和发布流程复用 Linux Docker 检查；PR 仍用 Buildx/QEMU 交叉构建两架构检查，main 的镜像发布由上面的独立 job 执行。模拟证书仅用于本机回环，不能用于正式客户端。
 
-`build-relay.sh` 除两份 Linux 程序包外，还会生成独立的 `QuietDesk-Relay-版本-Docker.tar.gz`。Docker 包只从 Git 跟踪清单选入中继 Go 源码、公开部署文件和许可证，包含各文件的 SHA-256、版本、源码提交及脏状态；证书、接入码、卷数据、构建缓存和本机配置不进入包。解压后无需完整 Mac 项目即可执行部署脚本。
+`build-relay.sh` 除两份 Linux 程序包外，还会生成含 Go 源码的 `QuietDesk-Relay-版本-Docker.tar.gz` 和仅含部署文件的 `QuietDesk-Relay-版本-Docker-Deploy.tar.gz`，四个归档均进入 `SHA256SUMS.txt`。源码 Docker 包从 Git 跟踪清单选择公开部署文件和中继 Go 源码；轻量包仅含 `deploy.sh`、`compose.image.yaml`、README、许可证与清单。清单包含文件 SHA-256、版本、源码提交及脏状态。证书、接入码、卷数据、构建缓存和本机配置不进入包。轻量目录默认拉取镜像；完整源码目录默认本地构建，加 `--pull` 可使用镜像。拉取在初始化身份前完成，失败不会重建服务；后续 run/up 禁止再次拉取。默认项目/卷名保持一致，模式切换保留状态。
 
 `--build-only` 只编译原生测试，不运行网络。混合路径测试的专用密文代理仅通过 ClientHello 中的 ALPN 区分视频角色，不持有桌面密钥；丢弃真实 TLS 视频记录，控制和可靠数据仍由真实 Peer 处理。节点测试只在显式临时 fixture 目录下生成测试证书与凭据，结束清理服务；不要把该目录放进源码包。
 

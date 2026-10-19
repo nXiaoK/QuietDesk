@@ -6,21 +6,54 @@
 
 准备一台双方可访问的 Linux 服务器（amd64 或 arm64）、Docker Engine 和 Docker Compose v2.20+，在云安全组和防火墙放行 **7443/TCP 与 7443/UDP**。可直接使用固定公网 IP，无需域名或提前申请证书。部署脚本不修改防火墙。
 
-下载并解压 `QuietDesk-Relay-版本-Docker.tar.gz`，进入解压目录，执行：
+### 拉取已发布镜像
+
+GitHub Actions 在 `main` 推送后自动构建并发布双架构镜像 `ghcr.io/nxiaok/quietdesk-relay`，服务器无需克隆仓库或编译。首次工作流成功后即可使用；如果 GHCR 包初始为 Private，仓库维护者需在 GitHub Packages 的 `quietdesk-relay` 包设置中将可见性改为 **Public**，之后服务器可匿名拉取。保持私有时，先由部署者按 GHCR 的方式登录 Docker。
+
+服务器只下载两个很小的部署文件：
+
+```sh
+mkdir -p quietdesk-relay
+cd quietdesk-relay
+curl -fsSL https://raw.githubusercontent.com/nXiaoK/QuietDesk/main/relay/compose.image.yaml -o compose.image.yaml
+curl -fsSL https://raw.githubusercontent.com/nXiaoK/QuietDesk/main/relay/deploy.sh -o deploy.sh
+sh deploy.sh --ip 你的服务器IP
+```
+
+脚本自动拉取适合服务器架构的镜像，配置身份并等待健康检查。部署目录中无需 Dockerfile、Go 源码或编译器。也可下载并解压发行版的 `QuietDesk-Relay-版本-Docker-Deploy.tar.gz`，在解压目录执行同一命令。
+
+镜像标签与固定版本：
+
+- `latest`、`main`：最近一次通过节点检查、双架构构建及已发布镜像部署检查的 main 镜像。
+- `sha-完整提交号`：对应源码提交的构建。工作流摘要提供具体镜像 digest；严格固定镜像内容时使用 `ghcr.io/nxiaok/quietdesk-relay@sha256:…`，因为重新构建同一提交可能更新基础镜像。
+
+```sh
+QUIETDESK_RELAY_IMAGE=ghcr.io/nxiaok/quietdesk-relay:sha-完整提交号 sh deploy.sh --ip 你的服务器IP
+```
+
+固定提交时，下载 URL 中的 `main` 也替换成相同提交号，以便配置与镜像配套。首次发布未完成或拉取失败时，脚本会在配置身份和重启服务之前停止。每次部署先拉取一次选定镜像，准备与服务启动均禁止再次拉取，避免同一脚本因再次拉取移动标签而使用不同版本。
+
+### 从源码构建
+
+原有 `QuietDesk-Relay-版本-Docker.tar.gz` 包和仓库内的源码构建方式继续可用：
 
 ```sh
 ./deploy.sh --ip 你的服务器IP
 ```
 
-将参数替换为实际 IPv4 或 IPv6 地址，不附端口，IPv6 不加方括号。首次生成有效期 365 天、RSA 3072/SHA-256、包含该 IP SAN 和 serverAuth 用途的自签 TLS 证书；私钥仅保留在私有 tls 卷内。终端输出公开的 SHA-256 证书指纹，**不输出私钥和接入码**。重复执行会复用原证书；IP 不匹配、证书过期或证书/私钥缺一时拒绝自动替换。已有接入码或登记表但整个 TLS 身份丢失时，也拒绝重新发证；须恢复备份，或明确提供新证书并在客户端重新核对信任。
+在完整源码目录中，`deploy.sh` 默认仍使用 `compose.yaml` 构建本机架构镜像；在仓库根目录使用 `./relay/deploy.sh`，参数相同。加 `--pull`（例如 `./relay/deploy.sh --pull --ip 服务器IP`）可显式切换到已发布镜像。只有部署文件的目录会自动使用 `compose.image.yaml` 拉取镜像。
 
-从源码部署时，在仓库根目录使用 `./relay/deploy.sh`，参数相同。执行账户须能访问 Docker 引擎，并能联网拉取基础镜像；服务器不需要安装 Go、Swift 或 Python。脚本从源码构建本机架构的镜像，随机生成节点接入码、启动服务并等待真实健康检查通过。不将宿主机目录或 Docker socket 挂进容器。
+两种方式都不要求服务器安装 Go、Swift 或 Python；源码方式需要下载构建基础镜像，镜像方式只下载运行镜像。不将宿主机目录或 Docker socket 挂进容器。
 
-在服务器终端查看指纹，或只导出公开证书供客户端导入：
+### 身份与客户端配置
+
+将 IP 参数替换为实际 IPv4 或 IPv6 地址，不附端口，IPv6 不加方括号。首次生成有效期 365 天、RSA 3072/SHA-256、包含该 IP SAN 和 serverAuth 用途的自签 TLS 证书；私钥仅保留在私有 tls 卷内。终端输出公开的 SHA-256 证书指纹，**不输出私钥和接入码**。重复执行会复用原证书；IP 不匹配、证书过期或证书/私钥缺一时拒绝自动替换。已有接入码或登记表但整个 TLS 身份丢失时，也拒绝重新发证；须恢复备份，或明确提供新证书并在客户端重新核对信任。
+
+以下运维示例使用镜像部署的 `compose.image.yaml`；源码构建部署时改用 `compose.yaml`。在服务器终端查看指纹，或只导出公开证书供客户端导入：
 
 ```sh
-docker compose exec -T relay openssl x509 -in /etc/quietdesk-relay/fullchain.pem -noout -fingerprint -sha256
-docker compose exec -T relay openssl x509 -in /etc/quietdesk-relay/fullchain.pem -outform PEM > node-certificate.pem
+docker compose -f compose.image.yaml exec -T relay openssl x509 -in /etc/quietdesk-relay/fullchain.pem -noout -fingerprint -sha256
+docker compose -f compose.image.yaml exec -T relay openssl x509 -in /etc/quietdesk-relay/fullchain.pem -outform PEM > node-certificate.pem
 ```
 
 两台 Mac 使用支持节点证书信任的 QuietDesk 版本，填写 `tls://你的服务器IP:7443`（IPv6 写作 `tls://[IPv6地址]:7443`），在“中继设置”导入该公开证书，或获取证书后与服务器终端的 SHA-256 指纹核对，再保存信任。无需导入系统钥匙串或修改系统信任。地址、证书有效期和保存的节点证书仍会校验；接入码和 Mac 配对认证仍独立执行。
@@ -28,50 +61,46 @@ docker compose exec -T relay openssl x509 -in /etc/quietdesk-relay/fullchain.pem
 已有域名/证书的部署方式继续可用，例如：
 
 ```sh
-./deploy.sh /etc/letsencrypt/live/relay.example.com/fullchain.pem \
+sh deploy.sh /etc/letsencrypt/live/relay.example.com/fullchain.pem \
   /etc/letsencrypt/live/relay.example.com/privkey.pem
 ```
 
-证书链须匹配实际 IP 或域名，私钥不带密码，执行账户需有读取权限。路径允许使用证书管理器创建的符号链接；脚本通过标准输入传入证书。
-
-启动后进入包含 `compose.yaml` 的目录，**在私人终端**获取节点接入码：
+证书链须匹配实际 IP 或域名，私钥不带密码，执行账户需有读取权限。路径允许使用证书管理器创建的符号链接；脚本通过标准输入传入证书。在部署目录中，**使用私人终端**获取节点接入码：
 
 ```sh
-docker compose exec -T relay cat /var/lib/quietdesk-relay/access.key
+docker compose -f compose.image.yaml exec -T relay cat /var/lib/quietdesk-relay/access.key
 ```
 
 两台 Mac 的“中继设置”均填写相同节点地址与此接入码。被控端开启共享，控制端选择“仅中继”，填写被控端设备标识和原有 Mac 配对码。接入码不能代替 Mac 配对码。
+
+### 端口与运维
 
 如需公网端口 443，在每次部署或运维前设置同一环境变量；它同时映射 TCP 和 UDP，容器内仍监听 7443：
 
 ```sh
 export QUIETDESK_RELAY_PORT=443
-./deploy.sh /path/to/fullchain.pem /path/to/privkey.pem
+sh deploy.sh --ip 你的服务器IP
 ```
 
-自动发证方式同样可用 `export QUIETDESK_RELAY_PORT=443` 加 `./deploy.sh --ip 你的服务器IP`。此时客户端地址端口也改成 443。普通 HTTP/Nginx `location` 反向代理不能转发此协议。健康端点只在容器回环监听，没有向宿主机发布 9091 端口：
+此时客户端地址端口也改成 443。普通 HTTP/Nginx `location` 反向代理不能转发此协议。健康端点只在容器回环监听，没有向宿主机发布 9091 端口：
 
 ```sh
-docker compose ps
-docker compose logs --tail 100 relay
-docker compose exec -T relay wget -qO- http://127.0.0.1:9091/healthz
-docker compose stop relay
-docker compose start relay
+docker compose -f compose.image.yaml ps
+docker compose -f compose.image.yaml logs --tail 100 relay
+docker compose -f compose.image.yaml exec -T relay wget -qO- http://127.0.0.1:9091/healthz
+docker compose -f compose.image.yaml stop relay
+docker compose -f compose.image.yaml start relay
 ```
 
-容器以固定 UID/GID `65532:65532` 运行，根文件系统只读且移除 Linux capabilities。首次创建的 Docker 命名卷自动使用正确属主与私有权限：`quietdesk-relay_state` 保存接入密钥和 `devices.json`，`quietdesk-relay_tls` 保存证书链与私钥；不写入镜像或安装包。日志自动轮转。默认项目名固定为 `quietdesk-relay`，换目录升级仍复用原卷；如使用 `COMPOSE_PROJECT_NAME` 隔离多个节点，后续所有命令必须保持相同项目名。
+容器以固定 UID/GID `65532:65532` 运行，根文件系统只读且移除 Linux capabilities。首次创建的 Docker 命名卷自动使用正确属主与私有权限：`quietdesk-relay_state` 保存接入密钥和 `devices.json`，`quietdesk-relay_tls` 保存证书链与私钥；不写入镜像或安装包。日志自动轮转。默认项目名固定为 `quietdesk-relay`，换目录升级或在源码/镜像模式间切换仍复用原卷；如使用 `COMPOSE_PROJECT_NAME` 隔离多个节点，后续所有命令必须保持相同项目名。
 
-**更新、证书续期与回退：**先停止服务并备份这两个命名卷（含属主和权限），保留旧镜像及其源码/Compose 配置。更新源码或解压新 Docker 包后重跑同一部署命令；它保留已有接入密钥和登记表，更新证书并重建容器。此操作和重启会中断中继会话。证书管理器续期不会自动更新容器里的证书副本，需再次执行部署命令。证书不匹配、过期、密钥丢失且仍有登记表、状态损坏或不兼容会报错，不自动清空旧状态。
+**更新、证书续期与回退：**先停止服务并备份这两个命名卷（含属主和权限），记录旧镜像 digest 并保留其配套部署文件。镜像部署重跑 `sh deploy.sh --ip 服务器IP` 即会拉取当前选择的镜像并重建容器；源码方式更新源码后重跑。两者保留已有证书、接入密钥和登记表；手动传入新证书时才替换证书。重建和重启会中断中继会话。证书管理器续期不会自动更新容器里的证书副本，需再次执行部署命令。证书不匹配、过期、密钥丢失且仍有登记表、状态损坏或不兼容会报错，不自动清空旧状态。
 
-可在升级前用 `docker image tag quietdesk-relay:local quietdesk-relay:previous` 保留镜像。回退时先停止服务，恢复旧版源码/Compose 配置及必要的卷备份，再执行：
-
-```sh
-QUIETDESK_RELAY_IMAGE=quietdesk-relay:previous docker compose up -d --no-build --force-recreate --wait relay
-```
+镜像部署可用 `docker compose -f compose.image.yaml images` 查实际使用的镜像，再用 `docker image inspect 镜像 --format '{{json .RepoDigests}}'` 保存 digest。回退时使用旧版部署文件，把 `QUIETDESK_RELAY_IMAGE` 指向保留的旧 digest，重跑部署命令。源码方式可用 `docker image tag quietdesk-relay:local quietdesk-relay:previous` 保留旧镜像，再使用旧版配置和 `QUIETDESK_RELAY_IMAGE=quietdesk-relay:previous docker compose up -d --no-build --force-recreate --wait relay` 回退。
 
 同一状态格式可继续使用原卷；跨格式回退必须遵循对应版本迁移说明。`docker compose down` 保留卷；**不要执行 `down -v`、删除卷或清空登记表来排障**。从原 systemd 安装迁移时，先停旧节点，将原接入密钥和登记表一起导入 state 卷，保持目录 `0700`、文件 `0600`、属主 `65532:65532`，再部署；不要用全新节点覆盖旧身份数据。
 
-镜像可用 Buildx 交叉构建：`docker buildx build --platform linux/amd64,linux/arm64 -o type=oci,dest=quietdesk-relay.oci.tar .`。本项目提供本地构建流程，未自动推送镜像或发布到镜像仓库。
+镜像也可在源码 `relay/` 中用 Buildx 交叉构建：`docker buildx build --platform linux/amd64,linux/arm64 -o type=oci,dest=quietdesk-relay.oci.tar .`。Actions 使用仓库的 `GITHUB_TOKEN` 和仅镜像发布 job 的 `packages: write` 权限发布到 GHCR，不需要添加 Docker Hub 密码或将任何节点证书、接入码上传到 GitHub。
 
 ## 构建
 
@@ -82,7 +111,7 @@ QUIETDESK_RELAY_IMAGE=quietdesk-relay:previous docker compose up -d --no-build -
 ./scripts/run-relay-server-checks.sh
 ```
 
-默认在 `outputs/relay/` 生成 Linux amd64、arm64 两份静态程序，以及各架构的 `.tar.gz` 安装包、独立 Docker 源码部署包和 `SHA256SUMS.txt`。程序归档包含程序、部署说明、systemd 模板、许可证和含程序 SHA-256 的清单；Docker 包包含独立构建所需的 Go 源码、Compose 和部署脚本。均不包含证书、私钥、接入码或设备状态。程序包解压后可将 `quietdesk-relay` 安装到模板指定位置。构建使用 Python 3 打包，服务器运行只需要程序本身。编译缓存保留在 `work/relay-build/`。只构建节点不需要 Swift。只构建原有 Mac 客户端不需要 Go。
+默认在 `outputs/relay/` 生成 Linux amd64、arm64 两份静态程序，以及各架构的 `.tar.gz` 安装包、Docker 源码包、Docker 轻量部署包和 `SHA256SUMS.txt`。程序归档包含程序、部署说明、systemd 模板、许可证和含程序 SHA-256 的清单；Docker 源码包包含独立构建所需的 Go 源码、Compose 和部署脚本；`Docker-Deploy` 轻量包只含拉取镜像的部署文件、说明和清单。均不包含证书、私钥、接入码或设备状态。程序包解压后可将 `quietdesk-relay` 安装到模板指定位置。构建使用 Python 3 打包，服务器运行只需要程序本身。编译缓存保留在 `work/relay-build/`。只构建节点不需要 Swift。只构建原有 Mac 客户端不需要 Go。
 
 ## 配置与启动
 

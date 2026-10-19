@@ -13,19 +13,21 @@ import tempfile
 from version import ROOT, current, parse_version
 
 
-def package_docker(root, output, version, revision, dirty):
-    name = f"QuietDesk-Relay-{version}-Docker"
-    public = {"Dockerfile", ".dockerignore", "compose.yaml", "deploy.sh", "docker/provision.sh", "README.md", "go.mod"}
+def package_docker(root, output, version, revision, dirty, include_source=True):
+    name = f"QuietDesk-Relay-{version}-Docker" + ("" if include_source else "-Deploy")
+    public = {"compose.image.yaml", "deploy.sh", "README.md"}
+    if include_source:
+        public |= {"Dockerfile", ".dockerignore", "compose.yaml", "docker/provision.sh", "go.mod"}
     tracked = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z", "--", "relay"], text=True).split("\0")
     sources = {}
     for item in filter(None, tracked):
         relative = Path(item).relative_to("relay").as_posix()
-        if relative in public or relative.endswith(".go"):
+        if relative in public or (include_source and relative.endswith(".go")):
             source = root / item
             if source.is_symlink() or not source.is_file():
                 raise ValueError("Docker source must be a regular file: " + item)
             sources[relative] = source
-    required = public | {"cmd/quietdesk-relay/main.go", "server.go", "privatefile.go", "protocol.go"}
+    required = public | ({"cmd/quietdesk-relay/main.go", "server.go", "privatefile.go", "protocol.go"} if include_source else set())
     if not required.issubset(sources):
         raise ValueError("Docker deployment files must be tracked before packaging")
     sources["LICENSE"] = root / "LICENSE"
@@ -91,6 +93,7 @@ def package(output, version):
                         raise ValueError("Unexpected relay package link")
             names.append(archive.name)
     names.append(package_docker(ROOT, output, version, revision, dirty))
+    names.append(package_docker(ROOT, output, version, revision, dirty, include_source=False))
     (output / "SHA256SUMS.txt").write_text("".join(hashlib.sha256((output / name).read_bytes()).hexdigest() + "  " + name + "\n" for name in names))
     for name in [*names, "SHA256SUMS.txt"]:
         print(output / name)

@@ -21,6 +21,12 @@ concurrency:
 jobs:
   relay-docker:
     uses: ./.github/workflows/relay-docker.yml
+  relay-image:
+    needs: relay-docker
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/relay-image.yml
   release:
     needs: relay-docker
     if: github.ref == 'refs/heads/main'

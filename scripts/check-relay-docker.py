@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise Docker deployment with isolated volumes and temporary TLS credentials."""
 
+import argparse
 import base64
 from contextlib import ExitStack
 import hmac
@@ -8,11 +9,11 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import socket
 import ssl
 import struct
 import subprocess
-import sys
 import tempfile
 
 
@@ -44,11 +45,23 @@ def read_message(connection, operation):
 
 
 def main():
-    automatic = "--self-signed" in sys.argv
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--self-signed", action="store_true")
+    parser.add_argument("--image", help="pull and test an existing image with only deployment files, without Go sources")
+    arguments = parser.parse_args()
+    automatic = arguments.self_signed
     subprocess.run(["docker", "info"], check=True, stdout=subprocess.DEVNULL)
     (ROOT / "work").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="relay-docker-checks-", dir=ROOT / "work") as temporary:
         directory = Path(temporary)
+        deployment = ROOT / "relay"
+        configuration = deployment / "compose.yaml"
+        if arguments.image:
+            deployment = directory / "deployment"
+            deployment.mkdir()
+            for filename in ["deploy.sh", "compose.image.yaml"]:
+                shutil.copy2(ROOT / "relay" / filename, deployment / filename)
+            configuration = deployment / "compose.image.yaml"
         certificate, key = directory / "fullchain.pem", directory / "privkey.pem"
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
                         "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost",
@@ -61,20 +74,24 @@ def main():
             udp.bind(("127.0.0.1", port))
         project = "qdr-check-" + secrets.token_hex(6)
         environment = {**os.environ, "COMPOSE_PROJECT_NAME": project, "QUIETDESK_RELAY_PORT": str(port),
-                       "QUIETDESK_RELAY_IMAGE": project + ":test"}
+                       "QUIETDESK_RELAY_IMAGE": arguments.image or project + ":test"}
 
         def compose(*arguments, **options):
-            return subprocess.run(["docker", "compose", "-f", str(ROOT / "relay/compose.yaml"), *arguments],
+            return subprocess.run(["docker", "compose", "-f", str(configuration), *arguments],
                                   env=environment, check=True, text=True, capture_output=True, timeout=180, **options).stdout
 
         def deploy(success=True, manual=False, ip="127.0.0.1"):
             arguments = ["--ip", ip] if automatic and not manual else [str(certificate), str(key)]
-            result = subprocess.run(["sh", str(ROOT / "relay/deploy.sh"), *arguments],
+            result = subprocess.run(["sh", str(deployment / "deploy.sh"), *arguments],
                                     env=environment, text=True, capture_output=True, timeout=600)
             if (result.returncode == 0) != success:
                 raise RuntimeError("Unexpected deployment result:\n" + result.stdout[-4000:] + result.stderr[-4000:])
 
         try:
+            if arguments.image:
+                require({path.name for path in deployment.iterdir()} == {"deploy.sh", "compose.image.yaml"}, "Image fixture contains application sources")
+                services = json.loads(compose("--profile", "tools", "config", "--format", "json"))["services"]
+                require(all("build" not in service for service in services.values()), "Image deployment can build local sources")
             deploy()
             if automatic:
                 certificate.write_text(compose("exec", "-T", "relay", "openssl", "x509", "-in", "/etc/quietdesk-relay/fullchain.pem", "-outform", "PEM"))
@@ -170,7 +187,8 @@ def main():
         finally:
             # Only this randomly named fixture project may have its volumes removed.
             compose("--profile", "tools", "down", "--volumes", "--remove-orphans")
-            subprocess.run(["docker", "image", "rm", project + ":test"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not arguments.image:
+                subprocess.run(["docker", "image", "rm", project + ":test"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

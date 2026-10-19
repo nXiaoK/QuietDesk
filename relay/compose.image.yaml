@@ -1,0 +1,40 @@
+name: quietdesk-relay
+
+x-image: &image
+  image: ${QUIETDESK_RELAY_IMAGE:-ghcr.io/nxiaok/quietdesk-relay:latest}
+  user: "65532:65532"
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,mode=1777
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  relay:
+    <<: *image
+    restart: unless-stopped
+    ports:
+      - "${QUIETDESK_RELAY_PORT:-7443}:7443/tcp"
+      - "${QUIETDESK_RELAY_PORT:-7443}:7443/udp"
+    volumes:
+      - state:/var/lib/quietdesk-relay
+      - tls:/etc/quietdesk-relay:ro
+  provision:
+    <<: *image
+    profiles: [tools]
+    entrypoint: [/usr/local/bin/provision-relay]
+    command: []
+    healthcheck:
+      disable: true
+    volumes:
+      - state:/var/lib/quietdesk-relay
+      - tls:/etc/quietdesk-relay
+
+volumes:
+  state:
+  tls:

@@ -40,6 +40,7 @@ fi
 cat > "$check_root/server.py" <<'PY'
 import http.server
 import pathlib
+import socketserver
 import sys
 import time
 import urllib.parse
@@ -75,7 +76,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+class Server(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind does a reverse DNS lookup that can stall CI runners.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = '127.0.0.1', self.server_address[1]
+
+server = Server(('127.0.0.1', 0), Handler)
 (root / 'server-port').write_text(str(server.server_port))
 server.serve_forever()
 PY
@@ -83,11 +90,13 @@ rm -f "$check_root/server-port"
 python3 "$check_root/server.py" "$check_root" > "$check_root/server.log" 2>&1 &
 server_pid=$!
 trap 'kill "$server_pid" 2>/dev/null || true' EXIT
-for _ in {1..100}; do
-    if [[ -f "$check_root/server-port" ]]; then break; fi
+for _ in {1..600}; do
+    if [[ -s "$check_root/server-port" ]]; then break; fi
+    if ! kill -0 "$server_pid" 2>/dev/null; then break; fi
     sleep 0.05
 done
-if [[ ! -f "$check_root/server-port" ]]; then
+if [[ ! -s "$check_root/server-port" ]]; then
+    echo "Loopback update fixture did not start" >&2
     cat "$check_root/server.log" >&2
     exit 1
 fi

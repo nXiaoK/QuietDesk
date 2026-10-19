@@ -55,6 +55,8 @@ private struct UpdateInstallerChecks {
     static let bundleID = "local.quietdesk.checks.updater"
 
     static func main() async {
+        // Keep progress visible in CI logs if a later check stops the process.
+        setvbuf(stdout, nil, _IOLBF, 0)
         let fixtureCache = (Bundle.main.object(forInfoDictionaryKey: "UpdateCheckCache") as? String).map { URL(fileURLWithPath: $0) }
         if CommandLine.arguments.contains("--quietdesk-install-update-v1"),
            Bundle.main.object(forInfoDictionaryKey: "UpdateCheckDelayReadiness") as? Bool == true,

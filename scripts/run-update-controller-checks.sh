@@ -42,6 +42,7 @@ rm -f "$port_file"
 python3 -u - "$check_root/http-root" "$port_file" > "$check_root/http-server.log" 2>&1 <<'PYHTTP' &
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import socketserver
 import sys
 import time
 
@@ -79,7 +80,13 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+class Server(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind does a reverse DNS lookup that can stall CI runners.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "127.0.0.1", self.server_address[1]
+
+server = Server(("127.0.0.1", 0), Handler)
 Path(sys.argv[2]).write_text(str(server.server_address[1]))
 server.serve_forever()
 PYHTTP
@@ -90,7 +97,7 @@ cleanup() {
     rm -f "$port_file" "$check_root/http-root/feed.json"
 }
 trap cleanup EXIT
-for _ in {1..100}; do
+for _ in {1..600}; do
     if [[ -s "$port_file" ]]; then break; fi
     if ! kill -0 "$http_server_pid" 2>/dev/null; then cat "$check_root/http-server.log"; exit 1; fi
     sleep 0.05

@@ -4,6 +4,7 @@ umask 077
 
 staging="$(mktemp -d)"
 temporary_key=''
+state=/var/lib/quietdesk-relay
 trap 'rm -rf "$staging"; if [ -n "$temporary_key" ]; then rm -f "$temporary_key"; fi' EXIT
 if [ "$#" -eq 2 ] && [ "$1" = --ip ]; then
     case "$2" in
@@ -15,6 +16,10 @@ if [ "$#" -eq 2 ] && [ "$1" = --ip ]; then
         echo 'Incomplete TLS identity; restore both certificate and private key.' >&2
         exit 1
     else
+        if [ -e "$state/access.key" ] || [ -L "$state/access.key" ] || [ -e "$state/devices.json" ] || [ -L "$state/devices.json" ]; then
+            echo 'Existing relay state has no TLS identity; restore it or provide a replacement certificate explicitly.' >&2
+            exit 1
+        fi
         openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 365 \
             -subj '/CN=QuietDesk Relay' -addext "subjectAltName=IP:$2" \
             -addext 'basicConstraints=critical,CA:FALSE' \
@@ -43,7 +48,6 @@ if ! cmp -s "$staging/cert-public.pem" "$staging/key-public.pem"; then
     exit 1
 fi
 
-state=/var/lib/quietdesk-relay
 if [ ! -e "$state/access.key" ] && [ ! -L "$state/access.key" ]; then
     if [ -e "$state/devices.json" ] || [ -L "$state/devices.json" ]; then
         echo 'Device registry exists without an access key; restore the original access key first.' >&2

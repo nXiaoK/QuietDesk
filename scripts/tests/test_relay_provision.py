@@ -75,6 +75,11 @@ class RelayProvisionTests(unittest.TestCase):
         self.provision("--ip", "192.0.2.10", success=False)
         self.assertFalse((self.state / "access.key").exists())
         self.assertFalse((self.tls / "fullchain.pem").exists())
+        (self.state / "devices.json").unlink()
+        (self.state / "access.key").write_text("existing access fixture")
+        self.provision("--ip", "192.0.2.10", success=False)
+        self.assertFalse((self.tls / "fullchain.pem").exists())
+        self.assertEqual((self.state / "access.key").read_text(), "existing access fixture")
 
     def test_expired_identity_and_manual_mismatch_preserve_installed_files(self):
         self.provision("--ip", "192.0.2.10")

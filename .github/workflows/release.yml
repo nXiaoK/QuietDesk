@@ -34,6 +34,8 @@ jobs:
         env:
           INCREMENT: ${{ inputs.increment || 'auto' }}
         run: python3 scripts/version.py next --increment "$INCREMENT" --github-output
+      - name: Verify relay build toolchain
+        run: go version
       - name: Run project checks
         run: ./scripts/run-all-checks.sh
       - name: Build Universal application
@@ -43,6 +45,10 @@ jobs:
         run: ./build-app.sh
       - name: Package DMG, ZIP and source
         run: python3 scripts/package-app.py
+      - name: Build Linux relay packages
+        env:
+          QUIETDESK_VERSION: ${{ steps.version.outputs.version }}
+        run: ./scripts/build-relay.sh
       - name: Save packages
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -51,6 +57,8 @@ jobs:
             dist/*.dmg
             dist/*.zip
             dist/SHA256SUMS-*.txt
+            outputs/relay/*.tar.gz
+            outputs/relay/SHA256SUMS.txt
           if-no-files-found: error
       - name: Tag and publish release
         env:
@@ -80,7 +88,8 @@ jobs:
             "dist/QuietDesk-$RELEASE_VERSION-macOS-universal.dmg" \
             "dist/QuietDesk-$RELEASE_VERSION-macOS-universal.zip" \
             "dist/QuietDesk-$RELEASE_VERSION-Source.zip" \
-            "dist/SHA256SUMS-$RELEASE_VERSION.txt"
+            "dist/SHA256SUMS-$RELEASE_VERSION.txt" \
+            outputs/relay/*.tar.gz outputs/relay/SHA256SUMS.txt
           if [[ "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" == true ]]; then
             gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$RELEASE_LATEST"
           fi

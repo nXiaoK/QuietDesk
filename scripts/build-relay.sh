@@ -8,4 +8,5 @@ for relay_arch in amd64 arm64; do
     CGO_ENABLED=0 GOOS=linux GOARCH="$relay_arch" go build -trimpath -buildvcs=false \
         -o "$relay_output/quietdesk-relay-linux-$relay_arch" ./cmd/quietdesk-relay
 done
-cp README.md quietdesk-relay.service "$relay_output/"
+cp README.md quietdesk-relay.service ../LICENSE "$relay_output/"
+python3 ../scripts/package-relay.py "$relay_output"

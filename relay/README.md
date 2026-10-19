@@ -1,6 +1,6 @@
 # QuietDesk 自托管中继节点
 
-节点使用 Go 标准库，可编译成 Linux 单一可执行文件，不在 Mac 客户端引入 Go 或第三方运行时。当前协议版本为 1。客户端接入与界面仍需结合对应版本的实现和验收记录查看，节点能够运行不代表整项中继功能已交付。
+节点使用 Go 标准库，可编译成 Linux 单一可执行文件，不在 Mac 客户端引入 Go 或第三方运行时。当前协议版本为 1。两端配置和连接策略见 [Mac 中继指南](../docs/relay.md)；独立安装包内按下文配置节点，再在两台 Mac 的“中继设置”保存同一节点地址和接入码。
 
 ## 构建
 
@@ -11,7 +11,7 @@
 ./scripts/run-relay-server-checks.sh
 ```
 
-默认在 `outputs/relay/` 生成 Linux amd64、arm64 两份静态程序，编译缓存保留在 `work/relay-build/`。只构建节点不需要 Swift。只构建原有 Mac 客户端不需要 Go。
+默认在 `outputs/relay/` 生成 Linux amd64、arm64 两份静态程序，以及各架构的 `.tar.gz` 安装包和 `SHA256SUMS.txt`。归档包含程序、部署说明、systemd 模板、许可证和含程序 SHA-256 的清单；不包含证书、私钥、接入码或设备状态。解压后可将 `quietdesk-relay` 安装到模板指定位置。构建使用 Python 3 打包，服务器运行只需要程序本身。编译缓存保留在 `work/relay-build/`。只构建节点不需要 Swift。只构建原有 Mac 客户端不需要 Go。
 
 ## 配置与启动
 
@@ -25,7 +25,7 @@ mkdir -p relay-state
 chmod 700 relay-state
 openssl rand -hex 32 > relay-state/access.key
 chmod 600 relay-state/access.key
-./quietdesk-relay-linux-amd64 \
+./quietdesk-relay \
   --listen :7443 \
   --cert /etc/quietdesk-relay/fullchain.pem \
   --key /etc/quietdesk-relay/privkey.pem \
@@ -66,3 +66,9 @@ curl --fail http://127.0.0.1:9091/healthz
 ## 验证范围
 
 服务端检查使用临时证书与凭据和本机回环，包含鉴权、设备接管拒绝、状态保留、可靠字节流双向转发、故障清理、UDP 鉴权/重放/重绑定、资源边界和竞态检查。Linux 两架构交叉编译不等于已在真实 Linux 节点部署，更不等于双机公网画面和输入已验收。
+
+## 停止与回退
+
+使用 systemd 安装后，`sudo systemctl stop quietdesk-relay` 停止服务，`sudo systemctl restart quietdesk-relay` 载入替换后的程序和证书；运行状态用 `systemctl status` 与回环健康端点核对。回退时停止服务、恢复保留的旧程序，再使用同一设备状态和接入密钥启动。不要删除 `devices.json` 来处理网络问题。协议 v1 的未知状态格式会阻止启动；升级涉及状态格式时须先按对应版本的迁移说明执行，不能直接覆盖生产状态。
+
+安装包清单记录源码提交和构建时工作树是否含未提交内容；候选构建的脏状态不能当作某个干净提交的正式发布。

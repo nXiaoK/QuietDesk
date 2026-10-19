@@ -5,6 +5,7 @@
 ## 环境
 
 - macOS 14+、Apple Command Line Tools、Swift 5.9+、Python 3。
+- 全项目检查及中继 Linux 包需 Go 1.25+；只构建 Mac 应用不需要 Go。CI 使用 macOS runner 自带 Go，打印实际版本，模块声明约束最低版本。
 - 原生 SwiftUI/AppKit 项目，使用 Swift Package Manager，不依赖第三方运行时包；不要求安装完整 Xcode。
 - `Sources/QuietDesk` 为应用界面、采集和输入，`Sources/QuietDeskCore` 为协议、传输、编解码及可测试逻辑。
 
@@ -109,3 +110,22 @@ QUIETDESK_CHECK_BUILD_DIR="$PWD/.build/clipboard-checks" ./scripts/run-app-check
 这些自动检查不操作真实系统剪贴板、钥匙串或登录项，不录屏，也不实际开启静音或防窥。它们不能代替真实两台 Mac 上的权限延续、屏幕采集、输入、文件粘贴、自启及网络测试；Universal 编译通过也不等于已在 Intel 或 macOS 14 实机验证。
 
 本页说明运行方法，不记录本轮执行结果。[BUILD-AND-CHECKS.md](../BUILD-AND-CHECKS.md) 保留的是 0.6.1 等历史记录，不能作为当前源码或本地候选版的验收结论；已发布包及 CI 结果以对应 Releases、Actions 记录为准。
+
+## 中继开发与检查
+
+`./scripts/run-all-checks.sh` 也运行节点 vet/race、连接记录隔离和原生端到端回环测试；需要允许本机回环端口及系统视频服务。可单独执行：
+
+```sh
+./scripts/run-relay-server-checks.sh
+./scripts/run-relay-connection-checks.sh
+./scripts/run-relay-client-checks.sh
+./scripts/run-relay-client-checks.sh --udp-blocked
+./scripts/run-relay-client-checks.sh --private-udp-port
+./scripts/run-relay-client-checks.sh --mixed
+./scripts/run-relay-client-checks.sh --mixed-blocked
+./scripts/build-relay.sh
+```
+
+`--build-only` 只编译原生测试，不运行网络。混合路径测试的专用密文代理仅通过 ClientHello 中的 ALPN 区分视频角色，不持有桌面密钥；丢弃真实 TLS 视频记录，控制和可靠数据仍由真实 Peer 处理。节点测试只在显式临时 fixture 目录下生成测试证书与凭据，结束清理服务；不要把该目录放进源码包。
+
+实现位于 `relay/`、Core 的 `Relay*` 传输桥，以及可选的媒体能力协商。所有新增媒体字段可选，默认不启用混合恢复；业务模型只在显式配置并匹配目标标识后提供候选。协议细节见 [中继协议](relay-protocol.md)。

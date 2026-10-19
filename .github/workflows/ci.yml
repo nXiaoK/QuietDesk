@@ -20,10 +20,14 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - name: Verify relay build toolchain
+        run: go version
       - name: Run project checks
         run: ./scripts/run-all-checks.sh
       - name: Build Universal application
         run: ./build-app.sh
+      - name: Build Linux relay packages
+        run: ./scripts/build-relay.sh
       - name: Check application metadata
         run: |
           plutil -lint dist/QuietDesk.app/Contents/Info.plist

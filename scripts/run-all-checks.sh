@@ -18,3 +18,9 @@ build_directory="$("${swift_build[@]}" --show-bin-path)"
 for script in app input caps-lock video cursor session-data session-effects traffic log credential permission media-transport media-session media-blackhole; do
     "./scripts/run-$script-checks.sh"
 done
+./scripts/run-relay-server-checks.sh
+./scripts/run-relay-connection-checks.sh
+for relay_mode in normal --udp-blocked --private-udp-port --mixed --mixed-blocked; do
+    if [[ "$relay_mode" == normal ]]; then ./scripts/run-relay-client-checks.sh
+    else ./scripts/run-relay-client-checks.sh "$relay_mode"; fi
+done

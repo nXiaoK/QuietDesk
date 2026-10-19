@@ -36,6 +36,8 @@ final class ViewerSession {
     var usesRelayControl = false
     var transportHost: String?
     var transportPort: UInt16?
+    var relayTargetVerified = false
+    var relayFallbackRequested = false
     var cursorRequestID: UUID?
     var cursorRequestedEnabled = false
     var cursorTimeout: Task<Void, Never>?

@@ -175,7 +175,9 @@ public struct Hello: Codable, Sendable {
     public let sessionPause: Bool?
     public let mediaTransportV1: Bool?
     public let independentCursorV1: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil) {
+    public let relayTransportV1: Bool?
+    public let relayDeviceID: UUID?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -195,6 +197,8 @@ public struct Hello: Codable, Sendable {
         self.sessionPause = sessionPause
         self.mediaTransportV1 = mediaTransportV1
         self.independentCursorV1 = independentCursorV1
+        self.relayTransportV1 = relayTransportV1
+        self.relayDeviceID = relayDeviceID
     }
 
     public func validate() throws {

@@ -15,21 +15,24 @@ public struct MediaControl: Codable, Sendable {
     public let path: String?
     public let mediaFailure: Bool?
     public let encodeMilliseconds: Double?
+    public let relayRouting: Bool?
 
     public init(_ operation: Operation, sessionID: UUID? = nil, token: Data? = nil,
                 datagramKey: Data? = nil, role: MediaChannelRole? = nil, transactionID: UUID? = nil,
                 transportEpoch: UInt32? = nil, codecEpoch: UInt32? = nil, path: String? = nil,
-                mediaFailure: Bool? = nil, encodeMilliseconds: Double? = nil) {
+                mediaFailure: Bool? = nil, encodeMilliseconds: Double? = nil, relayRouting: Bool? = nil) {
         self.operation = operation; self.sessionID = sessionID; self.token = token
         self.datagramKey = datagramKey; self.role = role; self.transactionID = transactionID
         self.transportEpoch = transportEpoch; self.codecEpoch = codecEpoch; self.path = path
         self.mediaFailure = mediaFailure; self.encodeMilliseconds = encodeMilliseconds
+        self.relayRouting = relayRouting
     }
 
     public func validate() throws {
         guard token == nil || token?.count == 32, datagramKey == nil || datagramKey?.count == 32,
               path == nil || ["udp", "tcp", "shared"].contains(path!),
-              mediaFailure == nil || operation == .abort,
+              mediaFailure == nil || operation == .abort || operation == .recover,
+              relayRouting == nil || operation == .request || operation == .offer,
               encodeMilliseconds == nil || operation == .stats else {
             throw DeskError.invalid("媒体协商参数无效")
         }

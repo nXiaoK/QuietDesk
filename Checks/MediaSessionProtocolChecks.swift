@@ -6,6 +6,7 @@ func runMediaSessionProtocolChecks() {
         let original = Hello(name: "legacy", width: 1920, height: 1080, settings: .init(), canControl: true)
         let decoded = try Wire.readJSON(Hello.self, JSONEncoder().encode(original))
         try check(decoded.mediaTransportV1 == nil, "Legacy hello enabled media transport")
+        try check(decoded.relayTransportV1 == nil && decoded.relayDeviceID == nil, "Legacy hello enabled relay routing")
         let modern = Hello(name: "modern", width: 1920, height: 1080, settings: .init(), canControl: true, mediaTransportV1: true)
         try check(Wire.readJSON(Hello.self, JSONEncoder().encode(modern)).mediaTransportV1 == true, "Capability was lost")
         try check(MessageKind.hello.rawValue == 1 && MessageKind.sessionPauseResult.rawValue == 25,
@@ -34,7 +35,19 @@ func runMediaSessionProtocolChecks() {
             try MediaControl(.stats, sessionID: session, encodeMilliseconds: .infinity).validate()
         }
         try rejects("Accepted media failure on an unrelated operation") {
-            try MediaControl(.recover, sessionID: session, transportEpoch: 1, codecEpoch: 1, mediaFailure: true).validate()
+            try MediaControl(.stats, sessionID: session, mediaFailure: true, encodeMilliseconds: 4).validate()
+        }
+    }
+    run("Relay media capability and delivery hints remain optional and operation-scoped") {
+        let session = UUID(), device = UUID()
+        let hello = Hello(name: "relay", width: 1920, height: 1080, settings: .init(), canControl: true,
+                          relayTransportV1: true, relayDeviceID: device)
+        try check(Wire.readJSON(Hello.self, JSONEncoder().encode(hello)).relayDeviceID == device, "Relay identity changed")
+        try check(MediaControl.read(MediaControl(.request).message().payload).relayRouting == nil, "Default request changed")
+        try check(MediaControl.read(MediaControl(.request, relayRouting: true).message().payload).relayRouting == true, "Capability lost")
+        try MediaControl(.recover, sessionID: session, transportEpoch: 1, codecEpoch: 1, mediaFailure: true).validate()
+        try rejects("Allowed relay capability on a transaction") {
+            try MediaControl(.recover, sessionID: session, transportEpoch: 1, codecEpoch: 1, relayRouting: true).validate()
         }
     }
     run("Auxiliary bindings are session-bound, expiring and consumed once per role") {

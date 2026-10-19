@@ -157,6 +157,149 @@ private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false,
     try requireRelay(errors.read().isEmpty, "Relayed session failed: \(errors.read())")
 }
 
+// Uses real inner TLS/DTLS and the real node, with fake video and no capture/input injection.
+private func exerciseMixedRelay(_ fixture: Fixture, drop: Bool, blocked: Bool = false, cancelCandidate: Bool = false, decoderFailure: Bool = false) throws {
+    let queue = DispatchQueue(label: "checks.relay.mixed-host")
+    let key = try PairingKey.generate(), device = UUID()
+    let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8)
+    let parameters = try MediaSecureTransport.tlsParameters(key: key, roles: MediaChannelRole.allCases)
+    parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+    let hostPort = RelayBox<UInt16>(0)
+    let online = DispatchSemaphore(value: 0), proxyReady = DispatchSemaphore(value: 0)
+    let committed = DispatchSemaphore(value: 0), relayed = DispatchSemaphore(value: 0), requested = DispatchSemaphore(value: 0)
+    let hostCommitted = DispatchSemaphore(value: 0)
+    let fallback = DispatchSemaphore(value: 0), inputDone = DispatchSemaphore(value: 0)
+    let host = RelayBox<MediaSession?>(nil), viewer = RelayBox<MediaSession?>(nil), peers = RelayBox<[Peer]>([])
+    let agentBox = RelayBox<RelayHostRegistration?>(nil), bridgeBox = RelayBox<RelayViewerBridge?>(nil)
+    let controls = RelayBox(0), sequence = RelayBox<UInt32>(0), requests = RelayBox(0), commits = RelayBox(0)
+    let inputs = RelayBox<[UInt8]>([]), states = RelayBox<[String]>([]), shuttingDown = RelayBox(false)
+    let held = RelayBox<((MediaSession.DatagramEndpoint?) -> Void)?>(nil)
+    let listener = try startRelayHostListener(parameters, queue: queue) { connection in
+        let peer = Peer(connection: connection); peers.update { $0.append(peer) }
+        peer.onReady = { [weak peer] in
+            guard let peer else { return }
+            if let role = MediaSecureTransport.negotiatedRole(on: connection), role != .control {
+                host.read()?.acceptAuxiliary(peer, role: role); return
+            }
+            controls.update { $0 += 1 }
+            do {
+                let media = try MediaSession.host(control: peer, key: key, port: hostPort.read(), settings: settings, relayRouting: true)
+                host.update { $0 = media }
+                media.isRelayedDatagram = { agentBox.read()?.ownsLocalDatagramEndpoint($0) == true }
+                media.onPrepareRecovery = { $0(true) }
+                media.onProduceRecoveryFrame = { [weak media] in
+                    sequence.update { $0 += 1 }; media?.sendVideo(relayPacket(sequence.read(), idr: true))
+                }
+                media.onResumeFrames = { hostCommitted.signal() }
+                peer.onMessageHandled = { message, resume in
+                    if message.kind == .input, let value = message.payload.first {
+                        inputs.update { $0.append(value) }; if inputs.read().count == 100 { inputDone.signal() }
+                    } else { _ = media.receive(message) }
+                    resume()
+                }
+                media.start()
+            } catch { peer.close("Synthetic mixed media setup failed") }
+        }
+        peer.start()
+    }
+    hostPort.update { $0 = listener.port!.rawValue }
+    let agent = try RelayHostRegistration(endpoint: fixture.endpoint, accessKey: fixture.accessKey, deviceID: device,
+        ownerKey: PairingKey.generate().data, localPort: listener.port!.rawValue, certificateAuthorities: fixture.authorities)
+    agentBox.update { $0 = agent }
+    agent.onStatus = { if case .online = $0 { online.signal() } }
+    agent.start()
+    let proxy = try RelayOpaqueProxy(target: listener.port!.rawValue)
+    proxy.onReady = { proxyReady.signal() }; proxy.start()
+    defer {
+        shuttingDown.update { $0 = true }; viewer.read()?.stop(); host.read()?.stop(); agent.stop()
+        bridgeBox.read()?.stop(); proxy.stop(); peers.read().forEach { $0.close() }; listener.cancel()
+    }
+    try waitRelay(online, "Mixed host did not register")
+    try waitRelay(proxyReady, "Mixed direct proxy did not bind")
+    let connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: proxy.port!)!,
+        using: try MediaSecureTransport.tlsParameters(key: key, roles: [.control]))
+    let client = Peer(connection: connection)
+    defer { client.close() }
+    client.onReady = {
+        do {
+            let media = try MediaSession.viewer(control: client, key: key, host: "127.0.0.1", port: proxy.port!, settings: settings, relayRouting: true)
+            viewer.update { $0 = media }
+            media.onVideo = { frame, complete in
+                // A received frame whose decoder stalls is compute failure, not delivery failure.
+                if decoderFailure, !frame.header.isIDR { return }
+                complete(true)
+            }
+            media.onCommitStream = { _, _ in commits.update { $0 += 1 }; committed.signal() }
+            media.onState = { state in
+                states.update { $0.append(state) }
+                if state == "中继 UDP 视频" { relayed.signal() }
+            }
+            media.onReliablePathFailure = { fallback.signal() }
+            media.prepareAlternateDatagramPath = { [weak media] complete in
+                requests.update { $0 += 1 }; requested.signal()
+                if cancelCandidate { held.update { $0 = complete }; return }
+                do {
+                    let bridge = try RelayViewerBridge(endpoint: fixture.endpoint, accessKey: fixture.accessKey, deviceID: device,
+                        certificateAuthorities: fixture.authorities)
+                    bridgeBox.update { $0 = bridge }
+                    bridge.onReady = { [weak bridge] port in
+                        complete(MediaSession.DatagramEndpoint(host: "127.0.0.1", port: port, retire: { [weak bridge] in bridge?.retireDatagramPath() }))
+                    }
+                    bridge.onClose = { _ in complete(nil) }
+                    bridge.onDatagramFailure = { [weak media] _ in if !shuttingDown.read() { media?.networkPathChanged() } }
+                    bridge.start()
+                } catch { complete(nil) }
+            }
+            client.onMessageHandled = { message, resume in _ = media.receive(message); resume() }
+            media.start()
+        } catch { client.close("Synthetic mixed viewer setup failed") }
+    }
+    client.start()
+    try waitRelay(committed, "Direct TCP never committed before testing its failure", seconds: 12)
+    try waitRelay(hostCommitted, "Host did not finish its direct TCP commit")
+    try requireRelay(states.read().contains("TCP 视频") && requests.read() == 0, "Healthy direct fallback contacted relay")
+    if drop {
+        proxy.dropVideo()
+        sequence.update { $0 += 1 }; host.read()?.sendVideo(relayPacket(sequence.read(), idr: false))
+        try waitRelay(requested, "Actual reliable delivery failure did not request an alternate", seconds: 10)
+        if cancelCandidate {
+            viewer.read()?.stop()
+            Thread.sleep(forTimeInterval: 0.2)
+            let before = commits.read()
+            held.read()?(MediaSession.DatagramEndpoint(host: "127.0.0.1", port: 9))
+            Thread.sleep(forTimeInterval: 0.3)
+            try requireRelay(commits.read() == before && requests.read() == 1, "Late candidate resurrected stopped media")
+            return
+        }
+        if blocked {
+            try waitRelay(fallback, "Failed direct and relay video never reached bounded reliable fallback", seconds: 25)
+            try requireRelay(commits.read() == 1 && !states.read().contains("中继 UDP 视频"), "Unusable candidate replaced the old image")
+        } else {
+            try waitRelay(relayed, "Direct control did not migrate its video to relay UDP: \(states.read())", seconds: 20)
+            try requireRelay(proxy.droppedRecords > 0 && requests.read() == 1, "Mixed test did not exercise a real bounded alternate")
+            host.read()?.setPaused(true); viewer.read()?.setPaused(true)
+            Thread.sleep(forTimeInterval: 1.3)
+            host.read()?.setPaused(false); viewer.read()?.setPaused(false)
+            try waitRelay(relayed, "Relay video did not recover after pause", seconds: 10)
+            // A closed alternate route is forgotten, so the next reliable failure can prepare a new one.
+            bridgeBox.read()?.stop(); viewer.read()?.alternateDatagramPathClosed()
+            try waitRelay(requested, "A closed relay route was never prepared again: \(states.read())", seconds: 15)
+            try requireRelay(requests.read() == 2, "A closed relay route did not allow exactly one new preparation")
+        }
+    } else {
+        if decoderFailure {
+            sequence.update { $0 += 1 }; host.read()?.sendVideo(relayPacket(sequence.read(), idr: false))
+            try waitRelay(committed, "A stalled decoder did not recover its reference chain", seconds: 10)
+        }
+        Thread.sleep(forTimeInterval: 6)
+        try requireRelay(requests.read() == 0 && commits.read() == (decoderFailure ? 2 : 1), "Static or compute-limited media switched network routes")
+    }
+    for value in UInt8(0)..<UInt8(100) { client.send(Message(.input, Data([value]))) }
+    try waitRelay(inputDone, "Direct control stopped responding while video was recovering")
+    try requireRelay(inputs.read() == Array(UInt8(0)..<UInt8(100)) && controls.read() == 1,
+                     "Video route change duplicated input or rebuilt the control peer")
+}
+
 private func rejectedRelay(_ fixture: Fixture, wrongKey: Bool) throws {
     let bridge = try RelayViewerBridge(endpoint: fixture.endpoint,
         accessKey: wrongKey ? PairingKey.generate().data : fixture.accessKey, deviceID: UUID(), certificateAuthorities: fixture.authorities)
@@ -183,7 +326,14 @@ private func rejectedRelay(_ fixture: Fixture, wrongKey: Bool) throws {
                 do { try body(); passed += 1; print("PASS \(name)") }
                 catch { failed += 1; print("FAIL \(name): \(error)") }
             }
-            if CommandLine.arguments.contains("--udp-blocked") {
+            if CommandLine.arguments.contains("--mixed") {
+                run("Healthy direct TCP and static media never contact a configured relay") { try exerciseMixedRelay(fixture, drop: false) }
+                run("Delivery failure migrates video to relay DTLS without rebuilding control or duplicating input") { try exerciseMixedRelay(fixture, drop: true) }
+                run("A stalled decoder does not turn into a false network relay trial") { try exerciseMixedRelay(fixture, drop: false, decoderFailure: true) }
+                run("Late alternate readiness cannot resurrect cancelled media") { try exerciseMixedRelay(fixture, drop: true, cancelCandidate: true) }
+            } else if CommandLine.arguments.contains("--mixed-blocked") {
+                run("Failed direct TCP and blocked relay UDP preserve the old frame and request bounded reliable fallback") { try exerciseMixedRelay(fixture, drop: true, blocked: true) }
+            } else if CommandLine.arguments.contains("--udp-blocked") {
                 run("Blocked relay UDP still commits independent end-to-end TCP video and reliable bulk") { try exerciseRelay(fixture, udp: true, blocked: true) }
             } else if CommandLine.arguments.contains("--private-udp-port") {
                 run("A private node listen port cannot redirect public-endpoint DTLS forwarding") { try exerciseRelay(fixture, udp: true) }

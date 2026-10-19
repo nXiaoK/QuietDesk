@@ -25,6 +25,7 @@ public final class RelayHostRegistration: @unchecked Sendable {
     private var routes: [Data: HostDatagramRoute] = [:]
     private let endpointLock = NSLock()
     private var localSources: [UUID: UInt16] = [:]
+    private var datagramSources: [Data: UInt16] = [:]
 
     public init(endpoint: RelayEndpoint, accessKey: Data, deviceID: UUID, ownerKey: Data, localPort: UInt16,
                 certificateAuthorities: [Data] = []) throws {
@@ -36,6 +37,11 @@ public final class RelayHostRegistration: @unchecked Sendable {
     public func ownsLocalEndpoint(_ endpoint: NWEndpoint) -> Bool {
         guard case .hostPort(let host, let port) = endpoint, host.debugDescription == "127.0.0.1" else { return false }
         return endpointLock.withLock { localSources.values.contains(port.rawValue) }
+    }
+
+    public func ownsLocalDatagramEndpoint(_ endpoint: NWEndpoint) -> Bool {
+        guard case .hostPort(let host, let port) = endpoint, host.debugDescription == "127.0.0.1" else { return false }
+        return endpointLock.withLock { datagramSources.values.contains(port.rawValue) }
     }
 
     public func start() {
@@ -116,14 +122,19 @@ public final class RelayHostRegistration: @unchecked Sendable {
                     if self.routes.count < 4, self.routes[id] == nil {
                         let route = try HostDatagramRoute(message: message, endpoint: self.endpoint, localPort: self.localPort, queue: self.queue)
                         self.routes[id] = route
+                        route.onLocalReady = { [weak self] connection in
+                            guard let self, case .hostPort(_, let port) = connection.currentPath?.localEndpoint else { return }
+                            self.endpointLock.withLock { self.datagramSources[id] = port.rawValue }
+                        }
                         route.onClose = { [weak self, weak route] in
                             guard let self, let route, self.routes[id] === route else { return }
+                            self.endpointLock.withLock { _ = self.datagramSources.removeValue(forKey: id) }
                             self.routes.removeValue(forKey: id)
                         }
                         route.start()
                     }
                 case .datagramClosed:
-                    if let id = message.datagramID { self.routes.removeValue(forKey: id)?.close() }
+                    if let id = message.datagramID { self.routes[id]?.close() }
                 case .error: throw message.error ?? RelayServiceError.invalid
                 default: throw RelayServiceError.invalid
                 }
@@ -149,7 +160,7 @@ public final class RelayHostRegistration: @unchecked Sendable {
     private func closeRoutes() {
         let forwards = Array(forwarders.values); forwarders.removeAll()
         let datagrams = Array(routes.values); routes.removeAll()
-        endpointLock.withLock { localSources.removeAll() }
+        endpointLock.withLock { localSources.removeAll(); datagramSources.removeAll() }
         for forward in forwards { forward.close() }
         for route in datagrams { route.close() }
     }
@@ -167,6 +178,7 @@ public final class RelayHostRegistration: @unchecked Sendable {
 
 private final class HostDatagramRoute {
     var onClose: (() -> Void)?
+    var onLocalReady: ((NWConnection) -> Void)?
     private let pipe: RelayUDPPipe
     private let local: NWConnection
     private let queue: DispatchQueue
@@ -190,12 +202,14 @@ private final class HostDatagramRoute {
         local.stateUpdateHandler = { [weak self] state in
             guard let self, !self.closed else { return }
             switch state {
-            case .ready: self.localReady = true; self.receiveIfReady()
+            case .ready:
+                self.localReady = true; self.onLocalReady?(self.local)
+                self.pipe.start()
             case .failed, .cancelled: self.close()
             default: break
             }
         }
-        local.start(queue: queue); pipe.start()
+        local.start(queue: queue)
     }
     private var reading = false
     private func receiveIfReady() {

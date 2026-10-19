@@ -10,6 +10,20 @@ public struct RetryBackoff {
     public mutating func reset() { attempt = 0 }
 }
 
+// After an automatic relay fallback fails, later media-only fallbacks to the same target wait
+// 30/60/120/300 seconds, so a direct session and an unreachable relay cannot alternate endlessly.
+public struct RelayFallbackCooldown {
+    public private(set) var failures = 0
+    private var retryAt: TimeInterval = 0
+    public init() {}
+    public func allows(now: TimeInterval) -> Bool { failures == 0 || now >= retryAt }
+    public mutating func failed(now: TimeInterval) {
+        failures += 1
+        retryAt = now + [30, 60, 120, 300][min(failures - 1, 3)]
+    }
+    public mutating func reset() { failures = 0; retryAt = 0 }
+}
+
 public struct ConnectionRecord: Codable, Identifiable, Equatable {
     public let id: UUID
     public var address: String

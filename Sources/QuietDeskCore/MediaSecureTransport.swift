@@ -102,6 +102,7 @@ public final class BoundedDatagramPeer: @unchecked Sendable {
     }
 
     public var pendingBytes: Int { lock.withLock { reservedBytes } }
+    public var endpoint: NWEndpoint { connection.endpoint }
     public var maximumEffectiveDatagramBytes: Int { lock.withLock { effectiveDatagramBytes } }
 
     public func start() {

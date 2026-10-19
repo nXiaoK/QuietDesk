@@ -99,12 +99,15 @@ public struct MediaPathPolicy: Sendable {
     private var trialHasFrame = false
     private var pausedAt: TimeInterval?
     private var resumeProbeIsInitial: Bool?
+    private var alternateProbeUsed = false
+    private let initialProbeTimeout: TimeInterval
 
-    public init(capable: Bool, now: TimeInterval, initialEpoch: UInt32 = 0) {
+    public init(capable: Bool, now: TimeInterval, initialEpoch: UInt32 = 0, initialProbeTimeout: TimeInterval = 1.5) {
         phase = capable ? .initialTCP : .legacyTCP
         epoch = initialEpoch
         lastNow = now.isFinite ? now : 0
         lastObservationAt = lastNow
+        self.initialProbeTimeout = initialProbeTimeout.isFinite ? min(5, max(1.5, initialProbeTimeout)) : 1.5
     }
 
     public mutating func tick(now: TimeInterval) -> [MediaPathAction] {
@@ -141,6 +144,15 @@ public struct MediaPathPolicy: Sendable {
 
     public mutating func probeFailed(id: UUID, now: TimeInterval) -> [MediaPathAction] {
         probeFailed(id: id, now: now, reason: .probeFailed)
+    }
+
+    // Only the coordinator's first, delivery-failure-backed alternate route may bypass
+    // the direct route's cooldown. Subsequent probes retain the normal backoff.
+    public mutating func probeAlternateRoute(now: TimeInterval) -> [MediaPathAction] {
+        guard accept(now), !paused, !alternateProbeUsed, targetPath == .tcp, probeID == nil,
+              [.initialTCP, .tcp, .tcpTrial, .switchingTCP].contains(phase) else { return [] }
+        alternateProbeUsed = true
+        return beginProbe(initial: false, now: now)
     }
 
     public mutating func receivedPong(epoch: UInt32, now: TimeInterval) {
@@ -260,7 +272,7 @@ public struct MediaPathPolicy: Sendable {
     }
 
     private mutating func beginProbe(initial: Bool, now: TimeInterval) -> [MediaPathAction] {
-        let id = UUID(), timeout: TimeInterval = initial ? 1.5 : 5
+        let id = UUID(), timeout: TimeInterval = initial ? initialProbeTimeout : 5
         probeID = id; probeDeadline = now + timeout
         phase = initial ? .probingUDP : .probingRecovery
         lastObservationAt = now; resetEvidence()

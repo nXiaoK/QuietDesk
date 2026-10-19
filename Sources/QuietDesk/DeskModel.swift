@@ -119,6 +119,8 @@ final class DeskModel: ObservableObject {
     private var listener: NWListener?
     private var relayHostRegistration: RelayHostRegistration?
     private var relaySelectedForTarget = false
+    private var relayFallbackAttempted = false
+    private var relayFallbackCooldown = RelayFallbackCooldown()
     private var peer: Peer?
     private var dataChannel: SessionDataChannel?
     private var pending: [UUID: Peer] = [:]
@@ -849,7 +851,9 @@ final class DeskModel: ObservableObject {
                         host.deviceIdentityAdvertised = self.trafficHistoryStore.localDeviceID != nil
                         let streamer = ScreenStreamer(diagnostics: diagnostics)
                         host.streamer = streamer
-                        let media = try MediaSession.host(control: candidate, key: key, port: listeningPort, settings: settings)
+                        let media = try MediaSession.host(control: candidate, key: key, port: listeningPort, settings: settings,
+                                                          relayRouting: true)
+                        media.isRelayedDatagram = { [weak relayRegistration] in relayRegistration?.ownsLocalDatagramEndpoint($0) == true }
                         media.diagnostics = diagnostics
                         host.media = media
                         channel.configureMedia { [weak media] in media?.receive($0) ?? false }
@@ -901,7 +905,8 @@ final class DeskModel: ObservableObject {
                             preferredSettings: preferredSettings.extendedCompatible, deviceID: self.trafficHistoryStore.localDeviceID,
                             deviceIdentityExchange: host.deviceIdentityAdvertised ? true : nil,
                             highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings,
-                            sessionEffects: true, sessionPause: true, mediaTransportV1: true, independentCursorV1: true)))
+                            sessionEffects: true, sessionPause: true, mediaTransportV1: true, independentCursorV1: true,
+                            relayTransportV1: true, relayDeviceID: relayRegistration?.deviceID)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -1019,6 +1024,8 @@ final class DeskModel: ObservableObject {
                                 trafficEndpoint: endpoint, relay: relay, relayAccessKey: relayKey)
             self.target = target
             relaySelectedForTarget = relay?.strategy == .relay || (relay != nil && address.isEmpty)
+            relayFallbackAttempted = false
+            relayFallbackCooldown.reset()
             idlePolicy = SessionIdlePolicy(now: SessionClock.now)
             _ = idlePolicy.focusChanged(now: SessionClock.now, focused: sessionWindowFocused, suppressWake: true)
             pauseTransmission = SessionPauseTransmission()
@@ -1059,12 +1066,13 @@ final class DeskModel: ObservableObject {
         }
     }
 
-    private func configureViewerMedia(peer: Peer, settings: StreamSettings, preferred: StreamSettings) throws {
+    private func configureViewerMedia(peer: Peer, settings: StreamSettings, preferred: StreamSettings, relayRouting: Bool) throws {
         guard let target, let channel = dataChannel else { return }
         let viewer = viewerSession
         let renderer = canvas.makeMediaReceiver(diagnostics: performanceDiagnostics)
         let media = try MediaSession.viewer(control: peer, key: target.key, host: viewer.transportHost ?? target.address, port: viewer.transportPort ?? target.port,
-                                            settings: settings, udpEnabled: !mediaTCPOnly)
+                                            settings: settings, udpEnabled: !mediaTCPOnly, relayRouting: relayRouting,
+                                            relayedDatagram: viewer.usesRelayControl)
         media.diagnostics = performanceDiagnostics
         viewer.media = media
         viewer.mediaReceiver = renderer
@@ -1124,6 +1132,56 @@ final class DeskModel: ObservableObject {
                 self.applyAutomaticMediaSettings(next)
             }
         }
+        if relayRouting {
+            if !viewer.usesRelayControl, viewer.relayTargetVerified,
+               let relay = target.relay, relay.strategy == .automatic, let access = target.relayAccessKey {
+                media.prepareAlternateDatagramPath = { [weak self, weak viewer, weak media] completion in
+                    DispatchQueue.main.async {
+                        guard let self, let viewer, self.viewerSession === viewer, self.active else { completion(nil); return }
+                        do {
+                            viewer.mediaRelayBridge?.stop()
+                            let bridge = try RelayViewerBridge(endpoint: relay.endpoint, accessKey: access, deviceID: relay.deviceID)
+                            viewer.mediaRelayBridge = bridge
+                            bridge.onReady = { [weak self, weak viewer, weak bridge] port in
+                                DispatchQueue.main.async {
+                                    guard let self, let viewer, let bridge, self.viewerSession === viewer,
+                                          viewer.mediaRelayBridge === bridge, self.active else { completion(nil); return }
+                                    completion(MediaSession.DatagramEndpoint(host: "127.0.0.1", port: port,
+                                                                             retire: { [weak bridge] in bridge?.retireDatagramPath() }))
+                                }
+                            }
+                            bridge.onClose = { [weak self, weak viewer, weak bridge, weak media] _ in
+                                DispatchQueue.main.async {
+                                    guard let self, let viewer, let bridge, self.viewerSession === viewer,
+                                          viewer.mediaRelayBridge === bridge else { return }
+                                    viewer.mediaRelayBridge = nil
+                                    media?.alternateDatagramPathClosed(); completion(nil)
+                                }
+                            }
+                            bridge.onDatagramFailure = { [weak media] _ in media?.networkPathChanged() }
+                            bridge.start()
+                        } catch { completion(nil) }
+                    }
+                }
+            }
+            let controlBridge = viewer.relayBridge
+            media.onDatagramPathRetired = { [weak controlBridge] in controlBridge?.retireDatagramPath() }
+            media.onReliablePathFailure = { [weak self, weak viewer, weak peer] in
+                DispatchQueue.main.async {
+                    guard let self, let viewer, let peer, self.viewerSession === viewer, self.peer === peer,
+                          !self.systemSleeping, !self.idlePolicy.isPaused, !self.pauseTransmission.desiredPaused else { return }
+                    if !viewer.usesRelayControl, viewer.relayTargetVerified, target.relay?.strategy == .automatic,
+                       self.autoReconnect || !viewer.mediaCommitted {
+                        // A recent relay fallback failed: keep recovering over the direct route instead of alternating.
+                        guard self.relayFallbackCooldown.allows(now: SessionClock.now) else { return }
+                        viewer.relayFallbackRequested = true
+                        peer.close("直连视频持续无法交付，改用可靠中继连接", retryable: true)
+                    } else {
+                        peer.close("视频持续无法交付，请检查网络或中继节点后重新连接")
+                    }
+                }
+            }
+        }
         media.start()
     }
 
@@ -1138,9 +1196,9 @@ final class DeskModel: ObservableObject {
     private func recordMediaRoute(_ value: String, role: DiagnosticLog.Role, relayed: Bool) {
         guard relayEnabled else { return }
         let path: Int
-        switch value { case "UDP 视频": path = 1; case "TCP 视频": path = 2; case "TCP 兼容模式": path = 3; default: return }
+        switch value { case "UDP 视频", "中继 UDP 视频": path = 1; case "TCP 视频": path = 2; case "TCP 兼容模式": path = 3; default: return }
         DiagnosticLog.shared.record(.mediaRouteChanged, role: role, state: .ready,
-                                    values: [.relayControl: relayed ? 1 : 0, .relayVideo: relayed ? 1 : 0, .videoPath: path])
+                                    values: [.relayControl: relayed ? 1 : 0, .relayVideo: relayed || value == "中继 UDP 视频" ? 1 : 0, .videoPath: path])
     }
 
     private func applyAutomaticMediaSettings(_ settings: StreamSettings) {
@@ -1278,7 +1336,9 @@ final class DeskModel: ObservableObject {
                             let reason = error.localizedDescription
                             self.recordDisconnect(reason); self.clearSession()
                             if retryable, self.autoReconnect, self.target != nil {
-                                if relay.strategy == .automatic, !target.address.isEmpty { self.relaySelectedForTarget = false }
+                                if relay.strategy == .automatic, !target.address.isEmpty {
+                                    self.relaySelectedForTarget = false; self.relayFallbackFailed()
+                                }
                                 self.scheduleReconnect(reason)
                             } else { self.stop(); self.status = reason; self.connectionError = reason }
                         }
@@ -1353,7 +1413,7 @@ final class DeskModel: ObservableObject {
         }
         candidate.onTraffic = { channel.recordBytes($0) }
         let relayBridge = viewer.relayBridge
-        candidate.onClose = { [weak self, weak candidate, weak relayBridge] originalReason in
+        candidate.onClose = { [weak self, weak candidate, weak relayBridge, weak viewer] originalReason in
             history.requestFlush()
             let relayError = relayBridge?.failedBeforeDesktopStream == true ? relayBridge?.lastFailure : nil
             let reason = relayError?.localizedDescription ?? originalReason
@@ -1363,14 +1423,21 @@ final class DeskModel: ObservableObject {
                 guard let self, let candidate, self.peer === candidate else { return }
                 self.recordDisconnect(reason)
                 let wasConnected = self.connected
+                let verifiedTarget = viewer?.relayTargetVerified == true
+                let mediaFallback = viewer?.relayFallbackRequested == true
                 self.clearSession()
-                if !viaRelay, mayTryAlternate, target.relay?.strategy == .automatic, !wasConnected || self.autoReconnect {
+                if !viaRelay, mayTryAlternate || mediaFallback, target.relay?.strategy == .automatic,
+                   !wasConnected || self.autoReconnect || mediaFallback,
+                   !wasConnected || verifiedTarget {
                     self.relaySelectedForTarget = true
+                    self.relayFallbackAttempted = true
                     // Leaving an established session is a reconnect, so idle pause still defers it.
                     if wasConnected { self.reconnecting = true }
                     self.beginConnection(target)
                 } else if retryable, self.autoReconnect, self.target != nil {
-                    if viaRelay, target.relay?.strategy == .automatic, !target.address.isEmpty { self.relaySelectedForTarget = false }
+                    if viaRelay, target.relay?.strategy == .automatic, !target.address.isEmpty {
+                        self.relaySelectedForTarget = false; self.relayFallbackFailed()
+                    }
                     self.scheduleReconnect(reason)
                 } else {
                     self.stop()
@@ -1404,6 +1471,13 @@ final class DeskModel: ObservableObject {
                   !Task.isCancelled, self.peer == nil else { return }
             self.beginConnection(target)
         }
+    }
+
+    // Only an automatic fallback that never reached the desktop stream starts the cooldown.
+    private func relayFallbackFailed() {
+        guard relayFallbackAttempted else { return }
+        relayFallbackAttempted = false
+        relayFallbackCooldown.failed(now: SessionClock.now)
     }
 
     private func deferReconnectForIdle(_ reason: String) {
@@ -1558,6 +1632,10 @@ final class DeskModel: ObservableObject {
             guard !viewerSession.helloReceived else { throw DeskError.invalid("重复的会话信息") }
             let hello = try Wire.readJSON(Hello.self, message.payload)
             try hello.validate()
+            viewerSession.relayTargetVerified = hello.relayTransportV1 == true && target?.relay?.deviceID == hello.relayDeviceID && hello.relayDeviceID != nil
+            if viewerSession.usesRelayControl, !viewerSession.relayTargetVerified {
+                throw DeskError.invalid("中继目标标识不匹配或对端版本不支持，请检查设备标识并升级两端")
+            }
             if reconnecting, idlePolicy.isPaused || idlePolicy.tick(now: SessionClock.now) {
                 clearSession()
                 peer.close("空闲暂停，返回窗口后继续连接")
@@ -1565,6 +1643,7 @@ final class DeskModel: ObservableObject {
                 return
             }
             viewerSession.helloReceived = true
+            if viewerSession.usesRelayControl { relayFallbackAttempted = false; relayFallbackCooldown.reset() }
             dataChannel?.configureVideo(canvas.makeVideoReceiver(diagnostics: performanceDiagnostics))
             connected = true
             working = false
@@ -1621,7 +1700,8 @@ final class DeskModel: ObservableObject {
                 videoSettingsStatus = "当前生效：\(state.settings.summary)"
                 if hello.mediaTransportV1 == true {
                     viewerQualityPolicy.chooseManually()
-                    try configureViewerMedia(peer: peer, settings: state.settings, preferred: preferred)
+                    try configureViewerMedia(peer: peer, settings: state.settings, preferred: preferred,
+                                             relayRouting: hello.relayTransportV1 == true && target?.relay != nil)
                 }
                 applyInitialVideoQualityIfReady()
                 sendNextVideoSettings()
@@ -2560,6 +2640,8 @@ final class DeskModel: ObservableObject {
         relayHostRegistration?.stop(); relayHostRegistration = nil
         relayHostStatus = relayEnabled ? "中继共享已停止" : "中继已关闭"
         relaySelectedForTarget = false
+        relayFallbackAttempted = false
+        relayFallbackCooldown.reset()
         connectionError = nil
         hostRetryTask?.cancel()
         hostPreparationTask?.cancel()

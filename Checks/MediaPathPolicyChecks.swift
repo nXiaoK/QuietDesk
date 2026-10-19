@@ -19,6 +19,29 @@ func runMediaPathPolicyChecks() {
         return policy
     }
 
+    run("Alternate delivery-failure probes are single-use, pause-safe and retain later cooldown") {
+        var policy = MediaPathPolicy(capable: true, now: 0)
+        _ = policy.tick(now: 0)
+        let initial = policy.probeID!
+        _ = policy.probeFailed(id: initial, now: 1)
+        let cooldown = policy.nextRecoveryAt
+        _ = policy.setPaused(true, now: 2)
+        try check(policy.probeAlternateRoute(now: 3).isEmpty, "Paused alternate probe started")
+        _ = policy.setPaused(false, now: 4)
+        let actions = policy.probeAlternateRoute(now: 5)
+        try check(!actions.isEmpty && policy.probeID != nil && policy.activePath == .tcp, "Alternate bypass lost active TCP")
+        let alternate = policy.probeID!
+        _ = policy.probeFailed(id: alternate, now: 6)
+        try check(policy.nextRecoveryAt! > cooldown!, "Alternate failure reset backoff")
+        try check(policy.probeAlternateRoute(now: 7).isEmpty && policy.tick(now: 20).isEmpty, "Repeated failure bypassed cooldown")
+        _ = policy.stop()
+        try check(policy.probeSucceeded(id: alternate, now: 21).isEmpty && policy.probeAlternateRoute(now: 22).isEmpty, "Late probe revived stopped session")
+        var reliable = MediaPathPolicy(capable: false, now: 0)
+        try check(reliable.probeAlternateRoute(now: 1).isEmpty, "TCP-only started UDP relay")
+        var relayed = MediaPathPolicy(capable: true, now: 0, initialProbeTimeout: 5)
+        _ = relayed.tick(now: 0)
+        try check(relayed.tick(now: 2).isEmpty && relayed.probeID != nil, "Relay TLS setup inherited the direct-only deadline")
+    }
     run("Legacy TCP never probes or changes quality through media-path actions") {
         var policy = MediaPathPolicy(capable: false, now: 0)
         try check(policy.tick(now: 0).isEmpty && policy.tick(now: 60).isEmpty, "Legacy peer was probed")

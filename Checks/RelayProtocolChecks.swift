@@ -75,4 +75,14 @@ func runRelayProtocolChecks() {
             _ = try RelayConnectionInfo(endpoint: info.endpoint, deviceID: info.deviceID, strategy: .direct)
         }
     }
+    run("A failed relay fallback waits a bounded, growing cooldown before media can fall back again") {
+        var cooldown = RelayFallbackCooldown()
+        try check(cooldown.allows(now: 0), "A fresh target could not fall back to its relay")
+        cooldown.failed(now: 100)
+        try check(!cooldown.allows(now: 129.9) && cooldown.allows(now: 130), "The first relay failure did not wait 30 seconds")
+        cooldown.failed(now: 130); cooldown.failed(now: 190); cooldown.failed(now: 310); cooldown.failed(now: 610)
+        try check(!cooldown.allows(now: 909.9) && cooldown.allows(now: 910), "Repeated relay failures did not cap the cooldown at 300 seconds")
+        cooldown.reset()
+        try check(cooldown.allows(now: 0) && cooldown.failures == 0, "A successful relay session did not clear the cooldown")
+    }
 }

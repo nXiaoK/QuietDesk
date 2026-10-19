@@ -13,12 +13,13 @@ build_directory="$("${swift_build[@]}" --show-bin-path)"
 core_objects=("$build_directory"/QuietDeskCore.build/*.swift.o)
 swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     -module-cache-path "$build_directory/ModuleCache" -I "$build_directory/Modules" \
-    "${core_objects[@]}" AppChecks/RelayInteropChecks.swift -o "$build_directory/RelayInteropChecks"
+    "${core_objects[@]}" AppChecks/RelayInteropChecks.swift AppChecks/RelayOpaqueProxy.swift -o "$build_directory/RelayInteropChecks"
+if [[ "${1:-}" == "--build-only" ]]; then exit 0; fi
 fixture_directory="$(mktemp -d "$check_root/relay-fixture.XXXXXX")"
 fixture_directory="$(cd "$fixture_directory" && pwd)"
 blocked=0
 private_port=0
-if [[ "${1:-}" == "--udp-blocked" ]]; then blocked=1; fi
+if [[ "${1:-}" == "--udp-blocked" || "${1:-}" == "--mixed-blocked" ]]; then blocked=1; fi
 if [[ "${1:-}" == "--private-udp-port" ]]; then private_port=1; fi
 (cd relay && QUIETDESK_RELAY_FIXTURE_DIR="$fixture_directory" QUIETDESK_RELAY_FIXTURE_BLOCK_UDP="$blocked" QUIETDESK_RELAY_FIXTURE_PRIVATE_UDP_PORT="$private_port" go test -run '^TestNativeInteropFixture$' -count=1 -timeout=180s -v .) > "$fixture_directory/node.log" 2>&1 &
 fixture_pid=$!

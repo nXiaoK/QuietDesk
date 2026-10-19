@@ -16,6 +16,20 @@ struct UpdateSessionContext {
     var hasOtherPrompt = false
 }
 
+protocol UpdateInstalling: Sendable {
+    func consumeResult() -> UpdateInstaller.InstallationResult?
+    func downloadAndStage(expectation: UpdateInstaller.Expectation,
+                          progress: @escaping @Sendable (Int64, Int64?) -> Void,
+                          onVerifying: @escaping @Sendable () -> Void) async throws -> UpdateInstaller.PreparedUpdate
+    func installationAvailability() -> String?
+    func launchInstaller(for prepared: UpdateInstaller.PreparedUpdate) async throws
+    func abortPendingInstallation()
+    func discard(_ prepared: UpdateInstaller.PreparedUpdate)
+    func cancel()
+}
+
+extension UpdateInstaller: UpdateInstalling {}
+
 @MainActor
 final class UpdateController: ObservableObject {
     enum State { case idle, checking, upToDate, available, failed, downloading, verifying, ready, installing }
@@ -28,6 +42,8 @@ final class UpdateController: ObservableObject {
     @Published private(set) var totalBytes: Int64?
     @Published private(set) var needsManualInstall = false
     @Published private(set) var manualReleaseURL: URL?
+    @Published private(set) var completionNotice: String?
+    @Published private(set) var requiredSystemVersion: String?
 
     let currentVersion: String
     let currentBuild: Int
@@ -41,26 +57,38 @@ final class UpdateController: ObservableObject {
     private let sessionContext: () -> UpdateSessionContext
     private let mainWindow: () -> NSWindow?
     private let releaseControl: () -> Void
+    private let terminateApplication: @MainActor () -> Void
     private let loadFeed: @Sendable (URL, String) async throws -> Data
     private let launchedAt: Date
-    private var operation: Task<Void, Never>?
+    @Published private var operation: Task<Void, Never>?
     private var operationID = UUID()
     private var scheduler: Task<Void, Never>?
     private var panel: NSWindow?
     private var consentAlert: NSAlert?
     private var contextSubscription: AnyCancellable?
+    private let installer: any UpdateInstalling
+    private var prepared: UpdateInstaller.PreparedUpdate?
+    private var started = false
+    private var installationHandedOff = false
+    var interfacePromptVisible = false {
+        didSet { if interfacePromptVisible { dismissConsent() } }
+    }
 
     init(info: [String: Any] = Bundle.main.infoDictionary ?? [:], defaults: UserDefaults = .standard,
          launchedAt: Date = Date(), sessionContext: @escaping () -> UpdateSessionContext = { .init() },
          mainWindow: @escaping () -> NSWindow? = { nil }, releaseControl: @escaping () -> Void = {},
          contextChanges: AnyPublisher<Void, Never>? = nil,
+         installer: any UpdateInstalling = UpdateInstaller(),
+         terminateApplication: @escaping @MainActor () -> Void = { NSApp.terminate(nil) },
          loadFeed: @escaping @Sendable (URL, String) async throws -> Data = { try await UpdateFeedLoader.fetch($0, $1) }) {
         self.defaults = defaults
         self.launchedAt = launchedAt
         self.sessionContext = sessionContext
         self.mainWindow = mainWindow
         self.releaseControl = releaseControl
+        self.terminateApplication = terminateApplication
         self.loadFeed = loadFeed
+        self.installer = installer
         bundleIdentifier = info["CFBundleIdentifier"] as? String ?? ""
         currentVersion = info["CFBundleShortVersionString"] as? String ?? "0.0.0"
         currentBuild = Int(info["CFBundleVersion"] as? String ?? "") ?? 0
@@ -85,7 +113,11 @@ final class UpdateController: ObservableObject {
            let flags = (signingInfo as? [String: Any])?[kSecCodeInfoFlags as String] as? NSNumber {
             usesAdHocSignature = flags.uint32Value & SecCodeSignatureFlags.adhoc.rawValue != 0
         } else { usesAdHocSignature = false }
-        contextSubscription = contextChanges?.receive(on: DispatchQueue.main).sink { [weak self] in self?.objectWillChange.send() }
+        contextSubscription = contextChanges?.receive(on: DispatchQueue.main).sink { [weak self] in
+            guard let self else { return }
+            self.objectWillChange.send()
+            if self.consentAlert != nil { self.tick() }
+        }
     }
 
     var busy: Bool { operation != nil || state == .installing }
@@ -93,12 +125,26 @@ final class UpdateController: ObservableObject {
     var session: UpdateSessionContext { sessionContext() }
     var showBanner: Bool {
         let context = session
-        return !bannerDismissed && (manifest != nil || manualReleaseURL != nil) && !context.isControlling && !context.isFullScreen
+        return !bannerDismissed && (manifest != nil || manualReleaseURL != nil || completionNotice != nil) && !context.isControlling && !context.isFullScreen
             && !context.isSharing && !context.hasActiveConnection
     }
     var installBlocked: Bool { session.hasHostConnection }
+    var bannerTitle: String { completionNotice ?? menuTitle.replacingOccurrences(of: "…", with: "") }
 
     func start() {
+        if !started {
+            started = true
+            if let result = installer.consumeResult() {
+                completionNotice = result.message
+                message = result.message
+                state = result.succeeded ? .upToDate : .failed
+                if !result.succeeded {
+                    needsManualInstall = true
+                    manualReleaseURL = URL(string: "https://github.com/\(repository)/releases/latest")
+                }
+                DiagnosticLog.shared.record(.updateInstall, state: result.succeeded ? .succeeded : .failed)
+            }
+        }
         guard enabled, scheduler == nil else { return }
         scheduler = Task { [weak self] in
             while !Task.isCancelled {
@@ -110,20 +156,25 @@ final class UpdateController: ObservableObject {
 
     func tick(now: Date = Date()) {
         let context = session
-        let otherPrompt = context.hasOtherPrompt || consentAlert != nil || panel?.isVisible == true
-            || mainWindow()?.attachedSheet != nil || NSApp.modalWindow != nil
-        if UpdateCheckPolicy.shouldPresentConsent(updaterEnabled: enabled, autoCheckPreference: autoCheckPreference,
+        let window = mainWindow()
+        let consentWindow = consentAlert?.window
+        let otherPrompt = context.hasOtherPrompt || interfacePromptVisible || panel?.isVisible == true
+            || (window?.attachedSheet != nil && window?.attachedSheet !== consentWindow)
+            || (NSApp.modalWindow != nil && NSApp.modalWindow !== consentWindow)
+        let canPresentConsent = UpdateCheckPolicy.shouldPresentConsent(updaterEnabled: enabled, autoCheckPreference: autoCheckPreference,
             mainWindowVisible: context.mainWindowVisible, applicationActive: context.applicationActive,
             isControlling: context.isControlling, isFullScreen: context.isFullScreen,
-            hasHostConnection: context.hasHostConnection, hasOtherPrompt: otherPrompt), let window = mainWindow() {
+            hasHostConnection: context.hasHostConnection, hasOtherPrompt: otherPrompt)
+        if !canPresentConsent { dismissConsent() }
+        if canPresentConsent, consentAlert == nil, let window {
             let alert = NSAlert()
             alert.messageText = "自动检查更新？"
             alert.informativeText = "QuietDesk 每天最多访问一次 GitHub 获取最新版本信息，不会自动下载或安装。可以随时在菜单栏中修改。"
             alert.addButton(withTitle: "自动检查")
             alert.addButton(withTitle: "不检查")
             consentAlert = alert
-            alert.beginSheetModal(for: window) { [weak self] response in
-                guard let self else { return }
+            alert.beginSheetModal(for: window) { [weak self, weak alert] response in
+                guard let self, let alert, self.consentAlert === alert else { return }
                 self.consentAlert = nil
                 if response == .alertFirstButtonReturn { self.setAutomaticChecks(true) }
                 else if response == .alertSecondButtonReturn { self.setAutomaticChecks(false) }
@@ -136,6 +187,7 @@ final class UpdateController: ObservableObject {
     }
 
     func setAutomaticChecks(_ value: Bool) {
+        dismissConsent()
         autoCheckPreference = value
         defaults.set(value, forKey: "autoCheckUpdates")
         DiagnosticLog.shared.record(.updatePreferenceChanged, state: value ? .enabled : .disabled)
@@ -146,7 +198,7 @@ final class UpdateController: ObservableObject {
         if manual { present() }
         guard !busy, state != .ready else { return }
         let id = UUID(); operationID = id
-        state = .checking; message = "正在检查更新…"
+        state = .checking; message = "正在检查更新…"; completionNotice = nil
         if !manual { defaults.set(now, forKey: "lastUpdateCheck") }
         DiagnosticLog.shared.record(.updateCheck, state: .requested)
         operation = Task { [weak self] in
@@ -161,15 +213,16 @@ final class UpdateController: ObservableObject {
                 switch result {
                 case .requiresManualUpdate(_, let url):
                     self.manifest = nil; self.manualReleaseURL = url; self.needsManualInstall = true
+                    self.requiredSystemVersion = nil; self.bannerDismissed = false
                     self.state = .available; self.message = "此版本需要手动更新，请前往 GitHub 下载。"
                 case .supported(let update):
                     let system = ProcessInfo.processInfo.operatingSystemVersion
                     let assessment = try update.assess(currentVersion: self.currentVersion, currentBuild: self.currentBuild,
                         systemVersion: "\(system.majorVersion).\(system.minorVersion).\(system.patchVersion)")
-                    self.needsManualInstall = false; self.manualReleaseURL = nil
+                    self.needsManualInstall = false; self.manualReleaseURL = nil; self.requiredSystemVersion = nil
                     if assessment != .inconsistentBuild && !UpdateCheckPolicy.shouldOffer(version: update.version,
                         skippedVersion: self.defaults.string(forKey: "skippedUpdateVersion"), manual: manual) {
-                        self.state = self.manifest == nil ? .idle : .available
+                        self.manifest = nil; self.state = .idle; self.message = ""
                         return
                     }
                     switch assessment {
@@ -177,8 +230,8 @@ final class UpdateController: ObservableObject {
                         self.manifest = update; self.state = .available; self.bannerDismissed = false
                         self.message = "新版本 \(update.version) 可用"
                     case .requiresNewerSystem(let required):
-                        self.manifest = update; self.state = .available; self.needsManualInstall = true
-                        self.manualReleaseURL = update.releaseNotesURL
+                        self.manifest = update; self.state = .available; self.bannerDismissed = false
+                        self.requiredSystemVersion = required
                         self.message = "新版本需要 macOS \(required)，请先升级系统。"
                     case .upToDate:
                         self.manifest = nil; self.state = .upToDate; self.message = "已是最新版本。"
@@ -198,12 +251,14 @@ final class UpdateController: ObservableObject {
     }
 
     func present() {
-        guard enabled else { return }
+        guard enabled || completionNotice != nil else { return }
+        dismissConsent()
         releaseControl()
         if panel == nil {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 480),
-                styleMask: [.titled, .closable], backing: .buffered, defer: false)
+                styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
             window.title = "QuietDesk 更新"
+            window.contentMinSize = NSSize(width: 520, height: 480)
             window.isReleasedWhenClosed = false
             window.contentView = NSHostingView(rootView: UpdateView(controller: self))
             window.center()
@@ -216,23 +271,104 @@ final class UpdateController: ObservableObject {
     func later() { panel?.close(); bannerDismissed = true }
     func dismissBanner() { bannerDismissed = true }
     func skip() {
-        guard let update = manifest else { return }
+        guard !busy, prepared == nil, let update = manifest else { return }
         defaults.set(update.version, forKey: "skippedUpdateVersion")
-        manifest = nil; state = .idle; later()
+        manifest = nil; manualReleaseURL = nil; needsManualInstall = false; requiredSystemVersion = nil; state = .idle; later()
     }
     func openRelease() {
         if let url = manualReleaseURL ?? manifest?.releaseNotesURL { NSWorkspace.shared.open(url) }
     }
-    func download() { openRelease() }
-    func install() {}
-    func revealPreparedApplication() {}
+    func download() {
+        guard let update = manifest, !busy, state != .ready, !needsManualInstall, requiredSystemVersion == nil else { return }
+        let id = UUID(); operationID = id
+        state = .downloading; receivedBytes = 0; totalBytes = nil; message = "正在下载更新…"
+        let expected = UpdateInstaller.Expectation(bundleIdentifier: update.bundleIdentifier, version: update.version,
+            build: update.build, minimumSystemVersion: update.minimumSystemVersion, archiveURL: update.archive.url,
+            archiveSize: update.archive.size, sha256: update.archive.sha256, repository: repository)
+        DiagnosticLog.shared.record(.updateDownload, state: .requested)
+        operation = Task { [weak self] in
+            guard let self else { return }
+            defer { if self.operationID == id { self.operation = nil } }
+            do {
+                let staged = try await self.installer.downloadAndStage(expectation: expected, progress: { [weak self] received, total in
+                    Task { @MainActor in
+                        guard let self, self.operationID == id, self.state == .downloading else { return }
+                        self.receivedBytes = received; self.totalBytes = total
+                    }
+                }, onVerifying: { [weak self] in
+                    Task { @MainActor in
+                        guard let self, self.operationID == id, self.state == .downloading else { return }
+                        self.state = .verifying; self.message = "正在校验并暂存更新…"
+                    }
+                })
+                guard !Task.isCancelled, self.operationID == id else { self.installer.discard(staged); return }
+                self.prepared = staged; self.state = .ready
+                self.needsManualInstall = staged.manualInstallationReason != nil
+                self.message = staged.manualInstallationReason ?? "更新已通过校验，可以安装并重新启动。"
+                DiagnosticLog.shared.record(.updateDownload, state: .succeeded)
+            } catch {
+                guard !Task.isCancelled, self.operationID == id else { return }
+                self.state = .failed
+                self.message = (error as? UpdateInstaller.Failure)?.localizedDescription ?? "更新下载失败，请检查网络后重试。"
+                DiagnosticLog.shared.record(.updateDownload, state: .failed, error: error)
+            }
+        }
+    }
+    func install() {
+        guard state == .ready, let prepared, !busy, !needsManualInstall else { return }
+        guard !installBlocked else { message = "这台 Mac 正被远程控制，请先停止共享后安装。"; return }
+        if let reason = installer.installationAvailability() { needsManualInstall = true; message = reason; return }
+        let id = UUID(); operationID = id
+        state = .installing; message = "正在准备安装，QuietDesk 即将重新启动…"
+        DiagnosticLog.shared.record(.updateInstall, state: .requested)
+        operation = Task { [weak self] in
+            guard let self else { return }
+            defer { if self.operationID == id { self.operation = nil } }
+            do {
+                try await self.installer.launchInstaller(for: prepared)
+                guard !Task.isCancelled, self.operationID == id else {
+                    self.installer.abortPendingInstallation()
+                    return
+                }
+                guard !self.installBlocked else {
+                    self.installer.abortPendingInstallation()
+                    self.state = .ready; self.message = "安装已暂停；请停止共享后重试。"
+                    return
+                }
+                self.installationHandedOff = true
+                self.terminateApplication()
+            } catch {
+                guard !Task.isCancelled, self.operationID == id else { return }
+                self.state = .ready; self.needsManualInstall = true
+                self.message = (error as? UpdateInstaller.Failure)?.localizedDescription ?? "无法启动安装进程，请手动安装。"
+                DiagnosticLog.shared.record(.updateInstall, state: .failed, error: error)
+            }
+        }
+    }
+    func revealPreparedApplication() {
+        if let prepared { NSWorkspace.shared.activateFileViewerSelecting([prepared.applicationURL]) }
+    }
     func cancel() {
-        operationID = UUID(); operation?.cancel(); operation = nil
-        state = manifest == nil ? .idle : .available
+        guard !installationHandedOff, operation != nil || prepared != nil else { return }
+        operation?.cancel()
+        installer.cancel(); installer.abortPendingInstallation()
+        if let prepared { installer.discard(prepared); self.prepared = nil }
+        needsManualInstall = manualReleaseURL != nil && requiredSystemVersion == nil
+        state = manifest == nil && manualReleaseURL == nil ? .idle : .available
         message = "更新已取消，可以稍后重试。"
         DiagnosticLog.shared.record(.updateCancelled, state: .cancelled)
     }
-    func shutdown() { scheduler?.cancel(); scheduler = nil; cancel() }
+    func shutdown() {
+        scheduler?.cancel(); scheduler = nil
+        dismissConsent()
+        if !installationHandedOff { cancel() }
+    }
+
+    private func dismissConsent() {
+        guard let alert = consentAlert else { return }
+        consentAlert = nil
+        alert.window.sheetParent?.endSheet(alert.window, returnCode: .abort)
+    }
 }
 
 enum UpdateFeedError: LocalizedError {

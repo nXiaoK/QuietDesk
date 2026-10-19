@@ -7,6 +7,7 @@ import QuietDeskCore
 @main
 enum QuietDeskEntry {
     @MainActor static func main() {
+        if UpdateInstaller.runInstallerIfRequested() { return }
         if HostSessionEffects.runWatchdogIfRequested() { return }
         DiagnosticLog.shared.record(.applicationStarted)
         QuietDeskApp.main()
@@ -25,7 +26,7 @@ struct QuietDeskApp: App {
             guard let state else { return .init() }
             return UpdateSessionContext(mainWindowVisible: state.mainWindow?.isVisible == true && state.mainWindow?.isMiniaturized == false,
                 applicationActive: NSApp.isActive, isControlling: state.mode == .viewer && (state.connected || state.working || state.reconnecting),
-                isFullScreen: state.isFullScreen, hasHostConnection: state.mode == .host && state.connected,
+                isFullScreen: state.isFullScreen, hasHostConnection: state.hasIncomingControlConnection,
                 isSharing: state.mode == .host && (state.active || state.working), hasActiveConnection: state.connected,
                 autoStartSharing: state.autoStartSharing, hasOtherPrompt: state.updatePromptBlocked)
         }, mainWindow: { [weak state] in state?.mainWindow }, releaseControl: { [weak state] in state?.canvas.releaseControl() },
@@ -87,10 +88,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model?.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
         model?.refreshClipboardFocus()
         model?.sessionWindowFocusChanged()
+        updates?.tick()
     }
     func applicationDidResignActive(_ notification: Notification) {
         model?.refreshClipboardFocus()
         model?.sessionWindowFocusChanged()
+        updates?.tick()
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         model?.prepareShowWindow()
@@ -216,6 +219,10 @@ struct DeskView: View {
             dismissedClipboardStatus = message
         }
         .onChange(of: model.controlling) { _, controlling in if controlling { showFullScreenMenu = false; showOptions = false } }
+        .onChange(of: showOptions || showCapsSettings || showTrafficStatistics || showSessionEffects || showFullScreenMenu) { _, presented in
+            updates.interfacePromptVisible = presented
+        }
+        .onDisappear { updates.interfacePromptVisible = false }
     }
 
     private var remoteContent: some View {

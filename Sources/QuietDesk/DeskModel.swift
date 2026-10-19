@@ -137,6 +137,7 @@ final class DeskModel: ObservableObject {
     private var permissionTimer: Timer?
     private var permissionGuide: PermissionGuide?
     var updatePromptBlocked: Bool { permissionGuide?.isVisible == true || error != nil || pendingFileOffer != nil }
+    var hasIncomingControlConnection: Bool { mode == .host && peer != nil }
     private var capsLockStartAttempted = false
     private var controlStatusUpdatesEnabled = false
     private var lastMetrics = SessionClock.now

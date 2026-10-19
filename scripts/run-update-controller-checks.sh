@@ -16,7 +16,7 @@ mkdir -p "$check_app/Contents/MacOS"
 swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     -module-cache-path "$build_directory/ModuleCache" -I "$build_directory/Modules" \
     "${core_objects[@]}" Sources/QuietDesk/AppDataLocation.swift Sources/QuietDesk/DiagnosticLog.swift \
-    Sources/QuietDesk/UpdateController.swift Sources/QuietDesk/UpdateView.swift AppChecks/UpdateControllerChecks.swift \
+    Sources/QuietDesk/UpdateInstaller.swift Sources/QuietDesk/UpdateController.swift Sources/QuietDesk/UpdateView.swift AppChecks/UpdateControllerChecks.swift \
     -o "$check_app/Contents/MacOS/UpdateControllerChecks"
 python3 - "$check_app/Contents/Info.plist" <<'PY'
 from pathlib import Path

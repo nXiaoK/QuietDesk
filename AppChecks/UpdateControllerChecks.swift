@@ -60,6 +60,54 @@ private func requireRequests(_ feed: UpdateCheckFeed, _ expected: Int, _ message
     try requireUpdate(actual == expected, message)
 }
 
+// No filesystem installation or application termination is performed by this fixture.
+private final class UpdateCheckInstaller: UpdateInstalling, @unchecked Sendable {
+    private let directory: URL
+    private let lock = NSLock()
+    private var verifying: (@Sendable () -> Void)?
+    private var downloads = 0
+    private var launches = 0
+    private var discards = 0
+    private var aborts = 0
+    private var result: UpdateInstaller.InstallationResult?
+    var manualReason: String?
+    var ignoresLaunchCancellation = false
+    var downloadCount: Int { lock.withLock { downloads } }
+    var launchCount: Int { lock.withLock { launches } }
+    var discardCount: Int { lock.withLock { discards } }
+    var abortCount: Int { lock.withLock { aborts } }
+
+    init(directory: URL, result: UpdateInstaller.InstallationResult? = nil) {
+        self.directory = directory; self.result = result
+    }
+    func consumeResult() -> UpdateInstaller.InstallationResult? {
+        lock.withLock { defer { result = nil }; return result }
+    }
+    func downloadAndStage(expectation: UpdateInstaller.Expectation,
+                          progress: @escaping @Sendable (Int64, Int64?) -> Void,
+                          onVerifying: @escaping @Sendable () -> Void) async throws -> UpdateInstaller.PreparedUpdate {
+        lock.withLock { downloads += 1; verifying = onVerifying }
+        progress(8, nil)
+        try await Task.sleep(for: .milliseconds(150))
+        progress(16, 16)
+        onVerifying()
+        try await Task.sleep(for: .milliseconds(50))
+        return .init(applicationURL: directory.appendingPathComponent("QuietDesk.app"),
+                     stagingDirectory: directory, expectation: expectation, manualInstallationReason: manualReason)
+    }
+    func emitLateVerification() { lock.withLock { verifying }?() }
+    func installationAvailability() -> String? { manualReason }
+    func launchInstaller(for prepared: UpdateInstaller.PreparedUpdate) async throws {
+        lock.withLock { launches += 1 }
+        if ignoresLaunchCancellation {
+            await Task.detached { try? await Task.sleep(for: .milliseconds(150)) }.value
+        } else { try await Task.sleep(for: .milliseconds(150)) }
+    }
+    func abortPendingInstallation() { lock.withLock { aborts += 1 } }
+    func discard(_ prepared: UpdateInstaller.PreparedUpdate) { lock.withLock { discards += 1 } }
+    func cancel() {}
+}
+
 @main
 @MainActor
 private struct UpdateControllerChecks {
@@ -97,6 +145,37 @@ private struct UpdateControllerChecks {
             try await settled(controller)
             try requireUpdate(controller.manifest?.version == "0.8.0", "Manual request could not find a version")
             try requireUpdate(controller.autoCheckPreference == nil && fixture.defaults.object(forKey: "autoCheckUpdates") == nil, "Manual request changed consent")
+        }
+
+        await run("First consent queues behind other prompts and withdraws without choosing when a host connects") { directory in
+            let fixture = try Fixture(directory: directory, responses: [])
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 250),
+                                  styleMask: [.titled], backing: .buffered, defer: false)
+            window.title = "合成更新询问检查"
+            window.orderFront(nil)
+            var context = UpdateSessionContext(mainWindowVisible: true, applicationActive: true, hasOtherPrompt: true)
+            let controller = fixture.controller(context: { context }, window: window)
+            defer { controller.shutdown(); controller.later(); window.orderOut(nil) }
+            controller.tick(now: fixture.now)
+            await drain()
+            try requireUpdate(window.attachedSheet == nil, "Consent overlapped an existing prompt")
+            context.hasOtherPrompt = false
+            controller.tick(now: fixture.now)
+            await drain()
+            try requireUpdate(window.attachedSheet != nil, "Consent did not resume after another prompt closed")
+            context.hasHostConnection = true
+            controller.tick(now: fixture.now)
+            await drain()
+            try requireUpdate(window.attachedSheet == nil && controller.autoCheckPreference == nil,
+                              "Consent remained in a host session or dismissal saved a choice")
+            context.hasHostConnection = false
+            controller.tick(now: fixture.now)
+            await drain()
+            guard let sheet = window.attachedSheet else { throw UpdateControllerCheckFailure("Consent was not requeued") }
+            window.endSheet(sheet, returnCode: .alertSecondButtonReturn)
+            await drain()
+            try requireUpdate(controller.autoCheckPreference == false, "Explicit consent choice was not persisted")
+            try await requireRequests(fixture.feed, 0, "Consent dismissal performed a network request")
         }
 
         await run("Automatic checks respect a skipped version and manual checks still offer it") { directory in
@@ -145,11 +224,136 @@ private struct UpdateControllerChecks {
             await drain()
             try await requireRequests(fixture.feed, 1, "Concurrent triggers started multiple requests")
             controller.cancel()
+            try await settled(controller)
             controller.check(manual: false)
             try await settled(controller)
             await drain()
             try await requireRequests(fixture.feed, 2, "Replacement request did not start")
             try requireUpdate(controller.manifest?.version == "0.8.1" && controller.state == .available, "Cancelled result changed newer request")
+        }
+
+        await run("Progress uses received bytes, unknown lengths remain unknown and late callbacks preserve ready state") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
+            let installer = UpdateCheckInstaller(directory: directory)
+            let controller = fixture.controller(installer: installer)
+            defer { controller.shutdown(); controller.later() }
+            controller.check(manual: false)
+            try await settled(controller)
+            controller.download()
+            await drain()
+            try requireUpdate(controller.state == .downloading && controller.receivedBytes == 8 && controller.totalBytes == nil,
+                              "Unknown response length was estimated or real bytes were lost")
+            try await settled(controller)
+            try requireUpdate(controller.state == .ready && controller.receivedBytes == 16 && controller.totalBytes == 16,
+                              "Verified download did not become ready with its byte count")
+            installer.emitLateVerification()
+            await drain()
+            try requireUpdate(controller.state == .ready, "Late callback regressed ready state")
+            controller.cancel()
+            try requireUpdate(controller.state == .available && installer.discardCount == 1, "Cancelling ready update retained staging")
+            try requireUpdate(fixture.defaults.string(forKey: "skippedUpdateVersion") == nil, "Cancelling ready update skipped it")
+        }
+
+        await run("Cancellation keeps the task exclusive until cleanup and allows a fresh download afterwards") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
+            let installer = UpdateCheckInstaller(directory: directory)
+            let controller = fixture.controller(installer: installer)
+            defer { controller.shutdown(); controller.later() }
+            controller.check(manual: false)
+            try await settled(controller)
+            controller.download()
+            await drain()
+            controller.cancel()
+            controller.download()
+            try requireUpdate(installer.downloadCount == 1, "Replacement started before cancellation cleanup")
+            try await settled(controller)
+            controller.download()
+            try await settled(controller)
+            try requireUpdate(installer.downloadCount == 2 && controller.state == .ready, "Download did not recover after cancellation")
+        }
+
+        await run("Connected hosts may download but cannot launch or hand off installation") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
+            let installer = UpdateCheckInstaller(directory: directory)
+            var context = UpdateSessionContext(hasHostConnection: true)
+            var terminations = 0
+            let controller = fixture.controller(context: { context }, installer: installer, terminate: { terminations += 1 })
+            defer { controller.shutdown(); controller.later() }
+            controller.check(manual: false)
+            try await settled(controller)
+            controller.download()
+            try await settled(controller)
+            controller.install()
+            try requireUpdate(installer.launchCount == 0 && controller.state == .ready, "Connected host started installer")
+            context.hasHostConnection = false
+            installer.ignoresLaunchCancellation = true
+            controller.install()
+            await drain()
+            context.hasHostConnection = true
+            try await settled(controller)
+            try requireUpdate(installer.launchCount == 1 && installer.abortCount > 0 && terminations == 0 && controller.state == .ready,
+                              "Host connection arriving during readiness caused an application exit")
+            context.hasHostConnection = false
+            controller.install()
+            await drain()
+            controller.cancel()
+            try await settled(controller)
+            try requireUpdate(terminations == 0 && controller.state == .available, "Cancelled installer still handed off")
+        }
+
+        await run("A ready installer handoff requests a single normal application termination and preserves staging") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
+            let installer = UpdateCheckInstaller(directory: directory)
+            var terminations = 0
+            let controller = fixture.controller(installer: installer, terminate: { terminations += 1 })
+            controller.check(manual: false)
+            try await settled(controller)
+            controller.download()
+            try await settled(controller)
+            controller.install()
+            try await Task.sleep(for: .milliseconds(250))
+            controller.install()
+            controller.shutdown()
+            try requireUpdate(terminations == 1 && installer.launchCount == 1 && installer.discardCount == 0 && installer.abortCount == 0,
+                              "Handoff was duplicated or shutdown removed files needed by the installer")
+        }
+
+        await run("Manual installation and newer system requirements do not start the installer") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest()),
+                .data(try signedManifest(minimumSystemVersion: "999.0"))])
+            let installer = UpdateCheckInstaller(directory: directory)
+            installer.manualReason = "合成的只读磁盘。"
+            let controller = fixture.controller(installer: installer)
+            defer { controller.shutdown(); controller.later() }
+            controller.check(manual: false)
+            try await settled(controller)
+            controller.download()
+            try await settled(controller)
+            controller.install()
+            try requireUpdate(controller.needsManualInstall && installer.launchCount == 0, "Manual-only staged update started installation")
+            controller.cancel()
+            controller.check(manual: false)
+            try await settled(controller)
+            controller.download()
+            try requireUpdate(controller.requiredSystemVersion == "999.0" && !controller.needsManualInstall && installer.downloadCount == 1,
+                              "Unsupported macOS offered an installable download")
+        }
+
+        await run("Installation results restore a one-time notice without cancellation side effects") { directory in
+            let fixture = try Fixture(directory: directory, responses: [])
+            let installer = UpdateCheckInstaller(directory: directory, result: .init(version: "0.8.0", build: 31,
+                succeeded: true, message: "已更新到 0.8.0。", restartObserved: true))
+            let controller = fixture.controller(installer: installer)
+            controller.start()
+            try requireUpdate(controller.completionNotice == "已更新到 0.8.0。" && controller.state == .upToDate,
+                              "Startup did not consume the installer result")
+            controller.shutdown()
+            try requireUpdate(controller.message == "已更新到 0.8.0。" && controller.state == .upToDate,
+                              "Idle shutdown manufactured an update cancellation")
+            let restarted = fixture.controller(installer: installer)
+            restarted.start()
+            try requireUpdate(restarted.completionNotice == nil, "Installer result was presented twice")
+            restarted.shutdown()
         }
 
         await run("Daily update check time persists across controller and defaults instances") { directory in
@@ -297,17 +501,21 @@ private struct UpdateControllerChecks {
                 "QuietDeskUpdatePublicKeys": [["id": "checks", "key": signingKey.publicKey.rawRepresentation.base64EncodedString()]]]
         }
         func controller(defaults otherDefaults: UserDefaults? = nil, info otherInfo: [String: Any]? = nil,
-                        context: @escaping () -> UpdateSessionContext = { .init() }) -> UpdateController {
+                        context: @escaping () -> UpdateSessionContext = { .init() },
+                        installer: any UpdateInstalling = UpdateInstaller(), terminate: @escaping () -> Void = {},
+                        window: NSWindow? = nil) -> UpdateController {
             UpdateController(info: otherInfo ?? info, defaults: otherDefaults ?? defaults,
-                launchedAt: now.addingTimeInterval(-120), sessionContext: context,
+                launchedAt: now.addingTimeInterval(-120), sessionContext: context, mainWindow: { window },
+                installer: installer, terminateApplication: terminate,
                 loadFeed: { [feed] url, version in try await feed.fetch(url, version) })
         }
     }
 
     private static func signedManifest(version: String = "0.8.0", build: Int = 31,
+                                       minimumSystemVersion: String = "14.0",
                                        key: Curve25519.Signing.PrivateKey? = nil) throws -> Data {
         let manifest = UpdateManifest(bundleIdentifier: identifier, version: version, build: build,
-            minimumSystemVersion: "14.0", publishedAt: "2026-10-19T08:00:00Z", revision: "",
+            minimumSystemVersion: minimumSystemVersion, publishedAt: "2026-10-19T08:00:00Z", revision: "",
             releaseNotesURL: URL(string: "https://github.com/nXiaoK/QuietDesk/releases/tag/v\(version)")!, notes: "合成状态，仅用于更新器检查。",
             archive: UpdateArchive(url: URL(string: "https://github.com/nXiaoK/QuietDesk/releases/download/v\(version)/QuietDesk.zip")!,
                                    size: 16, sha256: String(repeating: "a", count: 64)))

@@ -3,11 +3,15 @@ import QuietDeskCore
 
 enum ConnectionStore {
     static func matching(_ records: [ConnectionRecord], address: String, port: UInt16,
-                         preferredID: UUID? = nil) -> ConnectionRecord? {
-        if let preferredID, let selected = records.first(where: { $0.id == preferredID && $0.matches(address: address, port: port) }) {
+                         preferredID: UUID? = nil, relay: RelayConnectionInfo? = nil) -> ConnectionRecord? {
+        func matches(_ record: ConnectionRecord) -> Bool {
+            if let relay { return record.relay?.endpoint == relay.endpoint && record.relay?.deviceID == relay.deviceID }
+            return record.relay == nil && record.matches(address: address, port: port)
+        }
+        if let preferredID, let selected = records.first(where: { $0.id == preferredID && matches($0) }) {
             return selected
         }
-        return records.first { $0.matches(address: address, port: port) }
+        return records.first(where: matches)
     }
 
     static func load() -> [ConnectionRecord] {

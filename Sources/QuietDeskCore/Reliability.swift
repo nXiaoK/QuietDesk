@@ -17,9 +17,11 @@ public struct ConnectionRecord: Codable, Identifiable, Equatable {
     public var name: String
     public var lastConnected: Date
     public var videoSettings: StreamSettings?
-    public init(id: UUID = UUID(), address: String, port: UInt16, name: String, lastConnected: Date = Date(), videoSettings: StreamSettings? = nil) {
+    public var relay: RelayConnectionInfo?
+    public init(id: UUID = UUID(), address: String, port: UInt16, name: String, lastConnected: Date = Date(), videoSettings: StreamSettings? = nil, relay: RelayConnectionInfo? = nil) {
         self.id = id; self.address = address; self.port = port; self.name = name; self.lastConnected = lastConnected
         self.videoSettings = videoSettings
+        self.relay = relay
     }
     public func matches(address: String, port: UInt16) -> Bool {
         self.port == port && self.address.caseInsensitiveCompare(address) == .orderedSame

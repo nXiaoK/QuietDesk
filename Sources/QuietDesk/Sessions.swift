@@ -4,6 +4,7 @@ import QuietDeskCore
 // These resources belong to one connection. Reconnect intent and UI state live in DeskModel.
 @MainActor
 final class HostSession {
+    var usesRelayControl = false
     var media: MediaSession?
     var mediaPrepared = false
     let cursorID = UUID()
@@ -30,6 +31,11 @@ final class HostSession {
 
 @MainActor
 final class ViewerSession {
+    var relayBridge: RelayViewerBridge?
+    var mediaRelayBridge: RelayViewerBridge?
+    var usesRelayControl = false
+    var transportHost: String?
+    var transportPort: UInt16?
     var cursorRequestID: UUID?
     var cursorRequestedEnabled = false
     var cursorTimeout: Task<Void, Never>?

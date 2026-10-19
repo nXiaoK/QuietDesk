@@ -12,6 +12,7 @@ final class DiagnosticLog: @unchecked Sendable {
         case clipboardCompleted, clipboardFailed, clipboardEchoSuppressed
         case permissionChanged, exportRequested, exportCompleted, exportFailed, counters
         case performanceDiagnosticsChanged, performanceWindow
+        case relayRegistration, mediaRouteChanged
     }
     enum Role: String, Codable { case viewer, host }
     enum State: String, Codable {
@@ -25,6 +26,7 @@ final class DiagnosticLog: @unchecked Sendable {
         case eventCount, scrollObserved, scrollSent, scrollReceived, scrollSuppressed, entriesDropped
         case pendingBytes, retryAttempt, maximumDimension
         case tcpAckStretchingDisabled
+        case relayControl, relayVideo, videoPath
     }
     enum Counter: String {
         case scrollObserved, scrollSent, scrollReceived, scrollSuppressed

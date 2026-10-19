@@ -44,7 +44,7 @@ func randomKey(t *testing.T) []byte {
 }
 
 func newFixture(t *testing.T, cfg Config) *fixture {
-	return newFixtureWithDatagrams(t, cfg, false)
+	return newFixtureWithDatagrams(t, cfg, false, false)
 }
 
 type blockedDatagramSocket struct{ net.PacketConn }
@@ -57,7 +57,15 @@ func (socket blockedDatagramSocket) ReadFrom(data []byte) (int, net.Addr, error)
 	}
 }
 
-func newFixtureWithDatagrams(t *testing.T, cfg Config, blocked bool) *fixture {
+type privatePortSocket struct{ net.PacketConn }
+
+func (socket privatePortSocket) LocalAddr() net.Addr {
+	address := *socket.PacketConn.LocalAddr().(*net.UDPAddr)
+	address.Port = 9
+	return &address
+}
+
+func newFixtureWithDatagrams(t *testing.T, cfg Config, blocked, privatePort bool) *fixture {
 	t.Helper()
 	if cfg.AccessKey == nil {
 		cfg.AccessKey = randomKey(t)
@@ -108,6 +116,9 @@ func newFixtureWithDatagrams(t *testing.T, cfg Config, blocked bool) *fixture {
 	var packets net.PacketConn = udp
 	if blocked {
 		packets = blockedDatagramSocket{udp}
+	}
+	if privatePort {
+		packets = privatePortSocket{packets}
 	}
 	go func() {
 		if err := server.Serve(listener, packets); err != nil {
@@ -430,7 +441,7 @@ func TestNativeInteropFixture(t *testing.T) {
 	if directory == "" {
 		t.Skip("native interoperability fixture is opt-in")
 	}
-	f := newFixtureWithDatagrams(t, Config{}, os.Getenv("QUIETDESK_RELAY_FIXTURE_BLOCK_UDP") == "1")
+	f := newFixtureWithDatagrams(t, Config{}, os.Getenv("QUIETDESK_RELAY_FIXTURE_BLOCK_UDP") == "1", os.Getenv("QUIETDESK_RELAY_FIXTURE_PRIVATE_UDP_PORT") == "1")
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		t.Fatal(err)
 	}

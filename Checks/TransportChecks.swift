@@ -54,6 +54,7 @@ func runTransportChecks() {
         try wait(closed, seconds: 4, "Refused connection waited for the handshake timeout")
         try check(reason.read() == SecureTransport.connectionFailureReason(.posix(.ECONNREFUSED)), "Refusal reason was not specific")
         try check(!peer.closeIsRetryable, "A closed listening port kept automatic reconnect active")
+        try check(peer.closeAllowsAlternateRoute, "A refused direct endpoint could not try an explicitly configured relay")
     }
     run("Stopping a host listener ends retries when the replacement connection is refused") {
         let key = try PairingKey.generate()

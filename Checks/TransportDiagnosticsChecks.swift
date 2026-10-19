@@ -40,6 +40,32 @@ func runTransportDiagnosticsChecks() {
             "Round-trip diagnostics lost their kind, unit or probe identifier")
     }
 
+    run("Relayed inner sockets suppress loopback TCP reports while application RTT and payloads remain measured") {
+        let diagnostics = PerformanceDiagnostics(enabled: true)
+        let key = try PairingKey.generate()
+        let listener = try makeListener(key, queue: DispatchQueue(label: "checks.relay-inner-diagnostics"))
+        let server = Box<Peer?>(nil)
+        let measured = DispatchSemaphore(value: 0), echoed = DispatchSemaphore(value: 0)
+        listener.newConnectionHandler = { connection in
+            let peer = Peer(connection: connection)
+            server.set(peer); peer.onMessage = { [weak peer] in peer?.send($0) }; peer.start()
+        }
+        guard let port = listener.port else { throw CheckFailure("No synthetic inner TLS port") }
+        let client = Peer(connection: NWConnection(host: "127.0.0.1", port: port, using: SecureTransport.parameters(key: key)),
+                          heartbeatInterval: 0.05, diagnostics: diagnostics, transportDiagnosticsSupported: false)
+        defer { client.close(); server.read()?.close(); listener.cancel() }
+        client.onRoundTripMilliseconds = { _ in measured.signal() }
+        client.onReady = { client.send(Message(.input, Data([1, 7, 255]))) }
+        client.onMessage = { message in if message.payload == Data([1, 7, 255]) { echoed.signal() } }
+        client.start()
+        try wait(measured, "Disabling inner socket reports suppressed end-to-end heartbeats")
+        try wait(echoed, "Disabling inner socket reports changed application delivery")
+        Thread.sleep(forTimeInterval: 0.2)
+        let samples = diagnostics.drain()
+        try check(samples.contains(where: { $0.metric == .roundTrip }) && !samples.contains(where: { $0.metric.rawValue.hasPrefix("tcp") }),
+                  "Loopback TCP timing was exposed as relay network timing")
+    }
+
     run("TCP reports follow mid-connection diagnostic changes and stop after close") {
         let diagnostics = PerformanceDiagnostics()
         let key = try PairingKey.generate()

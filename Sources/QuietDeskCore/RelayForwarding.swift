@@ -11,6 +11,7 @@ final class RelayTCPForwarder {
     private var localReady = false
     private var remoteReady = false
     private var forwarding = false
+    var hasForwarded: Bool { forwarding }
     private var closed = false
 
     init(local: NWConnection, channel: RelayTLSChannel, request: RelayMessage) {

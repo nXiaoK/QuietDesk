@@ -185,6 +185,8 @@ private func rejectedRelay(_ fixture: Fixture, wrongKey: Bool) throws {
             }
             if CommandLine.arguments.contains("--udp-blocked") {
                 run("Blocked relay UDP still commits independent end-to-end TCP video and reliable bulk") { try exerciseRelay(fixture, udp: true, blocked: true) }
+            } else if CommandLine.arguments.contains("--private-udp-port") {
+                run("A private node listen port cannot redirect public-endpoint DTLS forwarding") { try exerciseRelay(fixture, udp: true) }
             } else {
             run("Native endpoints preserve inner desktop TLS, independent TCP video and bulk through the Go relay") { try exerciseRelay(fixture, udp: false) }
             run("Native endpoints preserve inner desktop DTLS media through authenticated Go datagram routing") { try exerciseRelay(fixture, udp: true) }
@@ -206,6 +208,10 @@ private func rejectedRelay(_ fixture: Fixture, wrongKey: Bool) throws {
                 let bridge = try RelayViewerBridge(endpoint: fixture.endpoint, accessKey: fixture.accessKey, deviceID: UUID(), certificateAuthorities: fixture.authorities)
                 bridge.onReady = { _ in ready.update { $0 += 1 } }
                 bridge.start(); bridge.stop()
+                let host = try RelayHostRegistration(endpoint: fixture.endpoint, accessKey: fixture.accessKey, deviceID: UUID(),
+                    ownerKey: PairingKey.generate().data, localPort: 9, certificateAuthorities: fixture.authorities)
+                host.onStatus = { if case .online = $0 { ready.update { $0 += 1 } } }
+                host.start(); host.stop()
                 Thread.sleep(forTimeInterval: 0.2)
                 try requireRelay(ready.read() == 0, "Cancelled bridge revived")
             }

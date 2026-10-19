@@ -19,6 +19,7 @@ struct ConnectionSettingsView: View {
                         .disabled(model.connected && !model.supportsIndependentCursor)
                         .help("减少双光标跟随；远端形状不可用时使用通用指针。")
                     if model.connected {
+                        Text(model.controlTransportStatus).font(.caption).foregroundStyle(.secondary)
                         Text(model.supportsIndependentCursor ? model.cursorStatus : "对端版本不支持独立光标")
                             .font(.caption).foregroundStyle(.secondary)
                     }

@@ -17,8 +17,10 @@ swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
 fixture_directory="$(mktemp -d "$check_root/relay-fixture.XXXXXX")"
 fixture_directory="$(cd "$fixture_directory" && pwd)"
 blocked=0
+private_port=0
 if [[ "${1:-}" == "--udp-blocked" ]]; then blocked=1; fi
-(cd relay && QUIETDESK_RELAY_FIXTURE_DIR="$fixture_directory" QUIETDESK_RELAY_FIXTURE_BLOCK_UDP="$blocked" go test -run '^TestNativeInteropFixture$' -count=1 -timeout=180s -v .) > "$fixture_directory/node.log" 2>&1 &
+if [[ "${1:-}" == "--private-udp-port" ]]; then private_port=1; fi
+(cd relay && QUIETDESK_RELAY_FIXTURE_DIR="$fixture_directory" QUIETDESK_RELAY_FIXTURE_BLOCK_UDP="$blocked" QUIETDESK_RELAY_FIXTURE_PRIVATE_UDP_PORT="$private_port" go test -run '^TestNativeInteropFixture$' -count=1 -timeout=180s -v .) > "$fixture_directory/node.log" 2>&1 &
 fixture_pid=$!
 cleanup() { touch "$fixture_directory/finish"; wait "$fixture_pid" || true; }
 trap cleanup EXIT

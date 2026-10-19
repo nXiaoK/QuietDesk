@@ -8,6 +8,7 @@ struct SharingView: View {
     @State private var showCode = false
     @State private var confirmingRegeneration = false
     @State private var previousCode = ""
+    @State private var showRelaySettings = false
 
     private var locked: Bool { model.active || model.working }
 
@@ -36,6 +37,10 @@ struct SharingView: View {
         }
         .onAppear { model.prepareHostCode() }
         .onDisappear { previousCode = "" }
+        .sheet(isPresented: $showRelaySettings) {
+            RelaySettingsView(enabled: model.relayEnabled, address: model.relayAddress, deviceID: model.relayDeviceID,
+                              locked: locked, save: model.saveRelayConfiguration)
+        }
     }
 
     private var mainColumn: some View {
@@ -50,6 +55,19 @@ struct SharingView: View {
         VStack(alignment: .leading, spacing: 20) {
             launchSection
             clipboardSection
+            card {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("自托管中继", systemImage: "network").font(.headline)
+                    Text(model.relayEnabled ? model.relayHostStatus : "未启用；现有直连方式保持可用。")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    if model.relayEnabled, !model.relayDeviceID.isEmpty {
+                        Text("本机设备标识").font(.caption).foregroundStyle(.secondary)
+                        Text(model.relayDeviceID).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Button("中继设置…") { showRelaySettings = true }.buttonStyle(.link)
+                }
+            }
             Button(action: openTraffic) { Label("设备流量统计…", systemImage: "chart.bar.xaxis") }
                 .buttonStyle(.link)
             Text("共享期间 Mac 保持唤醒。支持一个显示器与一个控制连接；暂不包含音频和登录窗口控制。")
@@ -93,7 +111,7 @@ struct SharingView: View {
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                         } else {
-                            Text("把这张书桌带走：在家里 Mac 开启共享，然后从公司 Mac 连接。使用现有的 TCP 端口映射。")
+                            Text("把这张书桌带走：在家里 Mac 开启共享，然后从另一台 Mac 通过端口映射或自托管中继连接。")
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)

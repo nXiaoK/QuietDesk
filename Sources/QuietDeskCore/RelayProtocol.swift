@@ -36,6 +36,21 @@ public enum RelayConnectionStrategy: String, Codable, CaseIterable, Sendable {
     }
 }
 
+public struct RelayConnectionInfo: Codable, Equatable, Sendable {
+    public let endpoint: RelayEndpoint
+    public let deviceID: UUID
+    public let strategy: RelayConnectionStrategy
+    public init(endpoint: RelayEndpoint, deviceID: UUID, strategy: RelayConnectionStrategy = .relay) throws {
+        guard strategy != .direct else { throw RelayServiceError.invalid }
+        self.endpoint = endpoint; self.deviceID = deviceID; self.strategy = strategy
+    }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(endpoint: values.decode(RelayEndpoint.self, forKey: .endpoint), deviceID: values.decode(UUID.self, forKey: .deviceID),
+                      strategy: values.decode(RelayConnectionStrategy.self, forKey: .strategy))
+    }
+}
+
 public enum RelayServiceError: String, Codable, Error, LocalizedError, Sendable {
     case unauthorized, offline, busy, capacity, timeout, expired, storage, unsupported
     case ownerMismatch = "owner_mismatch"

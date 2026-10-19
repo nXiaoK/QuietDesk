@@ -9,6 +9,7 @@ struct ConnectionView: View {
     let openTraffic: () -> Void
     let openEffects: () -> Void
     @State private var showRecords = false
+    @State private var showRelaySettings = false
 
     private var locked: Bool { model.active || model.working }
     private var failure: String? { model.connectionFailure }
@@ -31,20 +32,40 @@ struct ConnectionView: View {
                     }
                     VStack(spacing: 14) {
                         VStack(spacing: 0) {
-                            formRow("家里 Mac 的地址") {
-                                TextField("域名或 IP", text: $model.address)
-                                    .accessibilityLabel("家里 Mac 的地址")
-                            }
-                            Divider()
-                            formRow("映射后的端口") {
-                                HStack(spacing: 10) {
-                                    TextField("5908", text: $model.port).frame(width: 80)
-                                        .accessibilityLabel("映射后的端口")
-                                    Text("家里 Mac 的监听端口经路由器映射后的端口")
-                                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                            if model.relayEnabled {
+                                formRow("连接策略") {
+                                    Picker("连接策略", selection: $model.relayStrategy) {
+                                        ForEach(RelayConnectionStrategy.allCases, id: \.self) { Text($0.title).tag($0) }
+                                    }.labelsHidden().pickerStyle(.menu)
+                                }
+                                Divider()
+                                if model.relayStrategy != .direct {
+                                    formRow("目标设备标识") {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            TextField("被控 Mac 显示的完整设备标识", text: $model.targetRelayDeviceID)
+                                                .accessibilityLabel("目标中继设备标识")
+                                            Text(model.viewerRelayAddress).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                        }
+                                    }
+                                    Divider()
                                 }
                             }
-                            Divider()
+                            if !model.relayEnabled || model.relayStrategy != .relay {
+                                formRow("家里 Mac 的地址") {
+                                    TextField(model.relayEnabled && model.relayStrategy == .automatic ? "可选：已知域名或 IP" : "域名或 IP", text: $model.address)
+                                        .accessibilityLabel("家里 Mac 的地址")
+                                }
+                                Divider()
+                                formRow("映射后的端口") {
+                                    HStack(spacing: 10) {
+                                        TextField("5908", text: $model.port).frame(width: 80)
+                                            .accessibilityLabel("映射后的端口")
+                                        Text("家里 Mac 的监听端口经路由器映射后的端口")
+                                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
+                                Divider()
+                            }
                             formRow("配对码") {
                                 SecureField("粘贴完整配对码", text: $model.viewerCode)
                                     .accessibilityLabel("家里 Mac 显示的配对码")
@@ -62,6 +83,7 @@ struct ConnectionView: View {
                                                            openTraffic: openTraffic, openEffects: openEffects)
                                 }
                             Button(action: openCaps) { Label("键盘设置…", systemImage: "keyboard") }
+                            Button { model.canvas.releaseControl(); showRelaySettings = true } label: { Label("中继设置…", systemImage: "network") }
                             Spacer()
                             if locked {
                                 ProgressView().controlSize(.small)
@@ -76,7 +98,8 @@ struct ConnectionView: View {
                             HStack(spacing: 8) {
                                 Text(model.status).font(.callout).foregroundStyle(.secondary)
                                 Spacer()
-                                Text("\(model.address):\(model.port)").font(.caption).monospaced().foregroundStyle(.secondary)
+                                Text(model.relayEnabled && model.relayStrategy == .relay ? "设备 \(model.targetRelayDeviceID.prefix(8))" : "\(model.address):\(model.port)")
+                                    .font(.caption).monospaced().foregroundStyle(.secondary)
                             }
                         }
                         if let failure {
@@ -127,7 +150,7 @@ struct ConnectionView: View {
                             Image(systemName: "desktopcomputer").foregroundStyle(.secondary)
                             VStack(alignment: .leading, spacing: 4) {
                                 Text(record.name).font(.headline)
-                                Text(verbatim: "\(record.address):\(record.port)").font(.caption).monospaced().foregroundStyle(.secondary)
+                                Text(connectionEndpointLabel(record)).font(.caption).monospaced().foregroundStyle(.secondary).lineLimit(2)
                                 Text(record.lastConnected.formatted(date: .abbreviated, time: .shortened))
                                     .font(.caption).foregroundStyle(.secondary)
                             }
@@ -139,6 +162,10 @@ struct ConnectionView: View {
                 }
                 HStack { Spacer(); Button("完成") { showRecords = false }.keyboardShortcut(.cancelAction) }
             }.padding(24).frame(width: 540, height: 420)
+        }
+        .sheet(isPresented: $showRelaySettings) {
+            RelaySettingsView(enabled: model.relayEnabled, address: model.relayAddress, deviceID: model.relayDeviceID,
+                              locked: locked, save: model.saveRelayConfiguration)
         }
     }
 
@@ -155,7 +182,7 @@ struct ConnectionView: View {
             HStack(alignment: .top, spacing: 0) {
                 guideStep(1, text: "在家里 Mac 打开 QuietDesk，切到「共享这台 Mac」")
                 Divider()
-                guideStep(2, text: "开启共享，并在路由器映射监听端口")
+                guideStep(2, text: "开启共享，使用端口映射或配置自托管中继")
                 Divider()
                 guideStep(3, text: "复制配对码，回到这里粘贴后连接")
             }
@@ -173,6 +200,13 @@ struct ConnectionView: View {
     }
 }
 
+private func connectionEndpointLabel(_ record: ConnectionRecord) -> String {
+    if let relay = record.relay {
+        return "\(relay.strategy == .automatic ? "自动" : "中继") · \(relay.deviceID.uuidString.lowercased()) · \(relay.endpoint.address)"
+    }
+    return "\(record.address):\(record.port)"
+}
+
 private struct ConnectionCard: View {
     let record: ConnectionRecord
     let connect: () -> Void
@@ -185,7 +219,8 @@ private struct ConnectionCard: View {
                 .frame(width: 34, height: 34).background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 6))
             VStack(alignment: .leading, spacing: 4) {
                 Text(record.name).font(.headline).lineLimit(1).help(record.name)
-                Text(verbatim: "\(record.address):\(record.port)").font(.caption).monospaced().lineLimit(1).truncationMode(.middle)
+                Text(connectionEndpointLabel(record)).font(.caption).monospaced().lineLimit(1).truncationMode(.middle)
+                    .help(connectionEndpointLabel(record))
                 Text("上次连接 \(record.lastConnected.formatted(date: .abbreviated, time: .shortened))")
                     .font(.caption2).lineLimit(1)
             }

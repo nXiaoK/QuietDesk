@@ -61,6 +61,7 @@ public final class Peer {
     public let trafficMeter = TrafficMeter()
     public var onRoundTripMilliseconds: ((Double) -> Void)?
     public private(set) var closeIsRetryable = false
+    public private(set) var closeAllowsAlternateRoute = false
     private let connection: NWConnection
     private var closed = false
     private var started = false
@@ -74,6 +75,7 @@ public final class Peer {
     private let handshakeTimeout: TimeInterval
     private let heartbeatInterval: TimeInterval
     private let diagnostics: PerformanceDiagnostics?
+    private var transportDiagnosticsSupported: Bool
     private var roundTrip = RoundTripProbe()
     private var roundTripDiagnostic: (identifier: UInt64, token: PerformanceDiagnostics.Token)?
     private var diagnosticsObserver: UUID?
@@ -101,12 +103,13 @@ public final class Peer {
         }
     }
 
-    public init(connection: NWConnection, idleTimeout: TimeInterval = 30, handshakeTimeout: TimeInterval = 15, heartbeatInterval: TimeInterval = 5, diagnostics: PerformanceDiagnostics? = nil) {
+    public init(connection: NWConnection, idleTimeout: TimeInterval = 30, handshakeTimeout: TimeInterval = 15, heartbeatInterval: TimeInterval = 5, diagnostics: PerformanceDiagnostics? = nil, transportDiagnosticsSupported: Bool = true) {
         self.connection = connection
         self.idleTimeout = idleTimeout
         self.handshakeTimeout = handshakeTimeout
         self.heartbeatInterval = heartbeatInterval
         self.diagnostics = diagnostics
+        self.transportDiagnosticsSupported = transportDiagnosticsSupported
     }
 
     public func start() {
@@ -122,6 +125,7 @@ public final class Peer {
                 guard let self else { return }
                 self.collectTransportDiagnostics()
                 if SessionClock.now - self.lastReceived > (self.ready ? self.idleTimeout : self.handshakeTimeout) {
+                    self.closeAllowsAlternateRoute = !self.ready
                     self.finish(self.ready ? "连接超过 \(Int(self.idleTimeout)) 秒无数据" : "建立连接超时，请检查地址或远端状态")
                 } else if self.ready {
                     self.sendHeartbeat()
@@ -145,6 +149,7 @@ public final class Peer {
                         self.finish(failure.reason, retryable: failure.retryable)
                     }
                     else {
+                        self.closeAllowsAlternateRoute = true
                         self.finish(SecureTransport.connectionFailureReason(error) ?? "连接失败：\(error.localizedDescription)",
                                     retryable: error != .posix(.ECONNREFUSED))
                     }
@@ -152,6 +157,7 @@ public final class Peer {
                     if case .tls(let code) = error, SecureTransport.pairingFailureCodes.contains(code) {
                         self.finish("TLS 配对验证失败：\(error.localizedDescription)", retryable: false)
                     } else if let reason = SecureTransport.connectionFailureReason(error) {
+                        self.closeAllowsAlternateRoute = true
                         self.finish(reason, retryable: error != .posix(.ECONNREFUSED))
                     }
                 case .cancelled: self.finish("连接已关闭")
@@ -175,7 +181,7 @@ public final class Peer {
     }
 
     private func updateTransportDiagnostics() {
-        guard !closed, ready, let diagnostics, let token = diagnostics.start() else {
+        guard !closed, ready, transportDiagnosticsSupported, let diagnostics, let token = diagnostics.start() else {
             transportReport = nil
             collectingTransportReport = nil
             return
@@ -184,6 +190,14 @@ public final class Peer {
         if let collection = collectingTransportReport, !diagnostics.accepts(collection.token) { collectingTransportReport = nil }
         if transportReport == nil, collectingTransportReport == nil {
             transportReport = (connection.startDataTransferReport(), token)
+        }
+    }
+
+    public func setTransportDiagnosticsSupported(_ supported: Bool) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.transportDiagnosticsSupported = supported
+            self.updateTransportDiagnostics()
         }
     }
 

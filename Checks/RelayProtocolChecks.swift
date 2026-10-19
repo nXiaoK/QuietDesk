@@ -56,4 +56,23 @@ func runRelayProtocolChecks() {
         for value: UInt64 in [0, 1, 2, 3, 65] { try check(!window.accept(value), "Replay revived an old relay packet") }
         try check(window.accept(.max) && !window.accept(1) && !window.accept(.max), "Counter exhaustion silently wrapped")
     }
+    run("Relay connection metadata remains optional and contains no service or desktop credentials") {
+        let direct = ConnectionRecord(address: "desktop.local", port: 5908, name: "Synthetic desktop")
+        let directData = try JSONEncoder().encode(direct)
+        let directJSON = try JSONSerialization.jsonObject(with: directData) as! [String: Any]
+        try check(directJSON["relay"] == nil && (try JSONDecoder().decode(ConnectionRecord.self, from: directData)).relay == nil,
+                  "A legacy direct record changed its JSON field range")
+        let info = try RelayConnectionInfo(endpoint: RelayEndpoint(address: "relay.example.com:7443"), deviceID: UUID(), strategy: .automatic)
+        var relayed = direct; relayed.relay = info
+        let encoded = try JSONEncoder().encode(relayed)
+        let decoded = try JSONDecoder().decode(ConnectionRecord.self, from: encoded)
+        try check(decoded == relayed && decoded.id == direct.id, "Relay metadata lost record identity or old fields")
+        let text = String(decoding: encoded, as: UTF8.self)
+        for field in ["accessKey", "ownerKey", "pairingCode", "registration", "datagramKey"] {
+            try check(!text.contains(field), "A credential entered connection metadata")
+        }
+        try rejects("Direct records acquired an active relay route") {
+            _ = try RelayConnectionInfo(endpoint: info.endpoint, deviceID: info.deviceID, strategy: .direct)
+        }
+    }
 }

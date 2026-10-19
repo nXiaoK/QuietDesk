@@ -29,8 +29,10 @@ public final class RelayViewerBridge: @unchecked Sendable {
     private var pendingDatagrams: [Data] = []
     private let failureLock = NSLock()
     private var failure: Error?
+    private var serviceSetupFailure = false
 
     public var lastFailure: Error? { failureLock.withLock { failure } }
+    public var failedBeforeDesktopStream: Bool { failureLock.withLock { serviceSetupFailure } }
 
     public init(endpoint: RelayEndpoint, accessKey: Data, deviceID: UUID, udpEnabled: Bool = true,
                 certificateAuthorities: [Data] = []) throws {
@@ -100,9 +102,9 @@ public final class RelayViewerBridge: @unchecked Sendable {
             let forwarder = RelayTCPForwarder(local: connection, channel: channel,
                 request: RelayMessage(.connect, accessKey: accessKey, deviceID: deviceID))
             forwarders[id] = forwarder
-            forwarder.onClose = { [weak self] error in
+            forwarder.onClose = { [weak self, weak forwarder] error in
                 guard let self else { return }; self.forwarders.removeValue(forKey: id)
-                if self.primary == id, !self.stopped { self.fail(error) }
+                if self.primary == id, !self.stopped { self.fail(error, serviceSetup: forwarder?.hasForwarded != true) }
             }
             forwarder.start()
         } catch { connection.cancel(); fail(error) }
@@ -132,10 +134,12 @@ public final class RelayViewerBridge: @unchecked Sendable {
                     do {
                         let message = try result.get()
                         if message.op == .error { throw message.error ?? .invalid }
-                        guard message.op == .datagramReady, let id = message.datagramID, let key = message.datagramKey, let port = message.udpPort else {
+                        guard message.op == .datagramReady, let id = message.datagramID, let key = message.datagramKey, message.udpPort != nil else {
                             throw RelayServiceError.invalid
                         }
-                        let pipe = try RelayUDPPipe(endpoint: self.endpoint, port: UInt16(port), id: id, key: key, side: 0, queue: self.queue)
+                        // A node's listener port may be private behind NAT. Only the user-configured
+                        // public service endpoint determines where routing datagrams are sent.
+                        let pipe = try RelayUDPPipe(endpoint: self.endpoint, port: self.endpoint.port, id: id, key: key, side: 0, queue: self.queue)
                         self.datagramPipe = pipe
                         pipe.onReady = { [weak self, weak pipe] in
                             guard let self, let pipe, self.datagramGeneration == token, !self.stopped else { return }
@@ -214,9 +218,9 @@ public final class RelayViewerBridge: @unchecked Sendable {
         datagramLocal?.stateUpdateHandler = nil; datagramLocal?.cancel(); datagramLocal = nil
     }
 
-    private func fail(_ error: Error) {
+    private func fail(_ error: Error, serviceSetup: Bool = true) {
         guard !stopped else { return }
-        failureLock.withLock { failure = error }
+        failureLock.withLock { failure = error; serviceSetupFailure = serviceSetup }
         closeAll(); onClose?(error)
     }
 

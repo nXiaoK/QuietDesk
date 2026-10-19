@@ -175,9 +175,9 @@ private final class HostDatagramRoute {
     private var localReady = false
 
     init(message: RelayMessage, endpoint: RelayEndpoint, localPort: UInt16, queue: DispatchQueue) throws {
-        guard let id = message.datagramID, let key = message.datagramKey, let port = message.udpPort else { throw RelayServiceError.invalid }
+        guard let id = message.datagramID, let key = message.datagramKey, message.udpPort != nil else { throw RelayServiceError.invalid }
         self.queue = queue
-        pipe = try RelayUDPPipe(endpoint: endpoint, port: UInt16(port), id: id, key: key, side: 1, queue: queue)
+        pipe = try RelayUDPPipe(endpoint: endpoint, port: endpoint.port, id: id, key: key, side: 1, queue: queue)
         local = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: localPort)!, using: .udp)
     }
     func start() {

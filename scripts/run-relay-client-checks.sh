@@ -17,6 +17,10 @@ swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
 if [[ "${1:-}" == "--build-only" ]]; then exit 0; fi
 fixture_directory="$(mktemp -d "$check_root/relay-fixture.XXXXXX")"
 fixture_directory="$(cd "$fixture_directory" && pwd)"
+openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 -subj '/CN=QuietDesk alternate synthetic node' \
+    -addext 'subjectAltName=IP:127.0.0.1' -addext 'extendedKeyUsage=serverAuth' \
+    -keyout "$fixture_directory/alternate.key" -out "$fixture_directory/alternate.pem" > /dev/null 2> "$fixture_directory/openssl.log"
+openssl x509 -in "$fixture_directory/alternate.pem" -outform DER -out "$fixture_directory/alternate.der"
 blocked=0
 private_port=0
 if [[ "${1:-}" == "--udp-blocked" || "${1:-}" == "--mixed-blocked" ]]; then blocked=1; fi

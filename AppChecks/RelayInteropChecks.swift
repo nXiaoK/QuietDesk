@@ -60,7 +60,7 @@ private func relayPacket(_ sequence: UInt32, idr: Bool) -> VideoPacket {
                 avcc: Data([0, 0, 0, 2, idr ? 0x65 : 0x41, 0x88]))
 }
 
-private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false, wrongPairing: Bool = false) throws {
+private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false, wrongPairing: Bool = false, pinned: Bool = false) throws {
     let queue = DispatchQueue(label: "checks.relay.host-listener")
     let key = try PairingKey.generate(), device = UUID()
     let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8)
@@ -102,8 +102,10 @@ private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false,
         peer.start()
     }
     hostPort.update { $0 = listener.port!.rawValue }
+    let certificate = pinned ? try RelayNodeCertificate(data: fixture.authorities[0]) : nil
+    let authorities = pinned ? [] : fixture.authorities
     let agent = try RelayHostRegistration(endpoint: fixture.endpoint, accessKey: fixture.accessKey, deviceID: device,
-        ownerKey: PairingKey.generate().data, localPort: listener.port!.rawValue, certificateAuthorities: fixture.authorities)
+        ownerKey: PairingKey.generate().data, localPort: listener.port!.rawValue, certificateAuthorities: authorities, trustedCertificate: certificate)
     hostAgent.update { $0 = agent }
     agent.onStatus = { status in
         if case .online = status { online.signal() }
@@ -111,7 +113,7 @@ private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false,
     }
     agent.start()
     let bridge = try RelayViewerBridge(endpoint: fixture.endpoint, accessKey: fixture.accessKey, deviceID: device,
-        udpEnabled: udp, certificateAuthorities: fixture.authorities)
+        udpEnabled: udp, certificateAuthorities: authorities, trustedCertificate: certificate)
     bridge.onReady = { port in bridgePort.update { $0 = port }; localReady.signal() }
     bridge.onClose = { error in if !shuttingDown.read() && !wrongPairing { errors.update { $0.append("Bridge failed: \(error.localizedDescription)") } } }
     bridge.onDatagramFailure = { error in
@@ -203,8 +205,9 @@ private func exerciseMixedRelay(_ fixture: Fixture, drop: Bool, blocked: Bool = 
         peer.start()
     }
     hostPort.update { $0 = listener.port!.rawValue }
+    let certificate = try RelayNodeCertificate(data: fixture.authorities[0])
     let agent = try RelayHostRegistration(endpoint: fixture.endpoint, accessKey: fixture.accessKey, deviceID: device,
-        ownerKey: PairingKey.generate().data, localPort: listener.port!.rawValue, certificateAuthorities: fixture.authorities)
+        ownerKey: PairingKey.generate().data, localPort: listener.port!.rawValue, trustedCertificate: certificate)
     agentBox.update { $0 = agent }
     agent.onStatus = { if case .online = $0 { online.signal() } }
     agent.start()
@@ -240,7 +243,7 @@ private func exerciseMixedRelay(_ fixture: Fixture, drop: Bool, blocked: Bool = 
                 if cancelCandidate { held.update { $0 = complete }; return }
                 do {
                     let bridge = try RelayViewerBridge(endpoint: fixture.endpoint, accessKey: fixture.accessKey, deviceID: device,
-                        certificateAuthorities: fixture.authorities)
+                        trustedCertificate: certificate)
                     bridgeBox.update { $0 = bridge }
                     bridge.onReady = { [weak bridge] port in
                         complete(MediaSession.DatagramEndpoint(host: "127.0.0.1", port: port, retire: { [weak bridge] in bridge?.retireDatagramPath() }))
@@ -334,12 +337,13 @@ private func rejectedRelay(_ fixture: Fixture, wrongKey: Bool) throws {
             } else if CommandLine.arguments.contains("--mixed-blocked") {
                 run("Failed direct TCP and blocked relay UDP preserve the old frame and request bounded reliable fallback") { try exerciseMixedRelay(fixture, drop: true, blocked: true) }
             } else if CommandLine.arguments.contains("--udp-blocked") {
-                run("Blocked relay UDP still commits independent end-to-end TCP video and reliable bulk") { try exerciseRelay(fixture, udp: true, blocked: true) }
+                run("Blocked relay UDP still commits independent end-to-end TCP video and reliable bulk") { try exerciseRelay(fixture, udp: true, blocked: true, pinned: true) }
             } else if CommandLine.arguments.contains("--private-udp-port") {
-                run("A private node listen port cannot redirect public-endpoint DTLS forwarding") { try exerciseRelay(fixture, udp: true) }
+                run("A private node listen port cannot redirect public-endpoint DTLS forwarding") { try exerciseRelay(fixture, udp: true, pinned: true) }
             } else {
             run("Native endpoints preserve inner desktop TLS, independent TCP video and bulk through the Go relay") { try exerciseRelay(fixture, udp: false) }
             run("Native endpoints preserve inner desktop DTLS media through authenticated Go datagram routing") { try exerciseRelay(fixture, udp: true) }
+            run("A confirmed node certificate covers registration, control, TCP bulk and DTLS routes") { try exerciseRelay(fixture, udp: true, pinned: true) }
             run("Relay access credentials cannot bypass a wrong desktop pairing key") { try exerciseRelay(fixture, udp: false, wrongPairing: true) }
             run("Incorrect node access credentials are explicit and nonretryable") { try rejectedRelay(fixture, wrongKey: true) }
             run("An offline device is never advertised as a connected desktop") { try rejectedRelay(fixture, wrongKey: false) }
@@ -352,6 +356,40 @@ private func rejectedRelay(_ fixture: Fixture, wrongKey: Bool) throws {
                 channel.start(); defer { channel.close() }
                 try waitRelay(rejected, "Untrusted node certificate did not fail")
                 try requireRelay(!ready.read() && (error.read() as? RelayTransportError) == .certificate, "System trust was bypassed")
+            }
+            run("Certificate discovery returns a matching candidate while rejecting its unauthenticated handshake") {
+                let done = DispatchSemaphore(value: 0), found = RelayBox<RelayNodeCertificate?>(nil)
+                let probe = RelayCertificateProbe(endpoint: try fixture.endpoint) { result in
+                    if case .success(let certificate) = result { found.update { $0 = certificate } }
+                    done.signal()
+                }
+                probe.start(); defer { probe.cancel() }
+                try waitRelay(done, "Certificate discovery did not finish")
+                try requireRelay(found.read()?.der == fixture.authorities[0], "Certificate discovery returned another identity")
+            }
+            run("A different valid certificate on the same address cannot replace a confirmed node") {
+                let wrong = try RelayNodeCertificate(data: Data(contentsOf: directory.appendingPathComponent("alternate.der")))
+                let endpoint = try fixture.endpoint
+                try wrong.validate(for: endpoint)
+                let done = DispatchSemaphore(value: 0), ready = RelayBox(false), failure = RelayBox<Error?>(nil)
+                let channel = try RelayTLSChannel(endpoint: endpoint, queue: DispatchQueue(label: "checks.relay.wrong-pin"), trustedCertificate: wrong)
+                channel.onReady = { ready.update { $0 = true }; done.signal() }
+                channel.onClose = { value in failure.update { $0 = value }; done.signal() }
+                channel.start(); defer { channel.close() }
+                try waitRelay(done, "Replaced certificate did not fail")
+                try requireRelay(!ready.read() && (failure.read() as? RelayTransportError) == .certificate, "A saved pin fell back to other trust")
+            }
+            run("Cancelling certificate discovery completes once without publishing trust") {
+                let done = DispatchSemaphore(value: 0), callbacks = RelayBox(0), succeeded = RelayBox(false)
+                let probe = RelayCertificateProbe(endpoint: try fixture.endpoint) { result in
+                    callbacks.update { $0 += 1 }
+                    if case .success = result { succeeded.update { $0 = true } }
+                    done.signal()
+                }
+                probe.cancel(); probe.start()
+                try waitRelay(done, "Cancelled discovery did not finish")
+                Thread.sleep(forTimeInterval: 0.1)
+                try requireRelay(callbacks.read() == 1 && !succeeded.read(), "Cancelled discovery published a late candidate")
             }
             run("Immediate cancellation cannot publish a late bridge or registration readiness") {
                 let ready = RelayBox(0)

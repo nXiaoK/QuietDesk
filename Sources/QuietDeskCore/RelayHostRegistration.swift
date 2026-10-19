@@ -13,6 +13,7 @@ public final class RelayHostRegistration: @unchecked Sendable {
     private let ownerKey: Data
     private let localPort: UInt16
     private let authorities: [Data]
+    private let trustedCertificate: RelayNodeCertificate?
     private let queue = DispatchQueue(label: "quietdesk.relay-host", qos: .userInitiated)
     private var channel: RelayTLSChannel?
     private var heartbeat: DispatchSourceTimer?
@@ -28,10 +29,11 @@ public final class RelayHostRegistration: @unchecked Sendable {
     private var datagramSources: [Data: UInt16] = [:]
 
     public init(endpoint: RelayEndpoint, accessKey: Data, deviceID: UUID, ownerKey: Data, localPort: UInt16,
-                certificateAuthorities: [Data] = []) throws {
+                certificateAuthorities: [Data] = [], trustedCertificate: RelayNodeCertificate? = nil) throws {
         guard accessKey.count == 32, ownerKey.count == 32, localPort > 0 else { throw RelayServiceError.invalid }
         self.endpoint = endpoint; self.accessKey = accessKey; self.deviceID = deviceID
         self.ownerKey = ownerKey; self.localPort = localPort; authorities = certificateAuthorities
+        self.trustedCertificate = trustedCertificate
     }
 
     public func ownsLocalEndpoint(_ endpoint: NWEndpoint) -> Bool {
@@ -53,7 +55,8 @@ public final class RelayHostRegistration: @unchecked Sendable {
         let token = UUID(); generation = token
         onStatus?(.connecting)
         do {
-            let connection = try RelayTLSChannel(endpoint: endpoint, queue: queue, certificateAuthorities: authorities)
+            let connection = try RelayTLSChannel(endpoint: endpoint, queue: queue, certificateAuthorities: authorities,
+                                                 trustedCertificate: trustedCertificate)
             channel = connection
             connection.onReady = { [weak self, weak connection] in
                 guard let self, let connection, self.channel === connection, !self.stopped else { return }
@@ -100,7 +103,8 @@ public final class RelayHostRegistration: @unchecked Sendable {
                     guard let circuit = message.circuitID, let registration = self.registration else { throw RelayServiceError.invalid }
                     if self.forwarders.count < 16 {
                         let id = UUID()
-                        let channel = try RelayTLSChannel(endpoint: self.endpoint, queue: self.queue, certificateAuthorities: self.authorities)
+                        let channel = try RelayTLSChannel(endpoint: self.endpoint, queue: self.queue, certificateAuthorities: self.authorities,
+                                                          trustedCertificate: self.trustedCertificate)
                         let local = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: self.localPort)!, using: .tcp)
                         let forwarder = RelayTCPForwarder(local: local, channel: channel,
                             request: RelayMessage(.accept, accessKey: self.accessKey, deviceID: self.deviceID,

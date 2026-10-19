@@ -165,7 +165,7 @@ struct ConnectionView: View {
         }
         .sheet(isPresented: $showRelaySettings) {
             RelaySettingsView(enabled: model.relayEnabled, address: model.relayAddress, deviceID: model.relayDeviceID,
-                              locked: locked, save: model.saveRelayConfiguration)
+                              locked: locked, loadTrust: model.relayCertificate, save: model.saveRelayConfiguration)
         }
     }
 

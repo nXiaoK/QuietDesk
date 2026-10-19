@@ -118,6 +118,7 @@ QUIETDESK_CHECK_BUILD_DIR="$PWD/.build/clipboard-checks" ./scripts/run-app-check
 ```sh
 ./scripts/run-relay-server-checks.sh
 ./scripts/run-relay-connection-checks.sh
+./scripts/run-relay-certificate-checks.sh
 ./scripts/run-relay-client-checks.sh
 ./scripts/run-relay-client-checks.sh --udp-blocked
 ./scripts/run-relay-client-checks.sh --private-udp-port
@@ -130,7 +131,12 @@ Docker 部署检查需要已运行的 Docker Engine、Compose v2.20+、Python 3 
 
 ```sh
 python3 scripts/check-relay-docker.py
+python3 scripts/check-relay-docker.py --self-signed
 ```
+
+`--self-signed` 使用 `deploy.sh --ip 127.0.0.1` 自动发证，并检查重复部署保留原证书、错误 IP 不会覆盖身份。Python 检查还会把实际 provisioner 的两个卷路径隔离到临时目录，使用真实 OpenSSL 检查 IPv4/IPv6、证书有效期、缺失身份与接入码、私钥不匹配和凭据不输出。
+
+`run-relay-certificate-checks.sh` 使用临时自签的非 CA 服务端证书和独立偏好域，检查 PEM/DER、SHA-256、IP/域名、有效期、服务端用途、按节点保存与损坏拒绝。原生回环检查增加证书获取、替换拒绝、取消及使用固定证书的控制/视频/数据路径；混合路径和 UDP 受阻模式也使用固定证书。不会更改系统信任或访问真实应用的偏好/凭据。系统信任服务、回环端口或视频服务受限时须单独报告限制。
 
 它使用随机项目名、临时自签名证书和独立命名卷，检查非 root 运行、TLS/接入鉴权、TCP 与 UDP 双向转发、重复部署后的登记归属和接入码保留，以及无效证书拒绝。结束只删除该测试项目的卷和镜像，不接触正式节点；端口使用临时空闲端口。CI 和发布流程复用 Linux Docker 检查，发布任务在检查通过后继续；另用 Buildx/QEMU 交叉构建 Linux amd64、arm64 镜像，不自动发布镜像。模拟证书仅用于本机回环，不能用于正式客户端。
 

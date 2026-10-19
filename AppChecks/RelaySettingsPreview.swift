@@ -1,14 +1,17 @@
 import AppKit
 import SwiftUI
+import QuietDeskCore
 
 @main private struct RelaySettingsPreview {
     @MainActor static func main() {
         _ = NSApplication.shared
         NSApp.setActivationPolicy(.accessory)
         let output = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+        let certificate = CommandLine.arguments.count > 2 ? try? RelayNodeCertificate(data: Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2]))) : nil
         let view = NSHostingView(rootView: VStack(alignment: .leading, spacing: 0) {
             Text("SYNTHETIC STATE · 中继设置预览").font(.caption).foregroundStyle(.secondary).padding(.horizontal, 22).padding(.top, 10)
-            RelaySettingsView(enabled: true, address: "tls://relay.example.test:7443", deviceID: "672d6104-a890-4c4c-8862-c8f28f55953a", locked: false) { _, _, _, _ in }
+            RelaySettingsView(enabled: true, address: "tls://127.0.0.1:7443", deviceID: "672d6104-a890-4c4c-8862-c8f28f55953a", locked: false,
+                              loadTrust: { _ in certificate }) { _, _, _, _, _ in }
         }.background(Color(nsColor: .windowBackgroundColor)))
         let size = view.fittingSize
         view.frame = NSRect(origin: .zero, size: size)

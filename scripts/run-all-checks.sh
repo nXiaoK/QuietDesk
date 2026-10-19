@@ -19,6 +19,7 @@ for script in app input caps-lock video cursor session-data session-effects traf
     "./scripts/run-$script-checks.sh"
 done
 ./scripts/run-relay-server-checks.sh
+./scripts/run-relay-certificate-checks.sh
 ./scripts/run-relay-connection-checks.sh
 for relay_mode in normal --udp-blocked --private-udp-port --mixed --mixed-blocked; do
     if [[ "$relay_mode" == normal ]]; then ./scripts/run-relay-client-checks.sh

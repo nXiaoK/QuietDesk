@@ -7,7 +7,7 @@ public enum RelayTransportError: Error, LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .network: return "中继网络连接失败或已关闭"
-        case .certificate: return "中继服务证书校验或 TLS 握手失败"
+        case .certificate: return "中继服务证书校验或 TLS 握手失败；请检查 IP/域名、有效期及已保存的节点证书，证书更换后需重新核对"
         case .timeout: return "中继连接或响应超时"
         case .cancelled: return "中继连接已取消"
         case .queueFull: return "中继发送队列已满"
@@ -37,14 +37,21 @@ public final class RelayTLSChannel: @unchecked Sendable {
     private var sends: [UUID: (bytes: Int, complete: (Bool) -> Void)] = [:]
     private static let maximumPendingBytes = 1_024 * 1_024
 
-    public init(endpoint: RelayEndpoint, queue: DispatchQueue, certificateAuthorities: [Data] = []) throws {
+    public init(endpoint: RelayEndpoint, queue: DispatchQueue, certificateAuthorities: [Data] = [],
+                trustedCertificate: RelayNodeCertificate? = nil) throws {
         self.queue = queue
         let tls = NWProtocolTLS.Options()
         let options = tls.securityProtocolOptions
         sec_protocol_options_set_min_tls_protocol_version(options, .TLSv12)
         sec_protocol_options_set_peer_authentication_required(options, true)
         sec_protocol_options_set_tls_server_name(options, endpoint.host)
-        if !certificateAuthorities.isEmpty {
+        if let trustedCertificate {
+            guard certificateAuthorities.isEmpty else { throw RelayServiceError.invalid }
+            sec_protocol_options_set_verify_block(options, { _, supplied, complete in
+                let trust = sec_trust_copy_ref(supplied).takeRetainedValue()
+                complete(trustedCertificate.evaluate(trust, endpoint: endpoint))
+            }, queue)
+        } else if !certificateAuthorities.isEmpty {
             guard certificateAuthorities.count <= 8, certificateAuthorities.allSatisfy({ !$0.isEmpty && $0.count <= 65_536 }) else {
                 throw RelayServiceError.invalid
             }

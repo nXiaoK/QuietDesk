@@ -10,6 +10,7 @@ public final class RelayViewerBridge: @unchecked Sendable {
     public let deviceID: UUID
     private let accessKey: Data
     private let authorities: [Data]
+    private let trustedCertificate: RelayNodeCertificate?
     private let udpEnabled: Bool
     private let queue = DispatchQueue(label: "quietdesk.relay-viewer", qos: .userInteractive)
     private var listener: NWListener?
@@ -35,10 +36,11 @@ public final class RelayViewerBridge: @unchecked Sendable {
     public var failedBeforeDesktopStream: Bool { failureLock.withLock { serviceSetupFailure } }
 
     public init(endpoint: RelayEndpoint, accessKey: Data, deviceID: UUID, udpEnabled: Bool = true,
-                certificateAuthorities: [Data] = []) throws {
+                certificateAuthorities: [Data] = [], trustedCertificate: RelayNodeCertificate? = nil) throws {
         guard accessKey.count == 32 else { throw RelayServiceError.invalid }
         self.endpoint = endpoint; self.accessKey = accessKey; self.deviceID = deviceID
         self.udpEnabled = udpEnabled; authorities = certificateAuthorities
+        self.trustedCertificate = trustedCertificate
     }
 
     public func start() {
@@ -98,7 +100,8 @@ public final class RelayViewerBridge: @unchecked Sendable {
         do {
             let id = UUID()
             if primary == nil { primary = id }
-            let channel = try RelayTLSChannel(endpoint: endpoint, queue: queue, certificateAuthorities: authorities)
+            let channel = try RelayTLSChannel(endpoint: endpoint, queue: queue, certificateAuthorities: authorities,
+                                              trustedCertificate: trustedCertificate)
             let forwarder = RelayTCPForwarder(local: connection, channel: channel,
                 request: RelayMessage(.connect, accessKey: accessKey, deviceID: deviceID))
             forwarders[id] = forwarder
@@ -124,7 +127,8 @@ public final class RelayViewerBridge: @unchecked Sendable {
         }
         connection.start(queue: queue)
         do {
-            let channel = try RelayTLSChannel(endpoint: endpoint, queue: queue, certificateAuthorities: authorities)
+            let channel = try RelayTLSChannel(endpoint: endpoint, queue: queue, certificateAuthorities: authorities,
+                                              trustedCertificate: trustedCertificate)
             datagramChannel = channel
             channel.onReady = { [weak self, weak channel] in
                 guard let self, let channel, self.datagramGeneration == token, !self.stopped else { return }

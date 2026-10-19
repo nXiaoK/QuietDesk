@@ -11,7 +11,7 @@ public struct RelayEndpoint: Codable, Equatable, Hashable, Sendable {
         guard let parts = URLComponents(string: url), parts.scheme == "tls", parts.user == nil, parts.password == nil,
               parts.query == nil, parts.fragment == nil, parts.path.isEmpty, let host = parts.host,
               !host.isEmpty, (1...65_535).contains(parts.port ?? 443) else {
-            throw DeskError.invalid("中继地址应为 tls://域名:端口，不包含路径、账户或密码")
+            throw DeskError.invalid("中继地址应为 tls://IP或域名:端口，不包含路径、账户或密码")
         }
         let endpoint = try TrafficEndpoint(address: host, port: UInt16(parts.port ?? 443))
         guard !endpoint.address.contains(where: { "/@?#\\%".contains($0) }) else { throw RelayServiceError.invalid }

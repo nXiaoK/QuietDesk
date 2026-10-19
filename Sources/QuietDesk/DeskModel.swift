@@ -165,6 +165,7 @@ final class DeskModel: ObservableObject {
         let trafficEndpoint: TrafficEndpoint
         let relay: RelayConnectionInfo?
         let relayAccessKey: Data?
+        let relayCertificate: RelayNodeCertificate?
     }
     private var target: Target?
     private var selectedConnectionID: UUID?
@@ -613,7 +614,12 @@ final class DeskModel: ObservableObject {
         return (display, selection)
     }
 
-    func saveRelayConfiguration(enabled: Bool, address: String, accessCode: String, deviceID: String) throws {
+    func relayCertificate(for endpoint: RelayEndpoint) throws -> RelayNodeCertificate? {
+        try RelayCertificateStore(defaults: .standard).load(for: endpoint)
+    }
+
+    func saveRelayConfiguration(enabled: Bool, address: String, accessCode: String, deviceID: String,
+                                certificate: RelayNodeCertificate?) throws {
         guard !active, !working else { throw DeskError.invalid("请先停止共享或断开连接，再修改中继设置") }
         let text = address.trimmingCharacters(in: .whitespacesAndNewlines)
         let supplied = accessCode.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -623,6 +629,10 @@ final class DeskModel: ObservableObject {
         let localID = deviceID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard localID.isEmpty || UUID(uuidString: localID) != nil else { throw DeskError.invalid("本机中继设备标识无效，请恢复配置或更换设备标识") }
         let key = supplied.isEmpty ? nil : try PairingKey(code: supplied)
+        if enabled, let certificate {
+            guard let endpoint else { throw DeskError.invalid("请填写此证书对应的中继地址") }
+            try certificate.validate(for: endpoint)
+        }
         if enabled {
             guard let endpoint else { throw DeskError.invalid("请填写自托管中继地址") }
             if key == nil {
@@ -636,6 +646,7 @@ final class DeskModel: ObservableObject {
             guard let endpoint else { throw DeskError.invalid("请先填写此接入码对应的中继地址") }
             try KeyStore.save(key, account: endpoint.credentialAccount)
         }
+        if enabled, let endpoint { try RelayCertificateStore(defaults: .standard).save(certificate, for: endpoint) }
         relayDeviceID = localID; relayAddress = endpoint?.address ?? ""; relayEnabled = enabled
         viewerRelayAddress = relayAddress
         UserDefaults.standard.set(relayAddress, forKey: "relayAddress")
@@ -658,7 +669,8 @@ final class DeskModel: ObservableObject {
             if let saved = try KeyStore.load(account: account) { owner = saved }
             else { owner = try PairingKey.generate(); try KeyStore.save(owner, account: account) }
             let registration = try RelayHostRegistration(endpoint: endpoint, accessKey: access.data, deviceID: deviceID,
-                                                        ownerKey: owner.data, localPort: localPort)
+                                                        ownerKey: owner.data, localPort: localPort,
+                                                        trustedCertificate: relayCertificate(for: endpoint))
             relayHostRegistration = registration
             registration.onStatus = { [weak self, weak registration] state in
                 DispatchQueue.main.async {
@@ -1021,7 +1033,8 @@ final class DeskModel: ObservableObject {
             if address.isEmpty, let relay { endpoint = try TrafficEndpoint(address: relay.endpoint.host, port: relay.endpoint.port) }
             else { endpoint = try TrafficEndpoint(address: address, port: port.rawValue) }
             let target = Target(address: address, port: port.rawValue, key: key, recordID: record?.id,
-                                trafficEndpoint: endpoint, relay: relay, relayAccessKey: relayKey)
+                                trafficEndpoint: endpoint, relay: relay, relayAccessKey: relayKey,
+                                relayCertificate: try relay.flatMap { try relayCertificate(for: $0.endpoint) })
             self.target = target
             relaySelectedForTarget = relay?.strategy == .relay || (relay != nil && address.isEmpty)
             relayFallbackAttempted = false
@@ -1140,7 +1153,8 @@ final class DeskModel: ObservableObject {
                         guard let self, let viewer, self.viewerSession === viewer, self.active else { completion(nil); return }
                         do {
                             viewer.mediaRelayBridge?.stop()
-                            let bridge = try RelayViewerBridge(endpoint: relay.endpoint, accessKey: access, deviceID: relay.deviceID)
+                            let bridge = try RelayViewerBridge(endpoint: relay.endpoint, accessKey: access, deviceID: relay.deviceID,
+                                                              trustedCertificate: target.relayCertificate)
                             viewer.mediaRelayBridge = bridge
                             bridge.onReady = { [weak self, weak viewer, weak bridge] port in
                                 DispatchQueue.main.async {
@@ -1312,7 +1326,8 @@ final class DeskModel: ObservableObject {
             let viewer = viewerSession
             guard viewer.relayBridge == nil else { return }
             do {
-                let bridge = try RelayViewerBridge(endpoint: relay.endpoint, accessKey: access, deviceID: relay.deviceID, udpEnabled: !mediaTCPOnly)
+                let bridge = try RelayViewerBridge(endpoint: relay.endpoint, accessKey: access, deviceID: relay.deviceID, udpEnabled: !mediaTCPOnly,
+                                                  trustedCertificate: target.relayCertificate)
                 viewer.relayBridge = bridge; viewer.usesRelayControl = true
                 active = true; working = true
                 controlTransportStatus = "正在接通中继"

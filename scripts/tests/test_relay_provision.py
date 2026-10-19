@@ -15,20 +15,24 @@ ROOT = Path(__file__).resolve().parents[2]
 class RelayProvisionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        candidates = [shutil.which("openssl")]
+        # The relay image runs Alpine's OpenSSL 3. OpenSSL 1.1 (the macOS runner default) also has
+        # -checkip but refuses the provisioned leaf as its own trusted anchor during verify.
+        candidates = []
         if shutil.which("brew"):
             prefix = subprocess.run(["brew", "--prefix", "openssl@3"], capture_output=True, text=True)
             if prefix.returncode == 0:
                 candidates.append(str(Path(prefix.stdout.strip()) / "bin/openssl"))
+        candidates.append(shutil.which("openssl"))
         for candidate in filter(None, candidates):
             if not Path(candidate).is_file():
                 continue
+            version = re.match(r"OpenSSL (\d+)\.", subprocess.run([candidate, "version"], capture_output=True, text=True).stdout)
             help_text = subprocess.run([candidate, "x509", "-help"], capture_output=True, text=True)
-            if "-checkip" in help_text.stdout + help_text.stderr:
+            if version and int(version[1]) >= 3 and "-checkip" in help_text.stdout + help_text.stderr:
                 cls.openssl_binary = candidate
                 cls.openssl_environment = {**os.environ, "PATH": str(Path(candidate).parent) + os.pathsep + os.environ.get("PATH", "")}
                 return
-        raise unittest.SkipTest("Relay provisioner checks require OpenSSL with x509 -checkip (OpenSSL 3 recommended)")
+        raise unittest.SkipTest("Relay provisioner checks require OpenSSL 3, matching the relay image")
 
     def setUp(self):
         (ROOT / "work").mkdir(exist_ok=True)

@@ -4,16 +4,35 @@
 
 ## Docker 单命令部署（推荐）
 
-准备一台双方可访问的 Linux 服务器（amd64 或 arm64）、Docker Engine、Docker Compose v2.20+，以及匹配中继域名的有效 TLS 证书链和无密码私钥。域名解析到此服务器，在云安全组和防火墙放行 **7443/TCP 与 7443/UDP**。证书可使用已有的 ACME/Let's Encrypt 签发流程；部署脚本不自动申请证书，不修改防火墙。
+准备一台双方可访问的 Linux 服务器（amd64 或 arm64）、Docker Engine 和 Docker Compose v2.20+，在云安全组和防火墙放行 **7443/TCP 与 7443/UDP**。可直接使用固定公网 IP，无需域名或提前申请证书。部署脚本不修改防火墙。
 
 下载并解压 `QuietDesk-Relay-版本-Docker.tar.gz`，进入解压目录，执行：
+
+```sh
+./deploy.sh --ip 你的服务器IP
+```
+
+将参数替换为实际 IPv4 或 IPv6 地址，不附端口，IPv6 不加方括号。首次生成有效期 365 天、RSA 3072/SHA-256、包含该 IP SAN 和 serverAuth 用途的自签 TLS 证书；私钥仅保留在私有 tls 卷内。终端输出公开的 SHA-256 证书指纹，**不输出私钥和接入码**。重复执行会复用原证书；IP 不匹配、证书过期或证书/私钥缺一时拒绝自动替换，须明确提供新证书并在客户端重新核对信任。
+
+从源码部署时，在仓库根目录使用 `./relay/deploy.sh`，参数相同。执行账户须能访问 Docker 引擎，并能联网拉取基础镜像；服务器不需要安装 Go、Swift 或 Python。脚本从源码构建本机架构的镜像，随机生成节点接入码、启动服务并等待真实健康检查通过。不将宿主机目录或 Docker socket 挂进容器。
+
+在服务器终端查看指纹，或只导出公开证书供客户端导入：
+
+```sh
+docker compose exec -T relay openssl x509 -in /etc/quietdesk-relay/fullchain.pem -noout -fingerprint -sha256
+docker compose exec -T relay openssl x509 -in /etc/quietdesk-relay/fullchain.pem -outform PEM > node-certificate.pem
+```
+
+两台 Mac 使用支持节点证书信任的 QuietDesk 版本，填写 `tls://你的服务器IP:7443`（IPv6 写作 `tls://[IPv6地址]:7443`），在“中继设置”导入该公开证书，或获取证书后与服务器终端的 SHA-256 指纹核对，再保存信任。无需导入系统钥匙串或修改系统信任。地址、证书有效期和保存的节点证书仍会校验；接入码和 Mac 配对认证仍独立执行。
+
+已有域名/证书的部署方式继续可用，例如：
 
 ```sh
 ./deploy.sh /etc/letsencrypt/live/relay.example.com/fullchain.pem \
   /etc/letsencrypt/live/relay.example.com/privkey.pem
 ```
 
-从源码部署时，在仓库根目录使用 `./relay/deploy.sh`，参数相同。执行账户须能读取证书私钥、访问 Docker 引擎，并能联网拉取基础镜像；服务器不需要安装 Go、Swift 或 Python。首次会从源码构建本机架构的镜像，安装证书、随机生成节点接入码、启动服务并等待真实健康检查通过。证书路径允许使用证书管理器创建的符号链接。脚本只通过标准输入传入证书，不将宿主机目录或 Docker socket 挂进容器，不输出密钥。
+证书链须匹配实际 IP 或域名，私钥不带密码，执行账户需有读取权限。路径允许使用证书管理器创建的符号链接；脚本通过标准输入传入证书。
 
 启动后进入包含 `compose.yaml` 的目录，**在私人终端**获取节点接入码：
 
@@ -21,7 +40,7 @@
 docker compose exec -T relay cat /var/lib/quietdesk-relay/access.key
 ```
 
-两台 Mac 的“中继设置”均填写 `tls://relay.example.com:7443` 与此接入码。被控端开启共享，控制端选择“仅中继”，填写被控端设备标识和原有 Mac 配对码。接入码不能代替 Mac 配对码。
+两台 Mac 的“中继设置”均填写相同节点地址与此接入码。被控端开启共享，控制端选择“仅中继”，填写被控端设备标识和原有 Mac 配对码。接入码不能代替 Mac 配对码。
 
 如需公网端口 443，在每次部署或运维前设置同一环境变量；它同时映射 TCP 和 UDP，容器内仍监听 7443：
 
@@ -30,7 +49,7 @@ export QUIETDESK_RELAY_PORT=443
 ./deploy.sh /path/to/fullchain.pem /path/to/privkey.pem
 ```
 
-此时客户端地址为 `tls://relay.example.com:443`。普通 HTTP/Nginx `location` 反向代理不能转发此协议。健康端点只在容器回环监听，没有向宿主机发布 9091 端口：
+自动发证方式同样可用 `export QUIETDESK_RELAY_PORT=443` 加 `./deploy.sh --ip 你的服务器IP`。此时客户端地址端口也改成 443。普通 HTTP/Nginx `location` 反向代理不能转发此协议。健康端点只在容器回环监听，没有向宿主机发布 9091 端口：
 
 ```sh
 docker compose ps
@@ -67,7 +86,7 @@ QUIETDESK_RELAY_IMAGE=quietdesk-relay:previous docker compose up -d --no-build -
 
 ## 配置与启动
 
-服务器需有两端可访问的域名、有效的服务器证书，以及同一数字端口的 TCP、UDP。TCP 用于服务鉴权、设备登记与独立可靠转发通道；UDP 用于转发带鉴权封装的端到端 DTLS 密文。示例使用 `7443`，也可部署到 `443`；仅开放 TCP 时仍应由客户端使用可靠传输兜底。
+服务器需有两端可访问的 IP 或域名、匹配地址且被客户端信任的有效服务器证书，以及同一数字端口的 TCP、UDP。TCP 用于服务鉴权、设备登记与独立可靠转发通道；UDP 用于转发带鉴权封装的端到端 DTLS 密文。示例使用 `7443`，也可部署到 `443`；仅开放 TCP 时仍应由客户端使用可靠传输兜底。
 
 使用独立 Linux 服务账户运行，准备其私有状态目录，并把证书链、私钥放到仓库外。以下命令在准备好的私有目录中生成独立的节点接入密钥，不输出密钥内容：
 

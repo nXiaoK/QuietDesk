@@ -12,6 +12,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import sys
 import tempfile
 
 
@@ -43,6 +44,7 @@ def read_message(connection, operation):
 
 
 def main():
+    automatic = "--self-signed" in sys.argv
     subprocess.run(["docker", "info"], check=True, stdout=subprocess.DEVNULL)
     (ROOT / "work").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="relay-docker-checks-", dir=ROOT / "work") as temporary:
@@ -65,14 +67,18 @@ def main():
             return subprocess.run(["docker", "compose", "-f", str(ROOT / "relay/compose.yaml"), *arguments],
                                   env=environment, check=True, text=True, capture_output=True, timeout=180, **options).stdout
 
-        def deploy(success=True):
-            result = subprocess.run(["sh", str(ROOT / "relay/deploy.sh"), str(certificate), str(key)],
+        def deploy(success=True, manual=False, ip="127.0.0.1"):
+            arguments = ["--ip", ip] if automatic and not manual else [str(certificate), str(key)]
+            result = subprocess.run(["sh", str(ROOT / "relay/deploy.sh"), *arguments],
                                     env=environment, text=True, capture_output=True, timeout=600)
             if (result.returncode == 0) != success:
                 raise RuntimeError("Unexpected deployment result:\n" + result.stdout[-4000:] + result.stderr[-4000:])
 
         try:
             deploy()
+            if automatic:
+                certificate.write_text(compose("exec", "-T", "relay", "openssl", "x509", "-in", "/etc/quietdesk-relay/fullchain.pem", "-outform", "PEM"))
+            original_certificate = certificate.read_bytes()
             require(compose("exec", "-T", "relay", "id", "-u").strip() == "65532", "Relay runs as root")
             access = compose("exec", "-T", "relay", "cat", "/var/lib/quietdesk-relay/access.key").strip()
             require(len(bytes.fromhex(access)) == 32, "Invalid generated access key")
@@ -89,7 +95,7 @@ def main():
 
             def connect(stack, operation, **fields):
                 raw = stack.enter_context(socket.create_connection(("127.0.0.1", port), timeout=5))
-                connection = stack.enter_context(context.wrap_socket(raw, server_hostname="localhost"))
+                connection = stack.enter_context(context.wrap_socket(raw, server_hostname="127.0.0.1" if automatic else "localhost"))
                 data = json.dumps({"version": 1, "op": operation, "deviceID": DEVICE,
                                    "accessKey": base64.b64encode(bytes.fromhex(access)).decode(), **fields}).encode()
                 connection.sendall(struct.pack("!I", len(data)) + data)
@@ -141,6 +147,10 @@ def main():
 
             state = compose("exec", "-T", "relay", "cat", "/var/lib/quietdesk-relay/devices.json")
             deploy()
+            exported = compose("exec", "-T", "relay", "openssl", "x509", "-in", "/etc/quietdesk-relay/fullchain.pem", "-outform", "PEM")
+            require(exported.encode() == original_certificate, "Redeployment replaced the node certificate")
+            if automatic:
+                deploy(success=False, ip="127.0.0.2")
             require(compose("exec", "-T", "relay", "cat", "/var/lib/quietdesk-relay/access.key").strip() == access,
                     "Redeployment replaced the access key")
             require(compose("exec", "-T", "relay", "cat", "/var/lib/quietdesk-relay/devices.json") == state,
@@ -152,7 +162,7 @@ def main():
             installed = compose("exec", "-T", "relay", "sha256sum", "/etc/quietdesk-relay/privkey.pem")
             subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", str(key)],
                            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            deploy(success=False)
+            deploy(success=False, manual=True)
             require(compose("exec", "-T", "relay", "sha256sum", "/etc/quietdesk-relay/privkey.pem") == installed,
                     "Invalid certificate deployment replaced the installed private key")
             json.loads(compose("exec", "-T", "relay", "wget", "-qO-", "http://127.0.0.1:9091/healthz"))

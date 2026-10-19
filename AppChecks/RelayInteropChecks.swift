@@ -21,6 +21,40 @@ private struct Fixture: Decodable {
     var endpoint: RelayEndpoint { get throws { try RelayEndpoint(address: address) } }
 }
 
+// The host media UDP listener reuses the TCP port number on every interface. Keep the TCP listener the
+// system assigned and retry only when that number is already taken for UDP, so an unrelated local
+// socket cannot silently turn a check into TCP-only media.
+private func startRelayHostListener(_ parameters: NWParameters, queue: DispatchQueue,
+                                    accept: @escaping (NWConnection) -> Void) throws -> NWListener {
+    for _ in 0..<20 {
+        let listener = try NWListener(using: parameters), ready = DispatchSemaphore(value: 0)
+        listener.stateUpdateHandler = { if case .ready = $0 { ready.signal() } }
+        listener.newConnectionHandler = accept
+        listener.start(queue: queue)
+        guard ready.wait(timeout: .now() + 10) == .success, let port = listener.port else {
+            listener.cancel(); throw RelayCheckFailure(message: "Synthetic desktop listener did not start")
+        }
+        if udpPortIsFree(port.rawValue) { return listener }
+        listener.cancel()
+    }
+    throw RelayCheckFailure(message: "No synthetic desktop port was also free for UDP")
+}
+
+private func udpPortIsFree(_ port: UInt16) -> Bool {
+    let ipv4 = socket(AF_INET, SOCK_DGRAM, 0), ipv6 = socket(AF_INET6, SOCK_DGRAM, 0)
+    defer { close(ipv4); close(ipv6) }
+    var any4 = sockaddr_in(), any6 = sockaddr_in6()
+    any4.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); any4.sin_family = sa_family_t(AF_INET); any4.sin_port = port.bigEndian
+    any6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size); any6.sin6_family = sa_family_t(AF_INET6); any6.sin6_port = port.bigEndian
+    let free4 = withUnsafePointer(to: &any4) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(ipv4, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0 }
+    }
+    let free6 = withUnsafePointer(to: &any6) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(ipv6, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) == 0 }
+    }
+    return ipv4 >= 0 && ipv6 >= 0 && free4 && free6
+}
+
 private func relayPacket(_ sequence: UInt32, idr: Bool) -> VideoPacket {
     VideoPacket(sequence: sequence, sps: idr ? Data([0x67, 0x64]) : Data(), pps: idr ? Data([0x68]) : Data(),
                 avcc: Data([0, 0, 0, 2, idr ? 0x65 : 0x41, 0x88]))
@@ -32,15 +66,14 @@ private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false,
     let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8)
     let parameters = try MediaSecureTransport.tlsParameters(key: key, roles: MediaChannelRole.allCases)
     parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
-    let listener = try NWListener(using: parameters)
-    let listening = DispatchSemaphore(value: 0), online = DispatchSemaphore(value: 0), localReady = DispatchSemaphore(value: 0)
+    let hostPort = RelayBox<UInt16>(0)
+    let online = DispatchSemaphore(value: 0), localReady = DispatchSemaphore(value: 0)
     let committed = DispatchSemaphore(value: 0), predicted = DispatchSemaphore(value: 0), data = DispatchSemaphore(value: 0), closed = DispatchSemaphore(value: 0)
     let hostMedia = RelayBox<MediaSession?>(nil), viewerMedia = RelayBox<MediaSession?>(nil), peers = RelayBox<[Peer]>([])
     let errors = RelayBox<[String]>([]), states = RelayBox<[String]>([]), sequence = RelayBox<UInt32>(0), bridgePort = RelayBox<UInt16?>(nil)
     let hostAgent = RelayBox<RelayHostRegistration?>(nil), hostReady = RelayBox(false), verifiedSource = RelayBox(false)
     let shuttingDown = RelayBox(false)
-    listener.stateUpdateHandler = { if case .ready = $0 { listening.signal() } }
-    listener.newConnectionHandler = { connection in
+    let listener = try startRelayHostListener(parameters, queue: queue) { connection in
         let peer = Peer(connection: connection); peers.update { $0.append(peer) }
         peer.onReady = { [weak peer] in
             guard let peer else { return }
@@ -50,7 +83,7 @@ private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false,
             hostReady.update { $0 = true }
             verifiedSource.update { $0 = hostAgent.read()?.ownsLocalEndpoint(connection.endpoint) == true }
             do {
-                let media = try MediaSession.host(control: peer, key: key, port: listener.port!.rawValue, settings: settings)
+                let media = try MediaSession.host(control: peer, key: key, port: hostPort.read(), settings: settings)
                 hostMedia.update { $0 = media }
                 media.onPrepareRecovery = { $0(true) }
                 media.onProduceRecoveryFrame = { [weak media] in
@@ -68,8 +101,7 @@ private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false,
         }
         peer.start()
     }
-    listener.start(queue: queue)
-    try waitRelay(listening, "Synthetic desktop listener did not start")
+    hostPort.update { $0 = listener.port!.rawValue }
     let agent = try RelayHostRegistration(endpoint: fixture.endpoint, accessKey: fixture.accessKey, deviceID: device,
         ownerKey: PairingKey.generate().data, localPort: listener.port!.rawValue, certificateAuthorities: fixture.authorities)
     hostAgent.update { $0 = agent }

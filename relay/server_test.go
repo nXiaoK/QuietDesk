@@ -80,14 +80,23 @@ func newFixtureWithDatagrams(t *testing.T, cfg Config, blocked bool) *fixture {
 	}
 	pool := x509.NewCertPool()
 	pool.AddCert(leaf)
-	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{certificate}, PrivateKey: key}}, MinVersion: tls.VersionTLS12})
-	if err != nil {
-		t.Fatal(err)
-	}
-	udp, err := net.ListenPacket("udp", listener.Addr().String())
-	if err != nil {
-		listener.Close()
-		t.Fatal(err)
+	// The node serves TCP and UDP on one port number; retry when an unrelated local socket already holds the UDP side.
+	var listener net.Listener
+	var udp net.PacketConn
+	for attempt := 1; udp == nil; attempt++ {
+		candidate, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{certificate}, PrivateKey: key}}, MinVersion: tls.VersionTLS12})
+		if err != nil {
+			t.Fatal(err)
+		}
+		packets, err := net.ListenPacket("udp", candidate.Addr().String())
+		if err != nil {
+			candidate.Close()
+			if attempt < 20 {
+				continue
+			}
+			t.Fatal(err)
+		}
+		listener, udp = candidate, packets
 	}
 	server, err := NewServer(cfg)
 	if err != nil {

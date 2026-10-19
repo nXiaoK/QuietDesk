@@ -36,7 +36,7 @@ SIGNING_IDENTITY='Developer ID Application: …' ./build-app.sh
 
 请将示例替换为实际身份。证书、私钥、密码、描述文件及私人签名配置保存在仓库外，不提交或加入源码包。指定身份只改变签名方式，不会自动完成 Apple 公证；开发签名也不等于 Developer ID 分发签名。
 
-保持签名身份、bundle ID 和安装路径稳定有助于系统识别应用，但不能保证更新后免于重新授权。构建脚本会执行严格签名校验。
+仓库默认发布继续使用临时签名，每次更新后需要在本机重新授予屏幕录制、辅助功能和输入监控权限。自行签名时，保持身份、bundle ID 和安装路径稳定有助于系统识别应用，但也不能保证更新后免于重新授权。构建脚本会执行严格签名校验。
 
 ## 打包
 
@@ -48,7 +48,7 @@ python3 scripts/package-app.py
 
 `dist/` 中会生成 DMG、应用 ZIP、源码 ZIP 和 SHA-256 校验文件。DMG 内含应用与“应用程序”快捷方式；脚本会检查签名、架构、图标、镜像及 ZIP 完整性，不会上传或发布。
 
-源码 ZIP 依据 **`git ls-files` 的跟踪文件清单**收录当前工作区内容。新增源码、文档和截图资源须纳入 Git 跟踪，否则不会进入源码包；打包前核对清单与工作区状态。源码包中的 `version.json` 使用实际应用包的版本及构建号。
+源码 ZIP 依据 **`git ls-files` 的跟踪文件清单**收录当前工作区内容，脚本要求工作树及暂存区干净，也拒绝未忽略的未跟踪文件。新增源码、文档和截图资源须纳入 Git 跟踪，否则不会进入源码包；打包前核对清单与工作区状态。用户另有未提交或未跟踪的本地配置时，在干净的隔离检出中打包，保留原工作区。源码包中的 `version.json` 使用实际应用包的版本及构建号。
 
 ## 版本与 GitHub Actions
 
@@ -62,14 +62,53 @@ python3 scripts/version.py current
 
 工作流分为：
 
-- **CI**：PR 面向 `main` 时运行 Python 版本检查、`QuietDeskChecks`、下方独立 App 检查、Universal 构建及应用元数据检查，也支持手动运行，不发布安装包。
-- **Build and release macOS**：推送 `main` 会触发；手动运行仅从 `main` 发布。它执行版本、Core 与独立 App 检查、Universal 构建、打包，随后创建标签并发布 Release。默认仍为临时签名、未公证。
+- **CI**：PR 面向 `main` 时运行 Python 检查、`QuietDeskChecks`、下方独立 App 检查、Universal 构建及应用元数据检查；另生成临时更新密钥，在独立 bundle ID 下构建，并对实际 ZIP 执行 sign → verify。也支持手动运行，不接触正式签名 secret 或发布安装包。
+- **Build and release macOS**：推送 `main` 会触发；手动运行仅从 `main` 发布。分配版本后先检查更新签名配置，再执行 Core 与独立 App 检查、Universal 构建、打包。既有资产上传草稿后，生成并复验更新清单，最后上传清单并公开 Release。公钥表为空时 warning 并跳过清单；默认仍为临时签名、未公证。
 
 该推送流程也在 Linux 节点检查通过后调用 **Publish relay image**，用 `GITHUB_TOKEN` 和镜像 job 的 `packages: write` 权限向 GHCR 发布 Linux amd64、arm64 镜像。镜像名按仓库路径转成小写并追加 `-relay`，本仓库为 `ghcr.io/nxiaok/quietdesk-relay`。先发布 `sha-完整提交号`，再以构建产物的 digest 拉取，使用仅两个部署文件的临时目录验证手动证书、自签证书、TCP/UDP、身份保留和失败路径；全部通过后才把同一镜像标为 `latest` 与 `main`。摘要记录源码提交和可固定使用的 digest。源码提交标签表示构建来源，重新构建可能更新基础镜像，严格固定内容应使用 digest。
 
 镜像发布与 Mac 构建是同一推送流程中独立的后续 job，都等待原有节点检查；镜像 job 失败不绕过检查去更新 `latest`，也不改变 Mac job 原有的依赖和发布条件。PR CI 只检查，不登录 GHCR 或发布镜像。首次发布后如果包默认私有，维护者需在 GitHub Packages 设置为 Public 才能匿名拉取；已有同名包则需授予此仓库写入该包的 Actions 权限。无需增加 Docker Hub 密码或上传部署节点的私密材料。
 
 自动发布按正式版本标签分配版本：`auto` 首次使用配置的版本下限，之后递增补丁号；手动运行可选 `patch`、`minor`、`major`。构建号由基础值加工作流运行序号生成。流程串行执行，同次运行重跑会复用已分配标签；文件先上传到草稿后公开。发布前若 `main` 已有更新提交，旧任务跳过正式发布，由新提交继续处理。
+
+## 更新签名与发布
+
+更新器完全使用系统框架：URLSession、CryptoKit、Security 与 `ditto`。`QuietDeskUpdateTool` 是依赖 Core 的开发工具，不放入 `.app`。`Resources/update-feed.json` 指定固定 GitHub Release 清单地址和公钥表；`build-app.sh` 校验配置后通过 `plutil` 写入 `QuietDeskUpdateFeedURL`、`QuietDeskUpdatePublicKeys`。当前公钥表为空，更新入口、首次询问和自动网络检查均关闭；发布流程只发 warning 并跳过签名清单。首个启用更新器的版本需用户手动安装一次。
+
+正式密钥必须由维护者本人生成、保存和设置，不能让实现或排障过程读取正式私钥。以下为维护者在自己机器上执行的命令示例；输出只有公钥和 keyID，私钥写在仓库外，文件权限为 `0600`，工具拒绝覆盖已有文件或写进 Git 仓库目录：
+
+```sh
+install -d -m 700 "$HOME/.config/QuietDesk"
+swift run --disable-sandbox QuietDeskUpdateTool generate-key \
+  --out "$HOME/.config/QuietDesk/update-signing.key"
+```
+
+把命令输出的公钥对象复制到 `Resources/update-feed.json` 的 `publicKeys` 数组中，例如 `[{"id":"<输出的 keyID>","key":"<输出的 base64 公钥>"}]`。公钥可以提交；私钥、密码和签名私有配置不能提交、加入源码包或输出到日志。维护者自行设置 Actions secret（Fork 请替换仓库）：
+
+```sh
+gh secret set QUIETDESK_UPDATE_SIGNING_KEY --repo nXiaoK/QuietDesk \
+  < "$HOME/.config/QuietDesk/update-signing.key"
+```
+
+私钥内容是 base64 编码的 32 字节 Ed25519 原始私钥，需由维护者离线备份两份。丢失后，已安装客户端无法信任新密钥，必须手动安装一次内置新公钥的版本。轮换时先发布同时内置新旧公钥、仍由旧私钥签名的版本，待用户升级后再切换 secret 使用新私钥；不要直接删除旧公钥并期望旧客户端自动接受新签名。工具默认以年月生成 keyID，同月生成轮换密钥时，需在公钥配置中为新密钥指定不同的唯一 `id`；签名工具会按公钥匹配并采用配置中的 `id`。
+
+发布前置检查放在版本分配之后、项目检查与构建之前，早于标签、草稿和发布。公钥非空但 secret 缺失或不匹配时直接失败，按提示设置正确 secret 后重跑。`check-key --config Resources/update-feed.json` 只输出“匹配 / 不匹配 / 缺失”，不输出私钥。签名步骤取草稿 Release 说明并截断到 4000 字符，`sign --app ... --archive ... --tag ... --repository ... --out ...` 生成 `QuietDesk-update.json`，再用 `verify --app ... --archive ... --manifest ...` 对照构建内公钥、应用元数据与 ZIP 大小/SHA-256 复验。签名失败的新 Release 保持草稿；全部验证成功后才上传清单并标记 latest。若已有更新的 `main` 提交，输出跳过标志并跳过后续签名/发布。
+
+测试覆盖可直接运行：
+
+```sh
+swift build --product QuietDeskUpdateTool
+python3 scripts/check-update-tool.py \
+  --tool "$(swift build --show-bin-path)/QuietDeskUpdateTool" \
+  --work "$PWD/work/update-tool-checks"
+./scripts/run-update-checks.sh
+```
+
+工具检查自行生成仓库外临时密钥，结束后删除，不需要正式 secret。安装检查使用 `work/update-checks` 下的临时“Applications”、独立 bundle ID `local.quietdesk.checks.updater` 和合成 ad-hoc 小型应用，验证安装器流程；它不是完整 QuietDesk 界面的本地更新演练。不启动或替换生产应用，不安装到 `/Applications`，不授予或重置系统权限。端到端用例通过 LaunchServices 打开合成新版。仓库位于 `~/Documents`、`~/Desktop`、`~/Downloads` 等受“文件和文件夹”保护的目录时，macOS 会为检查 bundle 弹出访问授权，进程在响应前阻塞，未及时响应会超时失败。不要为了通过检查而授予权限；请在不受保护的检出目录或 CI 中运行此脚本。
+
+对实际打包的 ZIP 复验结构、解压后应用元数据、架构和代码签名，可运行 `./scripts/run-update-checks.sh --validate-archive <ZIP 绝对路径> <参考 .app 绝对路径>`；这条命令只验证，不启动应用。
+
+预览构建可用 `QUIETDESK_BUNDLE_IDENTIFIER` 指定独立标识，默认没有更新源和公钥。`QUIETDESK_UPDATE_FEED_URL`、`QUIETDESK_UPDATE_PUBLIC_KEYS` 仅接受非正式 bundle ID，显式设置为匹配的临时公钥和 `http://127.0.0.1:<临时端口>/...` 或 `http://localhost:<临时端口>/...` 才启用回环演练；将两个变量同时设为空字符串可禁用，公钥非空而源为空会报配置错误。正式 bundle ID `local.quietdesk.app` 拒绝这两个覆盖变量，正式发布工作流也不得设置它们。预览输出与缓存通过 `QUIETDESK_DIST_DIR`、`QUIETDESK_BUILD_DIR` 放进 `work/`；演练版本可配合 `QUIETDESK_VERSION`、`QUIETDESK_BUILD_NUMBER`，不得指向正式应用安装路径。配置规则和故障排查见 [使用指南](usage.md#应用内更新) 与 [安全边界](security.md#应用内更新)。
 
 ## 运行检查
 
@@ -85,12 +124,14 @@ swift run --disable-sandbox QuietDeskChecks
 ./scripts/run-log-checks.sh
 ./scripts/run-credential-checks.sh
 ./scripts/run-permission-checks.sh
+./scripts/run-update-controller-checks.sh
+./scripts/run-update-checks.sh
 python3 -m unittest discover -s scripts/tests -v
 ```
 
 | 检查 | 范围 |
 | --- | --- |
-| `QuietDeskChecks` | 协议、兼容、视频、剪贴板传输、画质、流量及空闲策略；网络检查仅使用 `127.0.0.1` |
+| `QuietDeskChecks` | 协议、兼容、视频、剪贴板传输、画质、流量、空闲策略，以及更新清单签名、版本/URL 规则、首次询问与安装可用性纯逻辑；网络检查仅使用 `127.0.0.1` |
 | `run-app-checks.sh` | 实际 `ClipboardSync` 配合内存剪贴板和临时目录，验证焦点与传输顺序 |
 | `run-input-checks.sh` | 验证真实 AppKit 鼠标、滚轮事件到远程输入的转换，以及被控端 CGEvent 字段；使用离屏画布与假提交器，不向系统注入输入 |
 | `run-video-checks.sh` | 编码丢帧恢复、三帧窗口和画质/暂停边界，CoreMedia 数据持有与合成 H.264 编解码；不采集屏幕 |
@@ -101,7 +142,9 @@ python3 -m unittest discover -s scripts/tests -v
 | `run-log-checks.sh` | 临时目录中的日志轮转、并发聚合、隐私字段、文件权限与导出错误恢复 |
 | `run-credential-checks.sh` | 临时目录中的凭据往返、权限、损坏保留、原子写入失败、并发更新及连接记录匹配；不访问真实凭据或钥匙串 |
 | `run-permission-checks.sh` | 独立 bundle ID 的透明面板与合成权限，验证引导自动关闭、切换及手动关闭；检查设置入口不调用主动授权 API |
-| Python 检查 | 版本分配、参数校验及重跑规则 |
+| `run-update-controller-checks.sh` | 独立 bundle ID、隔离偏好与回环服务，检查更新控制器、首次询问时机、自动检查间隔及清单获取边界 |
+| `run-update-checks.sh` | 独立 bundle ID、临时目录、合成签名应用和回环服务；检查更新下载、暂存、独立安装进程、重启与故障恢复 |
+| Python 检查 | 版本分配、参数校验、打包、更新构建配置、plist 注入及发布前置顺序等规则；更新工具另用临时密钥检查签名与篡改拒绝 |
 
 跳过 Core 中的本机网络检查可用 `swift run --disable-sandbox QuietDeskChecks --skip-network`；这仍会运行合成视频检查。运行环境须允许所需的本机网络和系统视频服务，受限环境中的失败应与业务缺陷区分。
 
@@ -111,9 +154,9 @@ python3 -m unittest discover -s scripts/tests -v
 QUIETDESK_CHECK_BUILD_DIR="$PWD/.build/clipboard-checks" ./scripts/run-app-checks.sh
 ```
 
-这些自动检查不操作真实系统剪贴板、钥匙串或登录项，不录屏，也不实际开启静音或防窥。它们不能代替真实两台 Mac 上的权限延续、屏幕采集、输入、文件粘贴、自启及网络测试；Universal 编译通过也不等于已在 Intel 或 macOS 14 实机验证。
+这些自动检查不操作真实系统剪贴板、钥匙串或登录项，不录屏，也不实际开启静音或防窥。它们不能代替真实两台 Mac 上的权限重新授权、屏幕采集、输入、文件粘贴、自启及网络测试；Universal 编译通过也不等于已在 Intel 或 macOS 14 实机验证。更新的“App 管理”拦截、非管理员账户、DMG/Translocation、macOS 14/15/26 与 Intel 实机、更新后实际 TCC/登录项状态和自动共享恢复，仍需分别验收。
 
-本页说明运行方法，不记录本轮执行结果。[BUILD-AND-CHECKS.md](../BUILD-AND-CHECKS.md) 保留的是 0.6.1 等历史记录，不能作为当前源码或本地候选版的验收结论；已发布包及 CI 结果以对应 Releases、Actions 记录为准。
+本页说明运行方法，不记录本轮执行结果。[BUILD-AND-CHECKS.md](../BUILD-AND-CHECKS.md) 按功能或版本记录实际检查范围，旧版本记录不能作为当前源码或本地候选版的验收结论；已发布包及 CI 结果以对应 Releases、Actions 记录为准。
 
 ## 中继开发与检查
 

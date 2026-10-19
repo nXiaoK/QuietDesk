@@ -24,6 +24,7 @@ A native macOS remote desktop app for your own Macs. Connect directly over a LAN
 | Keyboard & permissions | Fullscreen system shortcuts, Caps Lock input-source switching, and permission guidance with a draggable app icon |
 | Connections & idle pause | Recent connections, automatic reconnect, and pause after 10 minutes without window input, resuming when you return to the window |
 | Background sharing | Launch after login, share in the background, and recover from display changes |
+| In-app updates | When a signed feed is configured: check, download and verify, then confirm installation and restart |
 | Endpoint traffic | Persistent sent/received totals by hostname/IP and port |
 | Session controls | Remote mute and a black-screen overlay on the host Mac, both off by default |
 
@@ -55,12 +56,20 @@ These are UI demonstrations, not evidence of real-device performance or permissi
 
 Treat the pairing code as a remote-control credential and share it only through a trusted channel. [Permissions and troubleshooting (Chinese) →](docs/usage.md#permissions)
 
+## Updating QuietDesk
+
+The first version with the updater must still be installed manually from [Releases](https://github.com/nXiaoK/QuietDesk/releases/latest). The repository currently has an empty update public-key table, so update controls remain hidden until the maintainer configures a public key and publishes an enabled build.
+
+Once enabled, QuietDesk asks whether to check automatically. If you agree, it checks at most once every 24 hours; it never downloads or installs automatically. You can also choose **检查更新…** (Check for Updates) in the app menu or menu bar. Downloads show actual progress, and installation requires another confirmation. Installation is blocked while this Mac is being remotely controlled; a manual-install option is available when automatic replacement cannot proceed. [Update guide (Chinese) →](docs/usage.md#应用内更新)
+
+Release builds remain ad-hoc signed. **After every update, grant Screen Recording, Accessibility and Input Monitoring again on the local Mac.** Arrange updates when someone can operate the host Mac locally.
+
 ## Before you use it
 
 - New features need support at both ends. One display and one controlling connection are supported at a time. Audio streaming, login-window control and FileVault unlock are not supported.
 - Native resolution still uses lossy H.264, and frame rate depends on hardware and network conditions. The software black-screen overlay cannot guarantee coverage of system security screens. [Security and limitations (Chinese) →](docs/security.md)
 - **画质与连接** shows the active transport and applied video settings. **仅使用 TCP（下次连接生效）** selects TCP for the next connection. The displayed RTT measures the control connection; FPS does not measure physical screen presentation. [UDP/TCP transport (Chinese) →](docs/udp-tcp-transport.md)
-- Default builds are ad-hoc signed and not Apple-notarized. You may need to reopen the app after granting permissions, or grant permissions again after an update.
+- Default builds are ad-hoc signed and not Apple-notarized. You may need to reopen the app after granting permissions. Every update requires granting permissions again; rely on the app’s actual permission checks.
 
 ## Documentation & development
 

@@ -957,6 +957,9 @@ final class InputInjector {
             if remoteCapsLock == nil { remoteCapsLock = capsLockState() }
         }
         if input.kind == .switchInputSource || input.kind == .toggleCapsLock {
+            guard !inputSources.requiresKeyboardRefocus else {
+                return InputFeedback(message: "请点击远端输入位置后继续", capsLocked: remoteCapsLock == true)
+            }
             if input.kind == .toggleCapsLock || remoteCapsLock == true {
                 remoteCapsLock = !(remoteCapsLock ?? false)
                 let event = CGEvent(keyboardEventSource: source, virtualKey: 57, keyDown: remoteCapsLock == true)
@@ -976,6 +979,10 @@ final class InputInjector {
             } catch is CancellationError {
                 return nil
             } catch {
+                if inputSources.requiresKeyboardRefocus {
+                    releaseAll()
+                    return InputFeedback(message: "\(error.localizedDescription)，请点击远端输入位置后继续", capsLocked: remoteCapsLock == true)
+                }
                 return InputFeedback(message: error.localizedDescription, capsLocked: remoteCapsLock == true)
             }
         }
@@ -992,6 +999,7 @@ final class InputInjector {
         let button = CGMouseButton(rawValue: UInt32(input.button)) ?? .left
         switch input.kind {
         case .keyDown, .keyUp, .flags:
+            guard !inputSources.requiresKeyboardRefocus else { return nil }
             if input.kind == .flags {
                 // Modifier keys arrive as flagsChanged, not ordinary keyDown/keyUp.
                 let modifier: CGEventFlags
@@ -1038,6 +1046,7 @@ final class InputInjector {
             let type: CGEventType
             switch input.kind {
             case .down:
+                inputSources.requiresKeyboardRefocus = false
                 heldButtons.insert(input.button)
                 type = input.button == 0 ? .leftMouseDown : input.button == 1 ? .rightMouseDown : .otherMouseDown
             case .up:

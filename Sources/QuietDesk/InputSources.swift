@@ -6,11 +6,14 @@ protocol InputSourceAccess {
     func enabledSources() throws -> [KeyboardSource]
     func currentSource() -> KeyboardSource?
     func select(_ source: KeyboardSource) throws
+    func prepareContextRefresh() -> InputSourceContextRefresh?
 }
 
 @MainActor
 private final class SystemInputSourceAccess: InputSourceAccess {
     private var selectable: [String: TISInputSource] = [:]
+
+    func prepareContextRefresh() -> InputSourceContextRefresh? { InputSourceContextRefresh() }
 
     func enabledSources() throws -> [KeyboardSource] {
         let filter = [kTISPropertyInputSourceCategory as String: kTISCategoryKeyboardInputSource as String,
@@ -54,6 +57,7 @@ private final class SystemInputSourceAccess: InputSourceAccess {
 
 @MainActor
 final class InputSources {
+    var requiresKeyboardRefocus = false
     private var choice = InputSourceChoice()
     private let access: InputSourceAccess
     private let waitForChange: () async throws -> Void
@@ -75,17 +79,29 @@ final class InputSources {
         }
         let token = UUID()
         generation = token
+        let contextRefresh = target.isChinese ? access.prepareContextRefresh() : nil
         try access.select(target)
+        try await confirm(target, token: token)
+        if let contextRefresh {
+            requiresKeyboardRefocus = true
+            try await contextRefresh.refresh { self.generation != token }
+            try await confirm(target, token: token)
+        }
+        requiresKeyboardRefocus = false
+        return target.name
+    }
+
+    private func confirm(_ target: KeyboardSource, token: UUID) async throws {
         var consecutiveMatches = 0
-        // Selection can return before the input-method service has activated the new mode.
-        // Keep later wire input behind this await, and confirm across separate main-loop turns.
+        // Confirm the selected ID across main-loop turns; cross-process input activation
+        // additionally requires the focus refresh above before later wire input can proceed.
         for _ in 0..<25 {
             try await waitForChange()
             guard generation == token else { throw CancellationError() }
             try Task.checkCancellation()
             if access.currentSource()?.id == target.id { consecutiveMatches += 1 }
             else { consecutiveMatches = 0 }
-            if consecutiveMatches == 2 { return target.name }
+            if consecutiveMatches == 2 { return }
         }
         throw DeskError.invalid("尚未确认远端输入法切换生效，请重试；输入法内部的中英文模式需在远端核对")
     }

@@ -13,7 +13,7 @@ build_directory="$("${swift_build[@]}" --show-bin-path)"
 core_objects=("$build_directory"/QuietDeskCore.build/*.swift.o)
 swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     -module-cache-path "$build_directory/ModuleCache" -I "$build_directory/Modules" \
-    "${core_objects[@]}" Sources/QuietDesk/Capture.swift Sources/QuietDesk/InputSources.swift AppChecks/InputInjectorChecks.swift \
+    "${core_objects[@]}" Sources/QuietDesk/Capture.swift Sources/QuietDesk/InputSources.swift Sources/QuietDesk/InputSourceContext.swift AppChecks/InputInjectorChecks.swift \
     -o "$build_directory/InputInjectorChecks"
 "$build_directory/InputInjectorChecks"
 

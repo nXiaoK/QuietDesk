@@ -12,12 +12,26 @@ private final class OrderingBox<Value>: @unchecked Sendable {
 private struct OrderingFailure: Error { let message: String }
 
 @MainActor
+private final class OrderingFocus: InputSourceFocusAccess {
+    let originalProcessID: pid_t? = 20
+    let currentProcessID: pid_t = 10
+    var frontmostProcessID: pid_t? = 20
+    var isRefreshWindowKey = false
+    var closed = false
+    func activateRefreshWindow() -> Bool { frontmostProcessID = currentProcessID; isRefreshWindowKey = true; return true }
+    func restoreOriginalApplication() -> Bool { frontmostProcessID = originalProcessID; isRefreshWindowKey = false; return true }
+    func closeRefreshWindow() { closed = true }
+}
+
+@MainActor
 private final class DelayedInputSource: InputSourceAccess {
     let english = KeyboardSource(id: "abc", name: "ABC", isChinese: false, isASCII: true)
     let chinese = KeyboardSource(id: "pinyin", name: "拼音", isChinese: true, isASCII: true)
     var current: KeyboardSource?
     var requested: KeyboardSource?
     var turns = 0
+    var contextRefresh: InputSourceContextRefresh?
+    func prepareContextRefresh() -> InputSourceContextRefresh? { contextRefresh }
     init() { current = english }
     func enabledSources() throws -> [KeyboardSource] { [english, chinese] }
     func currentSource() -> KeyboardSource? { current }
@@ -60,6 +74,8 @@ private struct InputSourceOrderingChecks {
         let listening = OrderingBox(false), host = OrderingBox<MediaSession?>(nil), accepted = OrderingBox<[Peer]>([])
         let path = OrderingBox(""), feedback = OrderingBox<[String]>([]), errors = OrderingBox<[String]>([])
         let probe = DelayedInputSource()
+        let focus = OrderingFocus()
+        probe.contextRefresh = InputSourceContextRefresh(access: focus) { try await Task.sleep(nanoseconds: 20_000_000) }
         let sources = InputSources(access: probe) {
             probe.turns += 1
             if probe.turns == 4 { probe.current = probe.requested }
@@ -67,7 +83,7 @@ private struct InputSourceOrderingChecks {
         }
         var keySources: [String] = []
         let injector = InputInjector(bounds: .zero, isTrusted: { true }, postEvent: { _ in
-            keySources.append(probe.current?.id ?? "missing")
+            keySources.append(focus.closed && focus.frontmostProcessID == focus.originalProcessID ? probe.current?.id ?? "missing" : "unrefreshed")
         }, inputSources: sources, capsLockState: { false })
         listener.stateUpdateHandler = {
             if case .ready = $0 { listening.update { $0 = true } }
@@ -139,6 +155,6 @@ private struct InputSourceOrderingChecks {
         try await eventually("Keyboard input did not follow the source confirmation") { !keySources.isEmpty }
         guard keySources == [probe.chinese.id], probe.turns >= 5, feedback.read().first?.contains("已确认") == true,
               errors.read().isEmpty else { throw OrderingFailure(message: "A fast key overtook delayed Pinyin activation") }
-        print("PASS Caps Lock source confirmation orders following TCP input with \(udp ? "UDP" : "TCP") video")
+        print("PASS Caps Lock context refresh and restoration precede following TCP input with \(udp ? "UDP" : "TCP") video")
     }
 }

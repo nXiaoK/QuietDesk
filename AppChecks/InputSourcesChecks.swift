@@ -11,7 +11,9 @@ private final class SourceProbe: InputSourceAccess {
     var requested: KeyboardSource?
     var rejectSelection = false
     var selections = 0
+    var contextRefresh: InputSourceContextRefresh?
     init() { current = english }
+    func prepareContextRefresh() -> InputSourceContextRefresh? { contextRefresh }
     func enabledSources() throws -> [KeyboardSource] { [english, chinese] }
     func currentSource() -> KeyboardSource? { current }
     func select(_ source: KeyboardSource) throws {

@@ -18,12 +18,17 @@ swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
 "$build_directory/CapsLockMonitorChecks"
 swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     -module-cache-path "$build_directory/ModuleCache" -I "$build_directory/Modules" \
-    "${core_objects[@]}" Sources/QuietDesk/Capture.swift Sources/QuietDesk/InputSources.swift AppChecks/InputSourcesChecks.swift \
+    "${core_objects[@]}" Sources/QuietDesk/Capture.swift Sources/QuietDesk/InputSources.swift Sources/QuietDesk/InputSourceContext.swift AppChecks/InputSourcesChecks.swift \
     -o "$build_directory/InputSourcesChecks"
 "$build_directory/InputSourcesChecks"
 swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     -module-cache-path "$build_directory/ModuleCache" -I "$build_directory/Modules" \
-    "${core_objects[@]}" Sources/QuietDesk/Capture.swift Sources/QuietDesk/InputSources.swift \
+    "${core_objects[@]}" Sources/QuietDesk/Capture.swift Sources/QuietDesk/InputSources.swift Sources/QuietDesk/InputSourceContext.swift \
+    AppChecks/InputContextRefreshChecks.swift -o "$build_directory/InputContextRefreshChecks"
+"$build_directory/InputContextRefreshChecks"
+swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
+    -module-cache-path "$build_directory/ModuleCache" -I "$build_directory/Modules" \
+    "${core_objects[@]}" Sources/QuietDesk/Capture.swift Sources/QuietDesk/InputSources.swift Sources/QuietDesk/InputSourceContext.swift \
     Sources/QuietDesk/CapsLockMonitor.swift AppChecks/InputSourceOrderingChecks.swift \
     -o "$build_directory/InputSourceOrderingChecks"
 "$build_directory/InputSourceOrderingChecks"

@@ -48,6 +48,27 @@ jobs:
         env:
           INCREMENT: ${{ inputs.increment || 'auto' }}
         run: python3 scripts/version.py next --increment "$INCREMENT" --github-output
+      - name: Preflight update signing
+        id: update-signing
+        env:
+          QUIETDESK_UPDATE_SIGNING_KEY: ${{ secrets.QUIETDESK_UPDATE_SIGNING_KEY }}
+        run: |
+          enabled="$(python3 -c 'import json; print(str(bool(json.load(open("Resources/update-feed.json"))["publicKeys"])).lower())')"
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+          if [[ "$enabled" != true ]]; then
+            echo '::warning::Update public key table is empty; this release will not include an update manifest.'
+            exit 0
+          fi
+          if [[ -z "$QUIETDESK_UPDATE_SIGNING_KEY" ]]; then
+            echo '::error::请设置 QUIETDESK_UPDATE_SIGNING_KEY 后重跑。'
+            exit 1
+          fi
+          swift build --product QuietDeskUpdateTool
+          tool="$(swift build --show-bin-path)/QuietDeskUpdateTool"
+          if ! "$tool" check-key --config Resources/update-feed.json; then
+            echo '::error::请设置匹配的 QUIETDESK_UPDATE_SIGNING_KEY 后重跑。'
+            exit 1
+          fi
       - name: Verify relay build toolchain
         run: go version
       - name: Run project checks
@@ -63,29 +84,19 @@ jobs:
         env:
           QUIETDESK_VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/build-relay.sh
-      - name: Save packages
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: QuietDesk-${{ steps.version.outputs.version }}
-          path: |
-            dist/*.dmg
-            dist/*.zip
-            dist/SHA256SUMS-*.txt
-            outputs/relay/*.tar.gz
-            outputs/relay/SHA256SUMS.txt
-          if-no-files-found: error
-      - name: Tag and publish release
+      - name: Create draft release and upload packages
+        id: draft
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
           RELEASE_BUILD: ${{ steps.version.outputs.build }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
-          RELEASE_LATEST: ${{ steps.version.outputs.latest }}
         run: |
           if ! git rev-parse --verify "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
             remote_head="$(git ls-remote origin refs/heads/main | cut -f1)"
             if [[ "$remote_head" != "$(git rev-parse HEAD)" ]]; then
               echo '::notice::A newer main commit exists; its workflow will publish the next release.'
+              echo 'skip=true' >> "$GITHUB_OUTPUT"
               exit 0
             fi
             git config user.name 'github-actions[bot]'
@@ -104,6 +115,43 @@ jobs:
             "dist/QuietDesk-$RELEASE_VERSION-Source.zip" \
             "dist/SHA256SUMS-$RELEASE_VERSION.txt" \
             outputs/relay/*.tar.gz outputs/relay/SHA256SUMS.txt
+      - name: Sign update manifest
+        if: steps.draft.outputs.skip != 'true' && steps.update-signing.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUIETDESK_UPDATE_SIGNING_KEY: ${{ secrets.QUIETDESK_UPDATE_SIGNING_KEY }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$RUNNER_TEMP/quietdesk-release-notes.txt"
+          swift build --product QuietDeskUpdateTool
+          tool="$(swift build --show-bin-path)/QuietDeskUpdateTool"
+          "$tool" sign --app dist/QuietDesk.app --archive "dist/QuietDesk-$RELEASE_VERSION-macOS-universal.zip" \
+            --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/quietdesk-release-notes.txt" --out dist/QuietDesk-update.json
+          "$tool" verify --app dist/QuietDesk.app --archive "dist/QuietDesk-$RELEASE_VERSION-macOS-universal.zip" --manifest dist/QuietDesk-update.json
+      - name: Save packages
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: QuietDesk-${{ steps.version.outputs.version }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/QuietDesk-update.json
+            dist/SHA256SUMS-*.txt
+            outputs/relay/*.tar.gz
+            outputs/relay/SHA256SUMS.txt
+          if-no-files-found: error
+      - name: Publish verified release
+        if: steps.draft.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_LATEST: ${{ steps.version.outputs.latest }}
+          UPDATE_SIGNING_ENABLED: ${{ steps.update-signing.outputs.enabled }}
+        run: |
+          if [[ "$UPDATE_SIGNING_ENABLED" == true ]]; then
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/QuietDesk-update.json
+          fi
           if [[ "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" == true ]]; then
             gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$RELEASE_LATEST"
           fi

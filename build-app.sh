@@ -64,6 +64,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSInputMonitoringUsageDescription</key><string>仅在远程画面聚焦时处理 Caps Lock，并在全屏控制时转发系统快捷键。</string>
 </dict></plist>
 PLIST
+python3 scripts/configure-update-feed.py --plist "$APP/Contents/Info.plist"
 if [[ -n "${SIGNING_IDENTITY:-}" ]]; then
   codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$APP"
 else

@@ -6,11 +6,13 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "QuietDesk", targets: ["QuietDesk"]),
-        .executable(name: "QuietDeskChecks", targets: ["QuietDeskChecks"])
+        .executable(name: "QuietDeskChecks", targets: ["QuietDeskChecks"]),
+        .executable(name: "QuietDeskUpdateTool", targets: ["QuietDeskUpdateTool"])
     ],
     targets: [
         .target(name: "QuietDeskCore"),
         .executableTarget(name: "QuietDesk", dependencies: ["QuietDeskCore"]),
-        .executableTarget(name: "QuietDeskChecks", dependencies: ["QuietDeskCore"], path: "Checks")
+        .executableTarget(name: "QuietDeskChecks", dependencies: ["QuietDeskCore"], path: "Checks"),
+        .executableTarget(name: "QuietDeskUpdateTool", dependencies: ["QuietDeskCore"])
     ]
 )

@@ -31,8 +31,30 @@ jobs:
         run: go version
       - name: Run project checks
         run: ./scripts/run-all-checks.sh
+      - name: Generate temporary update signing key
+        run: |
+          swift build --product QuietDeskUpdateTool
+          tool="$(swift build --show-bin-path)/QuietDeskUpdateTool"
+          public_key="$("$tool" generate-key --out "$RUNNER_TEMP/quietdesk-update-test-key")"
+          echo "QUIETDESK_UPDATE_PUBLIC_KEYS=[$public_key]" >> "$GITHUB_ENV"
       - name: Build Universal application
+        env:
+          QUIETDESK_BUNDLE_IDENTIFIER: local.quietdesk.checks.updater
+          QUIETDESK_UPDATE_FEED_URL: http://127.0.0.1:1/QuietDesk-update.json
         run: ./build-app.sh
+      - name: Sign and verify temporary update manifest
+        run: |
+          tool="$(swift build --show-bin-path)/QuietDeskUpdateTool"
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/QuietDesk.app/Contents/Info.plist)"
+          archive="$RUNNER_TEMP/QuietDesk-$version-macOS-universal.zip"
+          ditto -c -k --sequesterRsrc --keepParent dist/QuietDesk.app "$archive"
+          export QUIETDESK_UPDATE_SIGNING_KEY="$(cat "$RUNNER_TEMP/quietdesk-update-test-key")"
+          "$tool" sign --app dist/QuietDesk.app --archive "$archive" --tag "v$version" --repository nXiaoK/QuietDesk --out "$RUNNER_TEMP/QuietDesk-update.json"
+          "$tool" verify --app dist/QuietDesk.app --archive "$archive" --manifest "$RUNNER_TEMP/QuietDesk-update.json"
+          python3 scripts/check-update-tool.py --tool "$tool" --work "$RUNNER_TEMP/quietdesk-update-tool-checks"
+      - name: Remove temporary update signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/quietdesk-update-test-key"
       - name: Build Linux relay packages
         run: ./scripts/build-relay.sh
       - name: Check application metadata

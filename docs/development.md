@@ -65,6 +65,10 @@ python3 scripts/version.py current
 - **CI**：PR 面向 `main` 时运行 Python 检查、`QuietDeskChecks`、下方独立 App 检查、Universal 构建及应用元数据检查；另生成临时更新密钥，在独立 bundle ID 下构建，并对实际 ZIP 执行 sign → verify。也支持手动运行，不接触正式签名 secret 或发布安装包。
 - **Build and release macOS**：推送 `main` 会触发；手动运行仅从 `main` 发布。分配版本后先检查更新签名配置，再执行 Core 与独立 App 检查、Universal 构建、打包。既有资产上传草稿后，生成并复验更新清单，最后上传清单并公开 Release。公钥表为空时 warning 并跳过清单；默认仍为临时签名、未公证。
 
+两项 Mac 工作流使用 `macos-26` 运行器，并在所有 Swift 检查及构建前选择镜像已安装的最新稳定版 Xcode（`latest-stable`，排除该 Action 识别的 beta，也不自动下载 Xcode）。镜像更新后自动跟随其中的最新稳定工具链；不保证 Apple 刚发布的版本已在 GitHub 镜像中提供。日志输出 Xcode、Swift、macOS SDK 版本和路径，并通过 `vtool` 输出最终应用两个架构的实际 SDK 与最低系统版本。应用继续支持 macOS 14+ 和 Universal；SDK 版本不等于最低运行系统版本。
+
+原生 SwiftUI/AppKit 外观会受编译 SDK 影响。本地与 Actions 的界面需要严格一致时，应核对上述日志，并在本地使用相同版本的 Xcode/SDK；只对齐源码或最低系统版本不足以保证外观一致。
+
 该推送流程也在 Linux 节点检查通过后调用 **Publish relay image**，用 `GITHUB_TOKEN` 和镜像 job 的 `packages: write` 权限向 GHCR 发布 Linux amd64、arm64 镜像。镜像名按仓库路径转成小写并追加 `-relay`，本仓库为 `ghcr.io/nxiaok/quietdesk-relay`。先发布 `sha-完整提交号`，再以构建产物的 digest 拉取，使用仅两个部署文件的临时目录验证手动证书、自签证书、TCP/UDP、身份保留和失败路径；全部通过后才把同一镜像标为 `latest` 与 `main`。摘要记录源码提交和可固定使用的 digest。源码提交标签表示构建来源，重新构建可能更新基础镜像，严格固定内容应使用 digest。
 
 镜像发布与 Mac 构建是同一推送流程中独立的后续 job，都等待原有节点检查；镜像 job 失败不绕过检查去更新 `latest`，也不改变 Mac job 原有的依赖和发布条件。PR CI 只检查，不登录 GHCR 或发布镜像。首次发布后如果包默认私有，维护者需在 GitHub Packages 设置为 Public 才能匿名拉取；已有同名包则需授予此仓库写入该包的 Actions 权限。无需增加 Docker Hub 密码或上传部署节点的私密材料。

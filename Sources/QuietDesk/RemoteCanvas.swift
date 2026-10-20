@@ -3,6 +3,20 @@ import AVFoundation
 import ImageIO
 import QuietDeskCore
 import SwiftUI
+import VideoToolbox
+
+/// A decoded remote frame handed to a background queue for PNG encoding; the buffer is never written again.
+struct RemoteFrameSnapshot: @unchecked Sendable {
+    let frame: CVPixelBuffer
+    var width: Int { CVPixelBufferGetWidth(frame) }
+    var height: Int { CVPixelBufferGetHeight(frame) }
+
+    func pngData() -> Data? {
+        var image: CGImage?
+        guard VTCreateCGImageFromCVPixelBuffer(frame, options: nil, imageOut: &image) == noErr, let image else { return nil }
+        return NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
+    }
+}
 
 protocol MediaCanvasDecoding: AnyObject {
     func decode(_ packet: VideoPacket, completion: @escaping (Result<CVPixelBuffer, Error>) -> Void)
@@ -238,6 +252,8 @@ final class RemoteCanvas: NSView {
     private var mediaReceiverID: UUID?
     private var displayStream: MediaStreamID?
     private var awaitingDisplay = false
+    /// The decoded frame most recently handed to the display layer; the curtain is never part of it.
+    private(set) var displayedFrame: CVPixelBuffer?
     private var tracking: NSTrackingArea?
     private var observers: [NSObjectProtocol] = []
     private var movePacer = PointerMovePacer()
@@ -279,6 +295,7 @@ final class RemoteCanvas: NSView {
     var onFailure: ((String) -> Void)?
     var onFullScreen: ((Bool) -> Void)?
     var onToggleFullScreen: (() -> Void)?
+    var onCaptureFrame: (() -> Void)?
     var remoteSize = CGSize(width: 16, height: 10)
     var canControl = false {
         didSet {
@@ -529,6 +546,7 @@ final class RemoteCanvas: NSView {
                 self.videoLayer.stopRequestingMediaData()
                 self.awaitingDisplay = false
                 self.videoLayer.flush()
+                self.displayedFrame = nil
                 self.mailbox = inbox
             }
             self.showLatestFrame()
@@ -578,6 +596,7 @@ final class RemoteCanvas: NSView {
             refreshCursorImage(forcePublish: true)
         }
         videoLayer.enqueue(sample)
+        displayedFrame = image
         // Enqueue completion does not confirm that the frame has reached the screen.
         diagnostics?.record(.decodeToDisplay, since: received.decodedAt, kind: .video, identifier: received.sequence.map(UInt64.init))
         diagnostics?.record(.displayEnqueue, since: enqueueStarted, kind: .video, identifier: received.sequence.map(UInt64.init))
@@ -602,6 +621,7 @@ final class RemoteCanvas: NSView {
         diagnostics = nil
         videoLayer.stopRequestingMediaData()
         videoLayer.flushAndRemoveImage()
+        displayedFrame = nil
         awaitingDisplay = false
     }
 
@@ -776,6 +796,11 @@ final class RemoteCanvas: NSView {
         }
         if SystemShortcutRouting.localAction(keyCode: event.keyCode, flags: UInt64(event.modifierFlags.rawValue)) == .releaseControl {
             releaseControl()
+            return
+        }
+        if SystemShortcutRouting.localAction(keyCode: event.keyCode, flags: UInt64(event.modifierFlags.rawValue)) == .captureRemoteFrame {
+            localShortcutKeys.insert(event.keyCode)
+            if !event.isARepeat { onCaptureFrame?() }
             return
         }
         if synchronizesClipboard, event.keyCode == 9, modifiers.contains(.command),

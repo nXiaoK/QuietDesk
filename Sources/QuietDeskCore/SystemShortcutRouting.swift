@@ -13,7 +13,7 @@ public struct SystemShortcutScope: Equatable, Sendable {
 }
 
 public enum LocalControlShortcut: Equatable, Sendable {
-    case releaseControl, toggleFullScreen
+    case releaseControl, toggleFullScreen, captureRemoteFrame
 }
 
 public struct SystemShortcutRouting: Sendable {
@@ -43,6 +43,7 @@ public struct SystemShortcutRouting: Sendable {
         let modifiers = flags & (control | option | command | shift)
         if keyCode == 53, modifiers & (control | option) == (control | option) { return .releaseControl }
         if keyCode == 3, modifiers == (control | command) { return .toggleFullScreen }
+        if keyCode == 1, modifiers == (control | command) { return .captureRemoteFrame }
         return nil
     }
 }

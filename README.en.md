@@ -52,7 +52,7 @@ These are UI demonstrations, not evidence of real-device performance or permissi
 1. Install QuietDesk on both Macs and move it to Applications.
 2. **Host Mac:** choose **共享这台 Mac** (Share this Mac), grant Screen Recording and Accessibility, start sharing, and copy the pairing code.
 3. **Controlling Mac:** enter the host address, port and pairing code. On a LAN, use its local IP and default port `5908`. For public port forwarding, map TCP and UDP on the same external port to the same listening port on the host. TCP remains available when UDP cannot be reached.
-4. Click the remote desktop to control it. `⌃⌥Esc` releases input; `⌃⌘F` toggles fullscreen. System shortcut forwarding and Caps Lock features also need Accessibility and Input Monitoring on the controlling Mac.
+4. Click the remote desktop to control it. `⌃⌥Esc` releases input; `⌃⌘F` toggles fullscreen; `⌃⌘S` copies the remote picture to the clipboard. System shortcut forwarding and Caps Lock features also need Accessibility and Input Monitoring on the controlling Mac.
 
 Treat the pairing code as a remote-control credential and share it only through a trusted channel. [Permissions and troubleshooting (Chinese) →](docs/usage.md#permissions)
 

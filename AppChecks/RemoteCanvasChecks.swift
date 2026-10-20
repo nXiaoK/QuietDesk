@@ -68,6 +68,20 @@ private func canvasPixel() throws -> CVPixelBuffer {
     return pixel
 }
 
+private func decoderLikePixel(width: Int, height: Int, luma: UInt8) throws -> CVPixelBuffer {
+    var pixel: CVPixelBuffer?
+    let attributes = [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
+    guard CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, attributes, &pixel) == kCVReturnSuccess,
+          let pixel else { throw CanvasCheckFailure("Could not create a synthetic NV12 frame") }
+    CVPixelBufferLockBaseAddress(pixel, [])
+    defer { CVPixelBufferUnlockBaseAddress(pixel, []) }
+    for plane in 0..<2 {
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(pixel, plane) else { throw CanvasCheckFailure("Synthetic NV12 plane missing") }
+        memset(base, plane == 0 ? Int32(luma) : 128, CVPixelBufferGetBytesPerRowOfPlane(pixel, plane) * CVPixelBufferGetHeightOfPlane(pixel, plane))
+    }
+    return pixel
+}
+
 @MainActor
 private func canvasCursorPNG() throws -> Data {
     guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1, pixelsHigh: 1,
@@ -718,6 +732,58 @@ private struct RemoteCanvasChecks {
             try require(!receiver.commit(stream: stream), "A failed IDR decode committed its cursor binding")
             drainCanvasDisplay()
             try require(!presentation.isEmpty && presentation.allSatisfy { !$0.0 }, "Missing or failed media enabled independent cursor mode")
+        }
+
+        run("Frame capture uses the frame on screen, encodes decoder NV12 as PNG, stays local and ends with the session") {
+            let display = CanvasDisplayLayerProbe()
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300), videoLayer: display)
+            let decoder = CanvasDecoderProbe()
+            let receiver = canvas.makeMediaReceiver(makeDecoder: { _ in decoder })
+            let window = NSWindow(contentRect: canvas.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            defer { receiver.stop(); canvas.reset(); window.close() }
+            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
+            let shown = try decoderLikePixel(width: 64, height: 48, luma: 235), waiting = try decoderLikePixel(width: 64, height: 48, luma: 16)
+            receiver.receive(try mediaFrame(stream: stream, id: 1, keyFrame: true)) { _ in }
+            decoder.finish(1, .success(shown))
+            try require(receiver.commit(stream: stream), "Decoded frame did not commit")
+            drainCanvasDisplay()
+            try require(canvas.displayedFrame === shown, "Capture does not use the frame handed to the display")
+            display.acceptsFrames = false
+            receiver.receive(try mediaFrame(stream: stream, id: 2, keyFrame: false)) { _ in }
+            decoder.finish(2, .success(waiting))
+            drainCanvasDisplay()
+            try require(canvas.displayedFrame === shown, "Capture used a frame still waiting behind display backpressure")
+
+            let snapshot = RemoteFrameSnapshot(frame: shown)
+            guard let png = snapshot.pngData(), let bitmap = NSBitmapImageRep(data: png),
+                  let color = bitmap.colorAt(x: 32, y: 24)?.usingColorSpace(.sRGB) else {
+                throw CanvasCheckFailure("A decoder-style NV12 frame did not encode as PNG")
+            }
+            try require(snapshot.width == 64 && snapshot.height == 48 && bitmap.pixelsWide == 64 && bitmap.pixelsHigh == 48,
+                        "Captured PNG size differs from the remote frame")
+            try require(color.redComponent > 0.95 && color.greenComponent > 0.95 && color.blueComponent > 0.95,
+                        "Captured PNG colors were not converted from video range: \(color)")
+
+            window.contentView = canvas
+            canvas.canControl = true
+            try require(window.makeFirstResponder(canvas), "Canvas did not take fixture focus")
+            var captures = 0, inputs: [RemoteInput] = []
+            canvas.onCaptureFrame = { captures += 1 }
+            canvas.onInput = { inputs.append($0) }
+            @MainActor func key(_ type: NSEvent.EventType, _ code: UInt16, _ flags: NSEvent.ModifierFlags, _ text: String) throws -> NSEvent {
+                guard let event = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: flags, timestamp: 0,
+                    windowNumber: window.windowNumber, context: nil, characters: text, charactersIgnoringModifiers: text,
+                    isARepeat: false, keyCode: code) else { throw CanvasCheckFailure("Could not create keyboard events") }
+                return event
+            }
+            canvas.keyDown(with: try key(.keyDown, 1, [.control, .command], "s"))
+            canvas.keyUp(with: try key(.keyUp, 1, [.control, .command], "s"))
+            try require(captures == 1 && inputs.isEmpty, "The capture shortcut reached the remote Mac or did not capture")
+            canvas.keyDown(with: try key(.keyDown, 1, [.command], "s"))
+            try require(captures == 1 && inputs.count == 1 && inputs[0].keyCode == 1, "Plain ⌘S no longer reaches the remote Mac")
+            canvas.reset()
+            try require(canvas.displayedFrame == nil, "A capturable frame outlived the session")
         }
 
         print("\(passed) passed, \(failed) failed")

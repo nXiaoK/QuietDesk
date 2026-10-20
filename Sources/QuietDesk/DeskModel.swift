@@ -138,6 +138,7 @@ final class DeskModel: ObservableObject {
     private var metricsTimer: Timer?
     private var performanceDiagnostics: PerformanceDiagnostics?
     private let performanceQueue = DispatchQueue(label: "quietdesk.performance", qos: .utility)
+    private let snapshotQueue = DispatchQueue(label: "quietdesk.remote-snapshot", qos: .userInitiated)
     private var performanceTimer: DispatchSourceTimer?
     private var performanceConnectionID = 0
     private var performanceRole: DiagnosticLog.Role?
@@ -298,6 +299,7 @@ final class DeskModel: ObservableObject {
             }
         }
         canvas.onToggleFullScreen = { [weak self] in self?.toggleFullScreen() }
+        canvas.onCaptureFrame = { [weak self] in self?.copyRemoteFrame() }
         canvas.onFullScreen = { [weak self] enabled in
             self?.isFullScreen = enabled
         }
@@ -2292,6 +2294,26 @@ final class DeskModel: ObservableObject {
             viewer.clipboardPullPending = false
             viewer.clipboardPullTimeout = nil
             self.clipboardStatus = "未收到远端剪贴板文字（对方可能没有文字或已关闭剪贴板同步）"
+        }
+    }
+
+    /// Copies the remote frame shown here as PNG. It comes from the received video, so the host's curtain is not in it.
+    func copyRemoteFrame() {
+        guard mode == .viewer, connected else { return }
+        guard let frame = canvas.displayedFrame else { clipboardStatus = "还没有可截取的远端画面"; return }
+        let snapshot = RemoteFrameSnapshot(frame: frame)
+        snapshotQueue.async {
+            let png = snapshot.pngData()
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    guard let png else { self.clipboardStatus = "远端画面无法转换为 PNG"; return }
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    self.clipboardStatus = pasteboard.setData(png, forType: .png)
+                        ? "已复制远端画面 \(snapshot.width) × \(snapshot.height) 到剪贴板" : "远端画面无法写入剪贴板"
+                }
+            }
         }
     }
 

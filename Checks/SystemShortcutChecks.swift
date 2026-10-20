@@ -43,7 +43,7 @@ func runSystemShortcutChecks() {
         try check(routing.route(kind: .scroll, keyCode: 0, scope: active) == .passThrough, "Pointer event entered keyboard capture")
     }
 
-    run("Emergency release and fullscreen exit remain local while paste keeps its normal route") {
+    run("Emergency release, fullscreen exit and frame capture remain local while paste keeps its normal route") {
         let control = UInt64(NSEvent.ModifierFlags.control.rawValue), option = UInt64(NSEvent.ModifierFlags.option.rawValue)
         let command = UInt64(NSEvent.ModifierFlags.command.rawValue), shift = UInt64(NSEvent.ModifierFlags.shift.rawValue)
         try check(SystemShortcutRouting.localAction(keyCode: 53, flags: control | option) == .releaseControl, "Emergency release changed")
@@ -51,6 +51,9 @@ func runSystemShortcutChecks() {
                   "Additional modifiers disabled emergency release")
         try check(SystemShortcutRouting.localAction(keyCode: 3, flags: control | command) == .toggleFullScreen, "Fullscreen exit changed")
         try check(SystemShortcutRouting.localAction(keyCode: 3, flags: control | command | shift) == nil, "A different combination exited fullscreen")
+        try check(SystemShortcutRouting.localAction(keyCode: 1, flags: control | command) == .captureRemoteFrame, "Remote frame capture shortcut missing")
+        try check(SystemShortcutRouting.localAction(keyCode: 1, flags: command) == nil && SystemShortcutRouting.localAction(keyCode: 1, flags: control | command | shift) == nil,
+                  "Save or another S combination was kept from the remote Mac")
         try check(SystemShortcutRouting.localAction(keyCode: 49, flags: command) == nil, "Spotlight was treated as a local action")
         try check(SystemShortcutRouting.localAction(keyCode: 9, flags: command) == nil, "Paste bypassed the canvas paste preparation route")
     }

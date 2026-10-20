@@ -155,6 +155,15 @@ struct FullScreenSettingsView: View {
                             }
                         }
                         .buttonStyle(.bordered).controlSize(.regular)
+                        Button { model.copyRemoteFrame() } label: {
+                            HStack {
+                                Label("截取远端画面到剪贴板", systemImage: "camera.viewfinder")
+                                Spacer(minLength: 4)
+                                Text("⌃⌘S").font(.system(size: 10)).foregroundStyle(.secondary)
+                            }.frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered).controlSize(.regular).disabled(!model.connected)
+                        .help("截图来自收到的远端画面，防窥遮罩不会出现在里面")
                         Divider()
                         SessionQualitySection(model: model, compact: true)
                         Divider()

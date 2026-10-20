@@ -57,6 +57,9 @@ struct QuietDeskApp: App {
                     .keyboardShortcut("f", modifiers: [.control, .command])
                 Button("释放键盘鼠标") { model.canvas.releaseControl() }
                     .keyboardShortcut(.escape, modifiers: [.control, .option])
+                Button("截取远端画面到剪贴板") { model.copyRemoteFrame() }
+                    .keyboardShortcut("s", modifiers: [.control, .command])
+                    .disabled(model.mode != .viewer || !model.connected)
                 Button("断开连接 / 停止共享") { model.stop() }.disabled(!model.active && !model.working)
             }
         }
@@ -170,6 +173,8 @@ struct DeskView: View {
                         .help("发送本机剪贴板文字").disabled(!model.connected)
                     Button { model.canvas.releaseControl(); model.pullClipboard() } label: { Label("获取文字", systemImage: "arrow.down.doc") }
                         .help("获取远端剪贴板文字").disabled(!model.connected)
+                    Button { model.copyRemoteFrame() } label: { Label("截取画面", systemImage: "camera.viewfinder") }
+                        .help("把当前远端画面复制到剪贴板（⌃⌘S），防窥遮罩不会出现在截图里").disabled(!model.connected)
                     Button { model.canvas.releaseControl(); showCapsSettings = true } label: { Label("键盘设置", systemImage: "keyboard") }
                         .help("全屏系统快捷键与 Caps Lock 转发设置")
                     Button { model.canvas.releaseControl(); showOptions.toggle() } label: { Label("画质与连接", systemImage: "slider.horizontal.3") }

@@ -70,9 +70,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: DeskModel?
     weak var updates: UpdateController?
     private(set) var launchedAtLogin = false
+    private let quitHandler = SystemQuitHandler()
     func applicationWillFinishLaunching(_ notification: Notification) {
         launchedAtLogin = NSAppleEventManager.shared().currentAppleEvent?
             .paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem))?.booleanValue == true
+        quitHandler.install()
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         !(model?.mode == .host && (model?.active == true || model?.working == true || model?.autoStartSharing == true))
@@ -207,6 +209,9 @@ struct DeskView: View {
             Button("知道了", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
         .onChange(of: immersive) { _, _ in showFullScreenMenu = false; showOptions = false; showCapsSettings = false; showTrafficStatistics = false; showSessionEffects = false }
+        .onReceive(NotificationCenter.default.publisher(for: SystemQuitHandler.dismissSheets)) { _ in
+            showCapsSettings = false; showTrafficStatistics = false; showSessionEffects = false
+        }
         .onChange(of: model.mode) { _, _ in model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true) }
         .onReceive(model.$clipboardStatus) { _ in
             dismissedClipboardStatus = ""

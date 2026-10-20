@@ -9,6 +9,7 @@ enum QuietDeskEntry {
     @MainActor static func main() {
         if UpdateInstaller.runInstallerIfRequested() { return }
         if HostSessionEffects.runWatchdogIfRequested() { return }
+        if SystemQuitHandler.runReopenHelperIfRequested() { return }
         DiagnosticLog.shared.record(.applicationStarted)
         QuietDeskApp.main()
     }

@@ -196,7 +196,23 @@ enum SessionEffectsCancellationChecks {
         if deliveredWhileOpen, reads.state == (15, true) {
             print("PASS a short helper reply arrives while the pipe stays open and reading ends at EOF")
         } else { failures += 1; print("FAIL helper reply waited for EOF or reading never ended: \(reads.state)") }
-        print("\(10 - failures) passed, \(failures) failed")
+
+        do {
+            let audio = FakeSessionAudio(), privacy = FakeSessionPrivacy()
+            let effects = HostSessionEffects(audio: audio, privacy: privacy)
+            var updates: [String?] = []
+            effects.onStateChange = { _, message in updates.append(message) }
+            audio.onChange?(false, nil)
+            let quietWhenUnchanged = updates.isEmpty
+            audio.onChange?(false, "fake helper failure")
+            audio.isMuted = true
+            _ = try await effects.apply(.init(muted: true)) {}
+            audio.onChange?(false, nil)
+            if quietWhenUnchanged, updates == ["fake helper failure", nil], effects.state == SessionEffectsState() {
+                print("PASS an unchanged helper exit keeps the last failure while real changes and errors still reach the viewer")
+            } else { failures += 1; print("FAIL helper state updates: \(updates)") }
+        } catch { failures += 1; print("FAIL helper state update setup: \(error)") }
+        print("\(11 - failures) passed, \(failures) failed")
         exit(failures == 0 ? 0 : 1)
     }
 }

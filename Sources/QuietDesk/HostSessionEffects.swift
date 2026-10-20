@@ -38,7 +38,10 @@ final class HostSessionEffects {
         self.audio = audio; self.privacy = privacy
         audio.onChange = { [weak self] muted, error in
             guard let self else { return }
-            self.state = SessionEffectsState(muted: muted, privacy: self.privacy.isVisible)
+            let state = SessionEffectsState(muted: muted, privacy: self.privacy.isVisible)
+            // A helper exit that changes nothing must not replace the failure the viewer was just sent.
+            guard state != self.state || error != nil else { return }
+            self.state = state
             self.onStateChange?(self.state, error)
         }
         privacy.onExit = { [weak self] in

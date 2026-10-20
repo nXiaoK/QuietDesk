@@ -249,7 +249,7 @@ final class DeskModel: ObservableObject {
             }
         }
         canvas.onRelease = { [weak self] in
-            guard let self, self.connected else { return }
+            guard let self, self.mode == .viewer, self.connected else { return }
             self.peer?.send(Message(.releaseInput))
         }
         canvas.onFocus = { [weak self] focused in

@@ -21,7 +21,7 @@ struct SessionEffectsView: View {
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Toggle("断开后立即锁定被控 Mac", isOn: Binding(get: { model.sessionEffects.lockOnDisconnect }, set: model.setRemoteLockOnDisconnect))
                 .disabled(switchesDisabled || !model.supportsSessionLock)
-            Text("任何断开都会立即锁屏，包括网络中断、控制端休眠和 QuietDesk 自身重建连接。QuietDesk 不能在锁屏界面上远程操作，锁屏后需要在被控 Mac 前输入密码解锁，才能继续远程使用。被控端 QuietDesk 被强制结束或崩溃时无法锁屏。")
+            Text("任何断开都会立即锁屏，包括网络中断、控制端休眠和 QuietDesk 自身重建连接。被控 Mac 保持唤醒且 QuietDesk 在运行时，重新连接后可在锁屏界面输入密码解锁（断开锁屏后的重连尚待实机确认）；睡眠、注销、重启后无法远程解锁。被控端 QuietDesk 被强制结束或崩溃时无法锁屏。")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let remembered = model.sessionEffectsMemory.connectionState {
                 Text("新连接将自动开启：" + [remembered.muted ? "被控端静音" : nil, remembered.privacy ? "防窥" : nil,

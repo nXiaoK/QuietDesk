@@ -28,6 +28,20 @@ private final class FakeSessionPrivacy: SessionPrivacyCover {
     func hide() { isVisible = false }
 }
 
+@MainActor
+private final class FakeScreenLock: SessionScreenLocking {
+    var unavailableReason: String?
+    var lockCalls = 0
+    var confirmation: String?
+    var holdConfirmation = false
+    var confirmWaiters: [CheckedContinuation<Void, Never>] = []
+    func lock() -> String? { lockCalls += 1; return nil }
+    func confirmLocked() async -> String? {
+        if holdConfirmation { await withCheckedContinuation { confirmWaiters.append($0) } }
+        return confirmation
+    }
+}
+
 private final class PipeReadProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var bytes = 0, ended = false
@@ -42,7 +56,7 @@ enum SessionEffectsCancellationChecks {
         var failures = 0
         let privacy = FakeSessionPrivacy()
         let audio = FakeSessionAudio()
-        let effects = HostSessionEffects(audio: audio, privacy: privacy)
+        let effects = HostSessionEffects(audio: audio, privacy: privacy, screenLock: FakeScreenLock())
         var releasePreparation: CheckedContinuation<Void, Never>?
         let pending = Task { @MainActor in
             try await effects.apply(.init(privacy: true)) {
@@ -89,7 +103,7 @@ enum SessionEffectsCancellationChecks {
         } catch { failures += 1; print("FAIL unexpected audio cancellation failure: \(error)") }
         do {
             let audio = FakeSessionAudio(), privacy = FakeSessionPrivacy()
-            let effects = HostSessionEffects(audio: audio, privacy: privacy)
+            let effects = HostSessionEffects(audio: audio, privacy: privacy, screenLock: FakeScreenLock())
             _ = try await effects.apply(.init(privacy: true)) {}
             audio.isMuted = true; audio.holdRestores = true
             let first = Task { @MainActor in await effects.reset() }
@@ -108,7 +122,7 @@ enum SessionEffectsCancellationChecks {
 
         do {
             let audio = FakeSessionAudio(), privacy = FakeSessionPrivacy()
-            let effects = HostSessionEffects(audio: audio, privacy: privacy)
+            let effects = HostSessionEffects(audio: audio, privacy: privacy, screenLock: FakeScreenLock())
             audio.isMuted = true; audio.holdRestores = true
             let unmute = Task { @MainActor in try await effects.apply(.init()) {} }
             while audio.restoreWaiters.isEmpty { await Task.yield() }
@@ -128,7 +142,7 @@ enum SessionEffectsCancellationChecks {
         } catch { failures += 1; print("FAIL interleaved apply/reset: \(error)") }
 
         let failingAudio = FakeSessionAudio()
-        let failing = HostSessionEffects(audio: failingAudio, privacy: FakeSessionPrivacy())
+        let failing = HostSessionEffects(audio: failingAudio, privacy: FakeSessionPrivacy(), screenLock: FakeScreenLock())
         failingAudio.isMuted = true; failingAudio.holdRestores = true; failingAudio.restoreError = "fake restore failure"
         let failedFirst = Task { @MainActor in await failing.reset() }
         while failingAudio.restoreWaiters.isEmpty { await Task.yield() }
@@ -199,7 +213,7 @@ enum SessionEffectsCancellationChecks {
 
         do {
             let audio = FakeSessionAudio(), privacy = FakeSessionPrivacy()
-            let effects = HostSessionEffects(audio: audio, privacy: privacy)
+            let effects = HostSessionEffects(audio: audio, privacy: privacy, screenLock: FakeScreenLock())
             var updates: [String?] = []
             effects.onStateChange = { _, message in updates.append(message) }
             audio.onChange?(false, nil)
@@ -212,7 +226,47 @@ enum SessionEffectsCancellationChecks {
                 print("PASS an unchanged helper exit keeps the last failure while real changes and errors still reach the viewer")
             } else { failures += 1; print("FAIL helper state updates: \(updates)") }
         } catch { failures += 1; print("FAIL helper state update setup: \(error)") }
-        print("\(11 - failures) passed, \(failures) failed")
+        do {
+            let audio = FakeSessionAudio(), privacy = FakeSessionPrivacy(), lock = FakeScreenLock()
+            let effects = HostSessionEffects(audio: audio, privacy: privacy, screenLock: lock)
+            lock.unavailableReason = "fake lock unavailable"
+            var refused = false
+            do { _ = try await effects.apply(.init(privacy: true, lockOnDisconnect: true)) {} }
+            catch { refused = error.localizedDescription == "fake lock unavailable" && effects.state == .init(privacy: true) }
+            lock.unavailableReason = nil
+            let applied = try await effects.apply(.init(privacy: true, lockOnDisconnect: true)) {}
+            lock.holdConfirmation = true
+            effects.endSession()
+            let issuedAtOnce = lock.lockCalls == 1
+            var resetStarted = false
+            let reset = Task { @MainActor in resetStarted = true; return await effects.reset() }
+            while !resetStarted || lock.confirmWaiters.isEmpty { await Task.yield() }
+            await Task.yield()
+            let curtainHeld = privacy.isVisible
+            effects.endSession()
+            lock.confirmation = "fake lock not confirmed"
+            lock.holdConfirmation = false
+            lock.confirmWaiters.forEach { $0.resume() }; lock.confirmWaiters.removeAll()
+            let message = await reset.value
+            if refused, applied.lockOnDisconnect, issuedAtOnce, curtainHeld, lock.lockCalls == 1, !privacy.isVisible,
+               message == "fake lock not confirmed", !effects.state.lockOnDisconnect {
+                print("PASS a session lock is refused when unavailable, issued once at session end and confirmed before the curtain lifts")
+            } else { failures += 1; print("FAIL session lock: refused \(refused) once \(issuedAtOnce) held \(curtainHeld) calls \(lock.lockCalls) \(message ?? "nil")") }
+        } catch { failures += 1; print("FAIL session lock setup: \(error)") }
+
+        do {
+            let lock = FakeScreenLock()
+            let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: FakeSessionPrivacy(), screenLock: lock)
+            _ = try await effects.apply(.init(lockOnDisconnect: true)) {}
+            let switchedOff = try await effects.apply(.init()) {}
+            let message = await effects.reset()
+            let untouched = HostSessionEffects(audio: FakeSessionAudio(), privacy: FakeSessionPrivacy(), screenLock: lock)
+            let untouchedMessage = await untouched.reset()
+            if !switchedOff.lockOnDisconnect, lock.lockCalls == 0, message == nil, untouchedMessage == nil, effects.endSession() == nil {
+                print("PASS a session that switched the lock off or never asked for it ends without locking")
+            } else { failures += 1; print("FAIL an unrequested session lock was issued: \(lock.lockCalls)") }
+        } catch { failures += 1; print("FAIL unrequested lock setup: \(error)") }
+        print("\(13 - failures) passed, \(failures) failed")
         exit(failures == 0 ? 0 : 1)
     }
 }

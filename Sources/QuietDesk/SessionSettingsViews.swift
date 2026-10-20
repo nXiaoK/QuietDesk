@@ -31,7 +31,7 @@ struct ConnectionSettingsView: View {
                     Text("显示控制通道往返延迟、分辨率、解码 FPS 和收发流量。往返延迟约每 5 秒更新；不代表画面上屏延迟。静止画面 FPS 可能为 0。")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     Button(action: openTraffic) { Label("设备历史流量…", systemImage: "chart.bar.xaxis") }
-                    Button(action: openEffects) { Label("被控端静音与防窥…", systemImage: "display.trianglebadge.exclamationmark") }
+                    Button(action: openEffects) { Label("被控端隐私与安全…", systemImage: "lock.shield") }
                 }
                 Divider()
                 VStack(alignment: .leading, spacing: 8) {
@@ -185,7 +185,7 @@ struct FullScreenSettingsView: View {
                         VStack(spacing: 0) {
                             Button(action: openEffects) {
                                 HStack {
-                                    Label("被控端静音与防窥", systemImage: "display.trianglebadge.exclamationmark")
+                                    Label("被控端隐私与安全", systemImage: "lock.shield")
                                     Spacer()
                                     Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
                                 }.frame(minHeight: 28)

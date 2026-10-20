@@ -3,8 +3,19 @@ import Foundation
 public struct SessionEffectsState: Codable, Equatable, Sendable {
     public let muted: Bool
     public let privacy: Bool
-    public init(muted: Bool = false, privacy: Bool = false) {
-        self.muted = muted; self.privacy = privacy
+    /// Lock the host screen as soon as this control session ends. Endpoints without the field mean off.
+    public let lockOnDisconnect: Bool
+    public init(muted: Bool = false, privacy: Bool = false, lockOnDisconnect: Bool = false) {
+        self.muted = muted; self.privacy = privacy; self.lockOnDisconnect = lockOnDisconnect
+    }
+
+    private enum CodingKeys: String, CodingKey { case muted, privacy, lockOnDisconnect }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        muted = try container.decode(Bool.self, forKey: .muted)
+        privacy = try container.decode(Bool.self, forKey: .privacy)
+        lockOnDisconnect = try container.decodeIfPresent(Bool.self, forKey: .lockOnDisconnect) ?? false
     }
 }
 
@@ -28,7 +39,7 @@ public struct SessionEffectsResult: Codable, Sendable {
 /// Switching one on is remembered as the host actually applied it, so a failed attempt is not repeated.
 public struct SessionEffectsMemory: Sendable {
     public private(set) var remembered: SessionEffectsState
-    private var pending: (id: UUID, muted: Bool, privacy: Bool)?
+    private var pending: (id: UUID, muted: Bool, privacy: Bool, lock: Bool)?
 
     public init(remembered: SessionEffectsState = SessionEffectsState()) { self.remembered = remembered }
 
@@ -37,10 +48,12 @@ public struct SessionEffectsMemory: Sendable {
 
     /// Records a user toggle that changes `current` into `request.state`.
     public mutating func requested(_ request: SessionEffectsRequest, from current: SessionEffectsState) {
-        let mutedToggled = request.state.muted != current.muted, privacyToggled = request.state.privacy != current.privacy
-        remembered = SessionEffectsState(muted: remembered.muted && !(mutedToggled && !request.state.muted),
-                                         privacy: remembered.privacy && !(privacyToggled && !request.state.privacy))
-        pending = (request.id, mutedToggled && request.state.muted, privacyToggled && request.state.privacy)
+        let next = request.state
+        remembered = SessionEffectsState(muted: remembered.muted && !(current.muted && !next.muted),
+                                         privacy: remembered.privacy && !(current.privacy && !next.privacy),
+                                         lockOnDisconnect: remembered.lockOnDisconnect && !(current.lockOnDisconnect && !next.lockOnDisconnect))
+        pending = (request.id, !current.muted && next.muted, !current.privacy && next.privacy,
+                   !current.lockOnDisconnect && next.lockOnDisconnect)
     }
 
     /// Applies the host's reply to the recorded toggle; replies to other requests leave the memory unchanged.
@@ -48,7 +61,8 @@ public struct SessionEffectsMemory: Sendable {
         guard let pending, result.id == pending.id else { return }
         self.pending = nil
         remembered = SessionEffectsState(muted: pending.muted ? result.state.muted : remembered.muted,
-                                         privacy: pending.privacy ? result.state.privacy : remembered.privacy)
+                                         privacy: pending.privacy ? result.state.privacy : remembered.privacy,
+                                         lockOnDisconnect: pending.lock ? result.state.lockOnDisconnect : remembered.lockOnDisconnect)
     }
 
     /// Drops a recorded toggle whose reply can no longer arrive.

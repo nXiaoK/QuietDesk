@@ -90,6 +90,36 @@ func runSessionEffectsChecks() {
         try check(SessionEffectsMemory(remembered: saved).connectionState == .init(privacy: true), "Saved memory did not restore")
     }
 
+    run("Lock on disconnect is an optional, negotiated field that old endpoints read as off") {
+        let legacy = try JSONDecoder().decode(SessionEffectsState.self, from: Data("{\"muted\":true,\"privacy\":false}".utf8))
+        try check(legacy == .init(muted: true) && !legacy.lockOnDisconnect, "A legacy state without the lock field did not read as off")
+        let modern = SessionEffectsState(privacy: true, lockOnDisconnect: true)
+        let encoded = try JSONEncoder().encode(modern)
+        try check(try JSONDecoder().decode(SessionEffectsState.self, from: encoded) == modern, "Lock field lost on the wire")
+        struct LegacyState: Decodable { let muted: Bool; let privacy: Bool }
+        let seenByOldHost = try JSONDecoder().decode(LegacyState.self, from: encoded)
+        try check(!seenByOldHost.muted && seenByOldHost.privacy, "An old endpoint could not read a state that carries the lock field")
+        try rejects("Non-boolean lock accepted") {
+            _ = try JSONDecoder().decode(SessionEffectsState.self, from: Data("{\"muted\":false,\"privacy\":false,\"lockOnDisconnect\":\"true\"}".utf8))
+        }
+        let old = try Wire.readJSON(Hello.self, Wire.json(.hello, Hello(name: "old", width: 1920, height: 1080, settings: .init(), canControl: true)).payload)
+        let new = try Wire.readJSON(Hello.self, Wire.json(.hello, Hello(name: "new", width: 1920, height: 1080, settings: .init(),
+            canControl: true, sessionEffects: true, sessionLockV1: true)).payload)
+        try check(old.sessionLockV1 == nil && new.sessionLockV1 == true, "Lock capability was not optional")
+
+        var memory = SessionEffectsMemory(remembered: .init(privacy: true))
+        let lockOn = SessionEffectsRequest(state: .init(privacy: true, lockOnDisconnect: true))
+        memory.requested(lockOn, from: .init(privacy: true))
+        memory.confirmed(SessionEffectsResult(id: lockOn.id, state: .init(privacy: true), error: "fake host cannot lock"))
+        try check(memory.remembered == .init(privacy: true), "A refused lock was remembered")
+        let lockAgain = SessionEffectsRequest(state: .init(privacy: true, lockOnDisconnect: true))
+        memory.requested(lockAgain, from: .init(privacy: true))
+        memory.confirmed(SessionEffectsResult(id: lockAgain.id, state: .init(privacy: true, lockOnDisconnect: true)))
+        try check(memory.connectionState == .init(privacy: true, lockOnDisconnect: true), "A confirmed lock was not remembered")
+        memory.requested(SessionEffectsRequest(state: .init(lockOnDisconnect: true)), from: .init(privacy: true, lockOnDisconnect: true))
+        try check(memory.remembered == .init(lockOnDisconnect: true), "Switching privacy off also dropped the remembered lock")
+    }
+
     run("Mute preparation deduplicates output routes and does not modify any device") {
         let io = FakeSessionMuteIO()
         let prepared = try SessionMuteTransaction.prepare(using: io)

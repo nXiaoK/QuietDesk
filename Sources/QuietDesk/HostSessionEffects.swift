@@ -21,6 +21,16 @@ protocol SessionPrivacyCover: AnyObject {
 }
 
 @MainActor
+protocol SessionScreenLocking: AnyObject {
+    /// Why this Mac cannot lock itself, or nil when a lock method is available.
+    var unavailableReason: String? { get }
+    /// Starts the lock right away; returns a failure when no method could be started.
+    func lock() -> String?
+    /// Waits briefly until the system reports a locked session.
+    func confirmLocked() async -> String?
+}
+
+@MainActor
 final class HostSessionEffects {
     private(set) var state = SessionEffectsState()
     var onStateChange: ((SessionEffectsState, String?) -> Void)?
@@ -29,16 +39,21 @@ final class HostSessionEffects {
     private var resetsInProgress = 0
     private let audio: SessionAudioControlling
     private let privacy: SessionPrivacyCover
+    private let screenLock: SessionScreenLocking
+    private var locksOnDisconnect = false
+    private var lockTask: Task<String?, Never>?
     private var audioRestoreTask: Task<String?, Never>?
     private var audioRestoreID: UUID?
 
-    convenience init() { self.init(audio: SessionAudioClient(), privacy: SessionPrivacyWindows()) }
+    convenience init() {
+        self.init(audio: SessionAudioClient(), privacy: SessionPrivacyWindows(), screenLock: SystemScreenLock())
+    }
 
-    init(audio: SessionAudioControlling, privacy: SessionPrivacyCover) {
-        self.audio = audio; self.privacy = privacy
+    init(audio: SessionAudioControlling, privacy: SessionPrivacyCover, screenLock: SessionScreenLocking) {
+        self.audio = audio; self.privacy = privacy; self.screenLock = screenLock
         audio.onChange = { [weak self] muted, error in
             guard let self else { return }
-            let state = SessionEffectsState(muted: muted, privacy: self.privacy.isVisible)
+            let state = SessionEffectsState(muted: muted, privacy: self.privacy.isVisible, lockOnDisconnect: self.locksOnDisconnect)
             // A helper exit that changes nothing must not replace the failure the viewer was just sent.
             guard state != self.state || error != nil else { return }
             self.state = state
@@ -46,9 +61,13 @@ final class HostSessionEffects {
         }
         privacy.onExit = { [weak self] in
             guard let self else { return }
-            self.state = SessionEffectsState(muted: self.audio.isMuted)
+            self.state = self.actualState
             self.onStateChange?(self.state, "本机已退出防窥")
         }
+    }
+
+    private var actualState: SessionEffectsState {
+        SessionEffectsState(muted: audio.isMuted, privacy: privacy.isVisible, lockOnDisconnect: locksOnDisconnect)
     }
 
     func apply(_ desired: SessionEffectsState, preparePrivacy: @MainActor () async throws -> Void) async throws -> SessionEffectsState {
@@ -58,14 +77,15 @@ final class HostSessionEffects {
         defer { applying = false }
         let token = UUID()
         revision = token
-        if !desired.privacy { privacy.hide(); state = SessionEffectsState(muted: audio.isMuted) }
+        if !desired.lockOnDisconnect { locksOnDisconnect = false }
+        if !desired.privacy { privacy.hide(); state = actualState }
         do {
             if desired.privacy, !state.privacy {
                 try await preparePrivacy()
                 try Task.checkCancellation()
                 guard revision == token else { throw CancellationError() }
                 try privacy.show()
-                state = SessionEffectsState(muted: audio.isMuted, privacy: privacy.isVisible)
+                state = actualState
             }
             if desired.muted != audio.isMuted {
                 if desired.muted { try await audio.enable() }
@@ -73,15 +93,33 @@ final class HostSessionEffects {
             }
             try Task.checkCancellation()
             guard revision == token else { throw CancellationError() }
-            state = SessionEffectsState(muted: audio.isMuted, privacy: privacy.isVisible)
+            if desired.lockOnDisconnect, !locksOnDisconnect {
+                if let reason = screenLock.unavailableReason { throw DeskError.invalid(reason) }
+                locksOnDisconnect = true
+            }
+            state = actualState
             return state
         } catch {
             if error is CancellationError, revision == token { _ = await reset() }
-            if revision == token {
-                state = SessionEffectsState(muted: audio.isMuted, privacy: privacy.isVisible)
-            }
+            if revision == token { state = actualState }
             throw error
         }
+    }
+
+    /// Starts a requested lock synchronously, so it is issued even while the app is quitting.
+    /// Later calls return the same confirmation.
+    @discardableResult
+    func endSession() -> Task<String?, Never>? {
+        if locksOnDisconnect, lockTask == nil {
+            locksOnDisconnect = false
+            let lock = screenLock
+            let failure = lock.lock()
+            lockTask = Task { @MainActor in
+                if let failure { return failure }
+                return await lock.confirmLocked()
+            }
+        }
+        return lockTask
     }
 
     func reset() async -> String? {
@@ -89,11 +127,14 @@ final class HostSessionEffects {
         defer { resetsInProgress -= 1 }
         let token = UUID()
         revision = token
+        // The lock screen has to cover the display before the curtain comes down.
+        let lockError = await endSession()?.value
         privacy.hide()
-        state = SessionEffectsState(muted: audio.isMuted)
+        state = actualState
         let error = await restoreAudio()
-        if revision == token { state = SessionEffectsState(muted: audio.isMuted) }
-        return error
+        if revision == token { state = actualState }
+        let errors = [lockError, error].compactMap { $0 }
+        return errors.isEmpty ? nil : errors.joined(separator: "；")
     }
 
     private func restoreAudio() async -> String? {
@@ -118,6 +159,54 @@ final class HostSessionEffects {
         return true
     }
 
+}
+
+@MainActor
+private final class SystemScreenLock: SessionScreenLocking {
+    private typealias LockImmediately = @convention(c) () -> Int32
+    // The system's own lock entry point, resolved at run time; the ⌃⌘Q shortcut is the fallback.
+    private static let lockImmediately: LockImmediately? = {
+        guard let handle = dlopen("/System/Library/PrivateFrameworks/login.framework/Versions/Current/login", RTLD_LAZY),
+              let symbol = dlsym(handle, "SACLockScreenImmediate") else { return nil }
+        return unsafeBitCast(symbol, to: LockImmediately.self)
+    }()
+    private var postedShortcut = false
+
+    var unavailableReason: String? {
+        Self.lockImmediately != nil || AXIsProcessTrusted() ? nil : "被控端无法自动锁屏：系统锁屏接口不可用，且未授权辅助功能"
+    }
+
+    func lock() -> String? {
+        if let lockImmediately = Self.lockImmediately { _ = lockImmediately(); return nil }
+        return postLockShortcut() ? nil : "自动锁屏失败：系统锁屏接口不可用，且未授权辅助功能"
+    }
+
+    func confirmLocked() async -> String? {
+        if await waitForLock(seconds: 1.5) { return nil }
+        if !postedShortcut, postLockShortcut(), await waitForLock(seconds: 1.5) { return nil }
+        return "已请求自动锁屏，但系统未进入锁屏状态"
+    }
+
+    private func postLockShortcut() -> Bool {
+        guard AXIsProcessTrusted(), let source = CGEventSource(stateID: .hidSystemState) else { return false }
+        postedShortcut = true
+        for down in [true, false] {
+            guard let event = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_Q), keyDown: down) else { return false }
+            event.flags = [.maskControl, .maskCommand]
+            event.post(tap: .cghidEventTap)
+        }
+        return true
+    }
+
+    private func waitForLock(seconds: Double) async -> Bool {
+        let deadline = ContinuousClock.now + .milliseconds(Int(seconds * 1000))
+        while ContinuousClock.now < deadline, !Self.isLocked { try? await Task.sleep(for: .milliseconds(100)) }
+        return Self.isLocked
+    }
+
+    private static var isLocked: Bool {
+        (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool == true
+    }
 }
 
 @MainActor

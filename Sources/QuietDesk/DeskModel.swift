@@ -82,6 +82,7 @@ final class DeskModel: ObservableObject {
     @Published private(set) var supportsExtendedVideoSettings = false
     @Published private(set) var supportsHighRefreshVideoSettings = false
     @Published private(set) var supportsSessionEffects = false
+    @Published private(set) var supportsSessionLock = false
     @Published private(set) var sessionEffects = SessionEffectsState()
     @Published private(set) var sessionEffectsWorking = false
     @Published private(set) var sessionEffectsStatus = ""
@@ -933,7 +934,7 @@ final class DeskModel: ObservableObject {
                             deviceIdentityExchange: host.deviceIdentityAdvertised ? true : nil,
                             highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings,
                             sessionEffects: true, sessionPause: true, mediaTransportV1: true, independentCursorV1: true,
-                            relayTransportV1: true, relayDeviceID: relayRegistration?.deviceID)))
+                            relayTransportV1: true, relayDeviceID: relayRegistration?.deviceID, sessionLockV1: true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -1721,6 +1722,7 @@ final class DeskModel: ObservableObject {
             supportsExtendedVideoSettings = supportsLiveSettings && hello.extendedVideoSettings == true
             supportsHighRefreshVideoSettings = supportsExtendedVideoSettings && hello.highRefreshVideoSettings == true
             supportsSessionEffects = hello.sessionEffects == true
+            supportsSessionLock = supportsSessionEffects && hello.sessionLockV1 == true
             if supportsLiveSettings {
                 let hostDefault = supportsHighRefreshVideoSettings ? (hello.preferredHighRefreshSettings ?? hello.preferredSettings ?? hello.settings)
                     : supportsExtendedVideoSettings ? (hello.preferredSettings ?? hello.settings) : hello.settings
@@ -1743,7 +1745,9 @@ final class DeskModel: ObservableObject {
             if let token = pauseTransmission.freshFrameToken { scheduleFreshFrameTimeout(token, peer: peer) }
             // Sent after the cursor request so the host applies it once cursor capture has settled.
             if supportsSessionEffects, let remembered = sessionEffectsMemory.connectionState {
-                requestSessionEffects(remembered, automatic: true)
+                let supported = SessionEffectsState(muted: remembered.muted, privacy: remembered.privacy,
+                                                    lockOnDisconnect: remembered.lockOnDisconnect && supportsSessionLock)
+                if supported != SessionEffectsState() { requestSessionEffects(supported, automatic: true) }
             }
         case .sessionPauseResult:
             guard viewerSession.helloReceived, supportsSessionPause else { throw DeskError.invalid("当前连接未启用空闲暂停") }
@@ -1880,11 +1884,19 @@ final class DeskModel: ObservableObject {
     }
 
     func setRemoteMuted(_ enabled: Bool) {
-        requestSessionEffects(SessionEffectsState(muted: enabled, privacy: sessionEffects.privacy))
+        requestSessionEffects(SessionEffectsState(muted: enabled, privacy: sessionEffects.privacy,
+                                                  lockOnDisconnect: sessionEffects.lockOnDisconnect))
     }
 
     func setRemotePrivacy(_ enabled: Bool) {
-        requestSessionEffects(SessionEffectsState(muted: sessionEffects.muted, privacy: enabled))
+        requestSessionEffects(SessionEffectsState(muted: sessionEffects.muted, privacy: enabled,
+                                                  lockOnDisconnect: sessionEffects.lockOnDisconnect))
+    }
+
+    func setRemoteLockOnDisconnect(_ enabled: Bool) {
+        guard supportsSessionLock || !enabled else { return }
+        requestSessionEffects(SessionEffectsState(muted: sessionEffects.muted, privacy: sessionEffects.privacy,
+                                                  lockOnDisconnect: enabled))
     }
 
     private func requestSessionEffects(_ desired: SessionEffectsState, automatic: Bool = false) {
@@ -2636,6 +2648,13 @@ final class DeskModel: ObservableObject {
             Task { await streamer.stop() }
         }
         oldHost.injector?.releaseAll()
+        // Issued here, not in the async cleanup, so the lock is requested even when the app is quitting.
+        if let lock = oldHost.effects?.endSession() {
+            Task {
+                let failure = await lock.value
+                DiagnosticLog.shared.record(.screenLock, role: .host, state: failure == nil ? .succeeded : .failed)
+            }
+        }
         hostSession = HostSession()
         viewerSession = ViewerSession()
         supportsSessionPause = false
@@ -2645,6 +2664,7 @@ final class DeskModel: ObservableObject {
         sessionPauseWorking = false
         sessionEffectsWorking = false
         supportsSessionEffects = false
+        supportsSessionLock = false
         sessionEffects = SessionEffectsState()
         sessionEffectsStatus = ""
         sessionEffectsMemory.cancel()

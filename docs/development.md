@@ -184,7 +184,7 @@ python3 scripts/check-relay-docker.py --self-signed --image ghcr.io/nxiaok/quiet
 
 `--self-signed` 使用 `deploy.sh --ip 127.0.0.1` 自动发证，并检查重复部署保留原证书、错误 IP 不会覆盖身份。Python 检查还会把实际 provisioner 的两个卷路径隔离到临时目录，使用真实 OpenSSL 检查 IPv4/IPv6、证书有效期、缺失身份与接入码、私钥不匹配和凭据不输出。这组检查需要与中继镜像一致的 OpenSSL 3：优先使用已安装的 Homebrew `openssl@3`，其次使用 PATH 中的 OpenSSL 3。macOS runner 默认的 OpenSSL 1.1 虽支持 `x509 -checkip`，但校验时不接受生成的证书作为其自身的信任锚，因此不会被选用；只有 LibreSSL 或 OpenSSL 1.1 时会明确跳过。Docker 镜像内使用 OpenSSL，不依赖宿主机 LibreSSL。
 
-`run-relay-certificate-checks.sh` 使用临时自签的非 CA 服务端证书和独立偏好域，检查 PEM/DER、SHA-256、IP/域名、有效期、服务端用途、按节点保存与损坏拒绝。原生回环检查增加证书获取、替换拒绝、取消及使用固定证书的控制/视频/数据路径；混合路径和 UDP 受阻模式也使用固定证书。不会更改系统信任或访问真实应用的偏好/凭据。系统信任服务、回环端口或视频服务受限时须单独报告限制。
+`run-relay-certificate-checks.sh` 使用与中继镜像一致的 OpenSSL 3（优先 Homebrew `openssl@3`，其次 PATH；缺失时报错），生成临时自签的非 CA 服务端证书并使用独立偏好域，检查 PEM/DER、SHA-256、IP/域名、有效期、服务端用途、按节点保存与损坏拒绝，以及系统信任失败后的指定证书验证。日志输出生成器与系统版本，指定证书评估失败时附带 Security 错误和评估结果。原生回环检查增加证书获取、替换拒绝、取消及使用固定证书的控制/视频/数据路径；混合路径和 UDP 受阻模式也使用固定证书。不会更改系统信任或访问真实应用的偏好/凭据。系统信任服务、回环端口或视频服务受限时须单独报告限制。
 
 Docker 检查使用随机项目名、临时自签名证书和独立命名卷，检查非 root 运行、TLS/接入鉴权、TCP 与 UDP 双向转发、重复部署后的登记归属和接入码保留，以及无效证书拒绝。默认从源码构建；`--image` 只复制 `deploy.sh` 和 `compose.image.yaml`，实际拉取指定镜像并验证无需 Go 源码。结束只删除该测试项目的卷，本地构建时还删除其测试镜像；外部传入的镜像保留，不接触正式节点。端口使用临时空闲端口。CI 和发布流程复用 Linux Docker 检查；PR 仍用 Buildx/QEMU 交叉构建两架构检查，main 的镜像发布由上面的独立 job 执行。模拟证书仅用于本机回环，不能用于正式客户端。
 

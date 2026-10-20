@@ -1,5 +1,6 @@
 import Foundation
-import QuietDeskCore
+import Security
+@testable import QuietDeskCore
 
 private struct CheckFailure: Error { let message: String }
 private func require(_ condition: Bool, _ message: String) throws { if !condition { throw CheckFailure(message: message) } }
@@ -21,6 +22,7 @@ private func reject(_ message: String, _ body: () throws -> Void) throws {
             let der = try Data(contentsOf: directory.appendingPathComponent("certificate.der"))
             let certificate = try RelayNodeCertificate(data: pem)
             let endpoint = try RelayEndpoint(address: "tls://127.0.0.1:7443")
+            print("Relay certificate checks on \(ProcessInfo.processInfo.operatingSystemVersionString)")
             run("Bounded PEM/DER imports produce the same OpenSSL SHA-256 fingerprint") {
                 try require(certificate == RelayNodeCertificate(data: der), "PEM and DER differ")
                 let expected = try String(contentsOf: directory.appendingPathComponent("fingerprint.txt"))
@@ -29,6 +31,23 @@ private func reject(_ message: String, _ body: () throws -> Void) throws {
                              Data("-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----".utf8),
                              try Data(contentsOf: directory.appendingPathComponent("privkey.pem"))] {
                     try reject("Malformed, oversized, bundled or private data was accepted") { _ = try RelayNodeCertificate(data: data) }
+                }
+            }
+            run("Pinned evaluation recovers from failed system trust for IP and DNS nodes") {
+                let leaf = SecCertificateCreateWithData(nil, der as CFData)!
+                for address in ["tls://127.0.0.1:7443", "tls://[::1]:7443", "tls://localhost:7443"] {
+                    let node = try RelayEndpoint(address: address)
+                    var trust: SecTrust?
+                    try require(SecTrustCreateWithCertificates(leaf, SecPolicyCreateSSL(true, node.host as CFString), &trust) == errSecSuccess,
+                                "Cannot create trust for \(address)")
+                    let supplied = trust!
+                    try require(SecTrustSetNetworkFetchAllowed(supplied, false) == errSecSuccess, "Cannot disable network fetching")
+                    try require(!SecTrustEvaluateWithError(supplied, nil), "Synthetic node unexpectedly has system trust")
+                    if !certificate.evaluate(supplied, endpoint: node) {
+                        var error: CFError?
+                        _ = SecTrustEvaluateWithError(supplied, &error)
+                        throw CheckFailure(message: "Pinned evaluation rejected \(address): \(String(describing: error)); \(String(describing: SecTrustCopyResult(supplied)))")
+                    }
                 }
             }
             run("A self-signed non-CA node still requires matching IP/DNS and valid dates") {
@@ -41,6 +60,21 @@ private func reject(_ message: String, _ body: () throws -> Void) throws {
                 try reject("Not-yet-valid anchor was accepted") { try certificate.validate(for: endpoint, at: .distantPast) }
                 let client = try RelayNodeCertificate(data: Data(contentsOf: directory.appendingPathComponent("client.pem")))
                 try reject("Client-only certificate was accepted for a server") { try client.validate(for: endpoint) }
+            }
+            run("A valid chain anchored by the saved certificate cannot replace its exact leaf") {
+                let issuer = try RelayNodeCertificate(data: Data(contentsOf: directory.appendingPathComponent("issuer.pem")))
+                let issued = try Data(contentsOf: directory.appendingPathComponent("issued.der"))
+                let leaf = SecCertificateCreateWithData(nil, issued as CFData)!
+                let anchor = SecCertificateCreateWithData(nil, issuer.der as CFData)!
+                var trust: SecTrust?
+                try require(SecTrustCreateWithCertificates([leaf, anchor] as CFArray, SecPolicyCreateSSL(true, endpoint.host as CFString), &trust) == errSecSuccess,
+                            "Cannot create issued chain trust")
+                let supplied = trust!
+                try require(SecTrustSetAnchorCertificates(supplied, [anchor] as CFArray) == errSecSuccess &&
+                            SecTrustSetAnchorCertificatesOnly(supplied, true) == errSecSuccess &&
+                            SecTrustSetNetworkFetchAllowed(supplied, false) == errSecSuccess, "Cannot configure issued chain trust")
+                try require(SecTrustEvaluateWithError(supplied, nil), "Issued chain does not have valid server trust")
+                try require(!issuer.evaluate(supplied, endpoint: endpoint), "A valid chain bypassed the exact certificate pin")
             }
             run("Saved trust survives reload and is isolated by normalized node and port") {
                 let suite = "quietdesk.synthetic-certificate-check." + UUID().uuidString

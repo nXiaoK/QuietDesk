@@ -49,14 +49,15 @@ public struct RelayNodeCertificate: Equatable, Sendable {
         guard let certificate = SecCertificateCreateWithData(nil, der as CFData),
               let before = validity(kSecOIDX509V1ValidityNotBefore), let after = expires,
               before <= date, date <= after,
-              let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate], let leaf = chain.first,
-              (SecCertificateCopyData(leaf) as Data) == der,
               SecTrustSetPolicies(trust, SecPolicyCreateSSL(true, endpoint.host as CFString)) == errSecSuccess,
               SecTrustSetAnchorCertificates(trust, [certificate] as CFArray) == errSecSuccess,
               SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess,
               SecTrustSetNetworkFetchAllowed(trust, false) == errSecSuccess,
               SecTrustSetVerifyDate(trust, date as CFDate) == errSecSuccess else { return false }
-        return SecTrustEvaluateWithError(trust, nil)
+        // Copying the chain can trigger evaluation, so configure the node's trust first.
+        guard SecTrustEvaluateWithError(trust, nil),
+              let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate], let leaf = chain.first else { return false }
+        return (SecCertificateCopyData(leaf) as Data) == der
     }
 }
 

@@ -264,8 +264,19 @@ private struct DiagnosticLogChecks {
             let directory = folder.appendingPathComponent("logs")
             let log = DiagnosticLog(directory: directory, counterInterval: 0.05)
             log.count(.scrollSuppressed, amount: 20)
-            try await Task.sleep(for: .milliseconds(150))
             let file = directory.appendingPathComponent("quietdesk-current.jsonl")
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(5))
+            while true {
+                do {
+                    // The timer may be delayed, and file creation can precede the complete write.
+                    if try Data(contentsOf: file).last == 0x0A { break }
+                } catch let error as CocoaError where error.code == .fileReadNoSuchFile {}
+                guard clock.now < deadline else {
+                    throw LogCheckFailure("Timer did not persist a complete counter record within 5 seconds")
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
             let records = try entries(at: file)
             try require(records.count == 1 && (records[0]["values"] as? [String: Int])?["scrollSuppressed"] == 20,
                         "Timer did not write one aggregate counter entry")

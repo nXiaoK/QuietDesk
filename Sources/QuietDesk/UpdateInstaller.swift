@@ -400,7 +400,9 @@ final class UpdateInstaller: @unchecked Sendable {
         try validatePrivate(root, directory: true)
         let paths = [planURL, plan.applicationURL, plan.stagedApplicationURL, plan.stagingDirectory,
                      plan.backupURL, plan.resultURL, plan.readyURL, plan.acknowledgementURL]
-        guard paths.allSatisfy({ $0.isFileURL && $0.path == $0.standardizedFileURL.path }),
+        // Foundation rewrites /private/var to /var when standardizing a URL.
+        // Compare physical paths so canonical system staging directories remain valid.
+        guard paths.allSatisfy({ $0.isFileURL && $0.path == canonicalSystemLocation($0.standardizedFileURL).path }),
               planURL.lastPathComponent == "install-plan.json",
               plan.parentPID > 1, plan.parentPID != getpid(),
               plan.applicationURL.path == currentApplicationURL.standardizedFileURL.path,

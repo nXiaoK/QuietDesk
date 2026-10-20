@@ -200,11 +200,11 @@ private struct UpdateInstallerChecks {
             bundleIdentifier: bundleID, allowLoopbackForTesting: true) }
         print("PASS signed loopback feed and invalid signature rejection")
 
-        let installer = UpdateInstaller(applicationURL: application, cachesURL: cache,
-            replacementDirectory: fixtures.appendingPathComponent("Staging"))
+        let installer = UpdateInstaller(applicationURL: application, cachesURL: cache)
         let progress = ProgressRecord()
         let prepared = try await installer.downloadAndStage(expectation: expectation(),
             progress: { progress.progress($0, $1) }, onVerifying: { progress.verify() })
+        defer { if environment["QUIETDESK_KEEP_UPDATE_FIXTURE"] == nil { installer.discard(prepared) } }
         try require(progress.bytes == Int64(archiveData.count) && progress.verifying, "Download progress did not report actual bytes and verification")
         let top = try FileManager.default.contentsOfDirectory(atPath: prepared.stagingDirectory.path)
         try require(top == ["QuietDesk.app"], "ditto did not merge __MACOSX metadata into one top-level app")
@@ -343,6 +343,20 @@ private struct UpdateInstallerChecks {
         let sleeper = Process(); sleeper.executableURL = URL(fileURLWithPath: "/usr/bin/true")
         try sleeper.run(); sleeper.waitUntilExit()
         let exitedPID = sleeper.processIdentifier
+        try UpdateInstaller.validatePlan(plan(parent: exitedPID), planURL: planURL, currentApplicationURL: application)
+        print("PASS installation plan accepts the actual system replacement directory")
+        let traversingStaging = URL(fileURLWithPath: prepared.stagingDirectory.path + "/../" + prepared.stagingDirectory.lastPathComponent)
+        try rejects {
+            try UpdateInstaller.validatePlan(plan(parent: exitedPID, staging: traversingStaging),
+                                             planURL: planURL, currentApplicationURL: application)
+        }
+        let linkedStaging = fixtures.appendingPathComponent("QuietDesk-update-staging-link")
+        try FileManager.default.createSymbolicLink(at: linkedStaging, withDestinationURL: prepared.stagingDirectory)
+        try rejects {
+            try UpdateInstaller.validatePlan(plan(parent: exitedPID, staging: linkedStaging),
+                                             planURL: planURL, currentApplicationURL: application)
+        }
+        print("PASS installation plans still reject path traversal and symbolic-link staging")
         var renameCount = 0
         try rejects {
             try UpdateInstaller.performInstallation(plan(parent: exitedPID), planURL: planURL, waitTimeout: 0.1, restartTimeout: 0,
@@ -375,6 +389,7 @@ private struct UpdateInstallerChecks {
 
         for failReopen in [true, false] {
             let staged = try await installer.downloadAndStage(expectation: expectation(), progress: { _, _ in })
+            defer { installer.discard(staged) }
             let trial = plan(parent: exitedPID, staging: staged.stagingDirectory)
             try save(trial, planURL)
             try UpdateInstaller.performInstallation(trial, planURL: planURL, waitTimeout: 0.1, restartTimeout: 0,

@@ -200,6 +200,18 @@ private final class PrivacyCoverWindow: NSWindow {
     override var canBecomeMain: Bool { false }
 }
 
+/// Delivers each pipe read as soon as it returns, until EOF or a read error.
+/// FileHandle.read(upToCount:) waits for the full count or EOF, which would hold back short replies.
+func readAvailableChunks(from handle: FileHandle, _ deliver: (Data) -> Void) {
+    var buffer = [UInt8](repeating: 0, count: 65_536)
+    while true {
+        let count = buffer.withUnsafeMutableBytes { Darwin.read(handle.fileDescriptor, $0.baseAddress, $0.count) }
+        if count < 0, errno == EINTR { continue }
+        guard count > 0 else { return }
+        deliver(Data(buffer[..<count]))
+    }
+}
+
 private enum SessionAudioCommand: String, Codable { case prepare, mute, restore }
 private struct SessionAudioRequest: Codable { let id: UUID; let command: SessionAudioCommand }
 private struct SessionAudioReply: Codable {
@@ -339,11 +351,9 @@ private final class SessionAudioClient: SessionAudioControlling {
         try? outgoing.fileHandleForWriting.close()
         let reader = outgoing.fileHandleForReading
         Self.readerQueue.async { [weak self] in
-            do {
-                while let data = try reader.read(upToCount: 65_536), !data.isEmpty {
-                    DispatchQueue.main.async { MainActor.assumeIsolated { self?.receive(data, token: token) } }
-                }
-            } catch {}
+            readAvailableChunks(from: reader) { data in
+                DispatchQueue.main.async { MainActor.assumeIsolated { self?.receive(data, token: token) } }
+            }
             DispatchQueue.main.async { MainActor.assumeIsolated { self?.finishReading(token) } }
         }
     }

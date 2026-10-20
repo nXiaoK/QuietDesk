@@ -28,6 +28,14 @@ private final class FakeSessionPrivacy: SessionPrivacyCover {
     func hide() { isVisible = false }
 }
 
+private final class PipeReadProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var bytes = 0, ended = false
+    var state: (bytes: Int, ended: Bool) { lock.withLock { (bytes, ended) } }
+    func received(_ count: Int) { lock.withLock { bytes += count } }
+    func finish() { lock.withLock { ended = true } }
+}
+
 @main
 enum SessionEffectsCancellationChecks {
     @MainActor static func main() async {
@@ -173,7 +181,22 @@ enum SessionEffectsCancellationChecks {
         if isolated, currentError == "fake driver recovery failed", lateError == currentError {
             print("PASS exit barriers isolate process tokens and preserve cleanup failures for late waiters")
         } else { failures += 1; print("FAIL exit barrier lost its token or recovery failure") }
-        print("\(9 - failures) passed, \(failures) failed")
+
+        let replies = Pipe(), reads = PipeReadProbe()
+        let replyReader = replies.fileHandleForReading
+        DispatchQueue.global().async {
+            readAvailableChunks(from: replyReader) { reads.received($0.count) }
+            reads.finish()
+        }
+        try? replies.fileHandleForWriting.write(contentsOf: Data("{\"muted\":true}\n".utf8))
+        for _ in 0..<200 where reads.state.bytes == 0 { try? await Task.sleep(for: .milliseconds(10)) }
+        let deliveredWhileOpen = reads.state == (15, false)
+        try? replies.fileHandleForWriting.close()
+        for _ in 0..<200 where !reads.state.ended { try? await Task.sleep(for: .milliseconds(10)) }
+        if deliveredWhileOpen, reads.state == (15, true) {
+            print("PASS a short helper reply arrives while the pipe stays open and reading ends at EOF")
+        } else { failures += 1; print("FAIL helper reply waited for EOF or reading never ended: \(reads.state)") }
+        print("\(10 - failures) passed, \(failures) failed")
         exit(failures == 0 ? 0 : 1)
     }
 }

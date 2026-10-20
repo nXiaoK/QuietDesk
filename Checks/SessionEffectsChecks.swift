@@ -55,6 +55,41 @@ func runSessionEffectsChecks() {
                   "Legacy wire values changed")
     }
 
+    run("Session effect memory keeps confirmed toggles and forgets switched-off or failed ones") {
+        var memory = SessionEffectsMemory()
+        try check(memory.connectionState == nil, "Empty memory requested effects on connect")
+        let privacyOn = SessionEffectsRequest(state: .init(privacy: true))
+        memory.requested(privacyOn, from: .init())
+        memory.confirmed(SessionEffectsResult(state: .init(privacy: true)))
+        memory.confirmed(SessionEffectsResult(id: UUID(), state: .init(privacy: true)))
+        try check(memory.connectionState == nil, "An unconfirmed toggle or unrelated reply was remembered")
+        memory.confirmed(SessionEffectsResult(id: privacyOn.id, state: .init(privacy: true)))
+        try check(memory.connectionState == .init(privacy: true), "Confirmed privacy was not remembered")
+
+        let failedMute = SessionEffectsRequest(state: .init(muted: true, privacy: true))
+        memory.requested(failedMute, from: .init(privacy: true))
+        memory.confirmed(SessionEffectsResult(id: failedMute.id, state: .init(privacy: true), error: "fake unsupported output"))
+        try check(memory.remembered == .init(privacy: true), "A failed mute was remembered or privacy was dropped")
+        let mute = SessionEffectsRequest(state: .init(muted: true, privacy: true))
+        memory.requested(mute, from: .init(privacy: true))
+        memory.confirmed(SessionEffectsResult(id: mute.id, state: .init(muted: true, privacy: true)))
+        try check(memory.connectionState == .init(muted: true, privacy: true), "Both confirmed effects were not remembered")
+
+        let privacyOff = SessionEffectsRequest(state: .init())
+        memory.requested(privacyOff, from: .init(privacy: true))
+        try check(memory.remembered == .init(muted: true), "Switching privacy off was not forgotten at once or changed mute")
+        memory.cancel()
+        memory.confirmed(SessionEffectsResult(id: privacyOff.id, state: .init(privacy: true)))
+        try check(memory.remembered == .init(muted: true), "A late reply to a cancelled toggle changed the memory")
+        let muteOff = SessionEffectsRequest(state: .init())
+        memory.requested(muteOff, from: .init(muted: true))
+        memory.confirmed(SessionEffectsResult(id: muteOff.id, state: .init(muted: true), error: "fake restore failure"))
+        try check(memory.connectionState == nil, "A failed restore brought back the switched-off mute")
+
+        let saved = try JSONDecoder().decode(SessionEffectsState.self, from: JSONEncoder().encode(SessionEffectsState(privacy: true)))
+        try check(SessionEffectsMemory(remembered: saved).connectionState == .init(privacy: true), "Saved memory did not restore")
+    }
+
     run("Mute preparation deduplicates output routes and does not modify any device") {
         let io = FakeSessionMuteIO()
         let prepared = try SessionMuteTransaction.prepare(using: io)

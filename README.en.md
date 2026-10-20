@@ -26,7 +26,7 @@ A native macOS remote desktop app for your own Macs. Connect directly over a LAN
 | Background sharing | Launch after login, share in the background, and recover from display changes |
 | In-app updates | When a signed feed is configured: check, download and verify, then confirm installation and restart |
 | Endpoint traffic | Persistent sent/received totals by hostname/IP and port |
-| Session controls | Remote mute and a black-screen overlay on the host Mac, both off by default |
+| Session controls | Remote mute and a black-screen overlay on the host Mac, off by default; once switched on they are remembered and reapplied on new connections |
 
 <details>
 <summary>More feature screenshots</summary>

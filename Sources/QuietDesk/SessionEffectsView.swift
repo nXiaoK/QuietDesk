@@ -7,8 +7,8 @@ struct SessionEffectsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("被控端设置").font(.title3.weight(.semibold))
-            Text("仅本次连接，断开后恢复；新连接默认关闭。")
-                .font(.caption).foregroundStyle(.secondary)
+            Text("开启成功后会记住，之后每次连接自动开启；关闭开关即不再自动开启。断开时被控端恢复原状。")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Toggle("被控端静音", isOn: Binding(get: { model.sessionEffects.muted }, set: model.setRemoteMuted))
                 .disabled(!model.connected || !model.supportsSessionEffects || model.sessionEffectsWorking)
             Toggle("防窥 · 本地显示黑屏遮罩", isOn: Binding(get: { model.sessionEffects.privacy }, set: model.setRemotePrivacy))
@@ -17,6 +17,11 @@ struct SessionEffectsView: View {
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Text("防窥会从远端画面排除 QuietDesk 自身窗口，处理被控端的文件确认或权限设置前请先关闭。静音恢复原输出设备状态；设备不支持系统静音时会说明原因。")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let remembered = model.sessionEffectsMemory.connectionState {
+                Text("新连接将自动开启：" + [remembered.muted ? "被控端静音" : nil, remembered.privacy ? "防窥" : nil]
+                    .compactMap { $0 }.joined(separator: "、"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if !model.connected {
                 Text("连接后可使用。").font(.caption).foregroundStyle(.secondary)
             } else if !model.supportsSessionEffects {

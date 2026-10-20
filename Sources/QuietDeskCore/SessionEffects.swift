@@ -23,6 +23,38 @@ public struct SessionEffectsResult: Codable, Sendable {
     }
 }
 
+/// Viewer-side memory of the effects the user switched on, requested again when each new connection is ready.
+/// Switching an effect off is remembered at once, so a lost reply cannot bring it back on the next connection.
+/// Switching one on is remembered as the host actually applied it, so a failed attempt is not repeated.
+public struct SessionEffectsMemory: Sendable {
+    public private(set) var remembered: SessionEffectsState
+    private var pending: (id: UUID, muted: Bool, privacy: Bool)?
+
+    public init(remembered: SessionEffectsState = SessionEffectsState()) { self.remembered = remembered }
+
+    /// The state a new connection requests, or nil when nothing is remembered.
+    public var connectionState: SessionEffectsState? { remembered == SessionEffectsState() ? nil : remembered }
+
+    /// Records a user toggle that changes `current` into `request.state`.
+    public mutating func requested(_ request: SessionEffectsRequest, from current: SessionEffectsState) {
+        let mutedToggled = request.state.muted != current.muted, privacyToggled = request.state.privacy != current.privacy
+        remembered = SessionEffectsState(muted: remembered.muted && !(mutedToggled && !request.state.muted),
+                                         privacy: remembered.privacy && !(privacyToggled && !request.state.privacy))
+        pending = (request.id, mutedToggled && request.state.muted, privacyToggled && request.state.privacy)
+    }
+
+    /// Applies the host's reply to the recorded toggle; replies to other requests leave the memory unchanged.
+    public mutating func confirmed(_ result: SessionEffectsResult) {
+        guard let pending, result.id == pending.id else { return }
+        self.pending = nil
+        remembered = SessionEffectsState(muted: pending.muted ? result.state.muted : remembered.muted,
+                                         privacy: pending.privacy ? result.state.privacy : remembered.privacy)
+    }
+
+    /// Drops a recorded toggle whose reply can no longer arrive.
+    public mutating func cancel() { pending = nil }
+}
+
 public struct SessionMuteSnapshot: Codable, Equatable, Sendable {
     public let deviceUID: String
     public let originallyMuted: Bool

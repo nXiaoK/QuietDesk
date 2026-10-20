@@ -85,6 +85,13 @@ final class DeskModel: ObservableObject {
     @Published private(set) var sessionEffects = SessionEffectsState()
     @Published private(set) var sessionEffectsWorking = false
     @Published private(set) var sessionEffectsStatus = ""
+    @Published private(set) var sessionEffectsMemory = SessionEffectsMemory() {
+        didSet {
+            guard sessionEffectsMemory.remembered != oldValue.remembered,
+                  let data = try? JSONEncoder().encode(sessionEffectsMemory.remembered) else { return }
+            UserDefaults.standard.set(data, forKey: "rememberedSessionEffects")
+        }
+    }
     private var supportsSessionPause = false
     @Published private(set) var sessionPaused = false
     @Published private(set) var sessionPauseWorking = false
@@ -198,6 +205,10 @@ final class DeskModel: ObservableObject {
            let saved = try? JSONDecoder().decode(StreamSettings.self, from: data),
            (try? saved.validateControlValues()) != nil { settings = saved }
         if let id = UserDefaults.standard.object(forKey: "sharedDisplay") as? Int { preferredDisplayID = CGDirectDisplayID(clamping: id) }
+        if let data = UserDefaults.standard.data(forKey: "rememberedSessionEffects"),
+           let saved = try? JSONDecoder().decode(SessionEffectsState.self, from: data) {
+            sessionEffectsMemory = SessionEffectsMemory(remembered: saved)
+        }
         displayID = preferredDisplayID
         refreshDisplays()
         screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
@@ -1728,6 +1739,10 @@ final class DeskModel: ObservableObject {
             publishSessionPause()
             sendNextSessionPause()
             if let token = pauseTransmission.freshFrameToken { scheduleFreshFrameTimeout(token, peer: peer) }
+            // Sent after the cursor request so the host applies it once cursor capture has settled.
+            if supportsSessionEffects, let remembered = sessionEffectsMemory.connectionState {
+                requestSessionEffects(remembered, automatic: true)
+            }
         case .sessionPauseResult:
             guard viewerSession.helloReceived, supportsSessionPause else { throw DeskError.invalid("当前连接未启用空闲暂停") }
             let result = try Wire.readJSON(SessionPauseResult.self, message.payload)
@@ -1756,6 +1771,7 @@ final class DeskModel: ObservableObject {
             DiagnosticLog.shared.record(.sessionEffectsChanged, role: .viewer, state: result.error == nil ? .succeeded : .failed)
             sessionEffectsStatus = result.error ?? "被控端设置已生效"
             if result.id != nil {
+                sessionEffectsMemory.confirmed(result)
                 viewerSession.effectsRequestTimeout?.cancel()
                 viewerSession.effectsRequestID = nil
                 sessionEffectsWorking = false
@@ -1869,15 +1885,19 @@ final class DeskModel: ObservableObject {
         requestSessionEffects(SessionEffectsState(muted: sessionEffects.muted, privacy: enabled))
     }
 
-    private func requestSessionEffects(_ desired: SessionEffectsState) {
+    private func requestSessionEffects(_ desired: SessionEffectsState, automatic: Bool = false) {
         guard connected, supportsSessionEffects, !sessionEffectsWorking, let peer else { return }
         let viewer = viewerSession
         let request = SessionEffectsRequest(state: desired)
         viewerSession.effectsRequestID = request.id
+        if !automatic { sessionEffectsMemory.requested(request, from: sessionEffects) }
         sessionEffectsWorking = true
-        sessionEffectsStatus = "正在应用被控端设置…"
+        sessionEffectsStatus = automatic ? "正在开启已记住的被控端设置…" : "正在应用被控端设置…"
         do { peer.send(try Wire.json(.sessionEffectsRequest, request)) }
-        catch { sessionEffectsWorking = false; viewerSession.effectsRequestID = nil; sessionEffectsStatus = error.localizedDescription; return }
+        catch {
+            sessionEffectsWorking = false; viewerSession.effectsRequestID = nil; sessionEffectsMemory.cancel()
+            sessionEffectsStatus = error.localizedDescription; return
+        }
         viewerSession.effectsRequestTimeout?.cancel()
         viewer.effectsRequestTimeout = Task { [weak self, weak peer, weak viewer] in
             do { try await Task.sleep(for: .seconds(15)) } catch { return }
@@ -2605,6 +2625,7 @@ final class DeskModel: ObservableObject {
         supportsSessionEffects = false
         sessionEffects = SessionEffectsState()
         sessionEffectsStatus = ""
+        sessionEffectsMemory.cancel()
         flushTrafficHistory()
         trafficSession = nil
         trafficHistoryStatus = "按网址/IP＋端口累计；旧版按设备统计单独保留。"

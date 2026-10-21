@@ -34,6 +34,8 @@ final class DeskModel: ObservableObject {
     @Published var active = false
     @Published var working = false
     @Published var connected = false
+    /// When the current viewer connection received the host's hello; an automatic reconnect starts a new one.
+    @Published private(set) var connectedSince: Date?
     @Published var controlling = false
     @Published var status = "准备就绪"
     @Published var error: String?
@@ -1773,6 +1775,7 @@ final class DeskModel: ObservableObject {
             if viewerSession.usesRelayControl { relayFallbackAttempted = false; relayFallbackCooldown.reset() }
             dataChannel?.configureVideo(canvas.makeVideoReceiver(diagnostics: performanceDiagnostics))
             connected = true
+            connectedSince = Date()
             working = false
             remoteName = hello.name
             reconnecting = false
@@ -2798,6 +2801,7 @@ final class DeskModel: ObservableObject {
         clipboardSession = nil
         peer = nil
         connected = false
+        connectedSince = nil
         working = false
         controlling = false
         canControl = false

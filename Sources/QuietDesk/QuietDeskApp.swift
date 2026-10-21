@@ -384,6 +384,9 @@ struct DeskView: View {
 
     @ViewBuilder private var metrics: some View {
         if model.connected {
+            if let since = model.connectedSince {
+                Text("已连接 \(Text(since, style: .timer))").help("本次连接已持续的时间；断线自动重连后重新计时")
+            }
             if !model.resolution.isEmpty { Text(model.resolution) }
             Text(model.mediaTransportStatus)
             Text(model.latency).help("控制通道往返延迟（RTT），约每 5 秒更新；不代表画面上屏延迟")

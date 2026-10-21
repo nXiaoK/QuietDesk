@@ -85,4 +85,34 @@ func runRelayProtocolChecks() {
         cooldown.reset()
         try check(cooldown.allows(now: 0) && cooldown.failures == 0, "A successful relay session did not clear the cooldown")
     }
+    run("A taken loopback UDP number moves the viewer bridge to a fresh TCP/UDP pair instead of dropping relay UDP") {
+        func bindUDP(_ port: UInt16) -> (Int32, UInt16)? {
+            let socket = Darwin.socket(AF_INET, SOCK_DGRAM, 0)
+            guard socket >= 0 else { return nil }
+            var address = sockaddr_in(); address.sin_family = sa_family_t(AF_INET)
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_port = port.bigEndian; address.sin_addr.s_addr = inet_addr("127.0.0.1")
+            var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let bound = withUnsafeMutablePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.bind(socket, $0, length) == 0 && getsockname(socket, $0, &length) == 0
+                }
+            }
+            guard bound else { close(socket); return nil }
+            return (socket, UInt16(bigEndian: address.sin_port))
+        }
+        guard let (squatter, taken) = bindUDP(0) else { throw CheckFailure("Could not reserve a loopback UDP port") }
+        defer { close(squatter) }
+        let bridge = try RelayViewerBridge(endpoint: RelayEndpoint(address: "tls://127.0.0.1:9"), accessKey: Data(count: 32),
+                                           deviceID: UUID(), preferredLoopbackPort: taken)
+        let published = Box<UInt16?>(nil), ready = DispatchSemaphore(value: 0)
+        bridge.onReady = { published.set($0); ready.signal() }
+        bridge.onClose = { _ in ready.signal() }
+        bridge.start()
+        defer { bridge.stop() }
+        try wait(ready, seconds: 5, "The bridge did not publish a loopback port")
+        guard let port = published.read() else { throw CheckFailure("The bridge closed instead of choosing another port") }
+        try check(port != taken, "The bridge published a port whose UDP number another socket holds")
+        if let (probe, _) = bindUDP(port) { close(probe); throw CheckFailure("The published port has no relay UDP listener") }
+    }
 }

@@ -12,6 +12,8 @@ public final class RelayViewerBridge: @unchecked Sendable {
     private let authorities: [Data]
     private let trustedCertificate: RelayNodeCertificate?
     private let udpEnabled: Bool
+    private let preferredLoopbackPort: UInt16?
+    private var bindAttempts = 0
     private let queue = DispatchQueue(label: "quietdesk.relay-viewer", qos: .userInteractive)
     private var listener: NWListener?
     private var udpListener: NWListener?
@@ -35,37 +37,45 @@ public final class RelayViewerBridge: @unchecked Sendable {
     public var lastFailure: Error? { failureLock.withLock { failure } }
     public var failedBeforeDesktopStream: Bool { failureLock.withLock { serviceSetupFailure } }
 
+    /// `preferredLoopbackPort` only chooses the first loopback port tried; a taken UDP number still moves to a free pair.
     public init(endpoint: RelayEndpoint, accessKey: Data, deviceID: UUID, udpEnabled: Bool = true,
-                certificateAuthorities: [Data] = [], trustedCertificate: RelayNodeCertificate? = nil) throws {
+                certificateAuthorities: [Data] = [], trustedCertificate: RelayNodeCertificate? = nil,
+                preferredLoopbackPort: UInt16? = nil) throws {
         guard accessKey.count == 32 else { throw RelayServiceError.invalid }
         self.endpoint = endpoint; self.accessKey = accessKey; self.deviceID = deviceID
         self.udpEnabled = udpEnabled; authorities = certificateAuthorities
-        self.trustedCertificate = trustedCertificate
+        self.trustedCertificate = trustedCertificate; self.preferredLoopbackPort = preferredLoopbackPort
     }
 
     public func start() {
         queue.async { [self] in
             guard !started, !stopped else { return }; started = true
-            do {
-                let tcp = NWProtocolTCP.Options(); tcp.noDelay = true; tcp.disableAckStretching = true
-                let parameters = NWParameters(tls: nil, tcp: tcp)
-                parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
-                let listener = try NWListener(using: parameters)
-                self.listener = listener
-                listener.newConnectionHandler = { [weak self] connection in self?.acceptTCP(connection) }
-                listener.stateUpdateHandler = { [weak self] state in
-                    guard let self, !self.stopped else { return }
-                    switch state {
-                    case .ready:
-                        guard let port = self.listener?.port else { self.fail(RelayTransportError.network); return }
-                        if self.udpEnabled { self.startUDPListener(port: port) } else { self.publish(port.rawValue) }
-                    case .failed, .cancelled: self.fail(RelayTransportError.network)
-                    default: break
-                    }
-                }
-                listener.start(queue: queue)
-            } catch { fail(RelayTransportError.network) }
+            startTCPListener()
         }
+    }
+
+    private func startTCPListener() {
+        bindAttempts += 1
+        do {
+            let tcp = NWProtocolTCP.Options(); tcp.noDelay = true; tcp.disableAckStretching = true
+            let parameters = NWParameters(tls: nil, tcp: tcp)
+            let preferred = bindAttempts == 1 ? preferredLoopbackPort.flatMap { NWEndpoint.Port(rawValue: $0) } : nil
+            parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: preferred ?? .any)
+            let listener = try NWListener(using: parameters)
+            self.listener = listener
+            listener.newConnectionHandler = { [weak self] connection in self?.acceptTCP(connection) }
+            listener.stateUpdateHandler = { [weak self, weak listener] state in
+                guard let self, let listener, self.listener === listener, !self.stopped else { return }
+                switch state {
+                case .ready:
+                    guard let port = listener.port else { self.fail(RelayTransportError.network); return }
+                    if self.udpEnabled { self.startUDPListener(port: port) } else { self.publish(port.rawValue) }
+                case .failed, .cancelled: self.fail(RelayTransportError.network)
+                default: break
+                }
+            }
+            listener.start(queue: queue)
+        } catch { fail(RelayTransportError.network) }
     }
 
     private func startUDPListener(port: NWEndpoint.Port) {
@@ -78,17 +88,26 @@ public final class RelayViewerBridge: @unchecked Sendable {
                 guard let self, !self.stopped else { connection.cancel(); return }
                 self.acceptUDP(connection)
             }
-            listener.stateUpdateHandler = { [weak self] state in
-                guard let self, !self.stopped else { return }
+            listener.stateUpdateHandler = { [weak self, weak listener] state in
+                guard let self, let listener, self.udpListener === listener, !self.stopped else { return }
                 switch state {
                 case .ready: self.publish(port.rawValue)
-                case .failed:
-                    self.udpListener?.cancel(); self.udpListener = nil; self.publish(port.rawValue)
+                case .failed: self.udpBindFailed(port)
                 default: break
                 }
             }
             listener.start(queue: queue)
-        } catch { publish(port.rawValue) }
+        } catch { udpBindFailed(port) }
+    }
+
+    // The desktop session dials one port number for TCP and UDP. When another socket holds the UDP
+    // number, move both listeners to a fresh pair instead of silently leaving relay video on TCP.
+    private func udpBindFailed(_ port: NWEndpoint.Port) {
+        udpListener?.stateUpdateHandler = nil; udpListener?.cancel(); udpListener = nil
+        guard !published else { return }
+        guard bindAttempts < 4 else { publish(port.rawValue); return }
+        listener?.stateUpdateHandler = nil; listener?.newConnectionHandler = nil; listener?.cancel(); listener = nil
+        startTCPListener()
     }
 
     private func publish(_ port: UInt16) {

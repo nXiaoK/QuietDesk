@@ -41,6 +41,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     let diagnostics = inspectDiagnostics ? PerformanceDiagnostics(enabled:true) : nil
     let sampledCompute = DispatchSemaphore(value:0)
     let reductions=Box<[MediaBottleneck]>([])
+    let pathSwitches=Box<[(String,MediaSwitchCause)]>([])
     let overlapSent=Box(false)
     let cursorID = UUID()
     let streamPreparations = Box<[MediaStreamID]>([]), streamBindings = Box<[MediaStreamID]>([])
@@ -110,6 +111,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             viewerSession.update{$0=session}
             session.diagnostics=diagnostics
             session.onReduceLoad={ cause in reductions.update{$0.append(cause)} }
+            session.onPathSwitch={ label,cause in pathSwitches.update{$0.append((label,cause))} }
             session.onSample={ sample in if (sample.encodeMilliseconds ?? 0)>=45 && (sample.decodeMilliseconds ?? 0)>=2 { sampledCompute.signal() } }
             session.onVideo={ frame,complete in
                 decoded.update{$0.append(frame.header.frameID)}
@@ -206,6 +208,8 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     Thread.sleep(forTimeInterval:0.1)
     let expected = udp ? "UDP 视频" : auxiliary ? "TCP 视频" : "TCP 兼容模式"
     try require(states.get().contains(expected),"wrong selected path \(states.get())")
+    let firstCause: MediaSwitchCause = udp ? .policy(.initialProbe) : .initial
+    try require(pathSwitches.get().contains{ $0.0 == expected && $0.1 == firstCause },"Initial path switch did not report its cause \(pathSwitches.get())")
     try require(!decoded.get().isEmpty,"No decoded media frame")
     if delayedDecode {
         try wait(delayedFrameDone, "A delayed complete frame did not finish decoding")
@@ -223,6 +227,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
         Thread.sleep(forTimeInterval: 0.2)
         try require(committedCount.get() == 2 && states.get().last == expected,
                     "Stall recovery or a late decode caused repeated stream commits")
+        try require(pathSwitches.get().count == 1, "A same-path recovery was reported as a route change \(pathSwitches.get())")
     }
     if prepareHook == .boundStream {
         try require(prepared.get() == 0 && streamPreparations.get().count == 1,
@@ -256,11 +261,13 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
         try wait(committed,"UDP path failure did not commit TCP",seconds:4)
         try wait(pathStable,"Fallback path state was not published")
         try require(states.get().last=="TCP 视频","UDP path failure selected the wrong fallback")
+        try require(pathSwitches.get().last?.0=="TCP 视频","UDP fallback did not report its route change \(pathSwitches.get())")
         if restoreUDP {
             let fallbackTime=SessionClock.now
             try wait(committed,"Healthy UDP did not recover after cooldown",seconds:37)
             try wait(pathStable,"Recovered UDP state was not published")
             try require(states.get().last=="UDP 视频","Recovered path was not UDP")
+            try require(pathSwitches.get().last.map{ $0.0=="UDP 视频" && $0.1 == .policy(.recoveryProbe) } == true,"UDP recovery did not report its probe cause \(pathSwitches.get())")
             try require(SessionClock.now-fallbackTime>=29,"UDP recovery ignored its cooldown")
         }
     }

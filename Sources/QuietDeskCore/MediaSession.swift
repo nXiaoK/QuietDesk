@@ -46,6 +46,8 @@ public final class MediaSession: @unchecked Sendable {
     public var onResumeFrames: (() -> Void)?
     public var onAcknowledged: ((UInt32) -> Void)?
     public var onState: ((String) -> Void)?
+    // Viewer only, on the media queue: a new transaction moves video to another path (labels match onState).
+    public var onPathSwitch: ((String, MediaSwitchCause) -> Void)?
     public var onBytes: ((Int) -> Void)?
     public var onFrameSent: (() -> Void)?
     public var onReliableData: ((Message) -> Void)?
@@ -668,7 +670,7 @@ public final class MediaSession: @unchecked Sendable {
                 if self.videoPeer === peer {
                     self.videoPeer = nil; self.videoBound = false
                     if self.side == .viewer, self.active?.path == .tcp || self.transaction?.path == .tcp {
-                        self.abortTransaction(retry: false); self.beginSwitch(.shared)
+                        self.abortTransaction(retry: false); self.beginSwitch(.shared, cause: .auxiliaryClosed)
                     } else if self.side == .host { self.requestRecovery() }
                 }
                 if self.bulkPeer === peer { self.bulkPeer = nil; self.bulkBound = false }
@@ -824,7 +826,7 @@ public final class MediaSession: @unchecked Sendable {
         }
     }
 
-    private func beginSwitch(_ path: Path) {
+    private func beginSwitch(_ path: Path, cause: MediaSwitchCause) {
         guard side == .viewer, !stopped, !paused, !configurationSuspended, negotiated,
               transaction == nil, let sessionID else { return }
         guard transportEpoch < UInt32.max, codecEpoch < UInt32.max else {
@@ -837,6 +839,8 @@ public final class MediaSession: @unchecked Sendable {
             transportEpoch: transportEpoch, codecEpoch: codecEpoch), path: path, started: SessionClock.now)
         pending.diagnostic = diagnostics?.start()
         transaction = pending
+        // Same-path recoveries are counted by diagnostics; only route changes are reported with a cause.
+        if active?.path != path { onPathSwitch?(stateLabel(path), cause) }
         onState?(active == nil ? "正在准备视频" : "正在恢复画面")
         sendTransaction(.prepare, pending)
     }
@@ -1007,7 +1011,7 @@ public final class MediaSession: @unchecked Sendable {
                 return
             }
             let path: Path = active?.path == .udp && udpVerified ? .udp : videoBound ? .tcp : .shared
-            beginSwitch(path)
+            beginSwitch(path, cause: .recovery)
         } else if let active {
             sendControl(MediaControl(.recover, sessionID: active.stream.sessionID,
                 transportEpoch: active.stream.transportEpoch, codecEpoch: active.stream.codecEpoch,
@@ -1151,9 +1155,9 @@ public final class MediaSession: @unchecked Sendable {
                     }
                     retryAt = 0
                     let retry = retryPath; retryPath = nil
-                    beginSwitch(retry == .udp && udpVerified ? .udp : videoBound ? .tcp : .shared)
+                    beginSwitch(retry == .udp && udpVerified ? .udp : videoBound ? .tcp : .shared, cause: .retry)
                 } else if active == nil, (videoBound && !udpAvailable || now >= fallbackAt), policy.probeID == nil {
-                    beginSwitch(videoBound ? .tcp : .shared)
+                    beginSwitch(videoBound ? .tcp : .shared, cause: .initial)
                 }
             }
             handleReceiveEvents(receiver?.poll() ?? [])
@@ -1197,7 +1201,7 @@ public final class MediaSession: @unchecked Sendable {
             case .selectPath(let path, _, let reason):
                 if path == .tcp, reason == .noPong { retireDatagramPath() }
                 if transaction != nil { abortTransaction(retry: false) }
-                beginSwitch(path == .udp ? .udp : videoBound ? .tcp : .shared)
+                beginSwitch(path == .udp ? .udp : videoBound ? .tcp : .shared, cause: .policy(reason))
             case .reduceLoad(let bottleneck): onReduceLoad?(bottleneck)
             case .restartSession: control.close("媒体传输代次已耗尽，请重新连接", retryable: true)
             }

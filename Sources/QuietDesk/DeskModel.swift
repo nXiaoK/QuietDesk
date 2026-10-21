@@ -1147,6 +1147,12 @@ final class DeskModel: ObservableObject {
                 self.recordMediaRoute(value, role: .viewer, relayed: viewer.usesRelayControl)
             }
         }
+        media.onPathSwitch = { [weak self, weak viewer] value, cause in
+            DispatchQueue.main.async {
+                guard let self, let viewer, self.viewerSession === viewer else { return }
+                self.recordMediaPathSwitch(value, cause: cause, relayed: viewer.usesRelayControl)
+            }
+        }
         media.onReduceLoad = { [weak self, weak viewer] cause in
             DispatchQueue.main.async {
                 guard let self, let viewer, self.viewerSession === viewer,
@@ -1223,12 +1229,21 @@ final class DeskModel: ObservableObject {
         }
     }
 
+    private static func mediaPathCode(_ value: String) -> Int? {
+        switch value { case "UDP 视频", "中继 UDP 视频": return 1; case "TCP 视频": return 2; case "TCP 兼容模式": return 3; default: return nil }
+    }
+
     private func recordMediaRoute(_ value: String, role: DiagnosticLog.Role, relayed: Bool) {
-        guard relayEnabled else { return }
-        let path: Int
-        switch value { case "UDP 视频", "中继 UDP 视频": path = 1; case "TCP 视频": path = 2; case "TCP 兼容模式": path = 3; default: return }
+        guard relayEnabled, let path = Self.mediaPathCode(value) else { return }
         DiagnosticLog.shared.record(.mediaRouteChanged, role: role, state: .ready,
                                     values: [.relayControl: relayed ? 1 : 0, .relayVideo: relayed || value == "中继 UDP 视频" ? 1 : 0, .videoPath: path])
+    }
+
+    // Route changes are rare; their cause explains UDP/TCP alternation that route snapshots alone cannot.
+    private func recordMediaPathSwitch(_ value: String, cause: MediaSwitchCause, relayed: Bool) {
+        guard let path = Self.mediaPathCode(value) else { return }
+        DiagnosticLog.shared.record(.mediaPathSwitch, role: .viewer, state: .requested,
+                                    values: [.relayControl: relayed ? 1 : 0, .videoPath: path, .switchCause: cause.diagnosticCode])
     }
 
     private func applyAutomaticMediaSettings(_ settings: StreamSettings) {

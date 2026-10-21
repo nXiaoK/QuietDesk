@@ -348,6 +348,14 @@ func runMediaPathPolicyChecks() {
         for time in 52...70 { try check(quality.observe(sample(), now: Double(time)) == nil, "Automatic quality exceeded manual choice") }
     }
 
+    run("Media path switch causes keep unique, stable diagnostic codes") {
+        let reasons: [MediaPathReason] = [.initialProbe, .recoveryProbe, .probeTimeout, .probeFailed,
+                                          .noPong, .mediaTimeout, .networkDegraded, .epochExhausted]
+        let causes: [MediaSwitchCause] = [.initial, .recovery, .retry, .auxiliaryClosed] + reasons.map { .policy($0) }
+        try check(causes.map(\.diagnosticCode) == [1, 2, 3, 4, 10, 11, 12, 13, 14, 15, 16, 17],
+                  "Logged path switch codes changed meaning")
+    }
+
     run("Compute pressure uses window means, so decode bursts or one slow keyframe keep the current quality") {
         // Three frames queued behind each other twice, then one slow keyframe: the maximum exceeds a 60 fps budget.
         var burst = MediaComputeTiming()

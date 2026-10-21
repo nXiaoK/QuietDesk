@@ -14,6 +14,32 @@ public enum MediaPathReason: String, Sendable {
     case initialProbe, recoveryProbe, probeTimeout, probeFailed, noPong, mediaTimeout, networkDegraded, epochExhausted
 }
 
+// Why the viewer moved video to another path. Diagnostic logs keep only the stable numeric code.
+public enum MediaSwitchCause: Equatable, Sendable {
+    case initial, recovery, retry, auxiliaryClosed
+    case policy(MediaPathReason)
+
+    public var diagnosticCode: Int {
+        switch self {
+        case .initial: return 1
+        case .recovery: return 2
+        case .retry: return 3
+        case .auxiliaryClosed: return 4
+        case .policy(let reason):
+            switch reason {
+            case .initialProbe: return 10
+            case .recoveryProbe: return 11
+            case .probeTimeout: return 12
+            case .probeFailed: return 13
+            case .noPong: return 14
+            case .mediaTimeout: return 15
+            case .networkDegraded: return 16
+            case .epochExhausted: return 17
+            }
+        }
+    }
+}
+
 public enum MediaPathAction: Equatable, Sendable {
     case beginProbe(id: UUID, timeout: TimeInterval)
     case cancelProbe(id: UUID)

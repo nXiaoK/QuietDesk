@@ -348,6 +348,58 @@ func runMediaPathPolicyChecks() {
         for time in 52...70 { try check(quality.observe(sample(), now: Double(time)) == nil, "Automatic quality exceeded manual choice") }
     }
 
+    run("Quality upgrades that fail soon after applying back off exponentially until one proves stable") {
+        let ceiling = StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 30)
+        let reduced = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 30)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, applied: reduced, now: 0)
+        var time = 0.0
+        // Healthy one-second windows until the next level is applied; returns the healthy time it needed.
+        func upgrade() throws -> Double {
+            let started = time
+            while time - started < 400 {
+                time += 1
+                if let next = quality.observe(sample(), now: time) {
+                    try check(next == ceiling && quality.confirmApplied(next, now: time), "Upgrade was not applied")
+                    return time - started
+                }
+            }
+            throw CheckFailure("No upgrade within 400 seconds")
+        }
+        func overload() throws {
+            let before = quality.effective
+            for _ in 0..<10 {
+                time += 1
+                if let next = quality.observe(sample(encode: 20), now: time) {
+                    try check(next.longestEdge < before.longestEdge && quality.confirmApplied(next, now: time),
+                              "Encoder pressure did not reduce pixels")
+                    return
+                }
+            }
+            throw CheckFailure("Encoder pressure did not reduce quality")
+        }
+        // The logged pattern: each 2560 upgrade overloads within seconds and returns to 1920.
+        var holds: [Double] = []
+        for _ in 0..<7 { holds.append(try upgrade()); try overload() }
+        try check(holds == [10, 20, 40, 80, 160, 300, 300], "Failed upgrades did not back off exponentially: \(holds)")
+        try check(try upgrade() == 300, "Backoff did not stay at its maximum")
+        for _ in 0..<30 { time += 1; try check(quality.observe(sample(), now: time) == nil, "Quality exceeded its ceiling") }
+        try check(quality.upgradeHold == MediaQualityPolicy.initialUpgradeHold, "An upgrade that survived probation kept the long hold")
+        try overload()
+        try check(try upgrade() == 10, "Pressure after a proven upgrade inherited the old backoff")
+        try overload(); _ = try upgrade(); try overload()
+        try check(quality.upgradeHold == 40, "Renewed failures did not back off again")
+        try check(try quality.chooseManually(ceiling, now: time) == ceiling && quality.confirmApplied(ceiling, now: time)
+                  && quality.upgradeHold == MediaQualityPolicy.initialUpgradeHold, "A manual choice kept the automatic backoff")
+        // A host-rejected upgrade never applied, so the next reduction is not counted as its failure.
+        try overload()
+        var proposal: StreamSettings?
+        for _ in 0..<20 where proposal == nil { time += 1; proposal = quality.observe(sample(), now: time) }
+        try check(proposal == ceiling, "Healthy windows did not propose an upgrade")
+        quality.rejectPending(now: time)
+        try overload()
+        try check(quality.upgradeHold == MediaQualityPolicy.initialUpgradeHold, "A rejected upgrade was counted as failed")
+    }
+
     run("Invalid measurements, rejected requests and suspension cannot accumulate quality changes") {
         var quality = try MediaQualityPolicy(hostDefault: .highest, now: 0)
         try check(quality.observe(sample(duration: 3, loss: .nan), now: 3) == nil, "NaN adapted quality")

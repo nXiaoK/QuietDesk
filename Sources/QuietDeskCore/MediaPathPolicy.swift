@@ -319,10 +319,17 @@ public struct MediaPathPolicy: Sendable {
 // Automatic recommendations change pending/effective settings, never the user's preferred ceiling.
 // The coordinator serializes requests and confirms only settings actually applied by the host.
 public struct MediaQualityPolicy: Sendable {
+    // An upgrade reduced again within the probation window failed; each failure doubles the healthy
+    // time needed before the next one, so an unsustainable level is not retried every few seconds.
+    public static let initialUpgradeHold: TimeInterval = 10
+    public static let maximumUpgradeHold: TimeInterval = 300
+    public static let upgradeProbation: TimeInterval = 30
+
     public private(set) var preferred: StreamSettings?
     public private(set) var upperBound: StreamSettings
     public private(set) var effective: StreamSettings
     public private(set) var pending: StreamSettings?
+    public private(set) var upgradeHold = MediaQualityPolicy.initialUpgradeHold
     private let sourceLongestEdge: Int?
     private var lastNow: TimeInterval
     private var lastObservationAt: TimeInterval
@@ -330,6 +337,8 @@ public struct MediaQualityPolicy: Sendable {
     private var badDuration: TimeInterval = 0
     private var healthyDuration: TimeInterval = 0
     private var lastBottleneck: MediaBottleneck?
+    private var pendingUpgrade = false
+    private var upgradedAt: TimeInterval?
 
     public init(hostDefault: StreamSettings, preferred: StreamSettings? = nil, applied: StreamSettings? = nil,
                 sourceLongestEdge: Int? = nil, now: TimeInterval) throws {
@@ -349,16 +358,19 @@ public struct MediaQualityPolicy: Sendable {
         guard accept(now) else { return nil }
         preferred = settings; upperBound = settings
         resetEvidence(); lastObservationAt = now; lastChangeAt = now
+        upgradeHold = Self.initialUpgradeHold; upgradedAt = nil
         pending = effective == settings ? nil : settings
+        pendingUpgrade = false
         return pending
     }
 
     public mutating func reduceLoad(for cause: MediaBottleneck, now: TimeInterval) -> StreamSettings? {
         guard accept(now), pending == nil, now - lastChangeAt + mediaPolicyTimeTolerance >= 3 else { return nil }
+        settleUpgrade(now: now)
         var next = StreamSettings(longestEdge: min(effective.longestEdge, upperBound.longestEdge),
                                   framesPerSecond: min(effective.framesPerSecond, upperBound.framesPerSecond),
                                   megabits: min(effective.megabits, upperBound.megabits))
-        if next != effective { return recommend(next, now: now) }
+        if next != effective { return recommendReduction(next, now: now) }
         let dimensions = cause == .network ? [0, 1, 2] : [1, 2, 0]
         for dimension in dimensions {
             switch dimension {
@@ -370,7 +382,7 @@ public struct MediaQualityPolicy: Sendable {
             default:
                 if let lower = StreamSettings.frameRates.last(where: { $0 < next.framesPerSecond }) { next.framesPerSecond = lower }
             }
-            if next != effective { return recommend(next, now: now) }
+            if next != effective { return recommendReduction(next, now: now) }
         }
         return nil
     }
@@ -379,6 +391,7 @@ public struct MediaQualityPolicy: Sendable {
     // it must not also submit the same bad window here as a second adaptation source.
     public mutating func observe(_ sample: MediaPathSample, now: TimeInterval) -> StreamSettings? {
         guard accept(now), sample.isValid else { return nil }
+        settleUpgrade(now: now)
         let elapsed = min(sample.duration, max(0, now - lastObservationAt))
         if now - lastObservationAt > sample.duration + 0.5 { resetEvidence() }
         lastObservationAt = now
@@ -394,7 +407,7 @@ public struct MediaQualityPolicy: Sendable {
         badDuration = 0; lastBottleneck = nil
         guard sample.hasNetworkEvidence, sample.decodedFrames > 0 else { healthyDuration = 0; return nil }
         healthyDuration += elapsed
-        guard healthyDuration + mediaPolicyTimeTolerance >= 10,
+        guard healthyDuration + mediaPolicyTimeTolerance >= upgradeHold,
               now - lastChangeAt + mediaPolicyTimeTolerance >= 3 else { return nil }
         var next = effective
         if next.framesPerSecond < upperBound.framesPerSecond {
@@ -404,13 +417,18 @@ public struct MediaQualityPolicy: Sendable {
         } else if next.megabits < upperBound.megabits {
             next.megabits = StreamSettings.bitRates.first(where: { $0 > next.megabits && $0 <= upperBound.megabits }) ?? next.megabits
         }
-        return next == effective ? nil : recommend(next, now: now)
+        guard next != effective else { return nil }
+        let recommended = recommend(next, now: now)
+        pendingUpgrade = true
+        return recommended
     }
 
     @discardableResult
     public mutating func confirmApplied(_ settings: StreamSettings, now: TimeInterval) -> Bool {
         guard accept(now), pending == settings else { return false }
         effective = settings; pending = nil; lastChangeAt = now; lastObservationAt = now
+        if pendingUpgrade { upgradedAt = now }
+        pendingUpgrade = false
         resetEvidence()
         return true
     }
@@ -419,14 +437,14 @@ public struct MediaQualityPolicy: Sendable {
         try settings.validateControlValues()
         guard accept(now) else { return }
         effective = settings
-        if pending == settings { pending = nil }
+        if pending == settings { pending = nil; pendingUpgrade = false }
         lastChangeAt = now; lastObservationAt = now
         resetEvidence()
     }
 
     public mutating func rejectPending(now: TimeInterval) {
         guard accept(now) else { return }
-        pending = nil; lastChangeAt = now; lastObservationAt = now
+        pending = nil; pendingUpgrade = false; lastChangeAt = now; lastObservationAt = now
         resetEvidence()
     }
 
@@ -442,8 +460,23 @@ public struct MediaQualityPolicy: Sendable {
     }
 
     private mutating func recommend(_ settings: StreamSettings, now: TimeInterval) -> StreamSettings {
-        pending = settings; lastChangeAt = now; resetEvidence()
+        pending = settings; pendingUpgrade = false; lastChangeAt = now; resetEvidence()
         return settings
+    }
+
+    private mutating func recommendReduction(_ settings: StreamSettings, now: TimeInterval) -> StreamSettings {
+        if upgradedAt != nil {
+            upgradeHold = min(Self.maximumUpgradeHold, upgradeHold * 2)
+            upgradedAt = nil
+        }
+        return recommend(settings, now: now)
+    }
+
+    // An applied upgrade that survives probation proves that level; later pressure starts from the short hold.
+    private mutating func settleUpgrade(now: TimeInterval) {
+        guard let upgradedAt, now - upgradedAt + mediaPolicyTimeTolerance >= Self.upgradeProbation else { return }
+        self.upgradedAt = nil
+        upgradeHold = Self.initialUpgradeHold
     }
 
     private mutating func resetEvidence() {

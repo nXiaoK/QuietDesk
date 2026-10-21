@@ -2083,7 +2083,7 @@ final class DeskModel: ObservableObject {
                     do {
                         await cursor?.value
                         guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
-                        try await streamer.setExcludesCurrentApplication(false)
+                        try await streamer.setExcludedWindows([])
                     }
                     catch {
                         guard self.generation == token, self.peer === peer, self.hostSession === host else { return }
@@ -2091,6 +2091,19 @@ final class DeskModel: ObservableObject {
                         peer.close("防窥已退出，但采集恢复失败，正在重建共享：\(error.localizedDescription)", retryable: true)
                     }
                 }
+            }
+        }
+        effects.onCoverWindowsChanged = { [weak self, weak peer, weak effects, weak host] windows in
+            guard let self, let peer, let effects, let host, self.peer === peer, self.hostSession === host,
+                  host.effects === effects, let streamer = host.streamer else { return }
+            let token = self.generation
+            let running = host.effectsTask
+            Task { [weak self, weak peer, weak host] in
+                await running?.value
+                guard let self, let peer, let host, self.generation == token, self.peer === peer,
+                      self.hostSession === host, effects.state.privacy, !Task.isCancelled else { return }
+                do { try await streamer.setExcludedWindows(windows) }
+                catch { self.sessionEffectsStatus = "显示器变化后未能更新防窥采集：\(error.localizedDescription)" }
             }
         }
     }
@@ -2114,11 +2127,11 @@ final class DeskModel: ObservableObject {
                 await capture?.value
                 await cursor?.value
                 try Task.checkCancellation()
-                _ = try await effects.apply(request.state) { try await streamer.setExcludesCurrentApplication(true) }
+                _ = try await effects.apply(request.state) { try await streamer.setExcludedWindows($0) }
             } catch { failure = error.localizedDescription }
             guard self.generation == token, self.peer === peer, self.hostSession === host, host.effects === effects, !Task.isCancelled else { return }
             if !effects.state.privacy {
-                do { try await streamer.setExcludesCurrentApplication(false) }
+                do { try await streamer.setExcludedWindows([]) }
                 catch { failure = failure ?? error.localizedDescription; filterRestoreFailed = true }
             }
             guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }

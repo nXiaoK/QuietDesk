@@ -17,7 +17,7 @@ struct SessionEffectsView: View {
                 .disabled(switchesDisabled)
             Text("黑屏期间远端仍可观看和操作。被控 Mac 可按 ⌃⌥Esc 退出遮罩；系统安全界面、Mission Control 等不在遮罩保证范围内。被控端的截图软件只能截到黑屏，截图请用“截取画面”或 ⌃⌘S。")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            Text("防窥会从远端画面排除 QuietDesk 自身窗口，处理被控端的文件确认或权限设置前请先关闭。静音恢复原输出设备状态；设备不支持系统静音时会说明原因。")
+            Text("防窥只从远端画面排除黑屏遮罩本身；被控端的 QuietDesk 窗口、菜单、文件确认和权限提示在远端仍可见、可操作。静音恢复原输出设备状态；设备不支持系统静音时会说明原因。")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Toggle("断开后立即锁定被控 Mac", isOn: Binding(get: { model.sessionEffects.lockOnDisconnect }, set: model.setRemoteLockOnDisconnect))
                 .disabled(switchesDisabled || !model.supportsSessionLock)

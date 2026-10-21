@@ -220,7 +220,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var encoderHardware: Bool?
     private var running = false
     private var captureStarted = false
-    private var excludesCurrentApplication = false
+    private var excludedWindowIDs = Set<CGWindowID>()
     private var reconfiguring = false
     private var sessionPaused = false
     private var cursorGate = CursorCaptureGate()
@@ -383,7 +383,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             encoderHardware = nil
             encoderID = id
             self.stream = stream
-            excludesCurrentApplication = false
+            excludedWindowIDs = []
             displayID = capture.displayID
             outputWidth = width
             outputHeight = height
@@ -696,7 +696,10 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
-    func setExcludesCurrentApplication(_ enabled: Bool) async throws {
+    /// Leaves exactly these windows (the privacy curtain) out of the capture; every other window,
+    /// QuietDesk's own included, stays visible to the viewer. An empty list captures everything.
+    func setExcludedWindows(_ windowIDs: [CGWindowID]) async throws {
+        let wanted = Set(windowIDs)
         let snapshot = try queue.sync { () throws -> (SCStream, CGDirectDisplayID)? in
             guard running, let stream, let displayID else { throw DeskError.invalid("屏幕采集尚未就绪") }
             if let operation = cursorOperationID { cancelCursorOperation(operation); throw DeskError.invalid("光标采集正在更新，请稍后调整防窥") }
@@ -704,27 +707,29 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 cancelCursorRequest(waiter.id)
                 throw DeskError.invalid("正在等待光标采集的新画面")
             }
-            guard excludesCurrentApplication != enabled else { return nil }
+            guard excludedWindowIDs != wanted else { return nil }
             return (stream, displayID)
         }
         guard let snapshot else { return }
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard let display = content.displays.first(where: { $0.displayID == snapshot.1 }) else {
-            throw DeskError.invalid("共享的显示器已变化，请等待重新连接")
+        var display: SCDisplay?
+        var excluded: [SCWindow] = []
+        // A window ordered in a moment ago can take a few frames to show up in shareable content.
+        for attempt in 0..<20 {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            display = content.displays.first(where: { $0.displayID == snapshot.1 })
+            excluded = content.windows.filter { wanted.contains($0.windowID) }
+            if excluded.count == wanted.count { break }
+            guard attempt < 19 else { throw DeskError.invalid("无法从采集中排除防窥遮罩，防窥未开启") }
+            try await Task.sleep(for: .milliseconds(50))
         }
-        let filter: SCContentFilter
-        if enabled {
-            guard let application = content.applications.first(where: { $0.processID == ProcessInfo.processInfo.processIdentifier }) else {
-                throw DeskError.invalid("无法从采集中排除本应用，防窥未开启")
-            }
-            filter = SCContentFilter(display: display, excludingApplications: [application], exceptingWindows: [])
-        } else { filter = SCContentFilter(display: display, excludingWindows: []) }
+        guard let display else { throw DeskError.invalid("共享的显示器已变化，请等待重新连接") }
+        let filter = SCContentFilter(display: display, excludingWindows: excluded)
         try Task.checkCancellation()
         try await snapshot.0.updateContentFilter(filter)
         try Task.checkCancellation()
         try queue.sync {
             guard running, stream === snapshot.0 else { throw CancellationError() }
-            excludesCurrentApplication = enabled
+            excludedWindowIDs = wanted
             frameFlow.requestKeyFrame()
         }
     }

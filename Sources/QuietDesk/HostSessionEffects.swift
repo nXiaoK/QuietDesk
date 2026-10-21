@@ -14,9 +14,17 @@ protocol SessionAudioControlling: AnyObject {
 
 @MainActor
 protocol SessionPrivacyCover: AnyObject {
+    /// True once the curtain is opaque; prepared covers are not yet a curtain.
     var isVisible: Bool { get }
+    /// Window-server numbers of the cover windows, so capture can leave out only these windows.
+    var windowIDs: [CGWindowID] { get }
     var onExit: (() -> Void)? { get set }
-    func show() throws
+    /// Covers were added or removed for a new screen arrangement while the curtain is up.
+    var onWindowsChanged: (([CGWindowID]) -> Void)? { get set }
+    /// Orders the covers in nearly transparent and returns their window numbers.
+    func prepare() throws -> [CGWindowID]
+    /// Makes prepared covers opaque, after capture has been told to leave them out.
+    func reveal()
     func hide()
 }
 
@@ -34,6 +42,8 @@ protocol SessionScreenLocking: AnyObject {
 final class HostSessionEffects {
     private(set) var state = SessionEffectsState()
     var onStateChange: ((SessionEffectsState, String?) -> Void)?
+    /// The curtain's windows changed while it is up; capture should leave out the new set.
+    var onCoverWindowsChanged: (([CGWindowID]) -> Void)?
     private var revision = UUID()
     private var applying = false
     private var resetsInProgress = 0
@@ -64,13 +74,15 @@ final class HostSessionEffects {
             self.state = self.actualState
             self.onStateChange?(self.state, "本机已退出防窥")
         }
+        privacy.onWindowsChanged = { [weak self] windows in self?.onCoverWindowsChanged?(windows) }
     }
 
     private var actualState: SessionEffectsState {
         SessionEffectsState(muted: audio.isMuted, privacy: privacy.isVisible, lockOnDisconnect: locksOnDisconnect)
     }
 
-    func apply(_ desired: SessionEffectsState, preparePrivacy: @MainActor () async throws -> Void) async throws -> SessionEffectsState {
+    /// `preparePrivacy` receives the cover windows that capture must leave out before they turn opaque.
+    func apply(_ desired: SessionEffectsState, preparePrivacy: @MainActor ([CGWindowID]) async throws -> Void) async throws -> SessionEffectsState {
         guard !applying, resetsInProgress == 0 else { throw DeskError.invalid("正在处理上一项会话操作，请稍后重试") }
         try Task.checkCancellation()
         applying = true
@@ -81,10 +93,17 @@ final class HostSessionEffects {
         if !desired.privacy { privacy.hide(); state = actualState }
         do {
             if desired.privacy, !state.privacy {
-                try await preparePrivacy()
-                try Task.checkCancellation()
-                guard revision == token else { throw CancellationError() }
-                try privacy.show()
+                let windows = try privacy.prepare()
+                do {
+                    try await preparePrivacy(windows)
+                    try Task.checkCancellation()
+                    guard revision == token else { throw CancellationError() }
+                } catch {
+                    // Covers that capture may still include must never turn opaque.
+                    privacy.hide()
+                    throw error
+                }
+                privacy.reveal()
                 state = actualState
             }
             if desired.muted != audio.isMuted {
@@ -211,9 +230,16 @@ private final class SystemScreenLock: SessionScreenLocking {
 
 @MainActor
 private final class SessionPrivacyWindows: SessionPrivacyCover {
+    // Barely visible, so the window server lists the cover before capture is told to leave it out.
+    private static let preparedAlpha: CGFloat = 0.01
     var onExit: (() -> Void)?
-    var isVisible: Bool { !windows.isEmpty }
-    private var windows: [NSWindow] = []
+    var onWindowsChanged: (([CGWindowID]) -> Void)?
+    var isVisible: Bool { revealed && !windows.isEmpty }
+    var windowIDs: [CGWindowID] { windows.values.map { CGWindowID($0.windowNumber) }.sorted() }
+    // One cover per display, kept across arrangement changes so the shared display's window ID stays put.
+    private var windows: [CGDirectDisplayID: NSWindow] = [:]
+    private var revealed = false
+    private var preparedIDs: [CGWindowID] = []
     private var hotKey: EventHotKeyRef?
     private var hotKeyHandler: EventHandlerRef?
     private var screenObserver: NSObjectProtocol?
@@ -222,17 +248,16 @@ private final class SessionPrivacyWindows: SessionPrivacyCover {
         screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
             object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    guard let self, self.isVisible else { return }
+                    guard let self, !self.windows.isEmpty else { return }
                     let screens = NSScreen.screens
                     guard !screens.isEmpty else { self.hide(); self.onExit?(); return }
-                    let previous = self.windows
-                    self.windows = self.makeWindows(screens)
-                    previous.forEach { $0.orderOut(nil); $0.close() }
+                    if self.arrange(screens), self.revealed { self.onWindowsChanged?(self.windowIDs) }
                 }
             }
     }
 
-    func show() throws {
+    func prepare() throws -> [CGWindowID] {
+        guard windows.isEmpty else { return windowIDs }
         let screens = NSScreen.screens
         guard !screens.isEmpty else { throw DeskError.invalid("当前没有可覆盖的显示器") }
         var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
@@ -257,28 +282,60 @@ private final class SessionPrivacyWindows: SessionPrivacyCover {
             if let hotKeyHandler { RemoveEventHandler(hotKeyHandler); self.hotKeyHandler = nil }
             throw DeskError.system("本机 ⌃⌥Esc 已被占用，防窥未开启", status)
         }
-        windows = makeWindows(screens)
+        revealed = false
+        arrange(screens)
+        preparedIDs = windowIDs
+        return preparedIDs
     }
 
-    private func makeWindows(_ screens: [NSScreen]) -> [NSWindow] {
-        screens.map { screen in
-            let window = PrivacyCoverWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
-            window.backgroundColor = .black
-            window.isOpaque = true
-            window.hasShadow = false
-            window.level = .screenSaver
-            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-            window.ignoresMouseEvents = true
-            window.hidesOnDeactivate = false
-            window.isReleasedWhenClosed = false
-            window.orderFrontRegardless()
-            return window
+    func reveal() {
+        guard !windows.isEmpty else { return }
+        revealed = true
+        windows.values.forEach { $0.alphaValue = 1 }
+        // A display added while capture was being prepared brought a cover capture has not seen yet.
+        if windowIDs != preparedIDs { onWindowsChanged?(windowIDs) }
+    }
+
+    /// Returns whether a cover was added or removed; existing covers only follow their display's frame.
+    @discardableResult
+    private func arrange(_ screens: [NSScreen]) -> Bool {
+        var next: [CGDirectDisplayID: NSWindow] = [:]
+        var changed = false
+        for screen in screens {
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { continue }
+            let id = CGDirectDisplayID(number.uint32Value)
+            if let window = windows.removeValue(forKey: id) {
+                if window.frame != screen.frame { window.setFrame(screen.frame, display: true) }
+                next[id] = window
+            } else {
+                next[id] = makeWindow(screen)
+                changed = true
+            }
         }
+        for window in windows.values { window.orderOut(nil); window.close(); changed = true }
+        windows = next
+        return changed
+    }
+
+    private func makeWindow(_ screen: NSScreen) -> NSWindow {
+        let window = PrivacyCoverWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.backgroundColor = .black
+        window.isOpaque = true
+        window.hasShadow = false
+        window.level = .screenSaver
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        window.ignoresMouseEvents = true
+        window.hidesOnDeactivate = false
+        window.isReleasedWhenClosed = false
+        window.alphaValue = revealed ? 1 : Self.preparedAlpha
+        window.orderFrontRegardless()
+        return window
     }
 
     func hide() {
-        windows.forEach { $0.orderOut(nil); $0.close() }
+        windows.values.forEach { $0.orderOut(nil); $0.close() }
         windows.removeAll()
+        revealed = false
         if let hotKey { UnregisterEventHotKey(hotKey); self.hotKey = nil }
         if let hotKeyHandler { RemoveEventHandler(hotKeyHandler); self.hotKeyHandler = nil }
     }

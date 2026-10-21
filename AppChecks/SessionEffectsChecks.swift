@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import QuietDeskCore
 
@@ -22,10 +23,14 @@ private final class FakeSessionAudio: SessionAudioControlling {
 @MainActor
 private final class FakeSessionPrivacy: SessionPrivacyCover {
     var isVisible = false
+    var prepared = false
     var onExit: (() -> Void)?
+    var onWindowsChanged: (([CGWindowID]) -> Void)?
     var shows = 0
-    func show() throws { isVisible = true; shows += 1 }
-    func hide() { isVisible = false }
+    var windowIDs: [CGWindowID] { prepared ? [41, 42] : [] }
+    func prepare() throws -> [CGWindowID] { prepared = true; return windowIDs }
+    func reveal() { isVisible = true; shows += 1 }
+    func hide() { isVisible = false; prepared = false }
 }
 
 @MainActor
@@ -59,13 +64,13 @@ enum SessionEffectsCancellationChecks {
         let effects = HostSessionEffects(audio: audio, privacy: privacy, screenLock: FakeScreenLock())
         var releasePreparation: CheckedContinuation<Void, Never>?
         let pending = Task { @MainActor in
-            try await effects.apply(.init(privacy: true)) {
+            try await effects.apply(.init(privacy: true)) { _ in
                 await withCheckedContinuation { releasePreparation = $0 }
             }
         }
         while releasePreparation == nil { await Task.yield() }
         do {
-            _ = try await effects.apply(.init()) { fatalError("Overlapping request should be rejected before preparation") }
+            _ = try await effects.apply(.init()) { _ in fatalError("Overlapping request should be rejected before preparation") }
             failures += 1
             print("FAIL overlapping effect request accepted")
         } catch { print("PASS overlapping effect request is rejected") }
@@ -76,12 +81,12 @@ enum SessionEffectsCancellationChecks {
             failures += 1
             print("FAIL late privacy preparation survived reset")
         } catch is CancellationError {
-            if effects.state == SessionEffectsState(), resetError == nil, privacy.shows == 0 {
-                print("PASS reset cancels late privacy preparation before any window or audio is created")
+            if effects.state == SessionEffectsState(), resetError == nil, privacy.shows == 0, !privacy.prepared {
+                print("PASS reset cancels late privacy preparation; prepared covers are removed before they turn opaque")
             } else { failures += 1; print("FAIL reset left effects enabled") }
         } catch { failures += 1; print("FAIL unexpected preparation failure: \(error)") }
 
-        let cancelled = Task { @MainActor in try await effects.apply(.init(privacy: true)) {} }
+        let cancelled = Task { @MainActor in try await effects.apply(.init(privacy: true)) { _ in } }
         cancelled.cancel()
         do {
             _ = try await cancelled.value
@@ -91,7 +96,7 @@ enum SessionEffectsCancellationChecks {
             if effects.state == SessionEffectsState(), privacy.shows == 0 { print("PASS task cancellation leaves both effects disabled") }
             else { failures += 1; print("FAIL cancellation left effects enabled") }
         } catch { failures += 1; print("FAIL unexpected cancellation failure: \(error)") }
-        let cancelledAudio = Task { @MainActor in try await effects.apply(.init(muted: true)) {} }
+        let cancelledAudio = Task { @MainActor in try await effects.apply(.init(muted: true)) { _ in } }
         cancelledAudio.cancel()
         do {
             _ = try await cancelledAudio.value
@@ -104,7 +109,7 @@ enum SessionEffectsCancellationChecks {
         do {
             let audio = FakeSessionAudio(), privacy = FakeSessionPrivacy()
             let effects = HostSessionEffects(audio: audio, privacy: privacy, screenLock: FakeScreenLock())
-            _ = try await effects.apply(.init(privacy: true)) {}
+            _ = try await effects.apply(.init(privacy: true)) { _ in }
             audio.isMuted = true; audio.holdRestores = true
             let first = Task { @MainActor in await effects.reset() }
             while audio.restoreWaiters.isEmpty { await Task.yield() }
@@ -124,7 +129,7 @@ enum SessionEffectsCancellationChecks {
             let audio = FakeSessionAudio(), privacy = FakeSessionPrivacy()
             let effects = HostSessionEffects(audio: audio, privacy: privacy, screenLock: FakeScreenLock())
             audio.isMuted = true; audio.holdRestores = true
-            let unmute = Task { @MainActor in try await effects.apply(.init()) {} }
+            let unmute = Task { @MainActor in try await effects.apply(.init()) { _ in } }
             while audio.restoreWaiters.isEmpty { await Task.yield() }
             var resetStarted = false
             let reset = Task { @MainActor in resetStarted = true; return await effects.reset() }
@@ -220,7 +225,7 @@ enum SessionEffectsCancellationChecks {
             let quietWhenUnchanged = updates.isEmpty
             audio.onChange?(false, "fake helper failure")
             audio.isMuted = true
-            _ = try await effects.apply(.init(muted: true)) {}
+            _ = try await effects.apply(.init(muted: true)) { _ in }
             audio.onChange?(false, nil)
             if quietWhenUnchanged, updates == ["fake helper failure", nil], effects.state == SessionEffectsState() {
                 print("PASS an unchanged helper exit keeps the last failure while real changes and errors still reach the viewer")
@@ -231,10 +236,10 @@ enum SessionEffectsCancellationChecks {
             let effects = HostSessionEffects(audio: audio, privacy: privacy, screenLock: lock)
             lock.unavailableReason = "fake lock unavailable"
             var refused = false
-            do { _ = try await effects.apply(.init(privacy: true, lockOnDisconnect: true)) {} }
+            do { _ = try await effects.apply(.init(privacy: true, lockOnDisconnect: true)) { _ in } }
             catch { refused = error.localizedDescription == "fake lock unavailable" && effects.state == .init(privacy: true) }
             lock.unavailableReason = nil
-            let applied = try await effects.apply(.init(privacy: true, lockOnDisconnect: true)) {}
+            let applied = try await effects.apply(.init(privacy: true, lockOnDisconnect: true)) { _ in }
             lock.holdConfirmation = true
             effects.endSession()
             let issuedAtOnce = lock.lockCalls == 1
@@ -257,8 +262,8 @@ enum SessionEffectsCancellationChecks {
         do {
             let lock = FakeScreenLock()
             let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: FakeSessionPrivacy(), screenLock: lock)
-            _ = try await effects.apply(.init(lockOnDisconnect: true)) {}
-            let switchedOff = try await effects.apply(.init()) {}
+            _ = try await effects.apply(.init(lockOnDisconnect: true)) { _ in }
+            let switchedOff = try await effects.apply(.init()) { _ in }
             let message = await effects.reset()
             let untouched = HostSessionEffects(audio: FakeSessionAudio(), privacy: FakeSessionPrivacy(), screenLock: lock)
             let untouchedMessage = await untouched.reset()
@@ -266,7 +271,32 @@ enum SessionEffectsCancellationChecks {
                 print("PASS a session that switched the lock off or never asked for it ends without locking")
             } else { failures += 1; print("FAIL an unrequested session lock was issued: \(lock.lockCalls)") }
         } catch { failures += 1; print("FAIL unrequested lock setup: \(error)") }
-        print("\(13 - failures) passed, \(failures) failed")
+        do {
+            let privacy = FakeSessionPrivacy()
+            let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: FakeScreenLock())
+            var excluded: [CGWindowID] = []
+            var opaqueDuringPreparation = false
+            let applied = try await effects.apply(.init(privacy: true)) { windows in
+                excluded = windows; opaqueDuringPreparation = privacy.isVisible
+            }
+            var forwarded: [CGWindowID]?
+            effects.onCoverWindowsChanged = { forwarded = $0 }
+            privacy.onWindowsChanged?([41, 43])
+            if applied.privacy, excluded == [41, 42], !opaqueDuringPreparation, privacy.shows == 1, forwarded == [41, 43] {
+                print("PASS capture learns the cover windows before they turn opaque, and later cover changes are forwarded")
+            } else { failures += 1; print("FAIL cover exclusion order: \(excluded) opaque \(opaqueDuringPreparation) forwarded \(forwarded ?? [])") }
+        } catch { failures += 1; print("FAIL cover exclusion setup: \(error)") }
+        do {
+            let privacy = FakeSessionPrivacy()
+            let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: FakeScreenLock())
+            var refused = false
+            do { _ = try await effects.apply(.init(privacy: true)) { _ in throw DeskError.invalid("fake exclusion failure") } }
+            catch { refused = error.localizedDescription == "fake exclusion failure" }
+            if refused, privacy.shows == 0, !privacy.prepared, effects.state == SessionEffectsState() {
+                print("PASS a cover that capture could not leave out is removed without ever turning opaque")
+            } else { failures += 1; print("FAIL failed exclusion left a cover behind") }
+        }
+        print("\(15 - failures) passed, \(failures) failed")
         exit(failures == 0 ? 0 : 1)
     }
 }

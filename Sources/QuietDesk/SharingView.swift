@@ -39,7 +39,7 @@ struct SharingView: View {
         .onDisappear { previousCode = "" }
         .sheet(isPresented: $showRelaySettings) {
             RelaySettingsView(enabled: model.relayEnabled, address: model.relayAddress, deviceID: model.relayDeviceID,
-                              locked: locked, loadTrust: model.relayCertificate, save: model.saveRelayConfiguration)
+                              locked: model.relaySettingsLocked, loadTrust: model.relayCertificate, save: model.saveRelayConfiguration)
         }
         .onReceive(NotificationCenter.default.publisher(for: SystemQuitHandler.dismissSheets)) { _ in
             showRelaySettings = false; confirmingRegeneration = false
@@ -74,7 +74,7 @@ struct SharingView: View {
             }
             Button(action: openTraffic) { Label("设备流量统计…", systemImage: "chart.bar.xaxis") }
                 .buttonStyle(.link)
-            Text("共享期间 Mac 保持唤醒。支持一个显示器与一个控制连接；暂不包含音频和登录窗口控制。")
+            Text("共享期间 Mac 保持唤醒。支持一个显示器与一个控制连接；暂不包含音频和登录窗口控制。开启共享后仍可在「连接家里 Mac」连接其他 Mac，连接期间这台 Mac 暂不接受控制连接；正被控制时不能外连。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

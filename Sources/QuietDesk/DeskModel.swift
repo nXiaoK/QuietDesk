@@ -7,7 +7,10 @@ import QuietDeskCore
 @MainActor
 final class DeskModel: ObservableObject {
     enum Mode: String, CaseIterable { case viewer = "连接家里 Mac", host = "共享这台 Mac" }
-    @Published var mode: Mode = .viewer
+    /// Each model keeps one role for its lifetime; the app runs a viewer and a host side by side.
+    let mode: Mode
+    /// The model of the other role, for the one-session-at-a-time rule and settings both roles share.
+    weak var sibling: DeskModel?
     @Published var address = UserDefaults.standard.string(forKey: "remoteAddress") ?? ""
     @Published var port = UserDefaults.standard.string(forKey: "remotePort") ?? "5908"
     @Published var viewerCode = ""
@@ -45,7 +48,7 @@ final class DeskModel: ObservableObject {
         return connectionError
     }
     @Published var traffic = "0.00 Mbps"
-    let trafficHistory = TrafficHistoryFeed()
+    let trafficHistory: TrafficHistoryFeed
     @Published private(set) var trafficHistoryStatus = "按网址/IP＋端口累计；旧版按设备统计单独保留。"
     @Published var frameRate = "0 fps"
     @Published var latency = "— ms"
@@ -68,6 +71,7 @@ final class DeskModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(relayPeerAssist.rawValue, forKey: "relayPeerAssist")
             guard oldValue != relayPeerAssist else { return }
+            sibling?.relayPeerAssist = relayPeerAssist
             viewerSession.relayBridge?.setPeerAssistMode(relayPeerAssist)
             viewerSession.mediaRelayBridge?.setPeerAssistMode(relayPeerAssist)
             relayHostRegistration?.setPeerAssistMode(relayPeerAssist)
@@ -176,6 +180,8 @@ final class DeskModel: ObservableObject {
     private var permissionGuide: PermissionGuide?
     var updatePromptBlocked: Bool { permissionGuide?.isVisible == true || error != nil || pendingFileOffer != nil }
     var hasIncomingControlConnection: Bool { mode == .host && peer != nil }
+    /// This Mac is connecting to, connected to or about to reconnect to another Mac.
+    var isControllingAnotherMac: Bool { mode == .viewer && (active || working || connected || reconnecting) }
     private var capsLockStartAttempted = false
     private var controlStatusUpdatesEnabled = false
     private var lastMetrics = SessionClock.now
@@ -217,7 +223,7 @@ final class DeskModel: ObservableObject {
     private var systemSleeping = false
     private var displayRefreshTask: Task<Void, Never>?
     private var hostPreparationTask: Task<Void, Never>?
-    private let trafficHistoryStore = TrafficHistoryStore()
+    private let trafficHistoryStore: TrafficHistoryStore
     private var trafficSession: TrafficSession?
     private var effectsCleanupTask: Task<Void, Never>?
     private var effectsCleanupsRunning = 0
@@ -231,8 +237,10 @@ final class DeskModel: ObservableObject {
     private var suppressIdleFocusWake = false
     private var freshFrameRequiredOnReconnect = false
 
-    init() {
-        if autoStartSharing { mode = .host }
+    init(mode: Mode, services: DeskServices) {
+        self.mode = mode
+        trafficHistory = services.trafficHistory
+        trafficHistoryStore = services.trafficHistoryStore
         if let data = UserDefaults.standard.data(forKey: "streamSettings"),
            let saved = try? JSONDecoder().decode(StreamSettings.self, from: data),
            (try? saved.validateControlValues()) != nil { settings = saved }
@@ -358,11 +366,6 @@ final class DeskModel: ObservableObject {
             }
         }
         if let permissionTimer { RunLoop.main.add(permissionTimer, forMode: .common) }
-        trafficHistoryStore.observe { [weak self] records, legacyRecords, message in
-            DispatchQueue.main.async {
-                self?.trafficHistory.update(records: records, legacyRecords: legacyRecords, error: message)
-            }
-        }
     }
 
     private var diagnosticRole: DiagnosticLog.Role { mode == .viewer ? .viewer : .host }
@@ -664,9 +667,12 @@ final class DeskModel: ObservableObject {
         try RelayCertificateStore(defaults: .standard).load(for: endpoint)
     }
 
+    /// The relay settings serve both roles, so they change only while neither is sharing or connected.
+    var relaySettingsLocked: Bool { active || working || sibling?.active == true || sibling?.working == true }
+
     func saveRelayConfiguration(enabled: Bool, address: String, accessCode: String, deviceID: String,
                                 certificate: RelayNodeCertificate?) throws {
-        guard !active, !working else { throw DeskError.invalid("请先停止共享或断开连接，再修改中继设置") }
+        guard !relaySettingsLocked else { throw DeskError.invalid("请先停止共享并断开连接，再修改中继设置") }
         let text = address.trimmingCharacters(in: .whitespacesAndNewlines)
         let supplied = accessCode.trimmingCharacters(in: .whitespacesAndNewlines)
         let endpoint: RelayEndpoint?
@@ -700,6 +706,18 @@ final class DeskModel: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: "relayEnabled")
         if !enabled { relayStrategy = .direct; UserDefaults.standard.set(relayStrategy.rawValue, forKey: "relayStrategy") }
         relayHostStatus = enabled ? "下次开启共享时连接中继" : "中继已关闭"
+        sibling?.reloadRelayConfiguration()
+    }
+
+    /// Picks up relay settings saved by the other role's model.
+    func reloadRelayConfiguration() {
+        let defaults = UserDefaults.standard
+        relayEnabled = defaults.bool(forKey: "relayEnabled")
+        relayAddress = defaults.string(forKey: "relayAddress") ?? ""
+        viewerRelayAddress = relayAddress
+        relayDeviceID = defaults.string(forKey: "relayDeviceID") ?? ""
+        relayStrategy = RelayConnectionStrategy(rawValue: defaults.string(forKey: "relayStrategy") ?? "") ?? .direct
+        relayHostStatus = relayEnabled ? "下次开启共享时连接中继" : "中继已关闭"
     }
 
     private func startRelayRegistration(localPort: UInt16) {
@@ -868,6 +886,12 @@ final class DeskModel: ObservableObject {
                 guard let self, let candidate, self.pending.removeValue(forKey: id) != nil,
                       self.generation == token, self.active, self.hostingRequested else { return }
                 guard self.peer == nil else { candidate.close("这台 Mac 当前已有控制连接"); return }
+                // One session at a time: while this Mac controls another one it is not controlled itself.
+                if self.sibling?.isControllingAnotherMac == true {
+                    DiagnosticLog.shared.record(.connectionClosed, role: .host, state: .rejected)
+                    candidate.close("这台 Mac 正在远程控制另一台 Mac，暂不接受控制连接", retryable: true)
+                    return
+                }
                 DiagnosticLog.shared.record(.connectionReady, role: .host, state: .ready,
                     values: relayed ? [.relayControl: 1] : ackStretchingDisabled.map { [.tcpAckStretchingDisabled: $0 ? 1 : 0] } ?? [:])
                 self.peer = candidate
@@ -1053,6 +1077,10 @@ final class DeskModel: ObservableObject {
         guard !active, !working else { return }
         remoteName = ""
         connectionError = nil
+        if sibling?.hasIncomingControlConnection == true {
+            connectionError = "这台 Mac 正在被另一台 Mac 控制；对方断开后才能连接其他 Mac，共享无需关闭"
+            return
+        }
         do {
             let relay: RelayConnectionInfo?
             if let savedRelayRoute {
@@ -1654,6 +1682,10 @@ final class DeskModel: ObservableObject {
 
     func quickConnect(_ record: ConnectionRecord) {
         guard !active, !working else { return }
+        if sibling?.hasIncomingControlConnection == true {
+            connectionError = "这台 Mac 正在被另一台 Mac 控制；对方断开后才能连接其他 Mac，共享无需关闭"
+            return
+        }
         address = record.address
         port = String(record.port)
         relayStrategy = record.relay?.strategy ?? .direct
@@ -2512,8 +2544,10 @@ final class DeskModel: ObservableObject {
     }
 
     func setClipboardEnabled(_ enabled: Bool) {
+        guard clipboardEnabled != enabled else { return }
         clipboardEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "clipboardEnabled")
+        sibling?.setClipboardEnabled(enabled)
         if supportsClipboard, let peer {
             do { try sendClipboardPreference(to: peer) }
             catch { clipboardStatus = error.localizedDescription }
@@ -2625,7 +2659,7 @@ final class DeskModel: ObservableObject {
     }
 
     func attachWindow(_ window: NSWindow) {
-        if mainWindow !== window {
+        if mainWindow !== window, mode == .viewer {
             for observer in sessionFocusObservers { NotificationCenter.default.removeObserver(observer) }
             sessionFocusObservers = [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification].map { name in
                 NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -2661,10 +2695,7 @@ final class DeskModel: ObservableObject {
         }
         guard !initialLaunchHandled else { return }
         initialLaunchHandled = true
-        if autoStartSharing {
-            mode = .host
-            startHosting(interactive: false)
-        }
+        if autoStartSharing, mode == .host { startHosting(interactive: false) }
     }
 
     func prepareShowWindow() {

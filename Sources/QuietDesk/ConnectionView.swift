@@ -165,7 +165,7 @@ struct ConnectionView: View {
         }
         .sheet(isPresented: $showRelaySettings) {
             RelaySettingsView(enabled: model.relayEnabled, address: model.relayAddress, deviceID: model.relayDeviceID,
-                              locked: locked, loadTrust: model.relayCertificate, save: model.saveRelayConfiguration)
+                              locked: model.relaySettingsLocked, loadTrust: model.relayCertificate, save: model.saveRelayConfiguration)
         }
         .onReceive(NotificationCenter.default.publisher(for: SystemQuitHandler.dismissSheets)) { _ in
             showRecords = false; showRelaySettings = false

@@ -219,6 +219,64 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
                     "A new hole-filling fragment was not counted as real receiving progress")
     }
 
+    run("Loss counts only fragments that missed the reorder window, including frames that expired") {
+        let time = MediaCheckClock()
+        let receiver = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        let first = try frame(1, idr: true, bytes: 8_192)
+        let parts = try MediaFragment.fragment(frame: first)
+        // A brief reordering inside the window is not loss.
+        _ = try receiver.receive(parts[1]); _ = try receiver.receive(parts[0])
+        _ = try receiver.receive(parts[3])
+        time.now = 0.004
+        try require(feedback(receiver.poll(), .nack).count == 1, "The hole below received progress was not requested")
+        time.now = 0.006
+        for part in [parts[2]] + Array(parts[4...]) { _ = try receiver.receive(part) }
+        let repaired = receiver.takeFragmentCounts()
+        try require(repaired.settled == parts.count && repaired.lost == 1, "A repaired fragment was not counted once: \(repaired)")
+        try require(receiver.takeFragmentCounts() == (0, 0), "Counts were not cleared after reading")
+        _ = receiver.decoded(first.header, success: true)
+        let clean = try MediaFragment.fragment(frame: frame(2, bytes: 4_096))
+        for part in clean { _ = try receiver.receive(part) }
+        try require(receiver.takeFragmentCounts() == (clean.count, 0), "An in-order frame reported loss")
+        let stalled = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        let lost = try MediaFragment.fragment(frame: frame(1, idr: true, bytes: 8_192))
+        time.now = 1
+        _ = try stalled.receive(lost[0]); _ = try stalled.receive(lost[2])
+        time.now = 10
+        _ = stalled.poll()
+        try require(stalled.requiresRecovery && stalled.takeFragmentCounts() == (lost.count, lost.count - 2),
+                    "Fragments of an expired frame were not counted as lost")
+        let dropped = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        let inFlight = try MediaFragment.fragment(frame: frame(1, idr: true, bytes: 8_192))
+        time.now = 20
+        _ = try dropped.receive(inFlight[0]); _ = try dropped.receive(inFlight[2])
+        dropped.abandon()
+        try require(dropped.takeFragmentCounts() == (3, 1), "Abandoning counted a tail that may still be arriving")
+        let stopped = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        _ = try stopped.receive(inFlight[inFlight.count - 1])
+        time.now = 21
+        stopped.abandon(); stopped.abandon()
+        try require(stopped.takeFragmentCounts() == (inFlight.count, inFlight.count - 1),
+                    "A stalled frame abandoned before expiry was not counted once")
+        let reliable = try MediaFrameReassembler(stream: stream)
+        _ = try reliable.receive(frame(1, idr: true, bytes: 8_192))
+        try require(reliable.takeFragmentCounts() == (0, 0), "A complete TCP envelope was counted as UDP fragments")
+    }
+
+    run("Loss window reports a five-second share only with enough fragments") {
+        var window = MediaLossWindow()
+        window.add(settled: 10, lost: 1, at: 0)
+        try require(window.fraction(at: 0.5) == nil, "Too few fragments produced a loss figure")
+        window.add(settled: 90, lost: 9, at: 1)
+        try require(abs((window.fraction(at: 1) ?? -1) - 0.1) < 1e-9, "The window did not combine recent fragments")
+        window.add(settled: 50, lost: 80, at: 2)
+        try require(abs((window.fraction(at: 2) ?? -1) - 60.0 / 150) < 1e-9, "Lost fragments exceeded settled fragments")
+        try require(abs((window.fraction(at: 5.5) ?? -1) - 59.0 / 140) < 1e-9, "Entries older than five seconds were kept")
+        try require(window.fraction(at: 7.5) == nil, "An idle window kept reporting stale loss")
+        window.add(settled: 0, lost: 3, at: 8)
+        try require(window.fraction(at: 8) == nil, "Loss without fragments was recorded")
+    }
+
     run("A lost final fragment becomes repairable after receiving progress actually stalls") {
         let time = MediaCheckClock()
         let limits = MediaBufferLimits(reorderDelay: 0.02, nackInterval: 0.005)

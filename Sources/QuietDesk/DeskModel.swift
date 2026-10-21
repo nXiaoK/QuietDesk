@@ -74,6 +74,10 @@ final class DeskModel: ObservableObject {
         }
     }
     @Published private(set) var relayPeerStatus = ""
+    // Share of UDP video fragments that missed the reorder window over about five seconds; empty off UDP.
+    @Published private(set) var mediaLoss = ""
+    private var mediaLossFraction: Double?
+    var mediaRouteSummary: String { mediaLoss.isEmpty ? mediaTransportStatus : mediaTransportStatus + " · " + mediaLoss }
     private var mediaRouteValue = ""
     private var peerPathState = RelayPeerPathState.relay
     @Published private(set) var performanceDiagnosticsEnabled = false
@@ -1126,6 +1130,14 @@ final class DeskModel: ObservableObject {
                                             settings: settings, udpEnabled: !mediaTCPOnly, relayRouting: relayRouting,
                                             relayedDatagram: viewer.usesRelayControl)
         media.diagnostics = performanceDiagnostics
+        media.onDatagramLoss = { [weak self, weak viewer] fraction in
+            DispatchQueue.main.async {
+                guard let self, let viewer, self.viewerSession === viewer else { return }
+                self.mediaLossFraction = fraction
+                let label = fraction.map(Self.lossLabel) ?? ""
+                if self.mediaLoss != label { self.mediaLoss = label }
+            }
+        }
         media.onRelayedDatagramAuthenticated = { [weak viewer] _, secret in
             DispatchQueue.main.async {
                 guard let viewer else { return }
@@ -1269,6 +1281,10 @@ final class DeskModel: ObservableObject {
         }
     }
 
+    private static func lossLabel(_ fraction: Double) -> String {
+        fraction > 0 && fraction < 0.001 ? "丢包 <0.1%" : String(format: "丢包 %.1f%%", fraction * 100)
+    }
+
     private func setMediaRoute(_ label: String) {
         mediaRouteValue = label
         mediaTransportStatus = Self.peerRouteLabel(label, peerPath: peerPathState)
@@ -1324,8 +1340,10 @@ final class DeskModel: ObservableObject {
     // Route changes are rare; their cause explains UDP/TCP alternation that route snapshots alone cannot.
     private func recordMediaPathSwitch(_ value: String, cause: MediaSwitchCause, relayed: Bool) {
         guard let path = Self.mediaPathCode(value) else { return }
-        DiagnosticLog.shared.record(.mediaPathSwitch, role: .viewer, state: .requested,
-                                    values: [.relayControl: relayed ? 1 : 0, .videoPath: path, .switchCause: cause.diagnosticCode])
+        var values: [DiagnosticLog.Field: Int] = [.relayControl: relayed ? 1 : 0, .videoPath: path, .switchCause: cause.diagnosticCode]
+        // UDP loss just before leaving UDP explains many fallbacks; absent when the previous path was TCP.
+        if let mediaLossFraction { values[.lossPermille] = Int((mediaLossFraction * 1000).rounded()) }
+        DiagnosticLog.shared.record(.mediaPathSwitch, role: .viewer, state: .requested, values: values)
     }
 
     private func applyAutomaticMediaSettings(_ settings: StreamSettings) {
@@ -2721,6 +2739,7 @@ final class DeskModel: ObservableObject {
         controlTransportStatus = "尚未连接"
         mediaTransportStatus = "TCP 兼容模式"
         mediaRouteValue = ""; peerPathState = .relay; relayPeerStatus = ""
+        mediaLoss = ""; mediaLossFraction = nil
         supportsMediaTransport = false
         supportsIndependentCursor = false
         cursorStatus = "视频光标"

@@ -55,6 +55,30 @@ public enum MediaReceiveEvent: Sendable {
 }
 
 // Call on one media queue, and only after transport authentication. Epoch changes are local decisions.
+// Share of UDP video fragments that missed the reorder window over the last few seconds. It describes
+// the video path only: TCP retransmits inside the system and whole frames never seen are not counted.
+public struct MediaLossWindow: Sendable {
+    public static let span: TimeInterval = 5
+    public static let minimumFragments = 20
+    private var entries: [(at: TimeInterval, settled: Int, lost: Int)] = []
+
+    public init() {}
+
+    public mutating func add(settled: Int, lost: Int, at now: TimeInterval) {
+        guard now.isFinite, settled > 0 else { return }
+        entries.append((now, settled, min(max(0, lost), settled)))
+    }
+
+    public mutating func fraction(at now: TimeInterval) -> Double? {
+        entries.removeAll { now - $0.at > Self.span }
+        let settled = entries.reduce(0) { $0 + $1.settled }
+        guard settled >= Self.minimumFragments else { return nil }
+        return Double(entries.reduce(0) { $0 + $1.lost }) / Double(settled)
+    }
+
+    public mutating func reset() { entries.removeAll() }
+}
+
 public final class MediaFrameReassembler {
     public private(set) var stream: MediaStreamID
     public private(set) var requiresRecovery = false
@@ -70,6 +94,10 @@ public final class MediaFrameReassembler {
     private var assemblies: [UInt64: Assembly] = [:]
     private var lastDecoded: MediaFrameHeader?
     private var lastAcknowledgementAt: TimeInterval?
+    // Fragments of finished UDP frames, and how many of them missed the reorder window: requested
+    // again or never arrived. Complete TCP envelopes are not fragments and are never counted.
+    private var settledFragments = 0
+    private var lateFragments = 0
 
     private final class Assembly {
         let header: MediaFrameHeader
@@ -81,6 +109,7 @@ public final class MediaFrameReassembler {
         var lastNackAt: TimeInterval?
         var bytes: Data
         var received: [Bool]
+        var requested: [Bool]
         var receivedCount = 0
         var highestReceivedIndex = -1
         var frame: MediaFrame?
@@ -95,6 +124,7 @@ public final class MediaFrameReassembler {
             lastProgressAt = now
             bytes = Data(count: totalBytes)
             received = Array(repeating: false, count: fragmentCount)
+            requested = Array(repeating: false, count: fragmentCount)
         }
 
         init(_ frame: MediaFrame, bytes: Data, now: TimeInterval) {
@@ -106,6 +136,7 @@ public final class MediaFrameReassembler {
             lastProgressAt = now
             self.bytes = bytes
             received = Array(repeating: true, count: fragmentCount)
+            requested = Array(repeating: false, count: fragmentCount)
             receivedCount = fragmentCount
             highestReceivedIndex = fragmentCount - 1
             self.frame = frame
@@ -136,6 +167,27 @@ public final class MediaFrameReassembler {
         self.limits = limits
         self.clock = clock
         lastNow = now
+    }
+
+    /// Returns and clears the fragment counts since the previous call.
+    public func takeFragmentCounts() -> (settled: Int, lost: Int) {
+        defer { settledFragments = 0; lateFragments = 0 }
+        return (settledFragments, lateFragments)
+    }
+
+    /// Settles unfinished frames before this reassembler is dropped. Holes below received progress,
+    /// requested fragments and a stalled tail count as lost; a tail that may still be arriving does not.
+    public func abandon() {
+        let now = currentTime()
+        for assembly in assemblies.values where assembly.fragmented && assembly.frame == nil {
+            let end = now - assembly.lastProgressAt >= limits.reorderDelay ? assembly.fragmentCount : assembly.highestReceivedIndex + 1
+            settledFragments += end
+            lateFragments += (0..<end).lazy.filter { !assembly.received[$0] || assembly.requested[$0] }.count
+        }
+        assemblies.removeAll()
+        bufferedBytes = 0
+        awaitingDecode = nil
+        gapStartedAt = nil
     }
 
     public func replaceStream(_ stream: MediaStreamID, firstFrameID: UInt64 = 1) {
@@ -201,6 +253,8 @@ public final class MediaFrameReassembler {
                 do {
                     assembly.frame = try MediaFrame(header: assembly.header, packetBytes: assembly.bytes)
                     assembly.completedAt = now
+                    settledFragments += assembly.fragmentCount
+                    lateFragments += assembly.requested.lazy.filter { $0 }.count
                 } catch {
                     _ = invalidate(at: fragment.header)
                     throw error
@@ -268,6 +322,8 @@ public final class MediaFrameReassembler {
             let missing = assembly.missingRanges(includeTail: includeTail)
             if !missing.isEmpty, let feedback = try? MediaFeedback(kind: .nack, header: assembly.header, missingRanges: missing) {
                 assembly.lastNackAt = now
+                for range in missing { assembly.requested.replaceSubrange(Int(range.first)..<Int(range.first) + Int(range.count),
+                                                                         with: repeatElement(true, count: Int(range.count))) }
                 events.append(.feedback(feedback))
             }
         }
@@ -338,6 +394,10 @@ public final class MediaFrameReassembler {
     private func invalidate(at header: MediaFrameHeader) -> [MediaReceiveEvent] {
         guard !requiresRecovery else { return [] }
         requiresRecovery = true
+        for assembly in assemblies.values where assembly.fragmented && assembly.frame == nil {
+            settledFragments += assembly.fragmentCount
+            lateFragments += zip(assembly.received, assembly.requested).lazy.filter { !$0.0 || $0.1 }.count
+        }
         assemblies.removeAll()
         bufferedBytes = 0
         awaitingDecode = nil

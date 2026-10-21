@@ -333,6 +333,7 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
     let predictedFrame = DispatchSemaphore(value: 0), controlPong = DispatchSemaphore(value: 0)
     let hostSession = BlackholeBox<MediaSession?>(nil), viewerSession = BlackholeBox<MediaSession?>(nil)
     let hostPeers = BlackholeBox<[Peer]>([]), errors = BlackholeBox<[String]>([]), states = BlackholeBox<[String]>([])
+    let lossReports = BlackholeBox<[Double?]>([]), highestLoss = BlackholeBox<Double>(0)
     let sequence = BlackholeBox<UInt32>(100), udpPreparations = BlackholeBox(0), tcpPreparations = BlackholeBox(0)
     let videoConnections = BlackholeBox(0), committed = BlackholeBox<[MediaStreamID]>([])
     let teardown = BlackholeBox(false), decodedFrames = BlackholeBox(0)
@@ -407,6 +408,10 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
             viewerSession.update { $0 = media }
             media.diagnostics = diagnostics
             media.onReduceLoad = { cause in if cause == .network { networkLoadReductions.update { $0 += 1 } } }
+            media.onDatagramLoss = { fraction in
+                lossReports.update { $0.append(fraction) }
+                if let fraction { highestLoss.update { $0 = max($0, fraction) } }
+            }
             media.onVideo = { frame, complete in
                 let expected = blackholePacket(sequence: frame.packet.sequence, idr: frame.header.isIDR)
                 guard frame.packet.sps == expected.sps, frame.packet.pps == expected.pps, frame.packet.avcc == expected.avcc else {
@@ -442,12 +447,16 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
     try waitBlackhole(predictedFrame, "TCP committed an IDR but did not resume its P-frame chain", seconds: 3)
     requireNewControlPong.update { $0 = true }
     try waitBlackhole(controlPong, "TLS control stopped responding during media fallback", seconds: 2)
+    // One more sample window on TCP must clear the UDP loss figure.
+    let reportsBeforeSettling = lossReports.get().count
+    for _ in 0..<40 where lossReports.get().count < reportsBeforeSettling + 2 { Thread.sleep(forTimeInterval: 0.05) }
 
     let stats = proxy.snapshot()
     let pongSamples = diagnostics.drain().filter { $0.metric == .mediaRoundTrip }.reduce(0) { $0 + $1.count }
     let elapsed = SessionClock.now - droppedAt
     print("BLACKHOLE FILTER mode=\(blockAllUDP ? "all-udp" : "large-media") dropped=\(stats.droppedHostDatagrams) bytes=\(stats.droppedHostBytes) ciphertextSizes=\(stats.droppedSizes.sorted()) blockedClientDatagrams=\(stats.blockedClientDatagrams)")
     print("BLACKHOLE PROBES forwardedAfterDrop=\(stats.forwardedProbeSizedAfterDrop) ciphertextSizes=\(stats.allowedProbeSizes.sorted()) authenticatedRTTSamples=\(pongSamples)")
+    print("BLACKHOLE LOSS highest=\(String(format: "%.3f", highestLoss.get())) last=\(String(describing: lossReports.get().last ?? nil))")
     print("BLACKHOLE COMMIT path=TCP 视频 elapsed=\(String(format: "%.3f", elapsed))s udpPrepare=\(udpPreparations.get()) tcpPrepare=\(tcpPreparations.get()) videoTLSConnections=\(videoConnections.get()) tcpRelays=\(stats.tcpConnections) networkLoadReductions=\(networkLoadReductions.get())")
 
     if blockAllUDP {
@@ -456,14 +465,17 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
                              "A fully blocked UDP path prepared video or failed to choose one independent TCP stream")
         try requireBlackhole(elapsed >= 1 && elapsed < 4,
                              "Fully blocked UDP did not fall back within the probe budget plus TCP IDR delivery margin")
+        try requireBlackhole(highestLoss.get() == 0, "UDP loss was reported although no UDP video was ever received")
     } else {
         try requireBlackhole(stats.droppedHostDatagrams >= 100, "Fixture did not blackhole most large IDR fragments")
         try requireBlackhole(stats.forwardedProbeSizedAfterDrop >= 2 && pongSamples >= 2,
                              "Media fallback coincided with lost UDP liveness instead of surviving authenticated pongs")
         try requireBlackhole(networkLoadReductions.get() >= 1, "Actual media blackhole did not request network load reduction")
+        try requireBlackhole(highestLoss.get() >= 0.5, "Dropped IDR fragments were not reported as UDP loss: \(highestLoss.get())")
         try requireBlackhole(udpPreparations.get() >= 1 && udpPreparations.get() <= 3 && tcpPreparations.get() >= 1,
                              "UDP media was never tried or kept retrying instead of falling back")
     }
+    try requireBlackhole(lossReports.get().last.map { $0 == nil } ?? true, "UDP loss kept showing after video moved to TCP")
     try requireBlackhole(videoConnections.get() >= 1 && committed.get().count == 1 && states.get().last == "TCP 视频",
                          "Fallback did not commit exactly one independent TCP stream")
     try requireBlackhole(!states.get().contains("UDP 视频") && !states.get().contains("TCP 兼容模式"),

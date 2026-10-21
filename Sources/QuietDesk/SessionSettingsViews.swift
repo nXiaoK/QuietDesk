@@ -52,7 +52,7 @@ struct ConnectionSettingsView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Toggle("仅使用 TCP（下次连接生效）", isOn: $model.mediaTCPOnly)
-                    Text(model.connected ? model.mediaTransportStatus : (model.mediaTCPOnly ? "视频使用 TCP" : "视频优先 UDP，不可用时自动使用 TCP"))
+                    Text(model.connected ? model.mediaRouteSummary : (model.mediaTCPOnly ? "视频使用 TCP" : "视频优先 UDP，不可用时自动使用 TCP"))
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     if model.relayEnabled { RelayPeerAssistPicker(model: model) }
                     Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
@@ -202,7 +202,7 @@ struct FullScreenSettingsView: View {
                             Text(model.cursorStatus).font(.caption).foregroundStyle(.secondary)
                             Toggle(isOn: $model.showFullScreenStatistics) { Text("显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
                                 .help("显示控制通道 RTT、分辨率、解码 FPS 和流量；不代表画面上屏延迟。")
-                            Text(model.mediaTransportStatus).font(.caption).foregroundStyle(.secondary)
+                            Text(model.mediaRouteSummary).font(.caption).foregroundStyle(.secondary)
                             Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
                             Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) { Text("双向同步文字、图片和文件").frame(maxWidth: .infinity, alignment: .leading) }
                                 .help("文字和图片按控制端焦点同步；文件需逐次确认后下载，完成后再粘贴。")

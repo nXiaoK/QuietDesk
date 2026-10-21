@@ -61,6 +61,10 @@ public final class MediaSession: @unchecked Sendable {
     // On the media queue, once per relayed DTLS flow after it passed the session-key handshake and a
     // challenge in both directions. The secret lets the relay bridges authenticate a direct path.
     public var onRelayedDatagramAuthenticated: ((NWEndpoint, Data) -> Void)?
+    // Viewer only, on the media queue, once per sample window: the share of UDP video fragments that
+    // missed the reorder window over about five seconds. Nil while video is not being received over
+    // UDP (committed or on trial) or too few fragments arrived. Display and diagnostics only; path and quality policy do not use it.
+    public var onDatagramLoss: ((Double?) -> Void)?
 
     public static func peerAssistSecret(datagramKey: Data, sessionID: UUID) -> Data {
         HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: datagramKey), salt: Data(sessionID.uuidString.utf8),
@@ -160,6 +164,7 @@ public final class MediaSession: @unchecked Sendable {
     private var active: (stream: MediaStreamID, path: Path)?
     private var transaction: Transaction?
     private var receiver: MediaFrameReassembler?
+    private var lossWindow = MediaLossWindow()
     private var cache: MediaRetransmissionCache?
     private var nextFrameID: UInt64 = 1
     private var transportEpoch: UInt32 = 0
@@ -525,6 +530,7 @@ public final class MediaSession: @unchecked Sendable {
             guard var pending = transaction, pending.id == id, pending.stream == stream, pending.path == path else { return }
             if side == .viewer {
                 guard pending.stage == .preparing else { return }
+                collectLoss(abandoning: true)
                 receiver = try MediaFrameReassembler(stream: stream, limits: bufferLimits)
                 decoding.removeAll(); reassembledLocally.removeAll()
                 pending.stage = .ready; transaction = pending
@@ -866,6 +872,9 @@ public final class MediaSession: @unchecked Sendable {
         if side == .viewer {
             retryAt = SessionClock.now + (retry ? 0.5 : 0)
             retryPath = retry ? pending.path : nil
+            collectLoss(abandoning: true)
+            // A failed UDP attempt settles its lost fragments only now; report them before any switch.
+            if pending.path == .udp { onDatagramLoss?(lossWindow.fraction(at: SessionClock.now)) }
             receiver = nil; decoding.removeAll(); reassembledLocally.removeAll()
             onState?("正在恢复画面")
             if mediaFailure { sampleDirectReduction = true; onReduceLoad?(.network) }
@@ -1183,6 +1192,10 @@ public final class MediaSession: @unchecked Sendable {
                     frameBudgetMilliseconds: 1000 / Double(settings.framesPerSecond))
                 let actions = policy.observe(sample, epoch: policy.epoch, now: now)
                 if !sampleDirectReduction, !actions.contains(where: { if case .reduceLoad = $0 { return true }; return false }) { onSample?(sample) }
+                collectLoss()
+                // A UDP trial that has not committed yet is when loss explains a fallback, so follow
+                // the path currently receiving video rather than only the committed one.
+                onDatagramLoss?((transaction?.path ?? active?.path) == .udp ? lossWindow.fraction(at: now) : nil)
                 handleActions(actions)
                 sampleStartedAt = now; samplePackets = 0; sampleFrames = 0; sampleWaitMilliseconds = 0
                 sampleEncode = MediaComputeTiming(); sampleDecode = MediaComputeTiming()
@@ -1239,6 +1252,13 @@ public final class MediaSession: @unchecked Sendable {
         sendControl(MediaControl(operation, sessionID: value.stream.sessionID, transactionID: value.id,
             transportEpoch: value.stream.transportEpoch, codecEpoch: value.stream.codecEpoch, path: value.path.rawValue,
             mediaFailure: mediaFailure))
+    }
+
+    // Counts of a reassembler that is about to be replaced still belong to the current window.
+    private func collectLoss(abandoning: Bool = false) {
+        if abandoning { receiver?.abandon() }
+        guard let counts = receiver?.takeFragmentCounts() else { return }
+        lossWindow.add(settled: counts.settled, lost: counts.lost, at: SessionClock.now)
     }
 
     private func randomBytes(_ count: Int) throws -> Data {

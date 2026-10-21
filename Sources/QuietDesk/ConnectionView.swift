@@ -41,12 +41,11 @@ struct ConnectionView: View {
                                 Divider()
                                 if model.relayStrategy != .direct {
                                     formRow("目标设备标识") {
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            TextField("被控 Mac 显示的完整设备标识", text: $model.targetRelayDeviceID)
-                                                .accessibilityLabel("目标中继设备标识")
-                                            Text(model.viewerRelayAddress).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                                        }
+                                        TextField("被控 Mac 显示的完整设备标识", text: $model.targetRelayDeviceID)
+                                            .accessibilityLabel("目标中继设备标识")
                                     }
+                                    Divider()
+                                    formRow("中继节点") { RelayNodePicker(model: model) }
                                     Divider()
                                 }
                             }
@@ -164,8 +163,9 @@ struct ConnectionView: View {
             }.padding(24).frame(width: 540, height: 420)
         }
         .sheet(isPresented: $showRelaySettings) {
-            RelaySettingsView(enabled: model.relayEnabled, address: model.relayAddress, deviceID: model.relayDeviceID,
-                              locked: model.relaySettingsLocked, loadTrust: model.relayCertificate, save: model.saveRelayConfiguration)
+            RelaySettingsView(enabled: model.relayEnabled, nodes: model.relayNodes, deviceID: model.relayDeviceID,
+                              locked: model.relaySettingsLocked, measurements: model.relayNodeMeasurements,
+                              loadTrust: model.relayCertificate, saveNode: model.saveRelayNode, save: model.saveRelayConfiguration)
         }
         .onReceive(NotificationCenter.default.publisher(for: SystemQuitHandler.dismissSheets)) { _ in
             showRecords = false; showRelaySettings = false

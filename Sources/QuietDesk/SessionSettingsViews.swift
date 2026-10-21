@@ -30,6 +30,43 @@ struct RelayPeerAssistPicker: View {
     }
 }
 
+/// Chooses the relay node for the next connection; automatic uses the node with the best measured connection.
+struct RelayNodePicker: View {
+    @ObservedObject var model: DeskModel
+
+    var body: some View {
+        if model.relayNodes.count > 1 {
+            HStack(spacing: 10) {
+                Picker("中继节点", selection: $model.relayNodeChoice) {
+                    Text(automaticTitle).tag("")
+                    ForEach(model.relayNodes, id: \.self) { node in Text(title(node)).tag(node) }
+                }
+                .labelsHidden().pickerStyle(.menu)
+                Button(model.relayProbing ? "测量中…" : "测速") { model.measureRelayNodes() }
+                    .disabled(model.relayProbing)
+                    .help("测量各节点的 TCP 连接延迟（约一次网络往返，不含中继凭据）；连接前也会自动测量")
+            }
+            .onAppear { model.measureRelayNodesIfStale() }
+        } else {
+            Text(model.relayAddress.isEmpty ? "尚未添加中继节点" : model.relayAddress)
+                .font(.callout).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+        }
+    }
+
+    private var automaticTitle: String {
+        let best = model.relayNodes.min { (score($0) ?? .infinity) < (score($1) ?? .infinity) }
+        guard let best, score(best) != nil, let host = try? RelayEndpoint(address: best).host else { return "自动（连接质量最好的节点）" }
+        return "自动 · 当前最快 \(host)"
+    }
+
+    private func score(_ node: String) -> Double? { model.relayNodeMeasurements[node]?.score }
+
+    private func title(_ node: String) -> String {
+        let name = (try? RelayEndpoint(address: node)).map { "\($0.host):\($0.port)" } ?? node
+        return RelayNodeLabel.latency(model.relayNodeMeasurements[node]).map { "\(name) · \($0)" } ?? name
+    }
+}
+
 struct ConnectionSettingsView: View {
     @ObservedObject var model: DeskModel
     let openCaps: () -> Void

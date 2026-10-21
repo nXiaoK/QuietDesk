@@ -38,8 +38,9 @@ struct SharingView: View {
         .onAppear { model.prepareHostCode() }
         .onDisappear { previousCode = "" }
         .sheet(isPresented: $showRelaySettings) {
-            RelaySettingsView(enabled: model.relayEnabled, address: model.relayAddress, deviceID: model.relayDeviceID,
-                              locked: model.relaySettingsLocked, loadTrust: model.relayCertificate, save: model.saveRelayConfiguration)
+            RelaySettingsView(enabled: model.relayEnabled, nodes: model.relayNodes, deviceID: model.relayDeviceID,
+                              locked: model.relaySettingsLocked, measurements: model.relayNodeMeasurements,
+                              loadTrust: model.relayCertificate, saveNode: model.saveRelayNode, save: model.saveRelayConfiguration)
         }
         .onReceive(NotificationCenter.default.publisher(for: SystemQuitHandler.dismissSheets)) { _ in
             showRelaySettings = false; confirmingRegeneration = false
@@ -63,6 +64,10 @@ struct SharingView: View {
                     Label("自托管中继", systemImage: "network").font(.headline)
                     Text(model.relayEnabled ? model.relayHostStatus : "未启用；现有直连方式保持可用。")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    if model.relayEnabled, model.relayNodes.count > 1 {
+                        Text("共享时在 \(model.relayNodes.count) 个节点同时登记，另一台 Mac 可经任一节点连接。")
+                            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
                     if model.relayEnabled, !model.relayDeviceID.isEmpty {
                         Text("本机设备标识").font(.caption).foregroundStyle(.secondary)
                         Text(model.relayDeviceID).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)

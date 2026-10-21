@@ -279,10 +279,17 @@ public struct MediaPathPolicy: Sendable {
         return abandonAttempt ? [.reduceLoad(.network), .retryUDP] : [.retryUDP]
     }
 
+    /// `path` carried the committed keyframe. A recovery committed on TCP while a UDP trial waits for its
+    /// retry keeps the picture current, but it neither proves UDP nor clears UDP failures.
     @discardableResult
-    public mutating func mediaBecameUsable(epoch: UInt32, now: TimeInterval) -> Bool {
+    public mutating func mediaBecameUsable(epoch: UInt32, path: MediaPath, now: TimeInterval) -> Bool {
         guard accept(now), !paused, phase != .stopped, self.epoch == epoch else { return false }
-        if targetPath == .udp { udpMediaFailures = 0 }
+        guard path == targetPath else {
+            // That recovery held the UDP retry back, so the retry's trial window starts no earlier than now.
+            if phase == .trialUDP, !trialHasFrame, let started = selectionStartedAt { selectionStartedAt = max(started, now) }
+            return false
+        }
+        if path == .udp { udpMediaFailures = 0 }
         if phase == .trialUDP {
             activePath = .udp; trialHasFrame = true
             return true

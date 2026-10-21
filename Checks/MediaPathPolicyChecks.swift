@@ -16,7 +16,7 @@ func runMediaPathPolicyChecks() {
         _ = policy.tick(now: 0)
         guard let id = policy.probeID else { throw CheckFailure("Initial probe missing") }
         _ = policy.probeSucceeded(id: id, now: 0.1)
-        try check(policy.mediaBecameUsable(epoch: policy.epoch, now: 0.2), "Initial decoded keyframe rejected")
+        try check(policy.mediaBecameUsable(epoch: policy.epoch, path: .udp, now: 0.2), "Initial decoded keyframe rejected")
         return policy
     }
 
@@ -81,9 +81,9 @@ func runMediaPathPolicyChecks() {
         let selected = policy.probeSucceeded(id: id, now: 0.2)
         try check(selected == [.cancelProbe(id: id), .selectPath(.udp, epoch: 1, reason: .initialProbe)]
                   && policy.targetPath == .udp && policy.activePath == .tcp, "UDP became active before decoding")
-        try check(!policy.mediaBecameUsable(epoch: 0, now: 0.3) && policy.activePath == .tcp,
+        try check(!policy.mediaBecameUsable(epoch: 0, path: .udp, now: 0.3) && policy.activePath == .tcp,
                   "Old frame committed a new path")
-        try check(policy.mediaBecameUsable(epoch: 1, now: 0.4) && policy.activePath == .udp,
+        try check(policy.mediaBecameUsable(epoch: 1, path: .udp, now: 0.4) && policy.activePath == .udp,
                   "Matching keyframe did not activate UDP")
         try check(policy.probeFailed(id: id, now: 0.5).isEmpty, "Stale probe failure interrupted active media")
     }
@@ -105,8 +105,10 @@ func runMediaPathPolicyChecks() {
         let failed = policy.tick(now: 1_001)
         try check(failed == [.selectPath(.tcp, epoch: oldEpoch + 1, reason: .noPong)]
                   && policy.targetPath == .tcp && policy.activePath == .udp, "Missing pong did not request fast TCP fallback")
-        try check(!policy.mediaBecameUsable(epoch: oldEpoch, now: 1_001), "Old decode confirmed fallback")
-        try check(policy.mediaBecameUsable(epoch: policy.epoch, now: 1_001) && policy.activePath == .tcp,
+        try check(!policy.mediaBecameUsable(epoch: oldEpoch, path: .tcp, now: 1_001), "Old decode confirmed fallback")
+        try check(!policy.mediaBecameUsable(epoch: policy.epoch, path: .udp, now: 1_001) && policy.phase == .switchingTCP,
+                  "A late UDP keyframe confirmed the TCP fallback")
+        try check(policy.mediaBecameUsable(epoch: policy.epoch, path: .tcp, now: 1_001) && policy.activePath == .tcp,
                   "Confirmed TCP did not become active")
     }
 
@@ -145,7 +147,7 @@ func runMediaPathPolicyChecks() {
                   && policy.nextRecoveryAt == 32.4 && policy.recoveryAttempt == 1,
                   "Repeated UDP media failures did not enter TCP cooldown")
         try check(policy.mediaFailed(epoch: failedEpoch, now: 2.5).isEmpty, "A repeated failure selected another epoch")
-        try check(policy.mediaBecameUsable(epoch: policy.epoch, now: 2.6), "TCP fallback could not commit")
+        try check(policy.mediaBecameUsable(epoch: policy.epoch, path: .tcp, now: 2.6), "TCP fallback could not commit")
         try check(policy.tick(now: 32.39).isEmpty, "Media failure skipped recovery cooldown")
         try check(policy.tick(now: 32.4).count == 1 && policy.phase == .probingRecovery,
                   "Media failure did not allow a later bounded recovery probe")
@@ -159,10 +161,32 @@ func runMediaPathPolicyChecks() {
         for round in 0..<6 {
             let now = Double(round) * 10 + 1
             try check(stable.mediaFailed(epoch: stable.epoch, now: now) == [.retryUDP], "An isolated failure left UDP")
-            try check(stable.mediaBecameUsable(epoch: stable.epoch, now: now + 1) || stable.phase == .udp || stable.phase == .trialUDP,
+            try check(stable.mediaBecameUsable(epoch: stable.epoch, path: .udp, now: now + 1) || stable.phase == .udp || stable.phase == .trialUDP,
                       "Recovered UDP video was not accepted")
         }
         try check(stable.targetPath == .udp && stable.udpMediaFailures == 0, "Recovered failures still counted toward TCP")
+        // A UDP trial started from TCP: recoveries committed on TCP between its retries keep the picture,
+        // but neither prove UDP nor clear its failures, and each one gives the next UDP attempt its full window.
+        var recovering = try udp()
+        _ = recovering.tick(now: 1.1)
+        _ = recovering.mediaBecameUsable(epoch: recovering.epoch, path: .tcp, now: 1.1)
+        _ = recovering.tick(now: 31.1)
+        guard let recoveryProbe = recovering.probeID else { throw CheckFailure("No recovery probe") }
+        _ = recovering.probeSucceeded(id: recoveryProbe, now: 32)
+        try check(recovering.mediaFailed(epoch: recovering.epoch, now: 32.5) == [.retryUDP] && recovering.udpMediaFailures == 1,
+                  "A failed UDP keyframe during recovery did not retry UDP")
+        for second in 33...35 { recovering.receivedPong(epoch: recovering.epoch, now: Double(second)) }
+        try check(!recovering.mediaBecameUsable(epoch: recovering.epoch, path: .tcp, now: 35)
+                  && recovering.udpMediaFailures == 1 && recovering.activePath == .tcp && recovering.phase == .trialUDP,
+                  "A recovery committed on TCP counted as UDP video")
+        recovering.receivedPong(epoch: recovering.epoch, now: 36)
+        try check(recovering.tick(now: 36.5).isEmpty, "A TCP recovery that delayed the UDP retry cut its trial window short")
+        recovering.receivedPong(epoch: recovering.epoch, now: 37)
+        try check(recovering.tick(now: 37.1) == [.reduceLoad(.network), .retryUDP] && recovering.udpMediaFailures == 2,
+                  "A silent UDP retry after a TCP recovery was not counted")
+        let recoveringEpoch = recovering.epoch
+        try check(recovering.mediaFailed(epoch: recoveringEpoch, now: 37.5) == [.selectPath(.tcp, epoch: recoveringEpoch + 1, reason: .mediaTimeout)],
+                  "TCP recoveries between UDP retries let UDP keep failing past the limit")
     }
     run("Network degradation never changes the path; quality adaptation owns it") {
         var policy = try udp()
@@ -220,13 +244,13 @@ func runMediaPathPolicyChecks() {
     run("Recovery requires cooldown, a fresh probe, usable media and five healthy effective seconds") {
         var policy = try udp()
         _ = policy.tick(now: 1.1)
-        try check(policy.mediaBecameUsable(epoch: policy.epoch, now: 1.1), "TCP fallback missing")
+        try check(policy.mediaBecameUsable(epoch: policy.epoch, path: .tcp, now: 1.1), "TCP fallback missing")
         try check(policy.tick(now: 31.09).isEmpty, "Recovery ignored 30-second cooldown")
         _ = policy.tick(now: 31.1)
         guard let id = policy.probeID else { throw CheckFailure("No recovery probe") }
         _ = policy.probeSucceeded(id: id, now: 32)
         try check(policy.activePath == .tcp && policy.phase == .trialUDP, "Probe alone activated UDP")
-        try check(policy.mediaBecameUsable(epoch: policy.epoch, now: 32), "New keyframe was rejected")
+        try check(policy.mediaBecameUsable(epoch: policy.epoch, path: .udp, now: 32), "New keyframe was rejected")
         for step in 1...30 {
             let now = 32 + Double(step)
             policy.receivedPong(epoch: policy.epoch, now: now)
@@ -239,11 +263,11 @@ func runMediaPathPolicyChecks() {
         _ = policy.tick(now: 63.5)
         try check(policy.targetPath == .tcp && policy.recoveryAttempt == 2 && policy.nextRecoveryAt == 123.5,
                   "A UDP route that failed after a minute did not escalate its backoff")
-        try check(policy.mediaBecameUsable(epoch: policy.epoch, now: 63.6), "Second TCP fallback missing")
+        try check(policy.mediaBecameUsable(epoch: policy.epoch, path: .tcp, now: 63.6), "Second TCP fallback missing")
         _ = policy.tick(now: 123.5)
         guard let second = policy.probeID else { throw CheckFailure("No second recovery probe") }
         _ = policy.probeSucceeded(id: second, now: 124)
-        try check(policy.mediaBecameUsable(epoch: policy.epoch, now: 124), "Recovered keyframe was rejected")
+        try check(policy.mediaBecameUsable(epoch: policy.epoch, path: .udp, now: 124), "Recovered keyframe was rejected")
         for step in 1...300 {
             let now = 124 + Double(step)
             policy.receivedPong(epoch: policy.epoch, now: now)

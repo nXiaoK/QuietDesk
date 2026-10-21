@@ -573,7 +573,7 @@ public final class MediaSession: @unchecked Sendable {
             diagnostics?.record(.mediaSwitch, since: pending.diagnostic, kind: .mediaFrame, identifier: 1)
             recordTransport(path)
             onCommitStream?(stream, packet)
-            _ = policy.mediaBecameUsable(epoch: policy.epoch, now: SessionClock.now)
+            _ = policy.mediaBecameUsable(epoch: policy.epoch, path: path == .udp ? .udp : .tcp, now: SessionClock.now)
             sendTransaction(.committed, pending)
             transaction = nil
             reliableDeliveryFailures = 0

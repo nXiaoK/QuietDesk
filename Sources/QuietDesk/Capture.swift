@@ -700,15 +700,19 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     /// QuietDesk's own included, stays visible to the viewer. An empty list captures everything.
     func setExcludedWindows(_ windowIDs: [CGWindowID]) async throws {
         let wanted = Set(windowIDs)
-        let snapshot = try queue.sync { () throws -> (SCStream, CGDirectDisplayID)? in
-            guard running, let stream, let displayID else { throw DeskError.invalid("屏幕采集尚未就绪") }
-            if let operation = cursorOperationID { cancelCursorOperation(operation); throw DeskError.invalid("光标采集正在更新，请稍后调整防窥") }
-            if let waiter = cursorFrameWaiter {
-                cancelCursorRequest(waiter.id)
-                throw DeskError.invalid("正在等待光标采集的新画面")
+        // A cursor change in progress finishes first; cancelling it would force a rollback that
+        // needs yet another fresh frame, which a still screen may never deliver.
+        var snapshot: (SCStream, CGDirectDisplayID)?
+        for attempt in 0..<100 {
+            let busy = try queue.sync { () throws -> Bool in
+                guard running, let stream, let displayID else { throw DeskError.invalid("屏幕采集尚未就绪") }
+                if cursorOperationID != nil || cursorFrameWaiter != nil { return true }
+                snapshot = excludedWindowIDs == wanted ? nil : (stream, displayID)
+                return false
             }
-            guard excludedWindowIDs != wanted else { return nil }
-            return (stream, displayID)
+            guard busy else { break }
+            guard attempt < 99 else { throw DeskError.invalid("光标采集正在更新，请稍后调整防窥") }
+            try await Task.sleep(for: .milliseconds(50))
         }
         guard let snapshot else { return }
         var display: SCDisplay?

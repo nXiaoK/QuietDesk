@@ -2121,7 +2121,8 @@ final class DeskModel: ObservableObject {
             return
         }
         let token = generation
-        let capture = host.captureTask, cursor = host.cursorTask
+        // Capture changes run in the order they were requested; the curtain never interrupts one.
+        let capture = host.captureTask, cursor = host.cursorTask, pause = host.pauseTask, video = host.settingsTask
         host.effectsTask = Task { [weak self, weak peer, weak host] in
             guard let self, let peer, let host, self.hostSession === host else { return }
             defer { if self.generation == token, self.peer === peer, self.hostSession === host { host.effectsTask = nil } }
@@ -2130,6 +2131,8 @@ final class DeskModel: ObservableObject {
             do {
                 await capture?.value
                 await cursor?.value
+                await pause?.value
+                await video?.value
                 try Task.checkCancellation()
                 _ = try await effects.apply(request.state) { try await streamer.setExcludedWindows($0) }
             } catch { failure = error.localizedDescription }
@@ -2317,7 +2320,7 @@ final class DeskModel: ObservableObject {
         }
         host.injector?.releaseAll()
         let token = generation
-        let capture = host.captureTask, video = host.settingsTask, cursor = host.cursorTask
+        let capture = host.captureTask, video = host.settingsTask, cursor = host.cursorTask, effects = host.effectsTask
         host.pauseTask = Task { [weak self, weak peer, weak host] in
             guard let self, let peer, let host, self.hostSession === host else { return }
             defer {
@@ -2329,6 +2332,7 @@ final class DeskModel: ObservableObject {
             await capture?.value
             await video?.value
             await cursor?.value
+            await effects?.value
             guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer, !Task.isCancelled else { return }
             await self.suspendMediaForConfiguration(host.media)
             guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
@@ -2385,6 +2389,7 @@ final class DeskModel: ObservableObject {
         let capture = host.captureTask
         let pause = host.pauseTask
         let cursor = host.cursorTask
+        let effects = host.effectsTask
         host.settingsTask = Task { [weak self, weak peer, weak host] in
             guard let self, let peer, let host, self.hostSession === host else { return }
             defer {
@@ -2396,6 +2401,7 @@ final class DeskModel: ObservableObject {
                 await capture?.value
                 await pause?.value
                 await cursor?.value
+                await effects?.value
                 guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
                       host.settingsRequestID == request.id, !Task.isCancelled else { return }
                 // Automatic adaptation mostly changes bitrate; keep the stream running instead of rebuilding it.

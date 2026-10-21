@@ -338,7 +338,9 @@ private final class SessionPrivacyWindows: SessionPrivacyCover {
     private func makeWindow(_ screen: NSScreen) -> NSWindow {
         let window = PrivacyCoverWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
         window.backgroundColor = .black
-        window.isOpaque = true
+        // Declared non-opaque on purpose: an opaque full-screen window marks every window below it as
+        // occluded, and browsers and Electron apps then stop drawing, freezing what the viewer sees.
+        window.isOpaque = false
         window.hasShadow = false
         window.level = .screenSaver
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]

@@ -164,7 +164,6 @@ public final class MediaSession: @unchecked Sendable {
     private var pacingScheduled = false
     private var pacingTimer: DispatchSourceTimer?
     private var pacingGeneration: UInt64 = 0
-    private var firstFragments: [MediaFrameHeader: TimeInterval] = [:]
     private var decoding: Set<MediaFrameHeader> = []
     private var reassembledLocally: Set<MediaFrameHeader> = []
     private var reassembledAtPeer: Set<MediaFrameHeader> = []
@@ -385,7 +384,7 @@ public final class MediaSession: @unchecked Sendable {
             self.pendingAuxiliary.removeAll()
             self.transaction = nil; self.active = nil; self.receiver = nil; self.cache = nil
             self.bindingToken = nil; self.datagramKey = nil; self.grant = nil
-            self.clearDatagrams(); self.firstFragments.removeAll()
+            self.clearDatagrams()
             self.onDatagramPathRetired?(); self.alternateEndpoint?.retire?()
         }
     }
@@ -514,7 +513,7 @@ public final class MediaSession: @unchecked Sendable {
             if side == .viewer {
                 guard pending.stage == .preparing else { return }
                 receiver = try MediaFrameReassembler(stream: stream, limits: bufferLimits)
-                firstFragments.removeAll(); decoding.removeAll(); reassembledLocally.removeAll()
+                decoding.removeAll(); reassembledLocally.removeAll()
                 pending.stage = .ready; transaction = pending
                 sendTransaction(.ready, pending)
             } else {
@@ -804,7 +803,6 @@ public final class MediaSession: @unchecked Sendable {
                 let fragment = try MediaFragment.decode(Data(data.dropFirst()))
                 guard fragment.header.stream == expectedStream else { return }
                 samplePackets += 1; lastVideoAt = SessionClock.now
-                if firstFragments[fragment.header] == nil, firstFragments.count < 3 { firstFragments[fragment.header] = SessionClock.now }
                 handleReceiveEvents(try receiver?.receive(fragment) ?? [])
             case 4:
                 guard side == .host, udpVerified else { return }
@@ -931,9 +929,10 @@ public final class MediaSession: @unchecked Sendable {
             case .feedback(let feedback):
                 if feedback.kind == .reassembled { reassembledLocally.insert(feedback.header) }
                 if feedback.kind == .decoded { reassembledLocally.remove(feedback.header) }
-                if feedback.kind == .reassembled, let began = firstFragments.removeValue(forKey: feedback.header) {
-                    sampleWaitMilliseconds = max(sampleWaitMilliseconds, (SessionClock.now - began) * 1000)
-                    recordDuration(.mediaReassembly, seconds: SessionClock.now - began, identifier: feedback.header.frameID)
+                // The reassembler owns this wait, so late, repeated or expired fragments cannot leave stale timing.
+                if feedback.kind == .reassembled, let waited = receiver?.collectionDuration(of: feedback.header) {
+                    sampleWaitMilliseconds = max(sampleWaitMilliseconds, waited * 1000)
+                    recordDuration(.mediaReassembly, seconds: waited, identifier: feedback.header.frameID)
                 }
                 if feedback.kind == .expired { diagnostics?.recordValue(.mediaExpired, 1, kind: .mediaFrame, identifier: feedback.header.frameID) }
                 if !decoderFailure || feedback.kind != .expired { sendFeedback(feedback) }

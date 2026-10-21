@@ -293,7 +293,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
                 print("LARGE",summary.metric.rawValue,"count",summary.count,"max",summary.maximum,"frame",summary.worstIdentifier ?? 0)
             }
         }
-        for expected: PerformanceMetric in [.mediaRoundTrip,.mediaSwitch,.mediaTransport,.mediaDatagramSentBytes,.mediaDatagramReceivedBytes] {
+        for expected: PerformanceMetric in [.mediaRoundTrip,.mediaSwitch,.mediaTransport,.mediaDatagramSentBytes,.mediaDatagramReceivedBytes,.mediaReassembly] {
             try require(metrics.contains(expected),"Missing observable media diagnostic \(expected)")
         }
     }

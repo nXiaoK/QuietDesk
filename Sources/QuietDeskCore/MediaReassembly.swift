@@ -75,6 +75,7 @@ public final class MediaFrameReassembler {
         let header: MediaFrameHeader
         let totalBytes: Int
         let fragmentCount: Int
+        let fragmented: Bool
         let firstReceivedAt: TimeInterval
         var lastProgressAt: TimeInterval
         var lastNackAt: TimeInterval?
@@ -89,6 +90,7 @@ public final class MediaFrameReassembler {
             header = fragment.header
             totalBytes = fragment.frameBytes
             fragmentCount = Int(fragment.fragmentCount)
+            fragmented = true
             firstReceivedAt = now
             lastProgressAt = now
             bytes = Data(count: totalBytes)
@@ -99,6 +101,7 @@ public final class MediaFrameReassembler {
             header = frame.header
             totalBytes = bytes.count
             fragmentCount = (bytes.count + MediaFragment.maximumPayloadBytes - 1) / MediaFragment.maximumPayloadBytes
+            fragmented = false
             firstReceivedAt = now
             lastProgressAt = now
             self.bytes = bytes
@@ -242,6 +245,13 @@ public final class MediaFrameReassembler {
         updateGap(at: now)
         events += readyFrame()
         return events
+    }
+
+    // First fragment to completion, while the frame is still held. Whole frames had no fragment wait.
+    public func collectionDuration(of header: MediaFrameHeader) -> TimeInterval? {
+        guard let assembly = assemblies[header.frameID], assembly.header == header, assembly.fragmented,
+              let completedAt = assembly.completedAt else { return nil }
+        return completedAt - assembly.firstReceivedAt
     }
 
     public func poll() -> [MediaReceiveEvent] {

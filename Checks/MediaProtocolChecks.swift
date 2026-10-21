@@ -150,6 +150,39 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         try require(!feedback(receiver.poll(), .expired).isEmpty, "Repeated fragment extended frame lifetime")
     }
 
+    run("Fragment wait stays measurable after repeated, late and expired fragments") {
+        let time = MediaCheckClock()
+        let receiver = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        // A stable stream sees repairs and late copies on every frame; none may use up later measurements.
+        for id in UInt64(1)...6 {
+            let current = try frame(id, idr: id == 1, bytes: 3_000)
+            let parts = try MediaFragment.fragment(frame: current)
+            time.now = Double(id)
+            _ = try receiver.receive(parts[0])
+            try require(receiver.collectionDuration(of: current.header) == nil, "Incomplete frame \(id) reported a wait")
+            time.now = Double(id) + 0.04
+            var events: [MediaReceiveEvent] = []
+            for fragment in parts.dropFirst() { events += try receiver.receive(fragment) }
+            try require(feedback(events, .reassembled).count == 1, "Frame \(id) did not complete")
+            try require(receiver.collectionDuration(of: current.header).map { abs($0 - 0.04) < 0.000_001 } == true,
+                        "Frame \(id) wait was not measured from its first fragment")
+            try require(feedback(try receiver.receive(parts[1]), .reassembled).isEmpty, "Repeated fragment completed frame \(id) again")
+            _ = receiver.decoded(current.header, success: true)
+            try require(receiver.collectionDuration(of: current.header) == nil, "Decoded frame \(id) kept its timing")
+            try require(feedback(try receiver.receive(parts[0]), .reassembled).isEmpty
+                        && receiver.collectionDuration(of: current.header) == nil, "Late fragment revived frame \(id) timing")
+        }
+        let whole = try frame(7, bytes: 3_000)
+        try require(feedback(try receiver.receive(whole), .reassembled).count == 1
+                    && receiver.collectionDuration(of: whole.header) == nil, "Whole TCP frame reported a fragment wait")
+        _ = receiver.decoded(whole.header, success: true)
+        let lost = try frame(8, bytes: 3_000)
+        _ = try receiver.receive(MediaFragment.fragment(frame: lost)[0])
+        time.now += 1
+        try require(!feedback(receiver.poll(), .expired).isEmpty && receiver.collectionDuration(of: lost.header) == nil,
+                    "Expired frame kept its timing")
+    }
+
     run("A paced 512 KiB IDR does not NACK fragments still ahead of receiving progress") {
         let time = MediaCheckClock()
         let receiver = try MediaFrameReassembler(stream: stream, clock: { time.now })

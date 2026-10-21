@@ -239,7 +239,25 @@ func runMediaPathPolicyChecks() {
             if step < 5 { try check(policy.phase == .trialUDP, "Recovery skipped actual media trial") }
             if step == 5 { try check(policy.phase == .udp && policy.recoveryAttempt == 1, "Trial reset backoff too early") }
         }
-        try check(policy.phase == .udp && policy.recoveryAttempt == 0, "Sustained healthy UDP did not reset backoff")
+        // Thirty healthy seconds are not proof: the logged relay alternated about once a minute this way.
+        try check(policy.phase == .udp && policy.recoveryAttempt == 1, "A short healthy UDP run reset backoff")
+        _ = policy.tick(now: 63.5)
+        try check(policy.targetPath == .tcp && policy.recoveryAttempt == 2 && policy.nextRecoveryAt == 123.5,
+                  "A UDP route that failed after a minute did not escalate its backoff")
+        try check(policy.mediaBecameUsable(epoch: policy.epoch, now: 63.6), "Second TCP fallback missing")
+        _ = policy.tick(now: 123.5)
+        guard let second = policy.probeID else { throw CheckFailure("No second recovery probe") }
+        _ = policy.probeSucceeded(id: second, now: 124)
+        try check(policy.mediaBecameUsable(epoch: policy.epoch, now: 124), "Recovered keyframe was rejected")
+        for step in 1...300 {
+            let now = 124 + Double(step)
+            policy.receivedPong(epoch: policy.epoch, now: now)
+            _ = policy.observe(sample(active: step % 60 != 0), epoch: policy.epoch, now: now)
+        }
+        try check(policy.recoveryAttempt == 2, "Backoff reset before UDP lasted five minutes")
+        _ = policy.tick(now: 425.5)
+        try check(policy.targetPath == .tcp && policy.recoveryAttempt == 1 && policy.nextRecoveryAt == 455.5,
+                  "UDP that lasted five minutes, including static moments, did not earn a fresh backoff")
     }
 
     run("Pausing or stopping a probe fences its callbacks and resumes with a different probe identity") {

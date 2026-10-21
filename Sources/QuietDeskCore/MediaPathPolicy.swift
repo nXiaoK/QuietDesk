@@ -133,7 +133,7 @@ public struct MediaPathPolicy: Sendable {
     private var computeBadDuration: TimeInterval = 0
     private var computeBottleneck: MediaBottleneck?
     private var loadReduced = false
-    private var healthyDuration: TimeInterval = 0
+    private var udpSelectedAt: TimeInterval?
     private var trialDuration: TimeInterval = 0
     private var trialHasFrame = false
     private var pausedAt: TimeInterval?
@@ -174,7 +174,7 @@ public struct MediaPathPolicy: Sendable {
         guard advanceEpoch() else { return [.cancelProbe(id: id), .restartSession(reason: .epochExhausted)] }
         probeID = nil; probeDeadline = nil; nextRecoveryAt = nil
         targetPath = .udp; phase = .trialUDP
-        selectionStartedAt = now; lastPongAt = now
+        selectionStartedAt = now; lastPongAt = now; udpSelectedAt = now
         lastObservationAt = now
         resetEvidence(); trialHasFrame = false
         lastReason = initial ? .initialProbe : .recoveryProbe
@@ -233,7 +233,7 @@ public struct MediaPathPolicy: Sendable {
         guard phase == .trialUDP || phase == .udp || phase == .tcpTrial || phase == .tcp else { return [] }
         let cause = sample.bottleneck
         if cause == .encoder || cause == .decoder {
-            networkBadDuration = 0; loadReduced = false; healthyDuration = 0
+            networkBadDuration = 0; loadReduced = false
             if computeBottleneck != cause { computeBadDuration = 0 }
             computeBottleneck = cause; computeBadDuration += elapsed
             if computeBadDuration + mediaPolicyTimeTolerance >= 3 {
@@ -243,9 +243,9 @@ public struct MediaPathPolicy: Sendable {
             return []
         }
         computeBadDuration = 0; computeBottleneck = nil
-        guard sample.hasNetworkEvidence else { networkBadDuration = 0; healthyDuration = 0; return [] }
+        guard sample.hasNetworkEvidence else { networkBadDuration = 0; return [] }
         if cause == .network {
-            healthyDuration = 0; trialDuration = 0
+            trialDuration = 0
             networkBadDuration += elapsed
             if networkBadDuration + mediaPolicyTimeTolerance >= 3 {
                 networkBadDuration = 0
@@ -256,7 +256,6 @@ public struct MediaPathPolicy: Sendable {
             return []
         }
         networkBadDuration = 0; loadReduced = false
-        healthyDuration += elapsed
         if phase == .trialUDP, trialHasFrame {
             trialDuration += elapsed
             if trialDuration + mediaPolicyTimeTolerance >= 5 { phase = .udp }
@@ -264,7 +263,6 @@ public struct MediaPathPolicy: Sendable {
             trialDuration += elapsed
             if trialDuration + mediaPolicyTimeTolerance >= 5 { phase = .tcp }
         }
-        if targetPath == .udp, healthyDuration + mediaPolicyTimeTolerance >= 30 { recoveryAttempt = 0 }
         return []
     }
 
@@ -283,6 +281,7 @@ public struct MediaPathPolicy: Sendable {
             let duration = max(0, now - (pausedAt ?? now))
             if let nextRecoveryAt { self.nextRecoveryAt = nextRecoveryAt + duration }
             if let selectionStartedAt { self.selectionStartedAt = selectionStartedAt + duration }
+            if let udpSelectedAt { self.udpSelectedAt = udpSelectedAt + duration }
             if targetPath == .udp { lastPongAt = now }
             pausedAt = nil
             if let initial = resumeProbeIsInitial {
@@ -297,7 +296,7 @@ public struct MediaPathPolicy: Sendable {
         guard phase != .stopped else { return [] }
         let action = probeID.map { MediaPathAction.cancelProbe(id: $0) }
         probeID = nil; probeDeadline = nil; nextRecoveryAt = nil; resumeProbeIsInitial = nil
-        selectionStartedAt = nil; lastPongAt = nil; pausedAt = nil
+        selectionStartedAt = nil; lastPongAt = nil; pausedAt = nil; udpSelectedAt = nil
         if epoch < .max { epoch += 1 }
         phase = .stopped; activePath = nil
         resetEvidence()
@@ -328,6 +327,10 @@ public struct MediaPathPolicy: Sendable {
     private mutating func fallBack(now: TimeInterval, reason: MediaPathReason) -> [MediaPathAction] {
         guard targetPath == .udp else { return [] }
         guard advanceEpoch() else { return [.restartSession(reason: .epochExhausted)] }
+        // Only UDP that lasted about five minutes earns a fresh backoff. A route that fails every
+        // minute or so keeps escalating, instead of switching paths every 30 seconds forever.
+        if let udpSelectedAt, now - udpSelectedAt + mediaPolicyTimeTolerance >= 300 { recoveryAttempt = 0 }
+        udpSelectedAt = nil
         targetPath = .tcp; phase = .switchingTCP
         selectionStartedAt = now; lastPongAt = nil; lastObservationAt = now
         lastReason = reason; scheduleRecovery(now: now); resetEvidence()
@@ -351,7 +354,7 @@ public struct MediaPathPolicy: Sendable {
     private mutating func resetEvidence(preservingReduction: Bool = false) {
         networkBadDuration = 0; computeBadDuration = 0; computeBottleneck = nil
         if !preservingReduction { loadReduced = false }
-        healthyDuration = 0; trialDuration = 0
+        trialDuration = 0
     }
 }
 

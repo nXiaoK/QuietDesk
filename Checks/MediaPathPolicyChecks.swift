@@ -530,6 +530,27 @@ func runMediaPathPolicyChecks() {
                                            appliedSize: (3456, 2234), now: 0)
         try check(known.reduceLoad(for: .network, severe: true, now: 2) == StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 30),
                   "A known laptop-sized source was treated as 8K and lost smoothness")
+        // Scaling floors to even pixels: a 2940 × 1912 source at the 1920 edge is 1918 wide, not the whole screen.
+        let wide = StreamSettings(longestEdge: 3840, framesPerSecond: 30, megabits: 30)
+        let reduced = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 30)
+        let rounded = reduced.dimensions(width: 2940, height: 1912)
+        try check(rounded.0 == 1918, "Rounding fixture no longer loses pixels: \(rounded)")
+        func firstUpgrade(_ policy: inout MediaQualityPolicy, after start: TimeInterval) -> StreamSettings? {
+            var time = start, upgraded: StreamSettings?
+            while time < start + 60, upgraded == nil { time += 1; upgraded = policy.observe(sample(), now: time) }
+            return upgraded
+        }
+        var sharper = try MediaQualityPolicy(hostDefault: wide, preferred: wide, applied: reduced, bitRates: StreamSettings.adaptiveBitRates,
+                                             appliedSize: rounded, now: 0)
+        let restored = firstUpgrade(&sharper, after: 0)
+        try check(restored?.longestEdge == 2560, "An output rounded below its edge capped the size: \(String(describing: restored))")
+        // A larger output later (the shared display changed) lifts a size learned from a smaller screen.
+        var grown = try MediaQualityPolicy(hostDefault: wide, preferred: wide, applied: reduced, bitRates: StreamSettings.adaptiveBitRates,
+                                           appliedSize: (1280, 800), now: 0)
+        try check(firstUpgrade(&grown, after: 0) == nil, "A 1280-wide screen was offered a larger size")
+        try grown.synchronizeApplied(reduced, size: (1920, 1200), now: 100)
+        let lifted = firstUpgrade(&grown, after: 100)
+        try check(lifted?.longestEdge == 2560, "A larger screen stayed capped at its earlier size: \(String(describing: lifted))")
         try rejects("Unknown bitrate steps were accepted") { _ = try MediaQualityPolicy(hostDefault: native, bitRates: [7, 9], now: 0) }
     }
 

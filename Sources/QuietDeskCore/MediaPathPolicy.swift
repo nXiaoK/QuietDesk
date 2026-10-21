@@ -610,12 +610,15 @@ public struct MediaQualityPolicy: Sendable {
         return true
     }
 
-    // An output smaller than its requested edge is the whole source, which caps every larger setting.
+    // An output clearly smaller than its requested edge is the whole source, which caps every larger setting.
+    // Scaling floors to even pixels, so an output within two pixels of the edge only shows the source is at
+    // least that large, and lifts a smaller size learned before (the shared display may have changed).
     private mutating func learn(_ size: (width: Int, height: Int), for settings: StreamSettings) {
         let longest = max(size.width, size.height), shortest = min(size.width, size.height)
         guard (2...8192).contains(longest), shortest >= 2 else { return }
         aspect = Double(shortest) / Double(longest)
-        if longest < settings.longestEdge { sourceLongestEdge = longest }
+        if longest < settings.longestEdge - 2 { sourceLongestEdge = longest }
+        else if let known = sourceLongestEdge, known < longest { sourceLongestEdge = nil }
     }
 
     private func shownEdge(_ settings: StreamSettings) -> Int {

@@ -72,6 +72,7 @@ private final class UpdateCheckInstaller: UpdateInstalling, @unchecked Sendable 
     private var result: UpdateInstaller.InstallationResult?
     var manualReason: String?
     var ignoresLaunchCancellation = false
+    var launchDelay: Duration = .milliseconds(150)
     var downloadCount: Int { lock.withLock { downloads } }
     var launchCount: Int { lock.withLock { launches } }
     var discardCount: Int { lock.withLock { discards } }
@@ -101,7 +102,7 @@ private final class UpdateCheckInstaller: UpdateInstalling, @unchecked Sendable 
         lock.withLock { launches += 1 }
         if ignoresLaunchCancellation {
             await Task.detached { try? await Task.sleep(for: .milliseconds(150)) }.value
-        } else { try await Task.sleep(for: .milliseconds(150)) }
+        } else { try await Task.sleep(for: launchDelay) }
     }
     func abortPendingInstallation() { lock.withLock { aborts += 1 } }
     func discard(_ prepared: UpdateInstaller.PreparedUpdate) { lock.withLock { discards += 1 } }
@@ -304,14 +305,18 @@ private struct UpdateControllerChecks {
         await run("A ready installer handoff requests a single normal application termination and preserves staging") { directory in
             let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
             let installer = UpdateCheckInstaller(directory: directory)
+            installer.launchDelay = .milliseconds(400)
             var terminations = 0
             let controller = fixture.controller(installer: installer, terminate: { terminations += 1 })
+            defer { controller.shutdown() }
             controller.check(manual: false)
             try await settled(controller)
             controller.download()
             try await settled(controller)
             controller.install()
-            try await Task.sleep(for: .milliseconds(250))
+            let deadline = Date().addingTimeInterval(5)
+            while terminations == 0 && Date() < deadline { await drain() }
+            try requireUpdate(terminations == 1, "Installer handoff did not request application termination")
             controller.install()
             controller.shutdown()
             try requireUpdate(terminations == 1 && installer.launchCount == 1 && installer.discardCount == 0 && installer.abortCount == 0,

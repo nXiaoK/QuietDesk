@@ -1890,8 +1890,18 @@ final class DeskModel: ObservableObject {
     private func saveConnection(name: String) {
         guard !savedTarget, let target else { return }
         do {
-            var record = ConnectionStore.matching(connections, address: target.address, port: target.port, preferredID: target.recordID, relay: target.relay)
+            let existing = ConnectionStore.matching(connections, address: target.address, port: target.port, preferredID: target.recordID, relay: target.relay)
+            var record = existing
                 ?? ConnectionRecord(address: target.address, port: target.port, name: name, videoSettings: viewerQualityPolicy.preferred, relay: target.relay)
+            // Relay device IDs are scoped to a node, so another node gets its own record. This session
+            // authenticated with the source record's pairing code, which proves it is the same Mac, so
+            // that record's lock screen password follows.
+            if existing == nil, let source = target.recordID, source != record.id,
+               connections.first(where: { $0.id == source })?.relay?.deviceID == target.relay?.deviceID,
+               let password = try? KeyStore.loadSecret(account: Self.unlockAccount(source)) {
+                try? KeyStore.saveSecret(password, account: Self.unlockAccount(record.id))
+                Self.setAutoUnlock(Self.autoUnlocks(source), for: record.id)
+            }
             record.address = target.address; record.port = target.port; record.relay = target.relay
             record.name = name
             record.lastConnected = Date()

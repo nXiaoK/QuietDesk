@@ -4,14 +4,9 @@ import QuietDeskCore
 enum ConnectionStore {
     static func matching(_ records: [ConnectionRecord], address: String, port: UInt16,
                          preferredID: UUID? = nil, relay: RelayConnectionInfo? = nil) -> ConnectionRecord? {
-        if let relay {
-            // A relayed Mac is the same device through any node; a record on the same node wins a tie.
-            let device = records.filter { $0.relay?.deviceID == relay.deviceID }
-            if let preferredID, let selected = device.first(where: { $0.id == preferredID }) { return selected }
-            return device.first(where: { $0.relay?.endpoint == relay.endpoint }) ?? device.first
-        }
         func matches(_ record: ConnectionRecord) -> Bool {
-            record.relay == nil && record.matches(address: address, port: port)
+            if let relay { return record.relay?.endpoint == relay.endpoint && record.relay?.deviceID == relay.deviceID }
+            return record.relay == nil && record.matches(address: address, port: port)
         }
         if let preferredID, let selected = records.first(where: { $0.id == preferredID && matches($0) }) {
             return selected

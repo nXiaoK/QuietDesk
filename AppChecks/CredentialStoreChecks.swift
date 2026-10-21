@@ -352,25 +352,6 @@ private struct CredentialStoreChecks {
             try require(try codes.load()?.code == testKey().code, "Secret removal touched the pairing code")
         }
 
-        run("A relayed Mac keeps one record whichever node carried the connection") { _ in
-            let device = UUID()
-            let a = try RelayEndpoint(address: "tls://a.example:7443"), b = try RelayEndpoint(address: "tls://b.example:7443")
-            let onA = ConnectionRecord(address: "", port: 5908, name: "On A", relay: try RelayConnectionInfo(endpoint: a, deviceID: device))
-            let onB = ConnectionRecord(address: "", port: 5908, name: "On B", relay: try RelayConnectionInfo(endpoint: b, deviceID: device))
-            let other = ConnectionRecord(address: "", port: 5908, name: "Other",
-                                         relay: try RelayConnectionInfo(endpoint: b, deviceID: UUID()))
-            let viaB = try RelayConnectionInfo(endpoint: b, deviceID: device)
-            try require(ConnectionStore.matching([onA], address: "", port: 5908, relay: viaB)?.id == onA.id,
-                        "Another node created a second record for the same Mac")
-            try require(ConnectionStore.matching([onA, onB], address: "", port: 5908, relay: viaB)?.id == onB.id,
-                        "A record on the same node did not win the tie")
-            try require(ConnectionStore.matching([onA, onB], address: "", port: 5908, preferredID: onA.id, relay: viaB)?.id == onA.id,
-                        "The selected record lost to a node match")
-            try require(ConnectionStore.matching([other], address: "", port: 5908, relay: viaB) == nil,
-                        "A different device matched on node alone")
-            try require(ConnectionStore.matching([onA], address: "", port: 5908) == nil, "A relayed record matched a direct address")
-        }
-
         print("\(passed) credential and re-entry checks passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import QuietDeskCore
 
@@ -23,6 +24,21 @@ enum LocalDeviceIdentity {
         let document = try JSONDecoder().decode(Document.self, from: data)
         guard document.version == 1 else { throw DeskError.invalid("设备标识文件版本不受支持") }
         return document.id
+    }
+}
+
+// Totals change every second during a session. Only the statistics sheet observes them, so these
+// checkpoints do not re-render the main window, menu bar extra and commands each time.
+@MainActor
+final class TrafficHistoryFeed: ObservableObject {
+    @Published private(set) var records: [EndpointTrafficRecord] = []
+    @Published private(set) var legacyRecords: [DeviceTrafficRecord] = []
+    @Published private(set) var error: String?
+
+    func update(records: [EndpointTrafficRecord], legacyRecords: [DeviceTrafficRecord], error: String?) {
+        if self.records != records { self.records = records }
+        if self.legacyRecords != legacyRecords { self.legacyRecords = legacyRecords }
+        if self.error != error { self.error = error }
     }
 }
 

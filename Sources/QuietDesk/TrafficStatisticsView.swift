@@ -4,11 +4,12 @@ import SwiftUI
 
 struct TrafficStatisticsView: View {
     @ObservedObject var model: DeskModel
+    @ObservedObject var history: TrafficHistoryFeed
     let done: () -> Void
     @State private var selectedEndpoint: TrafficEndpoint?
 
     private var selectedRecord: EndpointTrafficRecord? {
-        model.trafficHistory.first { $0.id == selectedEndpoint }
+        history.records.first { $0.id == selectedEndpoint }
     }
 
     var body: some View {
@@ -27,7 +28,7 @@ struct TrafficStatisticsView: View {
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            if let error = model.trafficHistoryError {
+            if let error = history.error {
                 HStack(alignment: .top, spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                     ScrollView {
@@ -41,17 +42,17 @@ struct TrafficStatisticsView: View {
                 .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 7))
             }
 
-            if model.trafficHistory.isEmpty {
+            if history.records.isEmpty {
                 ContentUnavailableView {
                     Label("暂无地址流量", systemImage: "desktopcomputer")
                 } description: {
-                    Text(model.trafficHistoryError == nil
+                    Text(history.error == nil
                          ? "按网址/IP＋端口累计，建立连接后开始记录。"
                          : "当前没有可显示的统计，详细原因见上方提示。")
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                Table(model.trafficHistory, selection: $selectedEndpoint) {
+                Table(history.records, selection: $selectedEndpoint) {
                     TableColumn("网址/IP＋端口") { record in
                         Label {
                             Text(record.endpoint.label).textSelection(.enabled).lineLimit(1)
@@ -85,8 +86,8 @@ struct TrafficStatisticsView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
-            if !model.legacyTrafficHistory.isEmpty {
-                DisclosureGroup("旧版按设备统计（\(model.legacyTrafficHistory.count) 项）") {
+            if !history.legacyRecords.isEmpty {
+                DisclosureGroup("旧版按设备统计（\(history.legacyRecords.count) 项）") {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("旧记录未保存连接地址，无法拆分到网址/IP＋端口；原文件保留，以下数值不混入新增地址统计。")
                             .font(.caption).foregroundStyle(.secondary)
@@ -96,7 +97,7 @@ struct TrafficStatisticsView: View {
                                     Text("设备").frame(maxWidth: .infinity, alignment: .leading)
                                     Text("本机发送"); Text("本机接收"); Text("合计")
                                 }.font(.caption.weight(.medium))
-                                ForEach(model.legacyTrafficHistory) { record in
+                                ForEach(history.legacyRecords) { record in
                                     GridRow {
                                         Text(record.name).lineLimit(1)
                                             .help("\(record.name)\n首次统计：\(record.firstSeen.formatted(date: .abbreviated, time: .shortened))\n最近连接：\(record.lastSeen.formatted(date: .abbreviated, time: .shortened))")
@@ -120,7 +121,7 @@ struct TrafficStatisticsView: View {
                         Text("最近连接：\(selectedRecord.lastSeen.formatted(date: .abbreviated, time: .shortened))")
                     }
                 } else {
-                    Text(model.trafficHistory.isEmpty ? "从建立连接开始记录。" : "选择地址查看首次统计和最近连接时间。")
+                    Text(history.records.isEmpty ? "从建立连接开始记录。" : "选择地址查看首次统计和最近连接时间。")
                         .foregroundStyle(.secondary)
                 }
             }

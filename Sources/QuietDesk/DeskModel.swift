@@ -43,9 +43,7 @@ final class DeskModel: ObservableObject {
         return connectionError
     }
     @Published var traffic = "0.00 Mbps"
-    @Published private(set) var trafficHistory: [EndpointTrafficRecord] = []
-    @Published private(set) var legacyTrafficHistory: [DeviceTrafficRecord] = []
-    @Published private(set) var trafficHistoryError: String?
+    let trafficHistory = TrafficHistoryFeed()
     @Published private(set) var trafficHistoryStatus = "按网址/IP＋端口累计；旧版按设备统计单独保留。"
     @Published var frameRate = "0 fps"
     @Published var latency = "— ms"
@@ -330,9 +328,7 @@ final class DeskModel: ObservableObject {
         if let permissionTimer { RunLoop.main.add(permissionTimer, forMode: .common) }
         trafficHistoryStore.observe { [weak self] records, legacyRecords, message in
             DispatchQueue.main.async {
-                self?.trafficHistory = records
-                self?.legacyTrafficHistory = legacyRecords
-                self?.trafficHistoryError = message
+                self?.trafficHistory.update(records: records, legacyRecords: legacyRecords, error: message)
             }
         }
     }
@@ -459,7 +455,7 @@ final class DeskModel: ObservableObject {
             if localScreenRecording != allowed {
                 DiagnosticLog.shared.record(.permissionChanged, role: .host, values: [.screenRecordingGranted: allowed ? 1 : 0])
             }
-            localScreenRecording = allowed
+            if localScreenRecording != allowed { localScreenRecording = allowed }
         }
 
         if mode == .host, connected, canControl != accessibility {
@@ -479,16 +475,17 @@ final class DeskModel: ObservableObject {
         guard mode == .viewer, capsLockEnabled else {
             canvas.capsLockMonitor.stop()
             canvas.usesCapsLockActions = false
-            capsLockRunning = false
+            if capsLockRunning { capsLockRunning = false }
             capsLockStartAttempted = false
             return
         }
         guard accessibility, inputMonitoring else {
             canvas.capsLockMonitor.stop()
             canvas.usesCapsLockActions = false
-            capsLockRunning = false
+            if capsLockRunning { capsLockRunning = false }
             capsLockStartAttempted = false
-            inputStatus = "Caps Lock 等待本机辅助功能和输入监控生效；已勾选时请完全退出后重开，无需反复添加"
+            let waiting = "Caps Lock 等待本机辅助功能和输入监控生效；已勾选时请完全退出后重开，无需反复添加"
+            if inputStatus != waiting { inputStatus = waiting }
             return
         }
         if !canvas.capsLockMonitor.isRunning, retryCapsLock || !capsLockStartAttempted {
@@ -501,9 +498,10 @@ final class DeskModel: ObservableObject {
                 inputStatus = "系统权限已允许，输入监听尚未就绪：\(error.localizedDescription)。请重新检测或完全退出后重开"
             }
         }
-        capsLockRunning = canvas.capsLockMonitor.isRunning
+        if capsLockRunning != canvas.capsLockMonitor.isRunning { capsLockRunning = canvas.capsLockMonitor.isRunning }
         canvas.usesCapsLockActions = capsLockRunning && supportsInputActions && canControl && !sessionInputSuspended
-        if connected, !supportsInputActions { inputStatus = "远端版本较旧，请更新家里 Mac 后使用 Caps Lock 切换输入法" }
+        let outdated = "远端版本较旧，请更新家里 Mac 后使用 Caps Lock 切换输入法"
+        if connected, !supportsInputActions, inputStatus != outdated { inputStatus = outdated }
     }
 
     func prepareHostCode() {
@@ -2603,9 +2601,12 @@ final class DeskModel: ObservableObject {
                 }
                 let seconds = max(0.01, SessionClock.now - self.lastMetrics)
                 let metrics = self.dataChannel?.takeMetrics() ?? (bytes: 0, frames: 0)
-                self.traffic = String(format: "%.2f Mbps", Double(metrics.bytes) * 8 / seconds / 1_000_000)
-                self.frameRate = String(format: "%.0f fps", Double(metrics.frames) / seconds)
-                if let measured = self.viewerSession.lastLatencyAt, SessionClock.now - measured > 15 {
+                // @Published notifies on every assignment; a static picture keeps the same strings each second.
+                let traffic = String(format: "%.2f Mbps", Double(metrics.bytes) * 8 / seconds / 1_000_000)
+                let frameRate = String(format: "%.0f fps", Double(metrics.frames) / seconds)
+                if self.traffic != traffic { self.traffic = traffic }
+                if self.frameRate != frameRate { self.frameRate = frameRate }
+                if let measured = self.viewerSession.lastLatencyAt, SessionClock.now - measured > 15, self.latency != "— ms" {
                     self.latency = "— ms"
                 }
                 self.lastMetrics = SessionClock.now

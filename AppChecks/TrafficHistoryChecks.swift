@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import QuietDeskCore
 
@@ -260,6 +261,26 @@ private struct TrafficHistoryChecks {
             try require(!escaped, "Flush passed a delta before it was queued for storage")
             let reloaded = TrafficHistoryStore(directory: folder, checkpointInterval: 60)
             try require(reloaded.snapshot().records.first?.sentBytes == 10, "Closing lost the final in-progress delta")
+        }
+
+        run("History feed publishes changed checkpoints only, so unchanged totals do not refresh observers") { folder in
+            let store = TrafficHistoryStore(directory: folder, checkpointInterval: 60)
+            let endpoint = try TrafficEndpoint(address: "home.example", port: 5908)
+            store.record(endpoint, delta: .init(sentBytes: 7))
+            let first = store.snapshot()
+            store.record(endpoint, delta: .init(sentBytes: 1))
+            let second = store.snapshot()
+            try MainActor.assumeIsolated {
+                final class Count { var value = 0 }
+                let feed = TrafficHistoryFeed(), notifications = Count()
+                let subscription = feed.objectWillChange.sink { notifications.value += 1 }
+                defer { subscription.cancel() }
+                feed.update(records: first.records, legacyRecords: first.legacyRecords, error: first.error)
+                feed.update(records: first.records, legacyRecords: first.legacyRecords, error: first.error)
+                try require(notifications.value == 1, "An unchanged checkpoint refreshed observers")
+                feed.update(records: second.records, legacyRecords: second.legacyRecords, error: second.error)
+                try require(notifications.value == 2 && feed.records.first?.sentBytes == 8, "A changed checkpoint was not published")
+            }
         }
 
         print("\(passed) passed, \(failed) failed")

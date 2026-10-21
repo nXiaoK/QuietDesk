@@ -205,7 +205,7 @@ struct DeskView: View {
             CapsLockSettingsView(model: model, done: { showCapsSettings = false })
         }
         .sheet(isPresented: $showTrafficStatistics) {
-            TrafficStatisticsView(model: model, done: { showTrafficStatistics = false })
+            TrafficStatisticsView(model: model, history: model.trafficHistory, done: { showTrafficStatistics = false })
         }
         .sheet(isPresented: $showSessionEffects) {
             SessionEffectsView(model: model, done: { showSessionEffects = false })

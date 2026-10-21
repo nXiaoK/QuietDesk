@@ -22,6 +22,19 @@ public enum MediaPathAction: Equatable, Sendable {
     case restartSession(reason: MediaPathReason)
 }
 
+// Compute load is the mean over one sample window. One slow keyframe, or a frame queued behind a burst
+// of earlier ones, is latency rather than evidence that the codec cannot keep up with the frame rate.
+public struct MediaComputeTiming: Sendable {
+    private var total: Double = 0
+    private var count = 0
+    public init() {}
+    public var mean: Double? { count > 0 ? total / Double(count) : nil }
+    public mutating func add(_ milliseconds: Double) {
+        guard milliseconds.isFinite, milliseconds >= 0 else { return }
+        total += milliseconds; count += 1
+    }
+}
+
 // A local measurement window, not a report trusted directly from the other endpoint.
 public struct MediaPathSample: Sendable {
     public let duration: TimeInterval

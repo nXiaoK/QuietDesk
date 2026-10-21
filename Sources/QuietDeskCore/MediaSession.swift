@@ -173,8 +173,8 @@ public final class MediaSession: @unchecked Sendable {
     private var samplePackets = 0
     private var sampleFrames = 0
     private var sampleWaitMilliseconds: Double = 0
-    private var sampleEncodeMilliseconds: Double?
-    private var sampleDecodeMilliseconds: Double?
+    private var sampleEncode = MediaComputeTiming()
+    private var sampleDecode = MediaComputeTiming()
     private var sampleDirectReduction = false
     private var lastVideoAt: TimeInterval = 0
     private var lastDecodedAt: TimeInterval?
@@ -278,8 +278,8 @@ public final class MediaSession: @unchecked Sendable {
         guard [encodeMilliseconds, decodeMilliseconds].allSatisfy({ $0.map { $0.isFinite && $0 >= 0 } ?? true }) else { return }
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
-            if let encodeMilliseconds { self.sampleEncodeMilliseconds = max(self.sampleEncodeMilliseconds ?? 0, encodeMilliseconds) }
-            if let decodeMilliseconds { self.sampleDecodeMilliseconds = max(self.sampleDecodeMilliseconds ?? 0, decodeMilliseconds) }
+            if let encodeMilliseconds { self.sampleEncode.add(encodeMilliseconds) }
+            if let decodeMilliseconds { self.sampleDecode.add(decodeMilliseconds) }
         }
     }
 
@@ -449,7 +449,8 @@ public final class MediaSession: @unchecked Sendable {
         guard negotiated, value.sessionID == sessionID else { return }
         if value.operation == .stats {
             guard side == .viewer, let milliseconds = value.encodeMilliseconds else { return }
-            sampleEncodeMilliseconds = max(sampleEncodeMilliseconds ?? 0, milliseconds)
+            // Newer hosts report their window mean; an older host's per-second maximum is treated the same way.
+            sampleEncode.add(milliseconds)
             return
         }
         if value.operation == .recover {
@@ -1160,22 +1161,22 @@ public final class MediaSession: @unchecked Sendable {
                 let sample = MediaPathSample(duration: min(5, now - sampleStartedAt),
                     mediaActive: now - lastVideoAt < 1, networkSamples: samplePackets,
                     decodedFrames: sampleFrames, queueMilliseconds: samplePackets > 0 ? sampleWaitMilliseconds : nil,
-                    encodeMilliseconds: sampleEncodeMilliseconds, decodeMilliseconds: sampleDecodeMilliseconds,
+                    encodeMilliseconds: sampleEncode.mean, decodeMilliseconds: sampleDecode.mean,
                     frameBudgetMilliseconds: 1000 / Double(settings.framesPerSecond))
                 let actions = policy.observe(sample, epoch: policy.epoch, now: now)
                 if !sampleDirectReduction, !actions.contains(where: { if case .reduceLoad = $0 { return true }; return false }) { onSample?(sample) }
                 handleActions(actions)
                 sampleStartedAt = now; samplePackets = 0; sampleFrames = 0; sampleWaitMilliseconds = 0
-                sampleEncodeMilliseconds = nil; sampleDecodeMilliseconds = nil
+                sampleEncode = MediaComputeTiming(); sampleDecode = MediaComputeTiming()
                 sampleDirectReduction = false
             }
         } else {
             handleSendEvents(cache?.expire() ?? [])
             if now - sampleStartedAt >= 1 {
-                if let identifier = sessionID, let encode = sampleEncodeMilliseconds, encode <= 10_000 {
+                if let identifier = sessionID, let encode = sampleEncode.mean, encode <= 10_000 {
                     sendControl(MediaControl(.stats, sessionID: identifier, encodeMilliseconds: encode))
                 }
-                sampleStartedAt = now; sampleEncodeMilliseconds = nil; sampleDecodeMilliseconds = nil
+                sampleStartedAt = now; sampleEncode = MediaComputeTiming(); sampleDecode = MediaComputeTiming()
             }
         }
         pumpDatagrams()

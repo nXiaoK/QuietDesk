@@ -348,6 +348,25 @@ func runMediaPathPolicyChecks() {
         for time in 52...70 { try check(quality.observe(sample(), now: Double(time)) == nil, "Automatic quality exceeded manual choice") }
     }
 
+    run("Compute pressure uses window means, so decode bursts or one slow keyframe keep the current quality") {
+        // Three frames queued behind each other twice, then one slow keyframe: the maximum exceeds a 60 fps budget.
+        var burst = MediaComputeTiming()
+        for value in [4.0, 9, 14, 4, 9, 14, 40] { burst.add(value) }
+        var sustained = MediaComputeTiming()
+        for _ in 0..<60 { sustained.add(18) }
+        var invalid = MediaComputeTiming()
+        invalid.add(.nan); invalid.add(-1)
+        try check(MediaComputeTiming().mean == nil && invalid.mean == nil, "Missing or invalid timings produced a mean")
+        var quality = try MediaQualityPolicy(hostDefault: .highest, now: 0)
+        for time in 1...6 {
+            try check(quality.observe(sample(encode: burst.mean, decode: burst.mean), now: Double(time)) == nil,
+                      "Bursty but sustainable codec timing reduced quality")
+        }
+        var reduction: StreamSettings?
+        for time in 7...9 { reduction = quality.observe(sample(encode: sustained.mean), now: Double(time)) }
+        try check(reduction?.longestEdge == 3840, "Sustained encode cost above the frame budget did not reduce pixels")
+    }
+
     run("Quality upgrades that fail soon after applying back off exponentially until one proves stable") {
         let ceiling = StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 30)
         let reduced = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 30)

@@ -2,7 +2,33 @@
 
 节点使用 Go 标准库，可编译成 Linux 单一可执行文件，不在 Mac 客户端引入 Go 或第三方运行时。当前协议版本为 1。两端配置和连接策略见 [Mac 中继指南](../docs/relay.md)；独立安装包内按下文配置节点，再在两台 Mac 的“中继设置”保存同一节点地址和接入码。
 
-## Docker 单命令部署（推荐）
+## 一键脚本（推荐）
+
+在 Linux 服务器（amd64 或 arm64）上以 root 运行，按菜单选择安装、升级、查看接入信息、卸载或回退：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nXiaoK/QuietDesk/main/relay/quietdesk-relay.sh -o quietdesk-relay.sh
+sudo sh quietdesk-relay.sh
+```
+
+也可以直接带命令运行，例如 `sudo sh quietdesk-relay.sh install`。安装后脚本副本保存在 `/opt/quietdesk-relay/quietdesk-relay.sh`，之后用它升级或卸载。
+
+| 命令 | 作用 |
+| --- | --- |
+| `install` | 没有 Docker 时询问后用 Docker 官方脚本（get.docker.com）安装；自动识别公网 IP 并请你确认，生成自签证书和接入码，启动节点，最后显示服务地址、接入码和证书指纹。已安装时改为执行 `upgrade` |
+| `upgrade` | 先把接入码、证书和设备登记备份到 `/opt/quietdesk-relay/backups`，再拉取最新镜像重建容器；新版本启动失败时自动回到原版本。已是最新时不重启。地址、端口、证书和接入码保持不变 |
+| `info` | 再次显示服务地址、接入码、证书指纹、证书到期时间、节点版本和当前统计 |
+| `rollback` | 回到最近一次 `upgrade` 之前的版本 |
+| `uninstall` | 删除节点容器和镜像，默认保留接入码、证书和设备登记，重新 `install` 后沿用。加 `--purge` 并输入 `DELETE` 确认，才会永久删除它们和部署目录 |
+
+选项：`--ip IP` 指定公网地址并跳过自动识别；`--port PORT` 指定端口（默认 7443，TCP 和 UDP 同时使用）；`--dir DIR` 指定部署目录；`-y`/`--yes` 不再询问。`--ip` 和 `--port` 只在首次安装时生效，升级不会改动它们。
+
+- 公网 IP 依次向 ipify、icanhazip、ifconfig.me、ipw.cn 查询，只接受公网地址；都失败时使用本机网卡上的公网地址，仍没有就请你输入或使用 `--ip`。这个地址会写进节点证书，两台 Mac 必须填写同一个地址。
+- 接入码和证书指纹只显示在终端，不写日志。接入码相当于节点密码，只发给你自己的 Mac。
+- 脚本不修改防火墙，请在云安全组放行所用端口的 TCP 和 UDP。Docker 为 rootless 模式时会提示：节点可能看不到客户端的真实地址，中继打洞会失败，但视频仍可经中继传输。
+- 已用下文 `deploy.sh` 部署的节点可直接运行 `upgrade`，脚本会沿用原有端口、证书、接入码和设备登记。
+
+## Docker 单命令部署
 
 准备一台双方可访问的 Linux 服务器（amd64 或 arm64）、Docker Engine 和 Docker Compose v2.20+，在云安全组和防火墙放行 **7443/TCP 与 7443/UDP**。可直接使用固定公网 IP，无需域名或提前申请证书。部署脚本不修改防火墙。
 

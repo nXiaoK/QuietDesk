@@ -23,7 +23,7 @@ class RelayPackageTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             (root / "work").mkdir()
             (root / "output").mkdir()
-            names = ["Dockerfile", ".dockerignore", "compose.yaml", "compose.image.yaml", "deploy.sh", "docker/provision.sh", "README.md", "go.mod",
+            names = ["Dockerfile", ".dockerignore", "compose.yaml", "compose.image.yaml", "deploy.sh", "quietdesk-relay.sh", "docker/provision.sh", "README.md", "go.mod",
                      "cmd/quietdesk-relay/main.go", "server.go", "privatefile.go", "protocol.go", "server_test.go"]
             for name in names:
                 path = root / "relay" / name
@@ -44,12 +44,14 @@ class RelayPackageTests(unittest.TestCase):
                 for name, digest in manifest["sha256"].items():
                     self.assertEqual(digest, hashlib.sha256(archive.extractfile(prefix + name).read()).hexdigest())
                 self.assertEqual(archive.getmember(prefix + "deploy.sh").mode, 0o755)
+                self.assertEqual(archive.getmember(prefix + "quietdesk-relay.sh").mode, 0o755)
             filename = package_module.package_docker(root, root / "output", "0.7.3", "abc123", True, include_source=False)
             with tarfile.open(root / "output" / filename) as archive:
                 prefix = "QuietDesk-Relay-0.7.3-Docker-Deploy/"
                 self.assertEqual({item.name.removeprefix(prefix) for item in archive.getmembers() if item.isfile()},
-                                 {"compose.image.yaml", "deploy.sh", "README.md", "LICENSE", "manifest.json"})
+                                 {"compose.image.yaml", "deploy.sh", "quietdesk-relay.sh", "README.md", "LICENSE", "manifest.json"})
                 self.assertEqual(archive.getmember(prefix + "deploy.sh").mode, 0o755)
+                self.assertEqual(archive.getmember(prefix + "quietdesk-relay.sh").mode, 0o755)
             (root / "relay/compose.yaml").unlink()
             with self.assertRaisesRegex(ValueError, "regular file"):
                 package_module.package_docker(root, root / "output", "0.7.3", "abc123", True)

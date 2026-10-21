@@ -15,7 +15,7 @@ from version import ROOT, current, parse_version
 
 def package_docker(root, output, version, revision, dirty, include_source=True):
     name = f"QuietDesk-Relay-{version}-Docker" + ("" if include_source else "-Deploy")
-    public = {"compose.image.yaml", "deploy.sh", "README.md"}
+    public = {"compose.image.yaml", "deploy.sh", "quietdesk-relay.sh", "README.md"}
     if include_source:
         public |= {"Dockerfile", ".dockerignore", "compose.yaml", "docker/provision.sh", "go.mod"}
     tracked = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z", "--", "relay"], text=True).split("\0")

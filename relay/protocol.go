@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/netip"
+	"strings"
 )
 
 const (
@@ -14,6 +16,10 @@ const (
 	MaxMessageBytes    = 8192
 	MaxDatagramPayload = 1152
 	DatagramOverhead   = 64
+	// Assisted direct paths: each side reports at most MaxLocalCandidates of its own
+	// addresses; a peer list adds the node-observed address and stays within MaxPeerCandidates.
+	MaxLocalCandidates = 4
+	MaxPeerCandidates  = 8
 )
 
 // These credentials authorize routing, never the inner desktop TLS/DTLS session.
@@ -29,6 +35,53 @@ type Message struct {
 	DatagramKey  []byte `json:"datagramKey,omitempty"`
 	UDPPort      int    `json:"udpPort,omitempty"`
 	Error        string `json:"error,omitempty"`
+	// Optional assisted-direct-path capability; omitted fields keep the original wire bytes.
+	Assist     bool        `json:"assist,omitempty"`
+	Candidates []Candidate `json:"candidates,omitempty"`
+}
+
+// A candidate is an address hint for an assisted direct UDP path, never a routing instruction for the node.
+type Candidate struct {
+	Kind    string `json:"kind"`
+	Address string `json:"address"`
+	Port    int    `json:"port"`
+}
+
+func normalizeAddress(address netip.Addr) (netip.Addr, bool) {
+	address = address.Unmap()
+	if !address.IsValid() || address.Zone() != "" || address.IsUnspecified() || address.IsMulticast() ||
+		address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast() || address.IsInterfaceLocalMulticast() ||
+		address == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
+		return netip.Addr{}, false
+	}
+	return address, true
+}
+
+// LocalCandidates validates addresses a client reports about itself. Loopback is never useful to the other Mac.
+func LocalCandidates(candidates []Candidate) ([]Candidate, bool) {
+	if len(candidates) > MaxLocalCandidates {
+		return nil, false
+	}
+	result := make([]Candidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		parsed, err := netip.ParseAddr(candidate.Address)
+		address, ok := normalizeAddress(parsed)
+		if err != nil || !ok || address.IsLoopback() || candidate.Kind != "host" || candidate.Port < 1 || candidate.Port > 65535 ||
+			strings.ContainsAny(candidate.Address, "%/") {
+			return nil, false
+		}
+		result = append(result, Candidate{Kind: "host", Address: address.String(), Port: candidate.Port})
+	}
+	return result, true
+}
+
+// ReflexiveCandidate describes the source address the node observed for an authenticated datagram.
+func ReflexiveCandidate(address netip.AddrPort) (Candidate, bool) {
+	normalized, ok := normalizeAddress(address.Addr())
+	if !ok || address.Port() == 0 {
+		return Candidate{}, false
+	}
+	return Candidate{Kind: "srflx", Address: normalized.String(), Port: int(address.Port())}, true
 }
 
 func ReadMessage(r io.Reader) (Message, error) {

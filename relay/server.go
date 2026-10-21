@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -9,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -38,6 +40,7 @@ type Snapshot struct {
 	DatagramSessions       int    `json:"datagramSessions"`
 	ForwardedDatagramBytes uint64 `json:"forwardedDatagramBytes"`
 	RejectedDatagrams      uint64 `json:"rejectedDatagrams"`
+	AssistedLeases         int    `json:"assistedLeases"`
 }
 
 type Server struct {
@@ -64,6 +67,7 @@ type host struct {
 	conn         net.Conn
 	writeMu      sync.Mutex
 	done         chan struct{}
+	assist       bool
 }
 
 type circuit struct {
@@ -82,7 +86,30 @@ type datagramLease struct {
 	replay    [2]ReplayWindow
 	sequences [2]uint64
 	viewer    net.Conn
+	viewerMu  sync.Mutex
 	hostReady chan struct{}
+	// Assisted direct paths: both endpoints must have negotiated the capability and,
+	// after authenticating their desktop session, consented before any address leaves the node.
+	assist    bool
+	consent   [2]bool
+	local     [2][]Candidate
+	announced [2]string
+	notify    chan struct{}
+	done      chan struct{}
+}
+
+func (lease *datagramLease) wake() {
+	select {
+	case lease.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (lease *datagramLease) writeViewer(message Message) error {
+	lease.viewerMu.Lock()
+	defer lease.viewerMu.Unlock()
+	lease.viewer.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	return WriteMessage(lease.viewer, message)
 }
 
 var devicePattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -223,13 +250,18 @@ func (s *Server) Close() error {
 func (s *Server) Snapshot() Snapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	pending := 0
+	pending, assisted := 0, 0
 	for _, circuit := range s.circuits {
 		if !circuit.active {
 			pending++
 		}
 	}
-	return Snapshot{len(s.connections), len(s.hosts), pending, s.activeTunnels, len(s.datagrams), s.forwarded.Load(), s.rejected.Load()}
+	for _, lease := range s.datagrams {
+		if lease.assist {
+			assisted++
+		}
+	}
+	return Snapshot{len(s.connections), len(s.hosts), pending, s.activeTunnels, len(s.datagrams), s.forwarded.Load(), s.rejected.Load(), assisted}
 }
 
 func randomHex() (string, error) {
@@ -351,7 +383,7 @@ func (s *Server) register(conn net.Conn, message Message) {
 	if err != nil {
 		return
 	}
-	h := &host{id: message.DeviceID, registration: registration, conn: conn, done: make(chan struct{})}
+	h := &host{id: message.DeviceID, registration: registration, conn: conn, done: make(chan struct{}), assist: message.Assist}
 	s.mu.Lock()
 	code := ""
 	if stored, exists := s.owners[h.id]; exists && subtle.ConstantTimeCompare([]byte(stored), []byte(digest)) != 1 {
@@ -402,12 +434,82 @@ func (s *Server) register(conn net.Conn, message Message) {
 	for {
 		conn.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout))
 		request, err := ReadMessage(conn)
-		if err != nil || request.Op != "ping" {
+		if err != nil {
 			return
 		}
-		if h.send(Message{Op: "pong"}) != nil {
+		switch {
+		case request.Op == "ping":
+			if h.send(Message{Op: "pong"}) != nil {
+				return
+			}
+		case request.Op == "assist" && h.assist:
+			// A lease may close while its consent is in flight; never drop the registration for that.
+			s.acceptAssist(h, request.DatagramID, 1, request.Candidates)
+		default:
 			return
 		}
+	}
+}
+
+// acceptAssist records one side's consent and self-reported candidates for a negotiated lease.
+func (s *Server) acceptAssist(h *host, datagramID []byte, side byte, candidates []Candidate) bool {
+	local, ok := LocalCandidates(candidates)
+	if !ok || len(datagramID) != 16 {
+		return false
+	}
+	var id [16]byte
+	copy(id[:], datagramID)
+	s.mu.Lock()
+	lease := s.datagrams[id]
+	if lease == nil || !lease.assist || lease.host != h {
+		s.mu.Unlock()
+		return false
+	}
+	lease.consent[side] = true
+	lease.local[side] = local
+	s.mu.Unlock()
+	lease.wake()
+	return true
+}
+
+func candidateKey(candidates []Candidate) string {
+	var text strings.Builder
+	for _, candidate := range candidates {
+		fmt.Fprintf(&text, "%s|%s|%d;", candidate.Kind, candidate.Address, candidate.Port)
+	}
+	return text.String()
+}
+
+// announce sends each side the other's node-observed address and self-reported candidates when they changed.
+func (s *Server) announce(id [16]byte, lease *datagramLease) {
+	s.mu.Lock()
+	if s.datagrams[id] != lease || !lease.consent[0] || !lease.consent[1] {
+		s.mu.Unlock()
+		return
+	}
+	var lists [2][]Candidate
+	var changed [2]bool
+	for side := range lists {
+		other := 1 - side
+		list := make([]Candidate, 0, MaxPeerCandidates)
+		if address, ok := lease.addresses[other].(*net.UDPAddr); ok {
+			if candidate, ok := ReflexiveCandidate(address.AddrPort()); ok {
+				list = append(list, candidate)
+			}
+		}
+		list = append(list, lease.local[other]...)
+		key := candidateKey(list)
+		if len(list) > 0 && key != lease.announced[side] {
+			lists[side], changed[side], lease.announced[side] = list, true, key
+		}
+	}
+	h := lease.host
+	s.mu.Unlock()
+	if changed[0] {
+		lease.writeViewer(Message{Op: "peerCandidates", DatagramID: id[:], Candidates: lists[0]})
+	}
+	if changed[1] {
+		h.send(Message{Op: "peerCandidates", DatagramID: id[:], Candidates: lists[1]})
 	}
 }
 
@@ -498,7 +600,7 @@ func (s *Server) accept(conn net.Conn, message Message) {
 
 func (s *Server) openDatagram(conn net.Conn, message Message) {
 	var id [16]byte
-	lease := &datagramLease{viewer: conn, hostReady: make(chan struct{})}
+	lease := &datagramLease{viewer: conn, hostReady: make(chan struct{}), notify: make(chan struct{}, 1), done: make(chan struct{})}
 	if _, err := rand.Read(id[:]); err != nil {
 		return
 	}
@@ -515,6 +617,7 @@ func (s *Server) openDatagram(conn net.Conn, message Message) {
 		return
 	}
 	lease.host = h
+	lease.assist = message.Assist && h.assist
 	s.datagrams[id] = lease
 	address, ok := s.udp.LocalAddr().(*net.UDPAddr)
 	if !ok {
@@ -528,9 +631,10 @@ func (s *Server) openDatagram(conn net.Conn, message Message) {
 		s.mu.Lock()
 		delete(s.datagrams, id)
 		s.mu.Unlock()
+		close(lease.done)
 		h.send(Message{Op: "datagramClosed", DatagramID: id[:]})
 	}()
-	if h.send(Message{Op: "incomingDatagram", DatagramID: id[:], DatagramKey: lease.keys[1][:], UDPPort: port}) != nil {
+	if h.send(Message{Op: "incomingDatagram", DatagramID: id[:], DatagramKey: lease.keys[1][:], UDPPort: port, Assist: lease.assist}) != nil {
 		return
 	}
 	select {
@@ -541,17 +645,43 @@ func (s *Server) openDatagram(conn net.Conn, message Message) {
 		WriteMessage(conn, Message{Op: "error", Error: "timeout"})
 		return
 	}
-	if WriteMessage(conn, Message{Op: "datagramReady", DatagramID: id[:], DatagramKey: lease.keys[0][:], UDPPort: port}) != nil {
+	if lease.writeViewer(Message{Op: "datagramReady", DatagramID: id[:], DatagramKey: lease.keys[0][:], UDPPort: port, Assist: lease.assist}) != nil {
 		return
+	}
+	if lease.assist {
+		go func() {
+			for {
+				select {
+				case <-lease.notify:
+				case <-lease.done:
+					return
+				}
+				s.announce(id, lease)
+				// Coalesce NAT rebinding bursts into at most one update per second.
+				select {
+				case <-time.After(time.Second):
+				case <-lease.done:
+					return
+				}
+			}
+		}()
 	}
 	for {
 		conn.SetReadDeadline(time.Now().Add(s.cfg.IdleTimeout))
 		request, err := ReadMessage(conn)
-		if err != nil || request.Op != "ping" {
+		if err != nil {
 			return
 		}
-		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		if WriteMessage(conn, Message{Op: "pong"}) != nil {
+		switch {
+		case request.Op == "ping":
+			if lease.writeViewer(Message{Op: "pong"}) != nil {
+				return
+			}
+		case request.Op == "assist" && lease.assist && bytes.Equal(request.DatagramID, id[:]):
+			if !s.acceptAssist(h, request.DatagramID, 0, request.Candidates) {
+				return
+			}
+		default:
 			return
 		}
 	}
@@ -586,6 +716,9 @@ func (s *Server) serveUDP(conn net.PacketConn) {
 		}
 		if side == 1 && lease.addresses[side] == nil {
 			close(lease.hostReady)
+		}
+		if previous := lease.addresses[side]; lease.assist && (previous == nil || previous.String() != address.String()) {
+			lease.wake()
 		}
 		lease.addresses[side] = address
 		other := byte(1) - side

@@ -504,3 +504,154 @@ func TestConnectionAndRegistryResourceBounds(t *testing.T) {
 		t.Fatal("durable registry grew past its technical bound")
 	}
 }
+
+func silent(t *testing.T, conn net.Conn, wait time.Duration) {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(wait))
+	if message, err := ReadMessage(conn); err == nil {
+		t.Fatalf("unexpected %s before consent", message.Op)
+	} else if e, ok := err.(net.Error); !ok || !e.Timeout() {
+		t.Fatalf("connection failed while waiting: %v", err)
+	}
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+}
+
+func TestAssistedLeaseExchangesCandidatesOnlyAfterBothConsent(t *testing.T) {
+	f := newFixture(t, Config{})
+	registration := f.dial(t)
+	write(t, registration, Message{Op: "register", AccessKey: f.access, DeviceID: deviceA, OwnerKey: randomKey(t), Assist: true})
+	read(t, registration, "registered")
+	lease := f.dial(t)
+	write(t, lease, Message{Op: "datagram", DeviceID: deviceA, AccessKey: f.access, Assist: true})
+	host := read(t, registration, "incomingDatagram")
+	if !host.Assist {
+		t.Fatal("negotiated lease did not offer assistance to the host")
+	}
+	var id [16]byte
+	copy(id[:], host.DatagramID)
+	dialUDP := func() *net.UDPConn {
+		conn, err := net.DialUDP("udp", nil, f.udpAddress)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		return conn
+	}
+	hostSocket, viewerSocket, rebound := dialUDP(), dialUDP(), dialUDP()
+	sequence := [2]uint64{}
+	send := func(conn *net.UDPConn, side byte, key []byte) {
+		sequence[side]++
+		data, err := EncodeDatagram(Datagram{Side: side, Sequence: sequence[side], ID: id}, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = conn.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send(hostSocket, 1, host.DatagramKey)
+	viewer := read(t, lease, "datagramReady")
+	if !viewer.Assist {
+		t.Fatal("negotiated lease did not offer assistance to the viewer")
+	}
+	send(viewerSocket, 0, viewer.DatagramKey)
+	until(t, func() bool {
+		f.server.mu.Lock()
+		defer f.server.mu.Unlock()
+		return f.server.datagrams[id].addresses[0] != nil
+	})
+	if f.server.Snapshot().AssistedLeases != 1 {
+		t.Fatal("assisted lease was not counted")
+	}
+	write(t, lease, Message{Op: "assist", DatagramID: id[:], Candidates: []Candidate{{Kind: "host", Address: "192.0.2.10", Port: 5000}}})
+	// One consent alone must not reveal either Mac's address.
+	silent(t, lease, 300*time.Millisecond)
+	silent(t, registration, 50*time.Millisecond)
+	write(t, registration, Message{Op: "assist", DatagramID: id[:], Candidates: []Candidate{{Kind: "host", Address: "2001:db8::7", Port: 6000}}})
+	viewerList := read(t, lease, "peerCandidates").Candidates
+	hostList := read(t, registration, "peerCandidates").Candidates
+	port := func(conn *net.UDPConn) int { return conn.LocalAddr().(*net.UDPAddr).Port }
+	expectedViewer := []Candidate{{"srflx", "127.0.0.1", port(hostSocket)}, {"host", "2001:db8::7", 6000}}
+	expectedHost := []Candidate{{"srflx", "127.0.0.1", port(viewerSocket)}, {"host", "192.0.2.10", 5000}}
+	if candidateKey(viewerList) != candidateKey(expectedViewer) || candidateKey(hostList) != candidateKey(expectedHost) {
+		t.Fatalf("candidate lists differ: %v %v", viewerList, hostList)
+	}
+	// An authenticated NAT rebinding updates only the side whose peer moved.
+	send(rebound, 1, host.DatagramKey)
+	updated := read(t, lease, "peerCandidates").Candidates
+	if len(updated) != 2 || updated[0].Port != port(rebound) {
+		t.Fatalf("rebinding was not announced: %v", updated)
+	}
+	silent(t, registration, 200*time.Millisecond)
+	// Leases and registrations stay usable after assistance.
+	write(t, lease, Message{Op: "ping"})
+	read(t, lease, "pong")
+	write(t, registration, Message{Op: "ping"})
+	read(t, registration, "pong")
+}
+
+func TestAssistIsCapabilityGatedAndValidated(t *testing.T) {
+	f := newFixture(t, Config{})
+	legacy, _ := f.register(t, deviceA, randomKey(t))
+	lease := f.dial(t)
+	write(t, lease, Message{Op: "datagram", DeviceID: deviceA, AccessKey: f.access, Assist: true})
+	offered := read(t, legacy, "incomingDatagram")
+	if offered.Assist {
+		t.Fatal("assistance offered to a host that never declared it")
+	}
+	data, _ := json.Marshal(Message{Op: "datagramReady", DatagramID: offered.DatagramID})
+	if strings.Contains(string(data), "assist") || strings.Contains(string(data), "candidates") {
+		t.Fatal("unnegotiated messages changed their wire bytes")
+	}
+	var id [16]byte
+	copy(id[:], offered.DatagramID)
+	hostSocket, err := net.DialUDP("udp", nil, f.udpAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hostSocket.Close()
+	packet, _ := EncodeDatagram(Datagram{Side: 1, Sequence: 1, ID: id}, offered.DatagramKey)
+	hostSocket.Write(packet)
+	if read(t, lease, "datagramReady").Assist {
+		t.Fatal("assistance offered to a viewer of a legacy host")
+	}
+	// Without negotiation an assist request is an unknown operation that ends the lease.
+	write(t, lease, Message{Op: "assist", DatagramID: offered.DatagramID})
+	if _, err := ReadMessage(lease); err == nil {
+		t.Fatal("unnegotiated assist was accepted")
+	}
+
+	capable := f.dial(t)
+	write(t, capable, Message{Op: "register", AccessKey: f.access, DeviceID: deviceB, OwnerKey: randomKey(t), Assist: true})
+	read(t, capable, "registered")
+	plain := f.dial(t)
+	write(t, plain, Message{Op: "datagram", DeviceID: deviceB, AccessKey: f.access})
+	offered = read(t, capable, "incomingDatagram")
+	if offered.Assist {
+		t.Fatal("assistance offered without the viewer's request")
+	}
+	// A host consent for an unnegotiated or vanished lease is ignored without losing the registration.
+	write(t, capable, Message{Op: "assist", DatagramID: offered.DatagramID})
+	write(t, capable, Message{Op: "assist", DatagramID: make([]byte, 16)})
+	write(t, capable, Message{Op: "ping"})
+	read(t, capable, "pong")
+
+	for _, candidates := range [][]Candidate{
+		{{Kind: "host", Address: "127.0.0.1", Port: 5000}},
+		{{Kind: "host", Address: "fe80::1", Port: 5000}},
+		{{Kind: "host", Address: "224.0.0.1", Port: 5000}},
+		{{Kind: "host", Address: "0.0.0.0", Port: 5000}},
+		{{Kind: "host", Address: "relay.example.com", Port: 5000}},
+		{{Kind: "srflx", Address: "192.0.2.1", Port: 5000}},
+		{{Kind: "host", Address: "192.0.2.1", Port: 0}},
+		{{Kind: "host", Address: "192.0.2.1", Port: 1}, {Kind: "host", Address: "192.0.2.2", Port: 1},
+			{Kind: "host", Address: "192.0.2.3", Port: 1}, {Kind: "host", Address: "192.0.2.4", Port: 1}, {Kind: "host", Address: "192.0.2.5", Port: 1}},
+	} {
+		if _, ok := LocalCandidates(candidates); ok {
+			t.Fatalf("invalid local candidates accepted: %v", candidates)
+		}
+	}
+	if normalized, ok := LocalCandidates([]Candidate{{Kind: "host", Address: "::ffff:192.0.2.9", Port: 7}}); !ok || normalized[0].Address != "192.0.2.9" {
+		t.Fatal("mapped IPv4 candidate was not normalized")
+	}
+}

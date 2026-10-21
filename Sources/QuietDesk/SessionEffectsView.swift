@@ -44,8 +44,39 @@ struct SessionEffectsView: View {
             }
             HStack { Spacer(); Button("完成", action: done).buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction) }
         }
-        .toggleStyle(.switch)
+        .toggleStyle(SessionEffectSwitchStyle())
         .padding(22).frame(width: 450)
         .onExitCommand(perform: done)
+    }
+}
+
+// The macOS 26 system switch draws its knob through a window portal; in this sheet the knob was seen
+// missing after the remote round trip, leaving a bare track, so these switches are drawn here.
+private struct SessionEffectSwitchStyle: ToggleStyle {
+    func makeBody(configuration: Configuration) -> some View { SessionEffectSwitch(configuration: configuration) }
+}
+
+private struct SessionEffectSwitch: View {
+    let configuration: ToggleStyleConfiguration
+    @Environment(\.isEnabled) private var isEnabled
+
+    var body: some View {
+        Button { configuration.isOn.toggle() } label: {
+            HStack(spacing: 12) {
+                configuration.label
+                Capsule()
+                    .fill(configuration.isOn ? Color.accentColor : Color.primary.opacity(0.15))
+                    .overlay(alignment: configuration.isOn ? .trailing : .leading) {
+                        Circle().fill(.white).padding(2).shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
+                    }
+                    .frame(width: 38, height: 22)
+                    .opacity(isEnabled ? 1 : 0.5)
+                    .animation(.snappy(duration: 0.18), value: configuration.isOn)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(.isToggle)
+        .accessibilityValue(configuration.isOn ? "开" : "关")
     }
 }

@@ -42,7 +42,7 @@ QuietDesk 中继节点一键管理
 选项：
   --ip IP       服务器公网 IPv4 或 IPv6，跳过自动识别（首次安装时使用）
   --port PORT   服务端口，TCP 和 UDP 同时使用，默认 7443（首次安装时使用）
-  --dir DIR     部署目录，默认 /opt/quietdesk-relay
+  --dir DIR     部署目录，需为新的或空目录，默认 /opt/quietdesk-relay
   --purge       与 uninstall 同用：同时永久删除接入码、证书、设备登记、备份和部署目录
   -y, --yes     不再询问确认
   -h, --help    显示本帮助
@@ -218,10 +218,25 @@ script_directory() {
     (CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 }
 
+# The deployment directory holds only what this script writes. Anything else means a shared directory
+# such as /opt, whose permissions must stay as they are and which uninstall --purge must never remove.
+require_dedicated_directory() {
+    case "$directory" in /?*) ;; *) die '--dir 需要绝对路径，且不能是 /' ;; esac
+    [ -e "$directory" ] || [ -L "$directory" ] || return 0
+    [ -d "$directory" ] || die "$directory 不是目录，请用 --dir 指定新的或空目录"
+    for entry in "$directory"/* "$directory"/.[!.]* "$directory"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        case "${entry##*/}" in
+            compose.image.yaml|compose.image.yaml.new|quietdesk-relay.sh|quietdesk-relay.sh.new|.env|.env.new|backups) ;;
+            *) die "$directory 中已有其他文件，不能用作部署目录；请用 --dir 指定新的或空目录" ;;
+        esac
+    done
+}
+
 # Deployment files come from next to this script (release package or source checkout), otherwise from
 # GitHub at the same ref as the image tag documentation. The installed copy refreshes them on upgrade.
 prepare_directory() {
-    case "$directory" in /?*) ;; *) die '--dir 需要绝对路径，且不能是 /' ;; esac
+    require_dedicated_directory
     mkdir -p "$directory/backups"
     chmod 700 "$directory" "$directory/backups"
     here="$(script_directory)"
@@ -328,6 +343,7 @@ cmd_install() {
     require_root
     require_linux
     [ -z "$ip" ] || validate_ip
+    require_dedicated_directory
     ensure_docker install
     if [ -n "$(relay_container)" ]; then
         say '检测到已安装的中继节点，改为执行升级；接入码、证书和设备登记保持不变。'
@@ -445,14 +461,18 @@ cmd_uninstall() {
                 docker volume rm "$volume" >/dev/null || warn "无法删除数据卷 $volume，请手动检查"
             fi
         done
-        # Remove only a directory this script created; it is recognised by its generated .env.
+        # Remove only what this script wrote, in a directory it recognises by its generated .env, and the
+        # directory itself once nothing else is left in it.
         case "$directory" in /?*) ;; *) die "拒绝删除目录：$directory" ;; esac
         if [ -f "$directory/.env" ] && grep -q '^# quietdesk-relay.sh' "$directory/.env"; then
-            rm -rf -- "$directory"
+            for entry in backups compose.image.yaml compose.image.yaml.new quietdesk-relay.sh quietdesk-relay.sh.new .env.new .env; do
+                rm -rf -- "$directory/$entry"
+            done
+            rmdir -- "$directory" 2>/dev/null || warn "$directory 中还有其他文件，已保留这些文件和该目录"
         elif [ -d "$directory" ]; then
             warn "$directory 不是本脚本创建的部署目录，未删除"
         fi
-        say '已卸载节点，并永久删除了接入码、证书、设备登记和部署目录。Docker 本身保留。'
+        say '已卸载节点，并永久删除了接入码、证书、设备登记、备份和部署文件。Docker 本身保留。'
     else
         say '已卸载节点容器。Docker 本身保留。'
         say "接入码、证书和设备登记保留在 Docker 数据卷 ${project}_state、${project}_tls，备份在 $directory/backups；重新运行 install 会沿用它们。"

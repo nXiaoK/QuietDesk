@@ -357,6 +357,29 @@ class RelayManagerTests(unittest.TestCase):
         self.assertIn("不是本脚本创建的部署目录", output)
         self.assertTrue((self.directory / "keep.txt").exists())
 
+    def test_shared_directory_is_refused_before_any_change(self):
+        # A directory such as /opt that already holds other files keeps its permissions and contents.
+        self.directory.mkdir(parents=True)
+        self.directory.chmod(0o755)
+        (self.directory / "other-app.conf").write_text("unrelated")
+        for command in ["install", "upgrade"]:
+            with self.subTest(command=command):
+                if command == "upgrade":
+                    self.installed()
+                output, calls = self.run_manager(command, success=False)
+                self.assertIn("已有其他文件，不能用作部署目录", output)
+                self.assertFalse(self.compose(calls, "pull") + self.compose(calls, "run") + self.compose(calls, "up"))
+                self.assertEqual(stat.S_IMODE(self.directory.stat().st_mode), 0o755)
+                self.assertEqual(sorted(path.name for path in self.directory.iterdir()), ["other-app.conf"])
+
+    def test_purge_removes_only_its_own_files(self):
+        self.run_manager("install")
+        (self.directory / "notes.txt").write_text("added later")
+        output, _ = self.run_manager("uninstall", "--purge", "--yes")
+        self.assertIn("还有其他文件，已保留", output)
+        self.assertEqual(sorted(path.name for path in self.directory.iterdir()), ["notes.txt"])
+        self.assertEqual(self.state["volumes"], [])
+
     def test_piped_script_downloads_matching_files_and_keeps_a_copy(self):
         raw = "https://raw.githubusercontent.com/nXiaoK/QuietDesk/main/relay/"
         responses = {"https://ifconfig.me/ip": "198.51.100.7\n",

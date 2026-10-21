@@ -296,7 +296,17 @@ enum SessionEffectsCancellationChecks {
                 print("PASS a cover that capture could not leave out is removed without ever turning opaque")
             } else { failures += 1; print("FAIL failed exclusion left a cover behind") }
         }
-        print("\(15 - failures) passed, \(failures) failed")
+        do {
+            let privacy = FakeSessionPrivacy()
+            let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: FakeScreenLock())
+            _ = try await effects.apply(.init(privacy: true)) { _ in }
+            let wasUp = privacy.isVisible
+            let lock = effects.endSession()
+            if wasUp, lock == nil, !privacy.isVisible, !privacy.prepared, !effects.state.privacy {
+                print("PASS without a pending lock the curtain comes down synchronously when the session ends")
+            } else { failures += 1; print("FAIL curtain outlived the session end") }
+        } catch { failures += 1; print("FAIL curtain session end setup: \(error)") }
+        print("\(16 - failures) passed, \(failures) failed")
         exit(failures == 0 ? 0 : 1)
     }
 }

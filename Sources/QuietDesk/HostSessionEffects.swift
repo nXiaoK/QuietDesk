@@ -126,6 +126,7 @@ final class HostSessionEffects {
     }
 
     /// Starts a requested lock synchronously, so it is issued even while the app is quitting.
+    /// Without a lock the curtain comes down right here rather than after the asynchronous reset.
     /// Later calls return the same confirmation.
     @discardableResult
     func endSession() -> Task<String?, Never>? {
@@ -138,7 +139,15 @@ final class HostSessionEffects {
                 return await lock.confirmLocked()
             }
         }
+        if lockTask == nil, !privacy.windowIDs.isEmpty { privacy.hide(); state = actualState }
         return lockTask
+    }
+
+    /// Closes cover windows that `live` does not own, such as covers left by an interrupted cleanup.
+    /// Returns how many were removed.
+    @discardableResult
+    static func removeStrayCovers(keeping live: HostSessionEffects?) -> Int {
+        SessionPrivacyWindows.removeStray(keeping: live?.privacy as? SessionPrivacyWindows)
     }
 
     func reset() async -> String? {
@@ -256,6 +265,15 @@ private final class SessionPrivacyWindows: SessionPrivacyCover {
             }
     }
 
+    static func removeStray(keeping owner: SessionPrivacyWindows?) -> Int {
+        var removed = 0
+        for case let window as PrivacyCoverWindow in NSApp.windows where window.isVisible && (window.owner == nil || window.owner !== owner) {
+            window.orderOut(nil); window.close()
+            removed += 1
+        }
+        return removed
+    }
+
     func prepare() throws -> [CGWindowID] {
         guard windows.isEmpty else { return windowIDs }
         let screens = NSScreen.screens
@@ -328,6 +346,7 @@ private final class SessionPrivacyWindows: SessionPrivacyCover {
         window.hidesOnDeactivate = false
         window.isReleasedWhenClosed = false
         window.alphaValue = revealed ? 1 : Self.preparedAlpha
+        window.owner = self
         window.orderFrontRegardless()
         return window
     }
@@ -345,6 +364,8 @@ private final class SessionPrivacyWindows: SessionPrivacyCover {
 
 @MainActor
 private final class PrivacyCoverWindow: NSWindow {
+    /// Nil once the cover object that placed this window is gone, which makes the window a stray.
+    weak var owner: SessionPrivacyWindows?
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 }

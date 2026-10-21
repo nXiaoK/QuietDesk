@@ -220,6 +220,7 @@ final class DeskModel: ObservableObject {
     private let trafficHistoryStore = TrafficHistoryStore()
     private var trafficSession: TrafficSession?
     private var effectsCleanupTask: Task<Void, Never>?
+    private var effectsCleanupsRunning = 0
     private var idlePolicy = SessionIdlePolicy(now: SessionClock.now)
     private var pauseTransmission = SessionPauseTransmission()
     private var wakeInputGate = SessionWakeInputGate()
@@ -2071,6 +2072,9 @@ final class DeskModel: ObservableObject {
         host.effects = effects
         effects.onStateChange = { [weak self, weak peer, weak effects, weak host] state, message in
             guard let self, let peer, let effects, let host, self.peer === peer, self.hostSession === host, host.effects === effects else { return }
+            if self.sessionEffects.privacy != state.privacy {
+                DiagnosticLog.shared.record(.privacyCurtain, role: .host, state: state.privacy ? .enabled : .disabled)
+            }
             self.sessionEffects = state
             if let message { self.sessionEffectsStatus = message }
             if let result = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(state: state, error: message)) { peer.send(result) }
@@ -2135,6 +2139,9 @@ final class DeskModel: ObservableObject {
                 catch { failure = failure ?? error.localizedDescription; filterRestoreFailed = true }
             }
             guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
+            if self.sessionEffects.privacy != effects.state.privacy {
+                DiagnosticLog.shared.record(.privacyCurtain, role: .host, state: effects.state.privacy ? .enabled : .disabled)
+            }
             self.sessionEffects = effects.state
             self.sessionEffectsStatus = failure ?? "被控端设置已生效"
             if let reply = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(id: request.id, state: effects.state, error: failure)) { peer.send(reply) }
@@ -2755,6 +2762,7 @@ final class DeskModel: ObservableObject {
                         self.deferReconnectForIdle("10 分钟无窗口操作")
                     }
                 }
+                if self.mode == .host, self.hostSession.effects?.state.privacy != true { self.removeStrayPrivacyCovers() }
                 let seconds = max(0.01, SessionClock.now - self.lastMetrics)
                 let metrics = self.dataChannel?.takeMetrics() ?? (bytes: 0, frames: 0)
                 // @Published notifies on every assignment; a static picture keeps the same strings each second.
@@ -2811,10 +2819,15 @@ final class DeskModel: ObservableObject {
         oldViewer.clipboardPullTimeout?.cancel()
         if let effects = oldHost.effects {
             let token = generation
+            let hadCurtain = effects.state.privacy
+            effectsCleanupsRunning += 1
             effectsCleanupTask = Task { [weak self] in
-                if let message = await effects.reset(), let self, self.generation == token, self.hostSession.effects == nil {
-                    self.sessionEffectsStatus = message
-                }
+                let message = await effects.reset()
+                guard let self else { return }
+                self.effectsCleanupsRunning -= 1
+                if hadCurtain { DiagnosticLog.shared.record(.privacyCurtain, role: .host, state: .disabled) }
+                self.removeStrayPrivacyCovers()
+                if let message, self.generation == token, self.hostSession.effects == nil { self.sessionEffectsStatus = message }
             }
         }
         if let streamer = oldHost.streamer {
@@ -2881,6 +2894,14 @@ final class DeskModel: ObservableObject {
         canvas.usesCapsLockActions = false
         canvas.capsLockMonitor.stop()
         canvas.reset()
+    }
+
+    /// The curtain exists only for a live control session. Covers that no live session owns, for
+    /// example after an interrupted cleanup, would otherwise leave the host's display black.
+    private func removeStrayPrivacyCovers() {
+        guard mode == .host, effectsCleanupsRunning == 0 else { return }
+        let removed = HostSessionEffects.removeStrayCovers(keeping: hostSession.effects)
+        if removed > 0 { DiagnosticLog.shared.record(.privacyCurtain, role: .host, state: .failed, values: [.eventCount: removed]) }
     }
 
     func stop() {

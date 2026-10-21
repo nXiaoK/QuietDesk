@@ -23,6 +23,8 @@ public enum MessageKind: UInt8, Sendable {
     case sessionPauseRequest, sessionPauseResult
     case mediaControl = 26, mediaFrame, mediaFeedback
     case cursorControl = 29, cursorShape, cursorPosition
+    // Sent only after the host's hello advertised sessionUnlockV1.
+    case sessionUnlockRequest = 32, sessionUnlockResult
 }
 
 public struct Message: Sendable {
@@ -183,7 +185,10 @@ public struct Hello: Codable, Sendable {
     // The host accepts adaptiveBitRates, applies bitrate-only changes to the running encoder without a new
     // keyframe, and reports frame delivery delay in media stats.
     public let adaptiveVideoV1: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil) {
+    // The host types a lock screen password the viewer sends, and reports whether it was locked when this hello was sent.
+    public let sessionUnlockV1: Bool?
+    public let screenLocked: Bool?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -207,6 +212,8 @@ public struct Hello: Codable, Sendable {
         self.relayDeviceID = relayDeviceID
         self.sessionLockV1 = sessionLockV1
         self.adaptiveVideoV1 = adaptiveVideoV1
+        self.sessionUnlockV1 = sessionUnlockV1
+        self.screenLocked = screenLocked
     }
 
     public func validate() throws {

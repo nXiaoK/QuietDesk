@@ -124,6 +124,7 @@ swift run --disable-sandbox QuietDeskChecks
 ./scripts/run-cursor-checks.sh
 ./scripts/run-session-data-checks.sh
 ./scripts/run-session-effects-checks.sh
+./scripts/run-unlock-checks.sh
 ./scripts/run-traffic-checks.sh
 ./scripts/run-log-checks.sh
 ./scripts/run-credential-checks.sh
@@ -142,6 +143,7 @@ python3 -m unittest discover -s scripts/tests -v
 | `run-cursor-checks.sh` | 假光标、位置与显示器提供者，验证坐标、热点、图片边界、形状变化、未知回退及停止隔离；不读取真实光标 |
 | `run-session-data-checks.sh` | 后台数据路由、解码确认、新画面令牌、旧会话隔离与并发指标聚合 |
 | `run-session-effects-checks.sh` | 假音频、假遮罩及会话退出屏障，验证取消和恢复顺序 |
+| `run-unlock-checks.sh` | 假锁屏状态与假键盘，验证只在锁屏时输入、本机解锁时立即停止、回车与结果判断、并发与取消；不向系统注入按键 |
 | `run-traffic-checks.sh` | 临时目录中的地址/端口统计、旧设备历史保留、历史保存及错误处理 |
 | `run-log-checks.sh` | 临时目录中的日志轮转、并发聚合、隐私字段、文件权限与导出错误恢复 |
 | `run-credential-checks.sh` | 临时目录中的凭据往返、权限、损坏保留、原子写入失败、并发更新及连接记录匹配；不访问真实凭据或钥匙串 |

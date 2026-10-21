@@ -335,6 +335,23 @@ private struct CredentialStoreChecks {
                         "Connection metadata gained secret or unexpected fields")
         }
 
+        run("Session secrets live in their own private file and leave the pairing-code file readable by older versions") { folder in
+            let codes = LocalCredentialStore(directory: folder)
+            let secrets = LocalCredentialStore(directory: folder, filename: "session-secrets.json", holdsPairingCodes: false)
+            try codes.save(testKey())
+            try secrets.saveSecret("pass word £1", account: "unlock.device")
+            try require(try secrets.loadSecret(account: "unlock.device") == "pass word £1", "Secret did not persist")
+            let pairing = try JSONSerialization.jsonObject(with: Data(contentsOf: folder.appendingPathComponent("pairing-codes.json"))) as? [String: Any]
+            try require((pairing?["codes"] as? [String: String]) == ["host": testKey().code], "A secret reached the pairing-code file")
+            try require(try permissions(folder.appendingPathComponent("session-secrets.json")) == 0o600, "Secret file is not private")
+            try require(try codes.load()?.code == testKey().code, "Pairing code changed beside the secret")
+            try expectFailure { try secrets.saveSecret("", account: "unlock.empty") }
+            try expectFailure { try secrets.saveSecret(String(repeating: "x", count: LocalCredentialStore.maximumSecretLength + 1), account: "unlock.long") }
+            try secrets.remove(account: "unlock.device")
+            try require(try secrets.loadSecret(account: "unlock.device") == nil, "Secret removal kept the value")
+            try require(try codes.load()?.code == testKey().code, "Secret removal touched the pairing code")
+        }
+
         print("\(passed) credential and re-entry checks passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

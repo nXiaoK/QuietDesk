@@ -126,6 +126,15 @@ final class DeskModel: ObservableObject {
             UserDefaults.standard.set(data, forKey: "rememberedSessionEffects")
         }
     }
+    // Typing a saved lock screen password on the host after connecting (sessionUnlockV1).
+    @Published private(set) var supportsSessionUnlock = false
+    @Published private(set) var unlockWorking = false
+    /// Shown over the remote picture while and after the host types the password.
+    @Published private(set) var unlockNotice: String?
+    @Published private(set) var unlockStatus = ""
+    @Published private(set) var unlockPasswordSaved = false
+    @Published private(set) var autoUnlockEnabled = false
+    private var unlockNoticeTask: Task<Void, Never>?
     private var supportsSessionPause = false
     @Published private(set) var sessionPaused = false
     @Published private(set) var sessionPauseWorking = false
@@ -998,7 +1007,7 @@ final class DeskModel: ObservableObject {
                             highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings,
                             sessionEffects: true, sessionPause: true, mediaTransportV1: true, independentCursorV1: true,
                             relayTransportV1: true, relayDeviceID: relayRegistration?.deviceID, sessionLockV1: true,
-                            adaptiveVideoV1: true)))
+                            adaptiveVideoV1: true, sessionUnlockV1: true, screenLocked: ScreenLockState.isLockedOnConsole)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -1709,7 +1718,10 @@ final class DeskModel: ObservableObject {
             connections.removeAll { $0.id == record.id }
             if selectedConnectionID == record.id { selectedConnectionID = nil }
             try ConnectionStore.save(connections)
-        } catch { self.error = error.localizedDescription }
+        } catch { self.error = error.localizedDescription; return }
+        Self.setAutoUnlock(false, for: record.id)
+        do { try KeyStore.removeSecret(account: Self.unlockAccount(record.id)) }
+        catch { self.error = "连接记录已移除，但保存的锁屏密码未能删除：\(error.localizedDescription)" }
     }
 
     private func saveConnection(name: String) {
@@ -1745,6 +1757,8 @@ final class DeskModel: ObservableObject {
             applyHostSessionPause(try Wire.readJSON(SessionPauseRequest.self, message.payload), peer: peer)
         case .sessionEffectsRequest:
             applyHostSessionEffects(try Wire.readJSON(SessionEffectsRequest.self, message.payload), peer: peer)
+        case .sessionUnlockRequest:
+            applyHostUnlock(try Wire.readJSON(SessionUnlockRequest.self, message.payload), peer: peer)
         case .deviceIdentity:
             guard hostSession.deviceIdentityAdvertised else {
                 throw DeskError.invalid("当前连接未启用设备标识交换")
@@ -1764,6 +1778,8 @@ final class DeskModel: ObservableObject {
         case .input:
             let input = try Wire.readJSON(RemoteInput.self, message.payload)
             try input.validate()
+            // Keys from the viewer must not mix into the password being typed on the lock screen.
+            if hostSession.unlocker?.typing == true, [.keyDown, .keyUp, .flags].contains(input.kind) { return }
             if input.kind == .scroll {
                 DiagnosticLog.shared.count(.scrollReceived)
                 if !canControl || hostSession.paused || hostSession.pauseTask != nil { DiagnosticLog.shared.count(.scrollSuppressed) }
@@ -1888,6 +1904,8 @@ final class DeskModel: ObservableObject {
             supportsSessionEffects = hello.sessionEffects == true
             supportsSessionLock = supportsSessionEffects && hello.sessionLockV1 == true
             supportsAdaptiveVideo = supportsHighRefreshVideoSettings && hello.adaptiveVideoV1 == true
+            supportsSessionUnlock = hello.sessionUnlockV1 == true
+            refreshUnlockState()
             if supportsLiveSettings {
                 let hostDefault = supportsHighRefreshVideoSettings ? (hello.preferredHighRefreshSettings ?? hello.preferredSettings ?? hello.settings)
                     : supportsExtendedVideoSettings ? (hello.preferredSettings ?? hello.settings) : hello.settings
@@ -1915,6 +1933,7 @@ final class DeskModel: ObservableObject {
             publishSessionPause()
             sendNextSessionPause()
             if let token = pauseTransmission.freshFrameToken { scheduleFreshFrameTimeout(token, peer: peer) }
+            if supportsSessionUnlock, hello.screenLocked == true, autoUnlockEnabled { scheduleAutoUnlock(peer: peer) }
             // Sent after the cursor request so the host applies it once cursor capture has settled.
             if supportsSessionEffects, let remembered = sessionEffectsMemory.connectionState {
                 let supported = SessionEffectsState(muted: remembered.muted, privacy: remembered.privacy,
@@ -1954,6 +1973,9 @@ final class DeskModel: ObservableObject {
                 viewerSession.effectsRequestID = nil
                 sessionEffectsWorking = false
             }
+        case .sessionUnlockResult:
+            guard viewerSession.helloReceived, supportsSessionUnlock else { throw DeskError.invalid("当前连接未启用自动解锁") }
+            receiveUnlockResult(try Wire.readJSON(SessionUnlockResult.self, message.payload))
         case .controlStatus:
             guard viewerSession.helloReceived, controlStatusUpdatesEnabled else { throw DeskError.invalid("对端不支持控制权限更新") }
             let permission = try Wire.readJSON(ControlStatus.self, message.payload)
@@ -2074,6 +2096,149 @@ final class DeskModel: ObservableObject {
         guard supportsSessionLock || !enabled else { return }
         requestSessionEffects(SessionEffectsState(muted: sessionEffects.muted, privacy: sessionEffects.privacy,
                                                   lockOnDisconnect: enabled))
+    }
+
+    // MARK: Lock screen password
+
+    private static let autoUnlockKey = "autoUnlockRecords"
+    private static func unlockAccount(_ record: UUID) -> String { "unlock." + record.uuidString.lowercased() }
+    private static func autoUnlocks(_ record: UUID) -> Bool {
+        UserDefaults.standard.stringArray(forKey: autoUnlockKey)?.contains(record.uuidString) == true
+    }
+    private static func setAutoUnlock(_ enabled: Bool, for record: UUID) {
+        var records = Set(UserDefaults.standard.stringArray(forKey: autoUnlockKey) ?? [])
+        if enabled { records.insert(record.uuidString) } else { records.remove(record.uuidString) }
+        UserDefaults.standard.set(records.sorted(), forKey: autoUnlockKey)
+    }
+
+    /// The saved record of the current viewer connection; lock screen passwords are kept per record.
+    var currentRecordID: UUID? {
+        guard mode == .viewer, let target else { return nil }
+        return ConnectionStore.matching(connections, address: target.address, port: target.port,
+                                        preferredID: target.recordID, relay: target.relay)?.id
+    }
+
+    func refreshUnlockState() {
+        guard let record = currentRecordID else { unlockPasswordSaved = false; autoUnlockEnabled = false; return }
+        do { unlockPasswordSaved = try KeyStore.loadSecret(account: Self.unlockAccount(record)) != nil }
+        catch { unlockPasswordSaved = false; unlockStatus = error.localizedDescription }
+        autoUnlockEnabled = unlockPasswordSaved && Self.autoUnlocks(record)
+    }
+
+    /// Saving a password also turns on unlocking for later connections to this record.
+    func saveUnlockPassword(_ password: String) -> Bool {
+        guard let record = currentRecordID else { unlockStatus = "连接成功后才能为此连接记录保存密码"; return false }
+        do {
+            try SessionUnlockRequest.validate(password)
+            try KeyStore.saveSecret(password, account: Self.unlockAccount(record))
+            Self.setAutoUnlock(true, for: record)
+            unlockStatus = "锁屏密码已保存在这台 Mac，之后连接到锁屏的被控 Mac 时自动解锁"
+        } catch { unlockStatus = error.localizedDescription }
+        refreshUnlockState()
+        return unlockPasswordSaved
+    }
+
+    func removeUnlockPassword() {
+        guard let record = currentRecordID else { return }
+        do {
+            try KeyStore.removeSecret(account: Self.unlockAccount(record))
+            Self.setAutoUnlock(false, for: record)
+            unlockStatus = "已删除此连接记录保存的锁屏密码"
+        } catch { unlockStatus = error.localizedDescription }
+        refreshUnlockState()
+    }
+
+    func setAutoUnlock(_ enabled: Bool) {
+        guard let record = currentRecordID, unlockPasswordSaved || !enabled else { return }
+        Self.setAutoUnlock(enabled, for: record)
+        refreshUnlockState()
+    }
+
+    func unlockNow() { sendUnlockRequest(automatic: false) }
+
+    /// Waits for the first picture plus a moment, so the lock screen is visible before the field fills in.
+    private func scheduleAutoUnlock(peer: Peer) {
+        let viewer = viewerSession
+        viewer.unlockTask?.cancel()
+        viewer.unlockTask = Task { [weak self, weak peer, weak viewer] in
+            for _ in 0..<100 {
+                guard let self, let viewer, self.viewerSession === viewer else { return }
+                if viewer.mediaCommitted || !self.supportsMediaTransport { break }
+                do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+            }
+            do { try await Task.sleep(for: .milliseconds(1500)) } catch { return }
+            guard let self, let peer, let viewer, self.peer === peer, self.viewerSession === viewer, self.connected else { return }
+            self.sendUnlockRequest(automatic: true)
+        }
+    }
+
+    private func sendUnlockRequest(automatic: Bool) {
+        guard mode == .viewer, connected, supportsSessionUnlock, let peer, viewerSession.unlockRequestID == nil,
+              let record = currentRecordID else { return }
+        let request: SessionUnlockRequest
+        do {
+            guard let password = try KeyStore.loadSecret(account: Self.unlockAccount(record)) else {
+                unlockStatus = "此连接记录尚未保存锁屏密码"; return
+            }
+            request = try SessionUnlockRequest(password: password)
+            peer.send(try Wire.json(.sessionUnlockRequest, request))
+        } catch { unlockStatus = error.localizedDescription; return }
+        let viewer = viewerSession
+        viewer.unlockRequestID = request.id
+        viewer.unlockAutomatic = automatic
+        unlockWorking = true
+        DiagnosticLog.shared.record(.sessionUnlock, role: .viewer, state: .requested)
+        showUnlockNotice(automatic ? "被控 Mac 处于锁屏状态，正在自动输入密码解锁…" : "正在向被控 Mac 的锁屏界面输入密码…", persistent: true)
+        viewer.unlockTimeout?.cancel()
+        viewer.unlockTimeout = Task { [weak self, weak viewer] in
+            do { try await Task.sleep(for: .seconds(30)) } catch { return }
+            guard let self, let viewer, self.viewerSession === viewer, viewer.unlockRequestID == request.id else { return }
+            viewer.unlockRequestID = nil
+            self.unlockWorking = false
+            self.showUnlockNotice("被控端 30 秒内没有回复解锁结果")
+        }
+    }
+
+    private func receiveUnlockResult(_ result: SessionUnlockResult) {
+        let viewer = viewerSession
+        guard result.id == viewer.unlockRequestID else { return }
+        viewer.unlockRequestID = nil
+        viewer.unlockTimeout?.cancel()
+        unlockWorking = false
+        DiagnosticLog.shared.record(.sessionUnlock, role: .viewer,
+            state: result.outcome == .unlocked ? .succeeded : result.outcome == .notLocked ? .disabled : .failed)
+        switch result.outcome {
+        case .unlocked:
+            showUnlockNotice(viewer.unlockAutomatic ? "已自动解锁 · 连接时被控 Mac 处于锁屏状态" : "已输入锁屏密码，被控 Mac 已解锁")
+        case .notLocked: showUnlockNotice(result.error ?? "被控 Mac 当前没有锁屏，未输入密码")
+        case .failed: showUnlockNotice("自动解锁未完成：" + (result.error ?? "原因未知"))
+        }
+    }
+
+    private func showUnlockNotice(_ text: String, persistent: Bool = false) {
+        unlockNoticeTask?.cancel()
+        unlockNotice = text
+        unlockStatus = text
+        guard !persistent else { return }
+        unlockNoticeTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(8)) } catch { return }
+            self?.unlockNotice = nil
+        }
+    }
+
+    private func applyHostUnlock(_ request: SessionUnlockRequest, peer: Peer) {
+        let host = hostSession
+        let unlocker = host.unlocker ?? HostScreenUnlocker()
+        host.unlocker = unlocker
+        host.injector?.releaseAll()
+        DiagnosticLog.shared.record(.sessionUnlock, role: .host, state: .requested)
+        host.unlockTask = Task { [weak self, weak peer, weak host] in
+            let result = await unlocker.unlock(request)
+            guard let self, let peer, let host, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
+            DiagnosticLog.shared.record(.sessionUnlock, role: .host,
+                state: result.outcome == .unlocked ? .succeeded : result.outcome == .notLocked ? .disabled : .failed)
+            if let reply = try? Wire.json(.sessionUnlockResult, result) { peer.send(reply) }
+        }
     }
 
     private func requestSessionEffects(_ desired: SessionEffectsState, automatic: Bool = false) {
@@ -2854,6 +3019,14 @@ final class DeskModel: ObservableObject {
         oldViewer.videoRequestTimeout?.cancel()
         oldViewer.stableTask?.cancel()
         oldViewer.clipboardPullTimeout?.cancel()
+        oldViewer.unlockTask?.cancel()
+        oldViewer.unlockTimeout?.cancel()
+        oldHost.unlockTask?.cancel()
+        supportsSessionUnlock = false
+        unlockWorking = false
+        unlockNoticeTask?.cancel()
+        unlockNotice = nil
+        unlockStatus = ""
         if let effects = oldHost.effects {
             let token = generation
             let hadCurtain = effects.state.privacy

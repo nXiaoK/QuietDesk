@@ -27,6 +27,8 @@ final class HostSession {
     var paused = false
     var deviceIdentityAdvertised = false
     var remoteDeviceID: UUID?
+    var unlocker: HostScreenUnlocker?
+    var unlockTask: Task<Void, Never>?
 }
 
 @MainActor
@@ -58,4 +60,8 @@ final class ViewerSession {
     var pauseRequestTimeout: Task<Void, Never>?
     var lastLatencyAt: TimeInterval?
     var restoreCanvasFocusAfterIdle = false
+    var unlockRequestID: UUID?
+    var unlockAutomatic = false
+    var unlockTask: Task<Void, Never>?
+    var unlockTimeout: Task<Void, Never>?
 }

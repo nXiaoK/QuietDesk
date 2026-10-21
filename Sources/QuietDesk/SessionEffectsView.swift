@@ -3,6 +3,7 @@ import SwiftUI
 struct SessionEffectsView: View {
     @ObservedObject var model: DeskModel
     let done: () -> Void
+    @State private var unlockPassword = ""
 
     private var switchesDisabled: Bool { !model.connected || !model.supportsSessionEffects || model.sessionEffectsWorking }
 
@@ -23,6 +24,8 @@ struct SessionEffectsView: View {
                 .disabled(switchesDisabled || !model.supportsSessionLock)
             Text("任何断开都会立即锁屏，包括网络中断、控制端休眠和 QuietDesk 自身重建连接。被控 Mac 保持唤醒且 QuietDesk 在运行时，重新连接后可在锁屏界面输入密码解锁（断开锁屏后的重连尚待实机确认）；睡眠、注销、重启后无法远程解锁。被控端 QuietDesk 被强制结束或崩溃时无法锁屏。")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Divider()
+            unlockSection
             if let remembered = model.sessionEffectsMemory.connectionState {
                 Text("新连接将自动开启：" + [remembered.muted ? "被控端静音" : nil, remembered.privacy ? "防窥" : nil,
                                        remembered.lockOnDisconnect ? "断开后锁屏" : nil].compactMap { $0 }.joined(separator: "、"))
@@ -47,6 +50,36 @@ struct SessionEffectsView: View {
         .toggleStyle(SessionEffectSwitchStyle())
         .padding(22).frame(width: 450)
         .onExitCommand(perform: done)
+        .onAppear { model.refreshUnlockState() }
+        .onDisappear { unlockPassword = "" }
+    }
+
+    @ViewBuilder private var unlockSection: some View {
+        let record = model.currentRecordID != nil
+        Toggle("连接时被控 Mac 若在锁屏，自动输入密码解锁", isOn: Binding(get: { model.autoUnlockEnabled }, set: model.setAutoUnlock))
+            .disabled(!record || !model.unlockPasswordSaved)
+        HStack(spacing: 8) {
+            SecureField(model.unlockPasswordSaved ? "已保存；输入新密码可替换" : "被控 Mac 的登录密码", text: $unlockPassword)
+                .textFieldStyle(.roundedBorder).disabled(!record)
+            Button("保存") { if model.saveUnlockPassword(unlockPassword) { unlockPassword = "" } }
+                .disabled(!record || unlockPassword.isEmpty)
+            if model.unlockPasswordSaved { Button("删除") { model.removeUnlockPassword() } }
+        }
+        HStack(spacing: 8) {
+            Button("立即输入密码解锁") { model.unlockNow() }
+                .disabled(!model.connected || !model.supportsSessionUnlock || !model.unlockPasswordSaved || model.unlockWorking)
+            if model.unlockWorking { ProgressView().controlSize(.small) }
+        }
+        Text("按连接记录保存。连接成功、画面出现约 1.5 秒后，若被控 Mac 处于锁屏，被控端会逐个输入密码再回车，你能看到解锁过程，完成后画面上方会提示“已自动解锁”；被控 Mac 没有锁屏时不输入任何字符，输入中途被本机解锁会立即停止。密码保存在这台 Mac 的私有文件（仅当前账户可读，未单独加密），只经端到端加密的控制通道发送，不写入日志；能读取这台 Mac 账户文件的人也能借此解锁被控 Mac。被控端需授权辅助功能。")
+            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        if !record {
+            Text("连接成功后可为这条连接记录保存密码。").font(.caption).foregroundStyle(.secondary)
+        } else if model.connected, !model.supportsSessionUnlock {
+            Text("共享端需更新后才能自动解锁。").font(.caption).foregroundStyle(.secondary)
+        }
+        if !model.unlockStatus.isEmpty {
+            Text(model.unlockStatus).font(.caption).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+        }
     }
 }
 

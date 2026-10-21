@@ -3,9 +3,11 @@ import Darwin
 import QuietDeskCore
 
 enum KeyStore {
-    private static let store = LocalCredentialStore(directory:
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/\(AppDataLocation.folderName())/Credentials", isDirectory: true))
+    private static let directory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/\(AppDataLocation.folderName())/Credentials", isDirectory: true)
+    private static let store = LocalCredentialStore(directory: directory)
+    // Other secrets live in their own file: older versions reject a pairing-code file holding anything else.
+    private static let secrets = LocalCredentialStore(directory: directory, filename: "session-secrets.json", holdsPairingCodes: false)
 
     static func load(account: String = "host") throws -> PairingKey? {
         try store.load(account: account)
@@ -18,13 +20,20 @@ enum KeyStore {
     static func remove(account: String = "host") throws {
         try store.remove(account: account)
     }
+
+    static func loadSecret(account: String) throws -> String? { try secrets.loadSecret(account: account) }
+    static func saveSecret(_ value: String, account: String) throws { try secrets.saveSecret(value, account: account) }
+    static func removeSecret(account: String) throws { try secrets.remove(account: account) }
 }
 
 // Codes are plaintext JSON protected by the current account's file permissions, not encryption.
 // This store deliberately never reads, migrates or deletes existing Keychain items.
 struct LocalCredentialStore: Sendable {
+    static let maximumSecretLength = 1024
     let directory: URL
-    private static let filename = "pairing-codes.json"
+    var filename = "pairing-codes.json"
+    /// False for a file of other secrets, whose values are only checked for size.
+    var holdsPairingCodes = true
     private static let lockFilename = ".lock"
 
     private struct Document: Codable {
@@ -59,6 +68,21 @@ struct LocalCredentialStore: Sendable {
         }
     }
 
+    func loadSecret(account: String) throws -> String? {
+        try withLockedDirectory { descriptor in try read(descriptor).document.codes[account] }
+    }
+
+    func saveSecret(_ value: String, account: String) throws {
+        guard !value.isEmpty, value.count <= Self.maximumSecretLength else { throw DeskError.invalid("要保存的凭据为空或过长") }
+        try withLockedDirectory { descriptor in
+            removeStaleTemporaryFiles(in: descriptor)
+            var snapshot = try read(descriptor)
+            guard snapshot.document.codes[account] != value else { return }
+            snapshot.document.codes[account] = value
+            try write(snapshot, to: descriptor)
+        }
+    }
+
     func remove(account: String = "host") throws {
         try withLockedDirectory { descriptor in
             removeStaleTemporaryFiles(in: descriptor)
@@ -79,15 +103,15 @@ struct LocalCredentialStore: Sendable {
                 lock = openat(directoryDescriptor, Self.lockFilename, lockFlags)
             }
         }
-        guard lock >= 0 else { throw failure("无法打开本机配对码文件锁") }
+        guard lock >= 0 else { throw failure("无法打开本机\(label)文件锁") }
         defer { close(lock) }
         try validatePrivateFile(lock)
         while flock(lock, LOCK_EX) != 0 {
-            guard errno == EINTR else { throw failure("无法锁定本机配对码文件") }
+            guard errno == EINTR else { throw failure("无法锁定本机\(label)文件") }
         }
         defer { flock(lock, LOCK_UN) }
         var locked = stat()
-        guard fstat(lock, &locked) == 0 else { throw failure("无法检查本机配对码文件锁") }
+        guard fstat(lock, &locked) == 0 else { throw failure("无法检查本机\(label)文件锁") }
         try verifyEntry(Self.lockFilename, in: directoryDescriptor,
                         expected: Identity(device: locked.st_dev, inode: locked.st_ino))
         return try body(directoryDescriptor)
@@ -95,33 +119,33 @@ struct LocalCredentialStore: Sendable {
 
     private func openDirectory() throws -> Int32 {
         guard directory.isFileURL, directory.path.hasPrefix("/") else {
-            throw DeskError.invalid("本机配对码目录必须是绝对文件路径")
+            throw DeskError.invalid("本机\(label)目录必须是绝对文件路径")
         }
         let components = directory.pathComponents.filter { $0 != "/" }
         guard !components.isEmpty, !components.contains(".."), !components.contains(".") else {
-            throw DeskError.invalid("本机配对码目录路径无效")
+            throw DeskError.invalid("本机\(label)目录路径无效")
         }
         var descriptor = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard descriptor >= 0 else { throw failure("无法打开本机配对码目录") }
+        guard descriptor >= 0 else { throw failure("无法打开本机\(label)目录") }
         do {
             for (index, component) in components.enumerated() {
                 var next = openat(descriptor, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                 if next < 0 && errno == ENOENT {
                     guard mkdirat(descriptor, component, mode_t(0o700)) == 0 || errno == EEXIST else {
-                        throw failure("无法创建本机配对码目录")
+                        throw failure("无法创建本机\(label)目录")
                     }
                     next = openat(descriptor, component, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                 }
-                guard next >= 0 else { throw failure("本机配对码目录不可用，拒绝符号链接或非目录路径") }
+                guard next >= 0 else { throw failure("本机\(label)目录不可用，拒绝符号链接或非目录路径") }
                 close(descriptor)
                 descriptor = next
                 if index == components.count - 1 {
                     var info = stat()
-                    guard fstat(descriptor, &info) == 0 else { throw failure("无法检查本机配对码目录") }
+                    guard fstat(descriptor, &info) == 0 else { throw failure("无法检查本机\(label)目录") }
                     guard info.st_uid == geteuid() else {
-                        throw DeskError.invalid("本机配对码目录不属于当前账户，已停止访问")
+                        throw DeskError.invalid("本机\(label)目录不属于当前账户，已停止访问")
                     }
-                    guard fchmod(descriptor, mode_t(0o700)) == 0 else { throw failure("无法保护本机配对码目录") }
+                    guard fchmod(descriptor, mode_t(0o700)) == 0 else { throw failure("无法保护本机\(label)目录") }
                 }
             }
             return descriptor
@@ -133,31 +157,31 @@ struct LocalCredentialStore: Sendable {
 
     private func validatePrivateFile(_ descriptor: Int32) throws {
         var info = stat()
-        guard fstat(descriptor, &info) == 0 else { throw failure("无法检查本机配对码文件") }
+        guard fstat(descriptor, &info) == 0 else { throw failure("无法检查本机\(label)文件") }
         guard (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == geteuid(), info.st_nlink == 1 else {
-            throw DeskError.invalid("本机配对码文件类型或所有者异常，已停止访问")
+            throw DeskError.invalid("本机\(label)文件类型或所有者异常，已停止访问")
         }
-        guard fchmod(descriptor, mode_t(0o600)) == 0 else { throw failure("无法保护本机配对码文件") }
+        guard fchmod(descriptor, mode_t(0o600)) == 0 else { throw failure("无法保护本机\(label)文件") }
     }
 
     private func read(_ directoryDescriptor: Int32) throws -> Snapshot {
-        let descriptor = openat(directoryDescriptor, Self.filename, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        let descriptor = openat(directoryDescriptor, filename, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         if descriptor < 0 && errno == ENOENT {
             return Snapshot(document: Document(version: 1, codes: [:]), identity: nil)
         }
-        guard descriptor >= 0 else { throw failure("无法读取本机配对码文件，拒绝符号链接或异常路径") }
+        guard descriptor >= 0 else { throw failure("无法读取本机\(label)文件，拒绝符号链接或异常路径") }
         defer { close(descriptor) }
         try validatePrivateFile(descriptor)
         var info = stat()
-        guard fstat(descriptor, &info) == 0 else { throw failure("无法检查本机配对码文件") }
+        guard fstat(descriptor, &info) == 0 else { throw failure("无法检查本机\(label)文件") }
         let identity = Identity(device: info.st_dev, inode: info.st_ino)
-        try verifyEntry(Self.filename, in: directoryDescriptor, expected: identity)
+        try verifyEntry(filename, in: directoryDescriptor, expected: identity)
         var data = Data()
         var buffer = [UInt8](repeating: 0, count: 4096)
         while true {
             let count = Darwin.read(descriptor, &buffer, buffer.count)
             if count < 0 && errno == EINTR { continue }
-            guard count >= 0 else { throw failure("无法读取本机配对码文件") }
+            guard count >= 0 else { throw failure("无法读取本机\(label)文件") }
             if count == 0 { break }
             data.append(contentsOf: buffer.prefix(count))
         }
@@ -168,10 +192,13 @@ struct LocalCredentialStore: Sendable {
             throw damagedFile()
         }
         guard document.version == 1 else {
-            throw DeskError.invalid("本机配对码文件版本不受支持，已保留原文件。请备份并移走 Credentials/pairing-codes.json 后重新填写配对码。")
+            throw DeskError.invalid("本机\(label)文件版本不受支持，已保留原文件。请备份并移走 Credentials/\(filename) 后重新填写。")
         }
         do {
-            for code in document.codes.values { _ = try PairingKey(code: code) }
+            for code in document.codes.values {
+                if holdsPairingCodes { _ = try PairingKey(code: code) }
+                else if code.isEmpty || code.count > Self.maximumSecretLength { throw damagedFile() }
+            }
         } catch {
             throw damagedFile()
         }
@@ -205,7 +232,7 @@ struct LocalCredentialStore: Sendable {
         let temporaryName = ".pairing-" + UUID().uuidString + ".tmp"
         let descriptor = openat(directoryDescriptor, temporaryName,
                                 O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
-        guard descriptor >= 0 else { throw failure("无法保存本机配对码文件") }
+        guard descriptor >= 0 else { throw failure("无法保存本机\(label)文件") }
         var committed = false
         defer {
             close(descriptor)
@@ -217,14 +244,14 @@ struct LocalCredentialStore: Sendable {
             while offset < bytes.count {
                 let count = Darwin.write(descriptor, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
                 if count < 0 && errno == EINTR { continue }
-                guard count > 0 else { throw failure("无法写入本机配对码文件", code: count == 0 ? EIO : errno) }
+                guard count > 0 else { throw failure("无法写入本机\(label)文件", code: count == 0 ? EIO : errno) }
                 offset += count
             }
         }
-        guard fsync(descriptor) == 0 else { throw failure("无法同步本机配对码文件") }
-        try verifyEntry(Self.filename, in: directoryDescriptor, expected: snapshot.identity)
-        guard renameat(directoryDescriptor, temporaryName, directoryDescriptor, Self.filename) == 0 else {
-            throw failure("无法替换本机配对码文件，原文件已保留")
+        guard fsync(descriptor) == 0 else { throw failure("无法同步本机\(label)文件") }
+        try verifyEntry(filename, in: directoryDescriptor, expected: snapshot.identity)
+        guard renameat(directoryDescriptor, temporaryName, directoryDescriptor, filename) == 0 else {
+            throw failure("无法替换本机\(label)文件，原文件已保留")
         }
         committed = true
         // The rename is the commit point. Directory sync is best effort after a successful commit.
@@ -235,15 +262,18 @@ struct LocalCredentialStore: Sendable {
         var info = stat()
         let result = fstatat(directoryDescriptor, name, &info, AT_SYMLINK_NOFOLLOW)
         if result < 0 && errno == ENOENT && expected == nil { return }
-        guard result == 0 else { throw failure("本机配对码文件在访问时发生变化，请重试") }
+        guard result == 0 else { throw failure("本机\(label)文件在访问时发生变化，请重试") }
         guard let expected, (info.st_mode & S_IFMT) == S_IFREG,
               info.st_dev == expected.device, info.st_ino == expected.inode, info.st_nlink == 1 else {
-            throw DeskError.invalid("本机配对码文件在访问时发生变化或路径异常，已保留原文件")
+            throw DeskError.invalid("本机\(label)文件在访问时发生变化或路径异常，已保留原文件")
         }
     }
 
+    private var label: String { holdsPairingCodes ? "配对码" : "会话凭据" }
+
     private func damagedFile() -> DeskError {
-        DeskError.invalid("本机配对码文件已损坏，已保留原文件。请备份并移走 Credentials/pairing-codes.json 后重新填写配对码。")
+        DeskError.invalid(holdsPairingCodes ? "本机配对码文件已损坏，已保留原文件。请备份并移走 Credentials/\(filename) 后重新填写配对码。"
+            : "本机会话凭据文件已损坏，已保留原文件。请备份并移走 Credentials/\(filename) 后重新保存。")
     }
 
     private func failure(_ message: String, code: Int32 = errno) -> DeskError {

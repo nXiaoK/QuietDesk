@@ -28,7 +28,8 @@ MESSAGE_KINDS = dict(enumerate((
     "releaseInput", "inputStatus", "clipboardSettings", "clipboardBegin", "clipboardEntry", "clipboardChunk",
     "clipboardEnd", "clipboardReceipt", "clipboardCancel", "streamSettingsRequest", "streamSettingsResult",
     "controlStatus", "deviceIdentity", "sessionEffectsRequest", "sessionEffectsResult", "sessionPauseRequest",
-    "sessionPauseResult", "mediaControl", "mediaFrame", "mediaFeedback", "cursorControl", "cursorShape", "cursorPosition"), start=1))
+    "sessionPauseResult", "mediaControl", "mediaFrame", "mediaFeedback", "cursorControl", "cursorShape", "cursorPosition",
+    "sessionUnlockRequest", "sessionUnlockResult"), start=1))
 OTHER_EVENTS = set((
     "applicationStarted applicationStopped connectionStarted connectionReady connectionClosed connectionFailed "
     "connectionMetrics reconnectScheduled inputFailed hostStarted hostStopped captureStarted captureStopped "

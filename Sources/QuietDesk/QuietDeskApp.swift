@@ -301,6 +301,15 @@ struct DeskView: View {
                 GeometryReader { geometry in fullScreenStatus(in: geometry.size) }.allowsHitTesting(false)
             }
         }
+        .overlay(alignment: .top) {
+            if let notice = model.unlockNotice {
+                Label(notice, systemImage: model.unlockWorking ? "lock" : "lock.open")
+                    .font(.callout).foregroundStyle(.white)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(.black.opacity(0.72), in: Capsule())
+                    .padding(.top, immersive ? 44 : 16).allowsHitTesting(false)
+            }
+        }
         .overlay(alignment: .topTrailing) {
             if showClipboardActivity {
                 clipboardActivity.padding(.top, 16).padding(.trailing, immersive ? 76 : 16)

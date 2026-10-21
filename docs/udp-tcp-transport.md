@@ -70,7 +70,7 @@ UDP 探测每约 200 毫秒发送一次；尚未完成的挑战在一秒有效�
 
 “画质与连接”中的“仅使用 TCP（下次连接生效）”是本机选择，修改后重新连接才生效。实际路径以会话内的“UDP 视频”“TCP 视频”或“TCP 兼容模式”为准，探测中不显示为已经使用 UDP。
 
-应用不配置路由器、防火墙或 UPnP，不提供 NAT 穿透、中转服务或云账号连接。端口转发仍需外部网络本身可达。
+应用不配置路由器、防火墙或 UPnP，不使用公共 STUN/TURN、中转服务或云账号连接；直连模式不做 NAT 穿透，端口转发仍需外部网络本身可达。配置自托管中继后，中继 UDP 视频可尝试[中继打洞](relay.md#中继打洞)。
 
 ## 画质上限与实际值
 
@@ -112,6 +112,6 @@ python3 scripts/analyze-performance.py viewer.txt host.txt --output report.md
 
 真实 M2/M3 两台 Mac 的 Wi‑Fi 动态桌面、相同内容下的自动／仅 TCP 对照、弱网与公网映射、系统网络切换、macOS 14 与 Intel 实机仍待验收。当前不承诺固定恢复秒数、持续 60 fps，或已经达到其他远程产品的实际流畅度。
 
-新版已增加按能力协商的 [独立光标](independent-cursor.md)，旧端仍将光标放在视频中。FEC 前向纠错、音频传输、NAT 穿透和中转不在本次实现范围，系统权限要求保持原样。
+新版已增加按能力协商的 [独立光标](independent-cursor.md)，旧端仍将光标放在视频中。FEC 前向纠错和音频传输不在本次实现范围，系统权限要求保持原样；自托管中继及其视频打洞见[自托管中继](relay.md)。
 
 主要实现入口：[会话协调](../Sources/QuietDeskCore/MediaSession.swift)、[系统加密传输](../Sources/QuietDeskCore/MediaSecureTransport.swift)、[媒体封装](../Sources/QuietDeskCore/MediaProtocol.swift)、[重组与发送缓存](../Sources/QuietDeskCore/MediaReassembly.swift)、[路径与画质策略](../Sources/QuietDeskCore/MediaPathPolicy.swift)、[画布候选解码](../Sources/QuietDesk/RemoteCanvas.swift)。

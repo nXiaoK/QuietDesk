@@ -57,7 +57,7 @@ struct ConnectionSettingsView: View {
                     if model.relayEnabled { RelayPeerAssistPicker(model: model) }
                     Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
                     Toggle(isOn: $model.showFullScreenStatistics) { Text("全屏显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
-                    Text("显示控制通道往返延迟、分辨率、解码 FPS 和收发流量。往返延迟约每 5 秒更新；不代表画面上屏延迟。静止画面 FPS 可能为 0。")
+                    Text("显示控制通道往返延迟、分辨率、解码 FPS 和收发流量。远端画面与本机屏幕比例不同时，状态放在画面外的黑边里，不遮挡远端内容；没有足够黑边时以半透明小字显示在左上角。往返延迟约每 5 秒更新；不代表画面上屏延迟。静止画面 FPS 可能为 0。")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     Button(action: openTraffic) { Label("设备历史流量…", systemImage: "chart.bar.xaxis") }
                     Button(action: openEffects) { Label("被控端隐私与安全…", systemImage: "lock.shield") }
@@ -201,7 +201,7 @@ struct FullScreenSettingsView: View {
                                 .disabled(!model.supportsIndependentCursor)
                             Text(model.cursorStatus).font(.caption).foregroundStyle(.secondary)
                             Toggle(isOn: $model.showFullScreenStatistics) { Text("显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
-                                .help("显示控制通道 RTT、分辨率、解码 FPS 和流量；不代表画面上屏延迟。")
+                                .help("显示控制通道 RTT、分辨率、解码 FPS 和流量；有黑边时放在画面外，否则半透明显示。不代表画面上屏延迟。")
                             Text(model.mediaRouteSummary).font(.caption).foregroundStyle(.secondary)
                             Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
                             Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) { Text("双向同步文字、图片和文件").frame(maxWidth: .infinity, alignment: .leading) }

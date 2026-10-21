@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Network
 import Security
@@ -57,6 +58,14 @@ public final class MediaSession: @unchecked Sendable {
     public var onDatagramPathRetired: (() -> Void)?
     public var isRelayedDatagram: ((NWEndpoint) -> Bool)?
     public var onReliablePathFailure: (() -> Void)?
+    // On the media queue, once per relayed DTLS flow after it passed the session-key handshake and a
+    // challenge in both directions. The secret lets the relay bridges authenticate a direct path.
+    public var onRelayedDatagramAuthenticated: ((NWEndpoint, Data) -> Void)?
+
+    public static func peerAssistSecret(datagramKey: Data, sessionID: UUID) -> Data {
+        HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: datagramKey), salt: Data(sessionID.uuidString.utf8),
+                               info: Data("QuietDesk relay peer path v1".utf8), outputByteCount: 32).withUnsafeBytes { Data($0) }
+    }
 
     private enum Side { case host, viewer }
     private enum Path: String { case udp, tcp, shared }
@@ -129,6 +138,7 @@ public final class MediaSession: @unchecked Sendable {
     private var udpAvailable = false
     private var udpListener: NWListener?
     private var udpPeer: BoundedDatagramPeer?
+    private weak var assistAnnouncedPeer: BoundedDatagramPeer?
     private var pendingDatagramPeers: [ObjectIdentifier: BoundedDatagramPeer] = [:]
     private var udpVerified = false
     private var receivedChallenge = false
@@ -820,6 +830,10 @@ public final class MediaSession: @unchecked Sendable {
 
     private func verifiedUDP(receivedPong: Bool = true) {
         udpVerified = true
+        if udpRelayed, let peer = udpPeer, assistAnnouncedPeer !== peer, let datagramKey, let sessionID {
+            assistAnnouncedPeer = peer
+            onRelayedDatagramAuthenticated?(peer.endpoint, Self.peerAssistSecret(datagramKey: datagramKey, sessionID: sessionID))
+        }
         if side == .viewer {
             if receivedPong { policy.receivedPong(epoch: policy.epoch, now: SessionClock.now) }
             if let probe = policy.probeID { handleActions(policy.probeSucceeded(id: probe, now: SessionClock.now)) }

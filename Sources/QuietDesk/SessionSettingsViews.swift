@@ -2,6 +2,34 @@ import AppKit
 import QuietDeskCore
 import SwiftUI
 
+struct RelayPeerAssistPicker: View {
+    @ObservedObject var model: DeskModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Picker("中继打洞", selection: $model.relayPeerAssist) {
+                ForEach(RelayPeerAssistMode.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            Text(summary).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if model.connected, !model.relayPeerStatus.isEmpty {
+                Text(model.relayPeerStatus).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var summary: String {
+        switch model.relayPeerAssist {
+        case .automatic:
+            return "经中继接通后尝试打洞，按延迟和丢包自动选择直连或中继。只有视频会直连；两台已配对的 Mac 会互相看到对方的网络地址。"
+        case .on:
+            return "打通后视频始终直连，直连中断时立即回到中继。两台已配对的 Mac 会互相看到对方的网络地址。"
+        case .off:
+            return "视频始终经中继，不交换网络地址。从“关”改为其他选项后，下次连接（被控端为下次开启共享）生效。"
+        }
+    }
+}
+
 struct ConnectionSettingsView: View {
     @ObservedObject var model: DeskModel
     let openCaps: () -> Void
@@ -26,6 +54,7 @@ struct ConnectionSettingsView: View {
                     Toggle("仅使用 TCP（下次连接生效）", isOn: $model.mediaTCPOnly)
                     Text(model.connected ? model.mediaTransportStatus : (model.mediaTCPOnly ? "视频使用 TCP" : "视频优先 UDP，不可用时自动使用 TCP"))
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    if model.relayEnabled { RelayPeerAssistPicker(model: model) }
                     Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
                     Toggle(isOn: $model.showFullScreenStatistics) { Text("全屏显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
                     Text("显示控制通道往返延迟、分辨率、解码 FPS 和收发流量。往返延迟约每 5 秒更新；不代表画面上屏延迟。静止画面 FPS 可能为 0。")

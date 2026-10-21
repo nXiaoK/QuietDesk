@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Network
 
 public struct RelayEndpoint: Codable, Equatable, Hashable, Sendable {
     public let host: String
@@ -76,10 +77,43 @@ public enum RelayServiceError: String, Codable, Error, LocalizedError, Sendable 
     }
 }
 
+// An address hint for an assisted direct UDP path. It only ever receives small authenticated probes
+// until the peer answers with the session-derived key; it is never a routing instruction for the node.
+public struct RelayCandidate: Codable, Hashable, Sendable {
+    public enum Kind: String, Codable, Sendable { case host, srflx, prflx }
+    public static let maximumLocal = 4
+    public static let maximumPeer = 8
+    public let kind: Kind
+    public let address: String
+    public let port: UInt16
+
+    public init(kind: Kind, address: String, port: UInt16) {
+        self.kind = kind; self.address = address; self.port = port
+    }
+
+    /// Canonical IP literal, or nil for hostnames, scoped, unspecified, multicast, broadcast and link-local
+    /// addresses. Loopback is accepted only where the caller says it is meaningful (a loopback node).
+    public static func canonicalAddress(_ text: String, allowLoopback: Bool) -> String? {
+        guard !text.contains("%"), !text.contains("/") else { return nil }
+        if let v4 = IPv4Address(text) {
+            guard v4 != .any, v4 != .broadcast, !v4.isMulticast, !v4.isLinkLocal, allowLoopback || !v4.isLoopback else { return nil }
+            return RelayPeerAddress.text(v4: v4.rawValue)
+        }
+        guard let v6 = IPv6Address(text), v6.interface == nil else { return nil }
+        if v6.isIPv4Mapped, let v4 = v6.asIPv4 { return canonicalAddress(RelayPeerAddress.text(v4: v4.rawValue), allowLoopback: allowLoopback) }
+        guard v6 != .any, !v6.isMulticast, !v6.isLinkLocal, allowLoopback || !v6.isLoopback else { return nil }
+        return RelayPeerAddress.text(v6: v6.rawValue)
+    }
+
+    var wireValid: Bool { kind != .prflx && port > 0 && Self.canonicalAddress(address, allowLoopback: kind == .srflx) == address }
+}
+
 public struct RelayMessage: Codable, Sendable {
     public enum Operation: String, Codable, Sendable {
         case register, registered, connect, accept, ready, datagram, datagramReady
         case incoming, incomingDatagram, datagramClosed, ping, pong, error
+        // Only sent after both endpoints negotiated `assist`; older peers never see them.
+        case assist, peerCandidates
     }
     public static let maximumBytes = 8_192
     public var version = 1
@@ -93,13 +127,16 @@ public struct RelayMessage: Codable, Sendable {
     public var datagramKey: Data?
     public var udpPort: Int?
     public var error: RelayServiceError?
+    public var assist: Bool?
+    public var candidates: [RelayCandidate]?
 
     public init(_ op: Operation, accessKey: Data? = nil, deviceID: UUID? = nil, ownerKey: Data? = nil,
                 registration: String? = nil, circuitID: String? = nil, datagramID: Data? = nil,
-                datagramKey: Data? = nil, udpPort: Int? = nil) {
+                datagramKey: Data? = nil, udpPort: Int? = nil, assist: Bool? = nil, candidates: [RelayCandidate]? = nil) {
         self.op = op; self.accessKey = accessKey; self.deviceID = deviceID?.uuidString.lowercased()
         self.ownerKey = ownerKey; self.registration = registration; self.circuitID = circuitID
         self.datagramID = datagramID; self.datagramKey = datagramKey; self.udpPort = udpPort
+        self.assist = assist; self.candidates = candidates
     }
 
     public func validate() throws {
@@ -110,7 +147,8 @@ public struct RelayMessage: Codable, Sendable {
               deviceID.map({ UUID(uuidString: $0) != nil }) ?? true,
               registration == nil || token(registration), circuitID == nil || token(circuitID),
               datagramID.map({ $0.count == 16 }) ?? true, datagramKey.map({ $0.count == 32 }) ?? true,
-              udpPort.map({ (1...65_535).contains($0) }) ?? true else { throw RelayServiceError.invalid }
+              udpPort.map({ (1...65_535).contains($0) }) ?? true,
+              candidates.map({ $0.count <= RelayCandidate.maximumPeer && $0.allSatisfy(\.wireValid) }) ?? true else { throw RelayServiceError.invalid }
         switch op {
         case .register: guard accessKey != nil, deviceID != nil, ownerKey != nil else { throw RelayServiceError.invalid }
         case .connect, .datagram: guard accessKey != nil, deviceID != nil else { throw RelayServiceError.invalid }
@@ -121,6 +159,10 @@ public struct RelayMessage: Codable, Sendable {
             guard datagramID != nil, datagramKey != nil, udpPort != nil else { throw RelayServiceError.invalid }
         case .datagramClosed: guard datagramID != nil else { throw RelayServiceError.invalid }
         case .error: guard error != nil else { throw RelayServiceError.invalid }
+        case .assist:
+            guard datagramID != nil, (candidates ?? []).count <= RelayCandidate.maximumLocal,
+                  (candidates ?? []).allSatisfy({ $0.kind == .host }) else { throw RelayServiceError.invalid }
+        case .peerCandidates: guard datagramID != nil, candidates != nil else { throw RelayServiceError.invalid }
         case .ready, .ping, .pong: break
         }
     }

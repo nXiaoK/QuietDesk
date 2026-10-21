@@ -7,6 +7,9 @@ public enum RelayRegistrationStatus {
 
 public final class RelayHostRegistration: @unchecked Sendable {
     public var onStatus: ((RelayRegistrationStatus) -> Void)?
+    /// Outer path of the most recently authenticated assisted video route; reported on the registration queue.
+    public var onPeerPath: ((RelayPeerPathState) -> Void)?
+    public let peerTraffic = RelayPeerTrafficCounter()
     public let endpoint: RelayEndpoint
     public let deviceID: UUID
     private let accessKey: Data
@@ -27,13 +30,37 @@ public final class RelayHostRegistration: @unchecked Sendable {
     private let endpointLock = NSLock()
     private var localSources: [UUID: UInt16] = [:]
     private var datagramSources: [Data: UInt16] = [:]
+    private var peerAssist: RelayPeerAssistMode
+    private let peerInterfaceCandidates: Bool
+    private var peerPath = RelayPeerPathState.relay
 
     public init(endpoint: RelayEndpoint, accessKey: Data, deviceID: UUID, ownerKey: Data, localPort: UInt16,
-                certificateAuthorities: [Data] = [], trustedCertificate: RelayNodeCertificate? = nil) throws {
+                certificateAuthorities: [Data] = [], trustedCertificate: RelayNodeCertificate? = nil,
+                peerAssist: RelayPeerAssistMode = .off, peerInterfaceCandidates: Bool = true) throws {
         guard accessKey.count == 32, ownerKey.count == 32, localPort > 0 else { throw RelayServiceError.invalid }
         self.endpoint = endpoint; self.accessKey = accessKey; self.deviceID = deviceID
         self.ownerKey = ownerKey; self.localPort = localPort; authorities = certificateAuthorities
-        self.trustedCertificate = trustedCertificate
+        self.trustedCertificate = trustedCertificate; self.peerAssist = peerAssist
+        self.peerInterfaceCandidates = peerInterfaceCandidates
+    }
+
+    /// The host media session authenticated the relayed DTLS flow arriving from `localDatagramEndpoint`.
+    public func enablePeerAssist(localDatagramEndpoint endpoint: NWEndpoint, secret: Data) {
+        guard case .hostPort(let host, let port) = endpoint, host.debugDescription == "127.0.0.1" else { return }
+        queue.async { [self] in
+            let id = endpointLock.withLock { datagramSources.first { $0.value == port.rawValue }?.key }
+            if let id { routes[id]?.enableAssist(secret: secret) }
+        }
+    }
+
+    /// Automatic/on switch immediately; turning assistance back on after "off" needs a new registration.
+    public func setPeerAssistMode(_ mode: RelayPeerAssistMode) {
+        queue.async { [self] in peerAssist = mode; routes.values.forEach { $0.setMode(mode) } }
+    }
+
+    private func reportPeerPath(_ state: RelayPeerPathState) {
+        guard state != peerPath else { return }
+        peerPath = state; onPeerPath?(state)
     }
 
     public func ownsLocalEndpoint(_ endpoint: NWEndpoint) -> Bool {
@@ -60,7 +87,8 @@ public final class RelayHostRegistration: @unchecked Sendable {
             channel = connection
             connection.onReady = { [weak self, weak connection] in
                 guard let self, let connection, self.channel === connection, !self.stopped else { return }
-                connection.send(RelayMessage(.register, accessKey: self.accessKey, deviceID: self.deviceID, ownerKey: self.ownerKey))
+                connection.send(RelayMessage(.register, accessKey: self.accessKey, deviceID: self.deviceID, ownerKey: self.ownerKey,
+                                             assist: self.peerAssist != .off ? true : nil))
                 connection.readMessage(timeout: 10) { [weak self, weak connection] result in
                     guard let self, let connection, self.channel === connection else { return }
                     switch result {
@@ -124,8 +152,16 @@ public final class RelayHostRegistration: @unchecked Sendable {
                 case .incomingDatagram:
                     guard let id = message.datagramID else { throw RelayServiceError.invalid }
                     if self.routes.count < 4, self.routes[id] == nil {
-                        let route = try HostDatagramRoute(message: message, endpoint: self.endpoint, localPort: self.localPort, queue: self.queue)
+                        let assist = message.assist == true && self.peerAssist != .off ? self.peerAssist : nil
+                        let route = try HostDatagramRoute(message: message, endpoint: self.endpoint, localPort: self.localPort, queue: self.queue,
+                                                          assist: assist, counter: self.peerTraffic,
+                                                          interfaceCandidates: self.peerInterfaceCandidates)
                         self.routes[id] = route
+                        route.onConsent = { [weak self, weak connection] candidates in
+                            guard let self, let connection, self.channel === connection else { return }
+                            connection.send(RelayMessage(.assist, datagramID: id, candidates: candidates))
+                        }
+                        route.onPathState = { [weak self] state in self?.reportPeerPath(state) }
                         route.onLocalReady = { [weak self] connection in
                             guard let self, case .hostPort(_, let port) = connection.currentPath?.localEndpoint else { return }
                             self.endpointLock.withLock { self.datagramSources[id] = port.rawValue }
@@ -134,11 +170,14 @@ public final class RelayHostRegistration: @unchecked Sendable {
                             guard let self, let route, self.routes[id] === route else { return }
                             self.endpointLock.withLock { _ = self.datagramSources.removeValue(forKey: id) }
                             self.routes.removeValue(forKey: id)
+                            if route.assisted { self.reportPeerPath(.relay) }
                         }
                         route.start()
                     }
                 case .datagramClosed:
                     if let id = message.datagramID { self.routes[id]?.close() }
+                case .peerCandidates:
+                    if let id = message.datagramID, let candidates = message.candidates { self.routes[id]?.receivePeerCandidates(candidates) }
                 case .error: throw message.error ?? RelayServiceError.invalid
                 default: throw RelayServiceError.invalid
                 }
@@ -183,19 +222,38 @@ public final class RelayHostRegistration: @unchecked Sendable {
 private final class HostDatagramRoute {
     var onClose: (() -> Void)?
     var onLocalReady: ((NWConnection) -> Void)?
-    private let pipe: RelayUDPPipe
+    var onConsent: (([RelayCandidate]) -> Void)? {
+        get { assistedPipe?.onConsent } set { assistedPipe?.onConsent = newValue }
+    }
+    var onPathState: ((RelayPeerPathState) -> Void)? {
+        get { assistedPipe?.onPathState } set { assistedPipe?.onPathState = newValue }
+    }
+    var assisted: Bool { assistedPipe != nil }
+    private let pipe: RelayDatagramPipe
+    private let assistedPipe: RelayAssistedPipe?
     private let local: NWConnection
     private let queue: DispatchQueue
     private var closed = false
     private var pipeReady = false
     private var localReady = false
 
-    init(message: RelayMessage, endpoint: RelayEndpoint, localPort: UInt16, queue: DispatchQueue) throws {
+    init(message: RelayMessage, endpoint: RelayEndpoint, localPort: UInt16, queue: DispatchQueue,
+         assist: RelayPeerAssistMode?, counter: RelayPeerTrafficCounter, interfaceCandidates: Bool) throws {
         guard let id = message.datagramID, let key = message.datagramKey, message.udpPort != nil else { throw RelayServiceError.invalid }
         self.queue = queue
-        pipe = try RelayUDPPipe(endpoint: endpoint, port: endpoint.port, id: id, key: key, side: 1, queue: queue)
+        if let assist {
+            let assisted = try RelayAssistedPipe(endpoint: endpoint, id: id, key: key, side: 1, mode: assist, queue: queue,
+                                                 counter: counter, interfaceCandidates: interfaceCandidates)
+            assistedPipe = assisted; pipe = assisted
+        } else {
+            assistedPipe = nil
+            pipe = try RelayUDPPipe(endpoint: endpoint, port: endpoint.port, id: id, key: key, side: 1, queue: queue)
+        }
         local = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: localPort)!, using: .udp)
     }
+    func enableAssist(secret: Data) { assistedPipe?.enableAssist(secret: secret) }
+    func receivePeerCandidates(_ candidates: [RelayCandidate]) { assistedPipe?.receivePeerCandidates(candidates) }
+    func setMode(_ mode: RelayPeerAssistMode) { assistedPipe?.setMode(mode) }
     func start() {
         pipe.onReady = { [weak self] in self?.pipeReady = true; self?.receiveIfReady() }
         pipe.onPayload = { [weak self] data, complete in

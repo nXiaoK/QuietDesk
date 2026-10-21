@@ -68,6 +68,7 @@ struct SharingView: View {
                         Text(model.relayDeviceID).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
                             .fixedSize(horizontal: false, vertical: true)
                     }
+                    if model.relayEnabled { RelayPeerAssistPicker(model: model) }
                     Button("中继设置…") { showRelaySettings = true }.buttonStyle(.link)
                 }
             }

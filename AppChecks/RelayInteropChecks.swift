@@ -303,6 +303,120 @@ private func exerciseMixedRelay(_ fixture: Fixture, drop: Bool, blocked: Bool = 
                      "Video route change duplicated input or rebuilt the control peer")
 }
 
+// Both Macs sit behind the loopback "NAT", and interface addresses are not shared, so the node-observed
+// mapping is the only candidate: a direct path proves real sockets punched through the very ports they
+// use toward the Go node, with the inner DTLS session untouched.
+private func exerciseAssistedRelay(_ fixture: Fixture) throws {
+    let queue = DispatchQueue(label: "checks.relay.assisted-host")
+    let key = try PairingKey.generate(), device = UUID()
+    let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8)
+    let parameters = try MediaSecureTransport.tlsParameters(key: key, roles: MediaChannelRole.allCases)
+    parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+    let hostPort = RelayBox<UInt16>(0), bridgePort = RelayBox<UInt16?>(nil)
+    let online = DispatchSemaphore(value: 0), localReady = DispatchSemaphore(value: 0), committed = DispatchSemaphore(value: 0)
+    let frames = DispatchSemaphore(value: 0), viewerDirect = DispatchSemaphore(value: 0), hostDirect = DispatchSemaphore(value: 0)
+    let viewerRelay = DispatchSemaphore(value: 0), hostRelay = DispatchSemaphore(value: 0)
+    let hostMedia = RelayBox<MediaSession?>(nil), viewerMedia = RelayBox<MediaSession?>(nil), peers = RelayBox<[Peer]>([])
+    let errors = RelayBox<[String]>([]), states = RelayBox<[String]>([]), sequence = RelayBox<UInt32>(0), shuttingDown = RelayBox(false)
+    let hostAgent = RelayBox<RelayHostRegistration?>(nil)
+    let listener = try startRelayHostListener(parameters, queue: queue) { connection in
+        let peer = Peer(connection: connection); peers.update { $0.append(peer) }
+        peer.onReady = { [weak peer] in
+            guard let peer else { return }
+            if let role = MediaSecureTransport.negotiatedRole(on: connection), role != .control {
+                hostMedia.read()?.acceptAuxiliary(peer, role: role); return
+            }
+            do {
+                let media = try MediaSession.host(control: peer, key: key, port: hostPort.read(), settings: settings)
+                hostMedia.update { $0 = media }
+                media.isRelayedDatagram = { hostAgent.read()?.ownsLocalDatagramEndpoint($0) == true }
+                media.onRelayedDatagramAuthenticated = { endpoint, secret in
+                    hostAgent.read()?.enablePeerAssist(localDatagramEndpoint: endpoint, secret: secret)
+                }
+                media.onPrepareRecovery = { $0(true) }
+                media.onProduceRecoveryFrame = { [weak media] in
+                    sequence.update { $0 += 1 }; media?.sendVideo(relayPacket(sequence.read(), idr: true))
+                }
+                media.onResumeFrames = { [weak media] in
+                    sequence.update { $0 += 1 }; media?.sendVideo(relayPacket(sequence.read(), idr: false))
+                }
+                peer.onMessageHandled = { message, resume in _ = media.receive(message); resume() }
+                media.start()
+            } catch { errors.update { $0.append("Host media setup failed") } }
+        }
+        peer.start()
+    }
+    hostPort.update { $0 = listener.port!.rawValue }
+    let agent = try RelayHostRegistration(endpoint: fixture.endpoint, accessKey: fixture.accessKey, deviceID: device,
+        ownerKey: PairingKey.generate().data, localPort: listener.port!.rawValue, certificateAuthorities: fixture.authorities,
+        peerAssist: .on, peerInterfaceCandidates: false)
+    hostAgent.update { $0 = agent }
+    agent.onStatus = { status in if case .online = status { online.signal() } }
+    agent.onPeerPath = { state in
+        if case .direct = state { hostDirect.signal() } else if state == .relay { hostRelay.signal() }
+    }
+    agent.start()
+    let bridge = try RelayViewerBridge(endpoint: fixture.endpoint, accessKey: fixture.accessKey, deviceID: device,
+        certificateAuthorities: fixture.authorities, peerAssist: .on, peerInterfaceCandidates: false)
+    bridge.onReady = { port in bridgePort.update { $0 = port }; localReady.signal() }
+    bridge.onClose = { error in if !shuttingDown.read() { errors.update { $0.append("Bridge failed: \(error.localizedDescription)") } } }
+    bridge.onDatagramFailure = { error in
+        if !shuttingDown.read() { errors.update { $0.append("Datagram route failed: \(error.localizedDescription)") } }
+    }
+    bridge.onPeerPath = { state in
+        if case .direct = state { viewerDirect.signal() } else if state == .relay { viewerRelay.signal() }
+    }
+    defer {
+        shuttingDown.update { $0 = true }; viewerMedia.read()?.stop(); hostMedia.read()?.stop()
+        bridge.stop(); agent.stop(); peers.read().forEach { $0.close("relay synthetic check finished") }; listener.cancel()
+    }
+    try waitRelay(online, "Host registration did not authenticate")
+    bridge.start(); try waitRelay(localReady, "Private viewer bridge did not bind")
+    let connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: bridgePort.read()!)!,
+        using: try MediaSecureTransport.tlsParameters(key: key, roles: [.control]))
+    let client = Peer(connection: connection, handshakeTimeout: 20)
+    defer { client.close("relay synthetic check finished") }
+    client.onReady = {
+        do {
+            let media = try MediaSession.viewer(control: client, key: key, host: "127.0.0.1", port: bridgePort.read()!,
+                                                settings: settings, relayedDatagram: true)
+            viewerMedia.update { $0 = media }
+            media.onVideo = { frame, complete in complete(true); if !frame.header.isIDR { frames.signal() } }
+            media.onCommitStream = { _, _ in committed.signal() }
+            media.onState = { state in states.update { $0.append(state) } }
+            media.onRelayedDatagramAuthenticated = { _, secret in bridge.enablePeerAssist(secret: secret) }
+            client.onMessageHandled = { message, resume in _ = media.receive(message); resume() }
+            media.start()
+        } catch { errors.update { $0.append("Viewer media setup failed") } }
+    }
+    client.start()
+    try waitRelay(committed, "Assisted relay media never committed: \(states.read()), \(errors.read())", seconds: 15)
+    try waitRelay(frames, "Relay media did not resume its P-frame chain")
+    try waitRelay(viewerDirect, "Viewer never moved its relay lease onto the punched path: \(states.read())")
+    try waitRelay(hostDirect, "Host never followed the viewer's nomination", seconds: 5)
+    Thread.sleep(forTimeInterval: 0.3)
+    func deliver(_ count: Int) throws {
+        for _ in 0..<count {
+            sequence.update { $0 += 1 }
+            hostMedia.read()?.sendVideo(relayPacket(sequence.read(), idr: false))
+            try waitRelay(frames, "Video stopped after the outer path changed: \(states.read())", seconds: 5)
+        }
+    }
+    let mark = states.read().count, before = bridge.peerTraffic.snapshot
+    try deliver(5)
+    let after = bridge.peerTraffic.snapshot
+    try requireRelay(after.direct > before.direct && after.relayed == before.relayed,
+                     "Video still used the node after punching: \(before) -> \(after)")
+    bridge.setPeerAssistMode(.off)
+    try waitRelay(viewerRelay, "Turning assistance off did not return the viewer to the relay")
+    try waitRelay(hostRelay, "The host kept sending directly after the viewer turned assistance off")
+    let relayed = bridge.peerTraffic.snapshot.relayed
+    try deliver(3)
+    try requireRelay(bridge.peerTraffic.snapshot.relayed > relayed, "Video did not return to the node")
+    try requireRelay(!states.read().dropFirst(mark).contains { $0.contains("TCP") }, "Path changes pushed media off UDP: \(states.read())")
+    try requireRelay(errors.read().isEmpty, "Assisted session failed: \(errors.read())")
+}
+
 private func rejectedRelay(_ fixture: Fixture, wrongKey: Bool) throws {
     let bridge = try RelayViewerBridge(endpoint: fixture.endpoint,
         accessKey: wrongKey ? PairingKey.generate().data : fixture.accessKey, deviceID: UUID(), certificateAuthorities: fixture.authorities)
@@ -343,6 +457,9 @@ private func rejectedRelay(_ fixture: Fixture, wrongKey: Bool) throws {
             } else {
             run("Native endpoints preserve inner desktop TLS, independent TCP video and bulk through the Go relay") { try exerciseRelay(fixture, udp: false) }
             run("Native endpoints preserve inner desktop DTLS media through authenticated Go datagram routing") { try exerciseRelay(fixture, udp: true) }
+            run("Assisted relay UDP punches a direct path, keeps DTLS video flowing and returns to the node when turned off") {
+                try exerciseAssistedRelay(fixture)
+            }
             run("A confirmed node certificate covers registration, control, TCP bulk and DTLS routes") { try exerciseRelay(fixture, udp: true, pinned: true) }
             run("Relay access credentials cannot bypass a wrong desktop pairing key") { try exerciseRelay(fixture, udp: false, wrongPairing: true) }
             run("Incorrect node access credentials are explicit and nonretryable") { try rejectedRelay(fixture, wrongKey: true) }

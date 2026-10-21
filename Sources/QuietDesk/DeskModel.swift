@@ -60,6 +60,20 @@ final class DeskModel: ObservableObject {
     @Published var mediaTCPOnly = UserDefaults.standard.bool(forKey: "mediaTCPOnly") {
         didSet { UserDefaults.standard.set(mediaTCPOnly, forKey: "mediaTCPOnly") }
     }
+    // Applies to both roles. Automatic and On switch live; leaving Off applies to the next video lease
+    // (viewer) or the next relay registration (host), because Off never negotiates the capability.
+    @Published var relayPeerAssist = RelayPeerAssistMode(rawValue: UserDefaults.standard.string(forKey: "relayPeerAssist") ?? "") ?? .automatic {
+        didSet {
+            UserDefaults.standard.set(relayPeerAssist.rawValue, forKey: "relayPeerAssist")
+            guard oldValue != relayPeerAssist else { return }
+            viewerSession.relayBridge?.setPeerAssistMode(relayPeerAssist)
+            viewerSession.mediaRelayBridge?.setPeerAssistMode(relayPeerAssist)
+            relayHostRegistration?.setPeerAssistMode(relayPeerAssist)
+        }
+    }
+    @Published private(set) var relayPeerStatus = ""
+    private var mediaRouteValue = ""
+    private var peerPathState = RelayPeerPathState.relay
     @Published private(set) var performanceDiagnosticsEnabled = false
     @Published var showFullScreenStatistics = UserDefaults.standard.bool(forKey: "showFullScreenStatistics") {
         didSet { UserDefaults.standard.set(showFullScreenStatistics, forKey: "showFullScreenStatistics") }
@@ -684,8 +698,14 @@ final class DeskModel: ObservableObject {
             else { owner = try PairingKey.generate(); try KeyStore.save(owner, account: account) }
             let registration = try RelayHostRegistration(endpoint: endpoint, accessKey: access.data, deviceID: deviceID,
                                                         ownerKey: owner.data, localPort: localPort,
-                                                        trustedCertificate: relayCertificate(for: endpoint))
+                                                        trustedCertificate: relayCertificate(for: endpoint), peerAssist: relayPeerAssist)
             relayHostRegistration = registration
+            registration.onPeerPath = { [weak self, weak registration] state in
+                DispatchQueue.main.async {
+                    guard let self, let registration, self.relayHostRegistration === registration else { return }
+                    self.setPeerPath(state, role: .host)
+                }
+            }
             registration.onStatus = { [weak self, weak registration] state in
                 DispatchQueue.main.async {
                     guard let self, let registration, self.relayHostRegistration === registration, self.hostingRequested else { return }
@@ -880,6 +900,9 @@ final class DeskModel: ObservableObject {
                         let media = try MediaSession.host(control: candidate, key: key, port: listeningPort, settings: settings,
                                                           relayRouting: true)
                         media.isRelayedDatagram = { [weak relayRegistration] in relayRegistration?.ownsLocalDatagramEndpoint($0) == true }
+                        media.onRelayedDatagramAuthenticated = { [weak relayRegistration] endpoint, secret in
+                            relayRegistration?.enablePeerAssist(localDatagramEndpoint: endpoint, secret: secret)
+                        }
                         media.diagnostics = diagnostics
                         host.media = media
                         channel.configureMedia { [weak media] in media?.receive($0) ?? false }
@@ -921,7 +944,7 @@ final class DeskModel: ObservableObject {
                         media.onState = { [weak self, weak host] value in
                             DispatchQueue.main.async {
                                 guard let self, let host, self.hostSession === host else { return }
-                                self.mediaTransportStatus = Self.mediaRouteLabel(value, relayed: host.usesRelayControl)
+                                self.setMediaRoute(Self.mediaRouteLabel(value, relayed: host.usesRelayControl))
                                 self.recordMediaRoute(value, role: .host, relayed: host.usesRelayControl)
                             }
                         }
@@ -1101,6 +1124,12 @@ final class DeskModel: ObservableObject {
                                             settings: settings, udpEnabled: !mediaTCPOnly, relayRouting: relayRouting,
                                             relayedDatagram: viewer.usesRelayControl)
         media.diagnostics = performanceDiagnostics
+        media.onRelayedDatagramAuthenticated = { [weak viewer] _, secret in
+            DispatchQueue.main.async {
+                guard let viewer else { return }
+                (viewer.mediaRelayBridge ?? viewer.relayBridge)?.enablePeerAssist(secret: secret)
+            }
+        }
         viewer.media = media
         viewer.mediaReceiver = renderer
         canvas.onCursorPresentation = { [weak self, weak viewer] enabled, known in
@@ -1141,7 +1170,7 @@ final class DeskModel: ObservableObject {
         media.onState = { [weak self, weak viewer] value in
             DispatchQueue.main.async {
                 guard let self, let viewer, self.viewerSession === viewer else { return }
-                self.mediaTransportStatus = Self.mediaRouteLabel(value, relayed: viewer.usesRelayControl)
+                self.setMediaRoute(Self.mediaRouteLabel(value, relayed: viewer.usesRelayControl))
                 self.recordMediaRoute(value, role: .viewer, relayed: viewer.usesRelayControl)
             }
         }
@@ -1174,8 +1203,9 @@ final class DeskModel: ObservableObject {
                         do {
                             viewer.mediaRelayBridge?.stop()
                             let bridge = try RelayViewerBridge(endpoint: relay.endpoint, accessKey: access, deviceID: relay.deviceID,
-                                                              trustedCertificate: target.relayCertificate)
+                                                              trustedCertificate: target.relayCertificate, peerAssist: self.relayPeerAssist)
                             viewer.mediaRelayBridge = bridge
+                            self.observePeerPath(bridge, viewer: viewer)
                             bridge.onReady = { [weak self, weak viewer, weak bridge] port in
                                 DispatchQueue.main.async {
                                     guard let self, let viewer, let bridge, self.viewerSession === viewer,
@@ -1224,6 +1254,58 @@ final class DeskModel: ObservableObject {
         switch value {
         case "UDP 视频", "TCP 视频", "TCP 兼容模式": return "中继 " + value
         default: return value
+        }
+    }
+
+    private func observePeerPath(_ bridge: RelayViewerBridge, viewer: ViewerSession) {
+        bridge.onPeerPath = { [weak self, weak viewer, weak bridge] state in
+            DispatchQueue.main.async {
+                guard let self, let viewer, let bridge, self.viewerSession === viewer,
+                      viewer.relayBridge === bridge || viewer.mediaRelayBridge === bridge else { return }
+                self.setPeerPath(state, role: .viewer)
+            }
+        }
+    }
+
+    private func setMediaRoute(_ label: String) {
+        mediaRouteValue = label
+        mediaTransportStatus = Self.peerRouteLabel(label, peerPath: peerPathState)
+    }
+
+    // The bridge reports its outer path from real authenticated traffic; the label changes only once
+    // the direct path was nominated and confirmed, and returns as soon as video is back on the node.
+    private func setPeerPath(_ state: RelayPeerPathState, role: DiagnosticLog.Role) {
+        guard state != peerPathState else { return }
+        peerPathState = state
+        relayPeerStatus = Self.peerPathDescription(state)
+        if !mediaRouteValue.isEmpty { mediaTransportStatus = Self.peerRouteLabel(mediaRouteValue, peerPath: state) }
+        var values: [DiagnosticLog.Field: Int] = [.peerPath: state.diagnosticCode]
+        if case .direct(let kind) = state { values[.candidateKind] = kind == .host ? 1 : kind == .srflx ? 2 : 3 }
+        let phase: DiagnosticLog.State
+        switch state {
+        case .relay: phase = .disabled
+        case .checking: phase = .requested
+        case .direct: phase = .ready
+        case .relayFaster: phase = .rejected
+        case .unreachable: phase = .failed
+        }
+        DiagnosticLog.shared.record(.peerPathChanged, role: role, state: phase, values: values)
+    }
+
+    private static func peerRouteLabel(_ label: String, peerPath: RelayPeerPathState) -> String {
+        guard label == "中继 UDP 视频", case .direct = peerPath else { return label }
+        return "直连 UDP 视频（中继打洞）"
+    }
+
+    private static func peerPathDescription(_ state: RelayPeerPathState) -> String {
+        switch state {
+        case .relay: return "视频经中继"
+        case .checking: return "正在尝试打洞…"
+        case .direct(.host): return "已打洞直连 · 网卡地址"
+        case .direct(.srflx): return "已打洞直连 · 公网映射"
+        case .direct(.prflx): return "已打洞直连 · 对端映射"
+        case .relayFaster: return "中继延迟或丢包更低，视频保持中继"
+        case .unreachable: return "未能打通或直连中断，视频经中继，稍后重试"
         }
     }
 
@@ -1356,8 +1438,9 @@ final class DeskModel: ObservableObject {
             guard viewer.relayBridge == nil else { return }
             do {
                 let bridge = try RelayViewerBridge(endpoint: relay.endpoint, accessKey: access, deviceID: relay.deviceID, udpEnabled: !mediaTCPOnly,
-                                                  trustedCertificate: target.relayCertificate)
+                                                  trustedCertificate: target.relayCertificate, peerAssist: relayPeerAssist)
                 viewer.relayBridge = bridge; viewer.usesRelayControl = true
+                observePeerPath(bridge, viewer: viewer)
                 active = true; working = true
                 controlTransportStatus = "正在接通中继"
                 status = "正在通过 \(relay.endpoint.host) 接通目标设备…"
@@ -2634,6 +2717,7 @@ final class DeskModel: ObservableObject {
         oldViewer.mediaRelayBridge?.stop()
         controlTransportStatus = "尚未连接"
         mediaTransportStatus = "TCP 兼容模式"
+        mediaRouteValue = ""; peerPathState = .relay; relayPeerStatus = ""
         supportsMediaTransport = false
         supportsIndependentCursor = false
         cursorStatus = "视频光标"

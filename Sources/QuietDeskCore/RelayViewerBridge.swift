@@ -6,6 +6,9 @@ public final class RelayViewerBridge: @unchecked Sendable {
     public var onReady: ((UInt16) -> Void)?
     public var onClose: ((Error) -> Void)?
     public var onDatagramFailure: ((Error) -> Void)?
+    /// Outer path of the current assisted video lease; reported on the bridge queue.
+    public var onPeerPath: ((RelayPeerPathState) -> Void)?
+    public let peerTraffic = RelayPeerTrafficCounter()
     public let endpoint: RelayEndpoint
     public let deviceID: UUID
     private let accessKey: Data
@@ -14,6 +17,9 @@ public final class RelayViewerBridge: @unchecked Sendable {
     private let udpEnabled: Bool
     private let preferredLoopbackPort: UInt16?
     private var bindAttempts = 0
+    private var peerAssist: RelayPeerAssistMode
+    private let peerInterfaceCandidates: Bool
+    private var peerPath = RelayPeerPathState.relay
     private let queue = DispatchQueue(label: "quietdesk.relay-viewer", qos: .userInteractive)
     private var listener: NWListener?
     private var udpListener: NWListener?
@@ -24,7 +30,9 @@ public final class RelayViewerBridge: @unchecked Sendable {
     private var primary: UUID?
     private var datagramChannel: RelayTLSChannel?
     private var datagramLocal: NWConnection?
-    private var datagramPipe: RelayUDPPipe?
+    private var datagramPipe: RelayDatagramPipe?
+    private var assistedPipe: RelayAssistedPipe?
+    private var datagramID: Data?
     private var datagramHeartbeat: DispatchSourceTimer?
     private var datagramGeneration = UUID()
     private var datagramReading = false
@@ -40,11 +48,26 @@ public final class RelayViewerBridge: @unchecked Sendable {
     /// `preferredLoopbackPort` only chooses the first loopback port tried; a taken UDP number still moves to a free pair.
     public init(endpoint: RelayEndpoint, accessKey: Data, deviceID: UUID, udpEnabled: Bool = true,
                 certificateAuthorities: [Data] = [], trustedCertificate: RelayNodeCertificate? = nil,
-                preferredLoopbackPort: UInt16? = nil) throws {
+                preferredLoopbackPort: UInt16? = nil, peerAssist: RelayPeerAssistMode = .off,
+                peerInterfaceCandidates: Bool = true) throws {
         guard accessKey.count == 32 else { throw RelayServiceError.invalid }
         self.endpoint = endpoint; self.accessKey = accessKey; self.deviceID = deviceID
         self.udpEnabled = udpEnabled; authorities = certificateAuthorities
         self.trustedCertificate = trustedCertificate; self.preferredLoopbackPort = preferredLoopbackPort
+        self.peerAssist = peerAssist; self.peerInterfaceCandidates = peerInterfaceCandidates
+    }
+
+    /// The desktop session authenticated the relayed DTLS flow; `secret` is derived from its media key.
+    public func enablePeerAssist(secret: Data) { queue.async { [self] in assistedPipe?.enableAssist(secret: secret) } }
+
+    /// Automatic/on switch immediately; turning assistance back on after "off" applies to the next video lease.
+    public func setPeerAssistMode(_ mode: RelayPeerAssistMode) {
+        queue.async { [self] in peerAssist = mode; assistedPipe?.setMode(mode) }
+    }
+
+    private func reportPeerPath(_ state: RelayPeerPathState) {
+        guard state != peerPath else { return }
+        peerPath = state; onPeerPath?(state)
     }
 
     public func start() {
@@ -151,7 +174,8 @@ public final class RelayViewerBridge: @unchecked Sendable {
             datagramChannel = channel
             channel.onReady = { [weak self, weak channel] in
                 guard let self, let channel, self.datagramGeneration == token, !self.stopped else { return }
-                channel.send(RelayMessage(.datagram, accessKey: self.accessKey, deviceID: self.deviceID))
+                channel.send(RelayMessage(.datagram, accessKey: self.accessKey, deviceID: self.deviceID,
+                                          assist: self.peerAssist != .off ? true : nil))
                 channel.readMessage(timeout: 10) { [weak self, weak channel] result in
                     guard let self, let channel, self.datagramGeneration == token, self.datagramChannel === channel, !self.stopped else { return }
                     do {
@@ -162,8 +186,24 @@ public final class RelayViewerBridge: @unchecked Sendable {
                         }
                         // A node's listener port may be private behind NAT. Only the user-configured
                         // public service endpoint determines where routing datagrams are sent.
-                        let pipe = try RelayUDPPipe(endpoint: self.endpoint, port: self.endpoint.port, id: id, key: key, side: 0, queue: self.queue)
-                        self.datagramPipe = pipe
+                        let pipe: RelayDatagramPipe
+                        if message.assist == true, self.peerAssist != .off {
+                            let assisted = try RelayAssistedPipe(endpoint: self.endpoint, id: id, key: key, side: 0, mode: self.peerAssist,
+                                                                 queue: self.queue, counter: self.peerTraffic,
+                                                                 interfaceCandidates: self.peerInterfaceCandidates)
+                            assisted.onConsent = { [weak self, weak channel] candidates in
+                                guard let self, let channel, self.datagramGeneration == token else { return }
+                                channel.send(RelayMessage(.assist, datagramID: id, candidates: candidates))
+                            }
+                            assisted.onPathState = { [weak self] state in
+                                guard let self, self.datagramGeneration == token else { return }
+                                self.reportPeerPath(state)
+                            }
+                            self.assistedPipe = assisted; pipe = assisted
+                        } else {
+                            pipe = try RelayUDPPipe(endpoint: self.endpoint, port: self.endpoint.port, id: id, key: key, side: 0, queue: self.queue)
+                        }
+                        self.datagramPipe = pipe; self.datagramID = id
                         pipe.onReady = { [weak self, weak pipe] in
                             guard let self, let pipe, self.datagramGeneration == token, !self.stopped else { return }
                             self.datagramReady = true
@@ -220,7 +260,9 @@ public final class RelayViewerBridge: @unchecked Sendable {
             guard let self, let channel, self.datagramGeneration == token, !self.stopped else { return }
             do {
                 let message = try result.get()
-                guard message.op == .pong else { throw message.error ?? .invalid }
+                if message.op == .peerCandidates, let candidates = message.candidates, message.datagramID == self.datagramID {
+                    self.assistedPipe?.receivePeerCandidates(candidates)
+                } else if message.op != .pong { throw message.error ?? .invalid }
                 self.readDatagramHeartbeat(channel, token: token)
             } catch { self.datagramFailed(error, token: token) }
         }
@@ -237,8 +279,9 @@ public final class RelayViewerBridge: @unchecked Sendable {
         datagramGeneration = UUID(); datagramReady = false; datagramReading = false; pendingDatagrams.removeAll()
         datagramHeartbeat?.cancel(); datagramHeartbeat = nil
         let channel = datagramChannel; datagramChannel = nil; channel?.close()
-        let pipe = datagramPipe; datagramPipe = nil; pipe?.close()
+        let pipe = datagramPipe; datagramPipe = nil; assistedPipe = nil; datagramID = nil; pipe?.close()
         datagramLocal?.stateUpdateHandler = nil; datagramLocal?.cancel(); datagramLocal = nil
+        reportPeerPath(.relay)
     }
 
     private func fail(_ error: Error, serviceSetup: Bool = true) {

@@ -301,6 +301,12 @@ public final class MediaFrameReassembler {
         return events
     }
 
+    /// Payload bytes of a fragmented frame that is still held.
+    public func fragmentedBytes(of header: MediaFrameHeader) -> Int? {
+        guard let assembly = assemblies[header.frameID], assembly.header == header, assembly.fragmented else { return nil }
+        return assembly.totalBytes
+    }
+
     // First fragment to completion, while the frame is still held. Whole frames had no fragment wait.
     public func collectionDuration(of header: MediaFrameHeader) -> TimeInterval? {
         guard let assembly = assemblies[header.frameID], assembly.header == header, assembly.fragmented,

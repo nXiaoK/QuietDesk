@@ -77,6 +77,15 @@ final class DeskModel: ObservableObject {
     // Share of UDP video fragments that missed the reorder window over about five seconds; empty off UDP.
     @Published private(set) var mediaLoss = ""
     private var mediaLossFraction: Double?
+    // Applied frame rate and bitrate next to the video size; automatic changes never exceed the chosen ceiling.
+    var videoQualitySummary: String {
+        guard let settings = activeVideoState?.settings else { return "" }
+        return "\(settings.framesPerSecond) fps · \(settings.megabits) Mbps"
+    }
+    var videoQualityHelp: String {
+        guard mode == .viewer, supportsMediaTransport else { return "当前编码帧率上限与目标码率" }
+        return "当前生效的帧率上限与目标码率，按网络丢包和延迟自动调整，不超过所选：\(viewerSettings.summary)"
+    }
     var mediaRouteSummary: String { mediaLoss.isEmpty ? mediaTransportStatus : mediaTransportStatus + " · " + mediaLoss }
     private var mediaRouteValue = ""
     private var peerPathState = RelayPeerPathState.relay
@@ -101,6 +110,8 @@ final class DeskModel: ObservableObject {
     @Published private(set) var supportsHighRefreshVideoSettings = false
     @Published private(set) var supportsSessionEffects = false
     @Published private(set) var supportsSessionLock = false
+    // The host takes fine automatic bitrate steps live and reports delivery delay (adaptiveVideoV1).
+    @Published private(set) var supportsAdaptiveVideo = false
     @Published private(set) var sessionEffects = SessionEffectsState()
     @Published private(set) var sessionEffectsWorking = false
     @Published private(set) var sessionEffectsStatus = ""
@@ -961,7 +972,8 @@ final class DeskModel: ObservableObject {
                             deviceIdentityExchange: host.deviceIdentityAdvertised ? true : nil,
                             highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings,
                             sessionEffects: true, sessionPause: true, mediaTransportV1: true, independentCursorV1: true,
-                            relayTransportV1: true, relayDeviceID: relayRegistration?.deviceID, sessionLockV1: true)))
+                            relayTransportV1: true, relayDeviceID: relayRegistration?.deviceID, sessionLockV1: true,
+                            adaptiveVideoV1: true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -1152,7 +1164,8 @@ final class DeskModel: ObservableObject {
         }
         supportsMediaTransport = true
         viewer.mediaQuality = try MediaQualityPolicy(hostDefault: preferred, preferred: viewerQualityPolicy.preferred,
-                                                   applied: settings, now: SessionClock.now)
+                                                   applied: settings, bitRates: supportsAdaptiveVideo ? StreamSettings.adaptiveBitRates : viewerBitRates,
+                                                   appliedSize: activeVideoState.map { ($0.width, $0.height) }, now: SessionClock.now)
         channel.configureMedia { [weak media] in media?.receive($0) ?? false }
         channel.configureReliableData { [weak media] in media?.sendReliableData($0) }
         media.onVideo = { [weak renderer, weak media] frame, completion in
@@ -1196,8 +1209,9 @@ final class DeskModel: ObservableObject {
         }
         media.onReduceLoad = { [weak self, weak viewer] cause in
             DispatchQueue.main.async {
+                // Network reductions from the media session follow a keyframe that UDP could not deliver.
                 guard let self, let viewer, self.viewerSession === viewer,
-                      let next = viewer.mediaQuality?.reduceLoad(for: cause, now: SessionClock.now) else { return }
+                      let next = viewer.mediaQuality?.reduceLoad(for: cause, severe: cause == .network, now: SessionClock.now) else { return }
                 self.applyAutomaticMediaSettings(next)
             }
         }
@@ -1840,6 +1854,7 @@ final class DeskModel: ObservableObject {
             supportsHighRefreshVideoSettings = supportsExtendedVideoSettings && hello.highRefreshVideoSettings == true
             supportsSessionEffects = hello.sessionEffects == true
             supportsSessionLock = supportsSessionEffects && hello.sessionLockV1 == true
+            supportsAdaptiveVideo = supportsHighRefreshVideoSettings && hello.adaptiveVideoV1 == true
             if supportsLiveSettings {
                 let hostDefault = supportsHighRefreshVideoSettings ? (hello.preferredHighRefreshSettings ?? hello.preferredSettings ?? hello.settings)
                     : supportsExtendedVideoSettings ? (hello.preferredSettings ?? hello.settings) : hello.settings
@@ -1851,6 +1866,13 @@ final class DeskModel: ObservableObject {
                     viewerQualityPolicy.chooseManually()
                     try configureViewerMedia(peer: peer, settings: state.settings, preferred: preferred,
                                              relayRouting: hello.relayTransportV1 == true && target?.relay != nil)
+                    // A relayed session starts from a modest bitrate and climbs only as the path proves it.
+                    if supportsAdaptiveVideo, viewerSession.usesRelayControl, var tuning = videoTuning,
+                       let start = viewerSession.mediaQuality?.startingSettings(maximumMegabits: 10), start != tuning.desired {
+                        try tuning.choose(start)
+                        videoTuning = tuning
+                        viewerSession.automaticVideoSettings = start
+                    }
                 }
                 applyInitialVideoQualityIfReady()
                 sendNextVideoSettings()
@@ -1932,15 +1954,20 @@ final class DeskModel: ObservableObject {
         case .streamSettingsResult:
             guard viewerSession.helloReceived, supportsLiveSettings, var tuning = videoTuning else { throw DeskError.invalid("对端不支持动态画质") }
             let result = try Wire.readJSON(StreamSettingsResult.self, message.payload)
+            let previous = tuning.applied.settings
             guard try tuning.receive(result) else { return }
             viewerSession.videoRequestTimeout?.cancel()
             videoTuning = tuning
             activeVideoState = result.state
-            viewerSession.media?.updateSettings(result.state.settings)
+            // An adaptive host changed only the running encoder's bitrate, so the current stream continues.
+            let bitrateOnly = supportsAdaptiveVideo && previous.longestEdge == result.state.settings.longestEdge
+                && previous.framesPerSecond == result.state.settings.framesPerSecond
+            viewerSession.media?.updateSettings(result.state.settings, restartsStream: !bitrateOnly)
             if result.error == nil {
                 _ = viewerSession.mediaQuality?.confirmApplied(result.state.settings, now: SessionClock.now)
             } else { viewerSession.mediaQuality?.rejectPending(now: SessionClock.now) }
-            try viewerSession.mediaQuality?.synchronizeApplied(result.state.settings, now: SessionClock.now)
+            try viewerSession.mediaQuality?.synchronizeApplied(result.state.settings, size: (result.state.width, result.state.height),
+                                                               now: SessionClock.now)
             if viewerSession.automaticVideoSettings == result.state.settings || result.error != nil {
                 viewerSession.automaticVideoSettings = nil
             }
@@ -2351,6 +2378,18 @@ final class DeskModel: ObservableObject {
                 await cursor?.value
                 guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
                       host.settingsRequestID == request.id, !Task.isCancelled else { return }
+                // Automatic adaptation mostly changes bitrate; keep the stream running instead of rebuilding it.
+                if let current = self.activeVideoState, request.settings.longestEdge == current.settings.longestEdge,
+                   request.settings.framesPerSecond == current.settings.framesPerSecond,
+                   let updated = try? streamer.updateBitrate(request.settings) {
+                    self.activeVideoState = updated
+                    self.recordVideoConfiguration(updated)
+                    self.videoSettingsStatus = "控制端已调整：\(updated.settings.summary)"
+                    peer.setVideoPacing(VideoSendPacing(megabits: updated.settings.megabits))
+                    host.media?.updateSettings(updated.settings, restartsStream: false)
+                    peer.send(try Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: updated)))
+                    return
+                }
                 await self.suspendMediaForConfiguration(host.media)
                 guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
                 let updated = try await streamer.reconfigure(request.settings)
@@ -2787,6 +2826,7 @@ final class DeskModel: ObservableObject {
         sessionEffectsWorking = false
         supportsSessionEffects = false
         supportsSessionLock = false
+        supportsAdaptiveVideo = false
         sessionEffects = SessionEffectsState()
         sessionEffectsStatus = ""
         sessionEffectsMemory.cancel()

@@ -190,6 +190,14 @@ public final class MediaSession: @unchecked Sendable {
     private var samplePackets = 0
     private var sampleFrames = 0
     private var sampleWaitMilliseconds: Double = 0
+    private var sampleBytes = 0
+    private var sampleSettledFragments = 0
+    private var sampleLostFragments = 0
+    private var sampleDeliveryMilliseconds: Double?
+    private var deliveryEstimator = MediaDeliveryEstimator()
+    private var deliveryPath: Path?
+    // Hand-off time and the frame's own pacing time, which is not queueing.
+    private var deliverySentAt: [MediaFrameHeader: (at: TimeInterval, paced: TimeInterval)] = [:]
     private var sampleEncode = MediaComputeTiming()
     private var sampleDecode = MediaComputeTiming()
     private var sampleDirectReduction = false
@@ -280,14 +288,16 @@ public final class MediaSession: @unchecked Sendable {
         installAuxiliaryHandlers(peer, role: role, accepting: true)
     }
 
-    public func updateSettings(_ value: StreamSettings) {
+    /// `restartsStream` is false when the host changed only the running encoder's bitrate, so the
+    /// current reference chain stays valid and no new keyframe transaction is needed.
+    public func updateSettings(_ value: StreamSettings, restartsStream: Bool = true) {
         guard (try? value.validateControlValues()) != nil else { return }
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
             let changed = self.settings != value
             self.settings = value
             self.videoPeer?.setVideoPacing(VideoSendPacing(megabits: value.megabits))
-            if changed, self.active != nil, !self.configurationSuspended { self.requestRecovery() }
+            if changed, restartsStream, self.active != nil, !self.configurationSuspended { self.requestRecovery() }
         }
     }
 
@@ -422,7 +432,7 @@ public final class MediaSession: @unchecked Sendable {
                 if let auxiliary, auxiliary !== videoPeer || !videoBound { throw DeskError.invalid("媒体连接尚未绑定") }
                 let frame = try MediaFrame.decode(message.payload)
                 guard expectedStream == frame.header.stream else { return }
-                lastVideoAt = SessionClock.now
+                lastVideoAt = SessionClock.now; sampleBytes += message.payload.count
                 handleReceiveEvents(try receiver?.receive(frame) ?? [])
             case .mediaFeedback:
                 guard auxiliary == nil else { throw DeskError.invalid("辅助通道不接受媒体反馈") }
@@ -468,6 +478,7 @@ public final class MediaSession: @unchecked Sendable {
             guard side == .viewer, let milliseconds = value.encodeMilliseconds else { return }
             // Newer hosts report their window mean; an older host's per-second maximum is treated the same way.
             sampleEncode.add(milliseconds)
+            if let delivery = value.deliveryMilliseconds { sampleDeliveryMilliseconds = max(sampleDeliveryMilliseconds ?? 0, delivery) }
             return
         }
         if value.operation == .recover {
@@ -821,7 +832,7 @@ public final class MediaSession: @unchecked Sendable {
                 guard side == .viewer, udpVerified else { return }
                 let fragment = try MediaFragment.decode(Data(data.dropFirst()))
                 guard fragment.header.stream == expectedStream else { return }
-                samplePackets += 1; lastVideoAt = SessionClock.now
+                samplePackets += 1; sampleBytes += data.count; lastVideoAt = SessionClock.now
                 handleReceiveEvents(try receiver?.receive(fragment) ?? [])
             case 4:
                 guard side == .host, udpVerified else { return }
@@ -913,6 +924,11 @@ public final class MediaSession: @unchecked Sendable {
                 : isIDR ? max(1, Double(bytes) / bytesPerSecond + roundTrip * 2 + 0.2) : max(0.2, roundTrip * 3 + 0.05)
             let fragments = try cache!.insert(frame, deadline: SessionClock.now + min(5, budget))
             sentHeaders.insert(header)
+            if deliveryPath != target.1 { deliveryPath = target.1; deliveryEstimator.reset(); deliverySentAt.removeAll() }
+            if !isIDR, deliverySentAt.count < 16 {
+                let rate = target.1 == .udp ? bytesPerSecond : VideoSendPacing(megabits: settings.megabits).bytesPerSecond
+                deliverySentAt[header] = (SessionClock.now, Double(bytes) / rate)
+            }
             if transaction != nil { transaction?.frameSubmitted = true }
             nextFrameID += 1
             if target.1 == .udp { enqueue(fragments) }
@@ -959,7 +975,11 @@ public final class MediaSession: @unchecked Sendable {
                 if feedback.kind == .decoded { reassembledLocally.remove(feedback.header) }
                 // The reassembler owns this wait, so late, repeated or expired fragments cannot leave stale timing.
                 if feedback.kind == .reassembled, let waited = receiver?.collectionDuration(of: feedback.header) {
-                    sampleWaitMilliseconds = max(sampleWaitMilliseconds, waited * 1000)
+                    // The sender paces each frame at about the target rate; only time beyond that is queueing.
+                    if !feedback.header.isIDR {
+                        let paced = Double(receiver?.fragmentedBytes(of: feedback.header) ?? 0) / bytesPerSecond
+                        sampleWaitMilliseconds = max(sampleWaitMilliseconds, max(0, waited - paced) * 1000)
+                    }
                     recordDuration(.mediaReassembly, seconds: waited, identifier: feedback.header.frameID)
                 }
                 if feedback.kind == .expired { diagnostics?.recordValue(.mediaExpired, 1, kind: .mediaFrame, identifier: feedback.header.frameID) }
@@ -981,6 +1001,7 @@ public final class MediaSession: @unchecked Sendable {
                 discardQueued(header)
                 originalSubmittedCounts.removeValue(forKey: header)
                 sentHeaders.remove(header)
+                deliverySentAt.removeValue(forKey: header)
                 if reason == .decoded { reassembledAtPeer.remove(header) }
                 onAcknowledged?(sequence)
             case .retransmit(let fragments):
@@ -1007,6 +1028,9 @@ public final class MediaSession: @unchecked Sendable {
             }
             guard !ranges.isEmpty, let filtered = try? MediaFeedback(kind: .nack, header: feedback.header, missingRanges: ranges) else { return }
             accepted = filtered
+        }
+        if feedback.kind == .reassembled || feedback.kind == .decoded, let sent = deliverySentAt.removeValue(forKey: feedback.header) {
+            deliveryEstimator.add(max(0, SessionClock.now - sent.at - sent.paced), at: SessionClock.now)
         }
         if (feedback.kind == .reassembled || feedback.kind == .decoded),
            sentHeaders.contains(feedback.header), reassembledAtPeer.count < 3 {
@@ -1185,27 +1209,34 @@ public final class MediaSession: @unchecked Sendable {
             }
             handleReceiveEvents(receiver?.poll() ?? [])
             if now - sampleStartedAt >= 1 {
-                let sample = MediaPathSample(duration: min(5, now - sampleStartedAt),
-                    mediaActive: now - lastVideoAt < 1, networkSamples: samplePackets,
-                    decodedFrames: sampleFrames, queueMilliseconds: samplePackets > 0 ? sampleWaitMilliseconds : nil,
+                collectLoss()
+                let duration = min(5, now - sampleStartedAt)
+                let sample = MediaPathSample(duration: duration,
+                    mediaActive: now - lastVideoAt < 1, networkSamples: samplePackets, decodedFrames: sampleFrames,
+                    lossFraction: sampleSettledFragments >= MediaLossWindow.minimumFragments
+                        ? Double(sampleLostFragments) / Double(sampleSettledFragments) : nil,
+                    queueMilliseconds: samplePackets > 0 ? sampleWaitMilliseconds : nil,
                     encodeMilliseconds: sampleEncode.mean, decodeMilliseconds: sampleDecode.mean,
-                    frameBudgetMilliseconds: 1000 / Double(settings.framesPerSecond))
+                    frameBudgetMilliseconds: 1000 / Double(settings.framesPerSecond),
+                    deliveryMilliseconds: sampleDeliveryMilliseconds,
+                    receivedMegabits: Double(sampleBytes) * 8 / duration / 1_000_000)
                 let actions = policy.observe(sample, epoch: policy.epoch, now: now)
                 if !sampleDirectReduction, !actions.contains(where: { if case .reduceLoad = $0 { return true }; return false }) { onSample?(sample) }
-                collectLoss()
                 // A UDP trial that has not committed yet is when loss explains a fallback, so follow
                 // the path currently receiving video rather than only the committed one.
                 onDatagramLoss?((transaction?.path ?? active?.path) == .udp ? lossWindow.fraction(at: now) : nil)
                 handleActions(actions)
                 sampleStartedAt = now; samplePackets = 0; sampleFrames = 0; sampleWaitMilliseconds = 0
+                sampleBytes = 0; sampleSettledFragments = 0; sampleLostFragments = 0; sampleDeliveryMilliseconds = nil
                 sampleEncode = MediaComputeTiming(); sampleDecode = MediaComputeTiming()
                 sampleDirectReduction = false
             }
         } else {
             handleSendEvents(cache?.expire() ?? [])
             if now - sampleStartedAt >= 1 {
+                let delivery = deliveryEstimator.takeWindow(at: now).map { min(60_000, $0) }
                 if let identifier = sessionID, let encode = sampleEncode.mean, encode <= 10_000 {
-                    sendControl(MediaControl(.stats, sessionID: identifier, encodeMilliseconds: encode))
+                    sendControl(MediaControl(.stats, sessionID: identifier, encodeMilliseconds: encode, deliveryMilliseconds: delivery))
                 }
                 sampleStartedAt = now; sampleEncode = MediaComputeTiming(); sampleDecode = MediaComputeTiming()
             }
@@ -1230,6 +1261,10 @@ public final class MediaSession: @unchecked Sendable {
                 if transaction != nil { abortTransaction(retry: false) }
                 beginSwitch(path == .udp ? .udp : videoBound ? .tcp : .shared, cause: .policy(reason))
             case .reduceLoad(let bottleneck): onReduceLoad?(bottleneck)
+            case .retryUDP:
+                // The lower quality requested with this failure reaches the host before the fresh keyframe.
+                if transaction != nil { abortTransaction(retry: false) }
+                retryAt = SessionClock.now + MediaPathPolicy.udpRetryDelay; retryPath = .udp
             case .restartSession: control.close("媒体传输代次已耗尽，请重新连接", retryable: true)
             }
         }
@@ -1259,6 +1294,7 @@ public final class MediaSession: @unchecked Sendable {
         if abandoning { receiver?.abandon() }
         guard let counts = receiver?.takeFragmentCounts() else { return }
         lossWindow.add(settled: counts.settled, lost: counts.lost, at: SessionClock.now)
+        sampleSettledFragments += counts.settled; sampleLostFragments += min(counts.lost, counts.settled)
     }
 
     private func randomBytes(_ count: Int) throws -> Data {

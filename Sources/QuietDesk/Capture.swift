@@ -570,6 +570,21 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         waiter.continuation.resume(with: result)
     }
 
+    // Bitrate alone does not change capture, dimensions or the encoder, so no pause or keyframe is needed.
+    func updateBitrate(_ settings: StreamSettings) throws -> VideoStreamState {
+        try settings.validateControlValues()
+        return try queue.sync {
+            guard running, captureStarted, let encoder, !reconfiguring,
+                  settings.longestEdge == currentSettings.longestEdge,
+                  settings.framesPerSecond == currentSettings.framesPerSecond else {
+                throw DeskError.invalid("画质正在调整，请稍后再试")
+            }
+            try encoder.updateBitrate(megabits: settings.megabits)
+            currentSettings = settings
+            return VideoStreamState(settings: settings, width: outputWidth, height: outputHeight)
+        }
+    }
+
     func reconfigure(_ settings: StreamSettings) async throws -> VideoStreamState {
         try settings.validateControlValues()
         let snapshot = try queue.sync { () throws -> (SCStream, Int, Int, Int, Int, StreamSettings, Bool) in

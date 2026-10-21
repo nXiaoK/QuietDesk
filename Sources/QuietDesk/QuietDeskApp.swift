@@ -388,6 +388,7 @@ struct DeskView: View {
                 Text("已连接 \(Text(since, style: .timer))").help("本次连接已持续的时间；断线自动重连后重新计时")
             }
             if !model.resolution.isEmpty { Text(model.resolution) }
+            if !model.videoQualitySummary.isEmpty { Text(model.videoQualitySummary).help(model.videoQualityHelp) }
             Text(model.mediaTransportStatus)
             if !model.mediaLoss.isEmpty {
                 Text(model.mediaLoss).help("约 5 秒内 UDP 视频分片未按时到达（需补传或最终缺失）的比例；TCP 视频由系统重传，不显示")

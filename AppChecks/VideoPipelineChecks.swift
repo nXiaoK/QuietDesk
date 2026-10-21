@@ -422,6 +422,43 @@ private struct VideoPipelineChecks {
             }
         }
 
+        run("Changing a running encoder's bitrate keeps its reference chain without a new keyframe") {
+            var pixelBuffer: CVPixelBuffer?
+            let status = CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nil, &pixelBuffer)
+            guard status == kCVReturnSuccess, let pixelBuffer else { throw VideoCheckFailure("Could not create an offline video buffer") }
+            final class Outputs: @unchecked Sendable {
+                private let lock = NSLock(); private var values: [Bool] = []; private var errors = 0
+                func add(_ result: Result<VideoPacket, Error>) {
+                    lock.withLock {
+                        if case .success(let packet) = result, let idr = try? MediaFrame.containsIDR(packet.avcc) { values.append(idr) }
+                        else { errors += 1 }
+                    }
+                }
+                var snapshot: ([Bool], Int) { lock.withLock { (values, errors) } }
+            }
+            let outputs = Outputs(), done = DispatchSemaphore(value: 0)
+            let encoder = try VideoEncoder(width: 64, height: 64, settings: StreamSettings(framesPerSecond: 60, megabits: 20))
+            encoder.onOutput = { outputs.add($0); done.signal() }
+            encoder.onDropped = { _ in done.signal() }
+            defer { encoder.stop() }
+            for index in 1...6 {
+                CVPixelBufferLockBaseAddress(pixelBuffer, [])
+                for plane in 0..<CVPixelBufferGetPlaneCount(pixelBuffer) {
+                    if let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane) {
+                        memset(base, Int32(plane == 0 ? 16 + index * 20 : 128),
+                               CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane) * CVPixelBufferGetHeightOfPlane(pixelBuffer, plane))
+                    }
+                }
+                CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+                if index == 3 { try encoder.updateBitrate(megabits: 4) }
+                try encoder.encode(pixelBuffer, time: CMTime(value: Int64(index), timescale: 60), sequence: UInt32(index), forceKeyFrame: index == 1)
+                guard done.wait(timeout: .now() + 10) == .success else { throw VideoCheckFailure("Encoder produced no output") }
+            }
+            let (frames, errors) = outputs.snapshot
+            try require(errors == 0 && frames.first == true && frames.count >= 4 && !frames.dropFirst().contains(true),
+                        "A live bitrate change failed or forced a keyframe: \(frames), errors \(errors)")
+        }
+
         print("Video pipeline checks: \(passed) passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

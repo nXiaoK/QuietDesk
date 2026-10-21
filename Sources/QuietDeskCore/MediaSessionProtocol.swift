@@ -16,16 +16,19 @@ public struct MediaControl: Codable, Sendable {
     public let mediaFailure: Bool?
     public let encodeMilliseconds: Double?
     public let relayRouting: Bool?
+    // Host stats only: how far recent frame delivery (send to reassembly) exceeds its recent minimum.
+    public let deliveryMilliseconds: Double?
 
     public init(_ operation: Operation, sessionID: UUID? = nil, token: Data? = nil,
                 datagramKey: Data? = nil, role: MediaChannelRole? = nil, transactionID: UUID? = nil,
                 transportEpoch: UInt32? = nil, codecEpoch: UInt32? = nil, path: String? = nil,
-                mediaFailure: Bool? = nil, encodeMilliseconds: Double? = nil, relayRouting: Bool? = nil) {
+                mediaFailure: Bool? = nil, encodeMilliseconds: Double? = nil, relayRouting: Bool? = nil,
+                deliveryMilliseconds: Double? = nil) {
         self.operation = operation; self.sessionID = sessionID; self.token = token
         self.datagramKey = datagramKey; self.role = role; self.transactionID = transactionID
         self.transportEpoch = transportEpoch; self.codecEpoch = codecEpoch; self.path = path
         self.mediaFailure = mediaFailure; self.encodeMilliseconds = encodeMilliseconds
-        self.relayRouting = relayRouting
+        self.relayRouting = relayRouting; self.deliveryMilliseconds = deliveryMilliseconds
     }
 
     public func validate() throws {
@@ -33,7 +36,8 @@ public struct MediaControl: Codable, Sendable {
               path == nil || ["udp", "tcp", "shared"].contains(path!),
               mediaFailure == nil || operation == .abort || operation == .recover,
               relayRouting == nil || operation == .request || operation == .offer,
-              encodeMilliseconds == nil || operation == .stats else {
+              encodeMilliseconds == nil || operation == .stats,
+              deliveryMilliseconds.map({ operation == .stats && $0.isFinite && (0...60_000).contains($0) }) ?? true else {
             throw DeskError.invalid("媒体协商参数无效")
         }
         switch operation {

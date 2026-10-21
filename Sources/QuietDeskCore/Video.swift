@@ -64,6 +64,12 @@ public final class VideoEncoder {
         guard result == noErr else { throw DeskError.system("设置视频参数失败：\(key)", result) }
     }
 
+    // Rate control follows the new target from the next frames; the stream format and reference chain stay intact.
+    public func updateBitrate(megabits: Int) throws {
+        try set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: megabits * 1_000_000))
+        try set(kVTCompressionPropertyKey_DataRateLimits, [NSNumber(value: megabits * 1_000_000 / 8), NSNumber(value: 1)] as CFArray)
+    }
+
     private func setKeyFrameInterval(seconds: Int, framesPerSecond: Int) throws {
         try set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: framesPerSecond * seconds))
         try set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: seconds))

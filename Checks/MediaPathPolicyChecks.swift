@@ -4,10 +4,11 @@ import QuietDeskCore
 func runMediaPathPolicyChecks() {
     func sample(duration: TimeInterval = 1, active: Bool = true, count: Int = 60, frames: Int = 60,
                 loss: Double? = 0, jitter: Double? = 0, queue: Double? = 0,
-                encode: Double? = 4, decode: Double? = 3) -> MediaPathSample {
+                encode: Double? = 4, decode: Double? = 3, delivery: Double? = nil, received: Double? = 1_000) -> MediaPathSample {
         MediaPathSample(duration: duration, mediaActive: active, networkSamples: count, decodedFrames: frames,
                         lossFraction: loss, jitterMilliseconds: jitter, queueMilliseconds: queue,
-                        encodeMilliseconds: encode, decodeMilliseconds: decode)
+                        encodeMilliseconds: encode, decodeMilliseconds: decode,
+                        deliveryMilliseconds: delivery, receivedMegabits: received)
     }
 
     func udp() throws -> MediaPathPolicy {
@@ -116,11 +117,18 @@ func runMediaPathPolicyChecks() {
         _ = policy.probeSucceeded(id: id, now: 0.1)
         policy.receivedPong(epoch: policy.epoch, now: 1)
         policy.receivedPong(epoch: policy.epoch, now: 2.1)
-        try check(policy.tick(now: 2.1) == [.selectPath(.tcp, epoch: 2, reason: .mediaTimeout)],
-                  "Pongs alone kept an unusable media path")
+        try check(policy.tick(now: 2.1) == [.reduceLoad(.network), .retryUDP] && policy.targetPath == .udp,
+                  "A silent UDP trial was not retried at a lower quality")
+        // The retry gets its own trial window after the retry delay.
+        policy.receivedPong(epoch: policy.epoch, now: 3); policy.receivedPong(epoch: policy.epoch, now: 3.9)
+        try check(policy.tick(now: 4.0).isEmpty, "The retried trial was judged before its own window")
+        policy.receivedPong(epoch: policy.epoch, now: 4.9)
+        try check(policy.tick(now: 5.25) == [.reduceLoad(.network), .retryUDP], "A second silent trial was not retried")
+        policy.receivedPong(epoch: policy.epoch, now: 6); policy.receivedPong(epoch: policy.epoch, now: 7); policy.receivedPong(epoch: policy.epoch, now: 8)
+        try check(policy.tick(now: 8.5) == [.selectPath(.tcp, epoch: 2, reason: .mediaTimeout)],
+                  "Pongs alone kept an unusable media path after repeated attempts")
     }
-
-    run("A failed real UDP media trial immediately requests TCP and starts recovery cooldown") {
+    run("Failed UDP media retries UDP at lower quality and falls back to TCP only after repeated failures") {
         var policy = MediaPathPolicy(capable: true, now: 0)
         try check(policy.mediaFailed(epoch: 0, now: 0).isEmpty, "Initial preparation failure selected a path")
         _ = policy.tick(now: 0)
@@ -129,47 +137,50 @@ func runMediaPathPolicyChecks() {
         _ = policy.probeSucceeded(id: id, now: 0.2)
         let failedEpoch = policy.epoch
         try check(policy.mediaFailed(epoch: failedEpoch - 1, now: 0.3).isEmpty, "A stale media failure changed the path")
-        let actions = policy.mediaFailed(epoch: failedEpoch, now: 0.4)
+        try check(policy.mediaFailed(epoch: failedEpoch, now: 0.4) == [.retryUDP] && policy.udpMediaFailures == 1,
+                  "A first UDP media failure did not retry UDP")
+        try check(policy.mediaFailed(epoch: failedEpoch, now: 1.4) == [.retryUDP], "A second UDP media failure left UDP")
+        let actions = policy.mediaFailed(epoch: failedEpoch, now: 2.4)
         try check(actions == [.selectPath(.tcp, epoch: failedEpoch + 1, reason: .mediaTimeout)]
-                  && policy.nextRecoveryAt == 30.4 && policy.recoveryAttempt == 1,
-                  "A real-media failure retried UDP instead of entering TCP cooldown")
-        try check(policy.mediaFailed(epoch: failedEpoch, now: 0.5).isEmpty, "A repeated failure selected another epoch")
-        try check(policy.mediaBecameUsable(epoch: policy.epoch, now: 0.6), "TCP fallback could not commit")
-        try check(policy.tick(now: 30.39).isEmpty, "Media failure skipped recovery cooldown")
-        try check(policy.tick(now: 30.4).count == 1 && policy.phase == .probingRecovery,
+                  && policy.nextRecoveryAt == 32.4 && policy.recoveryAttempt == 1,
+                  "Repeated UDP media failures did not enter TCP cooldown")
+        try check(policy.mediaFailed(epoch: failedEpoch, now: 2.5).isEmpty, "A repeated failure selected another epoch")
+        try check(policy.mediaBecameUsable(epoch: policy.epoch, now: 2.6), "TCP fallback could not commit")
+        try check(policy.tick(now: 32.39).isEmpty, "Media failure skipped recovery cooldown")
+        try check(policy.tick(now: 32.4).count == 1 && policy.phase == .probingRecovery,
                   "Media failure did not allow a later bounded recovery probe")
         var paused = try udp()
         _ = paused.setPaused(true, now: 1)
         try check(paused.mediaFailed(epoch: paused.epoch, now: 2).isEmpty, "Paused media was treated as a failed path")
         var legacy = MediaPathPolicy(capable: false, now: 0)
         try check(legacy.mediaFailed(epoch: 0, now: 1).isEmpty, "Legacy mode entered media recovery")
+        // Committed UDP video in between proves the path again, so isolated failures never accumulate into TCP.
         var stable = try udp()
-        for step in 1...5 {
-            let now = Double(step) + 0.2
-            stable.receivedPong(epoch: stable.epoch, now: now)
-            _ = stable.observe(sample(), epoch: stable.epoch, now: now)
+        for round in 0..<6 {
+            let now = Double(round) * 10 + 1
+            try check(stable.mediaFailed(epoch: stable.epoch, now: now) == [.retryUDP], "An isolated failure left UDP")
+            try check(stable.mediaBecameUsable(epoch: stable.epoch, now: now + 1) || stable.phase == .udp || stable.phase == .trialUDP,
+                      "Recovered UDP video was not accepted")
         }
-        try check(stable.phase == .udp
-                  && stable.mediaFailed(epoch: stable.epoch, now: 6.2) == [.selectPath(.tcp, epoch: 2, reason: .mediaTimeout)],
-                  "An already active UDP media failure did not request TCP")
+        try check(stable.targetPath == .udp && stable.udpMediaFailures == 0, "Recovered failures still counted toward TCP")
     }
-
-    run("Network degradation requires three effective seconds, reduces load, then trials TCP") {
+    run("Network degradation never changes the path; quality adaptation owns it") {
         var policy = try udp()
-        var actions: [MediaPathAction] = []
-        for step in 1...6 {
+        for step in 1...20 {
             let now = Double(step) + 0.2
             policy.receivedPong(epoch: policy.epoch, now: now)
-            actions = policy.observe(sample(loss: 0.1), epoch: policy.epoch, now: now)
-            if step < 3 || step == 4 || step == 5 { try check(actions.isEmpty, "Degradation acted before its window") }
-            if step == 3 { try check(actions == [.reduceLoad(.network)], "First degraded window did not reduce load") }
+            try check(policy.observe(sample(loss: 0.3, delivery: 900), epoch: policy.epoch, now: now).isEmpty,
+                      "Network degradation produced a path action")
         }
-        try check(actions == [.selectPath(.tcp, epoch: 2, reason: .networkDegraded)]
-                  && policy.phase == .switchingTCP, "Persistent network failure did not trial TCP after load reduction")
-        try check(policy.mediaBecameUsable(epoch: 2, now: 6.2) && policy.phase == .tcpTrial,
-                  "TCP trial did not wait for usable media")
+        try check(policy.targetPath == .udp && policy.phase == .trialUDP, "A degraded but working UDP path was abandoned")
+        // Healthy windows still promote the trial once degradation clears.
+        for step in 21...26 {
+            let now = Double(step) + 0.2
+            policy.receivedPong(epoch: policy.epoch, now: now)
+            _ = policy.observe(sample(), epoch: policy.epoch, now: now)
+        }
+        try check(policy.phase == .udp, "Healthy UDP media did not pass its trial after degradation cleared")
     }
-
     run("Encoder and decoder pressure reduce compute load without blaming the UDP path") {
         for cause in [MediaBottleneck.encoder, .decoder] {
             var policy = try udp()
@@ -187,28 +198,12 @@ func runMediaPathPolicyChecks() {
         }
     }
 
-    run("A load-reduction reconfiguration pause preserves the subsequent TCP trial decision") {
+    run("UDP liveness loss still falls back to TCP, so a broken UDP path cannot stall video") {
         var policy = try udp()
-        var actions: [MediaPathAction] = []
-        for step in 1...3 {
-            let now = Double(step) + 0.2
-            policy.receivedPong(epoch: policy.epoch, now: now)
-            actions = policy.observe(sample(loss: 0.1), epoch: policy.epoch, now: now)
-        }
-        try check(actions == [.reduceLoad(.network)], "Initial reduction was not requested")
-        _ = policy.observe(sample(active: false, count: 0, frames: 0), epoch: policy.epoch, now: 4.2)
-        _ = policy.setPaused(true, now: 4.2)
-        _ = policy.setPaused(false, now: 10)
-        for step in 1...3 {
-            let now = 10 + Double(step)
-            policy.receivedPong(epoch: policy.epoch, now: now)
-            actions = policy.observe(sample(loss: 0.1), epoch: policy.epoch, now: now)
-            if step < 3 { try check(actions.isEmpty, "Pause retained the prior bad-time accumulator") }
-        }
-        try check(actions == [.selectPath(.tcp, epoch: 2, reason: .networkDegraded)],
-                  "A configuration pause repeatedly restarted load reduction instead of trying TCP")
+        policy.receivedPong(epoch: policy.epoch, now: 1)
+        try check(policy.tick(now: 1.9).isEmpty, "Liveness failed before one second without pongs")
+        try check(policy.tick(now: 2.0) == [.selectPath(.tcp, epoch: 2, reason: .noPong)], "Lost UDP liveness kept UDP")
     }
-
     run("Sparse, invalid, duplicate and discontinuous observations cannot manufacture degradation") {
         var policy = try udp()
         let bad = sample(duration: 2, loss: 0.5)
@@ -299,11 +294,12 @@ func runMediaPathPolicyChecks() {
 
     run("Automatic quality recommendations wait for confirmation and never overwrite the preferred ceiling") {
         var quality = try MediaQualityPolicy(hostDefault: .highest, preferred: .highest, now: 0)
-        var recommendation: StreamSettings?
-        for time in 1...3 { recommendation = quality.observe(sample(loss: 0.1), now: Double(time)) }
-        let lower = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 60)
+        try check(quality.observe(sample(loss: 0.1), now: 0.5) == nil, "A loss window changed quality right after a change")
+        let recommendation = quality.observe(sample(loss: 0.1), now: 1.5)
+        // Severe loss halves the bitrate; at 8K-class sizes 30 Mbps is below the readable floor for 60 fps.
+        let lower = StreamSettings(longestEdge: 8192, framesPerSecond: 30, megabits: 30)
         try check(recommendation == lower && quality.pending == lower && quality.effective == .highest,
-                  "Recommendation changed actual settings before confirmation")
+                  "Recommendation changed actual settings before confirmation: \(String(describing: recommendation))")
         try check(quality.preferred == .highest && quality.upperBound == .highest, "Automatic reduction changed preference")
         try check(quality.reduceLoad(for: .network, now: 10) == nil, "A pending request was overlapped")
         try check(!quality.confirmApplied(.init(), now: 10) && quality.pending == lower, "Unrelated reply resolved settings")
@@ -311,7 +307,6 @@ func runMediaPathPolicyChecks() {
                   "Applied settings were not confirmed")
         try check(quality.preferred == .highest, "Confirmation persisted an automatic reduction")
     }
-
     run("Quality keeps actual applied settings separate from its ceiling and preserves newer pending recommendations") {
         let initial = StreamSettings(longestEdge: 1920, framesPerSecond: 15, megabits: 3)
         let initialQuality = try MediaQualityPolicy(hostDefault: .highest, preferred: .highest, applied: initial, now: 0)
@@ -345,27 +340,30 @@ func runMediaPathPolicyChecks() {
                   "Network adaptation changed pixels before bitrate")
     }
 
-    run("Quality recovery requires decoded healthy windows and never exceeds manual limits") {
+    run("Quality recovery requires decoded healthy windows that used the bitrate and never exceeds manual limits") {
         let ceiling = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 8)
         var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, now: 0)
         guard let lower = quality.reduceLoad(for: .network, now: 3) else { throw CheckFailure("No reduction") }
+        try check(lower == StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 5), "Congestion did not lower bitrate first")
         _ = quality.confirmApplied(lower, now: 3)
         for time in 4...20 {
             try check(quality.observe(sample(active: false, count: 0, frames: 0), now: Double(time)) == nil,
                       "Static time recovered quality")
         }
+        for time in 21...40 {
+            try check(quality.observe(sample(received: 1), now: Double(time)) == nil, "A quiet screen proved a higher bitrate")
+        }
         var recovery: StreamSettings?
-        for time in 21...30 { recovery = quality.observe(sample(), now: Double(time)) }
+        for time in 41...50 where recovery == nil { recovery = quality.observe(sample(), now: Double(time)) }
         try check(recovery == ceiling && quality.preferred == ceiling, "Healthy recovery changed its ceiling")
-        _ = quality.confirmApplied(ceiling, now: 30)
-        for time in 31...50 { try check(quality.observe(sample(), now: Double(time)) == nil, "Quality exceeded ceiling") }
+        _ = quality.confirmApplied(ceiling, now: 50)
+        for time in 51...70 { try check(quality.observe(sample(), now: Double(time)) == nil, "Quality exceeded ceiling") }
         let manual = StreamSettings(longestEdge: 1280, framesPerSecond: 30, megabits: 3)
-        try check(try quality.chooseManually(manual, now: 51) == manual && quality.upperBound == manual,
+        try check(try quality.chooseManually(manual, now: 71) == manual && quality.upperBound == manual,
                   "Manual setting did not replace the ceiling")
-        _ = quality.confirmApplied(manual, now: 51)
-        for time in 52...70 { try check(quality.observe(sample(), now: Double(time)) == nil, "Automatic quality exceeded manual choice") }
+        _ = quality.confirmApplied(manual, now: 71)
+        for time in 72...90 { try check(quality.observe(sample(), now: Double(time)) == nil, "Automatic quality exceeded manual choice") }
     }
-
     run("Media path switch causes keep unique, stable diagnostic codes") {
         let reasons: [MediaPathReason] = [.initialProbe, .recoveryProbe, .probeTimeout, .probeFailed,
                                           .noPong, .mediaTimeout, .networkDegraded, .epochExhausted]
@@ -453,12 +451,112 @@ func runMediaPathPolicyChecks() {
         try check(proposed != nil, "Direct recommendation missing")
         quality.rejectPending(now: 6)
         try check(quality.pending == nil && quality.effective == .highest
-                  && quality.reduceLoad(for: .network, now: 8) == nil, "Rejection changed actual quality or skipped cooldown")
-        _ = quality.observe(sample(duration: 2, loss: 1), now: 8)
+                  && quality.reduceLoad(for: .network, now: 7) == nil, "Rejection changed actual quality or skipped spacing")
+        try check(quality.observe(sample(loss: 0.05), now: 9) == nil, "One congested window changed quality")
         quality.resetObservation(now: 20)
-        try check(quality.observe(sample(loss: 1), now: 21) == nil, "Suspension retained degradation time")
+        try check(quality.observe(sample(loss: 0.05), now: 21) == nil, "Suspension retained congestion time")
         try rejects("Invalid settings were accepted") {
             _ = try MediaQualityPolicy(hostDefault: StreamSettings(framesPerSecond: 999), now: 0)
         }
+    }
+
+    run("Network adaptation trims bitrate on congestion, halves it on severe loss and keeps text readable") {
+        let ceiling = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 30)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
+                                             appliedSize: (1920, 1240), now: 0)
+        try check(quality.observe(sample(loss: 0.05), now: 3) == nil, "One congested window changed quality")
+        let trimmed = quality.observe(sample(loss: 0.05), now: 4)
+        try check(trimmed == StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 20), "Congestion did not trim bitrate: \(String(describing: trimmed))")
+        _ = quality.confirmApplied(trimmed!, now: 4)
+        var steps: [StreamSettings] = []
+        var time = 4.0
+        for _ in 0..<6 {
+            time += 1
+            if let next = quality.observe(sample(loss: 0.2), now: time) { steps.append(next); _ = quality.confirmApplied(next, now: time) }
+        }
+        try check(steps == [StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 10),
+                            StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 5),
+                            StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 2),
+                            StreamSettings(longestEdge: 1280, framesPerSecond: 30, megabits: 1)],
+                  "Severe loss did not halve bitrate before lowering frame rate, then size: \(steps)")
+        var tcp = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates, now: 0)
+        func reliable(_ delivery: Double?) -> MediaPathSample {
+            sample(count: 0, loss: nil, jitter: nil, queue: nil, delivery: delivery)
+        }
+        try check(tcp.observe(reliable(nil), now: 3) == nil && tcp.observe(reliable(nil), now: 4) == nil,
+                  "TCP without delivery evidence adapted to the network")
+        try check(tcp.observe(reliable(200), now: 5) == nil && tcp.observe(reliable(200), now: 6)?.megabits == 20,
+                  "Growing TCP delivery time did not trim bitrate")
+        var severe = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates, now: 0)
+        try check(severe.observe(reliable(800), now: 2)?.megabits == 15, "A long TCP queue did not halve bitrate at once")
+    }
+
+    run("Bitrate ramps up in fine steps only while video fills it, and failed steps wait longer") {
+        let ceiling = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 60)
+        let start = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 10)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, applied: start,
+                                             bitRates: StreamSettings.adaptiveBitRates, appliedSize: (1920, 1240), now: 0)
+        var time = 0.0, ladder: [Int] = []
+        while time < 120, quality.effective != ceiling {
+            time += 1
+            if let next = quality.observe(sample(), now: time) {
+                try check(next.longestEdge == 1920 && next.framesPerSecond == 60 && next.megabits <= 60, "Ramp exceeded the ceiling")
+                ladder.append(next.megabits); _ = quality.confirmApplied(next, now: time)
+            }
+        }
+        try check(ladder == [15, 20, 25, 40, 50, 60], "Bitrate did not ramp through fine steps: \(ladder)")
+        var failing = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, applied: start,
+                                             bitRates: StreamSettings.adaptiveBitRates, now: 0)
+        time = 0
+        var up: StreamSettings?
+        while up == nil { time += 1; up = failing.observe(sample(), now: time) }
+        _ = failing.confirmApplied(up!, now: time)
+        time += 1
+        guard let down = failing.observe(sample(loss: 0.2), now: time) else { throw CheckFailure("Failed step was not reduced") }
+        _ = failing.confirmApplied(down, now: time)
+        try check(failing.bitrateHold == MediaQualityPolicy.initialBitrateHold * 2, "A bitrate step that failed soon did not back off")
+        try check(failing.upgradeHold == MediaQualityPolicy.initialUpgradeHold, "A bitrate failure delayed frame rate or size upgrades")
+    }
+
+    run("A narrow path starts from a capped bitrate, and the output size teaches the real screen size") {
+        let ceiling = StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 60)
+        let adaptive = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates, now: 0)
+        try check(adaptive.startingSettings(maximumMegabits: 10) == StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 10),
+                  "Conservative start changed more than bitrate")
+        let legacy = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, now: 0)
+        try check(legacy.startingSettings(maximumMegabits: 10).megabits == 8, "An older host received a step it cannot accept")
+        let native = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 60)
+        var known = try MediaQualityPolicy(hostDefault: native, preferred: native, bitRates: StreamSettings.adaptiveBitRates,
+                                           appliedSize: (3456, 2234), now: 0)
+        try check(known.reduceLoad(for: .network, severe: true, now: 2) == StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 30),
+                  "A known laptop-sized source was treated as 8K and lost smoothness")
+        try rejects("Unknown bitrate steps were accepted") { _ = try MediaQualityPolicy(hostDefault: native, bitRates: [7, 9], now: 0) }
+    }
+
+    run("Network condition classifies loss, delivery growth and queueing, and needs evidence") {
+        try check(sample(loss: 0.12).networkCondition == .severe && sample(loss: 0.04).networkCondition == .congested
+                  && sample(loss: 0.0).networkCondition == .healthy && sample(loss: 0.02).networkCondition == nil,
+                  "UDP loss thresholds changed")
+        try check(sample(queue: 150).networkCondition == .congested && sample(queue: 70).networkCondition == nil,
+                  "Queue thresholds changed")
+        func reliable(_ delivery: Double?) -> MediaPathSample { sample(count: 0, loss: nil, jitter: nil, queue: nil, delivery: delivery) }
+        try check(reliable(600).networkCondition == .severe && reliable(200).networkCondition == .congested
+                  && reliable(20).networkCondition == .healthy && reliable(nil).networkCondition == nil,
+                  "Delivery thresholds changed")
+        try check(sample(count: 2, loss: 0.5).networkCondition == nil, "Sparse UDP windows were classified")
+    }
+
+    run("Delivery estimator reports growth over its recent minimum and forgets an old baseline") {
+        var estimator = MediaDeliveryEstimator()
+        for index in 0..<5 { estimator.add(0.010, at: Double(index) * 0.1) }
+        try check(estimator.takeWindow(at: 1) == 0, "A steady delivery time reported growth")
+        for index in 0..<3 { estimator.add(0.210, at: 1 + Double(index) * 0.1) }
+        try check(abs((estimator.takeWindow(at: 2) ?? 0) - 200) < 0.001, "Queueing growth was not measured")
+        estimator.add(0.300, at: 2); estimator.add(0.300, at: 2.1)
+        try check(estimator.takeWindow(at: 3) == nil, "Two frames produced a delivery figure")
+        for index in 0..<3 { estimator.add(0.300, at: 40 + Double(index)) }
+        try check(estimator.takeWindow(at: 43) == 0, "A baseline older than thirty seconds was kept")
+        estimator.add(.nan, at: 44); estimator.add(-1, at: 44); estimator.add(100, at: 44)
+        try check(estimator.takeWindow(at: 44) == nil, "Invalid delivery times were accepted")
     }
 }

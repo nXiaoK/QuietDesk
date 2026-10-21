@@ -25,13 +25,14 @@ func packet(_ seq: UInt32, idr: Bool, largeIDR: Bool = false) -> VideoPacket {
 enum PrepareHookCheck { case unchecked, boundStream, fallback }
 func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
               failRecoveryCandidate: Bool = false, pauseResume: Bool = false, stopCandidate: Bool = false, pathFailure: Bool = false, legacy: Bool = false, restoreUDP: Bool = false, inspectDiagnostics: Bool = false, largeIDR: Bool = false, overlapPrepare: Bool = false, prepareHook: PrepareHookCheck = .unchecked,
-              delayedDecode: Bool = false, stalledDecode: Bool = false) throws {
+              delayedDecode: Bool = false, stalledDecode: Bool = false, liveBitrate: Bool = false) throws {
     let key = try PairingKey.generate(), settings = StreamSettings(longestEdge:1920,framesPerSecond:60,megabits:12)
     let queue = DispatchQueue(label:"session.loopback-listener")
     let params = try MediaSecureTransport.tlsParameters(key:key,roles:MediaChannelRole.allCases)
     params.requiredLocalEndpoint = .hostPort(host:"127.0.0.1",port:.any)
     let listener = try NWListener(using:params)
     let listenReady = DispatchSemaphore(value:0), committed = DispatchSemaphore(value:0), dataDone = DispatchSemaphore(value:0), pathStable = DispatchSemaphore(value:0)
+    let deliverySampled = DispatchSemaphore(value:0)
     let hostSession = Box<MediaSession?>(nil), viewerSession = Box<MediaSession?>(nil), peers = Box<[Peer]>([])
     let states=Box<[String]>([]), errors=Box<[String]>([]), decoded=Box<[UInt64]>([]), sequence=Box<UInt32>(0), prepared=Box(0), committedCount=Box(0)
     let rejectedCandidate = Box(false), candidateSeen = DispatchSemaphore(value:0)
@@ -112,7 +113,10 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             session.diagnostics=diagnostics
             session.onReduceLoad={ cause in reductions.update{$0.append(cause)} }
             session.onPathSwitch={ label,cause in pathSwitches.update{$0.append((label,cause))} }
-            session.onSample={ sample in if (sample.encodeMilliseconds ?? 0)>=45 && (sample.decodeMilliseconds ?? 0)>=2 { sampledCompute.signal() } }
+            session.onSample={ sample in
+                if (sample.encodeMilliseconds ?? 0)>=45 && (sample.decodeMilliseconds ?? 0)>=2 { sampledCompute.signal() }
+                if sample.deliveryMilliseconds != nil, (sample.receivedMegabits ?? 0) > 0 { deliverySampled.signal() }
+            }
             session.onVideo={ frame,complete in
                 decoded.update{$0.append(frame.header.frameID)}
                 if prepareHook != .unchecked, frame.header.isIDR {
@@ -271,6 +275,21 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             try require(SessionClock.now-fallbackTime>=29,"UDP recovery ignored its cooldown")
         }
     }
+    if liveBitrate {
+        let commitsBefore=committedCount.get(), preparedBefore=prepared.get(), decodedBefore=decoded.get().count
+        let lower=StreamSettings(longestEdge:1920,framesPerSecond:60,megabits:6)
+        hostSession.get()?.updateSettings(lower,restartsStream:false)
+        viewerSession.get()?.updateSettings(lower,restartsStream:false)
+        for _ in 0..<40 {
+            hostSession.get()?.recordComputeTiming(encodeMilliseconds:3)
+            hostSession.get()?.sendVideo(nextPacket(false))
+            Thread.sleep(forTimeInterval:0.05)
+        }
+        try wait(deliverySampled,"Host frame delivery timing did not reach a viewer sample",seconds:3)
+        try require(committedCount.get()==commitsBefore && prepared.get()==preparedBefore,"A bitrate-only change restarted the stream")
+        try require(decoded.get().count>=decodedBefore+30,"Predicted frames stopped after a live bitrate change")
+        try require(errors.get().isEmpty,"Live bitrate change failed: \(errors.get())")
+    }
     if reconfigure {
         let suspended=DispatchSemaphore(value:0)
         hostSession.get()?.suspendForConfiguration { suspended.signal() }
@@ -373,6 +392,8 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
    run("Overlapping prepare preserves current transaction and future epochs") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true,overlapPrepare:true) }
    run("512 KiB IDR is paced, reassembled and committed byte-for-byte") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,inspectDiagnostics:true,largeIDR:true) }
    run("Observable diagnostics and authenticated compute samples") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,inspectDiagnostics:true) }
+   run("A bitrate-only change keeps the UDP stream and reports host frame delivery") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,liveBitrate:true) }
+   run("A bitrate-only change keeps the TCP stream and reports host frame delivery") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false,liveBitrate:true) }
    run("Stopped candidates reject late decode completion") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,stopCandidate:true) }
   }
   print("Media session checks: \(passed) passed, \(failed) failed")

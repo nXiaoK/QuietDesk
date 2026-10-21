@@ -115,6 +115,8 @@ public struct StreamSettings: Codable, Equatable, Sendable {
     public static let legacyBitRates = [1, 2, 3, 5, 8, 12]
     public static let extendedBitRates = legacyBitRates + [30]
     public static let bitRates = extendedBitRates + [60, 100]
+    // Finer automatic steps for hosts that negotiated adaptiveVideoV1. Manual choices keep the coarse list.
+    public static let adaptiveBitRates = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50, 60, 80, 100]
     public static let highest = StreamSettings(longestEdge: nativeLongestEdge, framesPerSecond: 60, megabits: 100)
     public var longestEdge: Int
     public var framesPerSecond: Int
@@ -127,7 +129,7 @@ public struct StreamSettings: Codable, Equatable, Sendable {
 
     public func validateControlValues() throws {
         guard Self.longestEdges.contains(longestEdge), Self.frameRates.contains(framesPerSecond),
-              Self.bitRates.contains(megabits) else { throw DeskError.invalid("不支持的画质参数") }
+              Self.adaptiveBitRates.contains(megabits) else { throw DeskError.invalid("不支持的画质参数") }
     }
 
     public static func resolutionLabel(_ longestEdge: Int) -> String {
@@ -178,7 +180,10 @@ public struct Hello: Codable, Sendable {
     public let relayTransportV1: Bool?
     public let relayDeviceID: UUID?
     public let sessionLockV1: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil) {
+    // The host accepts adaptiveBitRates, applies bitrate-only changes to the running encoder without a new
+    // keyframe, and reports frame delivery delay in media stats.
+    public let adaptiveVideoV1: Bool?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -201,6 +206,7 @@ public struct Hello: Codable, Sendable {
         self.relayTransportV1 = relayTransportV1
         self.relayDeviceID = relayDeviceID
         self.sessionLockV1 = sessionLockV1
+        self.adaptiveVideoV1 = adaptiveVideoV1
     }
 
     public func validate() throws {

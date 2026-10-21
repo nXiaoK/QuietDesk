@@ -443,7 +443,8 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
     // Discard pre-filter samples so the next window describes traffic after the block became effective.
     _ = diagnostics.drain()
     let droppedAt = proxy.snapshot().firstDropAt ?? SessionClock.now
-    try waitBlackhole(committedTCP, "Live UDP probes with blackholed media never committed independent TCP; states \(states.get()), errors \(errors.get())", seconds: 10)
+    // UDP gets udpMediaFailureLimit attempts at decreasing quality before a blackholed media path moves to TCP.
+    try waitBlackhole(committedTCP, "Live UDP probes with blackholed media never committed independent TCP; states \(states.get()), errors \(errors.get())", seconds: 15)
     try waitBlackhole(predictedFrame, "TCP committed an IDR but did not resume its P-frame chain", seconds: 3)
     requireNewControlPong.update { $0 = true }
     try waitBlackhole(controlPong, "TLS control stopped responding during media fallback", seconds: 2)
@@ -472,8 +473,10 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
                              "Media fallback coincided with lost UDP liveness instead of surviving authenticated pongs")
         try requireBlackhole(networkLoadReductions.get() >= 1, "Actual media blackhole did not request network load reduction")
         try requireBlackhole(highestLoss.get() >= 0.5, "Dropped IDR fragments were not reported as UDP loss: \(highestLoss.get())")
-        try requireBlackhole(udpPreparations.get() >= 1 && udpPreparations.get() <= 3 && tcpPreparations.get() >= 1,
-                             "UDP media was never tried or kept retrying instead of falling back")
+        try requireBlackhole(udpPreparations.get() == MediaPathPolicy.udpMediaFailureLimit && tcpPreparations.get() >= 1,
+                             "UDP media was not retried at lower quality, or kept retrying instead of falling back")
+        try requireBlackhole(networkLoadReductions.get() >= MediaPathPolicy.udpMediaFailureLimit,
+                             "A failed UDP keyframe did not lower quality before the next UDP attempt")
     }
     try requireBlackhole(lossReports.get().last.map { $0 == nil } ?? true, "UDP loss kept showing after video moved to TCP")
     try requireBlackhole(videoConnections.get() >= 1 && committed.get().count == 1 && states.get().last == "TCP 视频",

@@ -31,6 +31,18 @@ func runMediaSessionProtocolChecks() {
             try MediaControl(.prepare, sessionID: session, transactionID: UUID(), transportEpoch: 1, codecEpoch: 1, path: "other").validate()
         }
         try MediaControl(.stats, sessionID: session, encodeMilliseconds: 4.2).validate()
+        try MediaControl(.stats, sessionID: session, encodeMilliseconds: 4.2, deliveryMilliseconds: 180).validate()
+        for delivery in [-1, .nan, .infinity, 60_001] {
+            try rejects("Invalid delivery growth was accepted") {
+                try MediaControl(.stats, sessionID: session, encodeMilliseconds: 4, deliveryMilliseconds: delivery).validate()
+            }
+        }
+        try rejects("Delivery growth outside stats was accepted") {
+            try MediaControl(.recover, sessionID: session, transportEpoch: 1, codecEpoch: 1, deliveryMilliseconds: 10).validate()
+        }
+        // An older viewer decodes stats with the new field and still sees a valid encode figure.
+        let encoded = try JSONEncoder().encode(MediaControl(.stats, sessionID: session, encodeMilliseconds: 4.2, deliveryMilliseconds: 180))
+        try check(String(decoding: encoded, as: UTF8.self).contains("encodeMilliseconds"), "Stats lost the field older viewers require")
         try rejects("Accepted non-finite encoder data") {
             try MediaControl(.stats, sessionID: session, encodeMilliseconds: .infinity).validate()
         }

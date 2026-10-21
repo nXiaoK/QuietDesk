@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Network
 import ScreenCaptureKit
 import IOKit.hid
@@ -2291,19 +2292,37 @@ final class DeskModel: ObservableObject {
                                         preferredID: target.recordID, relay: target.relay)?.id
     }
 
+    /// A saved lock screen password with the pairing code it was saved under. It is sent only over a
+    /// session authenticated with that same code, so a record later reused for another Mac never releases it.
+    private struct UnlockSecret: Codable { let key: String; let password: String }
+
+    private static func fingerprint(_ key: PairingKey) -> String {
+        SHA256.hash(data: key.data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The password saved for this record under the pairing code the current session authenticated with.
+    private func currentUnlockPassword() throws -> String? {
+        guard let record = currentRecordID, let key = target?.key,
+              let text = try KeyStore.loadSecret(account: Self.unlockAccount(record)),
+              let secret = try? JSONDecoder().decode(UnlockSecret.self, from: Data(text.utf8)),
+              secret.key == Self.fingerprint(key) else { return nil }
+        return secret.password
+    }
+
     func refreshUnlockState() {
         guard let record = currentRecordID else { unlockPasswordSaved = false; autoUnlockEnabled = false; return }
-        do { unlockPasswordSaved = try KeyStore.loadSecret(account: Self.unlockAccount(record)) != nil }
+        do { unlockPasswordSaved = try currentUnlockPassword() != nil }
         catch { unlockPasswordSaved = false; unlockStatus = error.localizedDescription }
         autoUnlockEnabled = unlockPasswordSaved && Self.autoUnlocks(record)
     }
 
     /// Saving a password also turns on unlocking for later connections to this record.
     func saveUnlockPassword(_ password: String) -> Bool {
-        guard let record = currentRecordID else { unlockStatus = "连接成功后才能为此连接记录保存密码"; return false }
+        guard let record = currentRecordID, let key = target?.key else { unlockStatus = "连接成功后才能为此连接记录保存密码"; return false }
         do {
             try SessionUnlockRequest.validate(password)
-            try KeyStore.saveSecret(password, account: Self.unlockAccount(record))
+            let secret = try JSONEncoder().encode(UnlockSecret(key: Self.fingerprint(key), password: password))
+            try KeyStore.saveSecret(String(decoding: secret, as: UTF8.self), account: Self.unlockAccount(record))
             Self.setAutoUnlock(true, for: record)
             unlockStatus = "锁屏密码已保存在这台 Mac，之后连接到锁屏的被控 Mac 时自动解锁"
         } catch { unlockStatus = error.localizedDescription }
@@ -2340,7 +2359,17 @@ final class DeskModel: ObservableObject {
                 do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
             }
             do { try await Task.sleep(for: .milliseconds(1500)) } catch { return }
+            // Remembered switches are requested at hello; the curtain has to be up before the desktop is.
+            for _ in 0..<200 {
+                guard let self, let viewer, self.viewerSession === viewer else { return }
+                if !self.sessionEffectsWorking { break }
+                do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+            }
             guard let self, let peer, let viewer, self.peer === peer, self.viewerSession === viewer, self.connected else { return }
+            if self.sessionEffectsMemory.remembered.privacy, !self.sessionEffects.privacy {
+                self.showUnlockNotice("防窥没有开启，为免被控 Mac 在本地露出桌面，未自动解锁；可在“被控端隐私与安全”中手动解锁")
+                return
+            }
             self.sendUnlockRequest(automatic: true)
         }
     }
@@ -2350,8 +2379,10 @@ final class DeskModel: ObservableObject {
               let record = currentRecordID else { return }
         let request: SessionUnlockRequest
         do {
-            guard let password = try KeyStore.loadSecret(account: Self.unlockAccount(record)) else {
-                unlockStatus = "此连接记录尚未保存锁屏密码"; return
+            guard let password = try currentUnlockPassword() else {
+                unlockStatus = try KeyStore.loadSecret(account: Self.unlockAccount(record)) == nil ? "此连接记录尚未保存锁屏密码"
+                    : "保存的锁屏密码属于使用另一配对码的 Mac，未发送；请为这台 Mac 重新保存"
+                return
             }
             request = try SessionUnlockRequest(password: password)
             peer.send(try Wire.json(.sessionUnlockRequest, request))
@@ -2401,12 +2432,19 @@ final class DeskModel: ObservableObject {
 
     private func applyHostUnlock(_ request: SessionUnlockRequest, peer: Peer) {
         let host = hostSession
+        // A second request must not replace the running task, which clearSession has to be able to cancel.
+        guard host.unlockTask == nil else {
+            if let reply = try? Wire.json(.sessionUnlockResult, SessionUnlockResult(id: request.id, outcome: .failed,
+                error: "正在输入上一次的解锁密码")) { peer.send(reply) }
+            return
+        }
         let unlocker = host.unlocker ?? HostScreenUnlocker()
         host.unlocker = unlocker
         host.injector?.releaseAll()
         DiagnosticLog.shared.record(.sessionUnlock, role: .host, state: .requested)
         host.unlockTask = Task { [weak self, weak peer, weak host] in
             let result = await unlocker.unlock(request)
+            host?.unlockTask = nil
             guard let self, let peer, let host, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
             DiagnosticLog.shared.record(.sessionUnlock, role: .host,
                 state: result.outcome == .unlocked ? .succeeded : result.outcome == .notLocked ? .disabled : .failed)

@@ -299,6 +299,69 @@ private struct RemoteCanvasChecks {
             }
         }
 
+        run("Dragging the status releases control and consumes only the status rectangle") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
+            let window = NSWindow(contentRect: canvas.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            defer { window.close() }
+            var position: CGPoint?, releases = 0, inputs: [RemoteInput] = []
+            canvas.canControl = true
+            canvas.onRelease = { releases += 1 }
+            canvas.onInput = { inputs.append($0) }
+            let hosting = NSHostingView(rootView: CanvasView(canvas: canvas).overlay {
+                FullScreenStatusOverlay(picture: CGSize(width: 900, height: 600),
+                    position: Binding(get: { position }, set: { position = $0 }), opacity: 0.6,
+                    beginDrag: { canvas.releaseControl() }) {
+                    Text("Synthetic status · 1920 × 1246 · 30 fps · 14 ms")
+                }
+            }.frame(width: 900, height: 600))
+            window.contentView = hosting
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+            hosting.layoutSubtreeIfNeeded()
+            func dragView(_ view: NSView) -> StatusDragView? {
+                if let view = view as? StatusDragView { return view }
+                return view.subviews.lazy.compactMap { dragView($0) }.first
+            }
+            guard let target = dragView(hosting) else { throw CanvasCheckFailure("Status drag target was not attached") }
+            try require(target.bounds.width > 100 && target.bounds.width < 800 && target.bounds.height < 60,
+                        "Status consumed a full row or screen instead of its contents: \(target.bounds)")
+            let point = target.convert(CGPoint(x: target.bounds.midX, y: target.bounds.midY), to: nil)
+            func event(_ type: NSEvent.EventType, _ location: CGPoint) throws -> NSEvent {
+                guard let event = NSEvent.mouseEvent(with: type, location: location, modifierFlags: [], timestamp: 0,
+                    windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) else {
+                    throw CanvasCheckFailure("Could not create status drag event")
+                }
+                return event
+            }
+            let localDown = try event(.leftMouseDown, point)
+            let remoteDown = try event(.leftMouseDown, CGPoint(x: 880, y: 100))
+            try require(!canvas.isInputTarget(of: localDown), "Status drag was classified as remote input")
+            try require(canvas.isInputTarget(of: remoteDown),
+                        "Exposed canvas stopped accepting input")
+            try require(window.makeFirstResponder(canvas), "Canvas did not take fixture focus")
+            target.mouseDown(with: try event(.leftMouseDown, point))
+            try require(window.firstResponder !== canvas && releases == 1, "Drag did not release control exactly once")
+            let drop = CGPoint(x: point.x + 120, y: point.y - 160)
+            target.mouseDragged(with: try event(.leftMouseDragged, drop))
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+            target.mouseUp(with: try event(.leftMouseUp, drop))
+            try require(position.map { $0.x > 0 && $0.x < 1 && $0.y > 0 && $0.y < 1 } == true,
+                        "Drop did not save a relative position")
+            try require(inputs.isEmpty && releases == 1, "Status drag sent remote input or repeated releases")
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+            let savedPosition = position
+            let savedOrigin = target.convert(CGPoint.zero, to: nil)
+            target.mouseDown(with: try event(.leftMouseDown, savedOrigin))
+            target.mouseDragged(with: try event(.leftMouseDragged, CGPoint(x: savedOrigin.x + 80, y: savedOrigin.y - 60)))
+            NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: window)
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+            target.mouseUp(with: try event(.leftMouseUp, drop))
+            let cancelledOrigin = target.convert(CGPoint.zero, to: nil)
+            try require(position == savedPosition && abs(cancelledOrigin.x - savedOrigin.x) < 1
+                        && abs(cancelledOrigin.y - savedOrigin.y) < 1 && inputs.isEmpty,
+                        "Losing window focus retained or saved an unfinished drag")
+        }
+
         run("Keyboard routing follows the actual first responder and rejects other windows") {
             let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
             let window = NSWindow(contentRect: canvas.bounds, styleMask: .borderless, backing: .buffered, defer: false)

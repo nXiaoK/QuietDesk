@@ -298,7 +298,13 @@ struct DeskView: View {
         }
         .overlay {
             if immersive && model.showFullScreenStatistics {
-                GeometryReader { geometry in fullScreenStatus(in: geometry.size) }.allowsHitTesting(false)
+                FullScreenStatusOverlay(
+                    picture: model.activeVideoState.map { CGSize(width: $0.width, height: $0.height) } ?? .zero,
+                    position: $model.fullScreenStatusPosition, opacity: model.fullScreenStatusOpacity,
+                    beginDrag: { model.canvas.releaseControl() }) {
+                    Circle().fill(model.connected ? Color.green : Color.orange).frame(width: 6, height: 6)
+                    metrics
+                }
             }
         }
         .overlay(alignment: .top) {
@@ -343,33 +349,6 @@ struct DeskView: View {
                 }
                 .padding(.trailing, 16)
             }
-        }
-    }
-
-    /// Puts the status in a black band outside the remote picture when one is large enough, so it covers
-    /// nothing on the remote screen; otherwise it stays over the picture, small and translucent.
-    @ViewBuilder private func fullScreenStatus(in size: CGSize) -> some View {
-        let picture = model.activeVideoState.map { CGSize(width: $0.width, height: $0.height) } ?? .zero
-        let indicator = Circle().fill(model.connected ? Color.green : Color.orange).frame(width: 6, height: 6)
-        switch FullScreenStatusPlacement.choose(container: size, picture: picture) {
-        case .topBand(let height):
-            HStack(spacing: 10) { indicator; metrics }
-                .font(.caption).monospacedDigit().foregroundStyle(.white.opacity(0.85)).lineLimit(1)
-                .padding(.horizontal, 16).frame(height: height)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        case .leadingBand(let width):
-            VStack(alignment: .leading, spacing: 6) { indicator; metrics }
-                .font(.caption).monospacedDigit().foregroundStyle(.white.opacity(0.85))
-                .lineLimit(2).minimumScaleFactor(0.85)
-                .padding(.horizontal, 12).padding(.top, 16).frame(width: width, alignment: .leading)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        case .overlay:
-            HStack(spacing: 8) { indicator; metrics }
-                .font(.caption2).monospacedDigit().foregroundStyle(.white).lineLimit(1)
-                .padding(.horizontal, 9).padding(.vertical, 4)
-                .background(.black.opacity(0.35), in: Capsule())
-                .opacity(0.6).padding(10)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
     }
 

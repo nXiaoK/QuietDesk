@@ -106,6 +106,23 @@ final class DeskModel: ObservableObject {
     @Published var showFullScreenStatistics = UserDefaults.standard.bool(forKey: "showFullScreenStatistics") {
         didSet { UserDefaults.standard.set(showFullScreenStatistics, forKey: "showFullScreenStatistics") }
     }
+    @Published var fullScreenStatusPosition: CGPoint? = UserDefaults.standard.data(forKey: "fullScreenStatusPosition")
+        .flatMap { try? JSONDecoder().decode(CGPoint.self, from: $0) } {
+        didSet {
+            if let fullScreenStatusPosition, let data = try? JSONEncoder().encode(fullScreenStatusPosition) {
+                UserDefaults.standard.set(data, forKey: "fullScreenStatusPosition")
+            } else { UserDefaults.standard.removeObject(forKey: "fullScreenStatusPosition") }
+        }
+    }
+    // Missing means the original opacity for the automatic placement, including opaque text in black bands.
+    @Published var fullScreenStatusOpacity = UserDefaults.standard.object(forKey: "fullScreenStatusOpacity") as? Double {
+        didSet { UserDefaults.standard.set(fullScreenStatusOpacity, forKey: "fullScreenStatusOpacity") }
+    }
+    var fullScreenStatusEffectiveOpacity: Double {
+        if let value = fullScreenStatusOpacity, value.isFinite { return min(1, max(0.1, value)) }
+        let picture = activeVideoState.map { CGSize(width: $0.width, height: $0.height) } ?? .zero
+        return FullScreenStatusPlacement.choose(container: canvas.bounds.size, picture: picture).defaultOpacity
+    }
     @Published var resolution = ""
     @Published var remoteName = ""
     @Published var clipboardStatus = ""

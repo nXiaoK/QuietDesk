@@ -100,12 +100,13 @@ private final class ClipboardPair {
     var routeLocal: ((Message) -> Bool)?
     var routeRemote: ((Message) -> Bool)?
 
-    init(storage: URL, localAllowed: Bool = false, remoteAllowed: Bool = false,
+    init(storage: URL, localAllowed: Bool = false, remoteAllowed: Bool = false, controllingLocal: Bool = false,
          convertLocalTIFF: @escaping (Data) -> Data? = { data in NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) },
          validateRemotePNG: ((Data) -> Bool)? = nil) {
         let session = UUID()
         localSync = ClipboardSync(session: session, allowsFileSending: true, allowsAutomaticSending: localAllowed,
-            pasteboard: local, storage: storage.appendingPathComponent("local"), convertTIFF: convertLocalTIFF) { [weak self] message in
+            controllingRemote: controllingLocal, pasteboard: local, storage: storage.appendingPathComponent("local"),
+            convertTIFF: convertLocalTIFF) { [weak self] message in
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.localMessages.append(message.kind)
@@ -263,6 +264,122 @@ private struct ClipboardFocusChecks {
             try require(paste == false && messages.isEmpty
                         && statuses.last == "剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传",
                         "Relay notice was overwritten, a transfer began or the paste became ready")
+        }
+
+        run("A copy made here prompts the remote once on focus; copies and pastes on the remote never resend or re-offer it") { folder in
+            let pair = ClipboardPair(storage: folder, localAllowed: true)
+            defer { pair.stop() }
+            let file = folder.appendingPathComponent("copied-here.bin")
+            try Data([1, 2]).write(to: file)
+            var offer: ClipboardFileOffer?, offers = 0, statuses: [String] = []
+            pair.remoteSync.onFileOffer = { value in offer = value; if value != nil { offers += 1 } }
+            pair.localSync.onStatus = { statuses.append($0) }
+            pair.local.copy(.files([file]))
+            pair.localSync.setControllingRemote(true)
+            try eventually("A copy made before taking control did not prompt the remote") { offer != nil }
+            var paste: Bool?
+            try require(pair.localSync.holdsPaste, "⌘V did not wait for a file still being offered")
+            pair.localSync.prepareForPaste { paste = $0 }
+            try require(paste == false && statuses.last == "文件需在接收端确认；传输完成后请再次按 ⌘V 粘贴",
+                        "A file still being offered let the paste through")
+            pair.remoteSync.respondToFileOffer(id: offer!.id, accept: false)
+            try eventually("The declined offer did not settle") { offer == nil && !pair.localSync.holdsPaste }
+            let reads = pair.local.reads
+            pair.local.isRelayedFromOtherDevice = true
+            pair.local.copy(.text(Data("copied on the remote and relayed here".utf8)))
+            pump(for: 0.35)
+            paste = nil
+            pair.localSync.prepareForPaste { paste = $0 }
+            try require(paste == true && !pair.localSync.holdsPaste, "A paste on the remote waited for this Mac's clipboard")
+            pump(for: 0.35)
+            try require(offers == 1 && pair.local.reads == reads && pair.remote.writes == 0
+                        && pair.localMessages.filter { $0 == .clipboardBegin }.count == 1,
+                        "A copy or paste on the remote read, resent or re-offered this Mac's clipboard")
+            pair.localSync.setControllingRemote(false)
+            pump(for: 0.35)
+            try require(pair.local.reads == reads && pair.localMessages.filter { $0 == .clipboardBegin }.count == 1,
+                        "A clipboard change during control was sent after release")
+            pair.local.isRelayedFromOtherDevice = false
+            pair.local.copy(.text(Data("copied here after release".utf8)))
+            try eventually("A new copy made here after release did not send") { pair.remote.copiedText == "copied here after release" }
+        }
+
+        run("Clipboard content from before the session never reaches the remote through a paste during control") { folder in
+            let pasteboard = MemoryPasteboard()
+            pasteboard.copy(.files([folder.appendingPathComponent("older.bin")]))
+            pasteboard.isSensitive = true
+            var messages: [MessageKind] = [], statuses: [String] = [], paste: Bool?
+            let sync = ClipboardSync(session: UUID(), allowsFileSending: true, controllingRemote: true,
+                                     pasteboard: pasteboard, storage: folder) { message in
+                DispatchQueue.main.async { messages.append(message.kind) }
+            }
+            defer { sync.stop() }
+            sync.onStatus = { statuses.append($0) }
+            sync.prepareForPaste { paste = $0 }
+            pump(for: 0.35)
+            try require(paste == true && !sync.holdsPaste && messages.isEmpty && statuses.isEmpty && pasteboard.reads == 0,
+                        "A paste on the remote sent, read or blocked on older or sensitive clipboard content")
+            sync.setControllingRemote(false)
+            pump(for: 0.35)
+            try require(messages.isEmpty && pasteboard.reads == 0, "Older clipboard content was sent after release")
+        }
+
+        run("A text copy made before control holds a remote paste only until it lands") { folder in
+            let pair = ClipboardPair(storage: folder, localAllowed: true)
+            defer { pair.stop() }
+            var held: Message?
+            pair.routeLocal = { message in
+                if message.kind == .clipboardChunk, held == nil { held = message; return false }
+                return true
+            }
+            let bytes = Data(repeating: 66, count: 260_000)
+            pair.local.copy(.text(bytes))
+            pair.localSync.setControllingRemote(true)
+            try eventually("First chunk was not held") { held != nil }
+            var ready: Bool?
+            try require(pair.localSync.holdsPaste, "⌘V did not wait for the copy still being sent")
+            pair.localSync.prepareForPaste { ready = $0 }
+            try require(ready == nil, "The paste did not wait for the copy still being sent")
+            pair.remoteSync.receive(held!)
+            try eventually("The landed copy did not settle the paste") { ready != nil }
+            try require(ready == true && pair.remote.copiedText == String(data: bytes, encoding: .utf8) && !pair.localSync.holdsPaste,
+                        "The landed copy did not release the paste")
+        }
+
+        run("A copy made explicitly here during control, such as a remote picture capture, still sends") { folder in
+            let pair = ClipboardPair(storage: folder, localAllowed: true, controllingLocal: true)
+            defer { pair.stop() }
+            pair.local.copy(.text(Data("captured here".utf8)))
+            pump(for: 0.35)
+            try require(!pair.localMessages.contains(.clipboardBegin), "A change during control was sent without an explicit copy")
+            pair.local.copy(.text(Data("captured here".utf8)))
+            pair.localSync.sendLocalCopy()
+            try eventually("An explicit copy during control did not send") { pair.remote.copiedText == "captured here" }
+        }
+
+        run("An automatic reconnect hands over the handled version so a copy made while disconnected still sends") { folder in
+            let pasteboard = MemoryPasteboard()
+            let previous = ClipboardSync(session: UUID(), allowsFileSending: true, allowsAutomaticSending: false,
+                                         pasteboard: pasteboard, storage: folder.appendingPathComponent("previous")) { _ in }
+            pasteboard.copy(.text(Data("copied while disconnected".utf8)))
+            let handled = previous.handledChange
+            previous.stop()
+            var fresh: [MessageKind] = [], resumed: [MessageKind] = []
+            let manual = ClipboardSync(session: UUID(), allowsFileSending: true, allowsAutomaticSending: false,
+                                       pasteboard: pasteboard, storage: folder.appendingPathComponent("manual")) { message in
+                DispatchQueue.main.async { fresh.append(message.kind) }
+            }
+            let automatic = ClipboardSync(session: UUID(), allowsFileSending: true, allowsAutomaticSending: false,
+                                          handledChange: handled, pasteboard: pasteboard,
+                                          storage: folder.appendingPathComponent("automatic")) { message in
+                DispatchQueue.main.async { resumed.append(message.kind) }
+            }
+            defer { manual.stop(); automatic.stop() }
+            manual.setAutomaticSendingAllowed(true)
+            automatic.setAutomaticSendingAllowed(true)
+            try eventually("A copy made while disconnected did not send after the automatic reconnect") { resumed.contains(.clipboardBegin) }
+            pump(for: 0.35)
+            try require(fresh.isEmpty, "A manual connection sent clipboard content from before the session")
         }
 
         run("In-flight paste preparation, chunks and receipts complete after focus loss") { folder in

@@ -318,6 +318,39 @@ private struct RemoteCanvasChecks {
             try require(!canvas.isInputTarget(of: otherWindow), "Another window's input reached the canvas")
         }
 
+        run("⌘V reaches the remote as ordinary keys unless a copy made here is still sending") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            let window = NSWindow(contentRect: canvas.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            defer { window.close() }
+            window.contentView = canvas
+            canvas.canControl = true
+            canvas.synchronizesClipboard = true
+            try require(window.makeFirstResponder(canvas), "Canvas did not take fixture focus")
+            var holds = false, pastes = 0, inputs: [RemoteInput] = []
+            canvas.holdsPaste = { holds }
+            canvas.onPaste = { _ in pastes += 1 }
+            canvas.onInput = { inputs.append($0) }
+            @MainActor func paste(_ type: NSEvent.EventType, repeating: Bool = false) throws -> NSEvent {
+                guard let event = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [.command], timestamp: 0,
+                    windowNumber: window.windowNumber, context: nil, characters: "v", charactersIgnoringModifiers: "v",
+                    isARepeat: repeating, keyCode: 9) else { throw CanvasCheckFailure("Could not create keyboard events") }
+                return event
+            }
+            canvas.keyDown(with: try paste(.keyDown))
+            canvas.keyDown(with: try paste(.keyDown, repeating: true))
+            canvas.keyUp(with: try paste(.keyUp))
+            try require(pastes == 0 && inputs.map(\.kind) == [.keyDown, .keyDown, .keyUp] && inputs.allSatisfy { $0.keyCode == 9 },
+                        "A paste with nothing to wait for did not reach the remote as ordinary keys")
+            inputs.removeAll()
+            holds = true
+            canvas.keyDown(with: try paste(.keyDown))
+            holds = false
+            canvas.keyDown(with: try paste(.keyDown, repeating: true))
+            canvas.keyUp(with: try paste(.keyUp))
+            try require(pastes == 1 && inputs.isEmpty, "A held paste leaked its repeat or release to the remote")
+        }
+
         run("Preparing media keeps temporary legacy video live until the new stream commits") {
             let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
             let legacyDecoder = CanvasDecoderProbe(), mediaDecoder = CanvasDecoderProbe()

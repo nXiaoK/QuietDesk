@@ -100,6 +100,7 @@ final class ClipboardSync {
     var onDiagnostic: ((DiagnosticEvent) -> Void)?
     var allowsFileSending: Bool
     private var allowsAutomaticSending: Bool
+    private var controllingRemote: Bool
     private let pasteboard: ClipboardPasteboard
     private let transfer: ClipboardTransfer
     nonisolated let receiveMessage: @Sendable (Message) -> Void
@@ -110,6 +111,7 @@ final class ClipboardSync {
     private var staleFileChange: Int?
     private var sharedChange: Int?
     private var sendingChange: Int?
+    private var fileSendingChange: Int?
     private var imagePreparation: UUID?
     private let imageQueue = DispatchQueue(label: "quietdesk.clipboard.images", qos: .utility)
     private let convertTIFF: (Data) -> Data?
@@ -122,7 +124,7 @@ final class ClipboardSync {
     private let session: UUID
 
     init(session: UUID, allowsFileSending: Bool, allowsAutomaticSending: Bool = true, allowsChunkWindow: Bool = false,
-         pasteboard: ClipboardPasteboard? = nil, storage: URL? = nil,
+         controllingRemote: Bool = false, handledChange: Int? = nil, pasteboard: ClipboardPasteboard? = nil, storage: URL? = nil,
          convertTIFF: @escaping (Data) -> Data? = { data in
              autoreleasepool { NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) }
          },
@@ -131,11 +133,12 @@ final class ClipboardSync {
         self.session = session
         self.allowsFileSending = allowsFileSending
         self.allowsAutomaticSending = allowsAutomaticSending
+        self.controllingRemote = controllingRemote
         self.convertTIFF = convertTIFF
         self.validatePNG = validatePNG ?? { data in autoreleasepool { NSBitmapImageRep(data: data) != nil } }
         let pasteboard = pasteboard ?? SystemClipboardPasteboard()
         self.pasteboard = pasteboard
-        observedChange = pasteboard.changeCount
+        observedChange = handledChange ?? pasteboard.changeCount
         let transfer = ClipboardTransfer(storage: storage ?? Self.storageURL, requireFileApproval: true,
                                          allowsChunkWindow: allowsChunkWindow)
         self.transfer = transfer
@@ -204,6 +207,28 @@ final class ClipboardSync {
         if allowed { poll() }
     }
 
+    /// 操作远端期间本机剪贴板的变化来自系统通用剪贴板接力、其他程序等，不是在本机复制，
+    /// 记为已处理且不读取内容；进入控制前尚未发出的本机复制先发出。
+    func setControllingRemote(_ controlling: Bool) {
+        guard controllingRemote != controlling else { return }
+        if controlling { poll() } else { skipChangesWhileControlling() }
+        controllingRemote = controlling
+    }
+
+    /// 操作远端时按 ⌘V 是否要等剪贴板：只有本机复制仍在发往远端时才等，否则 ⌘V 作为普通按键直接送达。
+    var holdsPaste: Bool { running && (!controllingRemote || sendingChange != nil) }
+
+    /// 本机剪贴板已处理到的版本。自动重连时交给新会话，断线期间在本机的复制仍在切回时发送。
+    var handledChange: Int { observedChange }
+
+    /// 本机明确发起的复制（截取远端画面）在操作远端期间也照常发送。
+    func sendLocalCopy() {
+        guard running, allowsAutomaticSending else { return }
+        let change = pasteboard.changeCount
+        guard change != observedChange, change != deferredLocalChange else { return }
+        sendCurrent()
+    }
+
     func respondToFileOffer(id: UUID, accept: Bool) {
         guard running, let pendingFileOffer, pendingFileOffer.id == id else { return }
         if accept, pasteboard.changeCount != pendingFileOffer.change {
@@ -216,6 +241,17 @@ final class ClipboardSync {
 
     func prepareForPaste(_ completion: @escaping (Bool) -> Void) {
         guard running, allowsAutomaticSending else { completion(false); return }
+        if controllingRemote {
+            // 远端自己的复制粘贴不补发本机剪贴板，也不重新发起文件确认。
+            guard let sending = sendingChange else { completion(true); return }
+            if sending == fileSendingChange {
+                completion(false)
+                onStatus?("文件需在接收端确认；传输完成后请再次按 ⌘V 粘贴")
+                return
+            }
+            waiters.append(completion)
+            return
+        }
         guard !pasteboard.isSensitive else {
             onStatus?("剪贴板内容已标记为敏感，未同步到对端")
             completion(false)
@@ -262,10 +298,13 @@ final class ClipboardSync {
     }
 
     private func poll() {
-        guard running, allowsAutomaticSending else { return }
+        guard running else { return }
+        if controllingRemote { skipChangesWhileControlling() } else { sendLocalCopy() }
+    }
+
+    private func skipChangesWhileControlling() {
         let change = pasteboard.changeCount
-        guard change != observedChange, change != deferredLocalChange else { return }
-        sendCurrent()
+        if change != deferredLocalChange { observedChange = change }
     }
 
     private func sendCurrent() {
@@ -374,6 +413,7 @@ final class ClipboardSync {
             return
         }
         sendingChange = change
+        fileSendingChange = isFile ? change : nil
         let summary = diagnosticSummary(for: payload)
         onDiagnostic?(.sending(summary.kind, fileCount: summary.fileCount))
         transfer.send(payload, preparation: preparation) { [weak self] success in

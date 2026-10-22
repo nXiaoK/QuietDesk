@@ -289,6 +289,8 @@ final class RemoteCanvas: NSView {
     var onUserActivity: (() -> Void)?
     var onPaste: ((RemoteInput) -> Void)?
     var synchronizesClipboard = false
+    /// false 时 ⌘V 不等剪贴板，按普通按键送到远端。
+    var holdsPaste: (() -> Bool)?
     private(set) var interactionRevision: UInt64 = 0
     var onRelease: (() -> Void)?
     var onFocus: ((Bool) -> Void)?
@@ -804,7 +806,8 @@ final class RemoteCanvas: NSView {
             return
         }
         if synchronizesClipboard, event.keyCode == 9, modifiers.contains(.command),
-           !modifiers.contains(.control), !modifiers.contains(.option), window?.firstResponder === self {
+           !modifiers.contains(.control), !modifiers.contains(.option), window?.firstResponder === self,
+           localShortcutKeys.contains(9) || (!event.isARepeat && holdsPaste?() != false) {
             localShortcutKeys.insert(9)
             if !event.isARepeat {
                 var input = RemoteInput(kind: .keyDown)

@@ -219,6 +219,8 @@ final class DeskModel: ObservableObject {
     private var lastClipboardReceivePreference: Bool?
     private var clipboardFilePrompt: ClipboardFilePrompt?
     private var clipboardSession: UUID?
+    /// 控制端自动重连前剪贴板已处理到的版本；手动断开或关闭同步后清空。
+    private var clipboardHandledChange: Int?
     private var initialLaunchHandled = false
     private var loginWindowHandled = false
     private var shouldMinimizeOnLaunch = false
@@ -348,6 +350,7 @@ final class DeskModel: ObservableObject {
             DiagnosticLog.shared.record(.captureFailed, role: .viewer, state: .failed)
             self?.peer?.close(message, retryable: true)
         }
+        canvas.holdsPaste = { [weak self] in self?.clipboardSync?.holdsPaste == true }
         canvas.onPaste = { [weak self] input in
             guard let self, let peer = self.peer, self.connected else { return }
             self.recordSessionActivity()
@@ -2912,8 +2915,10 @@ final class DeskModel: ObservableObject {
                     guard let png else { self.clipboardStatus = "远端画面无法转换为 PNG"; return }
                     let pasteboard = NSPasteboard.general
                     pasteboard.clearContents()
-                    self.clipboardStatus = pasteboard.setData(png, forType: .png)
+                    let copied = pasteboard.setData(png, forType: .png)
+                    self.clipboardStatus = copied
                         ? "已复制远端画面 \(snapshot.width) × \(snapshot.height) 到剪贴板" : "远端画面无法写入剪贴板"
+                    if copied { self.clipboardSync?.sendLocalCopy() }
                 }
             }
         }
@@ -2936,6 +2941,9 @@ final class DeskModel: ObservableObject {
         return mode == .viewer ? NSApp.isActive : remoteReceivesAutomaticClipboard
     }
 
+    /// 远程画面获得焦点时，控制端剪贴板的新变化不算在控制端复制。
+    private var clipboardControlsRemote: Bool { mode == .viewer && controlling }
+
     private func sendClipboardPreference(to peer: Peer) throws {
         let receives = !sessionInputSuspended && !hostSession.paused && (mode == .viewer ? !controlling : true)
         peer.send(try Wire.json(.clipboardSettings, ClipboardPreference(enabled: clipboardEnabled,
@@ -2945,6 +2953,7 @@ final class DeskModel: ObservableObject {
 
     func refreshClipboardFocus() {
         clipboardSync?.setAutomaticSendingAllowed(automaticClipboardSendingAllowed)
+        clipboardSync?.setControllingRemote(clipboardControlsRemote)
         let receives = !sessionInputSuspended && !hostSession.paused && (mode == .viewer ? !controlling : true)
         guard mode == .viewer, connected, supportsClipboard, let peer,
               lastClipboardReceivePreference != receives else { return }
@@ -2966,10 +2975,12 @@ final class DeskModel: ObservableObject {
         if enabled, clipboardSync == nil, let peer, let clipboardSession {
             let channel = dataChannel
             let sync = ClipboardSync(session: clipboardSession, allowsFileSending: remoteFileApproval,
-                allowsAutomaticSending: automaticClipboardSendingAllowed, allowsChunkWindow: remoteClipboardChunkWindow) { [weak peer, weak channel] message in
+                allowsAutomaticSending: automaticClipboardSendingAllowed, allowsChunkWindow: remoteClipboardChunkWindow,
+                controllingRemote: clipboardControlsRemote, handledChange: clipboardHandledChange) { [weak peer, weak channel] message in
                     if let channel { channel.sendReliableData(message) }
                     else { peer?.send(message) }
                 }
+            clipboardHandledChange = nil
             clipboardSync = sync
             dataChannel?.configureClipboard(sync.receiveMessage)
             sync.onDiagnostic = { [weak self, weak sync] event in
@@ -2996,14 +3007,16 @@ final class DeskModel: ObservableObject {
                 prompt.present()
             }
             clipboardStatus = remoteClipboardFocusAware
-                ? "双向剪贴板已开启：控制端在 QuietDesk 前台时发送，远端在释放控制后发送；文件确认后接收"
-                : "双向剪贴板已开启：控制端在 QuietDesk 前台时发送；两端升级后可按控制焦点限制远端发送，文件确认后接收"
+                ? "双向剪贴板已开启：控制端复制后切回 QuietDesk 时发送，操作远端期间的复制粘贴留在远端；远端在释放控制后发送；文件确认后接收"
+                : "双向剪贴板已开启：控制端复制后切回 QuietDesk 时发送，操作远端期间的复制粘贴留在远端；两端升级后可按控制焦点限制远端发送，文件确认后接收"
         } else if enabled {
             clipboardSync?.allowsFileSending = remoteFileApproval
             clipboardSync?.setAutomaticSendingAllowed(automaticClipboardSendingAllowed)
+            clipboardSync?.setControllingRemote(clipboardControlsRemote)
         } else {
             dataChannel?.configureClipboard(nil)
             clipboardSync?.stop(); clipboardSync = nil
+            clipboardHandledChange = nil
             dismissClipboardPrompt(); clipboardFilePrompt = nil
             pendingFileOffer = nil
             if connected { clipboardStatus = supportsClipboard ? "自动剪贴板已关闭" : "对端版本较旧，可使用手动文字同步" }
@@ -3292,6 +3305,7 @@ final class DeskModel: ObservableObject {
         videoTuning = nil
         activeVideoState = nil
         videoSettingsStatus = ""
+        if mode == .viewer, let clipboardSync { clipboardHandledChange = clipboardSync.handledChange }
         clipboardSync?.stop()
         clipboardSync = nil
         dismissClipboardPrompt(); clipboardFilePrompt = nil
@@ -3356,6 +3370,7 @@ final class DeskModel: ObservableObject {
         pending.removeAll()
         peer?.close()
         clearSession()
+        clipboardHandledChange = nil
         if let activity { ProcessInfo.processInfo.endActivity(activity); self.activity = nil }
         metricsTimer?.invalidate()
         metricsTimer = nil

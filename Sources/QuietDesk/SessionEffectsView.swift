@@ -20,6 +20,10 @@ struct SessionEffectsView: View {
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Text("防窥只从远端画面排除黑屏遮罩本身；被控端的 QuietDesk 窗口、菜单、文件确认和权限提示在远端仍可见、可操作。静音恢复原输出设备状态；设备不支持系统静音时会说明原因。")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Toggle("防窥 · 内建屏幕亮度归零", isOn: Binding(get: { model.sessionEffects.dimBuiltInDisplay }, set: model.setRemoteDisplayDim))
+                .disabled(switchesDisabled || !(model.hostDisplayDimmable || model.sessionEffects.dimBuiltInDisplay))
+            Text("仅用于笔记本的内建屏幕：亮度调到 0、背光关闭，锁屏界面和 Mission Control 也看不见，远端画面照常；外接显示器不会变暗，可同时开启黑屏遮罩。被控 Mac 本机调高亮度时开关自动关闭并在此提示；断开时恢复原亮度，开启断开锁屏时先锁屏再恢复。")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Toggle("断开后立即锁定被控 Mac", isOn: Binding(get: { model.sessionEffects.lockOnDisconnect }, set: model.setRemoteLockOnDisconnect))
                 .disabled(switchesDisabled || !model.supportsSessionLock)
             Text("任何断开都会立即锁屏，包括网络中断、控制端休眠和 QuietDesk 自身重建连接。被控 Mac 保持唤醒且 QuietDesk 在运行时，重新连接后可在锁屏界面输入密码解锁（断开锁屏后的重连尚待实机确认）；睡眠、注销、重启后无法远程解锁。被控端 QuietDesk 被强制结束或崩溃时无法锁屏。")
@@ -28,6 +32,7 @@ struct SessionEffectsView: View {
             unlockSection
             if let remembered = model.sessionEffectsMemory.connectionState {
                 Text("新连接将自动开启：" + [remembered.muted ? "被控端静音" : nil, remembered.privacy ? "防窥" : nil,
+                                       remembered.dimBuiltInDisplay ? "亮度归零" : nil,
                                        remembered.lockOnDisconnect ? "断开后锁屏" : nil].compactMap { $0 }.joined(separator: "、"))
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -36,7 +41,11 @@ struct SessionEffectsView: View {
             } else if !model.supportsSessionEffects {
                 Text("共享端需更新后才能使用这些开关。").font(.caption).foregroundStyle(.secondary)
             } else if !model.supportsSessionLock {
-                Text("共享端需更新后才能使用断开锁屏。").font(.caption).foregroundStyle(.secondary)
+                Text("共享端需更新后才能使用断开锁屏和亮度归零。").font(.caption).foregroundStyle(.secondary)
+            } else if !model.supportsDisplayDimming {
+                Text("共享端需更新后才能使用亮度归零。").font(.caption).foregroundStyle(.secondary)
+            } else if !model.hostDisplayDimmable {
+                Text("被控端不是笔记本，或内建屏幕当前无法调节亮度（如已合盖），亮度归零不可用。").font(.caption).foregroundStyle(.secondary)
             }
             if !model.sessionEffectsStatus.isEmpty {
                 HStack(alignment: .top, spacing: 8) {

@@ -39,6 +39,20 @@ protocol SessionScreenLocking: AnyObject {
 }
 
 @MainActor
+protocol SessionDisplayDimming: AnyObject {
+    /// Why the built-in display cannot be dimmed now, or nil when it can.
+    var unavailableReason: String? { get }
+    var isDimmed: Bool { get }
+    /// Dimming ended without a request, for example after the brightness was raised on this Mac.
+    var onEnded: ((String) -> Void)? { get set }
+    func dim() async throws
+    /// Puts the original brightness back unless it was raised meanwhile; returns why that failed.
+    func restore() -> String?
+    /// A session lock was just requested: should the app go away now, the brightness comes back after the lock.
+    func holdForLock()
+}
+
+@MainActor
 final class HostSessionEffects {
     private(set) var state = SessionEffectsState()
     var onStateChange: ((SessionEffectsState, String?) -> Void)?
@@ -50,20 +64,23 @@ final class HostSessionEffects {
     private let audio: SessionAudioControlling
     private let privacy: SessionPrivacyCover
     private let screenLock: SessionScreenLocking
+    private let dimmer: SessionDisplayDimming
     private var locksOnDisconnect = false
     private var lockTask: Task<String?, Never>?
     private var audioRestoreTask: Task<String?, Never>?
     private var audioRestoreID: UUID?
 
     convenience init() {
-        self.init(audio: SessionAudioClient(), privacy: SessionPrivacyWindows(), screenLock: SystemScreenLock())
+        self.init(audio: SessionAudioClient(), privacy: SessionPrivacyWindows(), screenLock: SystemScreenLock(),
+                  dimmer: BuiltInDisplayDimmer())
     }
 
-    init(audio: SessionAudioControlling, privacy: SessionPrivacyCover, screenLock: SessionScreenLocking) {
-        self.audio = audio; self.privacy = privacy; self.screenLock = screenLock
+    init(audio: SessionAudioControlling, privacy: SessionPrivacyCover, screenLock: SessionScreenLocking, dimmer: SessionDisplayDimming) {
+        self.audio = audio; self.privacy = privacy; self.screenLock = screenLock; self.dimmer = dimmer
         audio.onChange = { [weak self] muted, error in
             guard let self else { return }
-            let state = SessionEffectsState(muted: muted, privacy: self.privacy.isVisible, lockOnDisconnect: self.locksOnDisconnect)
+            let state = SessionEffectsState(muted: muted, privacy: self.privacy.isVisible, lockOnDisconnect: self.locksOnDisconnect,
+                                            dimBuiltInDisplay: self.dimmer.isDimmed)
             // A helper exit that changes nothing must not replace the failure the viewer was just sent.
             guard state != self.state || error != nil else { return }
             self.state = state
@@ -75,10 +92,19 @@ final class HostSessionEffects {
             self.onStateChange?(self.state, "本机已退出防窥")
         }
         privacy.onWindowsChanged = { [weak self] windows in self?.onCoverWindowsChanged?(windows) }
+        dimmer.onEnded = { [weak self] reason in
+            guard let self else { return }
+            self.state = self.actualState
+            self.onStateChange?(self.state, reason)
+        }
     }
 
+    /// Whether this Mac is a laptop whose built-in display brightness can be turned down right now.
+    var canDimBuiltInDisplay: Bool { dimmer.unavailableReason == nil }
+
     private var actualState: SessionEffectsState {
-        SessionEffectsState(muted: audio.isMuted, privacy: privacy.isVisible, lockOnDisconnect: locksOnDisconnect)
+        SessionEffectsState(muted: audio.isMuted, privacy: privacy.isVisible, lockOnDisconnect: locksOnDisconnect,
+                            dimBuiltInDisplay: dimmer.isDimmed)
     }
 
     /// `preparePrivacy` receives the cover windows that capture must leave out before they turn opaque.
@@ -91,6 +117,8 @@ final class HostSessionEffects {
         revision = token
         if !desired.lockOnDisconnect { locksOnDisconnect = false }
         if !desired.privacy { privacy.hide(); state = actualState }
+        var dimRestoreFailure: String?
+        if !desired.dimBuiltInDisplay, dimmer.isDimmed { dimRestoreFailure = dimmer.restore(); state = actualState }
         do {
             if desired.privacy, !state.privacy {
                 let windows = try privacy.prepare()
@@ -116,6 +144,14 @@ final class HostSessionEffects {
                 if let reason = screenLock.unavailableReason { throw DeskError.invalid(reason) }
                 locksOnDisconnect = true
             }
+            // Last, so a display that cannot be dimmed does not hold back the other switches.
+            if desired.dimBuiltInDisplay, !dimmer.isDimmed {
+                if let reason = dimmer.unavailableReason { throw DeskError.invalid(reason) }
+                try await dimmer.dim()
+                // A reset that ran meanwhile found nothing to restore yet, so the brightness comes back here.
+                guard revision == token, !Task.isCancelled else { _ = dimmer.restore(); throw CancellationError() }
+            }
+            if let dimRestoreFailure { throw DeskError.invalid(dimRestoreFailure) }
             state = actualState
             return state
         } catch {
@@ -126,8 +162,8 @@ final class HostSessionEffects {
     }
 
     /// Starts a requested lock synchronously, so it is issued even while the app is quitting.
-    /// Without a lock the curtain comes down right here rather than after the asynchronous reset.
-    /// Later calls return the same confirmation.
+    /// Without a lock the curtain comes down and the brightness comes back right here rather than after
+    /// the asynchronous reset. Later calls return the same confirmation.
     @discardableResult
     func endSession() -> Task<String?, Never>? {
         if locksOnDisconnect, lockTask == nil {
@@ -139,7 +175,11 @@ final class HostSessionEffects {
                 return await lock.confirmLocked()
             }
         }
-        if lockTask == nil, !privacy.windowIDs.isEmpty { privacy.hide(); state = actualState }
+        if lockTask == nil {
+            if !privacy.windowIDs.isEmpty { privacy.hide(); state = actualState }
+            // A failure leaves the display marked dark; reset tries again and reports it.
+            if dimmer.isDimmed { _ = dimmer.restore(); state = actualState }
+        } else if dimmer.isDimmed { dimmer.holdForLock() }
         return lockTask
     }
 
@@ -155,13 +195,14 @@ final class HostSessionEffects {
         defer { resetsInProgress -= 1 }
         let token = UUID()
         revision = token
-        // The lock screen has to cover the display before the curtain comes down.
+        // The lock screen has to cover the display before the curtain comes down or the brightness comes back.
         let lockError = await endSession()?.value
         privacy.hide()
+        let dimError = dimmer.restore()
         state = actualState
         let error = await restoreAudio()
         if revision == token { state = actualState }
-        let errors = [lockError, error].compactMap { $0 }
+        let errors = [lockError, dimError, error].compactMap { $0 }
         return errors.isEmpty ? nil : errors.joined(separator: "；")
     }
 
@@ -181,6 +222,7 @@ final class HostSessionEffects {
     }
 
     static func runWatchdogIfRequested() -> Bool {
+        if DisplayDimWatchdog.runIfRequested() { return true }
         guard CommandLine.arguments.contains(SessionAudioClient.watchdogArgument) else { return false }
         let watchdog = SessionAudioWatchdog()
         watchdog.run()

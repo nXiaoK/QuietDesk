@@ -8,6 +8,7 @@ final class DiagnosticLog: @unchecked Sendable {
         case connectionStarted, connectionReady, connectionClosed, connectionFailed, connectionMetrics, reconnectScheduled, inputFailed
         case hostStarted, hostStopped, captureStarted, captureStopped, captureFailed
         case streamConfigured, displayChanged, sessionPaused, sessionResumed, sessionEffectsChanged, screenLock, privacyCurtain, sessionUnlock
+        case displayDim
         case clipboardOffered, clipboardOfferReceived, clipboardAccepted, clipboardRejected
         case clipboardCompleted, clipboardFailed, clipboardEchoSuppressed
         case permissionChanged, exportRequested, exportCompleted, exportFailed, counters

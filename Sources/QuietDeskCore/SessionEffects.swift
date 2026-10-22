@@ -5,17 +5,21 @@ public struct SessionEffectsState: Codable, Equatable, Sendable {
     public let privacy: Bool
     /// Lock the host screen as soon as this control session ends. Endpoints without the field mean off.
     public let lockOnDisconnect: Bool
-    public init(muted: Bool = false, privacy: Bool = false, lockOnDisconnect: Bool = false) {
+    /// Turn the host laptop's built-in display brightness down to zero. Endpoints without the field mean off.
+    public let dimBuiltInDisplay: Bool
+    public init(muted: Bool = false, privacy: Bool = false, lockOnDisconnect: Bool = false, dimBuiltInDisplay: Bool = false) {
         self.muted = muted; self.privacy = privacy; self.lockOnDisconnect = lockOnDisconnect
+        self.dimBuiltInDisplay = dimBuiltInDisplay
     }
 
-    private enum CodingKeys: String, CodingKey { case muted, privacy, lockOnDisconnect }
+    private enum CodingKeys: String, CodingKey { case muted, privacy, lockOnDisconnect, dimBuiltInDisplay }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         muted = try container.decode(Bool.self, forKey: .muted)
         privacy = try container.decode(Bool.self, forKey: .privacy)
         lockOnDisconnect = try container.decodeIfPresent(Bool.self, forKey: .lockOnDisconnect) ?? false
+        dimBuiltInDisplay = try container.decodeIfPresent(Bool.self, forKey: .dimBuiltInDisplay) ?? false
     }
 }
 
@@ -39,7 +43,7 @@ public struct SessionEffectsResult: Codable, Sendable {
 /// Switching one on is remembered as the host actually applied it, so a failed attempt is not repeated.
 public struct SessionEffectsMemory: Sendable {
     public private(set) var remembered: SessionEffectsState
-    private var pending: (id: UUID, muted: Bool, privacy: Bool, lock: Bool)?
+    private var pending: (id: UUID, muted: Bool, privacy: Bool, lock: Bool, dim: Bool)?
 
     public init(remembered: SessionEffectsState = SessionEffectsState()) { self.remembered = remembered }
 
@@ -51,9 +55,10 @@ public struct SessionEffectsMemory: Sendable {
         let next = request.state
         remembered = SessionEffectsState(muted: remembered.muted && !(current.muted && !next.muted),
                                          privacy: remembered.privacy && !(current.privacy && !next.privacy),
-                                         lockOnDisconnect: remembered.lockOnDisconnect && !(current.lockOnDisconnect && !next.lockOnDisconnect))
+                                         lockOnDisconnect: remembered.lockOnDisconnect && !(current.lockOnDisconnect && !next.lockOnDisconnect),
+                                         dimBuiltInDisplay: remembered.dimBuiltInDisplay && !(current.dimBuiltInDisplay && !next.dimBuiltInDisplay))
         pending = (request.id, !current.muted && next.muted, !current.privacy && next.privacy,
-                   !current.lockOnDisconnect && next.lockOnDisconnect)
+                   !current.lockOnDisconnect && next.lockOnDisconnect, !current.dimBuiltInDisplay && next.dimBuiltInDisplay)
     }
 
     /// Applies the host's reply to the recorded toggle; replies to other requests leave the memory unchanged.
@@ -62,11 +67,47 @@ public struct SessionEffectsMemory: Sendable {
         self.pending = nil
         remembered = SessionEffectsState(muted: pending.muted ? result.state.muted : remembered.muted,
                                          privacy: pending.privacy ? result.state.privacy : remembered.privacy,
-                                         lockOnDisconnect: pending.lock ? result.state.lockOnDisconnect : remembered.lockOnDisconnect)
+                                         lockOnDisconnect: pending.lock ? result.state.lockOnDisconnect : remembered.lockOnDisconnect,
+                                         dimBuiltInDisplay: pending.dim ? result.state.dimBuiltInDisplay : remembered.dimBuiltInDisplay)
     }
 
     /// Drops a recorded toggle whose reply can no longer arrive.
     public mutating func cancel() { pending = nil }
+}
+
+/// Reads and sets the brightness of one display, from 0 to 1.
+public protocol DisplayBrightnessIO {
+    func brightness() throws -> Float
+    func setBrightness(_ value: Float) throws
+}
+
+/// The brightness a session found before turning a display dark, so that only its own change is undone.
+public struct DisplayDimTransaction: Equatable, Sendable {
+    /// Readings at or below this count as dark; one brightness key step is far above it.
+    public static let darkLimit: Float = 0.001
+    public let original: Float
+
+    public init(original: Float) { self.original = original }
+
+    public static func isDark(_ brightness: Float) -> Bool { brightness <= darkLimit }
+
+    /// Remembers the current brightness without changing it.
+    public static func begin(using io: DisplayBrightnessIO) throws -> DisplayDimTransaction {
+        let value = try io.brightness()
+        guard value.isFinite, (0...1).contains(value) else { throw DeskError.invalid("内建屏幕亮度读数无效") }
+        return DisplayDimTransaction(original: value)
+    }
+
+    public func dim(using io: DisplayBrightnessIO) throws { try io.setBrightness(0) }
+
+    /// Puts the original brightness back while the display is still dark. Returns false without writing
+    /// when the brightness has been raised since, so that whoever raised it keeps their choice.
+    @discardableResult
+    public func restore(using io: DisplayBrightnessIO) throws -> Bool {
+        guard Self.isDark(try io.brightness()) else { return false }
+        if !Self.isDark(original) { try io.setBrightness(original) }
+        return true
+    }
 }
 
 public struct SessionMuteSnapshot: Codable, Equatable, Sendable {

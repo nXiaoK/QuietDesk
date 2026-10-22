@@ -196,7 +196,11 @@ public struct Hello: Codable, Sendable {
     // Rates above 60 fps use separate optional fields so existing high-refresh viewers still receive a valid default.
     public let higherFrameRateVideoV1: Bool?
     public let preferredHigherFrameRateSettings: StreamSettings?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil) {
+    // The host understands SessionEffectsState.dimBuiltInDisplay, and reports whether it was a laptop whose
+    // built-in display brightness could be changed when this hello was sent.
+    public let displayDimmingV1: Bool?
+    public let builtInDisplayDimmable: Bool?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -224,6 +228,8 @@ public struct Hello: Codable, Sendable {
         self.screenLocked = screenLocked
         self.higherFrameRateVideoV1 = higherFrameRateVideoV1
         self.preferredHigherFrameRateSettings = preferredHigherFrameRateSettings
+        self.displayDimmingV1 = displayDimmingV1
+        self.builtInDisplayDimmable = builtInDisplayDimmable
     }
 
     public func validate() throws {

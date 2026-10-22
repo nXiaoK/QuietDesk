@@ -170,6 +170,10 @@ final class DeskModel: ObservableObject {
     @Published private(set) var supportsHigherFrameRateVideo = false
     @Published private(set) var supportsSessionEffects = false
     @Published private(set) var supportsSessionLock = false
+    // The host understands the brightness switch (displayDimmingV1) and, when it sent its hello, was a laptop
+    // whose built-in display brightness could be turned down.
+    @Published private(set) var supportsDisplayDimming = false
+    @Published private(set) var hostDisplayDimmable = false
     // The host takes fine automatic bitrate steps live and reports delivery delay (adaptiveVideoV1).
     @Published private(set) var supportsAdaptiveVideo = false
     @Published private(set) var sessionEffects = SessionEffectsState()
@@ -1190,7 +1194,8 @@ final class DeskModel: ObservableObject {
                             sessionEffects: true, sessionPause: true, mediaTransportV1: true, independentCursorV1: true,
                             relayTransportV1: true, relayDeviceID: relayRegistrations.first?.deviceID, sessionLockV1: true,
                             adaptiveVideoV1: true, sessionUnlockV1: true, screenLocked: ScreenLockState.isLockedOnConsole,
-                            higherFrameRateVideoV1: true, preferredHigherFrameRateSettings: preferredSettings)))
+                            higherFrameRateVideoV1: true, preferredHigherFrameRateSettings: preferredSettings,
+                            displayDimmingV1: true, builtInDisplayDimmable: host.effects?.canDimBuiltInDisplay == true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -2152,6 +2157,8 @@ final class DeskModel: ObservableObject {
             supportsHigherFrameRateVideo = supportsHighRefreshVideoSettings && hello.higherFrameRateVideoV1 == true
             supportsSessionEffects = hello.sessionEffects == true
             supportsSessionLock = supportsSessionEffects && hello.sessionLockV1 == true
+            supportsDisplayDimming = supportsSessionEffects && hello.displayDimmingV1 == true
+            hostDisplayDimmable = supportsDisplayDimming && hello.builtInDisplayDimmable == true
             supportsAdaptiveVideo = supportsHighRefreshVideoSettings && hello.adaptiveVideoV1 == true
             supportsSessionUnlock = hello.sessionUnlockV1 == true
             refreshUnlockState()
@@ -2190,7 +2197,8 @@ final class DeskModel: ObservableObject {
             // Sent after the cursor request so the host applies it once cursor capture has settled.
             if supportsSessionEffects, let remembered = sessionEffectsMemory.connectionState {
                 let supported = SessionEffectsState(muted: remembered.muted, privacy: remembered.privacy,
-                                                    lockOnDisconnect: remembered.lockOnDisconnect && supportsSessionLock)
+                                                    lockOnDisconnect: remembered.lockOnDisconnect && supportsSessionLock,
+                                                    dimBuiltInDisplay: remembered.dimBuiltInDisplay && hostDisplayDimmable)
                 if supported != SessionEffectsState() { requestSessionEffects(supported, automatic: true) }
             }
         case .sessionPauseResult:
@@ -2345,18 +2353,26 @@ final class DeskModel: ObservableObject {
 
     func setRemoteMuted(_ enabled: Bool) {
         requestSessionEffects(SessionEffectsState(muted: enabled, privacy: sessionEffects.privacy,
-                                                  lockOnDisconnect: sessionEffects.lockOnDisconnect))
+                                                  lockOnDisconnect: sessionEffects.lockOnDisconnect,
+                                                  dimBuiltInDisplay: sessionEffects.dimBuiltInDisplay))
     }
 
     func setRemotePrivacy(_ enabled: Bool) {
         requestSessionEffects(SessionEffectsState(muted: sessionEffects.muted, privacy: enabled,
-                                                  lockOnDisconnect: sessionEffects.lockOnDisconnect))
+                                                  lockOnDisconnect: sessionEffects.lockOnDisconnect,
+                                                  dimBuiltInDisplay: sessionEffects.dimBuiltInDisplay))
     }
 
     func setRemoteLockOnDisconnect(_ enabled: Bool) {
         guard supportsSessionLock || !enabled else { return }
         requestSessionEffects(SessionEffectsState(muted: sessionEffects.muted, privacy: sessionEffects.privacy,
-                                                  lockOnDisconnect: enabled))
+                                                  lockOnDisconnect: enabled, dimBuiltInDisplay: sessionEffects.dimBuiltInDisplay))
+    }
+
+    func setRemoteDisplayDim(_ enabled: Bool) {
+        guard hostDisplayDimmable || !enabled else { return }
+        requestSessionEffects(SessionEffectsState(muted: sessionEffects.muted, privacy: sessionEffects.privacy,
+                                                  lockOnDisconnect: sessionEffects.lockOnDisconnect, dimBuiltInDisplay: enabled))
     }
 
     // MARK: Lock screen password
@@ -2446,7 +2462,7 @@ final class DeskModel: ObservableObject {
                 do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
             }
             do { try await Task.sleep(for: .milliseconds(1500)) } catch { return }
-            // Remembered switches are requested at hello; the curtain has to be up before the desktop is.
+            // Remembered switches are requested at hello; the curtain and the dark display have to be in place before the desktop is.
             for _ in 0..<200 {
                 guard let self, let viewer, self.viewerSession === viewer else { return }
                 if !self.sessionEffectsWorking { break }
@@ -2455,6 +2471,11 @@ final class DeskModel: ObservableObject {
             guard let self, let peer, let viewer, self.peer === peer, self.viewerSession === viewer, self.connected else { return }
             if self.sessionEffectsMemory.remembered.privacy, !self.sessionEffects.privacy {
                 self.showUnlockNotice("防窥没有开启，为免被控 Mac 在本地露出桌面，未自动解锁；可在“被控端隐私与安全”中手动解锁")
+                return
+            }
+            // Only a dimming that was tried counts; a host without a dimmable built-in display was never asked.
+            if self.sessionEffectsMemory.remembered.dimBuiltInDisplay, self.hostDisplayDimmable, !self.sessionEffects.dimBuiltInDisplay {
+                self.showUnlockNotice("内建屏幕亮度没有归零，为免被控 Mac 在本地露出桌面，未自动解锁；可在“被控端隐私与安全”中手动解锁")
                 return
             }
             self.sendUnlockRequest(automatic: true)
@@ -2570,6 +2591,9 @@ final class DeskModel: ObservableObject {
             if self.sessionEffects.privacy != state.privacy {
                 DiagnosticLog.shared.record(.privacyCurtain, role: .host, state: state.privacy ? .enabled : .disabled)
             }
+            if self.sessionEffects.dimBuiltInDisplay != state.dimBuiltInDisplay {
+                DiagnosticLog.shared.record(.displayDim, role: .host, state: state.dimBuiltInDisplay ? .enabled : .disabled)
+            }
             self.sessionEffects = state
             if let message { self.sessionEffectsStatus = message }
             if let result = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(state: state, error: message)) { peer.send(result) }
@@ -2639,6 +2663,9 @@ final class DeskModel: ObservableObject {
             guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
             if self.sessionEffects.privacy != effects.state.privacy {
                 DiagnosticLog.shared.record(.privacyCurtain, role: .host, state: effects.state.privacy ? .enabled : .disabled)
+            }
+            if self.sessionEffects.dimBuiltInDisplay != effects.state.dimBuiltInDisplay {
+                DiagnosticLog.shared.record(.displayDim, role: .host, state: effects.state.dimBuiltInDisplay ? .enabled : .disabled)
             }
             self.sessionEffects = effects.state
             self.sessionEffectsStatus = failure ?? "被控端设置已生效"
@@ -3397,12 +3424,16 @@ final class DeskModel: ObservableObject {
         if let effects = oldHost.effects {
             let token = generation
             let hadCurtain = effects.state.privacy
+            let hadDimmedDisplay = effects.state.dimBuiltInDisplay
             effectsCleanupsRunning += 1
             effectsCleanupTask = Task { [weak self] in
                 let message = await effects.reset()
                 guard let self else { return }
                 self.effectsCleanupsRunning -= 1
                 if hadCurtain { DiagnosticLog.shared.record(.privacyCurtain, role: .host, state: .disabled) }
+                if hadDimmedDisplay {
+                    DiagnosticLog.shared.record(.displayDim, role: .host, state: effects.state.dimBuiltInDisplay ? .failed : .disabled)
+                }
                 self.removeStrayPrivacyCovers()
                 if let message, self.generation == token, self.hostSession.effects == nil { self.sessionEffectsStatus = message }
             }
@@ -3429,6 +3460,8 @@ final class DeskModel: ObservableObject {
         sessionEffectsWorking = false
         supportsSessionEffects = false
         supportsSessionLock = false
+        supportsDisplayDimming = false
+        hostDisplayDimmable = false
         supportsAdaptiveVideo = false
         sessionEffects = SessionEffectsState()
         sessionEffectsStatus = ""

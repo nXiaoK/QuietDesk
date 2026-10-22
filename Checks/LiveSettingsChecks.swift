@@ -14,7 +14,7 @@ func runLiveSettingsChecks() {
 
     run("Live quality requests validate allowed values and preserve wire message numbers") {
         try low.validateControlValues(); try high.validateControlValues()
-        for invalid in [StreamSettings(longestEdge: -1), .init(framesPerSecond: 0), .init(framesPerSecond: 120), .init(megabits: 1000)] {
+        for invalid in [StreamSettings(longestEdge: -1), .init(framesPerSecond: 0), .init(framesPerSecond: 61), .init(framesPerSecond: 241), .init(megabits: 1000)] {
             try rejects("Invalid quality parameters accepted") { try invalid.validateControlValues() }
         }
         let request = StreamSettingsRequest(settings: medium)
@@ -25,6 +25,123 @@ func runLiveSettingsChecks() {
         let decodedResult = try Wire.readJSON(StreamSettingsResult.self, Wire.json(.streamSettingsResult, result).payload)
         try check(decodedResult.state == result.state, "Applied state changed over wire")
         try check(MessageKind.inputStatus.rawValue == 10 && MessageKind.clipboardCancel.rawValue == 17 && Wire.version == 1, "Legacy wire values changed")
+    }
+
+    run("Higher frame rates round-trip through live requests and replies while defaults stay unchanged") {
+        try check(StreamSettings().framesPerSecond == 15 && StreamSettings.highest.framesPerSecond == 60,
+                  "Adding manual rates changed the default or initial RTT selection")
+        for rate in [75, 90, 120, 144, 165, 240] {
+            let settings = StreamSettings(framesPerSecond: rate)
+            try settings.validateControlValues()
+            let request = StreamSettingsRequest(settings: settings)
+            let decoded = try Wire.readJSON(StreamSettingsRequest.self, Wire.json(.streamSettingsRequest, request).payload)
+            try check(decoded.settings == settings, "Request lost \(rate) fps")
+            let result = StreamSettingsResult(id: request.id, state: state(settings))
+            let reply = try Wire.readJSON(StreamSettingsResult.self, Wire.json(.streamSettingsResult, result).payload)
+            try reply.state.validate()
+            try check(reply.state == result.state, "Reply lost \(rate) fps")
+        }
+    }
+
+    run("Higher-rate hello fields keep old 30 and 60 fps defaults valid and require an explicit capability") {
+        let settings = StreamSettings(longestEdge: 8192, framesPerSecond: 240, megabits: 100)
+        let hello = Hello(name: "host", width: 3840, height: 2160, settings: settings.legacyCompatible,
+            canControl: true, preferredSettings: settings.extendedCompatible,
+            highRefreshVideoSettings: true, preferredHighRefreshSettings: settings.highRefreshCompatible,
+            higherFrameRateVideoV1: true, preferredHigherFrameRateSettings: settings)
+        let data = try JSONEncoder().encode(hello)
+        let decoded = try Wire.readJSON(Hello.self, data)
+        try decoded.validate()
+        try check(decoded.preferredHigherFrameRateSettings == settings && decoded.higherFrameRateVideoV1 == true,
+                  "Higher-rate host preference was lost")
+        struct PreviousHello: Decodable {
+            let settings: StreamSettings
+            let preferredSettings: StreamSettings?
+            let preferredHighRefreshSettings: StreamSettings?
+        }
+        let previous = try JSONDecoder().decode(PreviousHello.self, from: data)
+        try check(previous.settings == settings.legacyCompatible
+                  && previous.preferredSettings == settings.extendedCompatible
+                  && previous.preferredHighRefreshSettings == settings.highRefreshCompatible,
+                  "A higher-rate default leaked into an old JSON field")
+        for value in [previous.settings, previous.preferredSettings!, previous.preferredHighRefreshSettings!] {
+            try check([10, 15, 30, 60].contains(value.framesPerSecond), "Old parser would reject the default frame rate")
+        }
+        var object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        object.removeValue(forKey: "higherFrameRateVideoV1")
+        object.removeValue(forKey: "preferredHigherFrameRateSettings")
+        let older = try Wire.readJSON(Hello.self, JSONSerialization.data(withJSONObject: object))
+        try older.validate()
+        try check(older.higherFrameRateVideoV1 == nil && older.preferredHigherFrameRateSettings == nil,
+                  "Absent capability enabled higher rates")
+        object["higherFrameRateVideoV1"] = "true"
+        try rejects("Malformed higher-rate capability accepted") {
+            _ = try Wire.readJSON(Hello.self, JSONSerialization.data(withJSONObject: object))
+        }
+        try rejects("Unbounded higher-rate preference accepted") {
+            try Hello(name: "host", width: 1920, height: 1080, settings: .init(), canControl: true,
+                      higherFrameRateVideoV1: true, preferredHigherFrameRateSettings: .init(framesPerSecond: 241)).validate()
+        }
+        try rejects("Higher rate accepted in a compatibility field") {
+            try Hello(name: "host", width: 1920, height: 1080, settings: .init(), canControl: true,
+                      highRefreshVideoSettings: true, preferredHighRefreshSettings: settings).validate()
+        }
+    }
+
+    run("Old-host fallback and media startup preserve a saved higher rate until a manual choice is confirmed") {
+        let settings = StreamSettings(longestEdge: 8192, framesPerSecond: 240, megabits: 100)
+        var policy = ViewerQualityPolicy(preferred: settings)
+        let fallback = policy.settingsForConnection(hostDefault: .init(), supportsExtended: true, supportsHighRefresh: true)
+        try check(fallback == settings.highRefreshCompatible && !policy.maySaveCurrentChoice,
+                  "Old high-refresh host received a higher rate or allowed fallback to overwrite the saved choice")
+        policy.chooseManually(savePreference: policy.maySaveCurrentChoice)
+        try check(!policy.confirm(fallback, maySave: policy.maySaveCurrentChoice) && policy.preferred == settings,
+                  "Starting media adaptation erased the saved higher rate")
+        try check(policy.settingsForConnection(hostDefault: .init(), supportsExtended: true, supportsHighRefresh: false)
+                  == settings.extendedCompatible, "Extended-only fallback changed")
+        try check(policy.settingsForConnection(hostDefault: .init(), supportsExtended: false)
+                  == settings.legacyCompatible, "Legacy fallback changed")
+        try check(policy.settingsForConnection(hostDefault: .init(), supportsExtended: true, supportsHighRefresh: true,
+                                              supportsHigherFrameRate: true) == settings,
+                  "Reconnect to an updated host did not restore the saved rate")
+        policy.chooseManually()
+        try check(policy.confirm(fallback, maySave: policy.maySaveCurrentChoice) && policy.preferred == fallback,
+                  "An explicit manual 60 fps choice could not replace the saved preference")
+    }
+
+    run("Higher-rate edits coalesce and a failed earlier change retains the latest choice") {
+        let base = StreamSettings(framesPerSecond: 60)
+        var tuning = try VideoTuningSession(applied: state(base))
+        try tuning.choose(StreamSettings(framesPerSecond: 120))
+        let first = tuning.nextRequest()!
+        let latest = StreamSettings(framesPerSecond: 240)
+        try tuning.choose(latest)
+        try check(tuning.nextRequest() == nil, "Higher-rate edits sent concurrent requests")
+        try check(tuning.receive(StreamSettingsResult(id: first.id, state: state(base), error: "Synthetic encoder refusal")),
+                  "Failed earlier request was not acknowledged")
+        try check(tuning.applied.settings == base && tuning.desired == latest, "Failure replaced the latest higher-rate choice")
+        let next = tuning.nextRequest()!
+        try check(next.settings == latest, "Latest rate was not retried after the earlier request")
+        try check(tuning.receive(StreamSettingsResult(id: next.id, state: state(latest))), "Higher-rate reply was not applied")
+    }
+
+    run("Higher-rate connection preferences keep the old field readable and ignore invalid optional values") {
+        let settings = StreamSettings(longestEdge: 8192, framesPerSecond: 240, megabits: 100)
+        let record = ConnectionRecord(address: "home.test", port: 5908, name: "Home", videoSettings: settings)
+        let data = try JSONEncoder().encode(record)
+        try check(JSONDecoder().decode(ConnectionRecord.self, from: data) == record, "Higher-rate record did not round-trip")
+        var object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        let old = try JSONDecoder().decode(StreamSettings.self, from: JSONSerialization.data(withJSONObject: object["videoSettings"]!))
+        try check(old == settings.highRefreshCompatible, "An old reader would receive an unsupported saved rate")
+        object["higherFrameRateVideoSettings"] = ["framesPerSecond": 241, "longestEdge": 8192, "megabits": 100]
+        let invalid = try JSONDecoder().decode(ConnectionRecord.self, from: JSONSerialization.data(withJSONObject: object))
+        try check(invalid.id == record.id && invalid.videoSettings == old, "Invalid optional settings hid the connection record")
+        object["higherFrameRateVideoSettings"] = "invalid"
+        try check(JSONDecoder().decode(ConnectionRecord.self, from: JSONSerialization.data(withJSONObject: object)).videoSettings == old,
+                  "Malformed optional settings hid the legacy preference")
+        object.removeValue(forKey: "higherFrameRateVideoSettings")
+        try check(JSONDecoder().decode(ConnectionRecord.self, from: JSONSerialization.data(withJSONObject: object)).videoSettings == old,
+                  "An old record was assumed to contain a higher-rate preference")
     }
 
     run("Native resolution preserves source pixels within decoder limits without upscaling") {

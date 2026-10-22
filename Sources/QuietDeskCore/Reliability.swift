@@ -37,6 +37,37 @@ public struct ConnectionRecord: Codable, Identifiable, Equatable {
         self.videoSettings = videoSettings
         self.relay = relay
     }
+    private enum CodingKeys: String, CodingKey {
+        case id, address, port, name, lastConnected, videoSettings, relay, higherFrameRateVideoSettings
+    }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        address = try values.decode(String.self, forKey: .address)
+        port = try values.decode(UInt16.self, forKey: .port)
+        name = try values.decode(String.self, forKey: .name)
+        lastConnected = try values.decode(Date.self, forKey: .lastConnected)
+        videoSettings = try values.decodeIfPresent(StreamSettings.self, forKey: .videoSettings)
+        relay = try values.decodeIfPresent(RelayConnectionInfo.self, forKey: .relay)
+        if let higher = try? values.decode(StreamSettings.self, forKey: .higherFrameRateVideoSettings),
+           higher.framesPerSecond > 60, (try? higher.validateControlValues()) != nil,
+           higher.highRefreshCompatible == videoSettings {
+            videoSettings = higher
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(address, forKey: .address)
+        try values.encode(port, forKey: .port)
+        try values.encode(name, forKey: .name)
+        try values.encode(lastConnected, forKey: .lastConnected)
+        try values.encodeIfPresent(videoSettings?.highRefreshCompatible, forKey: .videoSettings)
+        try values.encodeIfPresent(relay, forKey: .relay)
+        if let videoSettings, videoSettings.framesPerSecond > 60 {
+            try values.encode(videoSettings, forKey: .higherFrameRateVideoSettings)
+        }
+    }
     public func matches(address: String, port: UInt16) -> Bool {
         self.port == port && self.address.caseInsensitiveCompare(address) == .orderedSame
     }

@@ -11,6 +11,28 @@ func runMediaPathPolicyChecks() {
                         deliveryMilliseconds: delivery, receivedMegabits: received)
     }
 
+    run("Adaptive quality reduces and restores higher rates without replacing the user's ceiling") {
+        let ceiling = StreamSettings(longestEdge: 1280, framesPerSecond: 240, megabits: 100)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (1280, 720), now: 0)
+        var time = 0.0
+        for rate in [165, 144, 120, 90, 75, 60] {
+            time += 3
+            guard let next = quality.reduceLoad(for: .encoder, now: time) else { throw CheckFailure("No compute reduction") }
+            try check(next.framesPerSecond == rate, "Higher-rate reduction skipped its next supported step")
+            try check(quality.confirmApplied(next, now: time), "Reduced rate was not applied")
+        }
+        while time < 120, quality.effective != ceiling {
+            time += 1
+            if let next = quality.observe(sample(frames: 240, encode: 1, decode: 1), now: time) {
+                try check(next.framesPerSecond <= 240 && StreamSettings.frameRates.contains(next.framesPerSecond),
+                          "Recovery exceeded the chosen ceiling or selected an unsupported rate")
+                _ = quality.confirmApplied(next, now: time)
+            }
+        }
+        try check(quality.effective == ceiling && quality.upperBound == ceiling && quality.preferred == ceiling,
+                  "Recovery failed to restore the chosen higher rate or overwrote the preference")
+    }
+
     func udp() throws -> MediaPathPolicy {
         var policy = MediaPathPolicy(capable: true, now: 0)
         _ = policy.tick(now: 0)

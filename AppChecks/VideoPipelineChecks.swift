@@ -300,6 +300,15 @@ private struct VideoPipelineChecks {
                         "Stopped encoder still produced a duration")
         }
 
+        run("Screen capture configuration carries each higher rate without a hidden 60 fps clamp") {
+            for rate in [75, 90, 120, 144, 165, 240] {
+                let settings = StreamSettings(framesPerSecond: rate)
+                let configuration = ScreenStreamer.configuration(width: 1920, height: 1080, settings: settings)
+                try require(CMTimeCompare(configuration.minimumFrameInterval, CMTime(value: 1, timescale: Int32(rate))) == 0,
+                            "Screen capture did not receive \(rate) fps")
+            }
+        }
+
         run("Cursor capture keeps the old default and each explicit configuration inherits its selected mode") {
             let settings = StreamSettings(framesPerSecond: 60, megabits: 12)
             let original = ScreenStreamer.configuration(width: 1920, height: 1080, settings: settings)

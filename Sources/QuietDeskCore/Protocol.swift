@@ -113,7 +113,8 @@ public struct StreamSettings: Codable, Equatable, Sendable {
     public static let nativeLongestEdge = 8192
     public static let longestEdges = legacyLongestEdges + [nativeLongestEdge]
     public static let legacyFrameRates = [10, 15, 30]
-    public static let frameRates = legacyFrameRates + [60]
+    public static let highRefreshFrameRates = legacyFrameRates + [60]
+    public static let frameRates = highRefreshFrameRates + [75, 90, 120, 144, 165, 240]
     public static let legacyBitRates = [1, 2, 3, 5, 8, 12]
     public static let extendedBitRates = legacyBitRates + [30]
     public static let bitRates = extendedBitRates + [60, 100]
@@ -147,6 +148,10 @@ public struct StreamSettings: Codable, Equatable, Sendable {
 
     public var extendedCompatible: StreamSettings {
         StreamSettings(longestEdge: longestEdge, framesPerSecond: min(framesPerSecond, 30), megabits: min(megabits, 30))
+    }
+
+    public var highRefreshCompatible: StreamSettings {
+        StreamSettings(longestEdge: longestEdge, framesPerSecond: min(framesPerSecond, 60), megabits: megabits)
     }
 
     public func dimensions(width: Int, height: Int) -> (Int, Int) {
@@ -188,7 +193,10 @@ public struct Hello: Codable, Sendable {
     // The host types a lock screen password the viewer sends, and reports whether it was locked when this hello was sent.
     public let sessionUnlockV1: Bool?
     public let screenLocked: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil) {
+    // Rates above 60 fps use separate optional fields so existing high-refresh viewers still receive a valid default.
+    public let higherFrameRateVideoV1: Bool?
+    public let preferredHigherFrameRateSettings: StreamSettings?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -214,6 +222,8 @@ public struct Hello: Codable, Sendable {
         self.adaptiveVideoV1 = adaptiveVideoV1
         self.sessionUnlockV1 = sessionUnlockV1
         self.screenLocked = screenLocked
+        self.higherFrameRateVideoV1 = higherFrameRateVideoV1
+        self.preferredHigherFrameRateSettings = preferredHigherFrameRateSettings
     }
 
     public func validate() throws {
@@ -224,6 +234,11 @@ public struct Hello: Codable, Sendable {
         }
         if extendedVideoSettings == true, let preferredSettings { try preferredSettings.validateControlValues() }
         if highRefreshVideoSettings == true, let preferredHighRefreshSettings { try preferredHighRefreshSettings.validateControlValues() }
+        guard extendedVideoSettings != true || (preferredSettings?.framesPerSecond ?? 0) <= 60,
+              highRefreshVideoSettings != true || (preferredHighRefreshSettings?.framesPerSecond ?? 0) <= 60 else {
+            throw DeskError.invalid("兼容画质字段的帧率不能超过 60 fps")
+        }
+        if higherFrameRateVideoV1 == true, let preferredHigherFrameRateSettings { try preferredHigherFrameRateSettings.validateControlValues() }
     }
 }
 

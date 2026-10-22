@@ -28,7 +28,7 @@ private final class ResultBox<Value>: @unchecked Sendable {
     func get() -> Value { lock.withLock { value } }
 }
 
-private func encodedPackets() throws -> [VideoPacket] {
+private func encodedPackets(framesPerSecond: Int = 15) throws -> [VideoPacket] {
     var buffer: CVPixelBuffer?
     let status = CVPixelBufferCreate(nil, 320, 180, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
         [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer)
@@ -41,7 +41,7 @@ private func encodedPackets() throws -> [VideoPacket] {
         }
     }
     CVPixelBufferUnlockBaseAddress(buffer, [])
-    let encoder = try VideoEncoder(width: 320, height: 180, settings: .init())
+    let encoder = try VideoEncoder(width: 320, height: 180, settings: .init(framesPerSecond: framesPerSecond))
     defer { encoder.stop() }
     let ready = DispatchSemaphore(value: 0)
     let result = ResultBox<Result<VideoPacket, Error>?>(nil)
@@ -52,7 +52,7 @@ private func encodedPackets() throws -> [VideoPacket] {
     }
     var packets: [VideoPacket] = []
     for sequence in UInt32(1)...2 {
-        try encoder.encode(buffer, time: CMTime(value: Int64(sequence), timescale: 15),
+        try encoder.encode(buffer, time: CMTime(value: Int64(sequence), timescale: Int32(framesPerSecond)),
                            sequence: sequence, forceKeyFrame: sequence == 1)
         try require(ready.wait(timeout: .now() + 10) == .success, "Synthetic encoder did not finish")
         guard let output = result.get() else { throw SampleCheckFailure("No synthetic output") }
@@ -68,6 +68,26 @@ private struct VideoSampleChecks {
         func run(_ name: String, _ body: () throws -> Void) {
             do { try body(); passed += 1; print("PASS \(name)") }
             catch { failed += 1; print("FAIL \(name): \(error)") }
+        }
+
+        run("Higher-rate VideoToolbox configurations encode and decode synthetic frames") {
+            for rate in [75, 90, 120, 144, 165, 240] {
+                let packets = try encodedPackets(framesPerSecond: rate)
+                let decoder = VideoDecoder()
+                defer { decoder.stop() }
+                for packet in packets {
+                    let ready = DispatchSemaphore(value: 0)
+                    let decoded = ResultBox(false)
+                    decoder.decode(packet) { result in
+                        if case .success(let frame) = result {
+                            decoded.set(CVPixelBufferGetWidth(frame) == 320 && CVPixelBufferGetHeight(frame) == 180)
+                        }
+                        ready.signal()
+                    }
+                    try require(ready.wait(timeout: .now() + 10) == .success && decoded.get(),
+                                "Synthetic encode/decode failed at \(rate) fps")
+                }
+            }
         }
 
         run("CoreMedia directly references immutable storage and releases its owner with the block") {

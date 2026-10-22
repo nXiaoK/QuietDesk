@@ -300,10 +300,7 @@ struct SharingView: View {
                         HStack(spacing: 8) {
                             Text("帧率上限")
                             Picker("帧率上限", selection: $model.settings.framesPerSecond) {
-                                Text("10 fps").tag(10)
-                                Text("15 fps").tag(15)
-                                Text("30 fps").tag(30)
-                                Text("60 fps").tag(60)
+                                ForEach(StreamSettings.frameRates, id: \.self) { Text("\($0) fps").tag($0) }
                             }
                             .labelsHidden()
                         }
@@ -321,7 +318,7 @@ struct SharingView: View {
                     VStack(alignment: .leading, spacing: 5) {
                         Text("建议先用 1920 / 15 fps / 3 Mbps。静止画面不重复编码；码率是目标值，关键帧和网络开销可能产生短时峰值。")
                         Text("控制端在会话中调整画质不会修改这里的默认值。")
-                        Text("原分辨率不放大画面，上限为单边 8192 像素、总计 3600 万像素；仍使用有损 H.264 / 4:2:0；窗口缩放也会影响清晰度。60 fps 与高码率新档位需两端更新，旧控制端沿用兼容画质。")
+                        Text("原分辨率不放大画面，上限为单边 8192 像素、总计 3600 万像素；仍使用有损 H.264 / 4:2:0；窗口缩放也会影响清晰度。帧率最高可选 240 fps，超过 60 fps 需两端更新；实际帧率受被控屏幕刷新率、硬件和网络限制。旧控制端沿用兼容画质。")
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)

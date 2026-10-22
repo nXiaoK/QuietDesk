@@ -38,7 +38,12 @@ final class DeskModel: ObservableObject {
         didSet { UserDefaults.standard.set(hostPort, forKey: "listenPort") }
     }
     @Published var settings = StreamSettings() {
-        didSet { if let data = try? JSONEncoder().encode(settings) { UserDefaults.standard.set(data, forKey: "streamSettings") } }
+        didSet {
+            if let data = try? JSONEncoder().encode(settings.highRefreshCompatible) { UserDefaults.standard.set(data, forKey: "streamSettings") }
+            if settings.framesPerSecond > 60, let data = try? JSONEncoder().encode(settings) {
+                UserDefaults.standard.set(data, forKey: "higherFrameRateStreamSettings")
+            } else { UserDefaults.standard.removeObject(forKey: "higherFrameRateStreamSettings") }
+        }
     }
     @Published var displayID = CGMainDisplayID()
     @Published private(set) var displayFallbackNotice: String?
@@ -138,6 +143,7 @@ final class DeskModel: ObservableObject {
     @Published private(set) var supportsLiveSettings = false
     @Published private(set) var supportsExtendedVideoSettings = false
     @Published private(set) var supportsHighRefreshVideoSettings = false
+    @Published private(set) var supportsHigherFrameRateVideo = false
     @Published private(set) var supportsSessionEffects = false
     @Published private(set) var supportsSessionLock = false
     // The host takes fine automatic bitrate steps live and reports delivery delay (adaptiveVideoV1).
@@ -171,7 +177,10 @@ final class DeskModel: ObservableObject {
     @Published private(set) var videoSettingsStatus = ""
     var viewerSettings: StreamSettings { viewerSession.mediaQuality?.upperBound ?? videoTuning?.desired ?? activeVideoState?.settings ?? StreamSettings() }
     var viewerLongestEdges: [Int] { supportsExtendedVideoSettings ? StreamSettings.longestEdges : StreamSettings.legacyLongestEdges }
-    var viewerFrameRates: [Int] { supportsHighRefreshVideoSettings ? StreamSettings.frameRates : StreamSettings.legacyFrameRates }
+    var viewerFrameRates: [Int] {
+        supportsHigherFrameRateVideo ? StreamSettings.frameRates
+            : supportsHighRefreshVideoSettings ? StreamSettings.highRefreshFrameRates : StreamSettings.legacyFrameRates
+    }
     var viewerBitRates: [Int] { supportsHighRefreshVideoSettings ? StreamSettings.bitRates : supportsExtendedVideoSettings ? StreamSettings.extendedBitRates : StreamSettings.legacyBitRates }
     @Published var inputStatus = ""
     @Published private(set) var systemShortcutStatus = "全屏控制画面获得焦点后自动转发系统快捷键"
@@ -298,7 +307,13 @@ final class DeskModel: ObservableObject {
         trafficHistoryStore = services.trafficHistoryStore
         if let data = UserDefaults.standard.data(forKey: "streamSettings"),
            let saved = try? JSONDecoder().decode(StreamSettings.self, from: data),
-           (try? saved.validateControlValues()) != nil { settings = saved }
+           (try? saved.validateControlValues()) != nil {
+            if let data = UserDefaults.standard.data(forKey: "higherFrameRateStreamSettings"),
+               let higher = try? JSONDecoder().decode(StreamSettings.self, from: data),
+               higher.framesPerSecond > 60, (try? higher.validateControlValues()) != nil,
+               higher.highRefreshCompatible == saved { settings = higher }
+            else { settings = saved }
+        }
         if let id = UserDefaults.standard.object(forKey: "sharedDisplay") as? Int { preferredDisplayID = CGDirectDisplayID(clamping: id) }
         if let data = UserDefaults.standard.data(forKey: "rememberedSessionEffects"),
            let saved = try? JSONDecoder().decode(SessionEffectsState.self, from: data) {
@@ -1132,10 +1147,11 @@ final class DeskModel: ObservableObject {
                             width: width, height: height, settings: settings, canControl: self.canControl,
                             preferredSettings: preferredSettings.extendedCompatible, deviceID: self.trafficHistoryStore.localDeviceID,
                             deviceIdentityExchange: host.deviceIdentityAdvertised ? true : nil,
-                            highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings,
+                            highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings.highRefreshCompatible,
                             sessionEffects: true, sessionPause: true, mediaTransportV1: true, independentCursorV1: true,
                             relayTransportV1: true, relayDeviceID: relayRegistrations.first?.deviceID, sessionLockV1: true,
-                            adaptiveVideoV1: true, sessionUnlockV1: true, screenLocked: ScreenLockState.isLockedOnConsole)))
+                            adaptiveVideoV1: true, sessionUnlockV1: true, screenLocked: ScreenLockState.isLockedOnConsole,
+                            higherFrameRateVideoV1: true, preferredHigherFrameRateSettings: preferredSettings)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -2095,20 +2111,24 @@ final class DeskModel: ObservableObject {
             supportsLiveSettings = hello.liveSettings == true
             supportsExtendedVideoSettings = supportsLiveSettings && hello.extendedVideoSettings == true
             supportsHighRefreshVideoSettings = supportsExtendedVideoSettings && hello.highRefreshVideoSettings == true
+            supportsHigherFrameRateVideo = supportsHighRefreshVideoSettings && hello.higherFrameRateVideoV1 == true
             supportsSessionEffects = hello.sessionEffects == true
             supportsSessionLock = supportsSessionEffects && hello.sessionLockV1 == true
             supportsAdaptiveVideo = supportsHighRefreshVideoSettings && hello.adaptiveVideoV1 == true
             supportsSessionUnlock = hello.sessionUnlockV1 == true
             refreshUnlockState()
             if supportsLiveSettings {
-                let hostDefault = supportsHighRefreshVideoSettings ? (hello.preferredHighRefreshSettings ?? hello.preferredSettings ?? hello.settings)
+                let hostDefault = supportsHigherFrameRateVideo ? (hello.preferredHigherFrameRateSettings ?? hello.preferredHighRefreshSettings ?? hello.preferredSettings ?? hello.settings)
+                    : supportsHighRefreshVideoSettings ? (hello.preferredHighRefreshSettings ?? hello.preferredSettings ?? hello.settings)
                     : supportsExtendedVideoSettings ? (hello.preferredSettings ?? hello.settings) : hello.settings
                 let preferred = viewerQualityPolicy.settingsForConnection(hostDefault: hostDefault, supportsExtended: supportsExtendedVideoSettings,
-                                                                         supportsHighRefresh: supportsHighRefreshVideoSettings)
+                                                                         supportsHighRefresh: supportsHighRefreshVideoSettings,
+                                                                         supportsHigherFrameRate: supportsHigherFrameRateVideo)
                 videoTuning = try VideoTuningSession(applied: state, preferred: preferred)
                 videoSettingsStatus = "当前生效：\(state.settings.summary)"
                 if hello.mediaTransportV1 == true {
-                    viewerQualityPolicy.chooseManually()
+                    // Media adaptation replaces the old RTT shortcut; a compatibility fallback still must not be saved.
+                    viewerQualityPolicy.chooseManually(savePreference: viewerQualityPolicy.maySaveCurrentChoice)
                     try configureViewerMedia(peer: peer, settings: state.settings, preferred: preferred,
                                              relayRouting: hello.relayTransportV1 == true && target?.relay != nil)
                     // A relayed session starts from a modest bitrate and climbs only as the path proves it.
@@ -2243,6 +2263,10 @@ final class DeskModel: ObservableObject {
         }
         guard supportsHighRefreshVideoSettings || settings == settings.extendedCompatible else {
             videoSettingsStatus = "60 fps 与 60/100 Mbps 需两端更新后使用"
+            return
+        }
+        guard supportsHigherFrameRateVideo || settings.framesPerSecond <= 60 else {
+            videoSettingsStatus = "超过 60 fps 的档位需两端更新后使用"
             return
         }
         do { try tuning.choose(settings) }
@@ -3319,6 +3343,7 @@ final class DeskModel: ObservableObject {
         supportsLiveSettings = false
         supportsExtendedVideoSettings = false
         supportsHighRefreshVideoSettings = false
+        supportsHigherFrameRateVideo = false
         videoTuning = nil
         activeVideoState = nil
         videoSettingsStatus = ""

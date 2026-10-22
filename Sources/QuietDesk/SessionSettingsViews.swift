@@ -438,9 +438,11 @@ private struct SessionQualitySection: View {
                      : model.supportsMediaTransport ? "已保存画质与手动选择作为自动调节上限；实际画质随网络负载调整。" : model.supportsExtendedVideoSettings ? "已保存画质与手动选择优先；旧传输首次 RTT <10 ms 的新连接默认最高画质。" : "已保存的连接会恢复画质；原分辨率和 30 Mbps 需共享端更新后使用。")
                     .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
+            Text("帧率为上限，实际受被控屏幕刷新率、硬件和网络限制；超过 60 fps 需两端更新。")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
         .font(.system(size: compact ? 11 : 12))
-        .help("画质调整只改变当前共享会话，不修改共享端默认值；同一连接记录会恢复手动确认的画质。自动调节不覆盖已保存选择。RTT 不代表网络类型或画面上屏延迟。原分辨率不放大，上限单边 8192 像素、总计 3600 万像素。60 fps 与 60/100 Mbps 需两端更新；H.264 / 4:2:0 仍为有损。可连续选择，等待时合并为最新设置。")
+        .help("画质调整只改变当前共享会话，不修改共享端默认值；同一连接记录会恢复手动确认的画质。自动调节不覆盖已保存选择。RTT 不代表网络类型或画面上屏延迟。原分辨率不放大，上限单边 8192 像素、总计 3600 万像素。最高可选 240 fps，超过 60 fps 需两端更新；实际帧率受被控屏幕刷新率、硬件和网络限制。60/100 Mbps 需两端支持；H.264 / 4:2:0 仍为有损。可连续选择，等待时合并为最新设置。")
     }
 }
 

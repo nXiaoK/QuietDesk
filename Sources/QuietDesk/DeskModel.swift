@@ -133,6 +133,7 @@ final class DeskModel: ObservableObject {
     @Published var clipboardStatus = ""
     @Published private(set) var pendingFileOffer: ClipboardFileOffer?
     @Published private(set) var receivingFileID: UUID?
+    @Published private(set) var receivedFilesKeptInFolder = false
     @Published var canControl = false
     @Published private(set) var localAccessibility = false
     @Published private(set) var localInputMonitoring = false
@@ -3028,6 +3029,11 @@ final class DeskModel: ObservableObject {
             sync.onFileReceptionChanged = { [weak self, weak sync] id in
                 guard let self, let sync, self.clipboardSync === sync else { return }
                 self.receivingFileID = id
+                if id != nil { self.receivedFilesKeptInFolder = false }
+            }
+            sync.onReceivedFilesKept = { [weak self, weak sync] in
+                guard let self, let sync, self.clipboardSync === sync else { return }
+                self.receivedFilesKeptInFolder = true
             }
             dataChannel?.configureClipboard(sync.receiveMessage)
             sync.onDiagnostic = { [weak self, weak sync] event in
@@ -3044,6 +3050,7 @@ final class DeskModel: ObservableObject {
                 self.clipboardFilePrompt = nil
                 self.pendingFileOffer = offer
                 guard let offer else { return }
+                self.receivedFilesKeptInFolder = false
                 if self.mode == .viewer { self.canvas.releaseControl() }
                 else { self.hostSession.injector?.releaseAll() }
                 let prompt = ClipboardFilePrompt(offer: offer, peerName: self.mode == .viewer ? self.remoteName : "") { [weak self, weak sync] accepted in
@@ -3066,16 +3073,20 @@ final class DeskModel: ObservableObject {
             clipboardHandledChange = nil
             dismissClipboardPrompt(); clipboardFilePrompt = nil
             pendingFileOffer = nil
+            receivedFilesKeptInFolder = false
             if connected { clipboardStatus = supportsClipboard ? "自动剪贴板已关闭" : "对端版本较旧，可使用手动文字同步" }
         }
     }
 
     func openReceivedFiles() {
+        receivedFilesKeptInFolder = false
         let folder = ClipboardSync.storageURL.appendingPathComponent("received", isDirectory: true)
         do { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
         catch { self.error = error.localizedDescription; return }
         NSWorkspace.shared.open(folder)
     }
+
+    func dismissReceivedFilesNotice() { receivedFilesKeptInFolder = false }
 
     func cancelFileReception(id: UUID) {
         guard receivingFileID == id else { return }
@@ -3363,6 +3374,7 @@ final class DeskModel: ObservableObject {
         clipboardSync = nil
         dismissClipboardPrompt(); clipboardFilePrompt = nil
         pendingFileOffer = nil
+        receivedFilesKeptInFolder = false
         canvas.synchronizesClipboard = false
         supportsClipboard = false
         remoteClipboardEnabled = false

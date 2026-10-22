@@ -95,9 +95,12 @@ final class ClipboardSync {
 
     static let storageURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("\(AppDataLocation.folderName())/Clipboard", isDirectory: true)
+    static let keptFilesNotice = "接收的文件已保存到接收目录，未放入剪贴板；保留了新的本机复制内容"
     var onStatus: ((String) -> Void)?
     var onFileOffer: ((ClipboardFileOffer?) -> Void)?
     var onFileReceptionChanged: ((UUID?) -> Void)?
+    /// 接收完成时本机已有更新的复制，文件只留在接收目录；之后的同步状态会覆盖状态行，提示需单独保留。
+    var onReceivedFilesKept: (() -> Void)?
     var onDiagnostic: ((DiagnosticEvent) -> Void)?
     var allowsFileSending: Bool
     private var allowsAutomaticSending: Bool
@@ -167,7 +170,8 @@ final class ClipboardSync {
                     self.receivingFileChange = nil
                     if self.receivedFilesKeptLocally {
                         self.receivedFilesKeptLocally = false
-                        self.onStatus?("文件接收完成，已保存到接收目录；保留了新的本机复制内容")
+                        self.onStatus?("文件接收完成")
+                        self.onReceivedFilesKept?()
                     }
                 }
                 self.onFileReceptionChanged?(id)

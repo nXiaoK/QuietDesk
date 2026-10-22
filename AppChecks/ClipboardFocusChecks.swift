@@ -558,9 +558,10 @@ private struct ClipboardFocusChecks {
                 let next = folder.appendingPathComponent("new-local.bin"), nextBytes = Data("copied while receiving".utf8)
                 try originalBytes.write(to: original); try nextBytes.write(to: next)
                 var offer: ClipboardFileOffer?, returnOffer: ClipboardFileOffer?, reception: UUID?, held: Message?
-                var senderEvents: [ClipboardSync.DiagnosticEvent] = []
+                var senderEvents: [ClipboardSync.DiagnosticEvent] = [], kept = 0
                 pair.localSync.onFileOffer = { offer = $0 }
                 pair.localSync.onFileReceptionChanged = { reception = $0 }
+                pair.localSync.onReceivedFilesKept = { kept += 1 }
                 pair.remoteSync.onFileOffer = { returnOffer = $0 }
                 pair.remoteSync.onDiagnostic = { senderEvents.append($0) }
                 pair.routeRemote = { message in
@@ -591,7 +592,7 @@ private struct ClipboardFocusChecks {
                 let batches = try FileManager.default.contentsOfDirectory(at: received, includingPropertiesForKeys: nil)
                 try require(batches.count == 1 && Data(contentsOf: batches[0].appendingPathComponent("incoming.bin")) == originalBytes,
                             "The completed file was missing or its bytes changed")
-                try require(pair.local.writes == 0, "Completing the file overwrote the newer local copy")
+                try require(pair.local.writes == 0 && kept == 1, "Completing the file overwrote the newer local copy or lost its folder notice")
                 if kind == "files" {
                     try eventually("The newer local file was not offered after receiving finished") { returnOffer != nil }
                     try require(pair.remote.writes == 0, "The newer file bypassed receiver approval")
@@ -654,9 +655,10 @@ private struct ClipboardFocusChecks {
             let file = folder.appendingPathComponent("cancelled.bin")
             try Data(repeating: 79, count: 120_000).write(to: file)
             var offer: ClipboardFileOffer?, reception: UUID?, held: Message?
-            var senderEvents: [ClipboardSync.DiagnosticEvent] = []
+            var senderEvents: [ClipboardSync.DiagnosticEvent] = [], kept = 0
             pair.localSync.onFileOffer = { offer = $0 }
             pair.localSync.onFileReceptionChanged = { reception = $0 }
+            pair.localSync.onReceivedFilesKept = { kept += 1 }
             pair.remoteSync.onDiagnostic = { senderEvents.append($0) }
             pair.routeRemote = { message in
                 if message.kind == .clipboardChunk, held == nil { held = message; return false }
@@ -678,7 +680,7 @@ private struct ClipboardFocusChecks {
             }
             pair.localSync.receive(held!)
             pump(for: 0.35)
-            try require(pair.local.writes == 0 && pair.local.copiedText == "local copy after cancellation"
+            try require(pair.local.writes == 0 && pair.local.copiedText == "local copy after cancellation" && kept == 0
                         && pair.localMessages.filter { $0 == .clipboardCancel }.count == 1
                         && !FileManager.default.fileExists(atPath: folder.appendingPathComponent("local/received").path),
                         "Cancelled or late file data was published, or cancellation lost the local copy")
@@ -693,10 +695,11 @@ private struct ClipboardFocusChecks {
                 let file = folder.appendingPathComponent("incoming.bin")
                 try Data(repeating: 83, count: 120_000).write(to: file)
                 var offer: ClipboardFileOffer?, reception: UUID?, held: Message?
-                var statuses: [String] = []
+                var statuses: [String] = [], kept = 0
                 pair.localSync.onFileOffer = { offer = $0 }
                 pair.localSync.onFileReceptionChanged = { reception = $0 }
                 pair.localSync.onStatus = { statuses.append($0) }
+                pair.localSync.onReceivedFilesKept = { kept += 1 }
                 pair.routeRemote = { message in
                     if message.kind == .clipboardChunk, held == nil { held = message; return false }
                     return true
@@ -729,11 +732,13 @@ private struct ClipboardFocusChecks {
                     try eventually("The deferred local copy did not synchronize after receiving finished") {
                         pair.remote.copiedText == "copied while receiving" && !pair.localSync.holdsPaste
                     }
-                    try require(pair.local.writes == 0, "The finished file replaced the newer local copy")
+                    try require(pair.local.writes == 0 && kept == 1,
+                                "The finished file replaced the newer local copy or its folder notice was not kept once")
                 } else {
                     pump(for: 0.35)
                     try require(pair.local.writes == 1 && !pair.localMessages.contains(.clipboardBegin) && !pair.localSync.holdsPaste,
                                 "The finished file was not published locally or was echoed back while controlling")
+                    try require(kept == 0, "A file published on the clipboard reported it was kept only in the folder")
                 }
             }
         }

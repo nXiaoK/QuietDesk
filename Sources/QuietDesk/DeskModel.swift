@@ -1343,7 +1343,8 @@ final class DeskModel: ObservableObject {
             self.cursorStatus = enabled ? (known ? "本地即时光标" : "本地即时光标 · 通用指针") : "视频光标"
         }
         supportsMediaTransport = true
-        viewer.mediaQuality = try MediaQualityPolicy(hostDefault: preferred, preferred: viewerQualityPolicy.preferred,
+        // Keep the saved preference for reconnects; this session's ceiling must fit the host's capabilities.
+        viewer.mediaQuality = try MediaQualityPolicy(hostDefault: preferred, preferred: viewerQualityPolicy.preferred == nil ? nil : preferred,
                                                    applied: settings, bitRates: supportsAdaptiveVideo ? StreamSettings.adaptiveBitRates : viewerBitRates,
                                                    appliedSize: activeVideoState.map { ($0.width, $0.height) }, now: SessionClock.now)
         channel.configureMedia { [weak media] in media?.receive($0) ?? false }

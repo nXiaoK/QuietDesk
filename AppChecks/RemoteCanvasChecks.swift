@@ -309,22 +309,28 @@ private struct RemoteCanvasChecks {
             canvas.onRelease = { releases += 1 }
             canvas.onInput = { inputs.append($0) }
             let hosting = NSHostingView(rootView: CanvasView(canvas: canvas).overlay {
-                FullScreenStatusOverlay(picture: CGSize(width: 900, height: 600),
-                    position: Binding(get: { position }, set: { position = $0 }), opacity: 0.6,
+                FullScreenStatusOverlay(position: Binding(get: { position }, set: { position = $0 }), opacity: 0.6,
+                    backdrop: { canvas.backdropLuminance(in: $0, container: $1) },
                     beginDrag: { canvas.releaseControl() }) {
-                    Text("Synthetic status · 1920 × 1246 · 30 fps · 14 ms")
+                    Text("0:49"); Text("中继 UDP 视频"); Text("30 fps"); Text("14 ms"); Text("1920 × 1246")
                 }
             }.frame(width: 900, height: 600))
             window.contentView = hosting
-            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
-            hosting.layoutSubtreeIfNeeded()
+            // The first pass measures the status; the corner position follows on the next one.
+            for _ in 0..<3 {
+                RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+                hosting.layoutSubtreeIfNeeded()
+            }
             func dragView(_ view: NSView) -> StatusDragView? {
                 if let view = view as? StatusDragView { return view }
                 return view.subviews.lazy.compactMap { dragView($0) }.first
             }
             guard let target = dragView(hosting) else { throw CanvasCheckFailure("Status drag target was not attached") }
-            try require(target.bounds.width > 100 && target.bounds.width < 800 && target.bounds.height < 60,
-                        "Status consumed a full row or screen instead of its contents: \(target.bounds)")
+            try require(target.bounds.width > 60 && target.bounds.width < 300 && target.bounds.height > 60 && target.bounds.height < 200,
+                        "Status consumed a full row or screen instead of its stacked contents: \(target.bounds)")
+            let frame = target.convert(target.bounds, to: nil)
+            try require(abs(frame.maxX - (900 - FullScreenStatusPlacement.margin)) < 1 && abs(frame.minY - FullScreenStatusPlacement.margin) < 1,
+                        "Status did not start in the bottom-right corner: \(frame)")
             let point = target.convert(CGPoint(x: target.bounds.midX, y: target.bounds.midY), to: nil)
             func event(_ type: NSEvent.EventType, _ location: CGPoint) throws -> NSEvent {
                 guard let event = NSEvent.mouseEvent(with: type, location: location, modifierFlags: [], timestamp: 0,
@@ -334,14 +340,16 @@ private struct RemoteCanvasChecks {
                 return event
             }
             let localDown = try event(.leftMouseDown, point)
-            let remoteDown = try event(.leftMouseDown, CGPoint(x: 880, y: 100))
+            // Away from the bottom-right corner the status occupies.
+            let remoteDown = try event(.leftMouseDown, CGPoint(x: 100, y: 500))
             try require(!canvas.isInputTarget(of: localDown), "Status drag was classified as remote input")
             try require(canvas.isInputTarget(of: remoteDown),
                         "Exposed canvas stopped accepting input")
             try require(window.makeFirstResponder(canvas), "Canvas did not take fixture focus")
             target.mouseDown(with: try event(.leftMouseDown, point))
             try require(window.firstResponder !== canvas && releases == 1, "Drag did not release control exactly once")
-            let drop = CGPoint(x: point.x + 120, y: point.y - 160)
+            // The status starts in the bottom-right corner, so the drop moves it left and up.
+            let drop = CGPoint(x: point.x - 120, y: point.y + 160)
             target.mouseDragged(with: try event(.leftMouseDragged, drop))
             RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
             target.mouseUp(with: try event(.leftMouseUp, drop))
@@ -880,6 +888,49 @@ private struct RemoteCanvasChecks {
             try require(captures == 1 && inputs.count == 1 && inputs[0].keyCode == 1, "Plain ⌘S no longer reaches the remote Mac")
             canvas.reset()
             try require(canvas.displayedFrame == nil, "A capturable frame outlived the session")
+        }
+
+        run("Status brightness reads the frame on screen under the status and counts black bands as black") {
+            let display = CanvasDisplayLayerProbe()
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300), videoLayer: display)
+            let decoder = CanvasDecoderProbe()
+            let receiver = canvas.makeMediaReceiver(makeDecoder: { _ in decoder })
+            defer { receiver.stop(); canvas.reset() }
+            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
+            let corner = CGRect(x: 300, y: 200, width: 90, height: 90), screen = CGSize(width: 400, height: 300)
+            try require(canvas.backdropLuminance(in: corner, container: screen) == nil, "Brightness was reported without a frame")
+            receiver.receive(try mediaFrame(stream: stream, id: 1, keyFrame: true)) { _ in }
+            decoder.finish(1, .success(try decoderLikePixel(width: 64, height: 48, luma: 235)))
+            try require(receiver.commit(stream: stream), "Decoded frame did not commit")
+            drainCanvasDisplay()
+            guard let white = canvas.backdropLuminance(in: corner, container: screen) else { throw CanvasCheckFailure("White frame was not read") }
+            try require(abs(white - 1) < 0.001, "Video-range white was not read as full brightness: \(white)")
+            // A 400 × 400 screen fits the 4:3 picture between 50-point bands; this strip is half picture, half band.
+            guard let straddling = canvas.backdropLuminance(in: CGRect(x: 0, y: 330, width: 400, height: 40),
+                                                             container: CGSize(width: 400, height: 400)),
+                  let band = canvas.backdropLuminance(in: CGRect(x: 0, y: 355, width: 400, height: 40),
+                                                      container: CGSize(width: 400, height: 400)) else {
+                throw CanvasCheckFailure("Banded areas were not read")
+            }
+            try require(abs(straddling - 0.5) < 0.001 && band == 0, "Black bands were not counted as black: \(straddling), \(band)")
+            receiver.receive(try mediaFrame(stream: stream, id: 2, keyFrame: false)) { _ in }
+            decoder.finish(2, .success(try decoderLikePixel(width: 64, height: 48, luma: 16)))
+            drainCanvasDisplay()
+            try require(canvas.backdropLuminance(in: corner, container: screen) == 0, "Video-range black was not read as black")
+            var bgra: CVPixelBuffer?
+            guard CVPixelBufferCreate(nil, 64, 48, kCVPixelFormatType_32BGRA, nil, &bgra) == kCVReturnSuccess, let bgra else {
+                throw CanvasCheckFailure("Could not create a synthetic BGRA frame")
+            }
+            CVPixelBufferLockBaseAddress(bgra, [])
+            memset(CVPixelBufferGetBaseAddress(bgra), 255, CVPixelBufferGetBytesPerRow(bgra) * 48)
+            CVPixelBufferUnlockBaseAddress(bgra, [])
+            receiver.receive(try mediaFrame(stream: stream, id: 3, keyFrame: false)) { _ in }
+            decoder.finish(3, .success(bgra))
+            drainCanvasDisplay()
+            guard let rgbWhite = canvas.backdropLuminance(in: corner, container: screen) else { throw CanvasCheckFailure("BGRA frame was not read") }
+            try require(abs(rgbWhite - 1) < 0.001, "BGRA white was not read as full brightness: \(rgbWhite)")
+            canvas.reset()
+            try require(canvas.backdropLuminance(in: corner, container: screen) == nil, "Brightness outlived the session")
         }
 
         print("\(passed) passed, \(failed) failed")

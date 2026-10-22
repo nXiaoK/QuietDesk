@@ -318,12 +318,10 @@ struct DeskView: View {
         }
         .overlay {
             if immersive && model.showFullScreenStatistics {
-                FullScreenStatusOverlay(
-                    picture: model.activeVideoState.map { CGSize(width: $0.width, height: $0.height) } ?? .zero,
-                    position: $model.fullScreenStatusPosition, opacity: model.fullScreenStatusOpacity,
+                FullScreenStatusOverlay(position: $model.fullScreenStatusPosition, opacity: model.fullScreenStatusOpacity,
+                    backdrop: { [canvas = model.canvas] in canvas.backdropLuminance(in: $0, container: $1) },
                     beginDrag: { model.canvas.releaseControl() }) {
-                    Circle().fill(model.connected ? Color.green : Color.orange).frame(width: 6, height: 6)
-                    metrics
+                    fullScreenMetrics
                 }
             }
         }
@@ -444,6 +442,25 @@ struct DeskView: View {
             Text(model.frameRate).help("解码完成 FPS；静止画面不重复编码，0 fps 正常")
             Text(model.traffic).help("视频、控制和剪贴板的收发流量")
         } else { Text(model.sessionPaused ? "空闲暂停" : model.reconnecting ? "正在重连" : "未连接") }
+    }
+
+    /// The full-screen status: one value per line, without labels where the unit already says what it is.
+    /// The lines take no pointer events (the whole status is a drag handle), so they carry no tooltips.
+    @ViewBuilder private var fullScreenMetrics: some View {
+        if model.connected {
+            if let since = model.connectedSince { Text(since, style: .timer) }
+            Text(model.mediaTransportStatus)
+            Text(model.frameRate)
+            Text(model.traffic)
+            Text(model.latency)
+            if !model.mediaLoss.isEmpty {
+                if model.mediaLossHigh { Text(model.mediaLoss).foregroundStyle(Color.red) } else { Text(model.mediaLoss) }
+            }
+            if !model.resolution.isEmpty { Text(model.resolution) }
+            if !model.videoQualitySummary.isEmpty { Text("上限 " + model.videoQualitySummary) }
+        } else {
+            Text(model.sessionPaused ? "空闲暂停" : model.reconnecting ? "正在重连" : "未连接").foregroundStyle(Color.orange)
+        }
     }
 
     private var clipboardActivity: some View {

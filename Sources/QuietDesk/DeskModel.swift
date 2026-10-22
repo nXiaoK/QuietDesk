@@ -105,28 +105,32 @@ final class DeskModel: ObservableObject {
         return "当前生效的帧率上限与目标码率，按网络丢包和延迟自动调整，不超过所选：\(viewerSettings.summary)"
     }
     var mediaRouteSummary: String { mediaLoss.isEmpty ? mediaTransportStatus : mediaTransportStatus + " · " + mediaLoss }
+    /// UDP loss at the level adaptive quality treats as congestion; the full-screen status shows it in red.
+    var mediaLossHigh: Bool { (mediaLossFraction ?? 0) >= 0.03 }
     private var mediaRouteValue = ""
     private var peerPathState = RelayPeerPathState.relay
     @Published private(set) var performanceDiagnosticsEnabled = false
     @Published var showFullScreenStatistics = UserDefaults.standard.bool(forKey: "showFullScreenStatistics") {
         didSet { UserDefaults.standard.set(showFullScreenStatistics, forKey: "showFullScreenStatistics") }
     }
-    @Published var fullScreenStatusPosition: CGPoint? = UserDefaults.standard.data(forKey: "fullScreenStatusPosition")
+    // The vertical status starts from its bottom-right default; a position saved for the old single row
+    // ("fullScreenStatusPosition") is left for older versions and not reused.
+    private static let fullScreenStatusPositionKey = "fullScreenStatusPositionV2"
+    @Published var fullScreenStatusPosition: CGPoint? = UserDefaults.standard.data(forKey: DeskModel.fullScreenStatusPositionKey)
         .flatMap { try? JSONDecoder().decode(CGPoint.self, from: $0) } {
         didSet {
             if let fullScreenStatusPosition, let data = try? JSONEncoder().encode(fullScreenStatusPosition) {
-                UserDefaults.standard.set(data, forKey: "fullScreenStatusPosition")
-            } else { UserDefaults.standard.removeObject(forKey: "fullScreenStatusPosition") }
+                UserDefaults.standard.set(data, forKey: Self.fullScreenStatusPositionKey)
+            } else { UserDefaults.standard.removeObject(forKey: Self.fullScreenStatusPositionKey) }
         }
     }
-    // Missing means the original opacity for the automatic placement, including opaque text in black bands.
+    // Missing means the default opacity of the text-only status.
     @Published var fullScreenStatusOpacity = UserDefaults.standard.object(forKey: "fullScreenStatusOpacity") as? Double {
         didSet { UserDefaults.standard.set(fullScreenStatusOpacity, forKey: "fullScreenStatusOpacity") }
     }
     var fullScreenStatusEffectiveOpacity: Double {
         if let value = fullScreenStatusOpacity, value.isFinite { return min(1, max(0.1, value)) }
-        let picture = activeVideoState.map { CGSize(width: $0.width, height: $0.height) } ?? .zero
-        return FullScreenStatusPlacement.choose(container: canvas.bounds.size, picture: picture).defaultOpacity
+        return FullScreenStatusPlacement.defaultOpacity
     }
     @Published var resolution = ""
     @Published var remoteName = ""

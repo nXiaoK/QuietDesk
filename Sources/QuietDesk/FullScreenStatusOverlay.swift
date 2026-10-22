@@ -2,36 +2,42 @@ import AppKit
 import SwiftUI
 import QuietDeskCore
 
+/// One value per line, drawn straight over the remote picture in a colour that follows its brightness.
 struct FullScreenStatusOverlay<Content: View>: View {
-    let picture: CGSize
     @Binding var position: CGPoint?
     let opacity: Double?
+    /// Brightness (0–1) of the remote picture under a rectangle of this overlay; nil keeps the current colour.
+    let backdrop: (CGRect, CGSize) -> Double?
     let beginDrag: () -> Void
     @ViewBuilder let content: Content
     @State private var statusSize: CGSize = .zero
     @State private var dragOrigin: CGPoint?
     @State private var translation: CGSize = .zero
+    @State private var darkText = false
+    // Sampling state lives outside SwiftUI state so a sample that keeps the colour does not redraw.
+    @State private var contrast = ContrastSampler()
 
     var body: some View {
         GeometryReader { geometry in
-            let placement = FullScreenStatusPlacement.choose(container: geometry.size, picture: picture)
-            let automatic: CGPoint = switch placement {
-            case .topBand(let height): CGPoint(x: 0, y: max(0, (height - statusSize.height) / 2))
-            case .leadingBand: CGPoint(x: 0, y: 16)
-            case .overlay: CGPoint(x: 10, y: 10)
-            }
+            let automatic = FullScreenStatusPlacement.automaticOrigin(container: geometry.size, status: statusSize)
             let saved = position.map { FullScreenStatusPlacement.origin(for: $0, container: geometry.size, status: statusSize) } ?? automatic
             let proposed = dragOrigin.map { CGPoint(x: $0.x + translation.width, y: $0.y + translation.height) } ?? saved
             let normalized = FullScreenStatusPlacement.position(for: proposed, container: geometry.size, status: statusSize)
             let origin = FullScreenStatusPlacement.origin(for: normalized, container: geometry.size, status: statusSize)
-            status(placement)
-                .fixedSize(horizontal: false, vertical: true)
+            let ink: Color = darkText ? .black : .white
+            VStack(alignment: .leading, spacing: 2) { content }
+                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                .lineLimit(1)
+                .foregroundStyle(ink)
+                .shadow(color: (darkText ? Color.white : Color.black).opacity(0.6), radius: 1)
+                .fixedSize()
+                .padding(6)
                 .background {
-                    if placement == .overlay || position != nil || dragOrigin != nil {
-                        RoundedRectangle(cornerRadius: 12).fill(.black.opacity(0.35))
-                    }
+                    if dragOrigin != nil { RoundedRectangle(cornerRadius: 8).strokeBorder(ink.opacity(0.5)) }
                 }
-                .background(GeometryReader { status in Color.clear.preference(key: StatusSizeKey.self, value: status.size) })
+                // Measured directly: a size preference would be reset by the drag target, a sibling that reports
+                // the key's default, which left every position computed for a zero-sized status.
+                .onGeometryChange(for: CGSize.self, of: { $0.size }) { statusSize = $0 }
                 .allowsHitTesting(false)
                 .overlay {
                     StatusDragTarget(begin: {
@@ -51,34 +57,29 @@ struct FullScreenStatusOverlay<Content: View>: View {
                         translation = .zero
                     })
                 }
-                .opacity(opacity.flatMap { $0.isFinite ? min(1, max(0.1, $0)) : nil } ?? placement.defaultOpacity)
+                // The corner position needs the measured size; stay hidden for the first pass instead of flashing off-screen.
+                .opacity(statusSize == .zero ? 0
+                         : opacity.flatMap { $0.isFinite ? min(1, max(0.1, $0)) : nil } ?? FullScreenStatusPlacement.defaultOpacity)
                 .offset(x: origin.x, y: origin.y)
-        }
-        .onPreferenceChange(StatusSizeKey.self) { statusSize = $0 }
-    }
-
-    @ViewBuilder private func status(_ placement: FullScreenStatusPlacement) -> some View {
-        switch placement {
-        case .topBand:
-            HStack(spacing: 10) { content }
-                .font(.caption).monospacedDigit().foregroundStyle(.white.opacity(0.85)).lineLimit(1)
-                .padding(.horizontal, 16).padding(.vertical, 4)
-        case .leadingBand(let width):
-            VStack(alignment: .leading, spacing: 6) { content }
-                .font(.caption).monospacedDigit().foregroundStyle(.white.opacity(0.85))
-                .lineLimit(2).minimumScaleFactor(0.85)
-                .padding(.horizontal, 12).padding(.vertical, 4).frame(width: min(width, 220), alignment: .leading)
-        case .overlay:
-            HStack(spacing: 8) { content }
-                .font(.caption2).monospacedDigit().foregroundStyle(.white).lineLimit(1)
-                .padding(.horizontal, 9).padding(.vertical, 4)
+                .animation(.easeInOut(duration: 0.2), value: darkText)
+                .task(id: BackdropArea(rect: CGRect(origin: origin, size: statusSize), container: geometry.size)) {
+                    let rect = CGRect(origin: origin, size: statusSize), container = geometry.size
+                    while !Task.isCancelled {
+                        if contrast.state.observe(backdrop(rect, container)) { darkText = contrast.state.darkText }
+                        try? await Task.sleep(for: .milliseconds(500))
+                    }
+                }
         }
     }
 }
 
-private struct StatusSizeKey: PreferenceKey {
-    static let defaultValue: CGSize = .zero
-    static func reduce(value: inout CGSize, nextValue: () -> CGSize) { value = nextValue() }
+private final class ContrastSampler {
+    var state = FullScreenStatusContrast()
+}
+
+private struct BackdropArea: Equatable {
+    let rect: CGRect
+    let container: CGSize
 }
 
 private struct StatusDragTarget: NSViewRepresentable {

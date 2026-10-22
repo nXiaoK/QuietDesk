@@ -50,9 +50,10 @@ public struct VideoTuningSession {
         pending = request
         return request
     }
-    public mutating func receive(_ result: StreamSettingsResult) throws -> Bool {
+    public mutating func receive(_ result: StreamSettingsResult, maximumFrameRate: Int = StreamSettings.frameRates.last!) throws -> Bool {
         guard let pending, pending.id == result.id else { return false }
         try result.state.validate()
+        guard result.state.settings.framesPerSecond <= maximumFrameRate else { throw DeskError.invalid("画质回复超过已协商的帧率上限") }
         applied = result.state
         if desired == pending.settings { desired = result.state.settings }
         self.pending = nil

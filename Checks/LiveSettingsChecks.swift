@@ -125,6 +125,22 @@ func runLiveSettingsChecks() {
         try check(tuning.receive(StreamSettingsResult(id: next.id, state: state(latest))), "Higher-rate reply was not applied")
     }
 
+    run("Unnegotiated higher-rate replies cannot change applied settings or clear the pending request") {
+        let base = StreamSettings(framesPerSecond: 60)
+        var tuning = try VideoTuningSession(applied: state(base), preferred: low)
+        let pending = tuning.nextRequest()!
+        let higher = StreamSettings(framesPerSecond: 240)
+        try rejects("Old host reply was allowed to raise the frame rate without negotiation") {
+            _ = try tuning.receive(StreamSettingsResult(id: pending.id, state: state(higher)), maximumFrameRate: 60)
+        }
+        try check(tuning.applied.settings == base && tuning.pending?.id == pending.id && tuning.desired == low,
+                  "Rejected reply mutated applied settings, pending request or saved intent")
+        try check(!tuning.receive(StreamSettingsResult(id: UUID(), state: state(higher)), maximumFrameRate: 60),
+                  "A stale reply bypassed request matching")
+        try check(tuning.receive(StreamSettingsResult(id: pending.id, state: state(low)), maximumFrameRate: 60),
+                  "Valid reply could not finish after rejecting an unnegotiated rate")
+    }
+
     run("Higher-rate connection preferences keep the old field readable and ignore invalid optional values") {
         let settings = StreamSettings(longestEdge: 8192, framesPerSecond: 240, megabits: 100)
         let record = ConnectionRecord(address: "home.test", port: 5908, name: "Home", videoSettings: settings)

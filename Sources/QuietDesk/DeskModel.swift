@@ -2224,7 +2224,7 @@ final class DeskModel: ObservableObject {
             guard viewerSession.helloReceived, supportsLiveSettings, var tuning = videoTuning else { throw DeskError.invalid("对端不支持动态画质") }
             let result = try Wire.readJSON(StreamSettingsResult.self, message.payload)
             let previous = tuning.applied.settings
-            guard try tuning.receive(result) else { return }
+            guard try tuning.receive(result, maximumFrameRate: supportsHigherFrameRateVideo ? StreamSettings.frameRates.last! : 60) else { return }
             viewerSession.videoRequestTimeout?.cancel()
             videoTuning = tuning
             activeVideoState = result.state

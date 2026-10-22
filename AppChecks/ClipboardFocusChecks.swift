@@ -346,6 +346,103 @@ private struct ClipboardFocusChecks {
                         "The landed copy did not release the paste")
         }
 
+        for kind in ["text", "png", "files"] {
+            run("A local \(kind) copy survives taking control before automatic sending resumes") { folder in
+                let pair = ClipboardPair(storage: folder, validateRemotePNG: { _ in true })
+                defer { pair.stop() }
+                let bytes = Data("copied on this Mac before activation".utf8)
+                let file = folder.appendingPathComponent("copied-here.bin")
+                try bytes.write(to: file)
+                let payload: ClipboardPayload = kind == "files" ? .files([file]) : kind == "png" ? .png(bytes) : .text(bytes)
+                var offer: ClipboardFileOffer?
+                pair.remoteSync.onFileOffer = { offer = $0 }
+                pair.local.copy(payload)
+                pair.localSync.setControllingRemote(true)
+                pump(for: 0.35)
+                try require(pair.local.reads == 0 && pair.localMessages.isEmpty,
+                            "Taking control read or sent clipboard content while automatic sending was disabled")
+                try require(pair.localSync.holdsPaste, "The pending local copy no longer holds a remote paste")
+                pair.localSync.setAutomaticSendingAllowed(true)
+                var paste: Bool?
+                pair.localSync.prepareForPaste { paste = $0 }
+                if kind == "files" {
+                    try eventually("The pending local file was not offered after activation") { offer != nil }
+                    try require(paste == false && pair.remote.writes == 0 && pair.localSync.holdsPaste,
+                                "A deferred file copy bypassed the receiver's approval")
+                    pair.remoteSync.respondToFileOffer(id: offer!.id, accept: true)
+                    try eventually("The approved file did not finish transferring") { pair.remote.writes == 1 && !pair.localSync.holdsPaste }
+                    guard case .files(let received) = pair.remote.payload, let receivedFile = received.first else {
+                        throw FocusCheckFailure("The file was not published on the remote pasteboard")
+                    }
+                    try require(try Data(contentsOf: receivedFile) == bytes, "The deferred file's contents changed")
+                    pair.localSync.prepareForPaste { paste = $0 }
+                } else {
+                    try require(paste == nil, "A pending local copy did not wait for remote publication")
+                    try eventually("The pending local \(kind) did not arrive after activation") { paste == true && pair.remote.writes == 1 }
+                    switch pair.remote.payload {
+                    case .text(let received), .png(let received): try require(received == bytes, "The deferred payload changed")
+                    case .files: throw FocusCheckFailure("A non-file copy changed payload type")
+                    }
+                }
+                try require(paste == true && !pair.localSync.holdsPaste,
+                            "The completed deferred copy did not release the remote paste")
+            }
+        }
+
+        run("A pending local copy is discarded if the clipboard changes during remote control") { folder in
+            let pair = ClipboardPair(storage: folder)
+            defer { pair.stop() }
+            pair.local.copy(.text(Data("local copy before control".utf8)))
+            pair.localSync.setControllingRemote(true)
+            pair.local.copy(.text(Data("a different change during remote control".utf8)))
+            pump(for: 0.35)
+            pair.localSync.setAutomaticSendingAllowed(true)
+            var paste: Bool?
+            pair.localSync.prepareForPaste { paste = $0 }
+            pump(for: 0.35)
+            try require(pair.local.reads == 0 && pair.localMessages.isEmpty && pair.remote.writes == 0
+                        && !pair.localSync.holdsPaste && paste == true,
+                        "A replacement during control was mistaken for the earlier local copy")
+        }
+
+        run("Releasing control preserves a pending local copy until automatic sending resumes") { folder in
+            let pair = ClipboardPair(storage: folder)
+            defer { pair.stop() }
+            pair.local.copy(.text(Data("local copy waiting for activation".utf8)))
+            pair.localSync.setControllingRemote(true)
+            pair.localSync.setControllingRemote(false)
+            pump(for: 0.35)
+            try require(pair.local.reads == 0 && pair.localMessages.isEmpty, "Releasing control read a background clipboard")
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Releasing control consumed the pending local copy") {
+                pair.remote.copiedText == "local copy waiting for activation"
+            }
+        }
+
+        run("A local TIFF interrupted by the automatic-sending gate retries the same version during control") { folder in
+            let probe = ImageConversionProbe()
+            let pair = ClipboardPair(storage: folder, localAllowed: true,
+                                     convertLocalTIFF: { probe.convert($0) }, validateRemotePNG: { _ in true })
+            defer { probe.release.signal(); probe.release.signal(); pair.stop() }
+            let bytes = Data([1, 2, 3, 4])
+            pair.local.copy(.text(Data("TIFF fallback".utf8)))
+            pair.local.rawTIFF = bytes
+            pair.localSync.setControllingRemote(true)
+            try eventually("The local TIFF did not begin converting") { probe.state.began }
+            pair.localSync.setAutomaticSendingAllowed(false)
+            probe.release.signal()
+            pump(for: 0.1)
+            pair.localSync.setAutomaticSendingAllowed(true)
+            probe.release.signal()
+            var paste: Bool?
+            pair.localSync.prepareForPaste { paste = $0 }
+            try eventually("The interrupted TIFF was not retried after automatic sending resumed") { pair.remote.writes == 1 }
+            try eventually("The retried TIFF did not settle the remote paste") { paste == true && !pair.localSync.holdsPaste }
+            guard case .png(let received) = pair.remote.payload else { throw FocusCheckFailure("The retried TIFF was not a PNG") }
+            try require(received == bytes && pair.localMessages.filter { $0 == .clipboardBegin }.count == 1,
+                        "The interrupted image changed contents or was transferred twice")
+        }
+
         run("A copy made explicitly here during control, such as a remote picture capture, still sends") { folder in
             let pair = ClipboardPair(storage: folder, localAllowed: true, controllingLocal: true)
             defer { pair.stop() }
@@ -355,6 +452,22 @@ private struct ClipboardFocusChecks {
             pair.local.copy(.text(Data("captured here".utf8)))
             pair.localSync.sendLocalCopy()
             try eventually("An explicit copy during control did not send") { pair.remote.copiedText == "captured here" }
+        }
+
+        run("An explicit local copy during control waits for automatic sending to resume") { folder in
+            let pair = ClipboardPair(storage: folder, controllingLocal: true)
+            defer { pair.stop() }
+            pair.local.copy(.text(Data("explicit local capture while paused".utf8)))
+            pair.localSync.sendLocalCopy()
+            pump(for: 0.35)
+            try require(pair.local.reads == 0 && pair.localMessages.isEmpty && pair.localSync.holdsPaste,
+                        "An explicit local copy was read while paused or forgotten during control")
+            pair.localSync.setAutomaticSendingAllowed(true)
+            var paste: Bool?
+            pair.localSync.prepareForPaste { paste = $0 }
+            try eventually("The explicit local copy did not resume and release its paste") {
+                pair.remote.copiedText == "explicit local capture while paused" && paste == true && !pair.localSync.holdsPaste
+            }
         }
 
         run("An automatic reconnect hands over the handled version so a copy made while disconnected still sends") { folder in

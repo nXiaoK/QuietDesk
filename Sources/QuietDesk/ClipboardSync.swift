@@ -106,6 +106,8 @@ final class ClipboardSync {
     nonisolated let receiveMessage: @Sendable (Message) -> Void
     private var timer: Timer?
     private var observedChange: Int
+    // A copy made before taking control may still be waiting for activation or session resume.
+    private var pendingLocalChange: Int?
     private var pendingFileOffer: (id: UUID, change: Int)?
     private var deferredLocalChange: Int?
     private var staleFileChange: Int?
@@ -163,6 +165,7 @@ final class ClipboardSync {
                 }
                 let change = self.pasteboard.changeCount
                 self.pendingFileOffer = (offer.id, change)
+                self.pendingLocalChange = nil
                 self.deferredLocalChange = change
                 self.staleFileChange = change
                 self.onDiagnostic?(.fileOfferReceived(count: offer.count, totalBytes: offer.bytes))
@@ -199,6 +202,7 @@ final class ClipboardSync {
     func setAutomaticSendingAllowed(_ allowed: Bool) {
         allowsAutomaticSending = allowed
         if !allowed, imagePreparation != nil {
+            pendingLocalChange = sendingChange
             imagePreparation = nil
             sendingChange = nil
             observedChange = Int.min
@@ -208,24 +212,30 @@ final class ClipboardSync {
     }
 
     /// 操作远端期间本机剪贴板的变化来自系统通用剪贴板接力、其他程序等，不是在本机复制，
-    /// 记为已处理且不读取内容；进入控制前尚未发出的本机复制先发出。
+    /// 记为已处理且不读取内容；进入控制前尚未发出的本机复制保留到允许发送时。
     func setControllingRemote(_ controlling: Bool) {
         guard controllingRemote != controlling else { return }
-        if controlling { poll() } else { skipChangesWhileControlling() }
+        if controlling {
+            let change = pasteboard.changeCount
+            pendingLocalChange = change != observedChange && change != deferredLocalChange ? change : nil
+            poll()
+        } else { skipChangesWhileControlling() }
         controllingRemote = controlling
     }
 
-    /// 操作远端时按 ⌘V 是否要等剪贴板：只有本机复制仍在发往远端时才等，否则 ⌘V 作为普通按键直接送达。
-    var holdsPaste: Bool { running && (!controllingRemote || sendingChange != nil) }
+    /// 操作远端时按 ⌘V 是否要等剪贴板：只有本机复制等待发送或仍在发送时才等，否则按普通按键直接送达。
+    var holdsPaste: Bool { running && (!controllingRemote || pendingLocalChange != nil || sendingChange != nil) }
 
     /// 本机剪贴板已处理到的版本。自动重连时交给新会话，断线期间在本机的复制仍在切回时发送。
     var handledChange: Int { observedChange }
 
     /// 本机明确发起的复制（截取远端画面）在操作远端期间也照常发送。
     func sendLocalCopy() {
-        guard running, allowsAutomaticSending else { return }
+        guard running else { return }
         let change = pasteboard.changeCount
         guard change != observedChange, change != deferredLocalChange else { return }
+        pendingLocalChange = change
+        guard allowsAutomaticSending else { return }
         sendCurrent()
     }
 
@@ -241,7 +251,8 @@ final class ClipboardSync {
 
     func prepareForPaste(_ completion: @escaping (Bool) -> Void) {
         guard running, allowsAutomaticSending else { completion(false); return }
-        if controllingRemote {
+        if controllingRemote { skipChangesWhileControlling() }
+        if controllingRemote, pendingLocalChange == nil {
             // 远端自己的复制粘贴不补发本机剪贴板，也不重新发起文件确认。
             guard let sending = sendingChange else { completion(true); return }
             if sending == fileSendingChange {
@@ -284,6 +295,7 @@ final class ClipboardSync {
 
     func stop() {
         running = false
+        pendingLocalChange = nil
         cancelImageApplication()
         imagePreparation = nil
         timer?.invalidate(); timer = nil
@@ -299,17 +311,23 @@ final class ClipboardSync {
 
     private func poll() {
         guard running else { return }
-        if controllingRemote { skipChangesWhileControlling() } else { sendLocalCopy() }
+        if controllingRemote {
+            skipChangesWhileControlling()
+            guard pendingLocalChange != nil else { return }
+        }
+        sendLocalCopy()
     }
 
     private func skipChangesWhileControlling() {
         let change = pasteboard.changeCount
-        if change != deferredLocalChange { observedChange = change }
+        if pendingLocalChange != change { pendingLocalChange = nil }
+        if change != deferredLocalChange, change != pendingLocalChange { observedChange = change }
     }
 
     private func sendCurrent() {
         guard running, allowsAutomaticSending else { return }
         let change = pasteboard.changeCount
+        pendingLocalChange = nil
         observedChange = change
         imagePreparation = nil
         cancelImageApplication()
@@ -497,6 +515,7 @@ final class ClipboardSync {
             return false
         }
         observedChange = pasteboard.changeCount
+        pendingLocalChange = nil
         imagePreparation = nil
         deferredLocalChange = nil
         staleFileChange = nil

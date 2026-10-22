@@ -254,7 +254,7 @@ final class ClipboardSync {
     }
 
     /// 操作远端时按 ⌘V 是否要等剪贴板：只有本机复制等待发送或仍在发送时才等，否则按普通按键直接送达。
-    var holdsPaste: Bool { running && (!controllingRemote || receivingFileChange != nil || pendingLocalChange != nil || sendingChange != nil) }
+    var holdsPaste: Bool { running && (!controllingRemote || pendingLocalChange != nil || sendingChange != nil) }
 
     /// 本机剪贴板已处理到的版本。自动重连时交给新会话，断线期间在本机的复制仍在切回时发送。
     var handledChange: Int { observedChange }
@@ -282,14 +282,9 @@ final class ClipboardSync {
 
     func prepareForPaste(_ completion: @escaping (Bool) -> Void) {
         guard running, allowsAutomaticSending else { completion(false); return }
-        guard receivingFileChange == nil else {
-            completion(false)
-            onStatus?("文件仍在接收，完成后请再次粘贴；新的本机复制会随后同步")
-            return
-        }
         if controllingRemote { skipChangesWhileControlling() }
         if controllingRemote, pendingLocalChange == nil {
-            // 远端自己的复制粘贴不补发本机剪贴板，也不重新发起文件确认。
+            // 远端自己的复制粘贴不补发本机剪贴板，也不重新发起文件确认；本机正在接收的文件与之无关。
             guard let sending = sendingChange else { completion(true); return }
             if sending == fileSendingChange {
                 completion(false)
@@ -297,6 +292,11 @@ final class ClipboardSync {
                 return
             }
             waiters.append(completion)
+            return
+        }
+        guard receivingFileChange == nil else {
+            completion(false)
+            onStatus?("文件仍在接收，完成后请再次粘贴；新的本机复制会随后同步")
             return
         }
         guard !pasteboard.isSensitive else {

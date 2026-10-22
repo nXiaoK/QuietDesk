@@ -684,6 +684,60 @@ private struct ClipboardFocusChecks {
                         "Cancelled or late file data was published, or cancellation lost the local copy")
         }
 
+        for copiedDuringReception in [false, true] {
+            run(copiedDuringReception
+                ? "A local copy made while receiving holds a remote paste until the accepted file finishes"
+                : "Receiving an accepted file does not hold the controlled Mac's own paste") { folder in
+                let pair = ClipboardPair(storage: folder, localAllowed: true, remoteAllowed: true)
+                defer { pair.stop() }
+                let file = folder.appendingPathComponent("incoming.bin")
+                try Data(repeating: 83, count: 120_000).write(to: file)
+                var offer: ClipboardFileOffer?, reception: UUID?, held: Message?
+                var statuses: [String] = []
+                pair.localSync.onFileOffer = { offer = $0 }
+                pair.localSync.onFileReceptionChanged = { reception = $0 }
+                pair.localSync.onStatus = { statuses.append($0) }
+                pair.routeRemote = { message in
+                    if message.kind == .clipboardChunk, held == nil { held = message; return false }
+                    return true
+                }
+                pair.remote.copy(.files([file]))
+                pair.remoteSync.setAutomaticSendingAllowed(true)
+                try eventually("Incoming file did not request approval") { offer != nil }
+                pair.localSync.respondToFileOffer(id: offer!.id, accept: true)
+                try eventually("Accepted file did not begin receiving") { reception != nil && held != nil }
+                if copiedDuringReception {
+                    pair.local.copy(.text(Data("copied while receiving".utf8)))
+                    pump(for: 0.35)
+                }
+                pair.localSync.setControllingRemote(true)
+                pump(for: 0.35)
+                let holds = pair.localSync.holdsPaste
+                var paste: Bool?
+                pair.localSync.prepareForPaste { paste = $0 }
+                if copiedDuringReception {
+                    try require(holds && paste == false && statuses.last?.hasPrefix("文件仍在接收") == true
+                                && !pair.localMessages.contains(.clipboardBegin),
+                                "A deferred local copy did not hold the remote paste while receiving")
+                } else {
+                    try require(!holds && paste == true && !statuses.contains { $0.hasPrefix("文件仍在接收") },
+                                "Receiving a file held or rejected a paste of the controlled Mac's own clipboard")
+                }
+                pair.localSync.receive(held!)
+                try eventually("Accepted file did not finish while controlling") { reception == nil }
+                if copiedDuringReception {
+                    try eventually("The deferred local copy did not synchronize after receiving finished") {
+                        pair.remote.copiedText == "copied while receiving" && !pair.localSync.holdsPaste
+                    }
+                    try require(pair.local.writes == 0, "The finished file replaced the newer local copy")
+                } else {
+                    pump(for: 0.35)
+                    try require(pair.local.writes == 1 && !pair.localMessages.contains(.clipboardBegin) && !pair.localSync.holdsPaste,
+                                "The finished file was not published locally or was echoed back while controlling")
+                }
+            }
+        }
+
         run("A new local copy replaces pending file approval; stale acceptance cannot download") { folder in
             let pair = ClipboardPair(storage: folder, remoteAllowed: true)
             defer { pair.stop() }

@@ -148,6 +148,7 @@ struct DeskView: View {
     @State private var showTrafficStatistics = false
     @State private var showSessionEffects = false
     @State private var dismissedClipboardStatus = ""
+    @State private var dismissedReceptionID: UUID?
     @State private var clipboardNoticeRevision: UInt64 = 0
 
     // Sharing keeps running in the background; only a viewer session pins the window to its role.
@@ -157,11 +158,20 @@ struct DeskView: View {
     private var immersive: Bool { model.isFullScreen && model.mode == .viewer }
     private var remoteTitle: String { model.remoteName.isEmpty ? model.address : model.remoteName }
     private var showClipboardActivity: Bool {
-        model.receivedFilesKeptInFolder
-            || (!model.clipboardStatus.isEmpty && model.clipboardStatus != dismissedClipboardStatus
-            && !model.clipboardStatus.hasPrefix("双向剪贴板已开启")
-            && !model.clipboardStatus.hasPrefix("自动剪贴板已关闭")
-            && !model.clipboardStatus.hasPrefix("对端版本较旧"))
+        Self.showsClipboardActivity(status: model.clipboardStatus, dismissedStatus: dismissedClipboardStatus,
+                                    receivingFileID: model.receivingFileID, dismissedReceptionID: dismissedReceptionID,
+                                    keptInFolder: model.receivedFilesKeptInFolder)
+    }
+
+    /// 接收进度约每 0.5 秒更新状态；按 × 收起的是这次接收，结束后的结果仍会显示。
+    static func showsClipboardActivity(status: String, dismissedStatus: String, receivingFileID: UUID?,
+                                       dismissedReceptionID: UUID?, keptInFolder: Bool) -> Bool {
+        if keptInFolder { return true }
+        if let receivingFileID, receivingFileID == dismissedReceptionID { return false }
+        return !status.isEmpty && status != dismissedStatus
+            && !status.hasPrefix("双向剪贴板已开启")
+            && !status.hasPrefix("自动剪贴板已关闭")
+            && !status.hasPrefix("对端版本较旧")
     }
 
     var body: some View {
@@ -456,6 +466,7 @@ struct DeskView: View {
             }.frame(maxWidth: .infinity, alignment: .leading)
             Button {
                 dismissedClipboardStatus = model.clipboardStatus
+                dismissedReceptionID = model.receivingFileID
                 model.dismissReceivedFilesNotice()
             } label: { Image(systemName: "xmark") }
                 .buttonStyle(.plain).foregroundStyle(.secondary).help("收起状态提示")

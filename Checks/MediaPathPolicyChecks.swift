@@ -227,20 +227,22 @@ func runMediaPathPolicyChecks() {
         }
         try check(policy.phase == .udp, "Healthy UDP media did not pass its trial after degradation cleared")
     }
-    run("Encoder and decoder pressure reduce compute load without blaming the UDP path") {
+    run("Encoder and decoder pressure never touch the UDP path; quality adaptation lowers the load from the same sample") {
         for cause in [MediaBottleneck.encoder, .decoder] {
             var policy = try udp()
-            var reductions = 0
+            let pressure = sample(queue: 200, encode: cause == .encoder ? 30 : 2, decode: cause == .decoder ? 30 : 2)
             for step in 1...12 {
                 let now = Double(step) + 0.2
                 policy.receivedPong(epoch: policy.epoch, now: now)
-                let pressure = sample(queue: 200, encode: cause == .encoder ? 30 : 2, decode: cause == .decoder ? 30 : 2)
-                let actions = policy.observe(pressure, epoch: policy.epoch, now: now)
-                reductions += actions.filter { $0 == .reduceLoad(cause) }.count
+                try check(policy.observe(pressure, epoch: policy.epoch, now: now).isEmpty, "The path policy acted on compute pressure")
                 try check(policy.targetPath == .udp && policy.tick(now: now).isEmpty,
                           "Compute pressure was treated as a network path failure")
             }
-            try check(reductions == 4, "Compute pressure did not use three-second windows")
+            var quality = try MediaQualityPolicy(hostDefault: .highest, now: 0)
+            var reduced: StreamSettings?
+            for step in 1...3 { reduced = quality.observe(pressure, now: Double(step)) }
+            try check(reduced != nil && quality.lastAdjustment == .compute(cause, milliseconds: 30),
+                      "Quality adaptation did not lower the load with the measured codec time")
         }
     }
 
@@ -375,7 +377,7 @@ func runMediaPathPolicyChecks() {
         try check(quality.effective == next, "Invalid actual settings replaced the confirmed state")
     }
 
-    run("Compute adaptation reduces actual pixel load while network adaptation reduces bitrate first") {
+    run("Without a measured codec time, compute adaptation reduces actual pixel load; network adaptation reduces bitrate first") {
         var compute = try MediaQualityPolicy(hostDefault: .highest, sourceLongestEdge: 1920, now: 0)
         let reduced = compute.reduceLoad(for: .encoder, now: 3)
         try check(reduced?.longestEdge == 1280 && reduced?.framesPerSecond == 60 && reduced?.megabits == 100,
@@ -432,9 +434,119 @@ func runMediaPathPolicyChecks() {
             try check(quality.observe(sample(encode: burst.mean, decode: burst.mean), now: Double(time)) == nil,
                       "Bursty but sustainable codec timing reduced quality")
         }
+        // 18 ms is inside the 10% margin over a 60 fps frame; 21 ms is over it, and too slow for 50 fps at the floor.
+        for time in 7...12 {
+            try check(quality.observe(sample(encode: sustained.mean), now: Double(time)) == nil,
+                      "An encoder just over the frame interval reduced quality")
+        }
+        var slower = MediaComputeTiming()
+        for _ in 0..<60 { slower.add(21) }
         var reduction: StreamSettings?
-        for time in 7...9 { reduction = quality.observe(sample(encode: sustained.mean), now: Double(time)) }
-        try check(reduction?.longestEdge == 3840, "Sustained encode cost above the frame budget did not reduce pixels")
+        for time in 13...15 { reduction = quality.observe(sample(encode: slower.mean), now: Double(time)) }
+        try check(reduction?.longestEdge == 3840, "Sustained encode cost too slow for the floor rate did not reduce pixels")
+    }
+
+    func codec(fps: Int, encode: Double?, decode: Double? = 2) -> MediaPathSample {
+        MediaPathSample(duration: 1, mediaActive: true, networkSamples: 60, decodedFrames: fps, lossFraction: 0,
+                        jitterMilliseconds: 0, queueMilliseconds: 0, encodeMilliseconds: encode, decodeMilliseconds: decode,
+                        frameBudgetMilliseconds: 1_000 / Double(fps), receivedMegabits: 1_000)
+    }
+
+    run("At 120 fps an encoder needing 10 ms per frame keeps the full size and settles at 90 fps without oscillating") {
+        // The reported case: a 3456 × 2234 host at original size, 120 fps and 100 Mbps over a clean relay.
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 120, megabits: 100)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (3456, 2234), now: 0)
+        var time = 0.0, changes: [StreamSettings] = []
+        while time < 600 {
+            time += 1
+            if let next = quality.observe(codec(fps: quality.effective.framesPerSecond, encode: 10), now: time) {
+                changes.append(next)
+                try check(quality.confirmApplied(next, now: time), "Reduction was not applied")
+            }
+        }
+        try check(changes == [StreamSettings(longestEdge: 8192, framesPerSecond: 90, megabits: 100)],
+                  "A 10 ms encoder did not settle at the full size and 90 fps: \(changes)")
+        try check(quality.lastAdjustment == .compute(.encoder, milliseconds: 10), "The cause of the reduction was not kept")
+        // Both over the limit: the slower decoder is named with its own time.
+        var both = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (3456, 2234), now: 0)
+        for time in 1...3 { _ = both.observe(codec(fps: 120, encode: 10, decode: 12), now: Double(time)) }
+        try check(both.lastAdjustment == .compute(.decoder, milliseconds: 12) && both.pending?.framesPerSecond == 75,
+                  "The slower codec was not the one named or used")
+        try check(MediaPathSample(duration: 1, mediaActive: true, networkSamples: 0, decodedFrames: 0,
+                                  encodeMilliseconds: 6, decodeMilliseconds: 9).computeMilliseconds == 9
+                  && codec(fps: 60, encode: nil, decode: 4).computeMilliseconds == 4
+                  && codec(fps: 60, encode: nil, decode: nil).computeMilliseconds == nil, "The slower codec time was not used")
+    }
+
+    run("An encoder just over the frame interval delivers a few frames fewer and keeps the quality") {
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 120, megabits: 100)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (3456, 2234), now: 0)
+        for time in 1...30 {
+            try check(quality.observe(codec(fps: 120, encode: 9.1), now: Double(time)) == nil, "9.1 ms at 120 fps reduced quality")
+        }
+        var reduced: StreamSettings?
+        for time in 31...33 { reduced = quality.observe(codec(fps: 120, encode: 9.2), now: Double(time)) }
+        try check(reduced?.framesPerSecond == 90 && reduced?.longestEdge == 8192, "10% over the frame interval did not lower the rate")
+    }
+
+    run("Near the 60 fps floor the size stays; clearly short of it, one size step drops and is not retried before the longest hold") {
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 120, megabits: 100)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (3456, 2234), now: 0)
+        var time = 0.0
+        var first: StreamSettings?
+        while first == nil, time < 10 { time += 1; first = quality.observe(codec(fps: 120, encode: 19), now: time) }
+        // 19 ms sustains about 53 fps: straight to the 60 fps floor, keeping the size.
+        try check(first == StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 100), "Rate did not drop straight to the floor")
+        _ = quality.confirmApplied(first!, now: time)
+        for _ in 0..<30 {
+            time += 1
+            try check(quality.observe(codec(fps: 60, encode: 19), now: time) == nil, "About 53 of 60 fps reduced the size")
+        }
+        var reduced: StreamSettings?
+        while reduced == nil, time < 60 { time += 1; reduced = quality.observe(codec(fps: 60, encode: 25), now: time) }
+        try check(reduced == StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 100),
+                  "40 fps at the floor did not drop one size step: \(String(describing: reduced))")
+        _ = quality.confirmApplied(reduced!, now: time)
+        try check(quality.lastAdjustment == .compute(.encoder, milliseconds: 25), "The size reduction lost its cause")
+        let reducedAt = time
+        // 2560 encodes in 13 ms: sustainable at 60 fps, without the headroom 75 fps needs.
+        while time < reducedAt + MediaQualityPolicy.maximumUpgradeHold - 1 {
+            time += 1
+            try check(quality.observe(codec(fps: 60, encode: 13), now: time) == nil,
+                      "A size measured too slow was retried, or the rate rose without headroom")
+        }
+        var retried: StreamSettings?
+        while retried == nil, time < reducedAt + 400 { time += 1; retried = quality.observe(codec(fps: 60, encode: 13), now: time) }
+        try check(retried?.longestEdge == 3840 && time == reducedAt + MediaQualityPolicy.maximumUpgradeHold,
+                  "The slow size did not return once the longest hold passed")
+        try check(quality.lastAdjustment == .raise, "The upgrade was not reported as one")
+    }
+
+    run("A chosen frame rate below 60 is its own floor, and raising the rate needs room in the measured codec time") {
+        let low = StreamSettings(longestEdge: 8192, framesPerSecond: 30, megabits: 100)
+        var thirty = try MediaQualityPolicy(hostDefault: low, preferred: low, appliedSize: (3456, 2234), now: 0)
+        for time in 1...10 {
+            try check(thirty.observe(codec(fps: 30, encode: 35), now: Double(time)) == nil, "About 29 of 30 fps reduced quality")
+        }
+        var reduced: StreamSettings?
+        for time in 11...13 { reduced = thirty.observe(codec(fps: 30, encode: 40), now: Double(time)) }
+        try check(reduced == StreamSettings(longestEdge: 2560, framesPerSecond: 30, megabits: 100),
+                  "25 of a chosen 30 fps did not drop one size step")
+
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 120, megabits: 100)
+        let applied = StreamSettings(longestEdge: 8192, framesPerSecond: 90, megabits: 100)
+        var crowded = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, applied: applied, appliedSize: (3456, 2234), now: 0)
+        for time in 1...120 {
+            try check(crowded.observe(codec(fps: 90, encode: 8), now: Double(time)) == nil, "120 fps was tried without codec headroom")
+        }
+        var roomy = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, applied: applied, appliedSize: (3456, 2234), now: 0)
+        var raised: StreamSettings?, time = 0
+        while raised == nil, time < 60 { time += 1; raised = roomy.observe(codec(fps: 90, encode: 6), now: Double(time)) }
+        try check(raised?.framesPerSecond == 120 && time == Int(MediaQualityPolicy.initialUpgradeHold),
+                  "A codec with headroom did not return to 120 fps after the usual hold")
+        var network = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (3456, 2234), now: 0)
+        _ = network.reduceLoad(for: .network, now: 3)
+        try check(network.lastAdjustment == .network, "A network reduction was not reported as one")
     }
 
     run("Quality upgrades that fail soon after applying back off exponentially until one proves stable") {
@@ -454,19 +566,21 @@ func runMediaPathPolicyChecks() {
             }
             throw CheckFailure("No upgrade within 400 seconds")
         }
+        // Overload without a measured codec time (failed decodes): a measured one also keeps the size it
+        // left from returning before the longest hold, which the next check covers.
         func overload() throws {
             let before = quality.effective
             for _ in 0..<10 {
                 time += 1
-                if let next = quality.observe(sample(encode: 20), now: time) {
+                if let next = quality.reduceLoad(for: .decoder, now: time) {
                     try check(next.longestEdge < before.longestEdge && quality.confirmApplied(next, now: time),
-                              "Encoder pressure did not reduce pixels")
+                              "Decoder failures did not reduce pixels")
                     return
                 }
             }
-            throw CheckFailure("Encoder pressure did not reduce quality")
+            throw CheckFailure("Decoder failures did not reduce quality")
         }
-        // The logged pattern: each 2560 upgrade overloads within seconds and returns to 1920.
+        // Each 2560 upgrade overloads within seconds and returns to 1920.
         var holds: [Double] = []
         for _ in 0..<7 { holds.append(try upgrade()); try overload() }
         try check(holds == [10, 20, 40, 80, 160, 300, 300], "Failed upgrades did not back off exponentially: \(holds)")

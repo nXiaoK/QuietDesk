@@ -28,6 +28,7 @@ final class DiagnosticLog: @unchecked Sendable {
         case pendingBytes, retryAttempt, maximumDimension
         case tcpAckStretchingDisabled
         case relayControl, relayVideo, videoPath, switchCause, peerPath, candidateKind, lossPermille
+        case qualityCause, computeMicroseconds
     }
     enum Counter: String {
         case scrollObserved, scrollSent, scrollReceived, scrollSuppressed

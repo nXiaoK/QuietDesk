@@ -933,6 +933,32 @@ private struct RemoteCanvasChecks {
             try require(canvas.backdropLuminance(in: corner, container: screen) == nil, "Brightness outlived the session")
         }
 
+        run("Decode time leaves out the wait behind earlier frames of a burst") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 64, height: 48), videoLayer: CanvasDisplayLayerProbe())
+            let decoder = CanvasDecoderProbe()
+            let receiver = canvas.makeMediaReceiver(makeDecoder: { _ in decoder })
+            defer { receiver.stop(); canvas.reset() }
+            let times = CanvasLocked<[Double]>([])
+            receiver.reportDecodeTime { value in times.update { $0.append(value) } }
+            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
+            // Three frames arrive together; the decoder spends 40 ms on the first and finishes the rest at once.
+            for id in 1...3 { receiver.receive(try mediaFrame(stream: stream, id: UInt64(id), keyFrame: id == 1)) { _ in } }
+            Thread.sleep(forTimeInterval: 0.04)
+            for id in 1...3 { decoder.finish(UInt32(id), .success(try decoderLikePixel(width: 64, height: 48, luma: 128))) }
+            let measured = times.read()
+            try require(measured.count == 3 && measured[0] >= 35 && measured[1] < 10 && measured[2] < 10,
+                        "Waiting behind a burst counted as decode time: \(measured)")
+            // An idle decoder measures from submission again.
+            receiver.receive(try mediaFrame(stream: stream, id: 4, keyFrame: false)) { _ in }
+            Thread.sleep(forTimeInterval: 0.02)
+            decoder.finish(4, .failure(CanvasCheckFailure("Synthetic decode failure")))
+            receiver.receive(try mediaFrame(stream: stream, id: 5, keyFrame: false)) { _ in }
+            Thread.sleep(forTimeInterval: 0.02)
+            decoder.finish(5, .success(try decoderLikePixel(width: 64, height: 48, luma: 128)))
+            let later = times.read()
+            try require(later.count == 4 && later[3] >= 15 && later[3] < 200, "A failed decode was timed or an idle frame lost its time: \(later)")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

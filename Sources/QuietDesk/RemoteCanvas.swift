@@ -93,6 +93,8 @@ final class MediaCanvasReceiver: @unchecked Sendable {
         let decoder: MediaCanvasDecoding
         let mailbox: LatestFrameMailbox
         var pending: [UUID: (Bool) -> Void] = [:]
+        var submittedAt: [UUID: TimeInterval] = [:]
+        var lastCompletedAt: TimeInterval?
         var lastSubmitted: UInt64?
         var lastDecoded: UInt64?
         var hasDecodedIDR = false
@@ -113,6 +115,7 @@ final class MediaCanvasReceiver: @unchecked Sendable {
     private var candidate: Stream?
     private var newestStream: MediaStreamID?
     private var stopped = false
+    private var decodeTime: ((Double) -> Void)?
 
     init(diagnostics: PerformanceDiagnostics? = nil,
          makeDecoder: @escaping (PerformanceDiagnostics?) -> MediaCanvasDecoding = { VideoDecoder(diagnostics: $0) },
@@ -145,6 +148,7 @@ final class MediaCanvasReceiver: @unchecked Sendable {
             let token = UUID()
             stream.lastSubmitted = frame.header.frameID
             stream.pending[token] = completion
+            stream.submittedAt[token] = SessionClock.now
             return (stream, token)
         }
         if let retired { retire(retired) }
@@ -182,13 +186,25 @@ final class MediaCanvasReceiver: @unchecked Sendable {
         for stream in retired { retire(stream) }
     }
 
+    /// Milliseconds the decoder spent on each decoded frame: from when it could start the frame (its submission,
+    /// or the previous frame's completion while still busy) to its completion. Waiting behind earlier frames of a
+    /// burst is not decode time, so this measures what the decoder sustains.
+    func reportDecodeTime(_ handler: ((Double) -> Void)?) { lock.withLock { decodeTime = handler } }
+
     private func decoded(_ result: Result<CVPixelBuffer, Error>, frame: MediaFrame, stream: Stream, token: UUID) {
         var success = false
         var shouldDisplay = false
+        var serviceTime: (Double, (Double) -> Void)?
         let completion: ((Bool) -> Void)? = lock.withLock {
             guard let completion = stream.pending.removeValue(forKey: token) else { return nil }
+            let submittedAt = stream.submittedAt.removeValue(forKey: token)
             guard !stopped, active === stream || candidate === stream else { return completion }
             if case .success(let image) = result {
+                let now = SessionClock.now
+                if let submittedAt, let decodeTime {
+                    serviceTime = (max(0, now - max(submittedAt, stream.lastCompletedAt ?? submittedAt)) * 1_000, decodeTime)
+                }
+                stream.lastCompletedAt = now
                 success = true
                 if frame.header.isIDR { stream.hasDecodedIDR = true }
                 if stream.lastDecoded.map({ frame.header.frameID > $0 }) ?? true {
@@ -201,6 +217,7 @@ final class MediaCanvasReceiver: @unchecked Sendable {
             }
             return completion
         }
+        if let (milliseconds, report) = serviceTime { report(milliseconds) }
         // ACK/failure delivery does not wait for the main queue, visibility or layer readiness.
         completion?(success)
         if shouldDisplay { scheduleDisplay(stream) }
@@ -232,6 +249,7 @@ final class MediaCanvasReceiver: @unchecked Sendable {
         let completions = lock.withLock {
             let pending = Array(stream.pending.values)
             stream.pending.removeAll()
+            stream.submittedAt.removeAll()
             return pending
         }
         stream.mailbox.stopDiagnostics()

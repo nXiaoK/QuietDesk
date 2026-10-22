@@ -102,7 +102,25 @@ final class DeskModel: ObservableObject {
     }
     var videoQualityHelp: String {
         guard mode == .viewer, supportsMediaTransport else { return "当前编码帧率上限与目标码率" }
-        return "当前生效的帧率上限与目标码率，按网络丢包和延迟自动调整，不超过所选：\(viewerSettings.summary)"
+        let help = "当前生效的帧率上限与目标码率，按网络丢包、延迟和编解码速度自动调整，不超过所选：\(viewerSettings.summary)"
+        return automaticQualityNote.isEmpty ? help : help + "\n" + automaticQualityNote
+    }
+    /// Why the applied quality is below the choice, after an automatic reduction; empty otherwise.
+    private(set) var automaticQualityNote = ""
+
+    static func qualityNote(_ adjustment: MediaQualityPolicy.Adjustment?, applied: StreamSettings) -> String {
+        switch adjustment {
+        case .network?:
+            return "网络丢包或延迟升高，已自动调整为 \(applied.summary)"
+        case .compute(let cause, let milliseconds?)? where milliseconds.isFinite && milliseconds > 0:
+            let side = cause == .encoder ? "被控端编码" : "本机解码"
+            return String(format: "%@每帧约 %.1f ms，最多约 %d fps，已自动调整为 %@",
+                          side, milliseconds, Int(1_000 / milliseconds), applied.summary)
+        case .compute?:
+            return "视频解码未完成，已自动调整为 \(applied.summary)"
+        case .raise?, nil:
+            return ""
+        }
     }
     var mediaRouteSummary: String { mediaLoss.isEmpty ? mediaTransportStatus : mediaTransportStatus + " · " + mediaLoss }
     /// UDP loss at the level adaptive quality treats as congestion; the full-screen status shows it in red.
@@ -497,10 +515,22 @@ final class DeskModel: ObservableObject {
         DiagnosticLog.shared.record(event, role: diagnosticRole, state: .failed, values: values, error: error)
     }
 
-    private func recordVideoConfiguration(_ state: VideoStreamState, succeeded: Bool = true) {
-        DiagnosticLog.shared.record(.streamConfigured, role: diagnosticRole, state: succeeded ? .ready : .failed,
-            values: [.width: state.width, .height: state.height, .fps: state.settings.framesPerSecond,
-                     .targetBitrate: state.settings.megabits * 1_000_000, .maximumDimension: state.settings.longestEdge])
+    /// An automatic change also records why it was made: 1 network, 2 raised, 3 host encoder, 4 local decoder,
+    /// with the measured time per frame of the slower codec when compute pressure caused it.
+    private func recordVideoConfiguration(_ state: VideoStreamState, succeeded: Bool = true,
+                                          adjustment: MediaQualityPolicy.Adjustment? = nil) {
+        var values: [DiagnosticLog.Field: Int] = [.width: state.width, .height: state.height, .fps: state.settings.framesPerSecond,
+                                                   .targetBitrate: state.settings.megabits * 1_000_000,
+                                                   .maximumDimension: state.settings.longestEdge]
+        switch adjustment {
+        case .network?: values[.qualityCause] = 1
+        case .raise?: values[.qualityCause] = 2
+        case .compute(let cause, let milliseconds)?:
+            values[.qualityCause] = cause == .encoder ? 3 : 4
+            if let milliseconds, milliseconds.isFinite { values[.computeMicroseconds] = Int(min(60_000, milliseconds) * 1_000) }
+        case nil: break
+        }
+        DiagnosticLog.shared.record(.streamConfigured, role: diagnosticRole, state: succeeded ? .ready : .failed, values: values)
     }
 
     private func recordClipboardDiagnostic(_ event: ClipboardSync.DiagnosticEvent) {
@@ -1358,15 +1388,12 @@ final class DeskModel: ObservableObject {
                                                    appliedSize: activeVideoState.map { ($0.width, $0.height) }, now: SessionClock.now)
         channel.configureMedia { [weak media] in media?.receive($0) ?? false }
         channel.configureReliableData { [weak media] in media?.sendReliableData($0) }
-        media.onVideo = { [weak renderer, weak media] frame, completion in
+        renderer.reportDecodeTime { [weak media] milliseconds in media?.recordComputeTiming(decodeMilliseconds: milliseconds) }
+        media.onVideo = { [weak renderer] frame, completion in
             guard let renderer else { completion(false); return }
             channel.mediaFrameReceived(frame.header)
-            let submittedAt = SessionClock.now
             renderer.receive(frame) { succeeded in
-                if succeeded {
-                    channel.recordFrame()
-                    media?.recordComputeTiming(decodeMilliseconds: max(0, SessionClock.now - submittedAt) * 1000)
-                }
+                if succeeded { channel.recordFrame() }
                 completion(succeeded)
             }
         }
@@ -1559,6 +1586,7 @@ final class DeskModel: ObservableObject {
         do { try tuning.choose(settings) }
         catch { viewerSession.mediaQuality?.rejectPending(now: SessionClock.now); return }
         viewerSession.automaticVideoSettings = settings
+        viewerSession.automaticVideoAdjustment = viewerSession.mediaQuality?.lastAdjustment
         videoTuning = tuning
         sendNextVideoSettings()
     }
@@ -2147,6 +2175,7 @@ final class DeskModel: ObservableObject {
                         try tuning.choose(start)
                         videoTuning = tuning
                         viewerSession.automaticVideoSettings = start
+                        viewerSession.automaticVideoAdjustment = nil
                     }
                 }
                 applyInitialVideoQualityIfReady()
@@ -2247,10 +2276,13 @@ final class DeskModel: ObservableObject {
             } else { viewerSession.mediaQuality?.rejectPending(now: SessionClock.now) }
             try viewerSession.mediaQuality?.synchronizeApplied(result.state.settings, size: (result.state.width, result.state.height),
                                                                now: SessionClock.now)
+            let adjustment = viewerSession.automaticVideoSettings == result.state.settings ? viewerSession.automaticVideoAdjustment : nil
             if viewerSession.automaticVideoSettings == result.state.settings || result.error != nil {
                 viewerSession.automaticVideoSettings = nil
+                viewerSession.automaticVideoAdjustment = nil
             }
-            recordVideoConfiguration(result.state, succeeded: result.error == nil)
+            if result.error == nil { automaticQualityNote = Self.qualityNote(adjustment, applied: result.state.settings) }
+            recordVideoConfiguration(result.state, succeeded: result.error == nil, adjustment: adjustment)
             canvas.remoteSize = CGSize(width: result.state.width, height: result.state.height)
             resolution = "\(result.state.width) × \(result.state.height)"
             if let error = result.error { videoSettingsStatus = "调整失败：\(error)" }
@@ -2283,6 +2315,7 @@ final class DeskModel: ObservableObject {
         catch { videoSettingsStatus = error.localizedDescription; return }
         viewerQualityPolicy.chooseManually()
         viewerSession.automaticVideoSettings = nil
+        viewerSession.automaticVideoAdjustment = nil
         _ = try? viewerSession.mediaQuality?.chooseManually(settings, now: SessionClock.now)
         if tuning.pending?.settings == settings { viewerSession.pendingVideoPreferenceCanSave = true }
         videoTuning = tuning
@@ -3335,6 +3368,7 @@ final class DeskModel: ObservableObject {
         mediaTransportStatus = "TCP 兼容模式"
         mediaRouteValue = ""; peerPathState = .relay; relayPeerStatus = ""
         mediaLoss = ""; mediaLossFraction = nil
+        automaticQualityNote = ""
         supportsMediaTransport = false
         supportsIndependentCursor = false
         cursorStatus = "视频光标"

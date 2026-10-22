@@ -48,6 +48,7 @@ final class ViewerSession {
     var mediaCommitted = false
     var mediaQuality: MediaQualityPolicy?
     var automaticVideoSettings: StreamSettings?
+    var automaticVideoAdjustment: MediaQualityPolicy.Adjustment?
     var helloReceived = false
     var stableTask: Task<Void, Never>?
     var clipboardPullTimeout: Task<Void, Never>?

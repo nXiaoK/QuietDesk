@@ -372,6 +372,9 @@ struct SharingView: View {
                         .fixedSize(horizontal: false, vertical: true)
                     Button { model.openReceivedFiles() } label: { Label("打开接收文件目录", systemImage: "folder") }
                         .controlSize(.small)
+                    if let id = model.receivingFileID {
+                        Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }.controlSize(.small)
+                    }
                     if !model.clipboardStatus.isEmpty {
                         Divider()
                         Text(model.clipboardStatus).font(.callout).foregroundStyle(.secondary)

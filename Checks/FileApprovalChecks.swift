@@ -2,6 +2,138 @@ import Foundation
 import QuietDeskCore
 
 func runFileApprovalChecks() {
+    run("Cancelling an accepted file reception removes partial data and ignores duplicate cancellation and late chunks") {
+        try withCheckFolder { folder in
+            let file = folder.appendingPathComponent("cancel.bin")
+            try Data(repeating: 83, count: 120_000).write(to: file)
+            let sender = ClipboardTransfer(storage: folder.appendingPathComponent("sender"))
+            let storage = folder.appendingPathComponent("receiver")
+            let receiver = ClipboardTransfer(storage: storage, requireFileApproval: true)
+            let heldReady = DispatchSemaphore(value: 0), done = DispatchSemaphore(value: 0), cleared = DispatchSemaphore(value: 0)
+            let held = Box<Message?>(nil), chunks = Box(0), reception = Box<UUID?>(nil)
+            let outcomes = Box<[Bool]>([]), published = Box(false), cancellations = Box(0)
+            sender.onSend = { message in
+                if message.kind == .clipboardChunk {
+                    chunks.update { $0 += 1 }
+                    if chunks.read() == 2 { held.set(message); heldReady.signal(); return }
+                }
+                receiver.receive(message)
+            }
+            receiver.onSend = { message in
+                if message.kind == .clipboardCancel { cancellations.update { $0 += 1 } }
+                sender.receive(message)
+            }
+            receiver.onFileOffer = { [weak receiver] in
+                if let offer = $0 { receiver?.respondToFileOffer(id: offer.id, accept: true) }
+            }
+            receiver.onFileReceptionChanged = { id in
+                if let id { reception.set(id) } else { cleared.signal() }
+            }
+            receiver.onReceive = { _ in published.set(true) }
+            defer { stopTransfers(sender, receiver) }
+            sender.send(.files([file])) { value in outcomes.update { $0.append(value) }; done.signal() }
+            try wait(heldReady, "File did not reach its second chunk")
+            guard let id = reception.read(), let late = held.read() else { throw CheckFailure("No active reception or held chunk") }
+            receiver.cancelFileReception(id: id)
+            receiver.cancelFileReception(id: id)
+            try wait(done, "Manual cancellation did not stop the sender")
+            try wait(cleared, "Manual cancellation left the reception active")
+            receiver.receive(late)
+            stopTransfers(sender, receiver)
+            let partial = storage.appendingPathComponent("partial")
+            try check((try FileManager.default.contentsOfDirectory(atPath: partial.path)).isEmpty
+                      && !FileManager.default.fileExists(atPath: storage.appendingPathComponent("received").path),
+                      "Cancelled file contents remained in partial or completed storage")
+            try check(outcomes.read() == [false] && cancellations.read() == 1 && !published.read(),
+                      "Cancellation completed twice, sent duplicate cancellation or published a partial file")
+        }
+    }
+
+    run("A stale reception cancellation cannot interrupt the next accepted file") {
+        try withCheckFolder { folder in
+            let files = [folder.appendingPathComponent("first.bin"), folder.appendingPathComponent("next.bin")]
+            let bytes = Data(repeating: 67, count: 100_000)
+            for file in files { try bytes.write(to: file) }
+            let sender = ClipboardTransfer(storage: folder.appendingPathComponent("sender"))
+            let receiver = ClipboardTransfer(storage: folder.appendingPathComponent("receiver"), requireFileApproval: true)
+            let heldReady = DispatchSemaphore(value: 0), done = DispatchSemaphore(value: 0), cleared = DispatchSemaphore(value: 0)
+            let held = Box<Message?>(nil), ids = Box<[UUID]>([]), outcomes = Box<[Bool]>([])
+            let correct = Box(false), cancellations = Box(0), shouldHold = Box(true)
+            sender.onSend = { message in
+                if message.kind == .clipboardChunk, shouldHold.read() {
+                    shouldHold.set(false); held.set(message); heldReady.signal(); return
+                }
+                receiver.receive(message)
+            }
+            receiver.onSend = { message in
+                if message.kind == .clipboardCancel { cancellations.update { $0 += 1 } }
+                sender.receive(message)
+            }
+            receiver.onFileOffer = { [weak receiver] in
+                if let offer = $0 { receiver?.respondToFileOffer(id: offer.id, accept: true) }
+            }
+            receiver.onFileReceptionChanged = { id in
+                if let id { ids.update { $0.append(id) } } else { cleared.signal() }
+            }
+            receiver.onReceive = { payload in
+                if case .files(let urls) = payload, let file = urls.first {
+                    correct.set(file.lastPathComponent == "next.bin" && (try? Data(contentsOf: file)) == bytes)
+                }
+            }
+            defer { stopTransfers(sender, receiver) }
+            sender.send(.files([files[0]])) { value in outcomes.update { $0.append(value) }; done.signal() }
+            try wait(heldReady, "First file did not start")
+            guard let oldID = ids.read().first else { throw CheckFailure("First reception ID missing") }
+            receiver.cancelFileReception(id: oldID)
+            try wait(done, "First file was not cancelled"); try wait(cleared, "First reception state did not clear")
+            shouldHold.set(true)
+            sender.send(.files([files[1]])) { value in outcomes.update { $0.append(value) }; done.signal() }
+            try wait(heldReady, "Next file did not start")
+            guard let next = held.read() else { throw CheckFailure("Next file chunk missing") }
+            receiver.cancelFileReception(id: oldID)
+            receiver.cancelFileReception(id: UUID())
+            receiver.receive(next)
+            try wait(done, "Stale cancellation interrupted the next file")
+            try wait(cleared, "Completed reception state did not clear")
+            stopTransfers(sender, receiver)
+            try check(ids.read().count == 2 && ids.read()[0] != ids.read()[1]
+                      && outcomes.read() == [false, true] && cancellations.read() == 1 && correct.read(),
+                      "Reception identity was reused, stale cancellation matched, or the next file changed")
+        }
+    }
+
+    for ending in ["failure", "stop"] {
+        run("File reception state clears after \(ending)") {
+            try withCheckFolder { folder in
+                let receiver = ClipboardTransfer(storage: folder, requireFileApproval: true)
+                let started = DispatchSemaphore(value: 0), cleared = DispatchSemaphore(value: 0), stopped = DispatchSemaphore(value: 0)
+                let revision: [String: Any] = ["counter": 1, "origin": UUID().uuidString]
+                let states = Box<[UUID?]>([])
+                receiver.onFileOffer = { [weak receiver] in
+                    if let offer = $0 { receiver?.respondToFileOffer(id: offer.id, accept: true) }
+                }
+                receiver.onFileReceptionChanged = { id in
+                    states.update { $0.append(id) }
+                    if id != nil { started.signal() } else { cleared.signal() }
+                }
+                let begin: [String: Any] = ["revision": revision, "sequence": 0, "type": "files", "count": 1, "bytes": 2]
+                receiver.receive(Message(.clipboardBegin, try JSONSerialization.data(withJSONObject: begin)))
+                try wait(started, "Approved reception did not publish its state")
+                if ending == "failure" {
+                    let invalid: [String: Any] = ["revision": revision, "sequence": 1, "path": "file", "directory": false,
+                                                 "bytes": 3, "mode": 384, "modified": 0]
+                    receiver.receive(Message(.clipboardEntry, try JSONSerialization.data(withJSONObject: invalid)))
+                    try wait(cleared, "Failed reception state stayed active")
+                }
+                receiver.stop { stopped.signal() }
+                try wait(stopped, "Receiver cleanup did not finish")
+                if ending == "stop" { try wait(cleared, "Stopped reception state stayed active") }
+                try check(states.read().count == 2 && states.read()[0] != nil && states.read()[1] == nil,
+                          "Reception lifecycle did not publish one start and one end")
+            }
+        }
+    }
+
     run("Received mode-zero files and directories remain readable, writable and removable by their owner") {
         try withCheckFolder { folder in
             let root = folder.appendingPathComponent("folder"), bytes = Data([0, 1, 2, 255])

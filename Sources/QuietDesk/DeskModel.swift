@@ -132,6 +132,7 @@ final class DeskModel: ObservableObject {
     @Published var remoteName = ""
     @Published var clipboardStatus = ""
     @Published private(set) var pendingFileOffer: ClipboardFileOffer?
+    @Published private(set) var receivingFileID: UUID?
     @Published var canControl = false
     @Published private(set) var localAccessibility = false
     @Published private(set) var localInputMonitoring = false
@@ -3024,6 +3025,10 @@ final class DeskModel: ObservableObject {
                 }
             clipboardHandledChange = nil
             clipboardSync = sync
+            sync.onFileReceptionChanged = { [weak self, weak sync] id in
+                guard let self, let sync, self.clipboardSync === sync else { return }
+                self.receivingFileID = id
+            }
             dataChannel?.configureClipboard(sync.receiveMessage)
             sync.onDiagnostic = { [weak self, weak sync] event in
                 guard let self, let sync, self.clipboardSync === sync else { return }
@@ -3070,6 +3075,11 @@ final class DeskModel: ObservableObject {
         do { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true) }
         catch { self.error = error.localizedDescription; return }
         NSWorkspace.shared.open(folder)
+    }
+
+    func cancelFileReception(id: UUID) {
+        guard receivingFileID == id else { return }
+        clipboardSync?.cancelFileReception(id: id)
     }
 
     func setAutoReconnect(_ enabled: Bool) {

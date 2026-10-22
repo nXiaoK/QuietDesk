@@ -110,6 +110,9 @@ struct ConnectionSettingsView: View {
                         Label("打开接收文件目录", systemImage: "folder")
                     }
                     .help(ClipboardSync.receivingDirectory)
+                    if let id = model.receivingFileID {
+                        Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }
+                    }
                 }
                 Divider()
                 HStack(spacing: 8) {
@@ -273,6 +276,10 @@ struct FullScreenSettingsView: View {
                                 }.frame(minHeight: 28)
                             }
                             .help(ClipboardSync.receivingDirectory)
+                            if let id = model.receivingFileID {
+                                Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }
+                                    .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                            }
                             Button {
                                 showingCaps = true
                                 model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)

@@ -97,6 +97,7 @@ final class ClipboardSync {
         .appendingPathComponent("\(AppDataLocation.folderName())/Clipboard", isDirectory: true)
     var onStatus: ((String) -> Void)?
     var onFileOffer: ((ClipboardFileOffer?) -> Void)?
+    var onFileReceptionChanged: ((UUID?) -> Void)?
     var onDiagnostic: ((DiagnosticEvent) -> Void)?
     var allowsFileSending: Bool
     private var allowsAutomaticSending: Bool
@@ -153,6 +154,12 @@ final class ClipboardSync {
             }
         }
         transfer.onStatus = { [weak self] status in DispatchQueue.main.async { self?.onStatus?(status) } }
+        transfer.onFileReceptionChanged = { [weak self] id in
+            DispatchQueue.main.async {
+                guard let self, self.running else { return }
+                self.onFileReceptionChanged?(id)
+            }
+        }
         transfer.onFileOffer = { [weak self] offer in
             DispatchQueue.main.async {
                 guard let self, self.running, let offer else { return }
@@ -198,6 +205,11 @@ final class ClipboardSync {
     }
 
     func receive(_ message: Message) { receiveMessage(message) }
+
+    func cancelFileReception(id: UUID) {
+        guard running else { return }
+        transfer.cancelFileReception(id: id)
+    }
 
     func setAutomaticSendingAllowed(_ allowed: Bool) {
         allowsAutomaticSending = allowed
@@ -295,6 +307,7 @@ final class ClipboardSync {
 
     func stop() {
         running = false
+        onFileReceptionChanged?(nil)
         pendingLocalChange = nil
         cancelImageApplication()
         imagePreparation = nil

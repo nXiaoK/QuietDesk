@@ -241,10 +241,15 @@ struct DeskView: View {
             dismissedClipboardStatus = ""
             clipboardNoticeRevision &+= 1
         }
+        .onChange(of: model.receivingFileID) { _, id in
+            if id != nil { dismissedClipboardStatus = "" }
+            clipboardNoticeRevision &+= 1
+        }
         .task(id: clipboardNoticeRevision) {
             let message = model.clipboardStatus
-            guard !message.isEmpty else { return }
+            guard !message.isEmpty, model.receivingFileID == nil else { return }
             do { try await Task.sleep(for: .seconds(1)) } catch { return }
+            guard model.receivingFileID == nil else { return }
             dismissedClipboardStatus = message
         }
         .onChange(of: model.controlling) { _, controlling in if controlling { showFullScreenMenu = false; showOptions = false } }
@@ -433,6 +438,9 @@ struct DeskView: View {
             VStack(alignment: .leading, spacing: 7) {
                 Text(model.pendingFileOffer == nil ? "剪贴板与文件" : "1 个文件请求待确认").font(.headline)
                 Text(model.clipboardStatus).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                if let id = model.receivingFileID {
+                    Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }.controlSize(.small)
+                }
                 if model.clipboardStatus.contains("接收完成") {
                     Button("打开接收文件目录") { model.openReceivedFiles() }.controlSize(.small)
                 }

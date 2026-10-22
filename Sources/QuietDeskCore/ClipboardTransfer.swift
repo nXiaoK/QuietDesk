@@ -128,6 +128,7 @@ public final class ClipboardTransfer {
     public var onStatus: ((String) -> Void)?
     public var onFileOffer: ((ClipboardFileOffer?) -> Void)?
     public var onFileOfferEnded: ((UUID, ClipboardFileOfferEndReason) -> Void)?
+    public var onFileReceptionChanged: ((UUID?) -> Void)?
     private let queue = DispatchQueue(label: "quietdesk.clipboard.files", qos: .utility)
     private let storage: URL
     private let requireFileApproval: Bool
@@ -139,6 +140,7 @@ public final class ClipboardTransfer {
     private var newest: ClipboardRevision?
     private var outgoing: Outgoing?
     private var incoming: Incoming?
+    private var receivingFileID: UUID?
     private var appliedFiles: [Part]?
     private var pendingFileOffer: (id: UUID, begin: ClipboardBegin, created: TimeInterval)?
     private var applying: (revision: ClipboardRevision, permit: ClipboardApplyPermit)?
@@ -221,6 +223,16 @@ public final class ClipboardTransfer {
                 sendJSON(.clipboardCancel, ClipboardReceipt(revision: pending.begin.revision, sequence: 0, reason: "对端选择不接收文件"))
                 onStatus?("已取消接收文件，未下载文件内容")
             }
+        }
+    }
+
+    public func cancelFileReception(id: UUID) {
+        queue.async { [self] in
+            guard !stopped, receivingFileID == id, let incoming, incoming.begin.type == "files" else { return }
+            sendJSON(.clipboardCancel, ClipboardReceipt(revision: incoming.begin.revision, sequence: incoming.sequence,
+                                                       reason: "接收端已中断文件接收"))
+            discardIncoming(reason: .cancelled)
+            onStatus?("已中断文件接收，未保留未完成的文件")
         }
     }
 
@@ -320,6 +332,7 @@ public final class ClipboardTransfer {
                     let receipt = try Wire.readJSON(ClipboardReceipt.self, message.payload)
                     if applying?.revision == receipt.revision {
                         applying?.permit.invalidate(); applying = nil
+                        finishFileReception()
                         onStatus?(receipt.reason ?? "剪贴板接收已取消")
                     }
                     if outgoing?.revision == receipt.revision {
@@ -534,6 +547,11 @@ public final class ClipboardTransfer {
         let folder = partialStorage.directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         incoming = Incoming(begin: value, directory: folder)
+        if value.type == "files" {
+            let id = UUID()
+            receivingFileID = id
+            onFileReceptionChanged?(id)
+        }
         ensureTimer()
         acknowledge(value.revision, 0)
         onStatus?("正在接收剪贴板：\(ByteCountFormatter.string(fromByteCount: Int64(clamping: value.bytes), countStyle: .file))")
@@ -647,6 +665,7 @@ public final class ClipboardTransfer {
                         self.sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: value.sequence, reason: "无法写入对端系统剪贴板"))
                         self.onStatus?("无法写入系统剪贴板")
                     }
+                    self.finishFileReception()
                 }
             }
             if let onApplyWithPermit, let permit { onApplyWithPermit(payload, permit, completion) }
@@ -656,6 +675,7 @@ public final class ClipboardTransfer {
             rememberAppliedFiles(payload)
             acknowledge(value.revision, value.sequence)
             onStatus?("剪贴板接收完成，可以粘贴")
+            finishFileReception()
         }
     }
 
@@ -678,10 +698,16 @@ public final class ClipboardTransfer {
         sendPreparation = nil
         applying?.permit.invalidate(); applying = nil
         finishFileOffer(reason)
+        finishFileReception()
         guard let incoming else { return }
         try? incoming.handle?.close(); incoming.handle = nil
         try? FileManager.default.removeItem(at: incoming.directory)
         self.incoming = nil
+    }
+    private func finishFileReception() {
+        guard receivingFileID != nil else { return }
+        receivingFileID = nil
+        onFileReceptionChanged?(nil)
     }
     private func ensureTimer() {
         guard timer == nil else { return }

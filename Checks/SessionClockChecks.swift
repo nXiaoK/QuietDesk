@@ -20,9 +20,9 @@ func runSessionClockChecks() {
         var probe = RoundTripProbe()
         guard let old = probe.begin(at: beforeSleep) else { throw CheckFailure("No pre-sleep probe") }
         let afterWake = beforeSleep + 3_600
-        try check(idle.tick(now: afterWake) && idle.isPaused, "Sleep interval did not count toward idle pause")
+        try check(idle.tick(now: afterWake, attended: false) && idle.isPaused, "Sleep interval did not count toward idle pause")
         try check(probe.complete(old, at: afterWake) == nil, "Pre-sleep RTT survived a long sleep gap")
-        try check(idle.activity(now: afterWake, focused: true), "Focused activity could not resume after wake")
+        try check(idle.activity(now: afterWake, attended: true), "Attended activity could not resume after wake")
         guard let current = probe.begin(at: afterWake) else { throw CheckFailure("No post-wake probe") }
         try check(probe.complete(old, at: afterWake + 0.01) == nil, "Old echo completed a post-wake probe")
         try check(probe.complete(current, at: afterWake + 0.02) != nil, "Fresh post-wake probe did not recover")

@@ -107,14 +107,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             model.refreshLoginStatus()
             model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
             model.refreshClipboardFocus()
-            model.sessionWindowFocusChanged()
+            model.sessionAttentionChanged()
         }
         updates?.tick()
     }
     func applicationDidResignActive(_ notification: Notification) {
         for model in models?.all ?? [] {
             model.refreshClipboardFocus()
-            model.sessionWindowFocusChanged()
+            model.sessionAttentionChanged()
         }
         updates?.tick()
     }
@@ -284,9 +284,9 @@ struct DeskView: View {
                         .font(.system(size: 28)).foregroundStyle(.secondary)
                     Text("空闲暂停")
                         .font(.title3.weight(.semibold))
-                    Text(model.sessionPauseStatus.isEmpty ? "10 分钟没有窗口操作，已暂停画面与自动剪贴板。" : model.sessionPauseStatus)
+                    Text(model.sessionPauseStatus.isEmpty ? "QuietDesk 窗口离开前台或不可见已满 10 分钟，已暂停画面与自动剪贴板。" : model.sessionPauseStatus)
                         .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                    Text("加密连接保持；已确认的文件传输继续。切回窗口或在窗口操作即可恢复，首次操作不会发送到旧画面。")
+                    Text("加密连接保持；已确认的文件传输继续。窗口在前台且可见时不会暂停；切回窗口或在窗口操作即可恢复，首次操作不会发送到旧画面。")
                         .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
                     if !model.sessionPauseWorking { Button("恢复画面") { model.resumeSession() } }
                 }

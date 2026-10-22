@@ -2,36 +2,72 @@ import Foundation
 import QuietDeskCore
 
 func runSessionIdleChecks() {
-    run("Idle pause occurs once after ten minutes and only focused activity resumes") {
+    run("Idle pause occurs once after ten minutes away and only attended activity resumes") {
         var policy = SessionIdlePolicy(now: 10)
-        try check(!policy.tick(now: 609.99), "Paused before ten minutes")
-        try check(policy.tick(now: 610) && policy.isPaused, "Ten minute idle session remained active")
-        try check(!policy.tick(now: 900), "Repeated pause request")
-        try check(!policy.activity(now: 901, focused: false) && policy.isPaused, "Background activity resumed transmission")
-        try check(policy.activity(now: 902, focused: true) && !policy.isPaused, "Focused activity failed to resume")
-        try check(!policy.tick(now: 1501.9) && policy.tick(now: 1502), "Resume did not start a new idle interval")
+        try check(!policy.tick(now: 609.99, attended: false), "Paused before ten minutes")
+        try check(policy.tick(now: 610, attended: false) && policy.isPaused, "Ten minutes away left the session active")
+        try check(!policy.tick(now: 900, attended: false), "Repeated pause request")
+        try check(!policy.activity(now: 901, attended: false) && policy.isPaused, "Background activity resumed transmission")
+        try check(policy.activity(now: 902, attended: true) && !policy.isPaused, "Attended activity failed to resume")
+        try check(!policy.tick(now: 1501.9, attended: false) && policy.tick(now: 1502, attended: false),
+                  "Resume did not start a new idle interval")
     }
     run("Foreground input postpones idle pause and a new session resets prior pause") {
         var policy = SessionIdlePolicy(now: 0)
-        try check(!policy.activity(now: 599, focused: true), "Active input produced a resume")
-        try check(!policy.tick(now: 600) && !policy.tick(now: 1198), "Input failed to extend idle interval")
-        try check(policy.tick(now: 1199), "Idle deadline was not reached")
+        try check(!policy.activity(now: 599, attended: true), "Active input produced a resume")
+        try check(!policy.tick(now: 600, attended: false) && !policy.tick(now: 1198, attended: false),
+                  "Input failed to extend idle interval")
+        try check(policy.tick(now: 1199, attended: false), "Idle deadline was not reached")
         policy = SessionIdlePolicy(now: 1200)
-        try check(!policy.isPaused && !policy.tick(now: 1201), "Prior session pause leaked into reconnect")
+        try check(!policy.isPaused && !policy.tick(now: 1201, attended: false), "Prior session pause leaked into reconnect")
         let request = SessionPauseRequest(paused: true)
         let decoded = try Wire.readJSON(SessionPauseRequest.self, Wire.json(.ping, request).payload)
         try check(decoded.id == request.id && decoded.paused, "Pause request changed on wire")
     }
-    run("Only a new focus edge resumes, and automatic panel focus changes can be suppressed") {
+    run("A focused, visible session window never pauses, however long it goes without input") {
         var policy = SessionIdlePolicy(now: 0)
-        try check(!policy.focusChanged(now: 0, focused: true), "Initial focus reported a resume")
-        try check(policy.tick(now: 600), "Focused inactivity did not pause")
-        try check(!policy.focusChanged(now: 601, focused: true) && policy.isPaused, "Repeated foreground refresh resumed idle transmission")
-        _ = policy.focusChanged(now: 602, focused: false)
-        try check(!policy.focusChanged(now: 603, focused: true, suppressWake: true) && policy.isPaused, "Automatic panel dismissal resumed transmission")
-        _ = policy.focusChanged(now: 604, focused: false)
-        try check(policy.focusChanged(now: 605, focused: true) && !policy.isPaused, "User return focus edge was ignored")
-        try check(!policy.tick(now: .nan) && !policy.tick(now: 1), "Invalid or reversed clock paused transmission")
+        try check(!policy.attentionChanged(now: 0, attended: true), "Initial attention reported a resume")
+        var now = 0.0
+        while now < 8 * 3_600 {
+            now += 1
+            try check(!policy.tick(now: now, attended: true) && !policy.isPaused, "Attended inactivity paused at \(now) s")
+        }
+        try check(!policy.activity(now: now, attended: true), "Input while attended reported a resume")
+    }
+    run("Away time starts when attention ends, so ten minutes away pause even after hours attended") {
+        var policy = SessionIdlePolicy(now: 0)
+        _ = policy.attentionChanged(now: 0, attended: true)
+        try check(!policy.tick(now: 5_000, attended: true), "Attended session paused")
+        // A focus or visibility change can land between one-second ticks.
+        try check(!policy.attentionChanged(now: 5_000.5, attended: false), "Leaving reported a resume")
+        try check(!policy.tick(now: 5_600.4, attended: false) && !policy.isPaused, "Paused before ten minutes away")
+        try check(policy.tick(now: 5_600.5, attended: false) && policy.isPaused, "Ten minutes away did not pause")
+        try check(!policy.tick(now: 5_700, attended: true) && policy.isPaused, "An attended tick resumed without a return")
+        try check(policy.attentionChanged(now: 5_701, attended: true) && !policy.isPaused, "Returning did not resume")
+        try check(!policy.tick(now: 9_000, attended: true), "The resumed, attended session paused again")
+    }
+    run("A focused window behind a lock, a sleeping display or another Space is away, and showing it again resumes") {
+        var policy = SessionIdlePolicy(now: 0)
+        _ = policy.attentionChanged(now: 0, attended: true)
+        // The window stays key while the screen locks; the model reports it as not attended.
+        _ = policy.attentionChanged(now: 100, attended: false)
+        try check(!policy.tick(now: 699, attended: false) && policy.tick(now: 700, attended: false),
+                  "Ten minutes behind a lock or a sleeping display did not pause")
+        try check(policy.attentionChanged(now: 1_000, attended: true) && !policy.isPaused, "Unlocking did not resume")
+    }
+    run("Only a new attention edge resumes, and automatic panel focus changes can be suppressed") {
+        var policy = SessionIdlePolicy(now: 0)
+        try check(!policy.attentionChanged(now: 0, attended: true), "Initial attention reported a resume")
+        _ = policy.attentionChanged(now: 1, attended: false)
+        try check(policy.tick(now: 601, attended: false), "Ten minutes away did not pause")
+        try check(!policy.attentionChanged(now: 602, attended: false) && policy.isPaused, "Repeated background refresh resumed idle transmission")
+        try check(!policy.attentionChanged(now: 603, attended: true, suppressWake: true) && policy.isPaused,
+                  "Automatic panel dismissal resumed transmission")
+        try check(!policy.attentionChanged(now: 604, attended: true) && policy.isPaused, "Repeated attention refresh resumed idle transmission")
+        _ = policy.attentionChanged(now: 605, attended: false)
+        try check(policy.attentionChanged(now: 606, attended: true) && !policy.isPaused, "User return edge was ignored")
+        try check(!policy.tick(now: .nan, attended: false) && !policy.tick(now: 1, attended: false),
+                  "Invalid or reversed clock paused transmission")
     }
     run("Pause requests coalesce while a wake waits for the in-flight pause acknowledgement") {
         var state = SessionPauseTransmission()

@@ -1,33 +1,40 @@
 import Foundation
 
+/// The viewer pauses after `timeout` seconds away from the session. Attended means the session window is
+/// focused and visible on this Mac; while it is, the session never pauses, with or without input.
 public struct SessionIdlePolicy: Sendable {
     public private(set) var isPaused = false
     private var lastActivity: TimeInterval
     private let timeout: TimeInterval
-    private var wasFocused = false
+    private var wasAttended = false
 
     public init(now: TimeInterval, timeout: TimeInterval = 600) {
         lastActivity = now; self.timeout = timeout
     }
 
-    public mutating func tick(now: TimeInterval) -> Bool {
-        guard now.isFinite, now >= lastActivity, !isPaused, now - lastActivity >= timeout else { return false }
+    /// Attention holds the clock at `now`; it never resumes a pause by itself, only a return or input does.
+    public mutating func tick(now: TimeInterval, attended: Bool) -> Bool {
+        guard now.isFinite, !isPaused else { return false }
+        if attended { lastActivity = max(lastActivity, now); return false }
+        guard now >= lastActivity, now - lastActivity >= timeout else { return false }
         isPaused = true
         return true
     }
 
-    public mutating func activity(now: TimeInterval, focused: Bool) -> Bool {
-        guard focused, now.isFinite else { return false }
+    public mutating func activity(now: TimeInterval, attended: Bool) -> Bool {
+        guard attended, now.isFinite else { return false }
         lastActivity = max(lastActivity, now)
         let resume = isPaused
         isPaused = false
         return resume
     }
 
-    public mutating func focusChanged(now: TimeInterval, focused: Bool, suppressWake: Bool = false) -> Bool {
-        let entered = focused && !wasFocused
-        wasFocused = focused
-        return entered && !suppressWake ? activity(now: now, focused: true) : false
+    /// A return (focused and visible again) resumes; leaving starts the away interval now.
+    public mutating func attentionChanged(now: TimeInterval, attended: Bool, suppressWake: Bool = false) -> Bool {
+        let entered = attended && !wasAttended
+        if !attended, wasAttended, !isPaused, now.isFinite { lastActivity = max(lastActivity, now) }
+        wasAttended = attended
+        return entered && !suppressWake ? activity(now: now, attended: true) : false
     }
 
     public mutating func synchronize(paused: Bool, now: TimeInterval) {

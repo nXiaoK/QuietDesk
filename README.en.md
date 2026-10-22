@@ -22,7 +22,7 @@ A native macOS remote desktop app for your own Macs. Connect directly over a LAN
 | Video settings | Manual choices cap automatic adaptation in the new media mode; up to 240 fps and a 100 Mbps target bitrate; rates above 60 fps require both ends to be updated |
 | Clipboard & files | Focus-aware text and image sync; confirmation before transferring files or folders |
 | Keyboard & permissions | Fullscreen system shortcuts, Caps Lock input-source switching, and permission guidance with a draggable app icon |
-| Connections & idle pause | Recent connections, automatic reconnect, and pause after 10 minutes without window input, resuming when you return to the window |
+| Connections & idle pause | Recent connections, automatic reconnect, and pause after 10 minutes away from the window (unfocused or not visible; never while it is focused and visible), resuming when you return to the window |
 | Background sharing | Launch after login, share in the background, and recover from display changes |
 | In-app updates | When a signed feed is configured: check, download and verify, then confirm installation and restart |
 | Endpoint traffic | Persistent sent/received totals by hostname/IP and port |

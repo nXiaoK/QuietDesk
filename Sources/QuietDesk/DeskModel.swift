@@ -303,6 +303,9 @@ final class DeskModel: ObservableObject {
     private var reconnectDeferredForIdle = false
     private var windowActivityMonitor: Any?
     private var sessionFocusObservers: [NSObjectProtocol] = []
+    private var sessionWorkspaceObservers: [NSObjectProtocol] = []
+    private var sessionLockObservers: [NSObjectProtocol] = []
+    private var localScreensAsleep = false
     private var focusRefreshTask: Task<Void, Never>?
     private var suppressIdleFocusWake = false
     private var freshFrameRequiredOnReconnect = false
@@ -1281,7 +1284,7 @@ final class DeskModel: ObservableObject {
             relayFallbackAttempted = false
             relayFallbackCooldown.reset()
             idlePolicy = SessionIdlePolicy(now: SessionClock.now)
-            _ = idlePolicy.focusChanged(now: SessionClock.now, focused: sessionWindowFocused, suppressWake: true)
+            _ = idlePolicy.attentionChanged(now: SessionClock.now, attended: sessionWindowAttended, suppressWake: true)
             pauseTransmission = SessionPauseTransmission()
             wakeInputGate = SessionWakeInputGate()
             reconnectDeferredForIdle = false
@@ -1702,8 +1705,8 @@ final class DeskModel: ObservableObject {
     private func beginConnection(_ target: Target) {
         guard peer == nil, !systemSleeping else { return }
         if reconnecting {
-            _ = idlePolicy.tick(now: SessionClock.now)
-            if idlePolicy.isPaused { deferReconnectForIdle("10 分钟无窗口操作"); return }
+            _ = idlePolicy.tick(now: SessionClock.now, attended: sessionWindowAttended)
+            if idlePolicy.isPaused { deferReconnectForIdle("离开窗口 10 分钟"); return }
         }
         if relaySelectedForTarget, let relay = target.relay, let access = target.relayAccessKey {
             if target.relayRoutes.count > 1, !target.relayRoutesOrdered { orderRelayRoutes(target); return }
@@ -1854,7 +1857,7 @@ final class DeskModel: ObservableObject {
     private func scheduleReconnect(_ reason: String) {
         reconnectTask?.cancel()
         guard !systemSleeping else { return }
-        _ = idlePolicy.tick(now: SessionClock.now)
+        _ = idlePolicy.tick(now: SessionClock.now, attended: sessionWindowAttended)
         if idlePolicy.isPaused {
             deferReconnectForIdle(reason)
             return
@@ -2063,7 +2066,7 @@ final class DeskModel: ObservableObject {
             if viewerSession.usesRelayControl, !viewerSession.relayTargetVerified {
                 throw DeskError.invalid("中继目标标识不匹配或对端版本不支持，请检查设备标识并升级两端")
             }
-            if reconnecting, idlePolicy.isPaused || idlePolicy.tick(now: SessionClock.now) {
+            if reconnecting, idlePolicy.isPaused || idlePolicy.tick(now: SessionClock.now, attended: sessionWindowAttended) {
                 clearSession()
                 peer.close("空闲暂停，返回窗口后继续连接")
                 deferReconnectForIdle("连接恢复前已达到空闲时限")
@@ -2081,7 +2084,7 @@ final class DeskModel: ObservableObject {
             if !supportsSessionPause {
                 idlePolicy.synchronize(paused: false, now: SessionClock.now)
                 pauseTransmission = SessionPauseTransmission()
-            } else if idlePolicy.tick(now: SessionClock.now) {
+            } else if idlePolicy.tick(now: SessionClock.now, attended: sessionWindowAttended) {
                 pauseTransmission.choose(paused: true)
             }
             if freshFrameRequiredOnReconnect { pauseTransmission.requireFreshFrame() }
@@ -2645,6 +2648,18 @@ final class DeskModel: ObservableObject {
         return belongsToSessionWindow(key)
     }
 
+    /// The session window can be seen on this Mac: not minimized, hidden, fully covered or on another Space,
+    /// with this login session on the console and its screens awake and unlocked.
+    private var sessionWindowVisible: Bool {
+        guard let window = mainWindow, window.isVisible, !window.isMiniaturized, !NSApp.isHidden,
+              window.occlusionState.contains(.visible), !localScreensAsleep else { return false }
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        return session?["CGSSessionScreenIsLocked"] as? Bool != true && session?["kCGSSessionOnConsoleKey"] as? Bool != false
+    }
+
+    /// Idle time counts only while nobody attends the session: its window is unfocused or cannot be seen.
+    private var sessionWindowAttended: Bool { sessionWindowFocused && sessionWindowVisible }
+
     private func belongsToSessionWindow(_ window: NSWindow) -> Bool {
         var current: NSWindow? = window
         while let candidate = current {
@@ -2693,27 +2708,30 @@ final class DeskModel: ObservableObject {
         guard let clipboardFilePrompt else { return }
         suppressIdleFocusWake = true
         clipboardFilePrompt.dismiss()
-        sessionWindowFocusChanged()
+        sessionAttentionChanged()
     }
 
-    func sessionWindowFocusChanged() {
+    /// Re-reads whether the session window is focused and visible; called on focus, visibility, lock and display changes.
+    func sessionAttentionChanged() {
         focusRefreshTask?.cancel()
         focusRefreshTask = Task { [weak self] in
             await Task.yield()
             guard let self, !Task.isCancelled else { return }
             if NSApp.isActive, NSApp.keyWindow == nil, let window = self.mainWindow,
                window.isVisible, !window.isMiniaturized { return }
-            let resumed = self.idlePolicy.focusChanged(now: SessionClock.now,
-                focused: self.sessionWindowFocused, suppressWake: self.suppressIdleFocusWake)
+            let resumed = self.idlePolicy.attentionChanged(now: SessionClock.now,
+                attended: self.sessionWindowAttended, suppressWake: self.suppressIdleFocusWake)
             self.suppressIdleFocusWake = false
             if resumed { self.resumeIdleTransmission() }
         }
     }
 
+    // Runs for every local input event, so it only checks focus: input that reaches the focused window
+    // already shows someone is there, and a locked screen or sleeping display delivers none.
     private func recordSessionActivity() {
         guard mode == .viewer, supportsSessionPause || idlePolicy.isPaused || reconnecting,
               sessionWindowFocused else { return }
-        if idlePolicy.activity(now: SessionClock.now, focused: true) { resumeIdleTransmission() }
+        if idlePolicy.activity(now: SessionClock.now, attended: true) { resumeIdleTransmission() }
     }
 
     private func resumeIdleTransmission() {
@@ -3117,10 +3135,34 @@ final class DeskModel: ObservableObject {
     func attachWindow(_ window: NSWindow) {
         if mainWindow !== window, mode == .viewer {
             for observer in sessionFocusObservers { NotificationCenter.default.removeObserver(observer) }
-            sessionFocusObservers = [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification].map { name in
-                NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.sessionWindowFocusChanged() }
+            for observer in sessionWorkspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+            for observer in sessionLockObservers { DistributedNotificationCenter.default().removeObserver(observer) }
+            // Idle time counts only while the session window is unfocused or cannot be seen, so every change
+            // to focus, visibility, screen lock or display sleep re-reads it.
+            let changed: @Sendable (Notification) -> Void = { [weak self] _ in
+                MainActor.assumeIsolated { self?.sessionAttentionChanged() }
+            }
+            sessionFocusObservers = [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
+                                     NSApplication.didHideNotification, NSApplication.didUnhideNotification].map { name in
+                NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main, using: changed)
+            } + [NSWindow.didChangeOcclusionStateNotification, NSWindow.didMiniaturizeNotification,
+                 NSWindow.didDeminiaturizeNotification].map { name in
+                NotificationCenter.default.addObserver(forName: name, object: window, queue: .main, using: changed)
+            }
+            sessionWorkspaceObservers = [NSWorkspace.screensDidSleepNotification, NSWorkspace.screensDidWakeNotification,
+                                         NSWorkspace.sessionDidResignActiveNotification,
+                                         NSWorkspace.sessionDidBecomeActiveNotification].map { name in
+                NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        if name == NSWorkspace.screensDidSleepNotification { self?.localScreensAsleep = true }
+                        if name == NSWorkspace.screensDidWakeNotification { self?.localScreensAsleep = false }
+                        self?.sessionAttentionChanged()
+                    }
                 }
+            }
+            sessionLockObservers = ["com.apple.screenIsLocked", "com.apple.screenIsUnlocked"].map { name in
+                DistributedNotificationCenter.default().addObserver(forName: Notification.Name(name), object: nil,
+                                                                    queue: .main, using: changed)
             }
             if windowActivityMonitor == nil {
                 windowActivityMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged,
@@ -3241,10 +3283,10 @@ final class DeskModel: ObservableObject {
                 guard let self else { return }
                 if self.mode == .viewer,
                    (self.connected && self.supportsSessionPause || self.reconnecting && self.target != nil),
-                   self.idlePolicy.tick(now: SessionClock.now) {
+                   self.idlePolicy.tick(now: SessionClock.now, attended: self.sessionWindowAttended) {
                     self.viewerSession.restoreCanvasFocusAfterIdle = self.controlling
                     self.pauseTransmission.choose(paused: true)
-                    self.sessionPauseStatus = "10 分钟无窗口操作，正在暂停画面与自动剪贴板…"
+                    self.sessionPauseStatus = "离开窗口 10 分钟，正在暂停画面与自动剪贴板…"
                     if self.connected {
                         self.publishSessionPause()
                         self.sendNextSessionPause()
@@ -3252,7 +3294,7 @@ final class DeskModel: ObservableObject {
                         let candidate = self.peer
                         self.clearSession()
                         candidate?.close("空闲暂停，返回窗口后继续连接")
-                        self.deferReconnectForIdle("10 分钟无窗口操作")
+                        self.deferReconnectForIdle("离开窗口 10 分钟")
                     }
                 }
                 if self.mode == .host, self.hostSession.effects?.state.privacy != true { self.removeStrayPrivacyCovers() }
@@ -3462,6 +3504,8 @@ final class DeskModel: ObservableObject {
         for observer in powerObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
         focusRefreshTask?.cancel()
         for observer in sessionFocusObservers { NotificationCenter.default.removeObserver(observer) }
+        for observer in sessionWorkspaceObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        for observer in sessionLockObservers { DistributedNotificationCenter.default().removeObserver(observer) }
         if let windowActivityMonitor { NSEvent.removeMonitor(windowActivityMonitor) }
     }
 }

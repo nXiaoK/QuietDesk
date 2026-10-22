@@ -549,6 +549,141 @@ private struct ClipboardFocusChecks {
                         "Accepted file caused old clipboard content to be sent")
         }
 
+        for kind in ["text", "png", "files", "tiff"] {
+            run("An accepted file finishes while a newer local \(kind) copy waits and remains on the clipboard") { folder in
+                let pair = ClipboardPair(storage: folder, remoteAllowed: true,
+                                         convertLocalTIFF: { $0 }, validateRemotePNG: { _ in true })
+                defer { pair.stop() }
+                let original = folder.appendingPathComponent("incoming.bin"), originalBytes = Data(repeating: 81, count: 120_000)
+                let next = folder.appendingPathComponent("new-local.bin"), nextBytes = Data("copied while receiving".utf8)
+                try originalBytes.write(to: original); try nextBytes.write(to: next)
+                var offer: ClipboardFileOffer?, returnOffer: ClipboardFileOffer?, reception: UUID?, held: Message?
+                var senderEvents: [ClipboardSync.DiagnosticEvent] = []
+                pair.localSync.onFileOffer = { offer = $0 }
+                pair.localSync.onFileReceptionChanged = { reception = $0 }
+                pair.remoteSync.onFileOffer = { returnOffer = $0 }
+                pair.remoteSync.onDiagnostic = { senderEvents.append($0) }
+                pair.routeRemote = { message in
+                    if message.kind == .clipboardChunk, held == nil { held = message; return false }
+                    return true
+                }
+                pair.remote.copy(.files([original]))
+                pair.remoteSync.setAutomaticSendingAllowed(true)
+                try eventually("Incoming file did not request approval") { offer != nil }
+                pair.localSync.respondToFileOffer(id: offer!.id, accept: true)
+                try eventually("Accepted file did not begin receiving") { reception != nil && held != nil }
+                if kind == "files" { pair.local.copy(.files([next])) }
+                else if kind == "png" { pair.local.copy(.png(nextBytes)) }
+                else {
+                    pair.local.copy(.text(nextBytes))
+                    if kind == "tiff" { pair.local.rawTIFF = nextBytes }
+                }
+                pair.localSync.setAutomaticSendingAllowed(true)
+                pump(for: 0.35)
+                try require(reception != nil && !pair.localMessages.contains(.clipboardBegin)
+                            && !senderEvents.contains(.sendFailed(.files, fileCount: 1)) && pair.local.writes == 0,
+                            "The new local copy interrupted or replaced an accepted file reception")
+                pair.localSync.receive(held!)
+                try eventually("Accepted file did not finish after the held chunk arrived") {
+                    senderEvents.contains(.sent(.files, fileCount: 1)) && reception == nil
+                }
+                let received = folder.appendingPathComponent("local/received", isDirectory: true)
+                let batches = try FileManager.default.contentsOfDirectory(at: received, includingPropertiesForKeys: nil)
+                try require(batches.count == 1 && Data(contentsOf: batches[0].appendingPathComponent("incoming.bin")) == originalBytes,
+                            "The completed file was missing or its bytes changed")
+                try require(pair.local.writes == 0, "Completing the file overwrote the newer local copy")
+                if kind == "files" {
+                    try eventually("The newer local file was not offered after receiving finished") { returnOffer != nil }
+                    try require(pair.remote.writes == 0, "The newer file bypassed receiver approval")
+                    pair.remoteSync.respondToFileOffer(id: returnOffer!.id, accept: true)
+                    try eventually("The approved newer file was not published") { pair.remote.writes == 1 }
+                    guard case .files(let urls) = pair.remote.payload, let file = urls.first else {
+                        throw FocusCheckFailure("New local file was not published as a file")
+                    }
+                    try require(Data(contentsOf: file) == nextBytes, "The deferred local file changed bytes")
+                } else {
+                    try eventually("The newer local copy did not synchronize after receiving finished") { pair.remote.writes == 1 }
+                    switch pair.remote.payload {
+                    case .text(let bytes), .png(let bytes): try require(bytes == nextBytes, "The deferred clipboard data changed")
+                    case .files: throw FocusCheckFailure("The deferred text/image became a file")
+                    }
+                }
+                try require(pair.localMessages.filter { $0 == .clipboardBegin }.count == 1
+                            && !pair.localMessages.contains(.clipboardCancel),
+                            "The newer local copy was sent twice or cancelled the completed reception")
+            }
+        }
+
+        run("A local copy queued immediately after file acceptance cannot race the reception notification") { folder in
+            let pair = ClipboardPair(storage: folder, remoteAllowed: true)
+            defer { pair.stop() }
+            let file = folder.appendingPathComponent("accepted.bin"), bytes = Data(repeating: 71, count: 120_000)
+            try bytes.write(to: file)
+            var offer: ClipboardFileOffer?, reception: UUID?, held: Message?
+            var senderEvents: [ClipboardSync.DiagnosticEvent] = []
+            pair.localSync.onFileOffer = { offer = $0 }
+            pair.localSync.onFileReceptionChanged = { reception = $0 }
+            pair.remoteSync.onDiagnostic = { senderEvents.append($0) }
+            pair.routeRemote = { message in
+                if message.kind == .clipboardChunk, held == nil { held = message; return false }
+                return true
+            }
+            pair.remote.copy(.files([file]))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("File offer missing before the acceptance race") { offer != nil }
+            pair.localSync.respondToFileOffer(id: offer!.id, accept: true)
+            pair.local.copy(.text(Data("copied before reception notice".utf8)))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            try eventually("Acceptance race did not leave an active reception") { reception != nil && held != nil }
+            pump(for: 0.35)
+            try require(!pair.localMessages.contains(.clipboardBegin) && !senderEvents.contains(.sendFailed(.files, fileCount: 1)),
+                        "A queued local send cancelled the accepted file before its main-thread notification")
+            pair.localSync.receive(held!)
+            try eventually("The raced reception or deferred local copy did not finish") {
+                senderEvents.contains(.sent(.files, fileCount: 1)) && pair.remote.copiedText == "copied before reception notice"
+            }
+            let batches = try FileManager.default.contentsOfDirectory(at: folder.appendingPathComponent("local/received"), includingPropertiesForKeys: nil)
+            try require(batches.count == 1 && Data(contentsOf: batches[0].appendingPathComponent("accepted.bin")) == bytes
+                        && pair.local.copiedText == "copied before reception notice" && pair.local.writes == 0,
+                        "Reception completion lost either the downloaded file or the raced local copy")
+        }
+
+        run("Manually cancelling reception releases the latest local copy without publishing a partial file") { folder in
+            let pair = ClipboardPair(storage: folder, remoteAllowed: true)
+            defer { pair.stop() }
+            let file = folder.appendingPathComponent("cancelled.bin")
+            try Data(repeating: 79, count: 120_000).write(to: file)
+            var offer: ClipboardFileOffer?, reception: UUID?, held: Message?
+            var senderEvents: [ClipboardSync.DiagnosticEvent] = []
+            pair.localSync.onFileOffer = { offer = $0 }
+            pair.localSync.onFileReceptionChanged = { reception = $0 }
+            pair.remoteSync.onDiagnostic = { senderEvents.append($0) }
+            pair.routeRemote = { message in
+                if message.kind == .clipboardChunk, held == nil { held = message; return false }
+                return true
+            }
+            pair.remote.copy(.files([file]))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("File offer missing before cancellation") { offer != nil }
+            pair.localSync.respondToFileOffer(id: offer!.id, accept: true)
+            try eventually("Reception missing before cancellation") { reception != nil && held != nil }
+            pair.local.copy(.text(Data("local copy after cancellation".utf8)))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            pump(for: 0.35)
+            guard let id = reception else { throw FocusCheckFailure("New copy cancelled reception before the explicit action") }
+            pair.localSync.cancelFileReception(id: id)
+            try eventually("Cancelling the file did not resume the local copy") {
+                reception == nil && pair.remote.copiedText == "local copy after cancellation"
+                    && senderEvents.contains(.sendFailed(.files, fileCount: 1))
+            }
+            pair.localSync.receive(held!)
+            pump(for: 0.35)
+            try require(pair.local.writes == 0 && pair.local.copiedText == "local copy after cancellation"
+                        && pair.localMessages.filter { $0 == .clipboardCancel }.count == 1
+                        && !FileManager.default.fileExists(atPath: folder.appendingPathComponent("local/received").path),
+                        "Cancelled or late file data was published, or cancellation lost the local copy")
+        }
+
         run("A new local copy replaces pending file approval; stale acceptance cannot download") { folder in
             let pair = ClipboardPair(storage: folder, remoteAllowed: true)
             defer { pair.stop() }

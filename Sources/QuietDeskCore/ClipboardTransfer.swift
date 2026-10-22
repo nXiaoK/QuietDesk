@@ -236,9 +236,12 @@ public final class ClipboardTransfer {
         }
     }
 
-    public func prepareSend(completion: @escaping (UUID?) -> Void) {
+    // Opting in leaves an accepted file reception intact and calls deferred instead of completion.
+    // The caller owns retrying its latest copy after onFileReceptionChanged reports nil.
+    public func prepareSend(deferred: (() -> Void)? = nil, completion: @escaping (UUID?) -> Void) {
         queue.async { [self] in
             guard !stopped else { completion(nil); return }
+            if receivingFileID != nil, let deferred { deferred(); return }
             let reason = "剪贴板已被新的复制内容替换"
             cancelOutgoing(reason)
             if let incoming {
@@ -255,9 +258,13 @@ public final class ClipboardTransfer {
         }
     }
 
-    public func send(_ payload: ClipboardPayload, preparation: UUID? = nil, completion: @escaping (Bool) -> Void = { _ in }) {
+    // As with prepareSend, deferral replaces completion and neither retains the payload nor schedules a retry.
+    public func send(_ payload: ClipboardPayload, preparation: UUID? = nil, deferred: (() -> Void)? = nil,
+                     completion: @escaping (Bool) -> Void = { _ in }) {
         queue.async { [self] in
             guard !stopped else { completion(false); return }
+            // A reception can start after prepareSend and invalidate its token while conversion runs.
+            if receivingFileID != nil, let deferred { deferred(); return }
             guard preparation == nil || preparation == sendPreparation else { completion(false); return }
             var installed = false
             do {

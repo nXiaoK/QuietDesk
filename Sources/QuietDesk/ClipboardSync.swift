@@ -110,6 +110,9 @@ final class ClipboardSync {
     // A copy made before taking control may still be waiting for activation or session resume.
     private var pendingLocalChange: Int?
     private var pendingFileOffer: (id: UUID, change: Int)?
+    private var receivingFileID: UUID?
+    private var receivingFileChange: Int?
+    private var receivedFilesKeptLocally = false
     private var deferredLocalChange: Int?
     private var staleFileChange: Int?
     private var sharedChange: Int?
@@ -157,7 +160,18 @@ final class ClipboardSync {
         transfer.onFileReceptionChanged = { [weak self] id in
             DispatchQueue.main.async {
                 guard let self, self.running else { return }
+                self.receivingFileID = id
+                if id != nil {
+                    self.receivingFileChange = self.receivingFileChange ?? self.pendingFileOffer?.change ?? self.pasteboard.changeCount
+                } else {
+                    self.receivingFileChange = nil
+                    if self.receivedFilesKeptLocally {
+                        self.receivedFilesKeptLocally = false
+                        self.onStatus?("文件接收完成，已保存到接收目录；保留了新的本机复制内容")
+                    }
+                }
                 self.onFileReceptionChanged?(id)
+                if id == nil { self.poll() }
             }
         }
         transfer.onFileOffer = { [weak self] offer in
@@ -189,10 +203,14 @@ final class ClipboardSync {
                     self.onDiagnostic?(.fileOfferAccepted)
                 case .declined:
                     self.deferredLocalChange = nil
+                    if self.receivingFileID == nil { self.receivingFileChange = nil }
                     self.onDiagnostic?(.fileOfferRejected)
-                case .timedOut, .failed: self.deferredLocalChange = nil
+                case .timedOut, .failed:
+                    self.deferredLocalChange = nil
+                    if self.receivingFileID == nil { self.receivingFileChange = nil }
                 // A remote cancellation can precede replacement data; keep the older local version deferred.
-                case .superseded, .cancelled, .stopped: break
+                case .superseded, .cancelled, .stopped:
+                    if self.receivingFileID == nil { self.receivingFileChange = nil }
                 }
                 self.onFileOffer?(nil)
                 self.poll()
@@ -236,7 +254,7 @@ final class ClipboardSync {
     }
 
     /// 操作远端时按 ⌘V 是否要等剪贴板：只有本机复制等待发送或仍在发送时才等，否则按普通按键直接送达。
-    var holdsPaste: Bool { running && (!controllingRemote || pendingLocalChange != nil || sendingChange != nil) }
+    var holdsPaste: Bool { running && (!controllingRemote || receivingFileChange != nil || pendingLocalChange != nil || sendingChange != nil) }
 
     /// 本机剪贴板已处理到的版本。自动重连时交给新会话，断线期间在本机的复制仍在切回时发送。
     var handledChange: Int { observedChange }
@@ -258,11 +276,17 @@ final class ClipboardSync {
             sendCurrent()
             return
         }
+        if accept { receivingFileChange = pendingFileOffer.change }
         transfer.respondToFileOffer(id: id, accept: accept)
     }
 
     func prepareForPaste(_ completion: @escaping (Bool) -> Void) {
         guard running, allowsAutomaticSending else { completion(false); return }
+        guard receivingFileChange == nil else {
+            completion(false)
+            onStatus?("文件仍在接收，完成后请再次粘贴；新的本机复制会随后同步")
+            return
+        }
         if controllingRemote { skipChangesWhileControlling() }
         if controllingRemote, pendingLocalChange == nil {
             // 远端自己的复制粘贴不补发本机剪贴板，也不重新发起文件确认。
@@ -307,6 +331,9 @@ final class ClipboardSync {
 
     func stop() {
         running = false
+        receivingFileID = nil
+        receivingFileChange = nil
+        receivedFilesKeptLocally = false
         onFileReceptionChanged?(nil)
         pendingLocalChange = nil
         cancelImageApplication()
@@ -340,6 +367,11 @@ final class ClipboardSync {
     private func sendCurrent() {
         guard running, allowsAutomaticSending else { return }
         let change = pasteboard.changeCount
+        guard receivingFileChange == nil else {
+            if change != deferredLocalChange { pendingLocalChange = change }
+            settleWaiters(false)
+            return
+        }
         pendingLocalChange = nil
         observedChange = change
         imagePreparation = nil
@@ -365,7 +397,9 @@ final class ClipboardSync {
             sendingChange = change
             let convert = convertTIFF
             let imageQueue = imageQueue
-            transfer.prepareSend { [weak self] preparation in
+            transfer.prepareSend(deferred: { [weak self] in
+                DispatchQueue.main.async { self?.deferLocalCopy(change: change) }
+            }) { [weak self] preparation in
                 guard let preparation else { return }
                 imageQueue.async {
                     let png = convert(tiff)
@@ -447,7 +481,9 @@ final class ClipboardSync {
         fileSendingChange = isFile ? change : nil
         let summary = diagnosticSummary(for: payload)
         onDiagnostic?(.sending(summary.kind, fileCount: summary.fileCount))
-        transfer.send(payload, preparation: preparation) { [weak self] success in
+        transfer.send(payload, preparation: preparation, deferred: { [weak self] in
+            DispatchQueue.main.async { self?.deferLocalCopy(change: change) }
+        }) { [weak self] success in
             DispatchQueue.main.async {
                 guard let self, self.running else { return }
                 self.onDiagnostic?(success ? .sent(summary.kind, fileCount: summary.fileCount) : .sendFailed(summary.kind, fileCount: summary.fileCount))
@@ -457,6 +493,16 @@ final class ClipboardSync {
                 self.settleWaiters(success)
             }
         }
+    }
+
+    private func deferLocalCopy(change: Int) {
+        guard running, sendingChange == change else { return }
+        imagePreparation = nil
+        sendingChange = nil
+        fileSendingChange = nil
+        pendingLocalChange = change
+        observedChange = Int.min
+        settleWaiters(false)
     }
 
     private func cancelImageApplication() {
@@ -519,7 +565,15 @@ final class ClipboardSync {
                 return false
             }
         case .png: break
-        case .files: break
+        case .files:
+            if let receivingFileChange, pasteboard.changeCount != receivingFileChange {
+                // The transfer is complete on disk; a later local copy still owns the pasteboard.
+                receivedFilesKeptLocally = true
+                deferredLocalChange = nil
+                staleFileChange = nil
+                settleWaiters(false)
+                return true
+            }
         }
         let contentMarker = contentMarker ?? Self.marker(for: payload, session: session)
         guard pasteboard.write(payload, marker: contentMarker) else {

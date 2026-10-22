@@ -575,6 +575,7 @@ final class ClipboardSync {
                 receivedFilesKeptLocally = true
                 deferredLocalChange = nil
                 staleFileChange = nil
+                onDiagnostic?(.applied(summary.kind, fileCount: summary.fileCount))
                 settleWaiters(false)
                 return true
             }

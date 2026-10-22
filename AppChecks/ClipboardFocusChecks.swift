@@ -696,10 +696,12 @@ private struct ClipboardFocusChecks {
                 try Data(repeating: 83, count: 120_000).write(to: file)
                 var offer: ClipboardFileOffer?, reception: UUID?, held: Message?
                 var statuses: [String] = [], kept = 0
+                var receiverEvents: [ClipboardSync.DiagnosticEvent] = []
                 pair.localSync.onFileOffer = { offer = $0 }
                 pair.localSync.onFileReceptionChanged = { reception = $0 }
                 pair.localSync.onStatus = { statuses.append($0) }
                 pair.localSync.onReceivedFilesKept = { kept += 1 }
+                pair.localSync.onDiagnostic = { receiverEvents.append($0) }
                 pair.routeRemote = { message in
                     if message.kind == .clipboardChunk, held == nil { held = message; return false }
                     return true
@@ -728,6 +730,8 @@ private struct ClipboardFocusChecks {
                 }
                 pair.localSync.receive(held!)
                 try eventually("Accepted file did not finish while controlling") { reception == nil }
+                try require(receiverEvents.filter { $0 == .applied(.files, fileCount: 1) }.count == 1,
+                            "A completed file reception was not recorded exactly once in diagnostics")
                 if copiedDuringReception {
                     try eventually("The deferred local copy did not synchronize after receiving finished") {
                         pair.remote.copiedText == "copied while receiving" && !pair.localSync.holdsPaste

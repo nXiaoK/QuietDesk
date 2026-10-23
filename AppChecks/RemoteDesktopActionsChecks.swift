@@ -74,9 +74,14 @@ private struct RemoteDesktopActionsChecks {
                             "Shortcut modifiers or keys were not released in reverse order")
                 try require(events.map { $0.getIntegerValueField(.keyboardEventKeycode) } == [59, key, key, 59],
                             "Shortcut targeted a different system action")
-                try require(events.prefix(3).allSatisfy { $0.flags == [.maskAlphaShift, .maskControl] }
-                            && events[3].flags == .maskAlphaShift,
+                let arrow: CGEventFlags = [.maskAlphaShift, .maskControl, .maskSecondaryFn, .maskNumericPad]
+                try require(events[0].flags == [.maskAlphaShift, .maskControl] && events[1].flags == arrow
+                            && events[2].flags == arrow && events[3].flags == .maskAlphaShift,
                             "Shortcut inherited unrelated modifiers or altered Caps Lock")
+                // The window server registers hotkeys 32, 79 and 81 with modifiers 0x840000 (Control | Fn).
+                let hotKeyModifiers: CGEventFlags = [.maskShift, .maskControl, .maskAlternate, .maskCommand, .maskSecondaryFn]
+                try require(events[1...2].allSatisfy { $0.flags.intersection(hotKeyModifiers).rawValue == 0x840000 },
+                            "Arrow presses lack the Fn flag, so macOS delivers them to the front app instead of switching")
                 try require(events.allSatisfy { $0.getIntegerValueField(.keyboardEventAutorepeat) == 0 },
                             "Shortcut introduced repeated key presses")
                 executor.cancel()

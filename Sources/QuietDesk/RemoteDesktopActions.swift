@@ -59,8 +59,10 @@ final class RemoteDesktopActionExecutor {
         controlDown.flags = capsLock.union(.maskControl)
         controlUp.type = .flagsChanged
         controlUp.flags = capsLock
+        // Hardware arrow keys carry Fn and keypad flags, and macOS registers these shortcuts as ⌃Fn;
+        // an arrow without Fn reaches the front app as ordinary ⌃← instead.
         for event in [keyDown, keyUp] {
-            event.flags = capsLock.union(.maskControl)
+            event.flags = capsLock.union([.maskControl, .maskSecondaryFn, .maskNumericPad])
             event.setIntegerValueField(.keyboardEventAutorepeat, value: 0)
         }
 

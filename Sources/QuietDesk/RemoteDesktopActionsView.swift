@@ -9,6 +9,23 @@ extension RemoteDesktopAction {
         case .missionControl: return "调度中心，选择桌面…"
         }
     }
+
+    /// The window toolbar shows each action as its own icon; Mission Control keeps the panel's icon.
+    var toolbarSymbol: String {
+        switch self {
+        case .previousSpace: return "arrow.left.square"
+        case .nextSpace: return "arrow.right.square"
+        case .missionControl: return "rectangle.3.group"
+        }
+    }
+
+    var toolbarHelp: String {
+        switch self {
+        case .previousSpace: return "切换到远端上一空间，也会经过全屏应用（远端默认 ⌃←）"
+        case .nextSpace: return "切换到远端下一空间，也会经过全屏应用（远端默认 ⌃→）"
+        case .missionControl: return "在远端打开调度中心，再点按画面选择桌面（远端默认 ⌃↑）"
+        }
+    }
 }
 
 struct RemoteDesktopActionsView: View {

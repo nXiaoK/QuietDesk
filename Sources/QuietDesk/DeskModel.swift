@@ -194,6 +194,9 @@ final class DeskModel: ObservableObject {
     @Published private(set) var supportsDesktopActions = false
     @Published private(set) var desktopActionWorking = false
     @Published private(set) var desktopActionStatus = ""
+    /// Briefly shown over the picture when the window toolbar's action is refused or unconfirmed.
+    @Published private(set) var desktopActionNotice: String?
+    private var desktopActionNoticeTask: Task<Void, Never>?
     var desktopActionUnavailableReason: String? {
         if !connected { return "连接后可选择远端桌面" }
         if !supportsDesktopActions { return "被控端需更新后才能使用桌面操作" }
@@ -2125,6 +2128,7 @@ final class DeskModel: ObservableObject {
             viewerSession.desktopActionRequest = nil
             desktopActionWorking = false
             desktopActionStatus = result.error ?? "已向远端发送“\(request.action.title)”快捷键；请点按远端画面继续。"
+            if let error = result.error { showDesktopActionNotice(error) }
             publishSessionPause()
         case .sessionTermination:
             guard viewerSession.helloReceived, viewerSession.terminationSubscribed else {
@@ -2617,12 +2621,14 @@ final class DeskModel: ObservableObject {
         viewer.desktopActionRequest = request
         desktopActionWorking = true
         desktopActionStatus = "正在发送桌面操作…"
+        showDesktopActionNotice(nil)
         publishSessionPause()
         do { peer.send(try Wire.json(.desktopActionRequest, request)) }
         catch {
             viewer.desktopActionRequest = nil
             desktopActionWorking = false
             desktopActionStatus = error.localizedDescription
+            showDesktopActionNotice(error.localizedDescription)
             publishSessionPause()
             return
         }
@@ -2634,7 +2640,19 @@ final class DeskModel: ObservableObject {
             viewer.desktopActionTimeout = nil
             self.desktopActionWorking = false
             self.desktopActionStatus = "未收到桌面操作回执，请查看远端画面；未自动重试。"
+            self.showDesktopActionNotice(self.desktopActionStatus)
             self.publishSessionPause()
+        }
+    }
+
+    // Success shows only on the remote picture; the full-screen panel shows desktopActionStatus instead.
+    private func showDesktopActionNotice(_ text: String?) {
+        desktopActionNoticeTask?.cancel()
+        desktopActionNotice = text
+        guard text != nil else { return }
+        desktopActionNoticeTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(5)) } catch { return }
+            self?.desktopActionNotice = nil
         }
     }
 
@@ -3570,6 +3588,8 @@ final class DeskModel: ObservableObject {
         supportsDesktopActions = false
         desktopActionWorking = false
         desktopActionStatus = ""
+        desktopActionNoticeTask?.cancel()
+        desktopActionNotice = nil
         supportsSessionUnlock = false
         unlockWorking = false
         unlockNoticeTask?.cancel()

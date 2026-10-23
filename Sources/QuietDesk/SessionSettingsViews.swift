@@ -440,7 +440,11 @@ private struct SessionQualitySection: View {
                     Text("实际生效：\(state.settings.summary)").foregroundStyle(.secondary).monospacedDigit()
                 }
             }
-            if !compact {
+            if model.localNetworkQuality {
+                Text("局域网优先所选画质 · 持续高延迟时才降档")
+                    .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    .help(model.videoQualityHelp)
+            } else if !compact {
                 Text(model.supportsAdaptiveVideo ? "以上为上限。实际画质按丢包和延迟自动调整：先调码率，码率过低时再降帧率和最长边，网络好转后逐步恢复。"
                      : model.supportsMediaTransport ? "已保存画质与手动选择作为自动调节上限；实际画质随网络负载调整。" : model.supportsExtendedVideoSettings ? "已保存画质与手动选择优先；旧传输首次 RTT <10 ms 的新连接默认最高画质。" : "已保存的连接会恢复画质；原分辨率和 30 Mbps 需共享端更新后使用。")
                     .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)

@@ -4,11 +4,173 @@ import QuietDeskCore
 func runMediaPathPolicyChecks() {
     func sample(duration: TimeInterval = 1, active: Bool = true, count: Int = 60, frames: Int = 60,
                 loss: Double? = 0, jitter: Double? = 0, queue: Double? = 0,
-                encode: Double? = 4, decode: Double? = 3, delivery: Double? = nil, received: Double? = 1_000) -> MediaPathSample {
+                encode: Double? = 4, decode: Double? = 3, delivery: Double? = nil, received: Double? = 1_000,
+                local: Bool = false, roundTrip: Double? = nil) -> MediaPathSample {
         MediaPathSample(duration: duration, mediaActive: active, networkSamples: count, decodedFrames: frames,
                         lossFraction: loss, jitterMilliseconds: jitter, queueMilliseconds: queue,
                         encodeMilliseconds: encode, decodeMilliseconds: decode,
-                        deliveryMilliseconds: delivery, receivedMegabits: received)
+                        deliveryMilliseconds: delivery, receivedMegabits: received,
+                        isLocalNetwork: local, roundTripMilliseconds: roundTrip)
+    }
+
+    run("Local links keep the chosen native high frame rate despite codec load, loss or direct reduction requests") {
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 120, megabits: 100)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (3024, 1964), now: 0)
+        quality.setLocalNetwork(true, now: 0)
+        for time in 1...30 {
+            let now = Double(time)
+            try check(quality.observe(sample(loss: 1, jitter: 100, queue: 500, encode: 80, decode: 60,
+                                             delivery: 20, local: true, roundTrip: 3), now: now) == nil,
+                      "A low-delay local link reduced quality for loss or codec pressure")
+            for cause in [MediaBottleneck.network, .encoder, .decoder] {
+                try check(quality.reduceLoad(for: cause, severe: true, computeMilliseconds: 80, now: now) == nil,
+                          "A direct reduction bypassed local delay observation")
+            }
+        }
+        try check(quality.effective == ceiling && quality.upperBound == ceiling && quality.preferred == ceiling,
+                  "Local adaptation replaced the requested quality")
+    }
+
+    run("Either local RTT or delivery delay at 150 ms must persist for five seconds before each reduction") {
+        for useRoundTrip in [false, true] {
+            let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 120, megabits: 100)
+            var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling,
+                                               bitRates: StreamSettings.adaptiveBitRates, appliedSize: (3024, 1964), now: 0)
+            quality.setLocalNetwork(true, now: 0)
+            for time in 1...10 {
+                try check(quality.observe(sample(delivery: 149.999, local: true, roundTrip: 149.999), now: Double(time)) == nil,
+                          "Local delay below 150 ms caused a reduction")
+            }
+            let delayed = sample(frames: 0, loss: 1, encode: 80, decode: 60, delivery: useRoundTrip ? 20 : 150,
+                                 local: true, roundTrip: useRoundTrip ? 150 : 3)
+            for time in 11...14 {
+                try check(quality.observe(delayed, now: Double(time)) == nil, "Local overload reduced quality before five seconds")
+            }
+            guard let first = quality.observe(delayed, now: 15) else { throw CheckFailure("Sustained local delay did not reduce load") }
+            try check(first == StreamSettings(longestEdge: 8192, framesPerSecond: 120, megabits: 60)
+                      && quality.lastAdjustment == .localLatency, "Local delay reduced size or reported codec pressure first")
+            try check(quality.confirmApplied(first, now: 15), "Local reduction was not confirmed")
+            try quality.synchronizeApplied(first, size: (3024, 1964), now: 15)
+            for time in 16...19 {
+                try check(quality.observe(delayed, now: Double(time)) == nil, "One delayed window caused repeated local reductions")
+            }
+            try check(quality.observe(delayed, now: 20)?.megabits == 40, "The next five seconds did not reduce bitrate again")
+            try check(quality.preferred == ceiling && quality.upperBound == ceiling, "Local delay overwrote the user's ceiling")
+        }
+    }
+
+    run("Three decoded low-delay local seconds restore the entire ceiling despite old codec cooldown") {
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 120, megabits: 100)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling,
+                                           applied: StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 20),
+                                           appliedSize: (3024, 1964), now: 0)
+        guard let reduced = quality.reduceLoad(for: .encoder, computeMilliseconds: 25, now: 3) else {
+            throw CheckFailure("Expected old-path codec reduction")
+        }
+        _ = quality.confirmApplied(reduced, now: 3)
+        quality.setLocalNetwork(true, now: 3)
+        for time in 4...10 {
+            try check(quality.observe(sample(delivery: 50, local: true, roundTrip: 3), now: Double(time)) == nil,
+                      "A 50 ms local measurement proved recovery")
+        }
+        let healthy = sample(loss: 1, encode: 80, decode: 60, delivery: 49.999, received: 0.1, local: true, roundTrip: 3)
+        try check(quality.observe(healthy, now: 11) == nil && quality.observe(healthy, now: 12) == nil,
+                  "Local recovery did not wait three seconds")
+        try check(quality.observe(healthy, now: 13) == ceiling && quality.lastAdjustment == .raise,
+                  "Local recovery inherited old cooldown, codec limits, or one-step upgrades")
+        try check(quality.confirmApplied(ceiling, now: 13), "Local recovery did not confirm")
+        try quality.synchronizeApplied(ceiling, size: (3024, 1964), now: 13)
+        for time in 14...20 {
+            try check(quality.observe(healthy, now: Double(time)) == nil, "Local recovery repeated at the ceiling")
+        }
+    }
+
+    run("Local recovery respects a lower manual ceiling and can restore an initially lower stream") {
+        let ceiling = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8)
+        var quality = try MediaQualityPolicy(hostDefault: .highest, now: 0)
+        _ = try quality.chooseManually(ceiling, now: 1)
+        _ = quality.confirmApplied(ceiling, now: 1)
+        try quality.synchronizeApplied(StreamSettings(longestEdge: 1280, framesPerSecond: 15, megabits: 3), now: 2)
+        quality.setLocalNetwork(true, now: 2)
+        for time in 3...4 {
+            try check(quality.observe(sample(local: true, roundTrip: 3), now: Double(time)) == nil,
+                      "Initial local recovery skipped observation")
+        }
+        try check(quality.observe(sample(local: true, roundTrip: 3), now: 5) == ceiling
+                  && quality.upperBound == ceiling && quality.preferred == ceiling,
+                  "Local recovery exceeded the lower manual choice")
+    }
+
+    run("Missing, inactive, invalid and intermediate local samples break continuous delay evidence") {
+        let interruptions = [sample(local: true), sample(active: false, local: true, roundTrip: 200),
+                             sample(local: true, roundTrip: .nan), sample(local: true, roundTrip: 100),
+                             sample(local: true, roundTrip: 3)]
+        for interruption in interruptions {
+            var quality = try MediaQualityPolicy(hostDefault: .highest, now: 0)
+            quality.setLocalNetwork(true, now: 0)
+            let delayed = sample(local: true, roundTrip: 500)
+            for time in 1...4 { _ = quality.observe(delayed, now: Double(time)) }
+            try check(quality.pending == nil && quality.observe(interruption, now: 5) == nil,
+                      "An incomplete local delay run reduced quality")
+            for time in 6...9 {
+                try check(quality.observe(delayed, now: Double(time)) == nil, "Interrupted local delay evidence was retained")
+            }
+            try check(quality.observe(delayed, now: 10) != nil, "A new five-second local delay run did not reduce quality")
+        }
+        var gap = try MediaQualityPolicy(hostDefault: .highest, now: 0)
+        gap.setLocalNetwork(true, now: 0)
+        for time in 1...4 { _ = gap.observe(sample(local: true, roundTrip: 200), now: Double(time)) }
+        for time in 10...13 {
+            try check(gap.observe(sample(local: true, roundTrip: 200), now: Double(time)) == nil,
+                      "A sampling gap completed an old local delay run")
+        }
+        try check(gap.observe(sample(local: true, roundTrip: 200), now: 14) != nil, "Complete post-gap evidence did not reduce quality")
+    }
+
+    run("Quiet or unmeasured local windows cannot accumulate recovery") {
+        let reduced = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 3)
+        let interruptions = [sample(local: true), sample(active: false, local: true, roundTrip: 3),
+                             sample(frames: 0, local: true, roundTrip: 3), sample(local: true, roundTrip: 50),
+                             sample(delivery: 150, local: true, roundTrip: 3), sample(local: true, roundTrip: -.infinity)]
+        for interruption in interruptions {
+            var quality = try MediaQualityPolicy(hostDefault: .highest, applied: reduced, now: 0)
+            quality.setLocalNetwork(true, now: 0)
+            let healthy = sample(local: true, roundTrip: 3)
+            _ = quality.observe(healthy, now: 1); _ = quality.observe(healthy, now: 2)
+            try check(quality.observe(interruption, now: 3) == nil, "An unproven local window restored quality")
+            try check(quality.observe(healthy, now: 4) == nil && quality.observe(healthy, now: 5) == nil,
+                      "Interrupted local recovery evidence was retained")
+            try check(quality.observe(healthy, now: 6) == .highest, "A complete local recovery run did not restore the ceiling")
+        }
+    }
+
+    run("Local route changes reset evidence and pending or failed requests require fresh observation") {
+        var quality = try MediaQualityPolicy(hostDefault: .highest, now: 0)
+        quality.setLocalNetwork(true, now: 0)
+        let delayed = sample(local: true, roundTrip: 200)
+        for time in 1...4 { _ = quality.observe(delayed, now: Double(time)) }
+        _ = quality.observe(sample(), now: 5)
+        try check(!quality.isLocalNetwork, "The current sample did not leave local mode")
+        for time in 6...10 {
+            try check(quality.observe(delayed, now: Double(time)) == nil, "A route change reused previous delay evidence")
+        }
+        guard let reduction = quality.observe(delayed, now: 11) else { throw CheckFailure("New local route did not complete observation") }
+        quality.setLocalNetwork(false, now: 12)
+        quality.setLocalNetwork(true, now: 13)
+        for time in 14...20 {
+            try check(quality.observe(delayed, now: Double(time)) == nil && quality.pending == reduction,
+                      "A pending settings change was overwritten")
+        }
+        quality.rejectPending(now: 20)
+        try quality.synchronizeApplied(.highest, now: 20)
+        for time in 21...24 {
+            try check(quality.observe(delayed, now: Double(time)) == nil, "Failed requests retained delay evidence")
+        }
+        try check(quality.observe(delayed, now: 25) == reduction, "Failed local reduction could not be retried after fresh evidence")
+        _ = quality.confirmApplied(reduction, now: 25)
+        quality.setLocalNetwork(false, now: 26)
+        try check(quality.reduceLoad(for: .encoder, computeMilliseconds: 25, now: 28) != nil,
+                  "Leaving the local route disabled the existing nonlocal codec policy")
     }
 
     run("Adaptive quality reduces and restores higher rates without replacing the user's ceiling") {

@@ -54,6 +54,8 @@ public final class MediaSession: @unchecked Sendable {
     public var onReliableData: ((Message) -> Void)?
     public var onReduceLoad: ((MediaBottleneck) -> Void)?
     public var onSample: ((MediaPathSample) -> Void)?
+    // Actual video route classification, delivered before its sample or direct reduction callback.
+    public var onLocalNetwork: ((Bool) -> Void)?
     public var prepareAlternateDatagramPath: ((@escaping (DatagramEndpoint?) -> Void) -> Void)?
     public var onDatagramPathRetired: (() -> Void)?
     public var isRelayedDatagram: ((NWEndpoint) -> Bool)?
@@ -83,6 +85,7 @@ public final class MediaSession: @unchecked Sendable {
         var packet: VideoPacket?
         var diagnostic: PerformanceDiagnostics.Token?
         var frameSubmitted = false
+        var localNetwork = false
     }
     private struct Datagram {
         let header: MediaFrameHeader
@@ -152,6 +155,8 @@ public final class MediaSession: @unchecked Sendable {
     private var lastPongAt: TimeInterval = 0
     private var livenessResumedAt: TimeInterval = 0
     private var roundTrip: TimeInterval = 0.01
+    private var controlRoundTrip: (milliseconds: Double, at: TimeInterval)?
+    private var reportedLocalNetwork: Bool?
     private var videoPeer: Peer?
     private var bulkPeer: Peer?
     private var videoBound = false
@@ -161,7 +166,7 @@ public final class MediaSession: @unchecked Sendable {
     private var pathMonitor: NWPathMonitor?
     private var pathFingerprint: PathFingerprint?
     private var policy: MediaPathPolicy
-    private var active: (stream: MediaStreamID, path: Path)?
+    private var active: (stream: MediaStreamID, path: Path, localNetwork: Bool)?
     private var transaction: Transaction?
     private var receiver: MediaFrameReassembler?
     private var lossWindow = MediaLossWindow()
@@ -310,6 +315,14 @@ public final class MediaSession: @unchecked Sendable {
         }
     }
 
+    public func recordControlRoundTrip(milliseconds: Double) {
+        guard milliseconds.isFinite, (0...60_000).contains(milliseconds) else { return }
+        queue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.controlRoundTrip = (milliseconds, SessionClock.now)
+        }
+    }
+
     public func setPaused(_ value: Bool) {
         queue.async { [weak self] in
             guard let self, !self.stopped, self.paused != value else { return }
@@ -330,6 +343,7 @@ public final class MediaSession: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
             self.udpVerified = false
+            self.controlRoundTrip = nil
             self.receivedChallenge = false
             self.challenge = nil
             self.udpPeer?.close("媒体网络路径变化，需要重新验证")
@@ -569,7 +583,7 @@ public final class MediaSession: @unchecked Sendable {
             guard side == .viewer, var pending = transaction, pending.id == id, pending.stream == stream,
                   pending.path == path, pending.stage == .decoded, let packet = pending.packet else { return }
             pending.stage = .committed; transaction = pending
-            active = (stream, path)
+            active = (stream, path, pending.localNetwork)
             diagnostics?.record(.mediaSwitch, since: pending.diagnostic, kind: .mediaFrame, identifier: 1)
             recordTransport(path)
             onCommitStream?(stream, packet)
@@ -582,7 +596,7 @@ public final class MediaSession: @unchecked Sendable {
         case .committed:
             guard side == .host, let pending = transaction, pending.id == id,
                   pending.stream == stream, pending.path == path, pending.stage == .decoded else { return }
-            active = (stream, path); transaction = nil; recoveryHold = false
+            active = (stream, path, pending.localNetwork); transaction = nil; recoveryHold = false
             recordTransport(path)
             onState?(stateLabel(path)); onResumeFrames?()
         case .abort:
@@ -868,10 +882,17 @@ public final class MediaSession: @unchecked Sendable {
         transportEpoch += 1; codecEpoch += 1
         var pending = Transaction(id: UUID(), stream: MediaStreamID(sessionID: sessionID,
             transportEpoch: transportEpoch, codecEpoch: codecEpoch), path: path, started: SessionClock.now)
+        pending.localNetwork = localNetworkClassification(path) ?? false
         pending.diagnostic = diagnostics?.start()
         transaction = pending
+        reportLocalNetwork()
         // Same-path recoveries are counted by diagnostics; only route changes are reported with a cause.
-        if active?.path != path { onPathSwitch?(stateLabel(path), cause) }
+        if active?.path != path {
+            sampleStartedAt = SessionClock.now; samplePackets = 0; sampleFrames = 0; sampleWaitMilliseconds = 0
+            sampleBytes = 0; sampleSettledFragments = 0; sampleLostFragments = 0; sampleDeliveryMilliseconds = nil
+            sampleEncode = MediaComputeTiming(); sampleDecode = MediaComputeTiming(); sampleDirectReduction = false
+            onPathSwitch?(stateLabel(path), cause)
+        }
         onState?(active == nil ? "正在准备视频" : "正在恢复画面")
         sendTransaction(.prepare, pending)
     }
@@ -888,11 +909,11 @@ public final class MediaSession: @unchecked Sendable {
             if pending.path == .udp { onDatagramLoss?(lossWindow.fraction(at: SessionClock.now)) }
             receiver = nil; decoding.removeAll(); reassembledLocally.removeAll()
             onState?("正在恢复画面")
-            if mediaFailure { sampleDirectReduction = true; onReduceLoad?(.network) }
+            if mediaFailure { reportReduction(.network, localNetwork: pending.localNetwork) }
             if mediaFailure, pending.path != .udp { reliableDeliveryFailed() }
             if mediaFailure, pending.path == .udp {
                 retryAt = 0; retryPath = nil
-                handleActions(policy.mediaFailed(epoch: policy.epoch, now: SessionClock.now))
+                handleActions(policy.mediaFailed(epoch: policy.epoch, now: SessionClock.now), localNetwork: pending.localNetwork)
             }
         }
     }
@@ -957,7 +978,7 @@ public final class MediaSession: @unchecked Sendable {
                             self.lastDecodedAt = now
                             self.sampleFrames += 1
                         }
-                        if !success { self.sampleDirectReduction = true; self.onReduceLoad?(.decoder) }
+                        if !success { self.reportReduction(.decoder) }
                         self.handleReceiveEvents(self.receiver?.decoded(frame.header, success: success) ?? [], decoderFailure: !success)
                         if !success, self.transaction?.stream == frame.header.stream {
                             self.abortTransaction(retry: true)
@@ -1211,6 +1232,13 @@ public final class MediaSession: @unchecked Sendable {
             if now - sampleStartedAt >= 1 {
                 collectLoss()
                 let duration = min(5, now - sampleStartedAt)
+                let localNetwork = reportLocalNetwork()
+                // Control heartbeats arrive every five seconds. Never reuse an old route's UDP RTT,
+                // or the initial 10 ms estimate, as evidence that the current video path is healthy.
+                var measuredRoundTrip = controlRoundTrip.flatMap { now - $0.at < 6 ? $0.milliseconds : nil }
+                if (transaction?.path ?? active?.path) == .udp, udpVerified, lastPongAt > 0, now - lastPongAt < 1 {
+                    measuredRoundTrip = max(measuredRoundTrip ?? 0, roundTrip * 1_000)
+                }
                 let sample = MediaPathSample(duration: duration,
                     mediaActive: now - lastVideoAt < 1, networkSamples: samplePackets, decodedFrames: sampleFrames,
                     lossFraction: sampleSettledFragments >= MediaLossWindow.minimumFragments
@@ -1219,9 +1247,10 @@ public final class MediaSession: @unchecked Sendable {
                     encodeMilliseconds: sampleEncode.mean, decodeMilliseconds: sampleDecode.mean,
                     frameBudgetMilliseconds: 1000 / Double(settings.framesPerSecond),
                     deliveryMilliseconds: sampleDeliveryMilliseconds,
-                    receivedMegabits: Double(sampleBytes) * 8 / duration / 1_000_000)
+                    receivedMegabits: Double(sampleBytes) * 8 / duration / 1_000_000,
+                    isLocalNetwork: localNetwork, roundTripMilliseconds: measuredRoundTrip)
                 let actions = policy.observe(sample, epoch: policy.epoch, now: now)
-                if !sampleDirectReduction, !actions.contains(where: { if case .reduceLoad = $0 { return true }; return false }) { onSample?(sample) }
+                if localNetwork || (!sampleDirectReduction && !actions.contains(where: { if case .reduceLoad = $0 { return true }; return false })) { onSample?(sample) }
                 // A UDP trial that has not committed yet is when loss explains a fallback, so follow
                 // the path currently receiving video rather than only the committed one.
                 onDatagramLoss?((transaction?.path ?? active?.path) == .udp ? lossWindow.fraction(at: now) : nil)
@@ -1244,7 +1273,7 @@ public final class MediaSession: @unchecked Sendable {
         pumpDatagrams()
     }
 
-    private func handleActions(_ actions: [MediaPathAction]) {
+    private func handleActions(_ actions: [MediaPathAction], localNetwork: Bool? = nil) {
         guard side == .viewer, !stopped else { return }
         for action in actions {
             switch action {
@@ -1260,7 +1289,7 @@ public final class MediaSession: @unchecked Sendable {
                 if path == .tcp, reason == .noPong { retireDatagramPath() }
                 if transaction != nil { abortTransaction(retry: false) }
                 beginSwitch(path == .udp ? .udp : videoBound ? .tcp : .shared, cause: .policy(reason))
-            case .reduceLoad(let bottleneck): onReduceLoad?(bottleneck)
+            case .reduceLoad(let bottleneck): reportReduction(bottleneck, localNetwork: localNetwork)
             case .retryUDP:
                 // The lower quality requested with this failure reaches the host before the fresh keyframe.
                 if transaction != nil { abortTransaction(retry: false) }
@@ -1268,6 +1297,39 @@ public final class MediaSession: @unchecked Sendable {
             case .restartSession: control.close("媒体传输代次已耗尽，请重新连接", retryable: true)
             }
         }
+    }
+
+    @discardableResult
+    private func reportLocalNetwork(_ failedRoute: Bool? = nil) -> Bool {
+        let local = failedRoute ?? localNetworkClassification(transaction?.path ?? active?.path ?? .shared)
+            ?? transaction?.localNetwork ?? active?.localNetwork ?? false
+        if failedRoute == nil {
+            if transaction != nil { transaction?.localNetwork = local }
+            else if active != nil { active?.localNetwork = local }
+        }
+        if reportedLocalNetwork != local {
+            reportedLocalNetwork = local
+            onLocalNetwork?(local)
+        }
+        return local
+    }
+
+    private func localNetworkClassification(_ path: Path) -> Bool? {
+        switch path {
+        case .udp: return udpRelayed ? false : udpPeer?.localNetworkClassification
+        case .tcp: return initialDatagramRelayed ? false : videoPeer?.localNetworkClassification
+        case .shared: return initialDatagramRelayed ? false : control.localNetworkClassification
+        }
+    }
+
+    private func reportReduction(_ cause: MediaBottleneck, localNetwork: Bool? = nil) {
+        // A closed connection may no longer have a NWPath. Keep the failed epoch's known classification;
+        // every new transaction starts from its own connection, including switches to a relay.
+        let local = reportLocalNetwork(localNetwork ?? transaction?.localNetwork ?? active?.localNetwork)
+        // LAN reductions require sustained latency samples; a decoder or delivery failure alone must
+        // neither lower the chosen ceiling nor hide the latency window from that policy.
+        if !local { sampleDirectReduction = true }
+        onReduceLoad?(cause)
     }
 
     private func retireDatagramPath() {

@@ -25,7 +25,8 @@ func packet(_ seq: UInt32, idr: Bool, largeIDR: Bool = false) -> VideoPacket {
 enum PrepareHookCheck { case unchecked, boundStream, fallback }
 func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
               failRecoveryCandidate: Bool = false, pauseResume: Bool = false, stopCandidate: Bool = false, pathFailure: Bool = false, legacy: Bool = false, restoreUDP: Bool = false, inspectDiagnostics: Bool = false, largeIDR: Bool = false, overlapPrepare: Bool = false, prepareHook: PrepareHookCheck = .unchecked,
-              delayedDecode: Bool = false, stalledDecode: Bool = false, liveBitrate: Bool = false) throws {
+              delayedDecode: Bool = false, stalledDecode: Bool = false, liveBitrate: Bool = false,
+              inspectRoundTrip: Bool = false) throws {
     let key = try PairingKey.generate(), settings = StreamSettings(longestEdge:1920,framesPerSecond:60,megabits:12)
     let queue = DispatchQueue(label:"session.loopback-listener")
     let params = try MediaSecureTransport.tlsParameters(key:key,roles:MediaChannelRole.allCases)
@@ -42,6 +43,8 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     let diagnostics = inspectDiagnostics ? PerformanceDiagnostics(enabled:true) : nil
     let sampledCompute = DispatchSemaphore(value:0)
     let reductions=Box<[MediaBottleneck]>([])
+    let localRoutes=Box<[Bool]>([]), roundTripSamples=Box<[MediaPathSample]>([])
+    let roundTripSampled=DispatchSemaphore(value:0)
     let pathSwitches=Box<[(String,MediaSwitchCause)]>([])
     let overlapSent=Box(false)
     let cursorID = UUID()
@@ -111,9 +114,17 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             let session=try MediaSession.viewer(control:client,key:key,host:"127.0.0.1",port:listener.port!.rawValue,settings:settings,udpEnabled:udp)
             viewerSession.update{$0=session}
             session.diagnostics=diagnostics
-            session.onReduceLoad={ cause in reductions.update{$0.append(cause)} }
+            session.onLocalNetwork={ local in localRoutes.update{$0.append(local)} }
+            session.onReduceLoad={ cause in
+                if localRoutes.get().last != false { errors.update{$0.append("Loopback reduction preceded its non-LAN classification")} }
+                reductions.update{$0.append(cause)}
+            }
             session.onPathSwitch={ label,cause in pathSwitches.update{$0.append((label,cause))} }
             session.onSample={ sample in
+                if localRoutes.get().last != false || sample.isLocalNetwork {
+                    errors.update{$0.append("Loopback sample used LAN policy or preceded its route classification")}
+                }
+                if inspectRoundTrip { roundTripSamples.update{$0.append(sample)};roundTripSampled.signal() }
                 if (sample.encodeMilliseconds ?? 0)>=45 && (sample.decodeMilliseconds ?? 0)>=2 { sampledCompute.signal() }
                 if sample.deliveryMilliseconds != nil, (sample.receivedMegabits ?? 0) > 0 { deliverySampled.signal() }
             }
@@ -215,6 +226,29 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     let firstCause: MediaSwitchCause = udp ? .policy(.initialProbe) : .initial
     try require(pathSwitches.get().contains{ $0.0 == expected && $0.1 == firstCause },"Initial path switch did not report its cause \(pathSwitches.get())")
     try require(!decoded.get().isEmpty,"No decoded media frame")
+    try require(localRoutes.get() == [false] && !client.isLocalNetwork,
+                "A connected loopback route was not explicitly classified as non-LAN: \(localRoutes.get())")
+    if inspectRoundTrip {
+        try wait(roundTripSampled,"Media route did not publish its first RTT sample",seconds:3)
+        if udp {
+            try require(roundTripSamples.get().contains { $0.roundTripMilliseconds.map { $0.isFinite && $0 > 0 && $0 < 1_000 } == true },
+                        "Authenticated UDP pongs did not provide measured RTT")
+        } else {
+            try require(roundTripSamples.get().allSatisfy { $0.roundTripMilliseconds == nil },
+                        "Initial TCP RTT used an unmeasured default estimate")
+            viewerSession.get()?.recordControlRoundTrip(milliseconds:200)
+            for invalid in [-1.0, .nan, .infinity, 60_001] { viewerSession.get()?.recordControlRoundTrip(milliseconds:invalid) }
+            try wait(roundTripSampled,"A measured control RTT did not reach the media sample",seconds:3)
+            try require(roundTripSamples.get().last?.roundTripMilliseconds == 200,
+                        "Valid control RTT was lost or overwritten by an invalid observation")
+            let deadline=SessionClock.now+7
+            while roundTripSamples.get().last?.roundTripMilliseconds != nil, SessionClock.now<deadline {
+                try wait(roundTripSampled,"RTT observation stopped before expiry",seconds:2)
+            }
+            try require(roundTripSamples.get().last?.roundTripMilliseconds == nil,
+                        "Control RTT remained usable more than six seconds after its observation")
+        }
+    }
     if delayedDecode {
         try wait(delayedFrameDone, "A delayed complete frame did not finish decoding")
         Thread.sleep(forTimeInterval: 0.3)
@@ -359,6 +393,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
   func run(_ name: String, _ body: () throws -> Void) {
    if CommandLine.arguments.contains("--large-only") && !name.contains("512 KiB") { return }
    if CommandLine.arguments.contains("--prepare-only") && !name.contains("onPrepare") { return }
+   if CommandLine.arguments.contains("--local-network-only") && !name.contains("Local-network") { return }
    do { try body();passed += 1;print("PASS",name) }
    catch { failed += 1;print("FAIL",name,error) }
   }
@@ -375,6 +410,9 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     throw Failure(message:"Zero media port was accepted")
   }
   if !CommandLine.arguments.contains("--skip-network") {
+   run("Local-network classification excludes loopback UDP and reports authenticated RTT") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,inspectRoundTrip:true) }
+   run("Local-network classification excludes loopback TCP and expires measured control RTT") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false,inspectRoundTrip:true) }
+   run("Local-network classification excludes framed shared loopback TCP") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false) }
    run("Optional onPrepareStream binds each exact generation before candidate video and commit") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true,prepareHook:.boundStream) }
    run("Absent onPrepareStream preserves default onPrepareRecovery for candidates and configuration hold") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true,prepareHook:.fallback) }
    run("Legacy peers keep configuration and pause recovery unchanged") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false,legacy:true) }

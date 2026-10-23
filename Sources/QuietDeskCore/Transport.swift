@@ -62,6 +62,9 @@ public final class Peer {
     public var onRoundTripMilliseconds: ((Double) -> Void)?
     public private(set) var closeIsRetryable = false
     public private(set) var closeAllowsAlternateRoute = false
+    public var isLocalNetwork: Bool { localNetworkClassification == true }
+    private let localNetworkStatus = LocalNetworkStatus()
+    var localNetworkClassification: Bool? { localNetworkStatus.read(connection.currentPath) }
     private let connection: NWConnection
     private var closed = false
     private var started = false

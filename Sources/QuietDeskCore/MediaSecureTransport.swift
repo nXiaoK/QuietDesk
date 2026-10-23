@@ -103,6 +103,9 @@ public final class BoundedDatagramPeer: @unchecked Sendable {
 
     public var pendingBytes: Int { lock.withLock { reservedBytes } }
     public var endpoint: NWEndpoint { connection.endpoint }
+    public var isLocalNetwork: Bool { localNetworkClassification == true }
+    private let localNetworkStatus = LocalNetworkStatus()
+    var localNetworkClassification: Bool? { localNetworkStatus.read(connection.currentPath) }
     public var maximumEffectiveDatagramBytes: Int { lock.withLock { effectiveDatagramBytes } }
 
     public func start() {

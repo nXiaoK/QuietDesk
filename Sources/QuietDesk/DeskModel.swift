@@ -94,6 +94,7 @@ final class DeskModel: ObservableObject {
     @Published private(set) var relayPeerStatus = ""
     // Share of UDP video fragments that missed the reorder window over about five seconds; empty off UDP.
     @Published private(set) var mediaLoss = ""
+    @Published private(set) var localNetworkQuality = false
     private var mediaLossFraction: Double?
     // Applied frame rate and bitrate next to the video size; automatic changes never exceed the chosen ceiling.
     var videoQualitySummary: String {
@@ -102,7 +103,9 @@ final class DeskModel: ObservableObject {
     }
     var videoQualityHelp: String {
         guard mode == .viewer, supportsMediaTransport else { return "当前编码帧率上限与目标码率" }
-        let help = "当前生效的帧率上限与目标码率，按网络丢包、延迟和编解码速度自动调整，不超过所选：\(viewerSettings.summary)"
+        let help = localNetworkQuality
+            ? "局域网优先保持所选画质：\(viewerSettings.summary)。延迟达到 150 ms 持续 5 秒才降档，低于 50 ms 持续 3 秒恢复；实际帧率仍受屏幕和硬件限制。"
+            : "当前生效的帧率上限与目标码率，按网络丢包、延迟和编解码速度自动调整，不超过所选：\(viewerSettings.summary)"
         return automaticQualityNote.isEmpty ? help : help + "\n" + automaticQualityNote
     }
     /// Why the applied quality is below the choice, after an automatic reduction; empty otherwise.
@@ -110,6 +113,8 @@ final class DeskModel: ObservableObject {
 
     static func qualityNote(_ adjustment: MediaQualityPolicy.Adjustment?, applied: StreamSettings) -> String {
         switch adjustment {
+        case .localLatency?:
+            return "局域网延迟达到 150 ms 持续 5 秒，已自动调整为 \(applied.summary)"
         case .network?:
             return "网络丢包或延迟升高，已自动调整为 \(applied.summary)"
         case .compute(let cause, let milliseconds?)? where milliseconds.isFinite && milliseconds > 0:
@@ -520,13 +525,14 @@ final class DeskModel: ObservableObject {
     }
 
     /// An automatic change also records why it was made: 1 network, 2 raised, 3 host encoder, 4 local decoder,
-    /// with the measured time per frame of the slower codec when compute pressure caused it.
+    /// 5 sustained LAN latency; with the slower codec's time per frame for compute pressure.
     private func recordVideoConfiguration(_ state: VideoStreamState, succeeded: Bool = true,
                                           adjustment: MediaQualityPolicy.Adjustment? = nil) {
         var values: [DiagnosticLog.Field: Int] = [.width: state.width, .height: state.height, .fps: state.settings.framesPerSecond,
                                                    .targetBitrate: state.settings.megabits * 1_000_000,
                                                    .maximumDimension: state.settings.longestEdge]
         switch adjustment {
+        case .localLatency?: values[.qualityCause] = 5
         case .network?: values[.qualityCause] = 1
         case .raise?: values[.qualityCause] = 2
         case .compute(let cause, let milliseconds)?:
@@ -1426,7 +1432,16 @@ final class DeskModel: ObservableObject {
         media.onPathSwitch = { [weak self, weak viewer] value, cause in
             DispatchQueue.main.async {
                 guard let self, let viewer, self.viewerSession === viewer else { return }
+                viewer.mediaQuality?.resetObservation(now: SessionClock.now)
                 self.recordMediaPathSwitch(value, cause: cause, relayed: viewer.usesRelayControl)
+            }
+        }
+        media.onLocalNetwork = { [weak self, weak viewer] local in
+            DispatchQueue.main.async {
+                guard let self, let viewer, self.viewerSession === viewer else { return }
+                self.localNetworkQuality = local
+                viewer.mediaQuality?.setLocalNetwork(local, now: SessionClock.now)
+                self.automaticQualityNote = ""
             }
         }
         media.onReduceLoad = { [weak self, weak viewer] cause in
@@ -1818,6 +1833,7 @@ final class DeskModel: ObservableObject {
                 }
                 self.latency = String(format: milliseconds < 10 ? "%.1f ms" : "%.0f ms", milliseconds)
                 viewer.lastLatencyAt = SessionClock.now
+                viewer.media?.recordControlRoundTrip(milliseconds: milliseconds)
                 self.viewerQualityPolicy.observeRoundTrip(milliseconds)
                 self.applyInitialVideoQualityIfReady()
             }
@@ -3396,6 +3412,7 @@ final class DeskModel: ObservableObject {
         mediaRouteValue = ""; peerPathState = .relay; relayPeerStatus = ""
         mediaLoss = ""; mediaLossFraction = nil
         automaticQualityNote = ""
+        localNetworkQuality = false
         supportsMediaTransport = false
         supportsIndependentCursor = false
         cursorStatus = "视频光标"

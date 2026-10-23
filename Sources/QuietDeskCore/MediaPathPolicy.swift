@@ -83,25 +83,29 @@ public struct MediaPathSample: Sendable {
     public let deliveryMilliseconds: Double?
     // Video payload actually received in this window, used to tell a filled link from a quiet screen.
     public let receivedMegabits: Double?
+    // Classified from the active transport route; a low RTT alone does not identify a local network.
+    public let isLocalNetwork: Bool
+    public let roundTripMilliseconds: Double?
 
     public init(duration: TimeInterval, mediaActive: Bool, networkSamples: Int, decodedFrames: Int,
                 lossFraction: Double? = nil, jitterMilliseconds: Double? = nil, queueMilliseconds: Double? = nil,
                 encodeMilliseconds: Double? = nil, decodeMilliseconds: Double? = nil,
                 frameBudgetMilliseconds: Double = 1_000 / 60, deliveryMilliseconds: Double? = nil,
-                receivedMegabits: Double? = nil) {
+                receivedMegabits: Double? = nil, isLocalNetwork: Bool = false, roundTripMilliseconds: Double? = nil) {
         self.duration = duration; self.mediaActive = mediaActive
         self.networkSamples = networkSamples; self.decodedFrames = decodedFrames
         self.lossFraction = lossFraction; self.jitterMilliseconds = jitterMilliseconds
         self.queueMilliseconds = queueMilliseconds; self.encodeMilliseconds = encodeMilliseconds
         self.decodeMilliseconds = decodeMilliseconds; self.frameBudgetMilliseconds = frameBudgetMilliseconds
         self.deliveryMilliseconds = deliveryMilliseconds; self.receivedMegabits = receivedMegabits
+        self.isLocalNetwork = isLocalNetwork; self.roundTripMilliseconds = roundTripMilliseconds
     }
 
     var isValid: Bool {
         guard duration.isFinite, duration > 0, duration <= 5, networkSamples >= 0, decodedFrames >= 0,
               frameBudgetMilliseconds.isFinite, frameBudgetMilliseconds > 0 else { return false }
         for value in [lossFraction, jitterMilliseconds, queueMilliseconds, encodeMilliseconds, decodeMilliseconds,
-                      deliveryMilliseconds, receivedMegabits] {
+                      deliveryMilliseconds, receivedMegabits, roundTripMilliseconds] {
             if let value, !value.isFinite || value < 0 { return false }
         }
         return lossFraction.map { $0 <= 1 } ?? true
@@ -464,7 +468,7 @@ public struct MediaQualityPolicy: Sendable {
 
     /// Why the last automatic recommendation was made, for diagnostics and the quality tooltip.
     public enum Adjustment: Equatable, Sendable {
-        case network, raise
+        case network, localLatency, raise
         case compute(MediaBottleneck, milliseconds: Double?)
     }
 
@@ -474,6 +478,7 @@ public struct MediaQualityPolicy: Sendable {
     public private(set) var upperBound: StreamSettings
     public private(set) var effective: StreamSettings
     public private(set) var pending: StreamSettings?
+    public private(set) var isLocalNetwork = false
     public private(set) var upgradeHold = MediaQualityPolicy.initialUpgradeHold
     public private(set) var bitrateHold = MediaQualityPolicy.initialBitrateHold
     private let bitRates: [Int]
@@ -533,13 +538,21 @@ public struct MediaQualityPolicy: Sendable {
         return pending
     }
 
+    /// Route changes discard mixed-path timing evidence, but retain an in-flight settings request.
+    public mutating func setLocalNetwork(_ enabled: Bool, now: TimeInterval) {
+        guard accept(now), isLocalNetwork != enabled else { return }
+        isLocalNetwork = enabled
+        lastObservationAt = now
+        resetEvidence()
+    }
+
     /// `severe` halves the bitrate at once, for loss that is already breaking frames. For compute pressure,
     /// `computeMilliseconds` (the slower codec's measured time per frame) picks the frame rate it sustains;
-    /// without it, as after a failed decode, the pixel load drops first.
+    /// without it, as after a failed decode, the pixel load drops first. Local links require observed delay instead.
     public mutating func reduceLoad(for cause: MediaBottleneck, severe: Bool = false, computeMilliseconds: Double? = nil,
                                     now: TimeInterval) -> StreamSettings? {
         let spacing: TimeInterval = cause != .network ? 3 : severe ? 1 : 2
-        guard accept(now), pending == nil, now - lastChangeAt + mediaPolicyTimeTolerance >= spacing else { return nil }
+        guard accept(now), !isLocalNetwork, pending == nil, now - lastChangeAt + mediaPolicyTimeTolerance >= spacing else { return nil }
         settleUpgrade(now: now)
         var next = StreamSettings(longestEdge: min(effective.longestEdge, upperBound.longestEdge),
                                   framesPerSecond: min(effective.framesPerSecond, upperBound.framesPerSecond),
@@ -570,16 +583,48 @@ public struct MediaQualityPolicy: Sendable {
         return nil
     }
 
-    // When a coordinator consumes MediaPathAction.reduceLoad, it calls reduceLoad directly;
-    // it must not also submit the same bad window here as a second adaptation source.
+    // Direct path failures already adapt nonlocal links, so their bad windows must not adapt twice.
+    // Local links still need sampled delay after a path action asks to reduce the load.
     public mutating func observe(_ sample: MediaPathSample, now: TimeInterval) -> StreamSettings? {
-        guard accept(now), sample.isValid else { return nil }
+        guard accept(now) else { return nil }
+        guard sample.isValid else {
+            if isLocalNetwork { lastObservationAt = now; resetEvidence() }
+            return nil
+        }
+        setLocalNetwork(sample.isLocalNetwork, now: now)
         settleUpgrade(now: now)
         let elapsed = min(sample.duration, max(0, now - lastObservationAt))
         if now - lastObservationAt > sample.duration + 0.5 { resetEvidence() }
         lastObservationAt = now
         guard elapsed > 0 else { return nil }
         guard sample.mediaActive, pending == nil else { resetEvidence(); return nil }
+        if isLocalNetwork {
+            // Local links keep the chosen quality despite codec load or loss. Only sustained delay
+            // reduces the load, including when congestion prevents frames from finishing decoding.
+            guard let delay = [sample.deliveryMilliseconds, sample.roundTripMilliseconds].compactMap({ $0 }).max() else {
+                resetEvidence()
+                return nil
+            }
+            if delay >= 150 {
+                healthyDuration = 0
+                congestedDuration += elapsed
+                guard congestedDuration + mediaPolicyTimeTolerance >= 5 else { return nil }
+                congestedDuration = 0
+                let current = StreamSettings(longestEdge: min(effective.longestEdge, upperBound.longestEdge),
+                                             framesPerSecond: min(effective.framesPerSecond, upperBound.framesPerSecond),
+                                             megabits: min(effective.megabits, upperBound.megabits))
+                let next = networkReduction(from: current, factor: 0.75)
+                guard next != effective else { return nil }
+                lastAdjustment = .localLatency
+                return recommend(next, now: now)
+            }
+            congestedDuration = 0
+            guard delay < 50, sample.decodedFrames > 0 else { healthyDuration = 0; return nil }
+            healthyDuration += elapsed
+            guard healthyDuration + mediaPolicyTimeTolerance >= 3, effective != upperBound else { return nil }
+            lastAdjustment = .raise
+            return recommend(upperBound, now: now)
+        }
         if let cause = sample.bottleneck, cause != .network {
             congestedDuration = 0; healthyDuration = 0; filledDuration = 0; peakComputeMilliseconds = nil
             if cause != lastBottleneck { computeDuration = 0 }

@@ -179,16 +179,17 @@ struct FullScreenSettingsView: View {
     let openTraffic: () -> Void
     let openEffects: () -> Void
     @State private var showingCaps = false
+    @State private var showingDesktopActions = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top, spacing: 8) {
-                if showingCaps {
-                    Button { showingCaps = false } label: { Image(systemName: "chevron.left") }
+                if showingCaps || showingDesktopActions {
+                    Button { showingCaps = false; showingDesktopActions = false } label: { Image(systemName: "chevron.left") }
                         .buttonStyle(.plain).frame(width: 20, height: 24).help("返回控制与设置")
                 }
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(showingCaps ? "键盘与快捷键" : (model.remoteName.isEmpty ? "控制与设置" : model.remoteName))
+                    Text(showingCaps ? "键盘与快捷键" : showingDesktopActions ? "远端桌面" : (model.remoteName.isEmpty ? "控制与设置" : model.remoteName))
                         .font(.system(size: 13, weight: .semibold)).lineLimit(1)
                     if showingCaps {
                         Text("仅在远程画面获得焦点时捕获")
@@ -209,6 +210,10 @@ struct FullScreenSettingsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     if showingCaps {
                         CapsLockDetails(model: model, compact: true)
+                    } else if showingDesktopActions {
+                        RemoteDesktopActionsView(unavailableReason: model.desktopActionUnavailableReason,
+                            status: model.desktopActionStatus, privacyEnabled: model.sessionEffects.privacy,
+                            perform: model.sendDesktopAction)
                     } else {
                         HStack(spacing: 8) {
                             Button { model.canvas.releaseControl() } label: {
@@ -223,6 +228,17 @@ struct FullScreenSettingsView: View {
                                     Text("⌃⌘F").font(.system(size: 10)).foregroundStyle(.secondary)
                                 }.frame(maxWidth: .infinity)
                             }
+                        }
+                        .buttonStyle(.bordered).controlSize(.regular)
+                        Button {
+                            model.canvas.releaseControl()
+                            showingDesktopActions = true
+                        } label: {
+                            HStack {
+                                Label("桌面", systemImage: "rectangle.3.group")
+                                Spacer(minLength: 4)
+                                Image(systemName: "chevron.right")
+                            }.frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.bordered).controlSize(.regular)
                         Button { model.copyRemoteFrame() } label: {

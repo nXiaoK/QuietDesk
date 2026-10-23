@@ -144,6 +144,7 @@ struct DeskView: View {
     @ObservedObject var model: DeskModel
     @ObservedObject var updates: UpdateController
     @State private var showCapsSettings = false
+    @State private var showDesktopActions = false
     @State private var showOptions = false
     @State private var showFullScreenMenu = false
     @State private var showTrafficStatistics = false
@@ -214,6 +215,17 @@ struct DeskView: View {
                         .help("获取远端剪贴板文字").disabled(!model.connected)
                     Button { model.copyRemoteFrame() } label: { Label("截取画面", systemImage: "camera.viewfinder") }
                         .help("把当前远端画面复制到剪贴板（⌃⌘S），防窥遮罩不会出现在截图里").disabled(!model.connected)
+                    Button { model.canvas.releaseControl(); showDesktopActions.toggle() } label: {
+                        Label("桌面", systemImage: "rectangle.3.group")
+                    }
+                    .help("切换远端空间，或打开调度中心选择桌面")
+                    .disabled(!model.connected)
+                    .popover(isPresented: $showDesktopActions, arrowEdge: .top) {
+                        RemoteDesktopActionsView(unavailableReason: model.desktopActionUnavailableReason,
+                            status: model.desktopActionStatus, privacyEnabled: model.sessionEffects.privacy,
+                            perform: model.sendDesktopAction)
+                            .padding(14).frame(width: 300)
+                    }
                     Button { model.canvas.releaseControl(); showCapsSettings = true } label: { Label("键盘设置", systemImage: "keyboard") }
                         .help("全屏系统快捷键与 Caps Lock 转发设置")
                     Button { model.canvas.releaseControl(); showOptions.toggle() } label: { Label("画质与连接", systemImage: "slider.horizontal.3") }
@@ -245,9 +257,9 @@ struct DeskView: View {
             set: { if !$0 { model.error = nil } })) {
             Button("知道了", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
-        .onChange(of: immersive) { _, _ in showFullScreenMenu = false; showOptions = false; showCapsSettings = false; showTrafficStatistics = false; showSessionEffects = false }
+        .onChange(of: immersive) { _, _ in showFullScreenMenu = false; showOptions = false; showCapsSettings = false; showTrafficStatistics = false; showSessionEffects = false; showDesktopActions = false }
         .onReceive(NotificationCenter.default.publisher(for: SystemQuitHandler.dismissSheets)) { _ in
-            showCapsSettings = false; showTrafficStatistics = false; showSessionEffects = false
+            showCapsSettings = false; showTrafficStatistics = false; showSessionEffects = false; showDesktopActions = false
         }
         .onReceive(model.$clipboardStatus) { _ in
             dismissedClipboardStatus = ""
@@ -268,10 +280,11 @@ struct DeskView: View {
             guard model.receivingFileID == nil, !model.receivedFilesKeptInFolder else { return }
             dismissedClipboardStatus = message
         }
-        .onChange(of: model.controlling) { _, controlling in if controlling { showFullScreenMenu = false; showOptions = false } }
-        .onChange(of: showOptions || showCapsSettings || showTrafficStatistics || showSessionEffects || showFullScreenMenu) { _, presented in
+        .onChange(of: model.controlling) { _, controlling in if controlling { showFullScreenMenu = false; showOptions = false; showDesktopActions = false } }
+        .onChange(of: showOptions || showCapsSettings || showTrafficStatistics || showSessionEffects || showFullScreenMenu || showDesktopActions) { _, presented in
             updates.interfacePromptVisible = presented
         }
+        .onChange(of: model.connected) { _, connected in if !connected { showDesktopActions = false } }
         .onDisappear { updates.interfacePromptVisible = false }
     }
 

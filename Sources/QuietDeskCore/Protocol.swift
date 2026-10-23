@@ -27,6 +27,8 @@ public enum MessageKind: UInt8, Sendable {
     case sessionUnlockRequest = 32, sessionUnlockResult
     // Sent only after sessionTerminationV1 is advertised and the viewer subscribes.
     case sessionTermination = 34
+    // Sent only after the host advertises desktopActionsV1.
+    case desktopActionRequest = 35, desktopActionResult
 }
 
 public struct Message: Sendable {
@@ -203,7 +205,8 @@ public struct Hello: Codable, Sendable {
     public let displayDimmingV1: Bool?
     public let builtInDisplayDimmable: Bool?
     public let sessionTerminationV1: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil) {
+    public let desktopActionsV1: Bool?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -234,6 +237,7 @@ public struct Hello: Codable, Sendable {
         self.displayDimmingV1 = displayDimmingV1
         self.builtInDisplayDimmable = builtInDisplayDimmable
         self.sessionTerminationV1 = sessionTerminationV1
+        self.desktopActionsV1 = desktopActionsV1
     }
 
     public func validate() throws {

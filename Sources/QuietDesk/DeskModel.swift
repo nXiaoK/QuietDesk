@@ -191,6 +191,18 @@ final class DeskModel: ObservableObject {
             UserDefaults.standard.set(data, forKey: "rememberedSessionEffects")
         }
     }
+    @Published private(set) var supportsDesktopActions = false
+    @Published private(set) var desktopActionWorking = false
+    @Published private(set) var desktopActionStatus = ""
+    var desktopActionUnavailableReason: String? {
+        if !connected { return "连接后可选择远端桌面" }
+        if !supportsDesktopActions { return "被控端需更新后才能使用桌面操作" }
+        if !canControl { return "当前仅观看，需被控端辅助功能权限生效" }
+        if sessionInputSuspended { return "画面暂停或恢复中，请稍候" }
+        if unlockWorking { return "正在解锁远端，请稍候" }
+        if desktopActionWorking { return "正在发送桌面操作…" }
+        return nil
+    }
     // Typing a saved lock screen password on the host after connecting (sessionUnlockV1).
     @Published private(set) var supportsSessionUnlock = false
     @Published private(set) var unlockWorking = false
@@ -383,7 +395,7 @@ final class DeskModel: ObservableObject {
         canvas.onInput = { [weak self] value in
             guard let self else { return }
             self.recordSessionActivity()
-            let allowed = self.wakeInputGate.allows(value, suspended: self.sessionInputSuspended || !self.connected)
+            let allowed = self.wakeInputGate.allows(value, suspended: self.sessionInputSuspended || self.desktopActionWorking || !self.connected)
             guard self.connected, self.canControl, allowed else {
                 if value.kind == .scroll { DiagnosticLog.shared.count(.scrollSuppressed) }
                 return
@@ -422,12 +434,12 @@ final class DeskModel: ObservableObject {
         canvas.onPaste = { [weak self] input in
             guard let self, let peer = self.peer, self.connected else { return }
             self.recordSessionActivity()
-            guard !self.sessionInputSuspended else { return }
+            guard !self.sessionInputSuspended, !self.desktopActionWorking else { return }
             let interaction = self.canvas.interactionRevision
             self.clipboardStatus = "正在等待剪贴板同步后粘贴…"
             self.clipboardSync?.prepareForPaste { [weak self, weak peer] success in
                 guard let self, let peer, self.peer === peer, self.connected else { return }
-                guard success, !self.sessionInputSuspended, self.canvas.interactionRevision == interaction,
+                guard success, !self.sessionInputSuspended, !self.desktopActionWorking, self.canvas.interactionRevision == interaction,
                       self.canvas.window?.firstResponder === self.canvas, self.canvas.window?.isKeyWindow == true else {
                     self.clipboardStatus = "粘贴未执行：同步失败、焦点离开或等待期间进行了其他操作"
                     return
@@ -625,7 +637,7 @@ final class DeskModel: ObservableObject {
             }
         }
 
-        canvas.updateSystemShortcutCapture(sessionActive: mode == .viewer && connected && canControl && !sessionInputSuspended,
+        canvas.updateSystemShortcutCapture(sessionActive: mode == .viewer && connected && canControl && !sessionInputSuspended && !desktopActionWorking,
             accessibility: accessibility, inputMonitoring: inputMonitoring, retry: retryCapsLock)
         guard mode == .viewer, capsLockEnabled else {
             canvas.capsLockMonitor.stop()
@@ -654,7 +666,7 @@ final class DeskModel: ObservableObject {
             }
         }
         if capsLockRunning != canvas.capsLockMonitor.isRunning { capsLockRunning = canvas.capsLockMonitor.isRunning }
-        canvas.usesCapsLockActions = capsLockRunning && supportsInputActions && canControl && !sessionInputSuspended
+        canvas.usesCapsLockActions = capsLockRunning && supportsInputActions && canControl && !sessionInputSuspended && !desktopActionWorking
         let outdated = "远端版本较旧，请更新家里 Mac 后使用 Caps Lock 切换输入法"
         if connected, !supportsInputActions, inputStatus != outdated { inputStatus = outdated }
     }
@@ -1202,7 +1214,7 @@ final class DeskModel: ObservableObject {
                             adaptiveVideoV1: true, sessionUnlockV1: true, screenLocked: ScreenLockState.isLockedOnConsole,
                             higherFrameRateVideoV1: true, preferredHigherFrameRateSettings: preferredSettings,
                             displayDimmingV1: true, builtInDisplayDimmable: host.effects?.canDimBuiltInDisplay == true,
-                            sessionTerminationV1: true)))
+                            sessionTerminationV1: true, desktopActionsV1: true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -2028,6 +2040,8 @@ final class DeskModel: ObservableObject {
 
     private func handleHost(_ message: Message, peer: Peer) async throws {
         switch message.kind {
+        case .desktopActionRequest:
+            applyHostDesktopAction(try Wire.readJSON(DesktopActionRequest.self, message.payload), peer: peer)
         case .sessionTermination:
             let notification = try SessionTermination.read(message.payload)
             guard notification.operation == .subscribe else { throw DeskError.invalid("结束连接消息方向无效") }
@@ -2061,6 +2075,7 @@ final class DeskModel: ObservableObject {
         case .input:
             let input = try Wire.readJSON(RemoteInput.self, message.payload)
             try input.validate()
+            if hostSession.desktopActionTask != nil { return }
             // Keys from the viewer must not mix into the password being typed on the lock screen.
             if hostSession.unlocker?.typing == true, [.keyDown, .keyUp, .flags].contains(input.kind) { return }
             if input.kind == .scroll {
@@ -2101,6 +2116,16 @@ final class DeskModel: ObservableObject {
 
     private func handleViewer(_ message: Message, peer: Peer) throws {
         switch message.kind {
+        case .desktopActionResult:
+            guard supportsDesktopActions else { throw DeskError.invalid("桌面操作未协商") }
+            let result = try Wire.readJSON(DesktopActionResult.self, message.payload)
+            guard let request = viewerSession.desktopActionRequest, request.id == result.id else { return }
+            viewerSession.desktopActionTimeout?.cancel()
+            viewerSession.desktopActionTimeout = nil
+            viewerSession.desktopActionRequest = nil
+            desktopActionWorking = false
+            desktopActionStatus = result.error ?? "已向远端发送“\(request.action.title)”快捷键；请点按远端画面继续。"
+            publishSessionPause()
         case .sessionTermination:
             guard viewerSession.helloReceived, viewerSession.terminationSubscribed else {
                 throw DeskError.invalid("当前连接未启用结束通知")
@@ -2206,6 +2231,7 @@ final class DeskModel: ObservableObject {
             hostDisplayDimmable = supportsDisplayDimming && hello.builtInDisplayDimmable == true
             supportsAdaptiveVideo = supportsHighRefreshVideoSettings && hello.adaptiveVideoV1 == true
             supportsSessionUnlock = hello.sessionUnlockV1 == true
+            supportsDesktopActions = hello.desktopActionsV1 == true
             refreshUnlockState()
             if supportsLiveSettings {
                 let hostDefault = supportsHigherFrameRateVideo ? (hello.preferredHigherFrameRateSettings ?? hello.preferredHighRefreshSettings ?? hello.preferredSettings ?? hello.settings)
@@ -2289,7 +2315,7 @@ final class DeskModel: ObservableObject {
                 if !permission.canControl { canvas.releaseControl() }
                 canControl = permission.canControl
                 canvas.canControl = permission.canControl
-                canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && canControl && !sessionInputSuspended
+                canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && canControl && !sessionInputSuspended && !desktopActionWorking
                 status = permission.canControl ? "已连接 · 辅助功能已生效，点击画面开始操作" : "已连接 · 仅观看（家里 Mac 的辅助功能未生效）"
             }
         case .video:
@@ -2583,6 +2609,70 @@ final class DeskModel: ObservableObject {
         }
     }
 
+    func sendDesktopAction(_ action: RemoteDesktopAction) {
+        guard mode == .viewer, desktopActionUnavailableReason == nil, let peer else { return }
+        canvas.releaseControl()
+        let viewer = viewerSession
+        let request = DesktopActionRequest(action: action)
+        viewer.desktopActionRequest = request
+        desktopActionWorking = true
+        desktopActionStatus = "正在发送桌面操作…"
+        publishSessionPause()
+        do { peer.send(try Wire.json(.desktopActionRequest, request)) }
+        catch {
+            viewer.desktopActionRequest = nil
+            desktopActionWorking = false
+            desktopActionStatus = error.localizedDescription
+            publishSessionPause()
+            return
+        }
+        viewer.desktopActionTimeout = Task { [weak self, weak peer, weak viewer] in
+            do { try await Task.sleep(for: .seconds(5)) } catch { return }
+            guard let self, let peer, let viewer, self.peer === peer, self.viewerSession === viewer,
+                  viewer.desktopActionRequest?.id == request.id else { return }
+            viewer.desktopActionRequest = nil
+            viewer.desktopActionTimeout = nil
+            self.desktopActionWorking = false
+            self.desktopActionStatus = "未收到桌面操作回执，请查看远端画面；未自动重试。"
+            self.publishSessionPause()
+        }
+    }
+
+    private func applyHostDesktopAction(_ request: DesktopActionRequest, peer: Peer) {
+        let host = hostSession
+        if let result = host.lastDesktopActionResult, result.id == request.id {
+            if let reply = try? Wire.json(.desktopActionResult, result) { peer.send(reply) }
+            return
+        }
+        let rejection: String?
+        if !canControl || host.injector == nil { rejection = "被控端尚不能接收控制输入" }
+        else if host.paused || host.pauseTask != nil { rejection = "远端画面暂停或恢复中，请稍候" }
+        else if host.unlockTask != nil { rejection = "远端正在解锁，请稍候" }
+        else if host.desktopActionTask != nil { rejection = "正在发送上一次桌面操作，请稍候" }
+        else { rejection = nil }
+        if let rejection {
+            if let reply = try? Wire.json(.desktopActionResult, DesktopActionResult(id: request.id, error: rejection)) { peer.send(reply) }
+            return
+        }
+        host.injector?.releaseAll()
+        let executor = host.desktopActions ?? RemoteDesktopActionExecutor()
+        host.desktopActions = executor
+        host.desktopActionTask = Task { [weak self, weak peer, weak host] in
+            guard let self, let peer, let host, self.peer === peer, self.hostSession === host else { return }
+            let error: String?
+            if !self.canControl || host.paused || host.pauseTask != nil || host.unlockTask != nil || Task.isCancelled {
+                error = "会话状态已变化，桌面操作已取消"
+            } else {
+                error = await executor.perform(request.action)
+            }
+            guard self.peer === peer, self.hostSession === host else { return }
+            host.desktopActionTask = nil
+            let result = DesktopActionResult(id: request.id, error: error)
+            host.lastDesktopActionResult = result
+            if let reply = try? Wire.json(.desktopActionResult, result) { peer.send(reply) }
+        }
+    }
+
     private func applyHostUnlock(_ request: SessionUnlockRequest, peer: Peer) {
         let host = hostSession
         // A second request must not replace the running task, which clearSession has to be able to cancel.
@@ -2593,6 +2683,8 @@ final class DeskModel: ObservableObject {
         }
         let unlocker = host.unlocker ?? HostScreenUnlocker()
         host.unlocker = unlocker
+        host.desktopActionTask?.cancel()
+        host.desktopActions?.cancel()
         host.injector?.releaseAll()
         DiagnosticLog.shared.record(.sessionUnlock, role: .host, state: .requested)
         host.unlockTask = Task { [weak self, weak peer, weak host] in
@@ -2785,7 +2877,7 @@ final class DeskModel: ObservableObject {
         }
         guard mode == .viewer, supportsSessionPause || idlePolicy.isPaused || reconnecting,
               let window = event.window, belongsToSessionWindow(window) else { return event }
-        let wasSuspended = sessionInputSuspended
+        let wasSuspended = sessionInputSuspended || desktopActionWorking
         let windowWasFocused = sessionWindowFocused
         recordSessionActivity()
         let kind: RemoteInput.Kind
@@ -2806,7 +2898,7 @@ final class DeskModel: ObservableObject {
             input.button = min(2, max(0, event.buttonNumber))
         }
         input.flags = UInt64(event.modifierFlags.rawValue)
-        let allowed = wakeInputGate.allows(input, suspended: wasSuspended || sessionInputSuspended || !connected)
+        let allowed = wakeInputGate.allows(input, suspended: wasSuspended || sessionInputSuspended || desktopActionWorking || !connected)
         let remoteTarget = canvas.isInputTarget(of: event)
         // AppKit must still receive the click that activates an inactive window.
         if !allowed && remoteTarget && windowWasFocused && kind == .scroll { DiagnosticLog.shared.count(.scrollSuppressed) }
@@ -2861,10 +2953,10 @@ final class DeskModel: ObservableObject {
             sessionPaused = idlePolicy.isPaused || pauseTransmission.desiredPaused || pauseTransmission.appliedPaused
             sessionPauseWorking = pauseTransmission.pending != nil || pauseTransmission.freshFrameToken != nil
         } else { sessionPaused = hostSession.paused; sessionPauseWorking = hostSession.pauseTask != nil }
-        canvas.updateSystemShortcutCapture(sessionActive: mode == .viewer && connected && canControl && !sessionInputSuspended,
+        canvas.updateSystemShortcutCapture(sessionActive: mode == .viewer && connected && canControl && !sessionInputSuspended && !desktopActionWorking,
             accessibility: localAccessibility, inputMonitoring: localInputMonitoring)
-        canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && canControl && !sessionInputSuspended
-        canvas.pointerInputSuspended = sessionInputSuspended
+        canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && canControl && !sessionInputSuspended && !desktopActionWorking
+        canvas.pointerInputSuspended = sessionInputSuspended || desktopActionWorking
         refreshClipboardFocus()
     }
 
@@ -2904,6 +2996,8 @@ final class DeskModel: ObservableObject {
                 error: "正在处理上一项暂停/恢复")) { peer.send(reply) }
             return
         }
+        host.desktopActionTask?.cancel()
+        host.desktopActions?.cancel()
         host.injector?.releaseAll()
         let token = generation
         let capture = host.captureTask, video = host.settingsTask, cursor = host.cursorTask, effects = host.effectsTask
@@ -3470,6 +3564,12 @@ final class DeskModel: ObservableObject {
         oldViewer.unlockTask?.cancel()
         oldViewer.unlockTimeout?.cancel()
         oldHost.unlockTask?.cancel()
+        oldHost.desktopActionTask?.cancel()
+        oldHost.desktopActions?.cancel()
+        oldViewer.desktopActionTimeout?.cancel()
+        supportsDesktopActions = false
+        desktopActionWorking = false
+        desktopActionStatus = ""
         supportsSessionUnlock = false
         unlockWorking = false
         unlockNoticeTask?.cancel()

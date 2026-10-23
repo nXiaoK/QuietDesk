@@ -134,8 +134,16 @@ struct SharingView: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     if locked {
-                        Button { model.stop() } label: { Label("停止共享", systemImage: "stop.circle") }
-                            .controlSize(.large)
+                        VStack(alignment: .trailing, spacing: 8) {
+                            if model.hasIncomingControlConnection {
+                                Button(role: .destructive) { model.disconnectController() } label: {
+                                    Label("断开控制端", systemImage: "xmark.circle")
+                                }
+                                .help("结束当前控制连接，共享保持开启；旧版控制端可能自动重连")
+                            }
+                            Button { model.stop() } label: { Label("停止共享", systemImage: "stop.circle") }
+                        }
+                        .controlSize(.large)
                     } else {
                         Button { model.startHosting() } label: { Label("开启共享", systemImage: "power") }
                             .buttonStyle(.borderedProminent)

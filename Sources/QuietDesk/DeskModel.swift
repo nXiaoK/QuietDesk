@@ -1201,7 +1201,8 @@ final class DeskModel: ObservableObject {
                             relayTransportV1: true, relayDeviceID: relayRegistrations.first?.deviceID, sessionLockV1: true,
                             adaptiveVideoV1: true, sessionUnlockV1: true, screenLocked: ScreenLockState.isLockedOnConsole,
                             higherFrameRateVideoV1: true, preferredHigherFrameRateSettings: preferredSettings,
-                            displayDimmingV1: true, builtInDisplayDimmable: host.effects?.canDimBuiltInDisplay == true)))
+                            displayDimmingV1: true, builtInDisplayDimmable: host.effects?.canDimBuiltInDisplay == true,
+                            sessionTerminationV1: true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -2027,6 +2028,10 @@ final class DeskModel: ObservableObject {
 
     private func handleHost(_ message: Message, peer: Peer) async throws {
         switch message.kind {
+        case .sessionTermination:
+            let notification = try SessionTermination.read(message.payload)
+            guard notification.operation == .subscribe else { throw DeskError.invalid("结束连接消息方向无效") }
+            hostSession.terminationSubscribed = true
         case .cursorControl:
             let request = try CursorControl.read(message.payload)
             guard request.operation == .request, hostSession.mediaPrepared else { throw DeskError.invalid("光标功能未协商") }
@@ -2096,6 +2101,17 @@ final class DeskModel: ObservableObject {
 
     private func handleViewer(_ message: Message, peer: Peer) throws {
         switch message.kind {
+        case .sessionTermination:
+            guard viewerSession.helloReceived, viewerSession.terminationSubscribed else {
+                throw DeskError.invalid("当前连接未启用结束通知")
+            }
+            let notification = try SessionTermination.read(message.payload)
+            guard notification.operation == .ended else { throw DeskError.invalid("结束连接消息方向无效") }
+            // Invalidate this attempt before the transport's EOF/failure or a relay fallback can retry it.
+            recordDisconnect(SessionTermination.hostEndedReason)
+            stop()
+            status = SessionTermination.hostEndedReason
+            connectionError = SessionTermination.hostEndedReason
         case .cursorControl:
             guard supportsIndependentCursor else { throw DeskError.invalid("光标功能未协商") }
             let control = try CursorControl.read(message.payload)
@@ -2131,6 +2147,10 @@ final class DeskModel: ObservableObject {
                 return
             }
             viewerSession.helloReceived = true
+            if hello.sessionTerminationV1 == true {
+                viewerSession.terminationSubscribed = true
+                peer.send(try SessionTermination(.subscribe).message())
+            }
             if viewerSession.usesRelayControl { relayFallbackAttempted = false; relayFallbackCooldown.reset() }
             dataChannel?.configureVideo(canvas.makeVideoReceiver(diagnostics: performanceDiagnostics))
             connected = true
@@ -2651,7 +2671,10 @@ final class DeskModel: ObservableObject {
                 guard let self, let peer, let host, self.generation == token, self.peer === peer,
                       self.hostSession === host, effects.state.privacy, !Task.isCancelled else { return }
                 do { try await streamer.setExcludedWindows(windows) }
-                catch { self.sessionEffectsStatus = "显示器变化后未能更新防窥采集：\(error.localizedDescription)" }
+                catch {
+                    guard self.generation == token, self.peer === peer, self.hostSession === host else { return }
+                    self.sessionEffectsStatus = "显示器变化后未能更新防窥采集：\(error.localizedDescription)"
+                }
             }
         }
     }
@@ -3546,6 +3569,18 @@ final class DeskModel: ObservableObject {
         guard mode == .host, effectsCleanupsRunning == 0 else { return }
         let removed = HostSessionEffects.removeStrayCovers(keeping: hostSession.effects)
         if removed > 0 { DiagnosticLog.shared.record(.privacyCurtain, role: .host, state: .failed, values: [.eventCount: removed]) }
+    }
+
+    /// Ends only the authenticated control session. The listener and relay registrations stay available.
+    func disconnectController() {
+        guard mode == .host, let oldPeer = peer else { return }
+        let subscribed = hostSession.terminationSubscribed
+        recordDisconnect("已断开控制端")
+        // Revoke input/data handlers and cancel capture before attempting the final control notification.
+        // clearSession replaces the session identity so late peer callbacks cannot act on the new session.
+        clearSession()
+        status = active ? "已断开控制端 · 等待连接" : "共享已停止"
+        oldPeer.closeAfterSessionTermination(notify: subscribed)
     }
 
     func stop() {

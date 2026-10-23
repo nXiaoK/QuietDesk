@@ -4,6 +4,7 @@ import QuietDeskCore
 // These resources belong to one connection. Reconnect intent and UI state live in DeskModel.
 @MainActor
 final class HostSession {
+    var terminationSubscribed = false
     var usesRelayControl = false
     var media: MediaSession?
     var mediaPrepared = false
@@ -49,6 +50,7 @@ final class ViewerSession {
     var mediaQuality: MediaQualityPolicy?
     var automaticVideoSettings: StreamSettings?
     var automaticVideoAdjustment: MediaQualityPolicy.Adjustment?
+    var terminationSubscribed = false
     var helloReceived = false
     var stableTask: Task<Void, Never>?
     var clipboardPullTimeout: Task<Void, Never>?

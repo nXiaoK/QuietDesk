@@ -76,6 +76,7 @@ private struct RemoteControlCommands: Commands {
                 .keyboardShortcut("s", modifiers: [.control, .command])
                 .disabled(!viewer.connected)
             Button("断开远程连接") { viewer.stop() }.disabled(!viewer.active && !viewer.working)
+            Button("断开控制端") { host.disconnectController() }.disabled(!host.hasIncomingControlConnection)
             Button("停止共享") { host.stop() }.disabled(!host.active && !host.working)
         }
     }
@@ -540,6 +541,7 @@ private struct TrayView: View {
             models.mainWindow?.deminiaturize(nil)
             models.mainWindow?.makeKeyAndOrderFront(nil)
         }
+        if host.hasIncomingControlConnection { Button("断开控制端") { host.disconnectController() } }
         Button(host.active || host.working ? "停止共享" : "开启共享") {
             if host.active || host.working { host.stop() } else { host.startHosting() }
         }

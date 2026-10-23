@@ -63,6 +63,9 @@ final class HostSessionEffects {
     private var resetsInProgress = 0
     private let audio: SessionAudioControlling
     private let privacy: SessionPrivacyCover
+    private let privacyCursor: PrivacyCursorHider?
+    private var independentCursor = false
+    private var cursorFailure: String?
     private let screenLock: SessionScreenLocking
     private let dimmer: SessionDisplayDimming
     private var locksOnDisconnect = false
@@ -72,11 +75,13 @@ final class HostSessionEffects {
 
     convenience init() {
         self.init(audio: SessionAudioClient(), privacy: SessionPrivacyWindows(), screenLock: SystemScreenLock(),
-                  dimmer: BuiltInDisplayDimmer())
+                  dimmer: BuiltInDisplayDimmer(), privacyCursor: PrivacyCursorHider())
     }
 
-    init(audio: SessionAudioControlling, privacy: SessionPrivacyCover, screenLock: SessionScreenLocking, dimmer: SessionDisplayDimming) {
+    init(audio: SessionAudioControlling, privacy: SessionPrivacyCover, screenLock: SessionScreenLocking,
+         dimmer: SessionDisplayDimming, privacyCursor: PrivacyCursorHider? = nil) {
         self.audio = audio; self.privacy = privacy; self.screenLock = screenLock; self.dimmer = dimmer
+        self.privacyCursor = privacyCursor
         audio.onChange = { [weak self] muted, error in
             guard let self else { return }
             let state = SessionEffectsState(muted: muted, privacy: self.privacy.isVisible, lockOnDisconnect: self.locksOnDisconnect,
@@ -88,8 +93,9 @@ final class HostSessionEffects {
         }
         privacy.onExit = { [weak self] in
             guard let self else { return }
+            self.cursorFailure = self.privacyCursor?.end()
             self.state = self.actualState
-            self.onStateChange?(self.state, "本机已退出防窥")
+            self.onStateChange?(self.state, self.cursorFailure.map { "本机已退出防窥；\($0)" } ?? "本机已退出防窥")
         }
         privacy.onWindowsChanged = { [weak self] windows in self?.onCoverWindowsChanged?(windows) }
         dimmer.onEnded = { [weak self] reason in
@@ -97,6 +103,29 @@ final class HostSessionEffects {
             self.state = self.actualState
             self.onStateChange?(self.state, reason)
         }
+    }
+
+    /// A video-embedded cursor must remain visible at the host; only the negotiated independent cursor
+    /// can be kept on the viewer while the host cursor is hidden.
+    var cursorNotice: String? {
+        guard state.privacy, privacyCursor != nil else { return nil }
+        if let cursorFailure { return "黑屏遮罩已开启；\(cursorFailure)" }
+        return independentCursor ? nil : "黑屏遮罩已开启；隐藏本机光标需开启“本地即时光标”，旧版控制端保留原有遮罩行为"
+    }
+
+    /// Call before switching to video cursors, and after confirming an independent cursor mode.
+    /// Returning an error when disabling means capture must not switch to video cursors yet.
+    @discardableResult
+    func setIndependentCursor(_ enabled: Bool) -> String? {
+        independentCursor = enabled
+        if enabled, privacy.isVisible {
+            do { try privacyCursor?.begin(); cursorFailure = nil }
+            catch { cursorFailure = error.localizedDescription }
+        } else {
+            cursorFailure = privacyCursor?.end()
+        }
+        if state.privacy { onStateChange?(state, cursorNotice) }
+        return cursorFailure
     }
 
     /// Whether this Mac is a laptop whose built-in display brightness can be turned down right now.
@@ -116,7 +145,9 @@ final class HostSessionEffects {
         let token = UUID()
         revision = token
         if !desired.lockOnDisconnect { locksOnDisconnect = false }
-        if !desired.privacy { privacy.hide(); state = actualState }
+        if !desired.privacy {
+            privacy.hide(); cursorFailure = privacyCursor?.end(); state = actualState
+        }
         var dimRestoreFailure: String?
         if !desired.dimBuiltInDisplay, dimmer.isDimmed { dimRestoreFailure = dimmer.restore(); state = actualState }
         do {
@@ -125,11 +156,17 @@ final class HostSessionEffects {
                 do {
                     try await preparePrivacy(windows)
                     try Task.checkCancellation()
+                    // The local escape shortcut can remove prepared covers while capture is updating.
                     guard revision == token else { throw CancellationError() }
+                    guard !privacy.windowIDs.isEmpty else { throw DeskError.invalid("本机已退出防窥") }
                 } catch {
                     // Covers that capture may still include must never turn opaque.
                     privacy.hide()
                     throw error
+                }
+                if independentCursor {
+                    do { try privacyCursor?.begin(); cursorFailure = nil }
+                    catch { cursorFailure = error.localizedDescription }
                 }
                 privacy.reveal()
                 state = actualState
@@ -152,6 +189,7 @@ final class HostSessionEffects {
                 guard revision == token, !Task.isCancelled else { _ = dimmer.restore(); throw CancellationError() }
             }
             if let dimRestoreFailure { throw DeskError.invalid(dimRestoreFailure) }
+            if !desired.privacy, let cursorFailure { throw DeskError.invalid(cursorFailure) }
             state = actualState
             return state
         } catch {
@@ -177,6 +215,7 @@ final class HostSessionEffects {
         }
         if lockTask == nil {
             if !privacy.windowIDs.isEmpty { privacy.hide(); state = actualState }
+            cursorFailure = privacyCursor?.end()
             // A failure leaves the display marked dark; reset tries again and reports it.
             if dimmer.isDimmed { _ = dimmer.restore(); state = actualState }
         } else if dimmer.isDimmed { dimmer.holdForLock() }
@@ -187,7 +226,9 @@ final class HostSessionEffects {
     /// Returns how many were removed.
     @discardableResult
     static func removeStrayCovers(keeping live: HostSessionEffects?) -> Int {
-        SessionPrivacyWindows.removeStray(keeping: live?.privacy as? SessionPrivacyWindows)
+        let removed = SessionPrivacyWindows.removeStray(keeping: live?.privacy as? SessionPrivacyWindows)
+        _ = PrivacyCursorHider.removeStray(keeping: live?.privacyCursor)
+        return removed
     }
 
     func reset() async -> String? {
@@ -198,11 +239,13 @@ final class HostSessionEffects {
         // The lock screen has to cover the display before the curtain comes down or the brightness comes back.
         let lockError = await endSession()?.value
         privacy.hide()
+        let cursorError = privacyCursor?.end()
+        cursorFailure = cursorError
         let dimError = dimmer.restore()
         state = actualState
         let error = await restoreAudio()
         if revision == token { state = actualState }
-        let errors = [lockError, dimError, error].compactMap { $0 }
+        let errors = [lockError, cursorError, dimError, error].compactMap { $0 }
         return errors.isEmpty ? nil : errors.joined(separator: "；")
     }
 

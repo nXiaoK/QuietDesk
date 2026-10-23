@@ -1644,6 +1644,11 @@ final class DeskModel: ObservableObject {
             guard self.hostSession === host, self.peer === peer, !Task.isCancelled else { return }
             host.cursorSampler?.stop()
             var reason: CursorControl.Reason?
+            // Restore the physical cursor before any frame can include it again.
+            if !request.enabled, let error = host.effects?.setIndependentCursor(false) {
+                peer.close("本机光标恢复失败，正在结束共享：\(error)", retryable: true)
+                return
+            }
             do {
                 try await streamer.setCursorIncluded(!request.enabled)
                 host.cursorEnabled = request.enabled
@@ -1658,6 +1663,10 @@ final class DeskModel: ObservableObject {
                 reason = .unavailable
             }
             guard self.hostSession === host, self.peer === peer, !Task.isCancelled else { return }
+            if let error = host.effects?.setIndependentCursor(host.cursorEnabled), !host.cursorEnabled {
+                peer.close("本机光标恢复失败，正在结束共享：\(error)", retryable: true)
+                return
+            }
             host.cursorEpoch += 1
             host.cursorSubscribed = true
             host.cursorShapeRevision = 0; host.cursorPositionSequence = 0
@@ -2611,7 +2620,7 @@ final class DeskModel: ObservableObject {
                 DiagnosticLog.shared.record(.displayDim, role: .host, state: state.dimBuiltInDisplay ? .enabled : .disabled)
             }
             self.sessionEffects = state
-            if let message { self.sessionEffectsStatus = message }
+            self.sessionEffectsStatus = message ?? "被控端设置已生效"
             if let result = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(state: state, error: message)) { peer.send(result) }
             if !state.privacy, host.effectsTask == nil, let streamer = host.streamer {
                 let token = self.generation
@@ -2684,6 +2693,7 @@ final class DeskModel: ObservableObject {
                 DiagnosticLog.shared.record(.displayDim, role: .host, state: effects.state.dimBuiltInDisplay ? .enabled : .disabled)
             }
             self.sessionEffects = effects.state
+            failure = failure ?? effects.cursorNotice
             self.sessionEffectsStatus = failure ?? "被控端设置已生效"
             if let reply = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(id: request.id, state: effects.state, error: failure)) { peer.send(reply) }
             if filterRestoreFailed { peer.close("采集过滤器恢复失败，正在重建共享：\(failure ?? "未知错误")", retryable: true) }
@@ -2901,6 +2911,10 @@ final class DeskModel: ObservableObject {
                 // A verified rollback can restore the previous cursor mode. Sampling
                 // must follow the actual capture mode rather than the paused request.
                 if failure != nil || !host.paused { host.cursorEnabled = !actual }
+                if let error = host.effects?.setIndependentCursor(host.cursorEnabled), !host.cursorEnabled {
+                    peer.close("本机光标恢复失败，正在结束共享：\(error)", retryable: true)
+                    return
+                }
                 if let message = failure { failure = "\(message)；保持已确认的光标模式" }
             }
             self.sessionPauseStatus = failure ?? (host.paused ? "控制端空闲暂停，保留加密会话" : "画面传输已恢复")

@@ -16,7 +16,7 @@ struct SessionEffectsView: View {
                 .disabled(switchesDisabled)
             Toggle("防窥 · 本地显示黑屏遮罩", isOn: Binding(get: { model.sessionEffects.privacy }, set: model.setRemotePrivacy))
                 .disabled(switchesDisabled)
-            Text("黑屏期间远端仍可观看和操作。被控 Mac 可按 ⌃⌥Esc 退出遮罩；系统安全界面、Mission Control 等不在遮罩保证范围内。被控端的截图软件只能截到黑屏，截图请用“截取画面”或 ⌃⌘S。")
+            Text("黑屏期间远端仍可操作。新版被控端配合“本地即时光标”可隐藏本机指针，关闭遮罩时恢复；未启用即时光标时保留原有遮罩。⌃⌥Esc 可在被控 Mac 退出；系统安全界面、Mission Control 等不保证遮住。截图请用“截取画面”或 ⌃⌘S。")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Text("防窥只从远端画面排除黑屏遮罩本身；被控端的 QuietDesk 窗口、菜单、文件确认和权限提示在远端仍可见、可操作。静音恢复原输出设备状态；设备不支持系统静音时会说明原因。")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)

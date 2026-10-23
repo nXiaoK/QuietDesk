@@ -47,6 +47,239 @@ private final class FakeScreenLock: SessionScreenLocking {
     }
 }
 
+private final class SessionCursorProbe {
+    var calls: [String] = []
+    var hideResult = CGError.success, showResult = CGError.success
+    var backend: PrivacyCursorBackend {
+        PrivacyCursorBackend(setBackground: { self.calls.append($0 ? "background on" : "background off") },
+            hide: { self.calls.append("hide"); return self.hideResult },
+            show: { self.calls.append("show"); return self.showResult })
+    }
+}
+
+@MainActor
+private func checkPrivacyCursorLifecycle() async -> (count: Int, failures: Int) {
+    var count = 0, failures = 0
+    func require(_ condition: Bool, _ message: String) throws {
+        guard condition else { throw DeskError.invalid(message) }
+    }
+    func run(_ name: String, _ body: () async throws -> Void) async {
+        count += 1
+        do { try await body(); print("PASS \(name)") }
+        catch { failures += 1; print("FAIL \(name): \(error)") }
+    }
+
+    await run("capture exclusion completes before the local cursor is hidden and the curtain is revealed") {
+        let probe = SessionCursorProbe(), privacy = FakeSessionPrivacy()
+        let hider = PrivacyCursorHider(controller: PrivacyCursorController(backend: probe.backend))
+        let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: FakeScreenLock(),
+                                        dimmer: FakeDisplayDimmer(), privacyCursor: hider)
+        try require(effects.setIndependentCursor(true) == nil && probe.calls.isEmpty, "Idle cursor mode changed the host cursor")
+        let applied = try await effects.apply(.init(privacy: true)) { windows in
+            try require(windows == [41, 42] && privacy.prepared && !privacy.isVisible && probe.calls.isEmpty,
+                        "The curtain or cursor changed before capture exclusion")
+            probe.calls.append("excluded")
+        }
+        try require(applied.privacy && hider.isActive && effects.cursorNotice == nil && privacy.shows == 1 &&
+                    probe.calls == ["excluded", "background on", "hide"], "Capture-to-cursor activation order was wrong")
+        _ = await effects.reset()
+    }
+    await run("repeated privacy enable and cursor mode confirmation keep a single hide count") {
+        let probe = SessionCursorProbe(), privacy = FakeSessionPrivacy()
+        let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: FakeScreenLock(),
+            dimmer: FakeDisplayDimmer(), privacyCursor: PrivacyCursorHider(controller: PrivacyCursorController(backend: probe.backend)))
+        effects.setIndependentCursor(true)
+        _ = try await effects.apply(.init(privacy: true)) { _ in }
+        _ = try await effects.apply(.init(privacy: true)) { _ in throw DeskError.invalid("Duplicate enable prepared capture again") }
+        effects.setIndependentCursor(true)
+        try require(privacy.shows == 1 && probe.calls == ["background on", "hide"], "Duplicate enable hid again")
+        _ = try await effects.apply(.init()) { _ in }
+        _ = await effects.reset()
+        try require(!privacy.isVisible && probe.calls == ["background on", "hide", "show", "background off"],
+                    "Repeated cleanup over-restored the cursor")
+    }
+    await run("legacy or video cursor mode keeps the curtain and explains why the cursor remains visible") {
+        let probe = SessionCursorProbe(), privacy = FakeSessionPrivacy()
+        let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: FakeScreenLock(),
+            dimmer: FakeDisplayDimmer(), privacyCursor: PrivacyCursorHider(controller: PrivacyCursorController(backend: probe.backend)))
+        let applied = try await effects.apply(.init(privacy: true)) { _ in }
+        try require(applied.privacy && probe.calls.isEmpty && effects.cursorNotice?.contains("本地即时光标") == true,
+                    "Legacy mode hid the video cursor or omitted the notice")
+        _ = await effects.reset()
+        try require(probe.calls.isEmpty, "Legacy cleanup touched the cursor")
+    }
+    await run("cursor mode changes restore and rehide the cursor without rebuilding the curtain") {
+        let probe = SessionCursorProbe(), privacy = FakeSessionPrivacy()
+        let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: FakeScreenLock(),
+            dimmer: FakeDisplayDimmer(), privacyCursor: PrivacyCursorHider(controller: PrivacyCursorController(backend: probe.backend)))
+        var messages: [String?] = []
+        effects.onStateChange = { _, message in messages.append(message) }
+        _ = try await effects.apply(.init(privacy: true)) { _ in }
+        try require(effects.setIndependentCursor(true) == nil && effects.cursorNotice == nil, "Independent mode did not hide")
+        try require(effects.setIndependentCursor(false) == nil && effects.cursorNotice?.contains("本地即时光标") == true,
+                    "Video mode did not restore or explain the cursor")
+        try require(effects.setIndependentCursor(true) == nil && effects.cursorNotice == nil, "Independent mode did not rehide")
+        try require(privacy.isVisible && privacy.shows == 1 && messages.count == 3 &&
+                    probe.calls == ["background on", "hide", "show", "background off", "background on", "hide"],
+                    "Mode change disturbed the curtain or cursor count")
+        _ = await effects.reset()
+    }
+    await run("a failed cursor restore refuses the switch to video mode and can be retried") {
+        let probe = SessionCursorProbe(), privacy = FakeSessionPrivacy()
+        let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: FakeScreenLock(),
+            dimmer: FakeDisplayDimmer(), privacyCursor: PrivacyCursorHider(controller: PrivacyCursorController(backend: probe.backend)))
+        effects.setIndependentCursor(true)
+        _ = try await effects.apply(.init(privacy: true)) { _ in }
+        probe.showResult = .failure
+        try require(effects.setIndependentCursor(false)?.contains("恢复本机光标失败") == true,
+                    "Capture could switch to video despite a failed show")
+        try require(privacy.isVisible && probe.calls == ["background on", "hide", "show"],
+                    "Failed show disabled background support or the curtain")
+        probe.showResult = .success
+        try require(effects.setIndependentCursor(false) == nil && effects.cursorNotice?.contains("本地即时光标") == true,
+                    "Video mode restore did not recover")
+        _ = await effects.reset()
+    }
+    await run("the local exit callback releases the cursor and reports the curtain's actual state") {
+        let probe = SessionCursorProbe(), privacy = FakeSessionPrivacy()
+        let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: FakeScreenLock(),
+            dimmer: FakeDisplayDimmer(), privacyCursor: PrivacyCursorHider(controller: PrivacyCursorController(backend: probe.backend)))
+        var state: SessionEffectsState?, message: String?
+        effects.onStateChange = { state = $0; message = $1 }
+        effects.setIndependentCursor(true)
+        _ = try await effects.apply(.init(privacy: true)) { _ in }
+        // The real hotkey and no-display callback remove the cover before notifying the session.
+        privacy.hide(); privacy.onExit?()
+        try require(state == .init() && effects.state == .init() && message == "本机已退出防窥" &&
+                    probe.calls == ["background on", "hide", "show", "background off"], "Local exit left the cursor hidden")
+        _ = await effects.reset()
+        try require(probe.calls.count == 4, "Reset after local exit showed twice")
+    }
+    for operation in ["reset", "cancellation", "local exit"] {
+        await run("\(operation) during capture preparation never hides the cursor") {
+            let probe = SessionCursorProbe(), privacy = FakeSessionPrivacy()
+            let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: FakeScreenLock(),
+                dimmer: FakeDisplayDimmer(), privacyCursor: PrivacyCursorHider(controller: PrivacyCursorController(backend: probe.backend)))
+            effects.setIndependentCursor(true)
+            var continuation: CheckedContinuation<Void, Never>?
+            let pending = Task { @MainActor in
+                try await effects.apply(.init(privacy: true)) { _ in
+                    await withCheckedContinuation { continuation = $0 }
+                }
+            }
+            while continuation == nil { await Task.yield() }
+            if operation == "reset" { _ = await effects.reset() }
+            else if operation == "cancellation" { pending.cancel() }
+            else { privacy.hide(); privacy.onExit?() }
+            continuation?.resume()
+            var cancelled = false, reason: String?
+            do { _ = try await pending.value }
+            catch is CancellationError { cancelled = true }
+            catch { reason = error.localizedDescription }
+            let expectedFailure = operation == "local exit" ? !cancelled && reason == "本机已退出防窥" : cancelled
+            try require(expectedFailure && !privacy.prepared && privacy.shows == 0 && effects.state == .init() && probe.calls.isEmpty,
+                        "Late capture preparation hid a cursor or revealed a curtain")
+        }
+    }
+    await run("local exit during privacy preparation preserves mute, dimming and the disconnect lock") {
+        let probe = SessionCursorProbe(), privacy = FakeSessionPrivacy(), audio = FakeSessionAudio()
+        let lock = FakeScreenLock(), dimmer = FakeDisplayDimmer()
+        let effects = HostSessionEffects(audio: audio, privacy: privacy, screenLock: lock, dimmer: dimmer,
+            privacyCursor: PrivacyCursorHider(controller: PrivacyCursorController(backend: probe.backend)))
+        effects.setIndependentCursor(true)
+        let existing = SessionEffectsState(muted: true, lockOnDisconnect: true, dimBuiltInDisplay: true)
+        _ = try await effects.apply(existing) { _ in throw DeskError.invalid("Unrequested privacy preparation") }
+        let audioRestores = audio.restoreCalls, displayRestores = dimmer.restoreCalls
+        var continuation: CheckedContinuation<Void, Never>?
+        let pending = Task { @MainActor in
+            try await effects.apply(.init(muted: true, privacy: true, lockOnDisconnect: true, dimBuiltInDisplay: true)) { _ in
+                await withCheckedContinuation { continuation = $0 }
+            }
+        }
+        while continuation == nil { await Task.yield() }
+        privacy.hide(); privacy.onExit?()
+        continuation?.resume()
+        var reason: String?
+        do { _ = try await pending.value } catch { reason = error.localizedDescription }
+        try require(reason == "本机已退出防窥" && effects.state == existing && audio.isMuted && dimmer.isDimmed &&
+                    audio.restoreCalls == audioRestores && dimmer.restoreCalls == displayRestores && lock.lockCalls == 0 &&
+                    !privacy.prepared && privacy.shows == 0 && probe.calls.isEmpty,
+                    "Local privacy exit reset unrelated effects, locked the session or hid the cursor")
+        _ = await effects.reset()
+    }
+    await run("cursor hiding failure keeps the existing curtain and supplies a truthful notice") {
+        let probe = SessionCursorProbe(), privacy = FakeSessionPrivacy(); probe.hideResult = .failure
+        let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: FakeScreenLock(),
+            dimmer: FakeDisplayDimmer(), privacyCursor: PrivacyCursorHider(controller: PrivacyCursorController(backend: probe.backend)))
+        effects.setIndependentCursor(true)
+        let applied = try await effects.apply(.init(privacy: true)) { _ in }
+        try require(applied.privacy && privacy.isVisible && effects.cursorNotice?.contains("隐藏本机光标失败") == true &&
+                    effects.cursorNotice?.contains("防窥未开启") == false && probe.calls == ["background on", "hide", "background off"],
+                    "Failed hide removed the curtain or misreported success")
+        probe.hideResult = .success
+        try require(effects.setIndependentCursor(true) == nil && effects.cursorNotice == nil && privacy.shows == 1,
+                    "A later successful hide could not clear the failure")
+        _ = await effects.reset()
+    }
+    await run("reset reports failed cursor restoration and a later reset finishes the same hide") {
+        let probe = SessionCursorProbe(), privacy = FakeSessionPrivacy()
+        let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: FakeScreenLock(),
+            dimmer: FakeDisplayDimmer(), privacyCursor: PrivacyCursorHider(controller: PrivacyCursorController(backend: probe.backend)))
+        effects.setIndependentCursor(true)
+        _ = try await effects.apply(.init(privacy: true)) { _ in }
+        probe.showResult = .failure
+        let failure = await effects.reset()
+        try require(failure?.contains("恢复本机光标失败") == true && !privacy.isVisible && effects.state == .init() &&
+                    !probe.calls.contains("background off"), "Failed restoration was lost or background support ended early")
+        probe.showResult = .success
+        let restored = await effects.reset()
+        try require(restored == nil && probe.calls.filter { $0 == "hide" }.count == 1 &&
+                    probe.calls.filter { $0 == "background off" }.count == 1 && Array(probe.calls.suffix(2)) == ["show", "background off"],
+                    "Retry added another hide or did not restore")
+    }
+    await run("lock confirmation keeps the curtain and cursor hidden until the system lock completes") {
+        let probe = SessionCursorProbe(), privacy = FakeSessionPrivacy(), lock = FakeScreenLock()
+        let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: lock,
+            dimmer: FakeDisplayDimmer(), privacyCursor: PrivacyCursorHider(controller: PrivacyCursorController(backend: probe.backend)))
+        effects.setIndependentCursor(true)
+        _ = try await effects.apply(.init(privacy: true, lockOnDisconnect: true)) { _ in }
+        lock.holdConfirmation = true
+        effects.endSession()
+        let reset = Task { @MainActor in await effects.reset() }
+        while lock.confirmWaiters.isEmpty { await Task.yield() }
+        let held = privacy.isVisible && probe.calls == ["background on", "hide"] && lock.lockCalls == 1
+        lock.holdConfirmation = false
+        lock.confirmWaiters.forEach { $0.resume() }; lock.confirmWaiters.removeAll()
+        let failure = await reset.value
+        try require(held && failure == nil && !privacy.isVisible && probe.calls == ["background on", "hide", "show", "background off"],
+                    "Cursor or curtain was restored before lock confirmation")
+    }
+    await run("ending an unlocked session restores the cursor synchronously") {
+        let probe = SessionCursorProbe(), privacy = FakeSessionPrivacy()
+        let effects = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: FakeScreenLock(),
+            dimmer: FakeDisplayDimmer(), privacyCursor: PrivacyCursorHider(controller: PrivacyCursorController(backend: probe.backend)))
+        effects.setIndependentCursor(true)
+        _ = try await effects.apply(.init(privacy: true)) { _ in }
+        try require(effects.endSession() == nil && !privacy.isVisible && !effects.state.privacy &&
+                    probe.calls == ["background on", "hide", "show", "background off"], "EndSession deferred cursor restoration")
+        _ = await effects.reset()
+        try require(probe.calls.count == 4, "Reset after endSession showed twice")
+    }
+    await run("releasing the effects and its last cursor owner restores the process hide") {
+        let probe = SessionCursorProbe(), privacy = FakeSessionPrivacy()
+        let controller = PrivacyCursorController(backend: probe.backend)
+        var effects: HostSessionEffects? = HostSessionEffects(audio: FakeSessionAudio(), privacy: privacy, screenLock: FakeScreenLock(),
+            dimmer: FakeDisplayDimmer(), privacyCursor: PrivacyCursorHider(controller: controller))
+        effects?.setIndependentCursor(true)
+        _ = try await effects?.apply(.init(privacy: true)) { _ in }
+        effects = nil
+        try require(probe.calls == ["background on", "hide", "show", "background off"],
+                    "Effects retained its cursor owner or dropping the owner did not restore")
+        try require(controller.retryRestoration() == nil && probe.calls.count == 4, "Post-release cleanup showed twice")
+    }
+    return (count, failures)
+}
+
 private final class PipeReadProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var bytes = 0, ended = false
@@ -483,7 +716,9 @@ enum SessionEffectsCancellationChecks {
                 print("PASS a real helper process restores after the app lets go without releasing, stays quiet when released, and its death is reported")
             } else { failures += 1; print("FAIL helper process: restored \(restored) released \(releasedEnded) untouched \(untouched) \(releasedReported) killed \(reported)") }
         } catch { failures += 1; print("FAIL helper process setup: \(error)") }
-        print("\(23 - failures) passed, \(failures) failed")
+        let cursorChecks = await checkPrivacyCursorLifecycle()
+        failures += cursorChecks.failures
+        print("\(23 + cursorChecks.count - failures) passed, \(failures) failed")
         exit(failures == 0 ? 0 : 1)
     }
 }

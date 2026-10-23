@@ -39,7 +39,6 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     let rejectedCandidate = Box(false), candidateSeen = DispatchSemaphore(value:0)
     let lateDecode = Box<((Bool)->Void)?>(nil)
     let delayedFrameDone = DispatchSemaphore(value: 0), stalledFrameSeen = DispatchSemaphore(value: 0)
-    let auxiliaryMeters = Box<[TrafficMeter]>([])
     let diagnostics = inspectDiagnostics ? PerformanceDiagnostics(enabled:true) : nil
     let sampledCompute = DispatchSemaphore(value:0)
     let reductions=Box<[MediaBottleneck]>([])
@@ -57,7 +56,6 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
         peer.onReady = { [weak peer] in
             guard let peer else { return }
             if let role=MediaSecureTransport.negotiatedRole(on:connection),role != .control {
-                auxiliaryMeters.update { $0.append(peer.trafficMeter) }
                 if auxiliary { hostSession.get()?.acceptAuxiliary(peer,role:role) } else { peer.close("test rejected auxiliary") }
                 peers.update { $0.removeAll { $0 === peer } }
                 return
@@ -376,16 +374,6 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
         }
     }
     try require(errors.get().isEmpty,"Session reported errors: \(errors.get())")
-    if auxiliary, let meter=auxiliaryMeters.get().first, let parent=peers.get().first?.trafficMeter {
-        let stopped=DispatchSemaphore(value:0)
-        hostSession.get()?.stop()
-        hostSession.get()?.suspendForConfiguration { stopped.signal() }
-        try wait(stopped,"Stopped host media did not settle")
-        let before=parent.snapshot().totals
-        meter.record(sentBytes:7,receivedBytes:11)
-        let after=parent.snapshot().totals
-        try require(after.sentBytes-before.sentBytes==7 && after.receivedBytes-before.receivedBytes==11,"Late auxiliary completion was lost or double-counted in parent traffic")
-    }
 }
 @main struct MediaSessionChecks {
  static func main() {
@@ -408,6 +396,43 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
       throw Failure(message:"Empty media destination was accepted")
     }
     throw Failure(message:"Zero media port was accepted")
+  }
+  run("Stopped media forwards late auxiliary traffic exactly once") {
+    let key=try PairingKey.generate()
+    for role in [MediaChannelRole.video, .bulk] {
+        let parent: TrafficMeter, meter: TrafficMeter, initial: TrafficSnapshot
+        do {
+            // Never start these connections: live control/UDP completions would also change the parent
+            // between snapshots, even after the media queue has stopped. Install the real relay instead.
+            let control=Peer(connection:NWConnection(host:"127.0.0.1",port:1,using:SecureTransport.parameters(key:key)))
+            let auxiliary=Peer(connection:NWConnection(host:"127.0.0.1",port:1,using:SecureTransport.parameters(key:key)))
+            let session=try MediaSession.host(control:control,key:key,port:1,settings:StreamSettings())
+            defer { session.stop();auxiliary.close("test done");control.close("test done") }
+            parent=control.trafficMeter;meter=auxiliary.trafficMeter
+            parent.record(sentBytes:100,receivedBytes:200)
+            meter.record(sentBytes:5,receivedBytes:9)
+            initial=meter.snapshot()
+            session.acceptAuxiliary(auxiliary,role:role)
+            try require(parent.snapshot().totals == TrafficTotals(sentBytes:105,receivedBytes:209),
+                        "Existing auxiliary traffic was not relayed exactly once")
+            let stopped=DispatchSemaphore(value:0)
+            session.stop()
+            session.suspendForConfiguration { stopped.signal() }
+            try wait(stopped,"Stopped host media did not settle")
+            auxiliary.queue.sync {}
+        }
+        meter.record(sentBytes:7,receivedBytes:11)
+        let after=parent.snapshot().totals
+        try require(after == TrafficTotals(sentBytes:112,receivedBytes:220),
+                    "Late auxiliary completion was lost or double-counted in parent traffic: \(after)")
+        guard let replay=meter.onUpdate else { throw Failure(message:"Stopped auxiliary meter lost its traffic relay") }
+        replay(meter.snapshot())
+        replay(initial)
+        try require(parent.snapshot().totals == after,"Repeated or older auxiliary snapshots changed parent traffic")
+        meter.record(sentBytes:13,receivedBytes:17)
+        try require(parent.snapshot().totals == TrafficTotals(sentBytes:125,receivedBytes:237),
+                    "Replaying an old snapshot changed the next late auxiliary delta")
+    }
   }
   if !CommandLine.arguments.contains("--skip-network") {
    run("Local-network classification excludes loopback UDP and reports authenticated RTT") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,inspectRoundTrip:true) }

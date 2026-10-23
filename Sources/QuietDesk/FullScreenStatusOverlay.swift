@@ -25,13 +25,14 @@ struct FullScreenStatusOverlay<Content: View>: View {
             let normalized = FullScreenStatusPlacement.position(for: proposed, container: geometry.size, status: statusSize)
             let origin = FullScreenStatusPlacement.origin(for: normalized, container: geometry.size, status: statusSize)
             let ink: Color = darkText ? .black : .white
-            VStack(alignment: .leading, spacing: 2) { content }
-                .font(.system(size: 12, weight: .bold, design: .monospaced))
+            VStack(alignment: .leading, spacing: 1) { content }
+                .font(.system(size: 12, weight: .semibold))
+                .monospacedDigit()
                 .lineLimit(1)
                 .foregroundStyle(ink)
                 .shadow(color: (darkText ? Color.white : Color.black).opacity(0.6), radius: 1)
                 .fixedSize()
-                .padding(6)
+                .padding(4)
                 .background {
                     if dragOrigin != nil { RoundedRectangle(cornerRadius: 8).strokeBorder(ink.opacity(0.5)) }
                 }

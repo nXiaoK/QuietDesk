@@ -95,7 +95,7 @@ struct ConnectionSettingsView: View {
                     Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
                     Toggle(isOn: $model.showFullScreenStatistics) { Text("全屏显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
                     if model.showFullScreenStatistics { FullScreenStatusSettings(model: model) }
-                    Text("每行一项，依次为连接时长、视频线路、解码 FPS、收发流量、往返延迟、UDP 丢包（达到 3% 时为红色）、分辨率和画质上限。默认在右下角，文字颜色随下方画面明暗自动切换；可直接拖动状态调整位置。往返延迟约每 5 秒更新；不代表画面上屏延迟。静止画面 FPS 可能为 0。")
+                    Text("每行一项，依次为连接时长、视频线路、解码 FPS、收发流量、往返延迟、UDP 丢包（达到 3% 时为红色）、分辨率。线路名精简显示，默认在右下角，文字颜色随下方画面明暗自动切换；可直接拖动状态调整位置。往返延迟约每 5 秒更新；不代表画面上屏延迟。静止画面 FPS 可能为 0。")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     Button(action: openTraffic) { Label("设备历史流量…", systemImage: "chart.bar.xaxis") }
                     Button(action: openEffects) { Label("被控端隐私与安全…", systemImage: "lock.shield") }
@@ -242,7 +242,7 @@ struct FullScreenSettingsView: View {
                                 .disabled(!model.supportsIndependentCursor)
                             Text(model.cursorStatus).font(.caption).foregroundStyle(.secondary)
                             Toggle(isOn: $model.showFullScreenStatistics) { Text("显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
-                                .help("在右下角竖排显示连接时长、线路、FPS、流量、RTT、丢包、分辨率和画质上限，文字颜色随画面明暗切换；可直接拖动调整位置。RTT 不代表画面上屏延迟。")
+                                .help("在右下角竖排显示连接时长、线路、FPS、流量、RTT、丢包、分辨率，线路名精简显示，文字颜色随画面明暗切换；可直接拖动调整位置。RTT 不代表画面上屏延迟。")
                             if model.showFullScreenStatistics { FullScreenStatusSettings(model: model) }
                             Text(model.mediaRouteSummary).font(.caption).foregroundStyle(.secondary)
                             Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }

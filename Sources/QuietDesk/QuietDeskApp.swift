@@ -449,15 +449,23 @@ struct DeskView: View {
     @ViewBuilder private var fullScreenMetrics: some View {
         if model.connected {
             if let since = model.connectedSince { Text(since, style: .timer) }
-            Text(model.mediaTransportStatus)
+            switch model.mediaTransportStatus {
+            case "UDP 视频": Text("UDP")
+            case "TCP 视频": Text("TCP")
+            case "TCP 兼容模式": Text("TCP 兼容")
+            case "中继 UDP 视频": Text("中继 UDP")
+            case "中继 TCP 视频": Text("中继 TCP")
+            case "中继 TCP 兼容模式": Text("中继 TCP 兼容")
+            case "直连 UDP 视频（中继打洞）": Text("直连 UDP")
+            default: Text(model.mediaTransportStatus)
+            }
             Text(model.frameRate)
             Text(model.traffic)
             Text(model.latency)
             if !model.mediaLoss.isEmpty {
                 if model.mediaLossHigh { Text(model.mediaLoss).foregroundStyle(Color.red) } else { Text(model.mediaLoss) }
             }
-            if !model.resolution.isEmpty { Text(model.resolution) }
-            if !model.videoQualitySummary.isEmpty { Text("上限 " + model.videoQualitySummary) }
+            if !model.resolution.isEmpty { Text(model.resolution.replacingOccurrences(of: " × ", with: "×")) }
         } else {
             Text(model.sessionPaused ? "空闲暂停" : model.reconnecting ? "正在重连" : "未连接").foregroundStyle(Color.orange)
         }

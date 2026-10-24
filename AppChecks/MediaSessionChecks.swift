@@ -440,7 +440,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
   if !CommandLine.arguments.contains("--skip-network") {
    run("Local-network classification excludes loopback UDP and reports authenticated RTT") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,inspectRoundTrip:true) }
    run("Local-network classification excludes loopback TCP and counts a control RTT only in its own window") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false,inspectRoundTrip:true) }
-   run("Local-network classification excludes framed shared loopback TCP") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false) }
+   run("Local-network classification excludes framed shared loopback TCP and samples fresh control RTT") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false,inspectRoundTrip:true) }
    run("Optional onPrepareStream binds each exact generation before candidate video and commit") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true,prepareHook:.boundStream) }
    run("Absent onPrepareStream preserves default onPrepareRecovery for candidates and configuration hold") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true,prepareHook:.fallback) }
    run("Legacy peers keep configuration and pause recovery unchanged") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false,legacy:true) }

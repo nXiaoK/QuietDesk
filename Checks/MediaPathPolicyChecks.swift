@@ -85,6 +85,105 @@ func runMediaPathPolicyChecks() {
         try check(quality.observe(busier, now: 48) == ceiling, "The next filled seconds did not restore the ceiling")
     }
 
+    run("Sparse TCP heartbeats reduce sustained local RTT without replaying a single measurement") {
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 100)
+        for delivery: Double? in [nil, 0] {
+            var quality = try MediaQualityPolicy(hostDefault: ceiling, bitRates: StreamSettings.adaptiveBitRates,
+                                               appliedSize: (3024, 1964), now: 0)
+            quality.setLocalNetwork(true, now: 0)
+            for time in 1...5 {
+                try check(quality.observe(sample(count: 0, delivery: delivery, local: true,
+                                                 roundTrip: time == 1 ? 200 : nil), now: Double(time)) == nil,
+                          "A single TCP heartbeat was replayed as sustained delay")
+            }
+            guard let reduced = quality.observe(sample(count: 0, delivery: delivery, local: true, roundTrip: 200), now: 6),
+                  reduced.megabits == 60 else { throw CheckFailure("Two fresh TCP heartbeats did not reduce sustained RTT") }
+            _ = quality.confirmApplied(reduced, now: 6)
+            try quality.synchronizeApplied(reduced, now: 6)
+            for time in 7...16 {
+                try check(quality.observe(sample(count: 0, delivery: 0, local: true), now: Double(time)) == nil,
+                          "Low relative delivery delay restored quality without a new healthy RTT")
+            }
+            for time in 17...19 {
+                try check(quality.observe(sample(count: 0, delivery: 0, local: true,
+                                                 roundTrip: time == 17 ? 3 : nil), now: Double(time)) == nil,
+                          "A healthy TCP heartbeat skipped the bitrate recovery hold")
+            }
+            try check(quality.observe(sample(count: 0, delivery: 0, local: true), now: 20)?.megabits == 80,
+                      "A fresh healthy TCP heartbeat did not allow stepwise recovery")
+        }
+    }
+
+    run("Sparse RTT evidence expires and mixed delay sources do not manufacture a continuous run") {
+        for intermediateDelivery: Double? in [nil, 0, 200] {
+            var quality = try MediaQualityPolicy(hostDefault: .highest, now: 0)
+            quality.setLocalNetwork(true, now: 0)
+            _ = quality.observe(sample(delivery: 0, local: true, roundTrip: 200), now: 1)
+            for time in 2...7 {
+                try check(quality.observe(sample(delivery: time == 2 ? intermediateDelivery : 0, local: true), now: Double(time)) == nil,
+                          "Missing RTT or one delayed delivery window manufactured sustained delay")
+            }
+            try check(quality.observe(sample(delivery: 0, local: true, roundTrip: 200), now: 8) == nil,
+                      "A late heartbeat reused expired RTT evidence")
+            for time in 9...12 { _ = quality.observe(sample(delivery: 0, local: true), now: Double(time)) }
+            try check(quality.observe(sample(delivery: 0, local: true, roundTrip: 200), now: 13) != nil,
+                      "Two new timely heartbeats did not rebuild sustained RTT evidence")
+        }
+        var stalled = try MediaQualityPolicy(hostDefault: .highest, now: 0)
+        stalled.setLocalNetwork(true, now: 0)
+        try check(stalled.observe(sample(duration: 5, delivery: 0, local: true, roundTrip: 200), now: 5) == nil,
+                  "One heartbeat in a long sampling window caused a reduction")
+    }
+
+    run("Pending settings clear RTT congestion runs while retaining the recovery veto until a fresh measurement") {
+        for applied in [false, true] {
+            let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 100)
+            var quality = try MediaQualityPolicy(hostDefault: ceiling, bitRates: StreamSettings.adaptiveBitRates,
+                                               appliedSize: (3024, 1964), now: 0)
+            quality.setLocalNetwork(true, now: 0)
+            _ = quality.observe(sample(delivery: 0, local: true, roundTrip: 200), now: 1)
+            guard let reduced = quality.observe(sample(delivery: 0, local: true, roundTrip: 200), now: 2) else {
+                throw CheckFailure("The pending RTT reduction was not created")
+            }
+            try check(quality.observe(sample(delivery: 0, local: true, roundTrip: 200), now: 3) == nil,
+                      "A pending request was replaced by RTT pressure")
+            if applied { _ = quality.confirmApplied(reduced, now: 3) }
+            else { quality.rejectPending(now: 3) }
+            try quality.synchronizeApplied(applied ? reduced : ceiling, now: 3)
+            for time in 4...7 {
+                try check(quality.observe(sample(delivery: 0, local: true), now: Double(time)) == nil,
+                          "Settings completion erased the high RTT recovery veto")
+            }
+            try check(quality.observe(sample(delivery: 0, local: true, roundTrip: 200), now: 8) == nil,
+                      "Settings completion retained old congestion evidence")
+            try check(quality.observe(sample(delivery: 0, local: true, roundTrip: 200), now: 9) != nil,
+                      "Fresh RTT evidence could not reduce again after settings completion")
+        }
+    }
+
+    run("Route, pause and manual resets discard the previous route's RTT recovery veto") {
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 100)
+        let lower = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 60)
+        for reset in 0...2 {
+            var quality = try MediaQualityPolicy(hostDefault: ceiling, applied: lower, now: 0)
+            quality.setLocalNetwork(true, now: 0)
+            _ = quality.observe(sample(delivery: 0, local: true, roundTrip: 200), now: 1)
+            switch reset {
+            case 0:
+                quality.setLocalNetwork(false, now: 2); quality.setLocalNetwork(true, now: 2)
+            case 1: quality.resetObservation(now: 2)
+            default:
+                _ = try quality.chooseManually(ceiling, now: 2); quality.rejectPending(now: 2)
+            }
+            for time in 3...4 {
+                try check(quality.observe(sample(delivery: 0, local: true), now: Double(time)) == nil,
+                          "A reset reused the old recovery duration")
+            }
+            try check(quality.observe(sample(delivery: 0, local: true), now: 5) == ceiling,
+                      "A reset retained the old RTT recovery veto")
+        }
+    }
+
     run("A local delay reduction soon after a bitrate step doubles the time the next step needs") {
         let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 100)
         var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling,
@@ -178,8 +277,8 @@ func runMediaPathPolicyChecks() {
                   "Local recovery exceeded the lower manual choice")
     }
 
-    run("Missing, inactive, invalid and intermediate local samples break continuous delay evidence") {
-        let interruptions = [sample(local: true), sample(active: false, local: true, roundTrip: 200),
+    run("Inactive, invalid and intermediate local samples break continuous RTT delay evidence") {
+        let interruptions = [sample(active: false, local: true, roundTrip: 200),
                              sample(local: true, roundTrip: .nan), sample(local: true, roundTrip: 60),
                              sample(local: true, roundTrip: 3)]
         for interruption in interruptions {

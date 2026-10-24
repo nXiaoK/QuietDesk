@@ -470,6 +470,8 @@ public struct MediaQualityPolicy: Sendable {
     public static let localDelayedMilliseconds = 80.0
     public static let localReductionDelay: TimeInterval = 2
     public static let localHealthyMilliseconds = 50.0
+    // TCP heartbeats arrive every five seconds; allow sampling jitter, but never bridge a missing heartbeat.
+    private static let localRoundTripMaximumGap: TimeInterval = 6
 
     /// Why the last automatic recommendation was made, for diagnostics and the quality tooltip.
     public enum Adjustment: Equatable, Sendable {
@@ -506,6 +508,8 @@ public struct MediaQualityPolicy: Sendable {
     private var slowEdges: [Int: TimeInterval] = [:]
     // Local delay reduced the load on this route, so its recovery climbs one step at a time.
     private var localLatencyLimited = false
+    private var localRoundTrip: (milliseconds: Double, at: TimeInterval)?
+    private var localRoundTripCongestedDuration: TimeInterval = 0
 
     /// `bitRates` are the steps the host accepts; the ceiling itself always comes from the user or host.
     public init(hostDefault: StreamSettings, preferred: StreamSettings? = nil, applied: StreamSettings? = nil,
@@ -539,7 +543,7 @@ public struct MediaQualityPolicy: Sendable {
         preferred = settings; upperBound = settings
         resetEvidence(); lastObservationAt = now; lastChangeAt = now
         upgradeHold = Self.initialUpgradeHold; bitrateHold = Self.initialBitrateHold; upgraded = nil
-        slowEdges.removeAll(); lastAdjustment = nil; localLatencyLimited = false
+        slowEdges.removeAll(); lastAdjustment = nil; localLatencyLimited = false; localRoundTrip = nil
         pending = effective == settings ? nil : settings
         pendingUpgrade = nil
         return pending
@@ -549,7 +553,7 @@ public struct MediaQualityPolicy: Sendable {
     public mutating func setLocalNetwork(_ enabled: Bool, now: TimeInterval) {
         guard accept(now), isLocalNetwork != enabled else { return }
         isLocalNetwork = enabled
-        localLatencyLimited = false
+        localLatencyLimited = false; localRoundTrip = nil
         lastObservationAt = now
         resetEvidence()
     }
@@ -609,15 +613,32 @@ public struct MediaQualityPolicy: Sendable {
         if isLocalNetwork {
             // Local links keep the chosen quality despite codec load or loss. Only sustained delay
             // reduces the load, including when congestion prevents frames from finishing decoding.
+            var sustainedRoundTrip = false
+            if let roundTrip = sample.roundTripMilliseconds {
+                let continued = localRoundTripCongestedDuration > 0
+                    && localRoundTrip.map { now - $0.at <= Self.localRoundTripMaximumGap } == true
+                if roundTrip >= Self.localDelayedMilliseconds {
+                    localRoundTripCongestedDuration = (continued ? localRoundTripCongestedDuration : 0) + elapsed
+                    sustainedRoundTrip = continued
+                        && localRoundTripCongestedDuration + mediaPolicyTimeTolerance >= Self.localReductionDelay
+                } else { localRoundTripCongestedDuration = 0 }
+                localRoundTrip = (roundTrip, now)
+            } else if let observed = localRoundTrip, now - observed.at > Self.localRoundTripMaximumGap {
+                localRoundTripCongestedDuration = 0
+            }
+            if let delivery = sample.deliveryMilliseconds, delivery >= Self.localDelayedMilliseconds {
+                congestedDuration += elapsed
+            } else { congestedDuration = 0 }
             guard let delay = [sample.deliveryMilliseconds, sample.roundTripMilliseconds].compactMap({ $0 }).max() else {
-                resetEvidence()
+                // Missing per-second measurements are normal between TCP heartbeats. Preserve only
+                // their bounded run; no delivery or recovery evidence accrues in an unmeasured window.
+                healthyDuration = 0; filledDuration = 0
                 return nil
             }
             if delay >= Self.localDelayedMilliseconds {
                 healthyDuration = 0; filledDuration = 0
-                congestedDuration += elapsed
-                guard congestedDuration + mediaPolicyTimeTolerance >= Self.localReductionDelay else { return nil }
-                congestedDuration = 0
+                guard sustainedRoundTrip || congestedDuration + mediaPolicyTimeTolerance >= Self.localReductionDelay else { return nil }
+                congestedDuration = 0; localRoundTripCongestedDuration = 0
                 let current = StreamSettings(longestEdge: min(effective.longestEdge, upperBound.longestEdge),
                                              framesPerSecond: min(effective.framesPerSecond, upperBound.framesPerSecond),
                                              megabits: min(effective.megabits, upperBound.megabits))
@@ -626,8 +647,10 @@ public struct MediaQualityPolicy: Sendable {
                 localLatencyLimited = true
                 return recommendReduction(next, adjustment: .localLatency, now: now)
             }
-            congestedDuration = 0
-            guard delay < Self.localHealthyMilliseconds, sample.decodedFrames > 0 else {
+            // A low relative delivery delay cannot disprove a high absolute RTT. Keep that recovery
+            // veto across settings requests, until a new healthy RTT arrives or the route is reset.
+            guard delay < Self.localHealthyMilliseconds, sample.decodedFrames > 0,
+                  localRoundTrip.map({ $0.milliseconds < Self.localHealthyMilliseconds }) ?? true else {
                 healthyDuration = 0; filledDuration = 0
                 return nil
             }
@@ -708,7 +731,7 @@ public struct MediaQualityPolicy: Sendable {
 
     public mutating func resetObservation(now: TimeInterval) {
         guard accept(now) else { return }
-        lastObservationAt = now; resetEvidence()
+        lastObservationAt = now; localRoundTrip = nil; resetEvidence()
     }
 
     private mutating func accept(_ now: TimeInterval) -> Bool {
@@ -850,6 +873,6 @@ public struct MediaQualityPolicy: Sendable {
 
     private mutating func resetEvidence() {
         computeDuration = 0; congestedDuration = 0; healthyDuration = 0; filledDuration = 0; lastBottleneck = nil
-        peakComputeMilliseconds = nil
+        peakComputeMilliseconds = nil; localRoundTripCongestedDuration = 0
     }
 }

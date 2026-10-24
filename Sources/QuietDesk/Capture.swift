@@ -960,18 +960,21 @@ final class InputInjector {
     private let isTrusted: () -> Bool
     private let postEvent: (CGEvent) -> Void
     private let capsLockState: () -> Bool
+    private let pointerLocation: () -> CGPoint?
 
     convenience init(displayID: CGDirectDisplayID) { self.init(bounds: CGDisplayBounds(displayID)) }
 
     init(bounds: CGRect, isTrusted: @escaping () -> Bool = { AXIsProcessTrusted() },
          postEvent: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
          inputSources: InputSources? = nil,
-         capsLockState: @escaping () -> Bool = { CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift) }) {
+         capsLockState: @escaping () -> Bool = { CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift) },
+         pointerLocation: @escaping () -> CGPoint? = { CGEvent(source: nil)?.location }) {
         self.bounds = bounds
         self.isTrusted = isTrusted
         self.postEvent = postEvent
         self.inputSources = inputSources ?? InputSources()
         self.capsLockState = capsLockState
+        self.pointerLocation = pointerLocation
     }
 
     func receive(_ input: RemoteInput) async throws -> InputFeedback? {
@@ -1051,18 +1054,25 @@ final class InputInjector {
             }
         case .scroll:
             guard let pixels = try scroll.accumulate(deltaX: input.deltaX, deltaY: input.deltaY) else { return nil }
-            let heldButton = heldButtons.min()
-            let moveType: CGEventType = heldButton == nil ? .mouseMoved
-                : heldButton == 0 ? .leftMouseDragged : heldButton == 1 ? .rightMouseDragged : .otherMouseDragged
-            let moveButton = CGMouseButton(rawValue: UInt32(heldButton ?? 0)) ?? .left
-            guard let move = CGEvent(mouseEventSource: source, mouseType: moveType, mouseCursorPosition: point, mouseButton: moveButton),
-                  let wheel = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
-                    wheel1: pixels.y, wheel2: pixels.x, wheel3: 0) else {
+            guard let wheel = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
+                                      wheel1: pixels.y, wheel2: pixels.x, wheel3: 0) else {
                 throw DeskError.invalid("无法建立远端滚动事件")
             }
-            // A scroll's location does not move the pointer used for window and view routing.
-            move.flags = flags
-            postEvent(move)
+            // A scroll's location does not move the pointer used for window and view routing, so move it there
+            // first. Skip the move once the pointer is already there: one per wheel event redoes hover mid-scroll.
+            let current = pointerLocation()
+            if current.map({ abs($0.x - point.x) >= 0.5 || abs($0.y - point.y) >= 0.5 }) ?? true {
+                let heldButton = heldButtons.min()
+                let moveType: CGEventType = heldButton == nil ? .mouseMoved
+                    : heldButton == 0 ? .leftMouseDragged : heldButton == 1 ? .rightMouseDragged : .otherMouseDragged
+                let moveButton = CGMouseButton(rawValue: UInt32(heldButton ?? 0)) ?? .left
+                guard let move = CGEvent(mouseEventSource: source, mouseType: moveType, mouseCursorPosition: point,
+                                         mouseButton: moveButton) else {
+                    throw DeskError.invalid("无法建立远端滚动事件")
+                }
+                move.flags = flags
+                postEvent(move)
+            }
             lastPoint = point
             event = wheel
             event?.location = point

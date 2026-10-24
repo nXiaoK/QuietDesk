@@ -43,7 +43,7 @@ private struct InputInjectorChecks {
         await run("A wire scroll moves the pointer to its Quartz target before delivering both axes") {
             let recorder = EventRecorder()
             let injector = InputInjector(bounds: CGRect(x: -1920, y: -200, width: 1920, height: 1080),
-                                         isTrusted: { true }, postEvent: recorder.post)
+                                         isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
             var input = scroll(x: 0.75, y: 0.25, dx: 24, dy: -36)
             input.flags = CGEventFlags.maskShift.union(.maskAlternate).union(.maskNonCoalesced).rawValue
             let packet = try Wire.json(.input, input)
@@ -69,10 +69,10 @@ private struct InputInjectorChecks {
         await run("Trackpad fractions accumulate independently and emit no empty wheel events") {
             let recorder = EventRecorder()
             let injector = InputInjector(bounds: CGRect(x: 100, y: -1440, width: 900, height: 1440),
-                                         isTrusted: { true }, postEvent: recorder.post)
-            for index in 0..<4 {
+                                         isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
+            for (index, count) in [0, 2, 2, 3].enumerated() {
                 _ = try await injector.receive(scroll(x: 1, y: 1, dx: 0.25, dy: -0.5))
-                try require(recorder.events.count == (index + 1) / 2 * 2, "Subpixel input generated an empty event or was lost")
+                try require(recorder.events.count == count, "Subpixel input generated an empty or repeated move, or was lost at \(index)")
             }
             let wheels = recorder.events.filter { $0.type == .scrollWheel }
             try require(wheels.count == 2 && wheels.reduce(0) { $0 + $1.getIntegerValueField(.scrollWheelEventPointDeltaAxis1) } == -2
@@ -85,7 +85,7 @@ private struct InputInjectorChecks {
         await run("Wheel direction, single-axis motion, limits and display endpoints remain intact") {
             let recorder = EventRecorder()
             let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 1440, height: 900),
-                                         isTrusted: { true }, postEvent: recorder.post)
+                                         isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
             let inputs = [scroll(x: 0, y: 0, dx: 120), scroll(x: 1, y: 1, dy: -240), scroll(dx: -3000, dy: 3000)]
             for input in inputs { _ = try await injector.receive(input) }
             try require(recorder.events.count == 6, "Wheel samples were dropped or produced extra events")
@@ -104,7 +104,7 @@ private struct InputInjectorChecks {
                                        (1, .rightMouseDragged, .rightMouseUp), (2, .otherMouseDragged, .otherMouseUp)] {
                 let recorder = EventRecorder()
                 let injector = InputInjector(bounds: CGRect(x: -100, y: 200, width: 101, height: 101),
-                                             isTrusted: { true }, postEvent: recorder.post)
+                                             isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
                 var down = RemoteInput(kind: .down)
                 down.button = button; down.x = 0; down.y = 0
                 _ = try await injector.receive(down)
@@ -116,10 +116,40 @@ private struct InputInjectorChecks {
             }
         }
 
+        await run("A scroll where the pointer already is posts only the wheel, and a moved pointer is moved back first") {
+            for held in [false, true] {
+                let recorder = EventRecorder()
+                let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 101, height: 101),
+                                             isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
+                if held {
+                    var down = RemoteInput(kind: .down)
+                    down.x = 0.5; down.y = 0.5
+                    _ = try await injector.receive(down)
+                    recorder.events.removeAll()
+                }
+                for _ in 0..<3 { _ = try await injector.receive(scroll(x: 0.2, y: 0.4, dy: -12)) }
+                try require(recorder.events.map(\.type) == [held ? .leftMouseDragged : .mouseMoved, .scrollWheel, .scrollWheel, .scrollWheel],
+                            "Scrolling at an unchanged pointer repeated its move or lost a wheel event")
+                recorder.pointer = CGPoint(x: 20.3, y: 40.2)
+                _ = try await injector.receive(scroll(x: 0.2, y: 0.4, dy: -12))
+                try require(recorder.events.count == 5, "A sub-pixel pointer difference added a move")
+                recorder.pointer = CGPoint(x: 90, y: 10)
+                _ = try await injector.receive(scroll(x: 0.2, y: 0.4, dy: -12))
+                try require(recorder.events.count == 7 && recorder.events[5].location == CGPoint(x: 20, y: 40)
+                            && recorder.events[6].type == .scrollWheel && recorder.scrollTargets.last == CGPoint(x: 20, y: 40),
+                            "A pointer moved on the host was not returned to the scroll target first")
+                let unknown = InputInjector(bounds: CGRect(x: 0, y: 0, width: 101, height: 101),
+                                            isTrusted: { true }, postEvent: recorder.post, pointerLocation: { nil })
+                _ = try await unknown.receive(scroll(x: 0.2, y: 0.4, dy: -12))
+                try require(recorder.events.count == 9 && recorder.events[7].type == .mouseMoved,
+                            "An unknown pointer position skipped the move")
+            }
+        }
+
         await run("Release clears pending fractions and zero input does not move the pointer") {
             let recorder = EventRecorder()
             let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 100, height: 100),
-                                         isTrusted: { true }, postEvent: recorder.post)
+                                         isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
             _ = try await injector.receive(scroll(dx: 0.75, dy: -0.75))
             injector.releaseAll()
             _ = try await injector.receive(scroll())
@@ -133,7 +163,7 @@ private struct InputInjectorChecks {
             let recorder = EventRecorder()
             var trusted = true
             let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 100, height: 100),
-                                         isTrusted: { trusted }, postEvent: recorder.post)
+                                         isTrusted: { trusted }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
             _ = try await injector.receive(scroll(dx: 0.5, dy: 0.5))
             for input in [scroll(x: .nan, dy: 12), scroll(dx: .infinity), scroll(dy: 3000.1)] {
                 do { _ = try await injector.receive(input); throw InputCheckFailure("Invalid scroll was accepted") }

@@ -211,15 +211,38 @@ private struct InputInjectorChecks {
                         }, "A phased scroll stopped being a precise pixel scroll or repeated its pointer move")
         }
 
-        await run("Lost gesture beginnings are supplied and unfinished ones end after silence, a wheel or a release") {
+        await run("A trackpad pause keeps one gesture open until its real ending") {
             let recorder = EventRecorder()
             let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 101, height: 101),
-                                         isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer },
-                                         scrollPhaseTimeout: 0.05)
+                                         isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
+            var began = phased(.began)
+            began.flags = CGEventFlags.maskControl.union(.maskShift).rawValue
+            var changed = began
+            changed.scrollPhase = .changed; changed.deltaY = -5
+            _ = try await injector.receive(began)
+            _ = try await injector.receive(changed)
+            try await Task.sleep(nanoseconds: 650_000_000)
+            try require(phases(recorder.events) == ["1/0/0", "4/0/-5"],
+                        "Pausing without lifting the fingers ended a valid gesture")
+            _ = try await injector.receive(changed)
+            var ended = began
+            ended.scrollPhase = .ended
+            _ = try await injector.receive(ended)
+            let wheels = recorder.events.filter { $0.type == .scrollWheel }
+            try require(phases(wheels) == ["1/0/0", "4/0/-5", "4/0/-5", "8/0/0"],
+                        "A paused gesture restarted or ended twice")
+            try require(wheels.allSatisfy { $0.flags == [.maskControl, .maskShift] },
+                        "A paused gesture lost its modifiers")
+        }
+
+        await run("Lost gesture beginnings are supplied and unfinished ones end on a wheel or a release") {
+            let recorder = EventRecorder()
+            let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 101, height: 101),
+                                         isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
             _ = try await injector.receive(phased(.changed, dy: -5))
             try require(phases(recorder.events) == ["1/0/0", "4/0/-5"], "A gesture without its beginning was not opened first")
-            try await Task.sleep(nanoseconds: 200_000_000)
-            try require(phases(recorder.events) == ["1/0/0", "4/0/-5", "8/0/0"], "A silent gesture stayed open")
+            injector.releaseAll()
+            try require(phases(recorder.events) == ["1/0/0", "4/0/-5", "8/0/0"], "Release left a gesture open")
             _ = try await injector.receive(phased(.ended))
             _ = try await injector.receive(phased(momentum: .ended))
             try require(phases(recorder.events).count == 3, "An ending for an already ended gesture reached apps")
@@ -232,7 +255,7 @@ private struct InputInjectorChecks {
             try require(phases(recorder.events).suffix(2) == ["0/1/0", "0/4/-4"], "Momentum without its beginning was not opened first")
             injector.releaseAll()
             try require(phases(recorder.events).last == "0/8/0", "Release left momentum open")
-            try await Task.sleep(nanoseconds: 200_000_000)
+            injector.releaseAll()
             try require(phases(recorder.events).count == 9, "A released gesture was ended twice")
             _ = try await injector.receive(phased(.began))
             _ = try await injector.receive(phased(momentum: .began, dy: -2))
@@ -240,8 +263,29 @@ private struct InputInjectorChecks {
                         "Momentum did not end the gesture whose ending was lost")
             _ = try await injector.receive(phased(.mayBegin))
             try require(phases(recorder.events).suffix(2) == ["0/8/0", "32/0/0"], "A new touch did not end the running momentum")
-            try await Task.sleep(nanoseconds: 200_000_000)
-            try require(phases(recorder.events).last == "16/0/0", "An unfinished touch was not cancelled after silence")
+            injector.releaseAll()
+            try require(phases(recorder.events).last == "16/0/0", "An unfinished touch was not cancelled on release")
+        }
+
+        await run("Synthetic gesture and momentum endings retain the latest remote modifiers") {
+            for momentum in [false, true] {
+                let recorder = EventRecorder()
+                let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 101, height: 101),
+                                             isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
+                var input = momentum ? phased(momentum: .began, dy: -3) : phased(.began, dy: -3)
+                input.flags = CGEventFlags.maskControl.rawValue
+                _ = try await injector.receive(input)
+                var modifier = RemoteInput(kind: .flags)
+                modifier.keyCode = 56
+                modifier.flags = CGEventFlags.maskControl.union(.maskShift).rawValue
+                _ = try await injector.receive(modifier)
+                injector.releaseAll()
+                guard let ending = recorder.events.last(where: { $0.type == .scrollWheel }) else {
+                    throw InputCheckFailure("Release did not end the gesture")
+                }
+                try require(ending.flags == [.maskControl, .maskShift], "Release dropped the active gesture's current modifiers")
+                try require(phases([ending]) == [momentum ? "0/8/0" : "8/0/0"], "Release used the wrong ending phase")
+            }
         }
 
         await run("Release clears pending fractions and zero input does not move the pointer") {

@@ -277,6 +277,7 @@ final class RemoteCanvas: NSView {
     private var movePacer = PointerMovePacer()
     private var moveTimer: Timer?
     private var moveGeneration = UUID()
+    private var activeScroll: RemoteInput?
     private var cursorState = CursorPresentationState()
     private var cursorImage: NSImage?
     private var localCursor = NSCursor.arrow
@@ -287,7 +288,7 @@ final class RemoteCanvas: NSView {
     var onCursorPresentation: ((Bool, Bool) -> Void)?
     var pointerInputSuspended = false {
         didSet {
-            if pointerInputSuspended { cancelPointerMoves() }
+            if pointerInputSuspended { cancelPointerMoves(); activeScroll = nil }
             window?.invalidateCursorRects(for: self)
             updateCursorPresentation()
         }
@@ -319,7 +320,7 @@ final class RemoteCanvas: NSView {
     var remoteSize = CGSize(width: 16, height: 10)
     var canControl = false {
         didSet {
-            if !canControl { cancelPointerMoves() }
+            if !canControl { cancelPointerMoves(); activeScroll = nil }
             reconcileSystemShortcutCapture()
             window?.invalidateCursorRects(for: self)
             updateCursorPresentation()
@@ -404,6 +405,7 @@ final class RemoteCanvas: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        cancelScrollGesture()
         cancelPointerMoves()
         needsLayout = true
         if systemShortcutMonitor.isRunning { releaseControl() }
@@ -693,6 +695,7 @@ final class RemoteCanvas: NSView {
 
     func releaseControl() {
         cancelPointerMoves()
+        activeScroll = nil
         interactionRevision &+= 1
         if window?.firstResponder === self, window?.makeFirstResponder(nil) == true { return }
         systemShortcutMonitor.stop()
@@ -712,6 +715,7 @@ final class RemoteCanvas: NSView {
     }
     override func resignFirstResponder() -> Bool {
         cancelPointerMoves()
+        activeScroll = nil
         systemShortcutMonitor.stop()
         shortcutStartAttempted = false
         publishShortcutStatus("全屏控制画面获得焦点后自动转发系统快捷键", running: false)
@@ -738,7 +742,7 @@ final class RemoteCanvas: NSView {
             let wasCapturing = systemShortcutMonitor.isRunning || (shortcutStatus?.1 == true)
             systemShortcutMonitor.stop()
             shortcutStartAttempted = false
-            if wasCapturing { onRelease?() }
+            if wasCapturing { activeScroll = nil; onRelease?() }
             if retry || shortcutStatus?.1 != false {
                 publishShortcutStatus("全屏控制画面获得焦点后自动转发系统快捷键", running: false)
             }
@@ -763,7 +767,7 @@ final class RemoteCanvas: NSView {
             if shortcutStatus?.1 == true { publishShortcutStatus("系统快捷键转发已暂停，请重新检测", running: false) }
             return
         }
-        if shortcutStartAttempted { onRelease?() }
+        if shortcutStartAttempted { activeScroll = nil; onRelease?() }
         shortcutStartAttempted = true
         do {
             try systemShortcutMonitor.start()
@@ -794,6 +798,7 @@ final class RemoteCanvas: NSView {
         let rect = pictureRect
         localPointerInside = rect.contains(point)
         updateCursorPresentation()
+        if !localPointerInside { cancelScrollGesture(flags: UInt64(event.modifierFlags.rawValue)) }
         guard rect.width > 0, rect.height > 0 else { return }
         if kind != .up && kind != .drag && !rect.contains(point) { return }
         onUserActivity?()
@@ -802,6 +807,9 @@ final class RemoteCanvas: NSView {
         input.x = min(1, max(0, (point.x - rect.minX) / rect.width))
         input.y = min(1, max(0, (point.y - rect.minY) / rect.height))
         input.flags = UInt64(event.modifierFlags.rawValue)
+        if localPointerInside, activeScroll != nil {
+            activeScroll?.x = input.x; activeScroll?.y = input.y; activeScroll?.flags = input.flags
+        }
         if kind == .down || kind == .up || kind == .drag {
             input.button = min(2, max(0, event.buttonNumber))
             input.clicks = min(3, max(1, event.clickCount))
@@ -819,6 +827,11 @@ final class RemoteCanvas: NSView {
                 input.lineDeltaX = min(limit, max(-limit, event.scrollingDeltaX))
                 input.lineDeltaY = min(limit, max(-limit, event.scrollingDeltaY))
             }
+            if let phase = input.scrollPhase {
+                activeScroll = phase == .ended || phase == .cancelled ? nil : input
+            } else if let momentum = input.momentumPhase {
+                activeScroll = momentum == .ended ? nil : input
+            } else { activeScroll = nil }
         }
         if kind == .move {
             if let ready = movePacer.offer(input, now: SessionClock.now) { onInput?(ready) }
@@ -848,6 +861,20 @@ final class RemoteCanvas: NSView {
     }
     override func mouseExited(with event: NSEvent) {
         localPointerInside = false; flushPointerMoves(); updateCursorPresentation()
+        cancelScrollGesture(flags: UInt64(event.modifierFlags.rawValue))
+    }
+
+    // A quiet trackpad can still be touched. End its remote gesture only when its input target is lost;
+    // zero deltas leave older hosts unchanged, while newer hosts receive an explicit phase ending.
+    private func cancelScrollGesture(flags: UInt64? = nil) {
+        guard var input = activeScroll else { return }
+        activeScroll = nil
+        flushPointerMoves()
+        input.deltaX = 0; input.deltaY = 0
+        if input.scrollPhase != nil { input.scrollPhase = .cancelled }
+        else { input.momentumPhase = .ended }
+        if let flags { input.flags = flags }
+        onInput?(input)
     }
 
     private func keyboard(_ event: NSEvent, _ kind: RemoteInput.Kind) {

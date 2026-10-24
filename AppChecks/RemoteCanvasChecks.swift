@@ -217,6 +217,94 @@ private struct RemoteCanvasChecks {
             try inputs.forEach { try $0.validate() }
         }
 
+        run("Leaving the picture ends only the active scroll without releasing held inputs") {
+            for (phase, momentum) in [(128, 0), (1, 0), (0, 1)] as [(Int64, Int64)] {
+                let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+                canvas.remoteSize = CGSize(width: 400, height: 300)
+                canvas.canControl = true
+                var inputs: [RemoteInput] = []
+                var releases = 0
+                canvas.onInput = { inputs.append($0) }
+                canvas.onRelease = { releases += 1 }
+                canvas.scrollWheel(with: try wheel(units: .pixel, x: 3, y: -6, phase: phase, momentum: momentum))
+                let outside = try mouse(.mouseMoved, point: CGPoint(x: 450, y: 150))
+                canvas.mouseExited(with: outside)
+                canvas.mouseExited(with: outside)
+                canvas.scrollWheel(with: try wheel(units: .pixel, x: 0, y: 0, point: CGPoint(x: 450, y: 150),
+                                                   phase: phase == 0 ? 0 : 4, momentum: momentum == 0 ? 0 : 3))
+                try require(inputs.count == 2 && releases == 0, "Leaving duplicated the ending or released unrelated inputs")
+                let ending = inputs[1]
+                try require(ending.kind == .scroll && ending.deltaX == 0 && ending.deltaY == 0
+                            && ending.x == inputs[0].x && ending.y == inputs[0].y
+                            && ending.flags == NSEvent.ModifierFlags.option.rawValue,
+                            "The synthetic ending moved, scrolled or lost the valid target and modifiers")
+                try require(ending.scrollPhase == (phase == 0 ? nil : .cancelled)
+                            && ending.momentumPhase == (momentum == 0 ? nil : .ended),
+                            "Leaving did not cancel the gesture or end its momentum")
+                try ending.validate()
+                // Legacy hosts ignore the optional phases and receive a no-op pixel scroll.
+                var legacy = ending
+                legacy.scrollPhase = nil; legacy.momentumPhase = nil
+                var accumulator = ScrollAccumulator()
+                let legacyPixels = try accumulator.accumulate(deltaX: legacy.deltaX, deltaY: legacy.deltaY)
+                try require(legacyPixels == nil, "The ending would scroll an older host")
+            }
+        }
+
+        run("Entering letterboxing by movement or scroll explicitly cancels the remote gesture") {
+            for scrollOutside in [false, true] {
+                let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+                canvas.remoteSize = CGSize(width: 400, height: 200)
+                canvas.canControl = true
+                var inputs: [RemoteInput] = []
+                canvas.onInput = { inputs.append($0) }
+                canvas.scrollWheel(with: try wheel(units: .pixel, x: 0, y: -6, phase: 1))
+                let outside = CGPoint(x: 100, y: 25)
+                if scrollOutside {
+                    canvas.scrollWheel(with: try wheel(units: .pixel, x: 0, y: -6, point: outside, phase: 2))
+                } else { canvas.mouseMoved(with: try mouse(.mouseMoved, point: outside)) }
+                try require(inputs.count == 2 && inputs[1].scrollPhase == .cancelled && inputs[1].deltaY == 0
+                            && inputs[1].x == 0.25 && inputs[1].y == 0.5,
+                            "A gesture entering letterboxing stayed open or sent outside motion")
+            }
+        }
+
+        run("A scroll ending after pointer movement keeps the latest valid remote position") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            canvas.remoteSize = CGSize(width: 400, height: 300)
+            canvas.canControl = true
+            var inputs: [RemoteInput] = []
+            canvas.onInput = { inputs.append($0) }
+            canvas.scrollWheel(with: try wheel(units: .pixel, x: 0, y: -6, phase: 1))
+            canvas.mouseMoved(with: try mouse(.mouseMoved, point: CGPoint(x: 200, y: 150)))
+            canvas.mouseMoved(with: try mouse(.mouseMoved, point: CGPoint(x: 300, y: 225)))
+            canvas.mouseMoved(with: try mouse(.mouseMoved, point: CGPoint(x: 450, y: 225)))
+            try require(inputs.count == 4 && inputs[1].kind == .move && inputs[2].kind == .move
+                        && inputs[3].scrollPhase == .cancelled && inputs[2].x == 0.75
+                        && inputs[3].x == inputs[2].x && inputs[3].y == inputs[2].y,
+                        "The ending overtook a pending pointer move or returned to an older scroll position: \(inputs.map { "\($0.kind.rawValue)/\($0.x)/\($0.y)/\($0.scrollPhase?.rawValue ?? 0)" })")
+        }
+
+        run("Focus release clears scroll tracking and does not repeat the host release with a late ending") {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+                                  styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            defer { window.close() }
+            let canvas = RemoteCanvas(frame: window.contentView!.bounds)
+            canvas.remoteSize = CGSize(width: 400, height: 300)
+            canvas.canControl = true
+            window.contentView = canvas
+            var inputs: [RemoteInput] = []
+            var releases = 0
+            canvas.onInput = { inputs.append($0) }
+            canvas.onRelease = { releases += 1 }
+            try require(window.makeFirstResponder(canvas), "Canvas did not take fixture focus")
+            canvas.scrollWheel(with: try wheel(units: .pixel, x: 0, y: -6, phase: 1))
+            canvas.releaseControl()
+            canvas.mouseExited(with: try mouse(.mouseMoved, point: CGPoint(x: 450, y: 150)))
+            try require(releases == 1 && inputs.count == 1, "Focus release left stale scroll tracking or duplicated input release")
+        }
+
         run("A line wheel scales its deltas without reading click-only NSEvent properties") {
             let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
             canvas.remoteSize = CGSize(width: 400, height: 300)

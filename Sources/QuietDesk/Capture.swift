@@ -1064,13 +1064,12 @@ final class InputInjector {
     private var heldKeys = Set<UInt16>()
     private var heldButtons = Set<Int>()
     private var lastPoint = CGPoint.zero
+    private var inputFlags: CGEventFlags = []
     private var scroll = ScrollAccumulator()
     private var lineScroll = ScrollAccumulator()
     // Gesture and momentum phases already given to apps and not yet ended.
     private var openScrollPhase: RemoteInput.ScrollPhase?
     private var momentumOpen = false
-    private var phaseWatch: Task<Void, Never>?
-    private let scrollPhaseTimeout: TimeInterval
     private let source = CGEventSource(stateID: .hidSystemState)
     private let inputSources: InputSources
     private var remoteCapsLock: Bool?
@@ -1085,15 +1084,13 @@ final class InputInjector {
          postEvent: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
          inputSources: InputSources? = nil,
          capsLockState: @escaping () -> Bool = { CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift) },
-         pointerLocation: @escaping () -> CGPoint? = { CGEvent(source: nil)?.location },
-         scrollPhaseTimeout: TimeInterval = 0.5) {
+         pointerLocation: @escaping () -> CGPoint? = { CGEvent(source: nil)?.location }) {
         self.bounds = bounds
         self.isTrusted = isTrusted
         self.postEvent = postEvent
         self.inputSources = inputSources ?? InputSources()
         self.capsLockState = capsLockState
         self.pointerLocation = pointerLocation
-        self.scrollPhaseTimeout = scrollPhaseTimeout
     }
 
     func receive(_ input: RemoteInput) async throws -> InputFeedback? {
@@ -1114,7 +1111,7 @@ final class InputInjector {
                 modifiers.remove(.maskAlphaShift)
                 if remoteCapsLock == true { modifiers.insert(.maskAlphaShift) }
                 event?.flags = modifiers
-                if let event { postEvent(event) }
+                if let event { inputFlags = modifiers; postEvent(event) }
                 return InputFeedback(message: remoteCapsLock == true ? "远端大写锁定已开启" : "远端大写锁定已关闭",
                                      capsLocked: remoteCapsLock == true)
             }
@@ -1175,7 +1172,6 @@ final class InputInjector {
             // A wheel or an older viewer sends no phases; finish any gesture an interrupted stream left open.
             if input.scrollPhase == nil && input.momentumPhase == nil { endScrollPhases() }
             let wheels = try scrollEvents(input)
-            watchScrollPhases()
             guard let wheel = wheels.last else { return nil }
             // A scroll's location does not move the pointer used for window and view routing, so move it there
             // first. Skip the move once the pointer is already there: one per wheel event redoes hover mid-scroll.
@@ -1220,7 +1216,7 @@ final class InputInjector {
         case .switchInputSource, .toggleCapsLock: return nil
         }
         event?.flags = flags
-        if let event { postEvent(event) }
+        if let event { inputFlags = flags; postEvent(event) }
         return nil
     }
 
@@ -1308,22 +1304,9 @@ final class InputInjector {
         return event
     }
 
-    // A gesture or momentum left open waits for an ending that a lost event, a pointer leaving the remote
-    // picture or a stalled network may never deliver; end it after a short silence so apps stop waiting.
-    private func watchScrollPhases() {
-        phaseWatch?.cancel()
-        guard openScrollPhase != nil || momentumOpen else { phaseWatch = nil; return }
-        let timeout = scrollPhaseTimeout
-        phaseWatch = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-            guard !Task.isCancelled else { return }
-            self?.endScrollPhases()
-        }
-    }
-
+    // Silence can be a stationary touch. Only an explicit ending, a different scroll stream or releaseAll
+    // closes the gesture; the viewer sends an ending when its pointer leaves the remote picture.
     private func endScrollPhases() {
-        phaseWatch?.cancel()
-        phaseWatch = nil
         var endings: [(RemoteInput.ScrollPhase?, RemoteInput.MomentumPhase?)] = []
         if let open = openScrollPhase { endings.append((open == .mayBegin ? .cancelled : .ended, nil)) }
         if momentumOpen { endings.append((nil, .ended)) }
@@ -1336,7 +1319,7 @@ final class InputInjector {
             event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase?.rawValue ?? 0))
             event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Int64(momentum?.rawValue ?? 0))
             event.location = lastPoint
-            event.flags = remoteCapsLock == true ? [.maskAlphaShift] : []
+            event.flags = inputFlags
             postEvent(event)
         }
     }
@@ -1361,5 +1344,6 @@ final class InputInjector {
         }
         heldKeys.removeAll()
         heldButtons.removeAll()
+        inputFlags = remoteCapsLock == true ? [.maskAlphaShift] : []
     }
 }

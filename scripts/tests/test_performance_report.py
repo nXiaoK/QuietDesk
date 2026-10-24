@@ -77,6 +77,22 @@ class PerformanceReportTests(unittest.TestCase):
         self.assertIn("mediaFrame (27)", text)
         self.assertIn("mediaFeedback (28)", text)
 
+    def test_capture_and_encoder_metrics_preserve_units_without_inventing_missing_samples(self):
+        records = [window(metric="captureInterval"), window(metric="encodeSubmit"),
+                   window(metric="encoderDropped", unit="count", count=3, minimum=1, maximum=1,
+                          mean=1, p95UpperBound=1)]
+        report = report_module.read_report(self.write(records))
+        self.assertEqual(report.valid_windows, 3)
+        self.assertEqual(report.skipped_lines, 0)
+        text = report_module.render_report([report])
+        for metric in ("captureInterval", "encodeSubmit", "encoderDropped"):
+            self.assertIn(metric, text)
+        self.assertIn("1.000 count", text)
+        self.assertNotIn("encoderHardware", text)
+        invalid = report_module.read_report(self.write([window(metric="encoderDropped")], "wrong-unit.jsonl"))
+        self.assertEqual(invalid.valid_windows, 0)
+        self.assertEqual(invalid.skipped_lines, 1)
+
     def test_roles_connections_kinds_files_and_application_runs_stay_separate(self):
         host = window()
         host["role"] = "host"

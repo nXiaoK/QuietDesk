@@ -8,9 +8,9 @@ public enum PerformanceMetric: String, Codable, CaseIterable, Sendable {
     case sendQueue, sendCompletion, receiveHeaderWait, receiveBody, messageHandler, roundTrip
     case tcpSmoothedRTT, tcpMinimumRTT, tcpRTTVariance, tcpReportDuration
     case tcpRetransmittedBytes, tcpOutOfOrderBytes, tcpSentBytes, tcpReceivedBytes
-    case captureAge, encode, encodeCallbackQueue, videoAck, decodeQueue, decodePrepare, decode, decodeToDisplay, displayEnqueue
+    case captureAge, captureInterval, encodeSubmit, encode, encodeCallbackQueue, videoAck, decodeQueue, decodePrepare, decode, decodeToDisplay, displayEnqueue
     case encodedBytes, keyframeBytes, pendingSendBytes
-    case captureReplaced, displayReplaced, encoderHardware, decoderHardware, videoOutstanding
+    case captureReplaced, displayReplaced, encoderHardware, decoderHardware, encoderDropped, videoOutstanding
     case mediaRoundTrip, mediaReassembly, mediaSwitch, mediaDecodeInterval
     case mediaDatagramSentBytes, mediaDatagramReceivedBytes, mediaRepairBytes
     case mediaExpired, mediaRecovery, mediaTransport
@@ -20,7 +20,7 @@ public enum PerformanceMetric: String, Codable, CaseIterable, Sendable {
         case .encodedBytes, .keyframeBytes, .pendingSendBytes, .tcpRetransmittedBytes, .tcpOutOfOrderBytes,
              .tcpSentBytes, .tcpReceivedBytes, .mediaDatagramSentBytes, .mediaDatagramReceivedBytes,
              .mediaRepairBytes: return .bytes
-        case .captureReplaced, .displayReplaced, .encoderHardware, .decoderHardware, .videoOutstanding,
+        case .captureReplaced, .displayReplaced, .encoderHardware, .decoderHardware, .encoderDropped, .videoOutstanding,
              .mediaExpired, .mediaRecovery, .mediaTransport: return .count
         default: return .microseconds
         }

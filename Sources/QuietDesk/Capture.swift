@@ -6,12 +6,26 @@ import QuietDeskCore
 // Encoder and acknowledgement state share one queue with the capture pump.
 struct VideoFrameFlow {
     static let maximumOutstandingFrames = 3
+    struct Encoding {
+        let sequence: UInt32
+        let startedAt: TimeInterval
+        let forceKeyFrame: Bool
+        let isRefinement: Bool
+    }
+    struct Completion {
+        let sequence: UInt32
+        let packet: VideoPacket?
+        let callbackAt: TimeInterval
+        let duration: TimeInterval?
+        let diagnostic: PerformanceDiagnostics.Token?
+        var encodingDiagnostic: PerformanceDiagnostics.Token? = nil
+    }
     private(set) var sequence: UInt32
-    private(set) var encoding: UInt32?
+    private(set) var encoding: [Encoding] = []
+    private var completed: [UInt32: Completion] = [:]
     private(set) var waiting: [UInt32: TimeInterval] = [:]
     private(set) var forceKeyFrame = true
-    private var encodingStartedAt: TimeInterval?
-    private var encodingKeyFrame = false
+    private(set) var encodingFailed = false
     private var consecutiveDrops = 0
     private(set) var mediaHold = false
     private(set) var mediaRecoveryFrameEncoded = false
@@ -20,25 +34,41 @@ struct VideoFrameFlow {
 
     init(sequence: UInt32 = 0) { self.sequence = sequence }
 
-    var isIdle: Bool { encoding == nil && waiting.isEmpty }
+    var isIdle: Bool { encoding.isEmpty && waiting.isEmpty }
+    var outstanding: Int { encoding.count + waiting.count }
 
-    mutating func begin(at now: TimeInterval) -> (sequence: UInt32, forceKeyFrame: Bool)? {
-        // The encoding reservation also consumes a credit; there is no unbounded encoder queue.
-        guard encoding == nil, waiting.count < Self.maximumOutstandingFrames,
+    mutating func begin(at now: TimeInterval, maximumConcurrentEncodes: Int = 1, isRefinement: Bool = false) -> Encoding? {
+        // Encoding and completed-but-not-yet-delivered output share the same three-frame credit window.
+        // A forced IDR is serialized so its drop cannot leave an already-submitted P frame behind it.
+        guard !encodingFailed, encoding.count < min(2, max(1, maximumConcurrentEncodes)),
+              outstanding < Self.maximumOutstandingFrames,
+              !encoding.contains(where: { $0.forceKeyFrame }), !forceKeyFrame || encoding.isEmpty,
+              !isRefinement || encoding.isEmpty,
               !mediaHold || mediaRecoveryRequested else { return nil }
-        repeat { sequence &+= 1 } while waiting[sequence] != nil
-        encoding = sequence
-        encodingStartedAt = now
-        encodingKeyFrame = forceKeyFrame
+        repeat { sequence &+= 1 } while waiting[sequence] != nil || encoding.contains(where: { $0.sequence == sequence })
+        let frame = Encoding(sequence: sequence, startedAt: now, forceKeyFrame: forceKeyFrame, isRefinement: isRefinement)
+        encoding.append(frame)
         forceKeyFrame = false
         if mediaHold { mediaRecoveryRequested = false }
-        return (sequence, encodingKeyFrame)
+        return frame
+    }
+
+    // Callback processing may reach the capture queue out of order. At most two results are retained,
+    // and their reservations remain occupied until the head is delivered or dropped.
+    mutating func complete(_ result: Completion) -> Bool {
+        guard !encodingFailed, encoding.contains(where: { $0.sequence == result.sequence }), completed[result.sequence] == nil else { return false }
+        completed[result.sequence] = result
+        return true
+    }
+
+    mutating func takeCompleted() -> (Encoding, Completion)? {
+        guard let first = encoding.first, let result = completed.removeValue(forKey: first.sequence) else { return nil }
+        return (first, result)
     }
 
     mutating func encoded(_ number: UInt32, at now: TimeInterval) -> Bool {
-        guard encoding == number else { return false }
-        encoding = nil
-        encodingStartedAt = nil
+        guard encoding.first?.sequence == number else { return false }
+        encoding.removeFirst(); completed.removeValue(forKey: number)
         consecutiveDrops = 0
         waiting[number] = now
         if mediaHold { mediaRecoveryFrameEncoded = true }
@@ -46,22 +76,21 @@ struct VideoFrameFlow {
     }
 
     mutating func dropped(_ number: UInt32) -> Bool {
-        guard encoding == number else { return false }
-        encoding = nil
-        encodingStartedAt = nil
+        guard let frame = encoding.first, frame.sequence == number else { return false }
+        encoding.removeFirst(); completed.removeValue(forKey: number)
         consecutiveDrops = min(consecutiveDrops + 1, 3)
-        forceKeyFrame = forceKeyFrame || encodingKeyFrame || consecutiveDrops >= 3
+        forceKeyFrame = forceKeyFrame || frame.forceKeyFrame || consecutiveDrops >= 3
         if mediaHold { mediaRecoveryRequested = true }
         return true
     }
 
     mutating func acknowledge(_ number: UInt32) -> Bool { waiting.removeValue(forKey: number) != nil }
     mutating func requestKeyFrame() { forceKeyFrame = true }
-    mutating func cancelEncoding() { encoding = nil; encodingStartedAt = nil }
+    mutating func cancelEncoding() { encoding.removeAll(); completed.removeAll() }
+    mutating func failEncoding() { cancelEncoding(); encodingFailed = true }
 
     mutating func prepareMediaRecovery() {
-        encoding = nil
-        encodingStartedAt = nil
+        cancelEncoding(); encodingFailed = false
         waiting.removeAll()
         forceKeyFrame = true
         consecutiveDrops = 0
@@ -87,7 +116,8 @@ struct VideoFrameFlow {
     }
 
     func stalled(at now: TimeInterval) -> String? {
-        if let encodingStartedAt, now - encodingStartedAt > 90 { return "视频编码超过 90 秒无输出" }
+        guard !encodingFailed else { return nil }
+        if let oldest = encoding.first?.startedAt, now - oldest > 90 { return "视频编码超过 90 秒无输出" }
         if let oldest = waiting.values.min(), now - oldest > 90 { return "视频解码确认超过 90 秒未返回" }
         return nil
     }
@@ -133,21 +163,59 @@ struct StaticFrameRefinement {
 }
 
 struct VideoEncodeTiming {
-    private var started: (encoderID: UUID, sequence: UInt32, at: TimeInterval)?
+    private var encoderID: UUID?
+    private var started: [UInt32: TimeInterval] = [:]
+    private var lastCompletedAt: TimeInterval?
 
-    mutating func begin(encoderID: UUID, sequence: UInt32, at now: TimeInterval) {
-        started = now.isFinite ? (encoderID, sequence, now) : nil
+    @discardableResult
+    mutating func begin(encoderID: UUID, sequence: UInt32, at now: TimeInterval) -> Bool {
+        guard now.isFinite else { return false }
+        if self.encoderID != encoderID {
+            self.encoderID = encoderID; started.removeAll(); lastCompletedAt = nil
+        }
+        guard started.count < 2, started[sequence] == nil else { return false }
+        started[sequence] = now
+        return true
     }
 
     mutating func complete(encoderID: UUID, sequence: UInt32, at now: TimeInterval) -> TimeInterval? {
-        guard let started, started.encoderID == encoderID, started.sequence == sequence else { return nil }
-        self.started = nil
-        let duration = now - started.at
+        guard self.encoderID == encoderID, let beganAt = started.removeValue(forKey: sequence) else { return nil }
+        let duration = now - beganAt
         return duration.isFinite && duration >= 0 ? duration : nil
     }
 
+    // Called in submission order. The diagnostic latency includes the encoder's queue; adaptation
+    // needs its sustained output time, excluding time already accounted for by the previous frame.
+    mutating func serviceDuration(encoderID: UUID, latency: TimeInterval, completedAt: TimeInterval) -> TimeInterval? {
+        guard self.encoderID == encoderID, latency.isFinite, latency >= 0, completedAt.isFinite else { return nil }
+        let duration = min(latency, max(0, completedAt - (lastCompletedAt ?? (completedAt - latency))))
+        lastCompletedAt = max(lastCompletedAt ?? completedAt, completedAt)
+        return duration
+    }
+
     mutating func cancel(encoderID: UUID? = nil) {
-        if encoderID == nil || started?.encoderID == encoderID { started = nil }
+        if encoderID == nil || self.encoderID == encoderID {
+            self.encoderID = nil; started.removeAll(); lastCompletedAt = nil
+        }
+    }
+}
+
+// SCK timestamps and retained-frame replays share one encoder timeline. A late capture after a replay
+// may be older than the last submission; advancing only that timestamp preserves VT's strict ordering.
+struct VideoPresentationTimeline {
+    private var encoderID: UUID?
+    private var lastSubmitted: CMTime?
+
+    mutating func next(encoderID: UUID, time: CMTime) throws -> CMTime {
+        guard time.isNumeric else { throw DeskError.invalid("视频帧时间戳无效") }
+        if self.encoderID != encoderID { self.encoderID = encoderID; lastSubmitted = nil }
+        var next = time
+        if let lastSubmitted, CMTimeCompare(next, lastSubmitted) <= 0 {
+            next = CMTimeAdd(lastSubmitted, CMTime(value: 1, timescale: 1_000_000))
+            guard next.isNumeric, CMTimeCompare(next, lastSubmitted) > 0 else { throw DeskError.invalid("视频帧时间戳无法递增") }
+        }
+        lastSubmitted = next
+        return next
     }
 }
 
@@ -253,13 +321,14 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var refinement = StaticFrameRefinement()
     private var refinementTimer: DispatchSourceTimer?
     private var lastCaptureAt: TimeInterval = 0
-    // `latest` holds a refinement pass rather than a capture; then the sequence it is encoded as.
+    // `latest` holds a refinement pass rather than a capture; submitted frames retain that identity.
     private var latestIsRefinement = false
-    private var refiningSequence: UInt32?
+    private var lastCaptureDiagnostics: PerformanceDiagnostics.Token?
     private let diagnostics: PerformanceDiagnostics?
     private let encodingTimingLock = NSLock()
-    private var encodingStarted: (id: UUID, sequence: UInt32, token: PerformanceDiagnostics.Token)?
+    private var encodingStarted: [UInt32: (id: UUID, token: PerformanceDiagnostics.Token)] = [:]
     private var encodeTiming = VideoEncodeTiming()
+    private var presentationTimeline = VideoPresentationTimeline()
     private var acknowledgements: [UInt32: PerformanceDiagnostics.Token] = [:]
     private var encoderHardwareChecked = false
     private var encoderHardware: Bool?
@@ -330,7 +399,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         configuration.captureResolution = .best
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: Int32(settings.framesPerSecond))
         configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        configuration.queueDepth = 3
+        // Two retained encoder inputs plus the newest capture still leave producer buffers available.
+        configuration.queueDepth = settings.framesPerSecond >= 60 ? 5 : 3
         configuration.showsCursor = includesCursor
         configuration.capturesAudio = false
         configuration.colorSpaceName = CGColorSpace.sRGB
@@ -343,50 +413,32 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         encoder.onOutput = { [weak self] result in
             guard let self else { return }
             let callbackAt = SessionClock.now
-            let observation = self.encodingTimingLock.withLock { () -> (duration: TimeInterval?, diagnostic: (UInt32, PerformanceDiagnostics.Token)?) in
-                let duration: TimeInterval?
-                switch result {
-                case .success(let packet): duration = self.encodeTiming.complete(encoderID: id, sequence: packet.sequence, at: callbackAt)
-                case .failure: self.encodeTiming.cancel(encoderID: id); duration = nil
-                }
-                guard let started = self.encodingStarted, started.id == id else { return (duration, nil) }
-                if case .success(let packet) = result, started.sequence != packet.sequence { return (duration, nil) }
-                self.encodingStarted = nil
-                return (duration, (started.sequence, started.token))
-            }
-            if let timing = observation.diagnostic { self.diagnostics?.record(.encode, since: timing.1, kind: .video, identifier: UInt64(timing.0)) }
-            let encodedAt = self.diagnostics?.start()
-            self.queue.async {
-                guard self.running, self.encoderID == id else { return }
-                if let duration = observation.duration { self.onEncodeDuration?(duration) }
+            let observation = self.encodingTimingLock.withLock { () -> (duration: TimeInterval?, diagnostic: PerformanceDiagnostics.Token?) in
                 switch result {
                 case .success(let packet):
-                    if self.frameFlow.mediaHold {
-                        guard !packet.sps.isEmpty, !packet.pps.isEmpty,
-                              (try? MediaFrame.containsIDR(packet.avcc)) == true else {
-                            self.frameFlow.cancelEncoding()
-                            self.reportError(DeskError.invalid("媒体恢复未产生独立 IDR 帧"))
-                            return
-                        }
-                    }
-                    guard self.frameFlow.encoded(packet.sequence, at: SessionClock.now) else { return }
-                    self.diagnostics?.record(.encodeCallbackQueue, since: encodedAt, kind: .video, identifier: UInt64(packet.sequence))
-                    if let encodedAt { self.acknowledgements[packet.sequence] = encodedAt }
-                    self.diagnostics?.recordValue(.encodedBytes, packet.avcc.count, kind: .video, identifier: UInt64(packet.sequence))
-                    if !packet.sps.isEmpty {
-                        self.diagnostics?.recordValue(.keyframeBytes, packet.avcc.count, kind: .video, identifier: UInt64(packet.sequence))
-                    }
-                    self.onFrame?(packet)
-                    self.scheduleRefinement(after: packet)
-                    self.completeFrameBoundary()
+                    let duration = self.encodeTiming.complete(encoderID: id, sequence: packet.sequence, at: callbackAt)
+                    guard self.encodingStarted[packet.sequence]?.id == id else { return (duration, nil) }
+                    return (duration, self.encodingStarted.removeValue(forKey: packet.sequence)?.token)
+                case .failure:
+                    self.encodeTiming.cancel(encoderID: id)
+                    self.encodingStarted = self.encodingStarted.filter { $0.value.id != id }
+                    return (nil, nil)
+                }
+            }
+            if case .success(let packet) = result {
+                self.diagnostics?.record(.encode, since: observation.diagnostic, kind: .video, identifier: UInt64(packet.sequence))
+            }
+            let encodedAt = self.diagnostics?.start()
+            self.queue.async {
+                guard self.running, self.encoderID == id, !self.frameFlow.encodingFailed else { return }
+                switch result {
+                case .success(let packet):
+                    guard self.frameFlow.complete(.init(sequence: packet.sequence, packet: packet, callbackAt: callbackAt,
+                        duration: observation.duration, diagnostic: encodedAt, encodingDiagnostic: observation.diagnostic)) else { return }
+                    self.completeEncodedFrames()
                 case .failure(let error):
                     self.diagnostics?.record(.encodeCallbackQueue, since: encodedAt, kind: .video)
-                    self.frameFlow.cancelEncoding()
-                    if let waiter = self.idleWaiter {
-                        self.idleWaiter = nil
-                        waiter.1.resume(throwing: error)
-                    }
-                    self.reportError(error)
+                    self.failEncoding(error)
                 }
             }
         }
@@ -395,23 +447,66 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             let callbackAt = SessionClock.now
             let observation = self.encodingTimingLock.withLock { () -> (duration: TimeInterval?, diagnostic: PerformanceDiagnostics.Token?) in
                 let duration = self.encodeTiming.complete(encoderID: id, sequence: number, at: callbackAt)
-                guard let started = self.encodingStarted, started.id == id, started.sequence == number else { return (duration, nil) }
-                self.encodingStarted = nil
-                return (duration, started.token)
+                guard self.encodingStarted[number]?.id == id else { return (duration, nil) }
+                return (duration, self.encodingStarted.removeValue(forKey: number)?.token)
             }
             self.diagnostics?.record(.encode, since: observation.diagnostic, kind: .video, identifier: UInt64(number))
             let droppedAt = self.diagnostics?.start()
             self.queue.async {
-                guard self.running, self.encoderID == id, self.frameFlow.dropped(number) else { return }
-                if let duration = observation.duration { self.onEncodeDuration?(duration) }
-                self.diagnostics?.record(.encodeCallbackQueue, since: droppedAt, kind: .video, identifier: UInt64(number))
-                self.refinement.dropped(isRefinement: self.refiningSequence == number, at: SessionClock.now)
-                self.refiningSequence = nil
-                self.armRefinementTimer()
-                self.completeFrameBoundary()
+                guard self.running, self.encoderID == id,
+                      self.frameFlow.complete(.init(sequence: number, packet: nil, callbackAt: callbackAt,
+                        duration: observation.duration, diagnostic: droppedAt, encodingDiagnostic: observation.diagnostic)) else { return }
+                self.completeEncodedFrames()
             }
         }
         return encoder
+    }
+
+    private func completeEncodedFrames() {
+        while let (frame, result) = frameFlow.takeCompleted() {
+            if let latency = result.duration,
+               let duration = encodingTimingLock.withLock({
+                   encodeTiming.serviceDuration(encoderID: encoderID, latency: latency, completedAt: result.callbackAt)
+               }) {
+                onEncodeDuration?(duration)
+            }
+            diagnostics?.record(.encodeCallbackQueue, since: result.diagnostic, kind: .video, identifier: UInt64(frame.sequence))
+            if let packet = result.packet {
+                if frameFlow.mediaHold {
+                    guard !packet.sps.isEmpty, !packet.pps.isEmpty,
+                          (try? MediaFrame.containsIDR(packet.avcc)) == true else {
+                        failEncoding(DeskError.invalid("媒体恢复未产生独立 IDR 帧"))
+                        return
+                    }
+                }
+                guard frameFlow.encoded(frame.sequence, at: SessionClock.now) else { return }
+                if let encodedAt = result.diagnostic { acknowledgements[packet.sequence] = encodedAt }
+                diagnostics?.recordValue(.encodedBytes, packet.avcc.count, kind: .video, identifier: UInt64(packet.sequence))
+                if !packet.sps.isEmpty { diagnostics?.recordValue(.keyframeBytes, packet.avcc.count, kind: .video, identifier: UInt64(packet.sequence)) }
+                onFrame?(packet)
+                scheduleRefinement(after: packet, isRefinement: frame.isRefinement)
+            } else {
+                guard frameFlow.dropped(frame.sequence) else { return }
+                if let token = result.encodingDiagnostic {
+                    diagnostics?.recordValue(.encoderDropped, 1, kind: .video, identifier: UInt64(frame.sequence), token: token)
+                }
+                refinement.dropped(isRefinement: frame.isRefinement, at: SessionClock.now)
+                armRefinementTimer()
+            }
+        }
+        completeFrameBoundary()
+    }
+
+    private func failEncoding(_ error: Error) {
+        guard !frameFlow.encodingFailed else { return }
+        frameFlow.failEncoding()
+        encodingTimingLock.withLock { encodingStarted.removeAll(); encodeTiming.cancel() }
+        cancelRefinement()
+        if let waiter = idleWaiter {
+            idleWaiter = nil
+            waiter.1.resume(throwing: error)
+        }
+        reportError(error)
     }
 
     private func reportError(_ error: Error, message: String? = nil) {
@@ -431,6 +526,10 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             encoderHardwareChecked = false
             encoderHardware = nil
             encoderID = id
+            frameFlow = VideoFrameFlow(sequence: frameFlow.sequence)
+            presentationTimeline = VideoPresentationTimeline()
+            encodingTimingLock.withLock { encodingStarted.removeAll(); encodeTiming.cancel() }
+            lastCaptureDiagnostics = nil
             self.stream = stream
             excludedWindowIDs = []
             displayID = capture.displayID
@@ -659,13 +758,19 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 let old = encoder
                 encoderID = id
                 encoder = replacement
-                encodingTimingLock.withLock { encodeTiming.cancel() }
+                encodingTimingLock.withLock { encodingStarted.removeAll(); encodeTiming.cancel() }
+                lastCaptureDiagnostics = nil
                 encoderHardwareChecked = false
                 encoderHardware = nil
                 outputWidth = width
                 outputHeight = height
                 currentSettings = settings
-                frameFlow.requestKeyFrame()
+                let wasMediaHeld = frameFlow.mediaHold
+                frameFlow = VideoFrameFlow(sequence: frameFlow.sequence)
+                // The media coordinator suspended this configuration before draining capture. Its
+                // replacement must still wait for a new recovery IDR and the coordinator's commit.
+                if wasMediaHeld { frameFlow.prepareMediaRecovery() }
+                presentationTimeline = VideoPresentationTimeline()
                 cancelRefinement()
                 latest = cursorGate.needsFreshFrame ? nil : lastCapture
                 if cursorGate.needsFreshFrame { lastCapture = nil; appliedCursorIncluded = nil }
@@ -801,6 +906,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                     return
                 }
                 reconfiguring = true
+                lastCaptureDiagnostics = nil
                 if frameFlow.isIdle { continuation.resume(); return }
                 let token = UUID()
                 idleWaiter = (token, continuation)
@@ -843,9 +949,11 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             self.encoder = replacement
             self.encoderHardwareChecked = false
             self.encoderHardware = nil
-            self.encodingTimingLock.withLock { self.encodingStarted = nil; self.encodeTiming.cancel() }
+            self.encodingTimingLock.withLock { self.encodingStarted.removeAll(); self.encodeTiming.cancel() }
+            self.lastCaptureDiagnostics = nil
             self.acknowledgements.removeAll()
             self.frameFlow.prepareMediaRecovery()
+            self.presentationTimeline = VideoPresentationTimeline()
             self.cancelRefinement()
             self.latest = self.lastCapture
             self.latest?.2 = nil
@@ -883,7 +991,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             guard let self, self.frameFlow.acknowledge(number) else { return }
             self.diagnostics?.record(.videoAck, since: self.acknowledgements.removeValue(forKey: number),
                                      kind: .video, identifier: UInt64(number))
-            self.diagnostics?.recordValue(.videoOutstanding, self.frameFlow.waiting.count + (self.frameFlow.encoding == nil ? 0 : 1))
+            self.diagnostics?.recordValue(.videoOutstanding, self.frameFlow.outstanding)
             self.completeFrameBoundary()
         }
     }
@@ -903,6 +1011,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             reconfiguring = false
             latest = nil
             lastCapture = nil
+            lastCaptureDiagnostics = nil
             cancelRefinement()
             refinementTimer?.cancel()
             refinementTimer = nil
@@ -914,9 +1023,10 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             cancelledCursorOperationID = nil
             cancelledCursorRequestID = nil
             cursorRollingBack = false
-            encodingTimingLock.withLock { encodingStarted = nil; encodeTiming.cancel() }
+            encodingTimingLock.withLock { encodingStarted.removeAll(); encodeTiming.cancel() }
             acknowledgements.removeAll()
             frameFlow = VideoFrameFlow(sequence: frameFlow.sequence)
+            presentationTimeline = VideoPresentationTimeline()
             if let waiter = idleWaiter { idleWaiter = nil; waiter.1.resume(throwing: CancellationError()) }
             watchdog?.cancel()
             watchdog = nil
@@ -951,6 +1061,10 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         if !reconfiguring, (CVPixelBufferGetWidth(buffer) != outputWidth || CVPixelBufferGetHeight(buffer) != outputHeight) { return }
         let cursorFrame = cursorGate.observe(sampleBuffer, displayTime: attachments.first?[.displayTime] as? UInt64)
         guard cursorFrame.retain else { return }
+        if captureStarted, !sessionPaused, !reconfiguring, diagnostics?.isEnabled == true {
+            diagnostics?.record(.captureInterval, since: lastCaptureDiagnostics, kind: .video)
+            lastCaptureDiagnostics = diagnostics?.start()
+        } else { lastCaptureDiagnostics = nil }
         if latest != nil, !latestIsRefinement, !sessionPaused, !reconfiguring { diagnostics?.recordValue(.captureReplaced, 1) }
         // SCK presentation time is not in the SessionClock domain.
         latest = (buffer, CMSampleBufferGetPresentationTimeStamp(sampleBuffer), diagnostics?.start())
@@ -967,10 +1081,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     // Runs on the capture queue once a frame's output was handed on.
-    private func scheduleRefinement(after packet: VideoPacket) {
+    private func scheduleRefinement(after packet: VideoPacket, isRefinement: Bool) {
         let now = SessionClock.now
-        if refiningSequence == packet.sequence {
-            refiningSequence = nil
+        if isRefinement {
             refinement.refined(at: now)
         } else {
             let budget = currentSettings.megabits * 125_000 / max(1, min(currentSettings.framesPerSecond, 60))
@@ -996,7 +1109,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     // a cursor change awaiting its fresh frame or a media recovery hold. Its time advances by the real wait.
     private func refineIfDue() {
         let now = SessionClock.now
-        guard running, captureStarted, !reconfiguring, !sessionPaused, !cursorGate.needsFreshFrame, !frameFlow.mediaHold,
+        guard running, captureStarted, !reconfiguring, !sessionPaused, !cursorGate.needsFreshFrame,
+              !frameFlow.mediaHold, !frameFlow.encodingFailed,
               refinement.isDue(at: now), latest == nil, let last = lastCapture,
               CVPixelBufferGetWidth(last.0) == outputWidth, CVPixelBufferGetHeight(last.0) == outputHeight else { return }
         refinement.wait()
@@ -1007,7 +1121,6 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 
     private func cancelRefinement() {
         refinement.cancel()
-        refiningSequence = nil
         if latestIsRefinement { latest = nil; latestIsRefinement = false }
     }
 
@@ -1016,7 +1129,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     private func pump() {
-        guard running, !reconfiguring, !sessionPaused, !cursorGate.needsFreshFrame else { return }
+        guard running, !reconfiguring, !sessionPaused, !cursorGate.needsFreshFrame, !frameFlow.encodingFailed else { return }
         discardMismatchedFrame()
         guard let latest else {
             // A one-shot timer may have fired during a configuration that was cancelled or rolled back.
@@ -1024,10 +1137,14 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             return
         }
         guard let encoder,
-              let frame = frameFlow.begin(at: SessionClock.now) else { return }
+              let frame = frameFlow.begin(at: SessionClock.now,
+                maximumConcurrentEncodes: currentSettings.framesPerSecond >= 60 ? 2 : 1,
+                isRefinement: latestIsRefinement) else { return }
         self.latest = nil
-        refiningSequence = latestIsRefinement ? frame.sequence : nil
         latestIsRefinement = false
+        let presentationTime: CMTime
+        do { presentationTime = try presentationTimeline.next(encoderID: encoderID, time: latest.1) }
+        catch { failEncoding(error); return }
         if diagnostics?.isEnabled == true {
             if !encoderHardwareChecked {
                 encoderHardware = encoder.hardwareAccelerationStatus
@@ -1036,18 +1153,20 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             if let encoderHardware { diagnostics?.recordValue(.encoderHardware, encoderHardware ? 1 : 0) }
         }
         diagnostics?.record(.captureAge, since: latest.2, kind: .video, identifier: UInt64(frame.sequence))
-        diagnostics?.recordValue(.videoOutstanding, frameFlow.waiting.count + 1)
+        diagnostics?.recordValue(.videoOutstanding, frameFlow.outstanding)
         let timing = diagnostics?.start()
         let submittedAt = SessionClock.now
         encodingTimingLock.withLock {
-            encodingStarted = timing.map { (encoderID, frame.sequence, $0) }
+            if let timing { encodingStarted[frame.sequence] = (encoderID, timing) }
             encodeTiming.begin(encoderID: encoderID, sequence: frame.sequence, at: submittedAt)
         }
-        do { try encoder.encode(latest.0, time: latest.1, sequence: frame.sequence, forceKeyFrame: frame.forceKeyFrame) }
-        catch {
-            encodingTimingLock.withLock { encodingStarted = nil; encodeTiming.cancel() }
-            frameFlow.cancelEncoding()
-            reportError(error)
+        let submitTiming = diagnostics?.start()
+        do {
+            try encoder.encode(latest.0, time: presentationTime, sequence: frame.sequence, forceKeyFrame: frame.forceKeyFrame)
+            diagnostics?.record(.encodeSubmit, since: submitTiming, kind: .video, identifier: UInt64(frame.sequence))
+        } catch {
+            diagnostics?.record(.encodeSubmit, since: submitTiming, kind: .video, identifier: UInt64(frame.sequence))
+            failEncoding(error)
         }
     }
 

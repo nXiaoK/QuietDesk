@@ -34,7 +34,7 @@ private final class EncodedRecoveryPacket: @unchecked Sendable {
     private var callbacks = 0
     private var duration: TimeInterval?
     func begin(encoderID: UUID, sequence: UInt32) {
-        lock.withLock { timing.begin(encoderID: encoderID, sequence: sequence, at: SessionClock.now) }
+        _ = lock.withLock { timing.begin(encoderID: encoderID, sequence: sequence, at: SessionClock.now) }
     }
     func set(_ result: Result<VideoPacket, Error>, encoderID: UUID) {
         let callbackAt = SessionClock.now
@@ -58,6 +58,18 @@ private struct VideoPipelineChecks {
         func run(_ name: String, _ body: () throws -> Void) {
             do { try body(); passed += 1; print("PASS \(name)") }
             catch { failed += 1; print("FAIL \(name): \(error)") }
+        }
+
+        func predictiveFlow(sequence: UInt32 = 0) -> VideoFrameFlow {
+            var flow = VideoFrameFlow(sequence: sequence)
+            let initial = flow.begin(at: 0)!
+            _ = flow.encoded(initial.sequence, at: 0)
+            _ = flow.acknowledge(initial.sequence)
+            return flow
+        }
+        func completed(_ frame: VideoFrameFlow.Encoding, dropped: Bool = false, at: TimeInterval = 1) -> VideoFrameFlow.Completion {
+            let packet = dropped ? nil : VideoPacket(sequence: frame.sequence, sps: Data(), pps: Data(), avcc: Data([0, 0, 0, 2, 0x41, 0]))
+            return .init(sequence: frame.sequence, packet: packet, callbackAt: at, duration: nil, diagnostic: nil)
         }
 
         run("VideoToolbox rate-control drops and empty successful output are nonfatal") {
@@ -103,7 +115,7 @@ private struct VideoPipelineChecks {
         run("An unrelated drop cannot release the active encoder or overwrite a keyframe request") {
             var flow = VideoFrameFlow()
             let first = flow.begin(at: 0)!
-            try require(!flow.dropped(first.sequence &+ 1) && flow.encoding == first.sequence,
+            try require(!flow.dropped(first.sequence &+ 1) && flow.encoding.first?.sequence == first.sequence,
                         "A stale drop released another frame")
             flow.requestKeyFrame()
             _ = flow.encoded(first.sequence, at: 1)
@@ -120,6 +132,200 @@ private struct VideoPipelineChecks {
             _ = flow.begin(at: 100)
             flow.cancelEncoding()
             try require(flow.isIdle && flow.stalled(at: 200) == nil, "A failed submission did not drain its encoder state")
+        }
+
+        run("Two encoder reservations still share three total credits and the legacy default remains one") {
+            var flow = predictiveFlow()
+            let first = flow.begin(at: 1, maximumConcurrentEncodes: 2)!
+            let second = flow.begin(at: 2, maximumConcurrentEncodes: 2)!
+            try require(flow.encoding.count == 2 && flow.outstanding == 2
+                        && flow.begin(at: 3, maximumConcurrentEncodes: 3) == nil,
+                        "The encoder window exceeded two reservations")
+            _ = flow.encoded(first.sequence, at: 3)
+            let third = flow.begin(at: 4, maximumConcurrentEncodes: 2)!
+            try require(flow.outstanding == 3 && flow.begin(at: 5, maximumConcurrentEncodes: 2) == nil
+                        && !flow.acknowledge(second.sequence), "Encoding bypassed the three-credit limit")
+            _ = flow.dropped(second.sequence)
+            try require(flow.outstanding == 2 && flow.encoding.first?.sequence == third.sequence
+                        && flow.waiting[first.sequence] != nil, "A drop released an unrelated credit")
+            _ = flow.acknowledge(first.sequence)
+            try require(flow.begin(at: 6) == nil, "The default call allowed overlapping encodes")
+            try require(flow.begin(at: 6, maximumConcurrentEncodes: 2) != nil && flow.outstanding == 2,
+                        "An ACK did not return exactly its own credit")
+        }
+
+        run("Out-of-order encoder completions are bounded and delivered in submission order") {
+            var flow = predictiveFlow()
+            let first = flow.begin(at: 1, maximumConcurrentEncodes: 2)!
+            let second = flow.begin(at: 2, maximumConcurrentEncodes: 2)!
+            try require(flow.complete(completed(second)) && !flow.complete(completed(second))
+                        && flow.takeCompleted() == nil && !flow.encoded(second.sequence, at: 3),
+                        "A later or duplicate callback escaped the ordering barrier")
+            try require(flow.complete(completed(first)), "The first callback was not retained")
+            let a = flow.takeCompleted()!
+            try require(a.0.sequence == first.sequence && a.1.packet?.sequence == first.sequence
+                        && flow.outstanding == 2, "Taking a completion released its reservation early")
+            _ = flow.encoded(first.sequence, at: 3)
+            let b = flow.takeCompleted()!
+            try require(b.0.sequence == second.sequence && b.1.packet?.sequence == second.sequence,
+                        "The buffered output lost submission order")
+            _ = flow.encoded(second.sequence, at: 3)
+            try require(!flow.complete(completed(first)) && flow.takeCompleted() == nil && flow.waiting.count == 2,
+                        "A stale callback was delivered twice")
+        }
+
+        run("A dropped head releases the buffered second result without inventing an ACK") {
+            var flow = predictiveFlow()
+            let first = flow.begin(at: 1, maximumConcurrentEncodes: 2)!
+            let second = flow.begin(at: 2, maximumConcurrentEncodes: 2)!
+            _ = flow.complete(completed(second))
+            _ = flow.complete(completed(first, dropped: true))
+            let a = flow.takeCompleted()!
+            try require(a.1.packet == nil && flow.dropped(a.0.sequence), "A dropped head could not drain")
+            let b = flow.takeCompleted()!
+            _ = flow.encoded(b.0.sequence, at: 3)
+            try require(!flow.acknowledge(first.sequence) && flow.acknowledge(second.sequence) && flow.isIdle,
+                        "A drop consumed the surviving frame's acknowledgement")
+        }
+
+        run("Initial, requested and dropped IDRs remain serialized with two encoder slots") {
+            var flow = VideoFrameFlow()
+            let initial = flow.begin(at: 0, maximumConcurrentEncodes: 2)!
+            try require(initial.forceKeyFrame && flow.begin(at: 1, maximumConcurrentEncodes: 2) == nil,
+                        "Prediction was submitted before the initial IDR completed")
+            _ = flow.encoded(initial.sequence, at: 1)
+            _ = flow.acknowledge(initial.sequence)
+            let normal = flow.begin(at: 2, maximumConcurrentEncodes: 2)!
+            flow.requestKeyFrame()
+            try require(flow.begin(at: 3, maximumConcurrentEncodes: 2) == nil,
+                        "An explicit IDR overlapped an older encoder reservation")
+            _ = flow.encoded(normal.sequence, at: 3)
+            let key = flow.begin(at: 4, maximumConcurrentEncodes: 2)!
+            try require(key.forceKeyFrame && flow.begin(at: 5, maximumConcurrentEncodes: 2) == nil,
+                        "Prediction overtook a requested IDR")
+            _ = flow.dropped(key.sequence)
+            try require(flow.begin(at: 6, maximumConcurrentEncodes: 2)?.forceKeyFrame == true,
+                        "A dropped IDR was replaced with a P frame")
+        }
+
+        run("Encoder failure fences both reservations and buffered results until a fresh recovery generation") {
+            var flow = predictiveFlow()
+            let first = flow.begin(at: 1, maximumConcurrentEncodes: 2)!
+            let second = flow.begin(at: 2, maximumConcurrentEncodes: 2)!
+            _ = flow.complete(completed(second))
+            flow.failEncoding()
+            try require(flow.encodingFailed && flow.isIdle && flow.takeCompleted() == nil
+                        && !flow.complete(completed(first)) && flow.begin(at: 3, maximumConcurrentEncodes: 2) == nil
+                        && flow.stalled(at: 100) == nil, "A fatal generation continued producing output")
+            flow.prepareMediaRecovery()
+            flow.requestMediaRecoveryFrame()
+            let recovery = flow.begin(at: 4, maximumConcurrentEncodes: 2)!
+            try require(recovery.forceKeyFrame && flow.begin(at: 5, maximumConcurrentEncodes: 2) == nil
+                        && !flow.complete(completed(second)), "Old output revived or recovery produced two frames")
+            _ = flow.encoded(recovery.sequence, at: 5)
+            _ = flow.acknowledge(recovery.sequence)
+            try require(flow.begin(at: 6, maximumConcurrentEncodes: 2) == nil && flow.resumeMediaFrames(),
+                        "An ACK crossed the recovery commit barrier")
+            try require(flow.begin(at: 7, maximumConcurrentEncodes: 2) != nil
+                        && flow.begin(at: 8, maximumConcurrentEncodes: 2) != nil,
+                        "A committed replacement could not use its two slots")
+        }
+
+        run("Replacing an encoder during a media-held configuration preserves the fresh recovery barrier") {
+            for oldStage in 0...2 {
+                var flow = predictiveFlow()
+                flow.prepareMediaRecovery()
+                if oldStage >= 1 { flow.requestMediaRecoveryFrame() }
+                if oldStage == 2 {
+                    let oldRecovery = flow.begin(at: 1, maximumConcurrentEncodes: 2)!
+                    _ = flow.encoded(oldRecovery.sequence, at: 1)
+                    _ = flow.acknowledge(oldRecovery.sequence)
+                }
+                let previousSequence = flow.sequence
+                let wasMediaHeld = flow.mediaHold
+                flow = VideoFrameFlow(sequence: flow.sequence)
+                if wasMediaHeld { flow.prepareMediaRecovery() }
+                try require(flow.mediaHold && !flow.mediaRecoveryFrameEncoded && flow.isIdle
+                            && flow.sequence == previousSequence
+                            && flow.begin(at: 2, maximumConcurrentEncodes: 2) == nil && !flow.resumeMediaFrames(),
+                            "Configuration replacement bypassed or inherited an old recovery barrier")
+                flow.requestMediaRecoveryFrame()
+                let recovery = flow.begin(at: 3, maximumConcurrentEncodes: 2)!
+                flow.requestMediaRecoveryFrame()
+                try require(recovery.forceKeyFrame && recovery.sequence == previousSequence &+ 1
+                            && flow.begin(at: 4, maximumConcurrentEncodes: 2) == nil,
+                            "The replacement produced more than one recovery frame")
+                _ = flow.encoded(recovery.sequence, at: 4)
+                _ = flow.acknowledge(recovery.sequence)
+                try require(flow.begin(at: 5, maximumConcurrentEncodes: 2) == nil && flow.resumeMediaFrames(),
+                            "A replacement IDR ACK released prediction before media commit")
+                try require(flow.begin(at: 6, maximumConcurrentEncodes: 2) != nil
+                            && flow.begin(at: 7, maximumConcurrentEncodes: 2) != nil,
+                            "Media commit did not restore the replacement's two-frame window")
+            }
+        }
+
+        run("Pause boundaries and cancellation account for every encoding and buffered completion") {
+            var flow = predictiveFlow()
+            let first = flow.begin(at: 1, maximumConcurrentEncodes: 2)!
+            let second = flow.begin(at: 2, maximumConcurrentEncodes: 2)!
+            _ = flow.complete(completed(second))
+            try require(!flow.isIdle && flow.stalled(at: 92)?.contains("编码") == true,
+                        "A later completion hid the oldest stalled encoder")
+            _ = flow.complete(completed(first))
+            for _ in 0..<2 {
+                let next = flow.takeCompleted()!
+                _ = flow.encoded(next.0.sequence, at: 3)
+            }
+            _ = flow.acknowledge(second.sequence)
+            try require(!flow.isIdle, "A pause completed before the oldest ACK")
+            _ = flow.acknowledge(first.sequence)
+            try require(flow.isIdle, "The full pause boundary could not drain")
+            let third = flow.begin(at: 4, maximumConcurrentEncodes: 2)!
+            let fourth = flow.begin(at: 5, maximumConcurrentEncodes: 2)!
+            _ = flow.complete(completed(fourth))
+            flow.cancelEncoding()
+            try require(flow.isIdle && flow.takeCompleted() == nil && !flow.complete(completed(third)),
+                        "Cancelled reservations retained a queued completion")
+        }
+
+        run("Two in-progress encodes preserve wraparound order and ignore duplicate ACKs") {
+            var flow = predictiveFlow(sequence: UInt32.max - 2)
+            let first = flow.begin(at: 1, maximumConcurrentEncodes: 2)!
+            let second = flow.begin(at: 2, maximumConcurrentEncodes: 2)!
+            try require(first.sequence == UInt32.max && second.sequence == 0, "Parallel capture identities did not wrap")
+            _ = flow.complete(completed(second)); _ = flow.complete(completed(first))
+            for expected in [UInt32.max, 0] {
+                let next = flow.takeCompleted()!
+                try require(next.0.sequence == expected, "Numeric sorting reordered a wrapped output")
+                _ = flow.encoded(next.0.sequence, at: 3)
+            }
+            try require(flow.acknowledge(0) && !flow.acknowledge(0) && flow.waiting[UInt32.max] != nil,
+                        "A wrapped or duplicate ACK released another frame")
+            _ = flow.acknowledge(UInt32.max)
+            try require(flow.isIdle, "Wrapped output did not drain")
+        }
+
+        run("A concurrent capture cannot overwrite the identity of an in-progress refinement") {
+            var flow = predictiveFlow()
+            var refinement = StaticFrameRefinement()
+            refinement.encoded(bytes: 1, keyFrame: true, budgetBytes: 100, at: 0)
+            let pass = flow.begin(at: 1, maximumConcurrentEncodes: 2, isRefinement: true)!
+            let capture = flow.begin(at: 2, maximumConcurrentEncodes: 2)!
+            _ = flow.complete(completed(capture, dropped: true))
+            _ = flow.complete(completed(pass, dropped: true))
+            let first = flow.takeCompleted()!
+            try require(first.0.isRefinement, "The new capture overwrote the pass identity")
+            _ = flow.dropped(first.0.sequence)
+            refinement.dropped(isRefinement: first.0.isRefinement, at: 3)
+            let second = flow.takeCompleted()!
+            try require(!second.0.isRefinement, "A capture consumed a refinement attempt")
+            _ = flow.dropped(second.0.sequence)
+            refinement.dropped(isRefinement: second.0.isRefinement, at: 3)
+            try require(refinement.remaining == 3 && flow.isIdle, "One pass spent more than one attempt")
+            _ = flow.begin(at: 4, maximumConcurrentEncodes: 2)
+            try require(flow.begin(at: 5, maximumConcurrentEncodes: 2, isRefinement: true) == nil,
+                        "A refinement competed with a busy capture encoder")
         }
 
         run("Three outstanding frames fill the credit window and encoding also reserves a credit") {
@@ -364,7 +570,7 @@ private struct VideoPipelineChecks {
             let recovery = flow.begin(at: 1)!
             try require(recovery.sequence == 0 && !flow.encoded(old.sequence, at: 2)
                         && !flow.dropped(old.sequence) && !flow.acknowledge(old.sequence)
-                        && flow.encoding == recovery.sequence, "An old callback changed the replacement frame")
+                        && flow.encoding.first?.sequence == recovery.sequence, "An old callback changed the replacement frame")
             _ = flow.dropped(recovery.sequence)
             let retry = flow.begin(at: 3)
             try require(retry?.forceKeyFrame == true && !flow.mediaRecoveryFrameEncoded,
@@ -409,6 +615,71 @@ private struct VideoPipelineChecks {
             timing.cancel(encoderID: id)
             try require(timing.complete(encoderID: id, sequence: 4, at: 11) == nil,
                         "Stopped encoder still produced a duration")
+        }
+
+        run("Overlapping encode timing preserves total latency but excludes previous-frame queueing from adaptation") {
+            var timing = VideoEncodeTiming()
+            let id = UUID()
+            try require(timing.begin(encoderID: id, sequence: 1, at: 0)
+                        && timing.begin(encoderID: id, sequence: 2, at: 0.01)
+                        && !timing.begin(encoderID: id, sequence: 3, at: 0.012)
+                        && !timing.begin(encoderID: id, sequence: 1, at: 0.013),
+                        "Timing reservations overwrote or exceeded two pending frames")
+            let second = timing.complete(encoderID: id, sequence: 2, at: 0.03)!
+            let first = timing.complete(encoderID: id, sequence: 1, at: 0.02)!
+            try require(abs(first - 0.02) < 0.000_001 && abs(second - 0.02) < 0.000_001,
+                        "Per-frame total latency was lost by another frame's callback")
+            let firstService = timing.serviceDuration(encoderID: id, latency: first, completedAt: 0.02)!
+            let secondService = timing.serviceDuration(encoderID: id, latency: second, completedAt: 0.03)!
+            try require(abs(firstService - 0.02) < 0.000_001 && abs(secondService - 0.01) < 0.000_001,
+                        "Adaptive encode pressure double-counted the previous frame's work")
+            try require(timing.serviceDuration(encoderID: id, latency: 0.005, completedAt: 10.005).map { abs($0 - 0.005) < 0.000_001 } == true,
+                        "Idle time became codec pressure")
+            let replacement = UUID()
+            timing.cancel(); timing.begin(encoderID: replacement, sequence: 1, at: 20)
+            timing.cancel(encoderID: id)
+            try require(timing.complete(encoderID: id, sequence: 1, at: 20.01) == nil
+                        && timing.serviceDuration(encoderID: id, latency: 1, completedAt: 21) == nil
+                        && timing.complete(encoderID: replacement, sequence: 1, at: 20) == 0,
+                        "A stale generation consumed the replacement's synchronous completion")
+        }
+
+        run("One encoder timeline minimally advances repeated or late capture timestamps after a replay") {
+            var timeline = VideoPresentationTimeline()
+            let id = UUID(), replacement = UUID()
+            let original = CMTime(value: 120, timescale: 60)
+            let first = try timeline.next(encoderID: id, time: original)
+            let repeated = try timeline.next(encoderID: id, time: original)
+            let late = try timeline.next(encoderID: id, time: CMTime(value: 119, timescale: 60))
+            try require(CMTimeCompare(first, original) == 0
+                        && abs(CMTimeGetSeconds(CMTimeSubtract(repeated, first)) - 0.000_001) < 0.000_000_1
+                        && abs(CMTimeGetSeconds(CMTimeSubtract(late, repeated)) - 0.000_001) < 0.000_000_1,
+                        "A replay made timestamps duplicate or introduced a whole synthetic frame interval")
+            let fresh = CMTime(value: 121, timescale: 60)
+            let acceptedFresh = try timeline.next(encoderID: id, time: fresh)
+            try require(CMTimeCompare(acceptedFresh, fresh) == 0,
+                        "A newer SCK timestamp was unnecessarily changed")
+            let restarted = try timeline.next(encoderID: replacement, time: .zero)
+            try require(CMTimeCompare(restarted, .zero) == 0, "The replacement encoder inherited an old PTS watermark")
+            for invalid in [CMTime.invalid, CMTime.indefinite, CMTime.positiveInfinity, CMTime.negativeInfinity] {
+                do {
+                    _ = try timeline.next(encoderID: replacement, time: invalid)
+                    throw VideoCheckFailure("An invalid timestamp was silently invented")
+                } catch is DeskError {}
+            }
+            let validAfterFailure = try timeline.next(encoderID: replacement, time: CMTime(value: 1, timescale: 60))
+            try require(CMTimeCompare(validAfterFailure, CMTime(value: 1, timescale: 60)) == 0,
+                        "Invalid PTS corrupted the following valid submission")
+        }
+
+        run("High-refresh capture reserves five bounded buffers while lower rates retain three") {
+            for rate in StreamSettings.frameRates {
+                let configuration = ScreenStreamer.configuration(width: 3024, height: 1964,
+                    settings: StreamSettings(longestEdge: 8192, framesPerSecond: rate, megabits: 100))
+                try require(configuration.width == 3024 && configuration.height == 1964
+                            && configuration.queueDepth == (rate >= 60 ? 5 : 3),
+                            "The high-refresh buffer budget changed native size or the lower-rate default")
+            }
         }
 
         run("Screen capture configuration carries each higher rate without a hidden 60 fps clamp") {
@@ -540,6 +811,66 @@ private struct VideoPipelineChecks {
                 try require(observation.callbacks == 1 && observation.duration.map({ $0.isFinite && $0 >= 0 }) == true,
                             "Native output was counted twice or did not produce a finite independent duration")
             }
+        }
+
+        run("Two native submissions preserve H264 order and decode across a live bitrate change") {
+            var pixelBuffer: CVPixelBuffer?
+            guard CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nil, &pixelBuffer) == kCVReturnSuccess,
+                  let pixelBuffer else { throw VideoCheckFailure("Could not create immutable native test pixels") }
+            CVPixelBufferLockBaseAddress(pixelBuffer, [])
+            for plane in 0..<CVPixelBufferGetPlaneCount(pixelBuffer) {
+                if let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, plane) {
+                    memset(base, plane == 0 ? 64 : 128,
+                           CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, plane) * CVPixelBufferGetHeightOfPlane(pixelBuffer, plane))
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+            final class Outputs: @unchecked Sendable {
+                private let lock = NSLock()
+                private var sequences: [UInt32] = [], packets: [VideoPacket] = []
+                private var errors = 0
+                func encoded(_ result: Result<VideoPacket, Error>) {
+                    lock.withLock {
+                        if case .success(let packet) = result { sequences.append(packet.sequence); packets.append(packet) }
+                        else { errors += 1 }
+                    }
+                }
+                func dropped(_ sequence: UInt32) { lock.withLock { sequences.append(sequence) } }
+                func decoded(_ result: Result<CVPixelBuffer, Error>) {
+                    lock.withLock {
+                        if case .success(let image) = result, CVPixelBufferGetWidth(image) == 64, CVPixelBufferGetHeight(image) == 64 {} else { errors += 1 }
+                    }
+                }
+                var snapshot: ([UInt32], [VideoPacket], Int) { lock.withLock { (sequences, packets, errors) } }
+            }
+            let outputs = Outputs(), done = DispatchSemaphore(value: 0)
+            let encoder = try VideoEncoder(width: 64, height: 64, settings: StreamSettings(framesPerSecond: 60, megabits: 20))
+            encoder.onOutput = { outputs.encoded($0); done.signal() }
+            encoder.onDropped = { outputs.dropped($0); done.signal() }
+            defer { encoder.stop() }
+            try encoder.encode(pixelBuffer, time: CMTime(value: 1, timescale: 60), sequence: 1, forceKeyFrame: true)
+            try require(done.wait(timeout: .now() + 10) == .success, "Initial native keyframe did not complete")
+            for first: UInt32 in [2, 4] {
+                try encoder.encode(pixelBuffer, time: CMTime(value: Int64(first), timescale: 60), sequence: first)
+                if first == 2 { try encoder.updateBitrate(megabits: 4) }
+                try encoder.encode(pixelBuffer, time: CMTime(value: Int64(first + 1), timescale: 60), sequence: first + 1)
+                for _ in 0..<2 { try require(done.wait(timeout: .now() + 10) == .success, "An overlapping native submission did not terminate") }
+            }
+            let (sequences, packets, errors) = outputs.snapshot
+            try require(errors == 0 && sequences == [1, 2, 3, 4, 5] && packets.count >= 2 && packets.first?.sequence == 1,
+                        "Native overlapping callbacks lost order, keyframe or completion identity")
+            let firstIDR = try MediaFrame.containsIDR(packets[0].avcc)
+            try require(firstIDR, "Native first output was not an IDR")
+            for packet in packets.dropFirst() {
+                let isIDR = try MediaFrame.containsIDR(packet.avcc)
+                try require(!isIDR, "Overlapping bitrate update restarted the reference chain")
+            }
+            let decoder = VideoDecoder()
+            for packet in packets {
+                decoder.decode(packet) { outputs.decoded($0); done.signal() }
+                try require(done.wait(timeout: .now() + 10) == .success, "The overlapping reference chain did not decode")
+            }
+            try require(outputs.snapshot.2 == 0, "Overlapping native frames did not decode at their original size")
         }
 
         run("Changing a running encoder's bitrate keeps its reference chain without a new keyframe") {

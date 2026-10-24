@@ -14,14 +14,14 @@ import sys
 METRIC_UNITS = {
     **dict.fromkeys(("sendQueue", "sendCompletion", "receiveHeaderWait", "receiveBody", "messageHandler", "roundTrip",
                      "tcpSmoothedRTT", "tcpMinimumRTT", "tcpRTTVariance", "tcpReportDuration",
-                     "captureAge", "encode", "encodeCallbackQueue", "videoAck", "decodeQueue",
+                     "captureAge", "captureInterval", "encodeSubmit", "encode", "encodeCallbackQueue", "videoAck", "decodeQueue",
                      "decodePrepare", "decode", "decodeToDisplay", "displayEnqueue", "mediaRoundTrip",
                      "mediaReassembly", "mediaSwitch", "mediaDecodeInterval"), "microseconds"),
     **dict.fromkeys(("encodedBytes", "keyframeBytes", "pendingSendBytes", "tcpRetransmittedBytes", "tcpOutOfOrderBytes",
                      "tcpSentBytes", "tcpReceivedBytes", "mediaDatagramSentBytes", "mediaDatagramReceivedBytes",
                      "mediaRepairBytes"), "bytes"),
     **dict.fromkeys(("captureReplaced", "displayReplaced", "encoderHardware", "decoderHardware",
-                     "videoOutstanding", "mediaExpired", "mediaRecovery", "mediaTransport"), "count"),
+                     "encoderDropped", "videoOutstanding", "mediaExpired", "mediaRecovery", "mediaTransport"), "count"),
 }
 MESSAGE_KINDS = dict(enumerate((
     "hello", "video", "acknowledgement", "input", "ping", "pong", "clipboard", "requestClipboard",

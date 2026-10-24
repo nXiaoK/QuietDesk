@@ -93,6 +93,29 @@ func runPerformanceDiagnosticsChecks() {
                   "A recorded zero retransmission count was discarded")
     }
 
+    run("Capture cadence, synchronous encode submission and drops keep units and diagnostic generations") {
+        let time = Box<TimeInterval>(0)
+        let diagnostics = PerformanceDiagnostics(enabled: true, clock: { time.read() })
+        let previousCapture = diagnostics.start()
+        time.set(0.02)
+        diagnostics.record(.captureInterval, since: previousCapture, kind: .video)
+        let submission = diagnostics.start()
+        time.set(0.023)
+        diagnostics.record(.encodeSubmit, since: submission, kind: .video, identifier: 7)
+        diagnostics.recordValue(.encoderDropped, 1, kind: .video, identifier: 7, token: submission)
+        let first = diagnostics.drain()
+        try check(first.first(where: { $0.metric == .captureInterval })?.maximum == 20_000
+                  && first.first(where: { $0.metric == .encodeSubmit })?.maximum == 3_000
+                  && first.first(where: { $0.metric == .encoderDropped })?.unit == .count,
+                  "Capture or encoder metrics lost their timing/count units")
+        diagnostics.setEnabled(false); diagnostics.setEnabled(true)
+        time.set(0.05)
+        diagnostics.record(.captureInterval, since: previousCapture, kind: .video)
+        diagnostics.record(.encodeSubmit, since: submission, kind: .video)
+        diagnostics.recordValue(.encoderDropped, 1, kind: .video, token: submission)
+        try check(diagnostics.drain().isEmpty, "An old capture or encode completion crossed diagnostic generations")
+    }
+
     run("Concurrent performance recording and draining preserve every sample") {
         let diagnostics = PerformanceDiagnostics(enabled: true)
         let drained = Box(0)

@@ -43,7 +43,10 @@ python3 scripts/analyze-performance.py viewer.jsonl host.jsonl --output report.m
 | tcpSentBytes / tcpReceivedBytes / tcpReportDuration | 同一系统传输报告内发送、接收的传输层字节数，以及实际报告区间时长（微秒）；用于结合流量观察重传，字节数不等同于应用视频载荷。 |
 | pendingSendBytes | 采样时尚未收到 contentProcessed 回调的发送字节数，包括等待匀速提交的视频；不是 TCP 内核队列的直接读数。 |
 | captureAge | 采集回调保存最新画面，到选择该画面编码的等待；不含 ScreenCaptureKit 内部采集/交付耗时，也不统计暂停或重配时有意重放旧画面的等待。 |
+| captureInterval | 相邻有效采集回调的间隔；暂停、重配和诊断开关边界不连续累计。它包含供帧及回调调度间隔，不是显示器的刷新间隔。 |
+| encodeSubmit | 同步调用 VideoToolbox 提交一帧的耗时，可用于检查采集队列是否在提交时被阻塞；不等于完整编码时间。 |
 | encode | 提交编码到应用收到编码结果的时间，包含 VideoToolbox 工作及输出回调中的 AVCC 数据准备，不是纯硬件编码耗时。 |
+| encoderDropped | 编码器正常主动丢弃的帧数，每次记录值为 1；看样本数表示次数。失败、旧代或没有有效诊断 token 的帧不会补录。 |
 | encodeCallbackQueue | VideoToolbox 输出回调到采集队列实际处理结果的等待。 |
 | encodedBytes / keyframeBytes | 视频压缩数据大小，以及其中关键帧的数据大小；不含全部协议和 TLS 开销。 |
 | videoAck | 主机收到编码结果回调，到采集队列处理该帧解码确认；包含编码回调排队、发送、接收、解码及确认返回，不是单独的解码耗时。 |
@@ -57,6 +60,8 @@ python3 scripts/analyze-performance.py viewer.jsonl host.jsonl --output report.m
 | encoderHardware / decoderHardware | 查询成功时记录 1（硬件）或 0（软件）；查询失败或尚未查询没有样本，nil/缺少不代表软件模式。 |
 
 先比较动态画面期间 video 的 receiveBody、sendQueue、sendCompletion、pendingSendBytes 与 roundTrip 是否同时升高；再比较 encode、encodeCallbackQueue、decodePrepare、decode、decodeToDisplay 是否升高。它们能缩小排查范围，不能单凭一个峰值确认网络、编码器或 UI 是根因。阶段可能重叠，不应直接相加成端到端耗时。
+
+高帧率下最多允许两帧正在编码，因此 `encode` 包含等待前帧的时间；自适应使用的编码处理间隔会排除这部分等待，二者含义不同。原分辨率与缩小分辨率的对照及本机实验边界见[高帧率说明](high-frame-rate.md)。
 
 TCP 指标可帮助区分应用有序消息排队与底层 TCP 等待。开启性能诊断后，已就绪的连接才开始系统传输报告，沿用 Peer 约 5 秒的定时器收集；每次收集回调完成后开始下一报告，区间之间可能有小段空隙，与日志聚合窗口不保证完全对齐。每项每报告记录一次，表中样本数和 P95 针对报告读数，不是逐包 RTT 分布；字节指标的均值也不能当带宽。系统聚合报告对字节数跨路径求和，不可求和的 RTT 使用主路径，本程序不记录接口、路径地址或报告描述。无有效路径的报告不生成这些指标。
 

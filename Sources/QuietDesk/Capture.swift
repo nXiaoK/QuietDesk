@@ -108,9 +108,15 @@ struct StaticFrameRefinement {
         schedule(at: now)
     }
 
-    /// A pass left the encoder, or was dropped by it.
+    /// A pass left the encoder.
     mutating func refined(at now: TimeInterval) {
         remaining = max(0, remaining - 1)
+        schedule(at: now)
+    }
+
+    /// A dropped capture still has a retained picture to refine; only a dropped pass uses an attempt.
+    mutating func dropped(isRefinement: Bool, at now: TimeInterval) {
+        if isRefinement { remaining = max(0, remaining - 1) }
         schedule(at: now)
     }
 
@@ -399,11 +405,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 guard self.running, self.encoderID == id, self.frameFlow.dropped(number) else { return }
                 if let duration = observation.duration { self.onEncodeDuration?(duration) }
                 self.diagnostics?.record(.encodeCallbackQueue, since: droppedAt, kind: .video, identifier: UInt64(number))
-                if self.refiningSequence == number {
-                    self.refiningSequence = nil
-                    self.refinement.refined(at: SessionClock.now)
-                    self.armRefinementTimer()
-                }
+                self.refinement.dropped(isRefinement: self.refiningSequence == number, at: SessionClock.now)
+                self.refiningSequence = nil
+                self.armRefinementTimer()
                 self.completeFrameBoundary()
             }
         }
@@ -1014,7 +1018,12 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private func pump() {
         guard running, !reconfiguring, !sessionPaused, !cursorGate.needsFreshFrame else { return }
         discardMismatchedFrame()
-        guard let latest, let encoder,
+        guard let latest else {
+            // A one-shot timer may have fired during a configuration that was cancelled or rolled back.
+            armRefinementTimer()
+            return
+        }
+        guard let encoder,
               let frame = frameFlow.begin(at: SessionClock.now) else { return }
         self.latest = nil
         refiningSequence = latestIsRefinement ? frame.sequence : nil

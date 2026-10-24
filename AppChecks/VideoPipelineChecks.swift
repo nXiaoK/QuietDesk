@@ -200,6 +200,75 @@ private struct VideoPipelineChecks {
             try require(refinement.remaining == 4 && refinement.dueAt == nil, "An invalid clock reading scheduled a pass")
         }
 
+        run("Dropping the last captured frame preserves and reschedules only the remaining refinement attempts") {
+            var flow = VideoFrameFlow()
+            var refinement = StaticFrameRefinement()
+            let first = flow.begin(at: 0)!
+            _ = flow.encoded(first.sequence, at: 0)
+            refinement.encoded(bytes: 300_000, keyFrame: true, budgetBytes: 100_000, at: 0)
+            _ = flow.acknowledge(first.sequence)
+            refinement.wait()
+            let capture = flow.begin(at: 0.1)!
+            try require(flow.dropped(capture.sequence), "The captured frame did not release its encoding credit")
+            refinement.dropped(isRefinement: false, at: 0.2)
+            try require(flow.isIdle && refinement.remaining == 4 && !refinement.isDue(at: 0.4)
+                        && refinement.isDue(at: 0.45), "The last captured frame's drop stranded or consumed refinement")
+
+            var now = 0.45
+            for remaining in stride(from: 3, through: 0, by: -1) {
+                refinement.wait()
+                let pass = flow.begin(at: now)!
+                try require(flow.dropped(pass.sequence), "A dropped refinement retained its encoding credit")
+                refinement.dropped(isRefinement: true, at: now)
+                try require(refinement.remaining == remaining, "A dropped refinement failed to consume one attempt")
+                if let next = refinement.dueAt { now = next }
+            }
+            try require(flow.isIdle && refinement.dueAt == nil, "Repeated drops created unbounded retries")
+            refinement.dropped(isRefinement: false, at: 10)
+            try require(refinement.remaining == 0 && refinement.dueAt == nil, "A normal drop invented new attempts")
+        }
+
+        run("A capture arriving during refinement can be dropped without losing the remaining passes") {
+            var flow = VideoFrameFlow()
+            var refinement = StaticFrameRefinement()
+            refinement.encoded(bytes: 300_000, keyFrame: true, budgetBytes: 100_000, at: 0)
+            refinement.wait()
+            let pass = flow.begin(at: 0.25)!
+            // A new capture replaces the retained picture while the pass is still encoding.
+            refinement.wait()
+            try require(flow.begin(at: 0.3) == nil, "The new capture overlapped the active encoder")
+            _ = flow.encoded(pass.sequence, at: 0.35)
+            refinement.refined(at: 0.35)
+            let capture = flow.begin(at: 0.35)!
+            _ = flow.acknowledge(pass.sequence)
+            _ = flow.dropped(capture.sequence)
+            refinement.dropped(isRefinement: false, at: 0.4)
+            try require(flow.isIdle && refinement.remaining == 3 && !refinement.isDue(at: 0.6)
+                        && refinement.isDue(at: 0.65), "A replacement capture lost or replenished remaining passes")
+            refinement.cancel()
+            refinement.dropped(isRefinement: false, at: 0.5)
+            try require(refinement.remaining == 0 && refinement.dueAt == nil, "A cancelled refinement restarted on drop")
+        }
+
+        run("An overdue refinement survives a media hold without spending an attempt") {
+            var flow = VideoFrameFlow()
+            var refinement = StaticFrameRefinement()
+            flow.prepareMediaRecovery()
+            flow.requestMediaRecoveryFrame()
+            let recovery = flow.begin(at: 0)!
+            _ = flow.encoded(recovery.sequence, at: 0)
+            refinement.encoded(bytes: 300_000, keyFrame: true, budgetBytes: 100_000, at: 0)
+            _ = flow.acknowledge(recovery.sequence)
+            try require(refinement.isDue(at: 1) && flow.begin(at: 1) == nil && refinement.remaining == 4,
+                        "A hold either lost an overdue pass or let it start")
+            try require(flow.resumeMediaFrames() && refinement.isDue(at: 2), "Resume lost the expired deadline")
+            refinement.wait()
+            let pass = flow.begin(at: 2)!
+            _ = flow.encoded(pass.sequence, at: 2)
+            refinement.refined(at: 2)
+            try require(refinement.remaining == 3 && refinement.isDue(at: 2.25), "Resume spent more than one pass")
+        }
+
         run("A reconfiguration or pause boundary waits for both all acknowledgements and encoding") {
             var flow = VideoFrameFlow()
             let first = flow.begin(at: 0)!

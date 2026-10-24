@@ -461,7 +461,7 @@ struct DeskView: View {
                 Text(model.mediaLoss).help("约 5 秒内 UDP 视频分片未按时到达（需补传或最终缺失）的比例；TCP 视频由系统重传，不显示")
             }
             Text(model.latency).help("控制通道往返延迟（RTT），约每 5 秒更新；不代表画面上屏延迟")
-            Text(model.frameRate).help("解码完成 FPS；静止画面不重复编码，0 fps 正常")
+            Text(model.frameRate).help("解码完成 FPS；静止画面细化完成后，0 fps 正常")
             Text(model.traffic).help("视频、控制和剪贴板的收发流量")
         } else { Text(model.sessionPaused ? "空闲暂停" : model.reconnecting ? "正在重连" : "未连接") }
     }

@@ -28,7 +28,7 @@ private final class ResultBox<Value>: @unchecked Sendable {
     func get() -> Value { lock.withLock { value } }
 }
 
-private func encodedPackets(framesPerSecond: Int = 15) throws -> [VideoPacket] {
+private func encodedPackets(framesPerSecond: Int = 15, codec: VideoCodec = .h264, count: UInt32 = 2) throws -> [VideoPacket] {
     var buffer: CVPixelBuffer?
     let status = CVPixelBufferCreate(nil, 320, 180, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
         [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer)
@@ -41,7 +41,8 @@ private func encodedPackets(framesPerSecond: Int = 15) throws -> [VideoPacket] {
         }
     }
     CVPixelBufferUnlockBaseAddress(buffer, [])
-    let encoder = try VideoEncoder(width: 320, height: 180, settings: .init(framesPerSecond: framesPerSecond))
+    let encoder = try VideoEncoder(width: 320, height: 180, settings: .init(framesPerSecond: framesPerSecond), codec: codec)
+    try require(encoder.codec == codec, "The encoder reported another codec")
     defer { encoder.stop() }
     let ready = DispatchSemaphore(value: 0)
     let result = ResultBox<Result<VideoPacket, Error>?>(nil)
@@ -51,7 +52,7 @@ private func encodedPackets(framesPerSecond: Int = 15) throws -> [VideoPacket] {
         ready.signal()
     }
     var packets: [VideoPacket] = []
-    for sequence in UInt32(1)...2 {
+    for sequence in UInt32(1)...count {
         try encoder.encode(buffer, time: CMTime(value: Int64(sequence), timescale: Int32(framesPerSecond)),
                            sequence: sequence, forceKeyFrame: sequence == 1)
         try require(ready.wait(timeout: .now() + 10) == .success, "Synthetic encoder did not finish")
@@ -88,6 +89,64 @@ private struct VideoSampleChecks {
                                 "Synthetic encode/decode failed at \(rate) fps")
                 }
             }
+        }
+
+        run("Hardware HEVC encodes keyframes with VPS/SPS/PPS that cross the wire and media checks, then decode") {
+            #if arch(arm64)
+            try require(VideoEncoder.hardwareHEVCAvailable, "Apple silicon reported no hardware HEVC encoder")
+            #else
+            try require(!VideoEncoder.hardwareHEVCAvailable, "An Intel Mac offered HEVC to viewers")
+            #endif
+            guard VideoEncoder.hardwareHEVCAvailable else { return }
+            let packets = try encodedPackets(framesPerSecond: 90, codec: .hevc, count: 4)
+            try require(packets.allSatisfy { $0.codec == .hevc }, "An HEVC packet lost its codec on the wire")
+            try require(packets[0].hasParameterSets && packets[0].vps.first.map { ($0 >> 1) & 0x3F } == 32
+                        && packets[0].sps.first.map { ($0 >> 1) & 0x3F } == 33 && packets[0].pps.first.map { ($0 >> 1) & 0x3F } == 34,
+                        "The HEVC keyframe lacked VPS, SPS or PPS")
+            try require(packets.dropFirst().allSatisfy { $0.vps.isEmpty && $0.sps.isEmpty && $0.pps.isEmpty },
+                        "An HEVC predicted frame carried parameter sets")
+            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
+            for (index, packet) in packets.enumerated() {
+                let frame = try MediaFrame(header: MediaFrameHeader(stream: stream, frameID: UInt64(index + 1), isIDR: index == 0), packet: packet)
+                try require(try MediaFrame.decode(frame.encode()).packet.avcc == packet.avcc, "An HEVC media frame did not round trip")
+                var rejected = false
+                do { _ = try MediaFrame(header: MediaFrameHeader(stream: stream, frameID: 9, isIDR: index != 0), packet: packet) }
+                catch { rejected = true }
+                try require(rejected, "A forged HEVC keyframe flag was accepted")
+            }
+            let decoder = VideoDecoder()
+            defer { decoder.stop() }
+            for packet in packets {
+                let ready = DispatchSemaphore(value: 0)
+                let decoded = ResultBox(false)
+                decoder.decode(packet) { result in
+                    if case .success(let frame) = result {
+                        decoded.set(CVPixelBufferGetWidth(frame) == 320 && CVPixelBufferGetHeight(frame) == 180)
+                    }
+                    ready.signal()
+                }
+                try require(ready.wait(timeout: .now() + 10) == .success && decoded.get(), "A hardware HEVC frame failed to decode")
+            }
+        }
+
+        run("One decoder follows H.264 to HEVC and back at keyframes and rejects a codec change without one") {
+            guard VideoEncoder.hardwareHEVCAvailable else { return }
+            let h264 = try encodedPackets(), hevc = try encodedPackets(codec: .hevc)
+            let decoder = VideoDecoder()
+            defer { decoder.stop() }
+            func decodes(_ packet: VideoPacket) throws -> Bool {
+                let ready = DispatchSemaphore(value: 0)
+                let decoded = ResultBox(false)
+                decoder.decode(packet) { result in
+                    if case .success = result { decoded.set(true) }
+                    ready.signal()
+                }
+                try require(ready.wait(timeout: .now() + 10) == .success, "The decoder did not answer")
+                return decoded.get()
+            }
+            for packet in h264 + hevc + h264 { try require(try decodes(packet), "A frame failed after a codec switch at a keyframe") }
+            try require(try !decodes(hevc[1]), "An HEVC predicted frame decoded against an H.264 keyframe")
+            try require(try decodes(h264[1]), "A rejected frame broke the running H.264 stream")
         }
 
         run("CoreMedia directly references immutable storage and releases its owner with the block") {

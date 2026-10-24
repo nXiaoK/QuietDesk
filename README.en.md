@@ -67,7 +67,7 @@ Release builds remain ad-hoc signed. **After every update, grant Screen Recordin
 ## Before you use it
 
 - New features need support at both ends. One display and one controlling connection are supported at a time. Audio streaming, login-window control and FileVault unlock are not supported.
-- Native resolution still uses lossy H.264, and frame rate depends on hardware and network conditions. The software black-screen overlay cannot guarantee coverage of system security screens. [Security and limitations (Chinese) →](docs/security.md)
+- Video uses lossy H.264, switching to HEVC automatically when both Macs encode and decode it in hardware (both 4:2:0); frame rate depends on hardware and network conditions. The software black-screen overlay cannot guarantee coverage of system security screens. [Security and limitations (Chinese) →](docs/security.md)
 - **画质与连接** shows the active transport and applied video settings. **仅使用 TCP（下次连接生效）** selects TCP for the next connection. The displayed RTT measures the control connection; FPS does not measure physical screen presentation. [UDP/TCP transport (Chinese) →](docs/udp-tcp-transport.md)
 - Default builds are ad-hoc signed and not Apple-notarized. You may need to reopen the app after granting permissions. Every update requires granting permissions again; rely on the app’s actual permission checks.
 

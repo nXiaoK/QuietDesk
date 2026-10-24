@@ -99,14 +99,16 @@ final class DeskModel: ObservableObject {
     // Applied frame rate and bitrate next to the video size; automatic changes never exceed the chosen ceiling.
     var videoQualitySummary: String {
         guard let settings = activeVideoState?.settings else { return "" }
-        return "\(settings.framesPerSecond) fps · \(settings.megabits) Mbps"
+        let summary = "\(settings.framesPerSecond) fps · \(settings.megabits) Mbps"
+        return activeVideoCodec == .hevc ? "HEVC · " + summary : summary
     }
     var videoQualityHelp: String {
         guard mode == .viewer, supportsMediaTransport else { return "当前编码帧率上限与目标码率" }
         let help = localNetworkQuality
             ? "局域网优先保持所选画质：\(viewerSettings.summary)。连续测得至少 80 ms 延迟才降码率：视频交付约 2 秒，TCP 心跳需连续多次测量。之后画面有活动且延迟低于 50 ms 时逐档回升；实际帧率仍受屏幕和硬件限制。"
             : "当前生效的帧率上限与目标码率，按网络丢包、延迟和编解码速度自动调整，不超过所选：\(viewerSettings.summary)"
-        return automaticQualityNote.isEmpty ? help : help + "\n" + automaticQualityNote
+        let codec = activeVideoCodec == .hevc ? "\n两端都有 HEVC 硬件编解码，已使用 HEVC：同样分辨率下编码更快。" : ""
+        return (automaticQualityNote.isEmpty ? help : help + "\n" + automaticQualityNote) + codec
     }
     /// Why the applied quality is below the choice, after an automatic reduction; empty otherwise.
     private(set) var automaticQualityNote = ""
@@ -221,6 +223,8 @@ final class DeskModel: ObservableObject {
     @Published private(set) var sessionPauseStatus = ""
     var sessionInputSuspended: Bool { mode == .viewer && (idlePolicy.isPaused || pauseTransmission.inputSuspended) }
     @Published private(set) var activeVideoState: VideoStreamState?
+    // The host's running encoder; on the viewer, what the host last confirmed. A new connection starts with H.264.
+    @Published private(set) var activeVideoCodec = VideoCodec.h264
     @Published private(set) var videoTuning: VideoTuningSession?
     @Published private(set) var videoSettingsStatus = ""
     var viewerSettings: StreamSettings { viewerSession.mediaQuality?.upperBound ?? videoTuning?.desired ?? activeVideoState?.settings ?? StreamSettings() }
@@ -540,12 +544,14 @@ final class DeskModel: ObservableObject {
     }
 
     /// An automatic change also records why it was made: 1 network, 2 raised, 3 host encoder, 4 local decoder,
-    /// 5 sustained LAN latency; with the slower codec's time per frame for compute pressure.
+    /// 5 sustained LAN latency; with the slower codec's time per frame for compute pressure. `videoCodec` is
+    /// 1 for H.264 and 2 for HEVC.
     private func recordVideoConfiguration(_ state: VideoStreamState, succeeded: Bool = true,
                                           adjustment: MediaQualityPolicy.Adjustment? = nil) {
         var values: [DiagnosticLog.Field: Int] = [.width: state.width, .height: state.height, .fps: state.settings.framesPerSecond,
                                                    .targetBitrate: state.settings.megabits * 1_000_000,
-                                                   .maximumDimension: state.settings.longestEdge]
+                                                   .maximumDimension: state.settings.longestEdge,
+                                                   .videoCodec: activeVideoCodec == .hevc ? 2 : 1]
         switch adjustment {
         case .localLatency?: values[.qualityCause] = 5
         case .network?: values[.qualityCause] = 1
@@ -1217,7 +1223,8 @@ final class DeskModel: ObservableObject {
                             adaptiveVideoV1: true, sessionUnlockV1: true, screenLocked: ScreenLockState.isLockedOnConsole,
                             higherFrameRateVideoV1: true, preferredHigherFrameRateSettings: preferredSettings,
                             displayDimmingV1: true, builtInDisplayDimmable: host.effects?.canDimBuiltInDisplay == true,
-                            sessionTerminationV1: true, desktopActionsV1: true)))
+                            sessionTerminationV1: true, desktopActionsV1: true,
+                            hevcVideoV1: VideoEncoder.hardwareHEVCAvailable ? true : nil)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -2245,6 +2252,8 @@ final class DeskModel: ObservableObject {
                                                                          supportsHighRefresh: supportsHighRefreshVideoSettings,
                                                                          supportsHigherFrameRate: supportsHigherFrameRateVideo)
                 videoTuning = try VideoTuningSession(applied: state, preferred: preferred)
+                // HEVC needs the host's hardware encoder and this Mac's hardware decoder; either missing keeps H.264.
+                if hello.hevcVideoV1 == true, VideoDecoder.hardwareHEVCAvailable { videoTuning?.chooseCodec(.hevc) }
                 videoSettingsStatus = "当前生效：\(state.settings.summary)"
                 if hello.mediaTransportV1 == true {
                     // Media adaptation replaces the old RTT shortcut; a compatibility fallback still must not be saved.
@@ -2346,13 +2355,15 @@ final class DeskModel: ObservableObject {
             guard viewerSession.helloReceived, supportsLiveSettings, var tuning = videoTuning else { throw DeskError.invalid("对端不支持动态画质") }
             let result = try Wire.readJSON(StreamSettingsResult.self, message.payload)
             let previous = tuning.applied.settings
+            let previousCodec = tuning.appliedCodec
             guard try tuning.receive(result, maximumFrameRate: supportsHigherFrameRateVideo ? StreamSettings.frameRates.last! : 60) else { return }
             viewerSession.videoRequestTimeout?.cancel()
             videoTuning = tuning
             activeVideoState = result.state
+            activeVideoCodec = tuning.appliedCodec
             // An adaptive host changed only the running encoder's bitrate, so the current stream continues.
             let bitrateOnly = supportsAdaptiveVideo && previous.longestEdge == result.state.settings.longestEdge
-                && previous.framesPerSecond == result.state.settings.framesPerSecond
+                && previous.framesPerSecond == result.state.settings.framesPerSecond && previousCodec == tuning.appliedCodec
             viewerSession.media?.updateSettings(result.state.settings, restartsStream: !bitrateOnly)
             if result.error == nil {
                 _ = viewerSession.mediaQuality?.confirmApplied(result.state.settings, now: SessionClock.now)
@@ -3073,17 +3084,23 @@ final class DeskModel: ObservableObject {
         let host = hostSession
         guard let state = activeVideoState, let streamer = host.streamer else { return }
         if host.settingsRequestID == request.id { return }
+        // Only a viewer that named a codec can decode HEVC, and only it hears which codec is running.
+        let codec: VideoCodec = request.codec == .hevc && VideoEncoder.hardwareHEVCAvailable ? .hevc : .h264
+        let reply = { [weak self] (state: VideoStreamState, error: String?) -> StreamSettingsResult in
+            StreamSettingsResult(id: request.id, state: state, error: error,
+                                 codec: request.codec == nil ? nil : self?.activeVideoCodec ?? .h264)
+        }
         if host.settingsRequestID != nil {
-            if let result = try? Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: state, error: "正在处理上一项画质调整")) { peer.send(result) }
+            if let result = try? Wire.json(.streamSettingsResult, reply(state, "正在处理上一项画质调整")) { peer.send(result) }
             return
         }
         do { try request.settings.validateControlValues() }
         catch {
-            if let result = try? Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: state, error: error.localizedDescription)) { peer.send(result) }
+            if let result = try? Wire.json(.streamSettingsResult, reply(state, error.localizedDescription)) { peer.send(result) }
             return
         }
-        if request.settings == state.settings {
-            if let result = try? Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: state)) { peer.send(result) }
+        if request.settings == state.settings, codec == activeVideoCodec {
+            if let result = try? Wire.json(.streamSettingsResult, reply(state, nil)) { peer.send(result) }
             return
         }
         host.settingsRequestID = request.id
@@ -3108,28 +3125,30 @@ final class DeskModel: ObservableObject {
                       host.settingsRequestID == request.id, !Task.isCancelled else { return }
                 // Automatic adaptation mostly changes bitrate; keep the stream running instead of rebuilding it.
                 if let current = self.activeVideoState, request.settings.longestEdge == current.settings.longestEdge,
-                   request.settings.framesPerSecond == current.settings.framesPerSecond,
+                   request.settings.framesPerSecond == current.settings.framesPerSecond, codec == self.activeVideoCodec,
                    let updated = try? streamer.updateBitrate(request.settings) {
                     self.activeVideoState = updated
                     self.recordVideoConfiguration(updated)
                     self.videoSettingsStatus = "控制端已调整：\(updated.settings.summary)"
                     peer.setVideoPacing(VideoSendPacing(megabits: updated.settings.megabits))
                     host.media?.updateSettings(updated.settings, restartsStream: false)
-                    peer.send(try Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: updated)))
+                    peer.send(try Wire.json(.streamSettingsResult, reply(updated, nil)))
                     return
                 }
                 await self.suspendMediaForConfiguration(host.media)
                 guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
-                let updated = try await streamer.reconfigure(request.settings)
+                let updated = try await streamer.reconfigure(request.settings, codec: codec)
                 guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
                       host.settingsRequestID == request.id, !Task.isCancelled else { return }
                 self.activeVideoState = updated
+                self.activeVideoCodec = streamer.videoCodec
                 self.recordVideoConfiguration(updated)
                 self.resolution = "\(updated.width) × \(updated.height)"
                 self.videoSettingsStatus = "控制端已调整：\(updated.settings.summary)"
+                    + (self.activeVideoCodec == .hevc ? " · HEVC" : "")
                 peer.setVideoPacing(VideoSendPacing(megabits: updated.settings.megabits))
                 host.media?.updateSettings(updated.settings)
-                peer.send(try Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: updated)))
+                peer.send(try Wire.json(.streamSettingsResult, reply(updated, nil)))
                 streamer.resumeAfterReconfiguration()
                 if !host.paused { host.media?.resumeAfterConfiguration() }
             } catch {
@@ -3137,7 +3156,7 @@ final class DeskModel: ObservableObject {
                       !Task.isCancelled, let actual = self.activeVideoState else { return }
                 self.recordDiagnosticFailure(.streamConfigured, error: error)
                 if !host.paused { host.media?.resumeAfterConfiguration() }
-                if let result = try? Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: actual, error: error.localizedDescription)) { peer.send(result) }
+                if let result = try? Wire.json(.streamSettingsResult, reply(actual, error.localizedDescription)) { peer.send(result) }
             }
         }
     }
@@ -3655,6 +3674,7 @@ final class DeskModel: ObservableObject {
         supportsHigherFrameRateVideo = false
         videoTuning = nil
         activeVideoState = nil
+        activeVideoCodec = .h264
         videoSettingsStatus = ""
         if mode == .viewer, let clipboardSync { clipboardHandledChange = clipboardSync.handledChange }
         clipboardSync?.stop()

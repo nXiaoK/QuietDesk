@@ -360,6 +360,12 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     var currentCursorIncluded: Bool? { cursorState().actual }
     var targetCursorIncluded: Bool? { cursorState().target }
 
+    /// The codec of the running encoder; HEVC can fall back to H.264 when the encoder rejects it.
+    var videoCodec: VideoCodec {
+        let read = { [self] in encoder?.codec ?? .h264 }
+        return DispatchQueue.getSpecific(key: queueIdentity) == true ? read() : queue.sync(execute: read)
+    }
+
     private func cursorState() -> (actual: Bool?, target: Bool?) {
         let read = { [self] in
             (actual: running && captureStarted ? appliedCursorIncluded : nil, target: running ? cursorGate.included : nil)
@@ -408,8 +414,12 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         return configuration
     }
 
-    private func makeEncoder(width: Int, height: Int, settings: StreamSettings, id: UUID) throws -> VideoEncoder {
-        let encoder = try VideoEncoder(width: width, height: height, settings: settings)
+    private func makeEncoder(width: Int, height: Int, settings: StreamSettings, codec: VideoCodec = .h264,
+                             id: UUID) throws -> VideoEncoder {
+        // A size or mode the hardware HEVC encoder rejects keeps the share on H.264; the viewer decodes either.
+        let encoder: VideoEncoder
+        if codec == .hevc, let hevc = try? VideoEncoder(width: width, height: height, settings: settings, codec: .hevc) { encoder = hevc }
+        else { encoder = try VideoEncoder(width: width, height: height, settings: settings) }
         encoder.onOutput = { [weak self] result in
             guard let self else { return }
             let callbackAt = SessionClock.now
@@ -473,8 +483,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             diagnostics?.record(.encodeCallbackQueue, since: result.diagnostic, kind: .video, identifier: UInt64(frame.sequence))
             if let packet = result.packet {
                 if frameFlow.mediaHold {
-                    guard !packet.sps.isEmpty, !packet.pps.isEmpty,
-                          (try? MediaFrame.containsIDR(packet.avcc)) == true else {
+                    guard packet.hasParameterSets,
+                          (try? MediaFrame.containsIDR(packet.avcc, codec: packet.codec)) == true else {
                         failEncoding(DeskError.invalid("媒体恢复未产生独立 IDR 帧"))
                         return
                     }
@@ -733,20 +743,22 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
-    func reconfigure(_ settings: StreamSettings) async throws -> VideoStreamState {
+    /// `codec` nil keeps the running encoder's codec.
+    func reconfigure(_ settings: StreamSettings, codec: VideoCodec? = nil) async throws -> VideoStreamState {
         try settings.validateControlValues()
-        let snapshot = try queue.sync { () throws -> (SCStream, Int, Int, Int, Int, StreamSettings, Bool) in
+        let snapshot = try queue.sync { () throws -> (SCStream, Int, Int, Int, Int, StreamSettings, Bool, VideoCodec) in
             guard running, captureStarted, let stream, displayID != nil else { throw DeskError.invalid("屏幕采集尚未就绪，请稍后调整") }
             if let operation = cursorOperationID { cancelCursorOperation(operation); throw DeskError.invalid("光标采集正在更新，请稍后调整画质") }
             if let waiter = cursorFrameWaiter {
                 cancelCursorRequest(waiter.id)
                 throw DeskError.invalid("正在等待光标采集的新画面")
             }
-            return (stream, sourceWidth, sourceHeight, outputWidth, outputHeight, currentSettings, cursorGate.included)
+            return (stream, sourceWidth, sourceHeight, outputWidth, outputHeight, currentSettings, cursorGate.included,
+                    encoder?.codec ?? .h264)
         }
         let (width, height) = settings.dimensions(width: snapshot.1, height: snapshot.2)
         let id = UUID()
-        let replacement = try makeEncoder(width: width, height: height, settings: settings, id: id)
+        let replacement = try makeEncoder(width: width, height: height, settings: settings, codec: codec ?? snapshot.7, id: id)
         do { try await pauseAtFrameBoundary() }
         catch { replacement.stop(); throw error }
         do {
@@ -938,7 +950,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             }
             let id = UUID()
             let replacement: VideoEncoder
-            do { replacement = try self.makeEncoder(width: self.outputWidth, height: self.outputHeight, settings: self.currentSettings, id: id) }
+            do { replacement = try self.makeEncoder(width: self.outputWidth, height: self.outputHeight, settings: self.currentSettings,
+                                                    codec: self.encoder?.codec ?? .h264, id: id) }
             catch {
                 self.onDiagnosticError?(error)
                 completion(false)

@@ -100,6 +100,31 @@ func runProtocolFuzzChecks() {
         }
     }
 
+    run("HEVC video packets carry a length flag older builds reject while H.264 bytes stay unchanged") {
+        let h264 = VideoPacket(sequence: 0x01020304, sps: Data([0x67, 0x64]), pps: Data([0x68]), avcc: Data([0, 0, 0, 1, 0x65]))
+        try check(try h264.encode() == Data([1, 2, 3, 4, 0, 2, 0, 1, 0x67, 0x64, 0x68, 0, 0, 0, 1, 0x65]), "H.264 packet bytes changed")
+        let hevc = VideoPacket(sequence: 7, codec: .hevc, vps: Data([0x40, 1]), sps: Data([0x42, 1, 9]), pps: Data([0x44, 1]),
+                               avcc: Data([0, 0, 0, 2, 0x28, 1]))
+        let bytes = try hevc.encode()
+        // An earlier build reads the flagged SPS length as more than 4096 and refuses the packet instead of decoding it as H.264.
+        try check(UInt16(bytes[4]) << 8 | UInt16(bytes[5]) > 4096, "An older build could misread an HEVC packet as H.264")
+        let decoded = try VideoPacket.decode(bytes)
+        try check(decoded.codec == .hevc && decoded.sequence == 7 && decoded.vps == hevc.vps && decoded.sps == hevc.sps
+                  && decoded.pps == hevc.pps && decoded.avcc == hevc.avcc && decoded.hasParameterSets, "HEVC packet did not round trip")
+        let predicted = VideoPacket(sequence: 8, codec: .hevc, vps: Data(), sps: Data(), pps: Data(), avcc: Data([0, 0, 0, 2, 2, 1]))
+        let predictedBytes = try predicted.encode()
+        try check(try VideoPacket.decode(predictedBytes).codec == .hevc && !predicted.hasParameterSets, "An HEVC predicted frame lost its codec")
+        for cut in 0..<bytes.count { try rejects("Truncated HEVC packet was accepted") { _ = try VideoPacket.decode(bytes.prefix(cut)) } }
+        for lengths: (UInt16, UInt16, UInt16) in [(0x8000, 0, 2), (0x8002, 1, 0), (0x8000 | 4097, 1, 1), (0x8001, 4097, 1), (0x8001, 1, 4097)] {
+            var invalid = Data(); invalid.put(UInt32(1)); invalid.put(lengths.0); invalid.put(lengths.1); invalid.put(lengths.2)
+            invalid.append(Data(count: 16))
+            try rejects("Invalid HEVC parameter set lengths were accepted") { _ = try VideoPacket.decode(invalid) }
+        }
+        try rejects("An H.264 packet carried a VPS") {
+            _ = try VideoPacket(sequence: 1, codec: .h264, vps: Data([0x40, 1]), sps: Data([0x67]), pps: Data([0x68]), avcc: Data([0, 0, 0, 1, 0x65])).encode()
+        }
+    }
+
     if CommandLine.arguments.contains("--skip-network") { return }
     run("Peer reassembles split four-byte headers and coalesced binary messages in order") {
         let key = try PairingKey.generate()

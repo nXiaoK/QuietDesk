@@ -81,19 +81,32 @@ public struct MediaFrame: Sendable {
 
     private init(header: MediaFrameHeader, packet: VideoPacket, packetBytes: Data) throws {
         guard packetBytes.count <= Self.maximumPacketBytes else { throw DeskError.invalid("媒体帧超过协议上限") }
-        let idr = try Self.containsIDR(packet.avcc)
-        guard header.isIDR == idr else { throw DeskError.invalid("媒体关键帧标志与 H.264 内容不符") }
+        let idr = try Self.containsIDR(packet.avcc, codec: packet.codec)
+        guard header.isIDR == idr else { throw DeskError.invalid("媒体关键帧标志与视频内容不符") }
         if idr {
-            guard packet.sps.first.map({ $0 & 0x9F == 7 }) == true,
-                  packet.pps.first.map({ $0 & 0x9F == 8 }) == true else {
-                throw DeskError.invalid("独立恢复帧缺少有效 SPS/PPS")
+            switch packet.codec {
+            case .h264:
+                guard packet.sps.first.map({ $0 & 0x9F == 7 }) == true,
+                      packet.pps.first.map({ $0 & 0x9F == 8 }) == true else {
+                    throw DeskError.invalid("独立恢复帧缺少有效 SPS/PPS")
+                }
+            case .hevc:
+                guard Self.hevcType(packet.vps) == 32, Self.hevcType(packet.sps) == 33, Self.hevcType(packet.pps) == 34 else {
+                    throw DeskError.invalid("独立恢复帧缺少有效 VPS/SPS/PPS")
+                }
             }
-        } else if !packet.sps.isEmpty || !packet.pps.isEmpty {
+        } else if !packet.vps.isEmpty || !packet.sps.isEmpty || !packet.pps.isEmpty {
             throw DeskError.invalid("媒体格式变化必须以 IDR 开始")
         }
         self.header = header
         self.packet = packet
         self.packetBytes = packetBytes
+    }
+
+    // The NAL unit type of an HEVC parameter set, or nil without a valid two-byte header.
+    private static func hevcType(_ unit: Data) -> UInt8? {
+        guard unit.count >= 2, let first = unit.first, first & 0x80 == 0 else { return nil }
+        return (first >> 1) & 0x3F
     }
 
     public func encode() throws -> Data {
@@ -114,13 +127,24 @@ public struct MediaFrame: Sendable {
         return try MediaFrame(header: header, packetBytes: reader.bytes(Int(length)))
     }
 
-    public static func containsIDR(_ avcc: Data) throws -> Bool {
+    public static func containsIDR(_ avcc: Data, codec: VideoCodec = .h264) throws -> Bool {
         var reader = ByteReader(avcc)
         var idr = false
-        guard reader.remaining > 0 else { throw DeskError.invalid("空 H.264 数据") }
+        guard reader.remaining > 0 else { throw DeskError.invalid(codec == .hevc ? "空 HEVC 数据" : "空 H.264 数据") }
         while reader.remaining > 0 {
             let length: UInt32 = try reader.take()
-            guard length > 0, length <= reader.remaining else { throw DeskError.invalid("H.264 NAL 长度无效") }
+            guard length > 0, length <= reader.remaining else {
+                throw DeskError.invalid(codec == .hevc ? "HEVC NAL 长度无效" : "H.264 NAL 长度无效")
+            }
+            if codec == .hevc {
+                guard length >= 2 else { throw DeskError.invalid("HEVC NAL 头无效") }
+                let first: UInt8 = try reader.take(), second: UInt8 = try reader.take()
+                guard first & 0x80 == 0, second & 0x07 != 0 else { throw DeskError.invalid("HEVC NAL 头无效") }
+                // BLA, IDR and CRA pictures start decoding on their own; VideoToolbox's keyframes are IDR.
+                if (16...21).contains((first >> 1) & 0x3F) { idr = true }
+                try reader.skip(Int(length) - 2)
+                continue
+            }
             let nal: UInt8 = try reader.take()
             guard nal & 0x80 == 0, nal & 0x1F != 0 else { throw DeskError.invalid("H.264 NAL 头无效") }
             if nal & 0x1F == 5 {

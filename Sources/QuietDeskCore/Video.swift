@@ -5,31 +5,55 @@ import CoreVideo
 
 public final class VideoEncoder {
     private var session: VTCompressionSession?
+    public let codec: VideoCodec
     public var onOutput: ((Result<VideoPacket, Error>) -> Void)?
     public var onDropped: ((UInt32) -> Void)?
 
-    public init(width: Int, height: Int, settings: StreamSettings) throws {
+    /// Whether this Mac can switch a share to HEVC. Apple silicon's media engine encodes it about 1.5 to 1.8 times
+    /// as fast as H.264 at the same size; an Intel Mac keeps H.264, and a software HEVC encoder would be far slower.
+    public static let hardwareHEVCAvailable: Bool = {
+        #if arch(arm64)
+        var created: VTCompressionSession?
+        let status = VTCompressionSessionCreate(allocator: nil, width: 1280, height: 720, codecType: kCMVideoCodecType_HEVC,
+            encoderSpecification: [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary,
+            imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: nil, refcon: nil,
+            compressionSessionOut: &created)
+        guard status == noErr, let created else { return false }
+        defer { VTCompressionSessionInvalidate(created) }
+        return VTCompressionSessionPrepareToEncodeFrames(created) == noErr
+        #else
+        return false
+        #endif
+    }()
+
+    public init(width: Int, height: Int, settings: StreamSettings, codec: VideoCodec = .h264) throws {
+        self.codec = codec
+        var specification: [CFString: Any] = [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true]
+        if codec == .hevc { specification[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder] = true }
         var created: VTCompressionSession?
         let status = VTCompressionSessionCreate(allocator: nil, width: Int32(width), height: Int32(height),
-            codecType: kCMVideoCodecType_H264,
-            encoderSpecification: [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true] as CFDictionary,
+            codecType: codec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
+            encoderSpecification: specification as CFDictionary,
             imageBufferAttributes: nil, compressedDataAllocator: nil,
             outputCallback: { context, frameContext, status, info, sample in
                 guard let context else { return }
                 let encoder = Unmanaged<VideoEncoder>.fromOpaque(context).takeUnretainedValue()
                 let sequence = UInt32(UInt(bitPattern: frameContext))
-                switch VideoEncoder.output(status: status, info: info, sample: sample, sequence: sequence) {
+                switch VideoEncoder.output(status: status, info: info, sample: sample, sequence: sequence, codec: encoder.codec) {
                 case .success(let packet?): encoder.onOutput?(.success(packet))
                 case .success(nil): encoder.onDropped?(sequence)
                 case .failure(let error): encoder.onOutput?(.failure(error))
                 }
             }, refcon: Unmanaged.passUnretained(self).toOpaque(), compressionSessionOut: &created)
-        guard status == noErr, let created else { throw DeskError.system("无法创建 H.264 编码器", status) }
+        guard status == noErr, let created else {
+            throw DeskError.system(codec == .hevc ? "无法创建 HEVC 编码器" : "无法创建 H.264 编码器", status)
+        }
         session = created
         do {
             try set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
             try set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
-            try set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel)
+            try set(kVTCompressionPropertyKey_ProfileLevel,
+                    codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel)
             try set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: settings.framesPerSecond))
             try set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: settings.megabits * 1_000_000))
             // TCP delivers every frame, and start, resume and setting changes force keyframes, so periodic ones only add
@@ -50,11 +74,11 @@ public final class VideoEncoder {
     }
 
     static func output(status: OSStatus, info: VTEncodeInfoFlags, sample: CMSampleBuffer?,
-                       sequence: UInt32) -> Result<VideoPacket?, Error> {
+                       sequence: UInt32, codec: VideoCodec = .h264) -> Result<VideoPacket?, Error> {
         guard status == noErr else { return .failure(DeskError.system("视频编码失败", status)) }
         // Real-time rate control may intentionally produce no compressed sample.
         guard !info.contains(.frameDropped), let sample else { return .success(nil) }
-        do { return .success(try packet(from: sample, sequence: sequence)) }
+        do { return .success(try packet(from: sample, sequence: sequence, codec: codec)) }
         catch { return .failure(error) }
     }
 
@@ -103,15 +127,15 @@ public final class VideoEncoder {
         return (value?.takeRetainedValue() as? NSNumber)?.boolValue
     }
 
-    private static func packet(from sample: CMSampleBuffer, sequence: UInt32) throws -> VideoPacket {
+    private static func packet(from sample: CMSampleBuffer, sequence: UInt32, codec: VideoCodec) throws -> VideoPacket {
         guard let format = CMSampleBufferGetFormatDescription(sample),
               let block = CMSampleBufferGetDataBuffer(sample) else {
             throw DeskError.invalid("编码输出为空")
         }
         let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]]
         let isKeyFrame = attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool != true
-        var sps = Data(), pps = Data()
-        if isKeyFrame {
+        var vps = Data(), sps = Data(), pps = Data()
+        if isKeyFrame, codec == .h264 {
             for index in 0..<2 {
                 var pointer: UnsafePointer<UInt8>?
                 var size = 0
@@ -126,6 +150,30 @@ public final class VideoEncoder {
                 if index == 0 { sps = Data(bytes: pointer, count: size) }
                 else { pps = Data(bytes: pointer, count: size) }
             }
+        } else if isKeyFrame {
+            // VideoToolbox lists VPS, SPS and PPS; anything else it may add stays out of the decoder's format.
+            var count = 0
+            var header: Int32 = 0
+            var index = 0
+            repeat {
+                var pointer: UnsafePointer<UInt8>?
+                var size = 0
+                let result = CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(format, parameterSetIndex: index,
+                    parameterSetPointerOut: &pointer, parameterSetSizeOut: &size,
+                    parameterSetCountOut: &count, nalUnitHeaderLengthOut: &header)
+                guard result == noErr, let pointer, size >= 2, header == 4 else {
+                    throw DeskError.system("无法提取 HEVC 参数", result)
+                }
+                let set = Data(bytes: pointer, count: size)
+                switch (pointer[0] >> 1) & 0x3F {
+                case 32 where vps.isEmpty: vps = set
+                case 33 where sps.isEmpty: sps = set
+                case 34 where pps.isEmpty: pps = set
+                default: break
+                }
+                index += 1
+            } while index < count
+            guard !vps.isEmpty, !sps.isEmpty, !pps.isEmpty else { throw DeskError.invalid("HEVC 关键帧缺少参数集") }
         }
         let size = CMBlockBufferGetDataLength(block)
         var bytes = Data(count: size)
@@ -133,7 +181,7 @@ public final class VideoEncoder {
             CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: size, destination: $0.baseAddress!)
         }
         guard result == noErr else { throw DeskError.system("无法读取视频帧", result) }
-        return VideoPacket(sequence: sequence, sps: sps, pps: pps, avcc: bytes)
+        return VideoPacket(sequence: sequence, codec: codec, vps: vps, sps: sps, pps: pps, avcc: bytes)
     }
 
     deinit { stop() }
@@ -159,6 +207,7 @@ public final class VideoSamples {
     }
 
     private var format: CMVideoFormatDescription?
+    private var formatCodec = VideoCodec.h264
     public init() {}
 
     static func block(for data: NSData, allocator: CFAllocator? = nil) throws -> CMBlockBuffer {
@@ -187,18 +236,25 @@ public final class VideoSamples {
 
     public func sample(for packet: VideoPacket) throws -> CMSampleBuffer {
         if !packet.sps.isEmpty {
+            guard packet.hasParameterSets else { throw DeskError.invalid("视频参数不完整") }
+            let sets = packet.codec == .hevc ? [packet.vps, packet.sps, packet.pps] : [packet.sps, packet.pps]
+            let joined = sets.reduce(into: [UInt8]()) { $0.append(contentsOf: $1) }
+            let sizes = sets.map(\.count)
             var created: CMFormatDescription?
-            let status = packet.sps.withUnsafeBytes { s in
-                packet.pps.withUnsafeBytes { p in
-                    let pointers = [s.bindMemory(to: UInt8.self).baseAddress!, p.bindMemory(to: UInt8.self).baseAddress!]
-                    let sizes = [packet.sps.count, packet.pps.count]
-                    return pointers.withUnsafeBufferPointer { pointerBuffer in
-                        sizes.withUnsafeBufferPointer { sizeBuffer in
-                            CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator: nil,
-                                parameterSetCount: 2, parameterSetPointers: pointerBuffer.baseAddress!,
+            let status = joined.withUnsafeBufferPointer { bytes -> OSStatus in
+                var offset = 0
+                let pointers = sizes.map { size -> UnsafePointer<UInt8> in defer { offset += size }; return bytes.baseAddress! + offset }
+                return pointers.withUnsafeBufferPointer { pointerBuffer in
+                    sizes.withUnsafeBufferPointer { sizeBuffer in
+                        packet.codec == .hevc
+                            ? CMVideoFormatDescriptionCreateFromHEVCParameterSets(allocator: nil,
+                                parameterSetCount: sets.count, parameterSetPointers: pointerBuffer.baseAddress!,
+                                parameterSetSizes: sizeBuffer.baseAddress!, nalUnitHeaderLength: 4, extensions: nil,
+                                formatDescriptionOut: &created)
+                            : CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator: nil,
+                                parameterSetCount: sets.count, parameterSetPointers: pointerBuffer.baseAddress!,
                                 parameterSetSizes: sizeBuffer.baseAddress!, nalUnitHeaderLength: 4,
                                 formatDescriptionOut: &created)
-                        }
                     }
                 }
             }
@@ -209,8 +265,11 @@ public final class VideoSamples {
                 throw DeskError.invalid("视频分辨率过大")
             }
             format = created
+            formatCodec = packet.codec
         }
         guard let format else { throw DeskError.invalid("尚未收到视频关键帧") }
+        // A frame can only continue the stream its keyframe started; a codec switch always begins with a keyframe.
+        guard packet.codec == formatCodec else { throw DeskError.invalid("视频编码格式变化前缺少关键帧") }
         // NSData owns a stable immutable pointer; bridging may itself copy some Data representations.
         let block = try Self.block(for: packet.avcc as NSData)
         var sample: CMSampleBuffer?

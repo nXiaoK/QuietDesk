@@ -114,7 +114,7 @@ struct SharingView: View {
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                             if model.connected, let state = model.activeVideoState {
-                                Text("当前会话：\(state.settings.summary)（控制端临时调整，不修改下方默认值）")
+                                Text("当前会话：\(state.settings.summary)\(model.activeVideoCodec == .hevc ? " · HEVC" : "")（控制端临时调整，不修改下方默认值）")
                                     .font(.callout)
                                     .foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
@@ -253,7 +253,7 @@ struct SharingView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Label("默认共享设置", systemImage: "slider.horizontal.3").font(.headline)
-                Text("H.264 · 加密连接")
+                Text("H.264 / HEVC · 加密连接")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 6)
@@ -326,7 +326,7 @@ struct SharingView: View {
                     VStack(alignment: .leading, spacing: 5) {
                         Text("建议先用 1920 / 15 fps / 3 Mbps。静止画面最多细化 4 次后停止重复编码；码率是目标值，关键帧和网络开销可能产生短时峰值。")
                         Text("控制端在会话中调整画质不会修改这里的默认值。")
-                        Text("原分辨率不放大画面，上限为单边 8192 像素、总计 3600 万像素；仍使用有损 H.264 / 4:2:0；窗口缩放也会影响清晰度。帧率最高可选 240 fps，超过 60 fps 需两端更新；实际帧率受被控屏幕刷新率、硬件和网络限制。旧控制端沿用兼容画质。")
+                        Text("原分辨率不放大画面，上限为单边 8192 像素、总计 3600 万像素；仍为有损 H.264 / 4:2:0，两端都有 HEVC 硬件编解码时改用 HEVC；窗口缩放也会影响清晰度。帧率最高可选 240 fps，超过 60 fps 需两端更新；实际帧率受被控屏幕刷新率、硬件和网络限制。旧控制端沿用兼容画质。")
                     }
                     .font(.caption)
                     .foregroundStyle(.secondary)

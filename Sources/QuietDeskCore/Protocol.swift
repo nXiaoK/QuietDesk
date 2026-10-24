@@ -206,7 +206,9 @@ public struct Hello: Codable, Sendable {
     public let builtInDisplayDimmable: Bool?
     public let sessionTerminationV1: Bool?
     public let desktopActionsV1: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil) {
+    // The host has a hardware HEVC encoder and switches to it when a stream settings request asks for HEVC.
+    public let hevcVideoV1: Bool?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -238,6 +240,7 @@ public struct Hello: Codable, Sendable {
         self.builtInDisplayDimmable = builtInDisplayDimmable
         self.sessionTerminationV1 = sessionTerminationV1
         self.desktopActionsV1 = desktopActionsV1
+        self.hevcVideoV1 = hevcVideoV1
     }
 
     public func validate() throws {
@@ -309,28 +312,54 @@ public struct RemoteInput: Codable, Sendable {
     }
 }
 
+// HEVC is sent only after the viewer asked for it in a stream settings request, so an older peer never receives it.
+public enum VideoCodec: String, Codable, Sendable {
+    case h264, hevc
+}
+
 public struct VideoPacket: Sendable {
     public let sequence: UInt32
+    public let codec: VideoCodec
+    // Parameter sets travel with keyframes only; HEVC adds a video parameter set that H.264 does not have.
+    public let vps: Data
     public let sps: Data
     public let pps: Data
     public let avcc: Data
 
     public init(sequence: UInt32, sps: Data, pps: Data, avcc: Data) {
+        self.init(sequence: sequence, codec: .h264, vps: Data(), sps: sps, pps: pps, avcc: avcc)
+    }
+
+    public init(sequence: UInt32, codec: VideoCodec, vps: Data, sps: Data, pps: Data, avcc: Data) {
         self.sequence = sequence
+        self.codec = codec
+        self.vps = vps
         self.sps = sps
         self.pps = pps
         self.avcc = avcc
     }
 
+    /// Every parameter set the codec needs to start decoding is present.
+    public var hasParameterSets: Bool { !sps.isEmpty && !pps.isEmpty && (codec == .h264 || !vps.isEmpty) }
+
+    // An HEVC packet sets the top bit of the SPS length and adds a VPS length after the PPS length. Earlier
+    // builds reject that length, so a misrouted HEVC packet fails instead of being decoded as H.264.
+    private static let hevcFlag: UInt16 = 0x8000
+
     public func encode() throws -> Data {
-        guard sps.count <= 4096, pps.count <= 4096, !avcc.isEmpty,
-              avcc.count < Wire.maximumMessageBytes - 8201 else {
+        let overhead = codec == .hevc ? 12_299 : 8201
+        guard vps.count <= 4096, sps.count <= 4096, pps.count <= 4096, codec == .hevc || vps.isEmpty, !avcc.isEmpty,
+              avcc.count < Wire.maximumMessageBytes - overhead else {
             throw DeskError.invalid("编码帧大小无效")
         }
         var data = Data()
         data.put(sequence)
-        data.put(UInt16(sps.count))
+        data.put(UInt16(sps.count) | (codec == .hevc ? Self.hevcFlag : 0))
         data.put(UInt16(pps.count))
+        if codec == .hevc {
+            data.put(UInt16(vps.count))
+            data.append(vps)
+        }
         data.append(sps)
         data.append(pps)
         data.append(avcc)
@@ -341,12 +370,16 @@ public struct VideoPacket: Sendable {
         guard data.count < Wire.maximumMessageBytes else { throw DeskError.invalid("视频帧过大") }
         var reader = ByteReader(data)
         let sequence: UInt32 = try reader.take()
-        let spsLength: UInt16 = try reader.take()
+        let spsField: UInt16 = try reader.take()
         let ppsLength: UInt16 = try reader.take()
-        guard spsLength <= 4096, ppsLength <= 4096,
-              (spsLength == 0) == (ppsLength == 0) else {
+        let codec: VideoCodec = spsField & hevcFlag != 0 ? .hevc : .h264
+        let spsLength = spsField & ~hevcFlag
+        let vpsLength: UInt16 = try codec == .hevc ? reader.take() : 0
+        guard spsLength <= 4096, ppsLength <= 4096, vpsLength <= 4096,
+              (spsLength == 0) == (ppsLength == 0), codec == .h264 || (vpsLength == 0) == (spsLength == 0) else {
             throw DeskError.invalid("视频参数无效")
         }
+        let vps = try reader.bytes(Int(vpsLength))
         let sps = try reader.bytes(Int(spsLength))
         let pps = try reader.bytes(Int(ppsLength))
         let avcc = try reader.bytes(reader.remaining)
@@ -355,11 +388,11 @@ public struct VideoPacket: Sendable {
         while nalReader.remaining > 0 {
             let length: UInt32 = try nalReader.take()
             guard length > 0, length <= nalReader.remaining else {
-                throw DeskError.invalid("H.264 数据损坏")
+                throw DeskError.invalid(codec == .hevc ? "HEVC 数据损坏" : "H.264 数据损坏")
             }
             try nalReader.skip(Int(length))
         }
-        return VideoPacket(sequence: sequence, sps: sps, pps: pps, avcc: avcc)
+        return VideoPacket(sequence: sequence, codec: codec, vps: vps, sps: sps, pps: pps, avcc: avcc)
     }
 }
 

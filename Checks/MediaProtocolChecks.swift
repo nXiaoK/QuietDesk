@@ -50,6 +50,38 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         try rejects { _ = try MediaFrame.containsIDR(Data([0, 0, 0, 1, 0xE5])) }
     }
 
+    run("HEVC media frames check two-byte NAL headers and require VPS, SPS and PPS on keyframes only") {
+        func unit(_ type: UInt8, tid: UInt8 = 1) -> Data { Data([type << 1, tid, 0xAA, 0xBB]) }
+        func avcc(_ units: [Data]) -> Data { units.reduce(into: Data()) { $0.put(UInt32($1.count)); $0.append($1) } }
+        let keyframe = VideoPacket(sequence: 1, codec: .hevc, vps: unit(32), sps: unit(33), pps: unit(34), avcc: avcc([unit(39), unit(20)]))
+        let predicted = VideoPacket(sequence: 2, codec: .hevc, vps: Data(), sps: Data(), pps: Data(), avcc: avcc([unit(1)]))
+        try require(try MediaFrame.containsIDR(keyframe.avcc, codec: .hevc), "An HEVC IDR was not recognised")
+        try require(try !MediaFrame.containsIDR(predicted.avcc, codec: .hevc), "An HEVC trailing picture was taken for an IDR")
+        for type: UInt8 in [16, 19, 21] {
+            try require(try MediaFrame.containsIDR(avcc([unit(type)]), codec: .hevc), "HEVC random access type \(type) was not recognised")
+        }
+        let frame = try MediaFrame(header: MediaFrameHeader(stream: stream, frameID: 1, isIDR: true), packet: keyframe)
+        let decoded = try MediaFrame.decode(frame.encode())
+        try require(decoded.packet.codec == .hevc && decoded.packet.vps == keyframe.vps && decoded.packet.sps == keyframe.sps
+                    && decoded.packet.pps == keyframe.pps && decoded.packet.avcc == keyframe.avcc, "The HEVC envelope changed the frame")
+        _ = try MediaFrame(header: MediaFrameHeader(stream: stream, frameID: 2, isIDR: false), packet: predicted)
+        try rejects { _ = try MediaFrame(header: MediaFrameHeader(stream: stream, frameID: 2, isIDR: true), packet: predicted) }
+        try rejects { _ = try MediaFrame(header: MediaFrameHeader(stream: stream, frameID: 1, isIDR: false), packet: keyframe) }
+        for (vps, sps, pps) in [(Data(), unit(33), unit(34)), (unit(33), unit(32), unit(34)), (unit(32), unit(33), Data([0x44]))] {
+            try rejects { _ = try MediaFrame(header: MediaFrameHeader(stream: stream, frameID: 1, isIDR: true),
+                                             packet: VideoPacket(sequence: 1, codec: .hevc, vps: vps, sps: sps, pps: pps, avcc: keyframe.avcc)) }
+        }
+        try rejects { _ = try MediaFrame(header: MediaFrameHeader(stream: stream, frameID: 2, isIDR: false),
+                                         packet: VideoPacket(sequence: 2, codec: .hevc, vps: unit(32), sps: Data(), pps: Data(), avcc: predicted.avcc)) }
+        for invalid in [Data([0x80 | 0x28, 1]), Data([0x28, 0]), Data([0x28])] {
+            try rejects { _ = try MediaFrame.containsIDR(avcc([invalid]), codec: .hevc) }
+        }
+        let fragments = try MediaFragment.fragment(frame: MediaFrame(header: MediaFrameHeader(stream: stream, frameID: 3, isIDR: true),
+            packet: VideoPacket(sequence: 3, codec: .hevc, vps: unit(32), sps: unit(33), pps: unit(34),
+                                avcc: avcc([Data([20 << 1, 1]) + Data(repeating: 0x5A, count: 6_000)]))))
+        try require(fragments.count > 3 && fragments.allSatisfy { $0.encode().count <= 1_100 }, "HEVC fragments exceeded the datagram budget")
+    }
+
     run("Media UDP fragments stay within DTLS application budget and reject corrupt shape") {
         let fragments = try MediaFragment.fragment(frame: frame(1, idr: true, bytes: 5_000))
         try require(fragments.count > 3, "Fixture was not fragmented")

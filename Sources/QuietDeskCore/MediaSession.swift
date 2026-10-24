@@ -935,7 +935,7 @@ public final class MediaSession: @unchecked Sendable {
         }
         if let pending = transaction, pending.stage != .producing { onAcknowledged?(packet.sequence); return }
         do {
-            let isIDR = try MediaFrame.containsIDR(packet.avcc)
+            let isIDR = try MediaFrame.containsIDR(packet.avcc, codec: packet.codec)
             if transaction != nil, !isIDR { abortTransaction(retry: true); onAcknowledged?(packet.sequence); return }
             if cache?.stream != target.0 { cache = try MediaRetransmissionCache(stream: target.0, limits: bufferLimits); nextFrameID = 1 }
             let header = MediaFrameHeader(stream: target.0, frameID: nextFrameID, isIDR: isIDR)

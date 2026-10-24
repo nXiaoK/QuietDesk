@@ -13,11 +13,17 @@ func require(_ value: Bool, _ message: String) throws { if !value { throw Failur
 func wait(_ value: DispatchSemaphore, _ message: String, seconds: Double = 8) throws {
     try require(value.wait(timeout:.now()+seconds) == .success,message)
 }
-func packet(_ seq: UInt32, idr: Bool, largeIDR: Bool = false) -> VideoPacket {
-    var avcc=Data([0,0,0,4,idr ? 0x65 : 0x41,1,2,3])
+func packet(_ seq: UInt32, idr: Bool, largeIDR: Bool = false, hevc: Bool = false) -> VideoPacket {
+    // HEVC NAL headers are two bytes: IDR_N_LP is type 20, TRAIL_R type 1, VPS/SPS/PPS types 32/33/34.
+    let header: [UInt8] = hevc ? (idr ? [0x28,0x01] : [0x02,0x01]) : [idr ? 0x65 : 0x41]
+    var avcc=Data();avcc.put(UInt32(header.count+3));avcc.append(contentsOf:header);avcc.append(contentsOf:[1,2,3])
     if idr && largeIDR {
-        let nal=Data([0x65])+Data(repeating:0x7D,count:512*1024-1)
+        let nal=Data(header)+Data(repeating:0x7D,count:512*1024-header.count)
         avcc=Data();avcc.put(UInt32(nal.count));avcc.append(nal)
+    }
+    if hevc {
+        return VideoPacket(sequence:seq,codec:.hevc,vps:idr ? Data([0x40,0x01,0x0c]):Data(),sps:idr ? Data([0x42,0x01,0x01]):Data(),
+            pps:idr ? Data([0x44,0x01,0xc1]):Data(),avcc:avcc)
     }
     return VideoPacket(sequence:seq,sps:idr ? Data([0x67,0x42,0x00,0x1f]):Data(),pps:idr ? Data([0x68,0xce,0x06]):Data(),
         avcc:avcc)
@@ -26,7 +32,7 @@ enum PrepareHookCheck { case unchecked, boundStream, fallback }
 func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
               failRecoveryCandidate: Bool = false, pauseResume: Bool = false, stopCandidate: Bool = false, pathFailure: Bool = false, legacy: Bool = false, restoreUDP: Bool = false, inspectDiagnostics: Bool = false, largeIDR: Bool = false, overlapPrepare: Bool = false, prepareHook: PrepareHookCheck = .unchecked,
               delayedDecode: Bool = false, stalledDecode: Bool = false, liveBitrate: Bool = false,
-              inspectRoundTrip: Bool = false) throws {
+              inspectRoundTrip: Bool = false, hevc: Bool = false) throws {
     let key = try PairingKey.generate(), settings = StreamSettings(longestEdge:1920,framesPerSecond:60,megabits:12)
     let queue = DispatchQueue(label:"session.loopback-listener")
     let params = try MediaSecureTransport.tlsParameters(key:key,roles:MediaChannelRole.allCases)
@@ -49,7 +55,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     let cursorID = UUID()
     let streamPreparations = Box<[MediaStreamID]>([]), streamBindings = Box<[MediaStreamID]>([])
     let streamVideos = Box<[MediaStreamID]>([]), streamCommits = Box<[MediaStreamID]>([])
-    func nextPacket(_ idr: Bool) -> VideoPacket { sequence.update{$0 += 1}; return packet(sequence.get(),idr:idr,largeIDR:largeIDR) }
+    func nextPacket(_ idr: Bool) -> VideoPacket { sequence.update{$0 += 1}; return packet(sequence.get(),idr:idr,largeIDR:largeIDR,hevc:hevc) }
     listener.newConnectionHandler = { connection in
         let peer = Peer(connection:connection); peers.update{$0.append(peer)}
         peer.onClose={ reason in if !reason.contains("test") { errors.update{$0.append(reason)} } }
@@ -101,7 +107,11 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
         if legacy {
             client.onMessageHandled={ message,resume in
                 if message.kind == .video {
-                    do { let old=try VideoPacket.decode(message.payload);decoded.update{$0.append(UInt64(old.sequence))};committed.signal() }
+                    do {
+                        let old=try VideoPacket.decode(message.payload)
+                        if old.codec != (hevc ? .hevc : .h264) { errors.update{$0.append("legacy frame changed codec")} }
+                        decoded.update{$0.append(UInt64(old.sequence))};committed.signal()
+                    }
                     catch { errors.update{$0.append("legacy frame invalid")} }
                 }
                 resume()
@@ -128,6 +138,10 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             }
             session.onVideo={ frame,complete in
                 decoded.update{$0.append(frame.header.frameID)}
+                let expected = packet(frame.packet.sequence,idr:frame.header.isIDR,largeIDR:largeIDR,hevc:hevc)
+                if frame.packet.codec != expected.codec || frame.packet.vps != expected.vps || frame.packet.sps != expected.sps {
+                    errors.update{$0.append("Media frame changed its codec or parameter sets in transit")}
+                }
                 if prepareHook != .unchecked, frame.header.isIDR {
                     if prepareHook == .boundStream, !streamBindings.get().contains(frame.header.stream) {
                         errors.update { $0.append("Candidate video arrived before its exact stream binding") }
@@ -141,7 +155,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
                             transportEpoch:frame.header.stream.transportEpoch+1,codecEpoch:frame.header.stream.codecEpoch+1,path:"udp").message())
                     } catch { errors.update{$0.append("Overlapping test prepare could not be encoded")} }
                 }
-                if largeIDR, frame.header.isIDR, frame.packet.avcc != packet(frame.packet.sequence,idr:true,largeIDR:true).avcc {
+                if largeIDR, frame.header.isIDR, frame.packet.avcc != packet(frame.packet.sequence,idr:true,largeIDR:true,hevc:hevc).avcc {
                     errors.update{$0.append("Large IDR payload changed across fragments")};complete(false);return
                 }
                 if stopCandidate { lateDecode.update{$0=complete};candidateSeen.signal();return }
@@ -461,6 +475,11 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
    run("A bitrate-only change keeps the UDP stream and reports host frame delivery") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,liveBitrate:true) }
    run("A bitrate-only change keeps the TCP stream and reports host frame delivery") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false,liveBitrate:true) }
    run("Stopped candidates reject late decode completion") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,stopCandidate:true) }
+   run("HEVC frames cross UDP fragments, a configuration cutover and the decode window") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true,hevc:true) }
+   run("A 512 KiB HEVC IDR is paced, reassembled and committed byte-for-byte") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,largeIDR:true,hevc:true) }
+   run("HEVC frames cross the independent TCP media connection") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false,hevc:true) }
+   run("HEVC frames cross framed shared TCP") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false,hevc:true) }
+   run("HEVC packets keep their codec on the legacy video message") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false,legacy:true,hevc:true) }
   }
   print("Media session checks: \(passed) passed, \(failed) failed")
   if failed>0 {exit(1)}

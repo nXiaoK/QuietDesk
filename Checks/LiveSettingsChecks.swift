@@ -27,6 +27,56 @@ func runLiveSettingsChecks() {
         try check(MessageKind.inputStatus.rawValue == 10 && MessageKind.clipboardCancel.rawValue == 17 && Wire.version == 1, "Legacy wire values changed")
     }
 
+    run("HEVC is requested only once chosen, survives later changes and is not asked again after a host keeps H.264") {
+        var plain = try VideoTuningSession(applied: initial, preferred: medium)
+        guard let first = plain.nextRequest() else { throw CheckFailure("A preferred quality sent no request") }
+        try check(first.codec == nil && !String(decoding: try JSONEncoder().encode(first), as: UTF8.self).contains("codec"),
+                  "An H.264-only request named a codec")
+        var tuning = try VideoTuningSession(applied: initial)
+        tuning.chooseCodec(.hevc)
+        guard let request = tuning.nextRequest() else { throw CheckFailure("Choosing HEVC alone sent no request") }
+        try check(request.codec == .hevc && request.settings == initial.settings && tuning.nextRequest() == nil,
+                  "The HEVC request was wrong or not coalesced")
+        try check(try tuning.receive(StreamSettingsResult(id: request.id, state: initial, codec: .hevc)), "The HEVC reply was ignored")
+        try check(tuning.appliedCodec == .hevc && tuning.desiredCodec == .hevc && tuning.nextRequest() == nil,
+                  "An applied HEVC stream was requested again")
+        try tuning.choose(StreamSettings(longestEdge: 1920, framesPerSecond: 15, megabits: 5))
+        guard let bitrate = tuning.nextRequest() else { throw CheckFailure("A bitrate change sent no request") }
+        try check(bitrate.codec == .hevc, "A later change dropped HEVC and would switch the host back to H.264")
+        var fallback = try VideoTuningSession(applied: initial)
+        fallback.chooseCodec(.hevc)
+        guard let asked = fallback.nextRequest() else { throw CheckFailure("No HEVC request") }
+        try check(try fallback.receive(StreamSettingsResult(id: asked.id, state: initial)), "The H.264 reply was ignored")
+        try check(fallback.appliedCodec == .h264 && fallback.desiredCodec == .h264 && fallback.nextRequest() == nil,
+                  "A host that kept H.264 was asked again")
+        try fallback.choose(medium)
+        try check(fallback.nextRequest()?.codec == nil, "A session that fell back still named a codec")
+    }
+
+    run("Codec fields are optional both ways so older peers keep decoding live quality and hello messages") {
+        struct OlderRequest: Decodable { let id: UUID; let settings: StreamSettings }
+        struct OlderResult: Decodable { let id: UUID; let state: VideoStreamState; let error: String? }
+        let request = StreamSettingsRequest(settings: medium, codec: .hevc)
+        let older = try JSONDecoder().decode(OlderRequest.self, from: JSONEncoder().encode(request))
+        try check(older.id == request.id && older.settings == medium, "An older host could not read an HEVC request")
+        let result = StreamSettingsResult(id: request.id, state: state(medium), codec: .hevc)
+        let olderResult = try JSONDecoder().decode(OlderResult.self, from: JSONEncoder().encode(result))
+        try check(olderResult.state == result.state && olderResult.error == nil, "An older viewer could not read a codec reply")
+        try check(try Wire.readJSON(StreamSettingsRequest.self, JSONEncoder().encode(StreamSettingsRequest(settings: medium))).codec == nil
+                  && Wire.readJSON(StreamSettingsResult.self, JSONEncoder().encode(StreamSettingsResult(id: request.id, state: initial))).codec == nil,
+                  "A message without a codec did not mean H.264")
+        let unknown = #"{"id":"\#(UUID().uuidString)","settings":{"longestEdge":1920,"framesPerSecond":15,"megabits":3},"codec":"av1"}"#
+        try rejects("An unknown codec was accepted") { _ = try Wire.readJSON(StreamSettingsRequest.self, Data(unknown.utf8)) }
+        let hello = Hello(name: "host", width: 1920, height: 1080, settings: .init(), canControl: true, hevcVideoV1: true)
+        let decodedHello = try Wire.readJSON(Hello.self, JSONEncoder().encode(hello))
+        try decodedHello.validate()
+        try check(decodedHello.hevcVideoV1 == true, "The HEVC capability was lost")
+        let plainHello = Hello(name: "host", width: 1920, height: 1080, settings: .init(), canControl: true)
+        try check(!String(decoding: try JSONEncoder().encode(plainHello), as: UTF8.self).contains("hevc")
+                  && Wire.readJSON(Hello.self, JSONEncoder().encode(plainHello)).hevcVideoV1 == nil,
+                  "A host without HEVC advertised it")
+    }
+
     run("Higher frame rates round-trip through live requests and replies while defaults stay unchanged") {
         try check(StreamSettings().framesPerSecond == 15 && StreamSettings.highest.framesPerSecond == 60,
                   "Adding manual rates changed the default or initial RTT selection")

@@ -16,6 +16,9 @@ public final class VideoDecoder {
 
     public init(diagnostics: PerformanceDiagnostics? = nil) { self.diagnostics = diagnostics }
 
+    /// A viewer asks for HEVC only when it decodes it in hardware; software decoding would cost the frame rate HEVC buys.
+    public static var hardwareHEVCAvailable: Bool { VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC) }
+
     public func decode(_ packet: VideoPacket, completion: @escaping (Result<CVPixelBuffer, Error>) -> Void) {
         let timingID: UUID? = diagnostics?.start().flatMap { token in
             timingLock.withLock {

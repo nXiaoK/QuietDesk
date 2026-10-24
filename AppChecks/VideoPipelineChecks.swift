@@ -158,6 +158,48 @@ private struct VideoPipelineChecks {
             try require(flow.isIdle, "All acknowledged frames did not drain the boundary")
         }
 
+        run("A keyframe or a large frame earns four refinement passes once the screen stays still") {
+            var refinement = StaticFrameRefinement()
+            refinement.encoded(bytes: 10_000, keyFrame: false, budgetBytes: 100_000, at: 0)
+            try require(refinement.remaining == 0 && refinement.dueAt == nil && !refinement.isDue(at: 10),
+                        "A small change asked for refinement on its own")
+            refinement.encoded(bytes: 900_000, keyFrame: true, budgetBytes: 100_000, at: 1)
+            try require(refinement.remaining == 4 && !refinement.isDue(at: 1.2) && refinement.isDue(at: 1.25),
+                        "A keyframe was not refined a quarter second after the screen went still")
+            var time = 1.25
+            for (index, gap) in [0.25, 0.5, 1].enumerated() {
+                refinement.wait()
+                try require(!refinement.isDue(at: time + 5), "A pass handed to the encoder was scheduled again before its output")
+                refinement.refined(at: time)
+                try require(refinement.remaining == 3 - index && !refinement.isDue(at: time + gap - 0.01)
+                            && refinement.isDue(at: time + gap), "Refinement passes did not slow down after each output")
+                time += gap
+            }
+            refinement.wait()
+            refinement.refined(at: time)
+            try require(refinement.remaining == 0 && refinement.dueAt == nil, "Refinement continued past four passes")
+            refinement.encoded(bytes: 50_000, keyFrame: false, budgetBytes: 100_000, at: time + 1)
+            try require(refinement.remaining == 4, "A frame using half its budget did not earn new passes")
+        }
+
+        run("New frames postpone refinement, small changes keep the passes left and cancellation clears them") {
+            var refinement = StaticFrameRefinement()
+            refinement.encoded(bytes: 300_000, keyFrame: false, budgetBytes: 100_000, at: 0)
+            refinement.wait()
+            refinement.refined(at: 0.25)
+            try require(refinement.remaining == 3, "The first pass was not counted")
+            refinement.wait()
+            try require(!refinement.isDue(at: 100), "A captured frame did not postpone the pending pass")
+            refinement.encoded(bytes: 2_000, keyFrame: false, budgetBytes: 100_000, at: 0.3)
+            try require(refinement.remaining == 3 && !refinement.isDue(at: 0.5) && refinement.isDue(at: 0.55),
+                        "A small change reset or dropped the remaining passes instead of waiting for stillness")
+            refinement.cancel()
+            try require(refinement.remaining == 0 && refinement.dueAt == nil && !refinement.isDue(at: 100),
+                        "Cancellation left a refinement pass scheduled")
+            refinement.encoded(bytes: 0, keyFrame: true, budgetBytes: 0, at: .nan)
+            try require(refinement.remaining == 4 && refinement.dueAt == nil, "An invalid clock reading scheduled a pass")
+        }
+
         run("A reconfiguration or pause boundary waits for both all acknowledgements and encoding") {
             var flow = VideoFrameFlow()
             let first = flow.begin(at: 0)!

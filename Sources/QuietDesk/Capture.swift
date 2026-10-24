@@ -93,6 +93,39 @@ struct VideoFrameFlow {
     }
 }
 
+// ScreenCaptureKit sends nothing more once the screen stops changing, so its last frame keeps the quality rate
+// control could give it: a keyframe or a frame in motion is often soft. Re-encoding that unchanged picture a few
+// times lets the encoder sharpen it; every new frame postpones the next pass until the screen is still again.
+struct StaticFrameRefinement {
+    static let delays: [TimeInterval] = [0.25, 0.25, 0.5, 1]
+    private(set) var remaining = 0
+    private(set) var dueAt: TimeInterval?
+
+    /// A captured frame left the encoder. A keyframe, or one using at least half the per-frame budget, earns a
+    /// full set of passes; a small change keeps the passes left and only waits for stillness again.
+    mutating func encoded(bytes: Int, keyFrame: Bool, budgetBytes: Int, at now: TimeInterval) {
+        if keyFrame || bytes >= max(1, budgetBytes / 2) { remaining = Self.delays.count }
+        schedule(at: now)
+    }
+
+    /// A pass left the encoder, or was dropped by it.
+    mutating func refined(at now: TimeInterval) {
+        remaining = max(0, remaining - 1)
+        schedule(at: now)
+    }
+
+    func isDue(at now: TimeInterval) -> Bool { dueAt.map { now + 0.001 >= $0 } ?? false }
+
+    /// A pass was handed to the encoder, or a new capture replaced the picture; its output schedules the next.
+    mutating func wait() { dueAt = nil }
+
+    mutating func cancel() { remaining = 0; dueAt = nil }
+
+    private mutating func schedule(at now: TimeInterval) {
+        dueAt = remaining > 0 && now.isFinite ? now + Self.delays[Self.delays.count - remaining] : nil
+    }
+}
+
 struct VideoEncodeTiming {
     private var started: (encoderID: UUID, sequence: UInt32, at: TimeInterval)?
 
@@ -211,6 +244,12 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var latest: (CVPixelBuffer, CMTime, PerformanceDiagnostics.Token?)?
     private var lastCapture: (CVPixelBuffer, CMTime, PerformanceDiagnostics.Token?)?
     private var frameFlow = VideoFrameFlow()
+    private var refinement = StaticFrameRefinement()
+    private var refinementTimer: DispatchSourceTimer?
+    private var lastCaptureAt: TimeInterval = 0
+    // `latest` holds a refinement pass rather than a capture; then the sequence it is encoded as.
+    private var latestIsRefinement = false
+    private var refiningSequence: UInt32?
     private let diagnostics: PerformanceDiagnostics?
     private let encodingTimingLock = NSLock()
     private var encodingStarted: (id: UUID, sequence: UInt32, token: PerformanceDiagnostics.Token)?
@@ -332,6 +371,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                         self.diagnostics?.recordValue(.keyframeBytes, packet.avcc.count, kind: .video, identifier: UInt64(packet.sequence))
                     }
                     self.onFrame?(packet)
+                    self.scheduleRefinement(after: packet)
                     self.completeFrameBoundary()
                 case .failure(let error):
                     self.diagnostics?.record(.encodeCallbackQueue, since: encodedAt, kind: .video)
@@ -359,6 +399,11 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 guard self.running, self.encoderID == id, self.frameFlow.dropped(number) else { return }
                 if let duration = observation.duration { self.onEncodeDuration?(duration) }
                 self.diagnostics?.record(.encodeCallbackQueue, since: droppedAt, kind: .video, identifier: UInt64(number))
+                if self.refiningSequence == number {
+                    self.refiningSequence = nil
+                    self.refinement.refined(at: SessionClock.now)
+                    self.armRefinementTimer()
+                }
                 self.completeFrameBoundary()
             }
         }
@@ -617,6 +662,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 outputHeight = height
                 currentSettings = settings
                 frameFlow.requestKeyFrame()
+                cancelRefinement()
                 latest = cursorGate.needsFreshFrame ? nil : lastCapture
                 if cursorGate.needsFreshFrame { lastCapture = nil; appliedCursorIncluded = nil }
                 // Replaying a retained frame is intentional, not capture-queue congestion.
@@ -665,7 +711,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             let pendingCursor = try queue.sync { () throws -> Bool? in
                 guard running, stream === current else { throw CancellationError() }
                 sessionPaused = paused
-                if paused { reconfiguring = false }
+                if paused { reconfiguring = false; cancelRefinement() }
                 else {
                     frameFlow.requestKeyFrame()
                     if cursorGate.needsFreshFrame { return cursorGate.included }
@@ -796,6 +842,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             self.encodingTimingLock.withLock { self.encodingStarted = nil; self.encodeTiming.cancel() }
             self.acknowledgements.removeAll()
             self.frameFlow.prepareMediaRecovery()
+            self.cancelRefinement()
             self.latest = self.lastCapture
             self.latest?.2 = nil
             self.discardMismatchedFrame()
@@ -821,6 +868,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         queue.async { [weak self] in
             guard let self, self.running, !self.reconfiguring, !self.sessionPaused,
                   self.frameFlow.resumeMediaFrames() else { return }
+            // A pass that fell due during the hold runs now that frames may flow again.
+            self.armRefinementTimer()
             self.pump()
         }
     }
@@ -850,6 +899,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             reconfiguring = false
             latest = nil
             lastCapture = nil
+            cancelRefinement()
+            refinementTimer?.cancel()
+            refinementTimer = nil
             if let waiter = cursorFrameWaiter { finishCursorFrameWaiter(waiter.id, result: .failure(CancellationError())) }
             cursorGate = CursorCaptureGate()
             appliedCursorIncluded = nil
@@ -895,16 +947,64 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         if !reconfiguring, (CVPixelBufferGetWidth(buffer) != outputWidth || CVPixelBufferGetHeight(buffer) != outputHeight) { return }
         let cursorFrame = cursorGate.observe(sampleBuffer, displayTime: attachments.first?[.displayTime] as? UInt64)
         guard cursorFrame.retain else { return }
-        if latest != nil, !sessionPaused, !reconfiguring { diagnostics?.recordValue(.captureReplaced, 1) }
+        if latest != nil, !latestIsRefinement, !sessionPaused, !reconfiguring { diagnostics?.recordValue(.captureReplaced, 1) }
         // SCK presentation time is not in the SessionClock domain.
         latest = (buffer, CMSampleBufferGetPresentationTimeStamp(sampleBuffer), diagnostics?.start())
         lastCapture = latest
+        lastCaptureAt = SessionClock.now
+        latestIsRefinement = false
+        refinement.wait()
         if let request = cursorFrame.completed {
             appliedCursorIncluded = cursorGate.included
             lastConfirmedCursorIncluded = cursorGate.included
             finishCursorFrameWaiter(request, result: .success(()))
         }
         pump()
+    }
+
+    // Runs on the capture queue once a frame's output was handed on.
+    private func scheduleRefinement(after packet: VideoPacket) {
+        let now = SessionClock.now
+        if refiningSequence == packet.sequence {
+            refiningSequence = nil
+            refinement.refined(at: now)
+        } else {
+            let budget = currentSettings.megabits * 125_000 / max(1, min(currentSettings.framesPerSecond, 60))
+            refinement.encoded(bytes: packet.avcc.count, keyFrame: !packet.sps.isEmpty, budgetBytes: budget, at: now)
+        }
+        armRefinementTimer()
+    }
+
+    private func armRefinementTimer() {
+        guard let dueAt = refinement.dueAt else { return }
+        let timer: DispatchSourceTimer
+        if let refinementTimer { timer = refinementTimer }
+        else {
+            timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.setEventHandler { [weak self] in self?.refineIfDue() }
+            refinementTimer = timer
+            timer.resume()
+        }
+        timer.schedule(deadline: .now() + max(0, dueAt - SessionClock.now), leeway: .milliseconds(20))
+    }
+
+    // Replays the last capture only while nothing newer waits, and never across a pause, a reconfiguration,
+    // a cursor change awaiting its fresh frame or a media recovery hold. Its time advances by the real wait.
+    private func refineIfDue() {
+        let now = SessionClock.now
+        guard running, captureStarted, !reconfiguring, !sessionPaused, !cursorGate.needsFreshFrame, !frameFlow.mediaHold,
+              refinement.isDue(at: now), latest == nil, let last = lastCapture,
+              CVPixelBufferGetWidth(last.0) == outputWidth, CVPixelBufferGetHeight(last.0) == outputHeight else { return }
+        refinement.wait()
+        latest = (last.0, CMTimeAdd(last.1, CMTime(seconds: max(0, now - lastCaptureAt), preferredTimescale: 1_000_000)), nil)
+        latestIsRefinement = true
+        pump()
+    }
+
+    private func cancelRefinement() {
+        refinement.cancel()
+        refiningSequence = nil
+        if latestIsRefinement { latest = nil; latestIsRefinement = false }
     }
 
     private func discardMismatchedFrame() {
@@ -917,6 +1017,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         guard let latest, let encoder,
               let frame = frameFlow.begin(at: SessionClock.now) else { return }
         self.latest = nil
+        refiningSequence = latestIsRefinement ? frame.sequence : nil
+        latestIsRefinement = false
         if diagnostics?.isEnabled == true {
             if !encoderHardwareChecked {
                 encoderHardware = encoder.hardwareAccelerationStatus
@@ -940,7 +1042,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
-    deinit { watchdog?.cancel() }
+    deinit { watchdog?.cancel(); refinementTimer?.cancel() }
 }
 
 @MainActor

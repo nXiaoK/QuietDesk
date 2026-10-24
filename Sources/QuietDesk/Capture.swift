@@ -954,6 +954,12 @@ final class InputInjector {
     private var heldButtons = Set<Int>()
     private var lastPoint = CGPoint.zero
     private var scroll = ScrollAccumulator()
+    private var lineScroll = ScrollAccumulator()
+    // Gesture and momentum phases already given to apps and not yet ended.
+    private var openScrollPhase: RemoteInput.ScrollPhase?
+    private var momentumOpen = false
+    private var phaseWatch: Task<Void, Never>?
+    private let scrollPhaseTimeout: TimeInterval
     private let source = CGEventSource(stateID: .hidSystemState)
     private let inputSources: InputSources
     private var remoteCapsLock: Bool?
@@ -968,13 +974,15 @@ final class InputInjector {
          postEvent: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
          inputSources: InputSources? = nil,
          capsLockState: @escaping () -> Bool = { CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift) },
-         pointerLocation: @escaping () -> CGPoint? = { CGEvent(source: nil)?.location }) {
+         pointerLocation: @escaping () -> CGPoint? = { CGEvent(source: nil)?.location },
+         scrollPhaseTimeout: TimeInterval = 0.5) {
         self.bounds = bounds
         self.isTrusted = isTrusted
         self.postEvent = postEvent
         self.inputSources = inputSources ?? InputSources()
         self.capsLockState = capsLockState
         self.pointerLocation = pointerLocation
+        self.scrollPhaseTimeout = scrollPhaseTimeout
     }
 
     func receive(_ input: RemoteInput) async throws -> InputFeedback? {
@@ -1053,11 +1061,11 @@ final class InputInjector {
                 if down { heldKeys.insert(input.keyCode) } else { heldKeys.remove(input.keyCode) }
             }
         case .scroll:
-            guard let pixels = try scroll.accumulate(deltaX: input.deltaX, deltaY: input.deltaY) else { return nil }
-            guard let wheel = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
-                                      wheel1: pixels.y, wheel2: pixels.x, wheel3: 0) else {
-                throw DeskError.invalid("无法建立远端滚动事件")
-            }
+            // A wheel or an older viewer sends no phases; finish any gesture an interrupted stream left open.
+            if input.scrollPhase == nil && input.momentumPhase == nil { endScrollPhases() }
+            let wheels = try scrollEvents(input)
+            watchScrollPhases()
+            guard let wheel = wheels.last else { return nil }
             // A scroll's location does not move the pointer used for window and view routing, so move it there
             // first. Skip the move once the pointer is already there: one per wheel event redoes hover mid-scroll.
             let current = pointerLocation()
@@ -1072,6 +1080,11 @@ final class InputInjector {
                 }
                 move.flags = flags
                 postEvent(move)
+            }
+            for earlier in wheels.dropLast() {
+                earlier.location = point
+                earlier.flags = flags
+                postEvent(earlier)
             }
             lastPoint = point
             event = wheel
@@ -1100,9 +1113,128 @@ final class InputInjector {
         return nil
     }
 
+    // Wheel events for one scroll input in posting order; the last is the input's own, earlier ones end or
+    // begin a phase whose own event was lost. Empty when it moves less than a pixel and starts or ends nothing.
+    private func scrollEvents(_ input: RemoteInput) throws -> [CGEvent] {
+        if let lineX = input.lineDeltaX, let lineY = input.lineDeltaY {
+            // A wheel stays a line wheel, so apps scroll by their own line height, as with a local mouse.
+            guard lineX != 0 || lineY != 0 else { return [] }
+            let pixels = try scroll.accumulate(deltaX: input.deltaX, deltaY: input.deltaY)
+            let lines = try lineScroll.accumulate(deltaX: lineX, deltaY: lineY)
+            let wheel = try wheelEvent(units: .line, x: lines?.x ?? 0, y: lines?.y ?? 0)
+            wheel.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: lineY)
+            wheel.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: lineX)
+            wheel.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(pixels?.y ?? 0))
+            wheel.setIntegerValueField(.scrollWheelEventPointDeltaAxis2, value: Int64(pixels?.x ?? 0))
+            return [wheel]
+        }
+        let pixels = try scroll.accumulate(deltaX: input.deltaX, deltaY: input.deltaY)
+        guard input.scrollPhase != nil || input.momentumPhase != nil else {
+            // An older viewer, or a precise device outside a gesture: pixels as before.
+            guard let pixels else { return [] }
+            return [try wheelEvent(units: .pixel, x: pixels.x, y: pixels.y)]
+        }
+        func wheel(_ phase: RemoteInput.ScrollPhase?, _ momentum: RemoteInput.MomentumPhase?,
+                   moving: Bool = true) throws -> CGEvent {
+            let event = try wheelEvent(units: .pixel, x: moving ? pixels?.x ?? 0 : 0, y: moving ? pixels?.y ?? 0 : 0)
+            event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase?.rawValue ?? 0))
+            event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Int64(momentum?.rawValue ?? 0))
+            return event
+        }
+        // A gesture phase and a momentum phase do not occur together; the gesture phase wins. An ending lost
+        // on the way is supplied before the next phase, so apps always see a gesture begin and end in order.
+        var events: [CGEvent] = []
+        if let phase = input.scrollPhase {
+            if momentumOpen {
+                momentumOpen = false
+                events.append(try wheel(nil, .ended, moving: false))
+            }
+            switch phase {
+            case .mayBegin, .began:
+                if let open = openScrollPhase, open != .mayBegin { events.append(try wheel(.ended, nil, moving: false)) }
+                openScrollPhase = phase
+                events.append(try wheel(phase, nil))
+            case .changed:
+                if openScrollPhase == nil || openScrollPhase == .mayBegin { events.append(try wheel(.began, nil, moving: false)) }
+                openScrollPhase = .changed
+                if pixels != nil { events.append(try wheel(.changed, nil)) }
+            case .ended, .cancelled:
+                guard openScrollPhase != nil else { return events }
+                openScrollPhase = nil
+                events.append(try wheel(phase, nil))
+                scroll.reset()
+            }
+            return events
+        }
+        guard let momentum = input.momentumPhase else { return [] }
+        if let open = openScrollPhase {
+            openScrollPhase = nil
+            events.append(try wheel(open == .mayBegin ? .cancelled : .ended, nil, moving: false))
+        }
+        switch momentum {
+        case .began:
+            if momentumOpen { events.append(try wheel(nil, .ended, moving: false)) }
+            momentumOpen = true
+            events.append(try wheel(nil, .began))
+        case .changed:
+            if !momentumOpen { events.append(try wheel(nil, .began, moving: false)) }
+            momentumOpen = true
+            if pixels != nil { events.append(try wheel(nil, .changed)) }
+        case .ended:
+            guard momentumOpen else { return events }
+            momentumOpen = false
+            events.append(try wheel(nil, .ended))
+            scroll.reset()
+        }
+        return events
+    }
+
+    private func wheelEvent(units: CGScrollEventUnit, x: Int32, y: Int32) throws -> CGEvent {
+        guard let event = CGEvent(scrollWheelEvent2Source: source, units: units, wheelCount: 2,
+                                  wheel1: y, wheel2: x, wheel3: 0) else {
+            throw DeskError.invalid("无法建立远端滚动事件")
+        }
+        return event
+    }
+
+    // A gesture or momentum left open waits for an ending that a lost event, a pointer leaving the remote
+    // picture or a stalled network may never deliver; end it after a short silence so apps stop waiting.
+    private func watchScrollPhases() {
+        phaseWatch?.cancel()
+        guard openScrollPhase != nil || momentumOpen else { phaseWatch = nil; return }
+        let timeout = scrollPhaseTimeout
+        phaseWatch = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.endScrollPhases()
+        }
+    }
+
+    private func endScrollPhases() {
+        phaseWatch?.cancel()
+        phaseWatch = nil
+        var endings: [(RemoteInput.ScrollPhase?, RemoteInput.MomentumPhase?)] = []
+        if let open = openScrollPhase { endings.append((open == .mayBegin ? .cancelled : .ended, nil)) }
+        if momentumOpen { endings.append((nil, .ended)) }
+        openScrollPhase = nil
+        momentumOpen = false
+        guard !endings.isEmpty else { return }
+        scroll.reset()
+        for (phase, momentum) in endings {
+            guard let event = try? wheelEvent(units: .pixel, x: 0, y: 0) else { continue }
+            event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase?.rawValue ?? 0))
+            event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Int64(momentum?.rawValue ?? 0))
+            event.location = lastPoint
+            event.flags = remoteCapsLock == true ? [.maskAlphaShift] : []
+            postEvent(event)
+        }
+    }
+
     func releaseAll() {
+        endScrollPhases()
         inputSources.cancel()
         scroll.reset()
+        lineScroll.reset()
         for key in heldKeys {
             let event = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false)
             if [54, 55, 56, 57, 58, 59, 60, 61, 62, 63].contains(key) { event?.type = .flagsChanged }

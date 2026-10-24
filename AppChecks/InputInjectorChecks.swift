@@ -30,6 +30,22 @@ private func scroll(x: Double = 0.5, y: Double = 0.5, dx: Double = 0, dy: Double
     return value
 }
 
+@MainActor
+private func phased(_ phase: RemoteInput.ScrollPhase? = nil, momentum: RemoteInput.MomentumPhase? = nil,
+                    dy: Double = 0) -> RemoteInput {
+    var value = scroll(x: 0.2, y: 0.4, dy: dy)
+    value.scrollPhase = phase; value.momentumPhase = momentum
+    return value
+}
+
+@MainActor
+private func phases(_ events: [CGEvent]) -> [String] {
+    events.filter { $0.type == .scrollWheel }.map { event in
+        let native = NSEvent(cgEvent: event)
+        return "\(native?.phase.rawValue ?? 999)/\(native?.momentumPhase.rawValue ?? 999)/\(event.getIntegerValueField(.scrollWheelEventPointDeltaAxis1))"
+    }
+}
+
 @main
 private struct InputInjectorChecks {
     @MainActor
@@ -144,6 +160,88 @@ private struct InputInjectorChecks {
                 try require(recorder.events.count == 9 && recorder.events[7].type == .mouseMoved,
                             "An unknown pointer position skipped the move")
             }
+        }
+
+        await run("A line wheel replays as non-continuous lines with its exact fraction and pixel totals") {
+            let recorder = EventRecorder()
+            let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 101, height: 101),
+                                         isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
+            var slow = scroll(x: 0.2, y: 0.4, dy: 3.6); slow.lineDeltaX = 0; slow.lineDeltaY = 0.3
+            var fast = scroll(x: 0.2, y: 0.4, dx: -24, dy: 0.6); fast.lineDeltaX = -2; fast.lineDeltaY = 0.7
+            var still = scroll(x: 0.2, y: 0.4); still.lineDeltaX = 0; still.lineDeltaY = 0
+            for input in [slow, fast, still] { _ = try await injector.receive(input) }
+            let wheels = recorder.events.filter { $0.type == .scrollWheel }
+            try require(recorder.events.count == 3 && recorder.events[0].type == .mouseMoved && wheels.count == 2,
+                        "A line wheel lost an event, moved the pointer twice or posted a zero wheel")
+            guard let first = NSEvent(cgEvent: wheels[0]), let second = NSEvent(cgEvent: wheels[1]) else {
+                throw InputCheckFailure("No native line wheel")
+            }
+            try require(wheels.allSatisfy { $0.getIntegerValueField(.scrollWheelEventIsContinuous) == 0 }
+                        && !first.hasPreciseScrollingDeltas && !second.hasPreciseScrollingDeltas,
+                        "A line wheel became a precise pixel scroll")
+            try require(abs(first.scrollingDeltaY - 0.3) < 0.001 && first.scrollingDeltaX == 0
+                        && abs(second.scrollingDeltaY - 0.7) < 0.001 && second.scrollingDeltaX == -2,
+                        "AppKit read different line amounts")
+            try require(wheels[0].getIntegerValueField(.scrollWheelEventDeltaAxis1) == 0
+                        && wheels[1].getIntegerValueField(.scrollWheelEventDeltaAxis1) == 1
+                        && wheels[1].getIntegerValueField(.scrollWheelEventDeltaAxis2) == -2,
+                        "Whole-line deltas did not accumulate the fractions")
+            try require(wheels[0].getIntegerValueField(.scrollWheelEventPointDeltaAxis1) == 3
+                        && wheels[1].getIntegerValueField(.scrollWheelEventPointDeltaAxis1) == 1
+                        && wheels[1].getIntegerValueField(.scrollWheelEventPointDeltaAxis2) == -24,
+                        "Pixel totals of a line wheel changed")
+            try require(wheels.allSatisfy { $0.getIntegerValueField(.scrollWheelEventScrollPhase) == 0
+                                            && $0.getIntegerValueField(.scrollWheelEventMomentumPhase) == 0 },
+                        "A line wheel acquired gesture phases")
+        }
+
+        await run("A trackpad gesture and its momentum keep their phases, including endings without a whole pixel") {
+            let recorder = EventRecorder()
+            let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 101, height: 101),
+                                         isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
+            let sequence = [phased(.mayBegin), phased(.began), phased(.changed, dy: -0.4), phased(.changed, dy: -0.8),
+                            phased(.ended), phased(momentum: .began, dy: -3), phased(momentum: .changed, dy: -2),
+                            phased(momentum: .ended)]
+            for input in sequence { _ = try await injector.receive(input) }
+            try require(phases(recorder.events) == ["32/0/0", "1/0/0", "4/0/-1", "8/0/0", "0/1/-3", "0/4/-2", "0/8/0"],
+                        "Gesture or momentum phases were lost, reordered or carried the wrong pixels: \(phases(recorder.events))")
+            try require(recorder.events.filter { $0.type == .mouseMoved }.count == 1
+                        && recorder.events.filter { $0.type == .scrollWheel }.allSatisfy {
+                            $0.getIntegerValueField(.scrollWheelEventIsContinuous) == 1 && NSEvent(cgEvent: $0)?.hasPreciseScrollingDeltas == true
+                        }, "A phased scroll stopped being a precise pixel scroll or repeated its pointer move")
+        }
+
+        await run("Lost gesture beginnings are supplied and unfinished ones end after silence, a wheel or a release") {
+            let recorder = EventRecorder()
+            let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 101, height: 101),
+                                         isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer },
+                                         scrollPhaseTimeout: 0.05)
+            _ = try await injector.receive(phased(.changed, dy: -5))
+            try require(phases(recorder.events) == ["1/0/0", "4/0/-5"], "A gesture without its beginning was not opened first")
+            try await Task.sleep(nanoseconds: 200_000_000)
+            try require(phases(recorder.events) == ["1/0/0", "4/0/-5", "8/0/0"], "A silent gesture stayed open")
+            _ = try await injector.receive(phased(.ended))
+            _ = try await injector.receive(phased(momentum: .ended))
+            try require(phases(recorder.events).count == 3, "An ending for an already ended gesture reached apps")
+            _ = try await injector.receive(phased(.began))
+            var wheel = scroll(x: 0.2, y: 0.4, dy: 12); wheel.lineDeltaX = 0; wheel.lineDeltaY = 1
+            _ = try await injector.receive(wheel)
+            try require(phases(recorder.events).suffix(3) == ["1/0/0", "8/0/0", "0/0/12"],
+                        "A wheel did not end the open gesture before scrolling")
+            _ = try await injector.receive(phased(momentum: .changed, dy: -4))
+            try require(phases(recorder.events).suffix(2) == ["0/1/0", "0/4/-4"], "Momentum without its beginning was not opened first")
+            injector.releaseAll()
+            try require(phases(recorder.events).last == "0/8/0", "Release left momentum open")
+            try await Task.sleep(nanoseconds: 200_000_000)
+            try require(phases(recorder.events).count == 9, "A released gesture was ended twice")
+            _ = try await injector.receive(phased(.began))
+            _ = try await injector.receive(phased(momentum: .began, dy: -2))
+            try require(phases(recorder.events).suffix(3) == ["1/0/0", "8/0/0", "0/1/-2"],
+                        "Momentum did not end the gesture whose ending was lost")
+            _ = try await injector.receive(phased(.mayBegin))
+            try require(phases(recorder.events).suffix(2) == ["0/8/0", "32/0/0"], "A new touch did not end the running momentum")
+            try await Task.sleep(nanoseconds: 200_000_000)
+            try require(phases(recorder.events).last == "16/0/0", "An unfinished touch was not cancelled after silence")
         }
 
         await run("Release clears pending fractions and zero input does not move the pointer") {

@@ -810,6 +810,15 @@ final class RemoteCanvas: NSView {
             let multiplier: Double = event.hasPreciseScrollingDeltas ? 1 : 12
             input.deltaX = min(3000, max(-3000, event.scrollingDeltaX * multiplier))
             input.deltaY = min(3000, max(-3000, event.scrollingDeltaY * multiplier))
+            // Newer hosts replay a wheel as lines and a trackpad gesture with its phases; older ones use the pixels.
+            if event.hasPreciseScrollingDeltas {
+                input.scrollPhase = RemoteInput.ScrollPhase(event.phase)
+                input.momentumPhase = RemoteInput.MomentumPhase(event.momentumPhase)
+            } else {
+                let limit = RemoteInput.maximumLineDelta
+                input.lineDeltaX = min(limit, max(-limit, event.scrollingDeltaX))
+                input.lineDeltaY = min(limit, max(-limit, event.scrollingDeltaY))
+            }
         }
         if kind == .move {
             if let ready = movePacer.offer(input, now: SessionClock.now) { onInput?(ready) }
@@ -903,6 +912,26 @@ final class RemoteCanvas: NSView {
     }
 
     deinit { moveTimer?.invalidate(); for observer in observers { NotificationCenter.default.removeObserver(observer) } }
+}
+
+private extension RemoteInput.ScrollPhase {
+    init?(_ phase: NSEvent.Phase) {
+        if phase.contains(.mayBegin) { self = .mayBegin }
+        else if phase.contains(.began) { self = .began }
+        else if phase.contains(.changed) { self = .changed }
+        else if phase.contains(.ended) { self = .ended }
+        else if phase.contains(.cancelled) { self = .cancelled }
+        else { return nil }
+    }
+}
+
+private extension RemoteInput.MomentumPhase {
+    init?(_ phase: NSEvent.Phase) {
+        if phase.contains(.began) { self = .began }
+        else if phase.contains(.changed) { self = .changed }
+        else if phase.contains(.ended) || phase.contains(.cancelled) { self = .ended }
+        else { return nil }
+    }
 }
 
 struct CanvasView: NSViewRepresentable {

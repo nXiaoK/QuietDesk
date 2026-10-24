@@ -144,12 +144,14 @@ private func nativeEvent(_ event: CGEvent, point: CGPoint) throws -> NSEvent {
 
 @MainActor
 private func wheel(units: CGScrollEventUnit, x: Int32, y: Int32,
-                   point: CGPoint = CGPoint(x: 100, y: 150)) throws -> NSEvent {
+                   point: CGPoint = CGPoint(x: 100, y: 150), phase: Int64 = 0, momentum: Int64 = 0) throws -> NSEvent {
     guard let event = CGEvent(scrollWheelEvent2Source: nil, units: units, wheelCount: 2,
                               wheel1: y, wheel2: x, wheel3: 0) else {
         throw CanvasCheckFailure("Could not construct a scroll event")
     }
     event.flags = .maskAlternate
+    event.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase)
+    event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentum)
     return try nativeEvent(event, point: point)
 }
 
@@ -194,6 +196,25 @@ private struct RemoteCanvasChecks {
             try require(input.x == 0.25 && input.y == 0.5, "Scroll coordinates ignored picture letterboxing")
             try require(input.button == 0 && input.clicks == 1 && input.flags == NSEvent.ModifierFlags.option.rawValue,
                         "Scroll acquired click metadata or lost its modifiers")
+            try require(input.lineDeltaX == nil && input.lineDeltaY == nil && input.scrollPhase == nil && input.momentumPhase == nil,
+                        "A precise scroll without phases acquired wheel lines or phases")
+        }
+
+        run("Trackpad gesture and momentum phases reach the wire for hosts that replay them") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            canvas.remoteSize = CGSize(width: 400, height: 300)
+            canvas.canControl = true
+            var inputs: [RemoteInput] = []
+            canvas.onInput = { inputs.append($0) }
+            for (phase, momentum) in [(128, 0), (1, 0), (2, 0), (4, 0), (8, 0), (0, 1), (0, 2), (0, 3)] as [(Int64, Int64)] {
+                canvas.scrollWheel(with: try wheel(units: .pixel, x: 0, y: -6, phase: phase, momentum: momentum))
+            }
+            try require(inputs.map(\.scrollPhase) == [.mayBegin, .began, .changed, .ended, .cancelled, nil, nil, nil]
+                        && inputs.map(\.momentumPhase) == [nil, nil, nil, nil, nil, .began, .changed, .ended],
+                        "Gesture or momentum phases changed between AppKit and the wire")
+            try require(inputs.allSatisfy { $0.deltaY == -6 && $0.lineDeltaX == nil && $0.lineDeltaY == nil },
+                        "A phased scroll changed its pixels or acquired wheel lines")
+            try inputs.forEach { try $0.validate() }
         }
 
         run("A line wheel scales its deltas without reading click-only NSEvent properties") {
@@ -208,6 +229,14 @@ private struct RemoteCanvasChecks {
             try require(inputs.count == 1 && inputs[0].deltaX == -24 && inputs[0].deltaY == 36,
                         "Line wheel movement was lost or scaled incorrectly")
             try require(inputs[0].button == 0 && inputs[0].clicks == 1, "A wheel inherited mouse click metadata")
+            try require(inputs[0].lineDeltaX == -2 && inputs[0].lineDeltaY == 3
+                        && inputs[0].scrollPhase == nil && inputs[0].momentumPhase == nil,
+                        "A line wheel did not carry its lines for newer hosts")
+            canvas.scrollWheel(with: try wheel(units: .line, x: -400, y: 400))
+            try require(inputs.count == 2 && inputs[1].lineDeltaX == -RemoteInput.maximumLineDelta
+                        && inputs[1].lineDeltaY == RemoteInput.maximumLineDelta && inputs[1].deltaY == 3000,
+                        "Wheel lines exceeded the protocol bounds")
+            try inputs.forEach { try $0.validate() }
         }
 
         run("Ordinary move, click, drag and release retain their pointer metadata") {

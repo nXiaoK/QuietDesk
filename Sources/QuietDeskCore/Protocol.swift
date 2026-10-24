@@ -265,6 +265,15 @@ public struct RemoteInput: Codable, Sendable {
     public enum Kind: String, Codable, Sendable {
         case move, drag, down, up, scroll, keyDown, keyUp, flags, switchInputSource, toggleCapsLock
     }
+    /// A trackpad-style gesture phase, numbered as CGScrollPhase.
+    public enum ScrollPhase: Int, Codable, Sendable {
+        case began = 1, changed = 2, ended = 4, cancelled = 8, mayBegin = 128
+    }
+    /// The phase of system momentum after a gesture, numbered as CGMomentumScrollPhase.
+    public enum MomentumPhase: Int, Codable, Sendable {
+        case began = 1, changed = 2, ended = 3
+    }
+    public static let maximumLineDelta = 250.0
     public var kind: Kind
     public var x: Double = 0
     public var y: Double = 0
@@ -276,6 +285,12 @@ public struct RemoteInput: Codable, Sendable {
     public var clicks: Int = 1
     public var isRepeat: Bool = false
     public var independentCapsLock: Bool?
+    // Scroll detail for hosts that apply it; older hosts ignore it and inject deltaX/deltaY as pixels.
+    // A wheel without precise deltas sends its line deltas; a trackpad or similar device sends its phases.
+    public var lineDeltaX: Double?
+    public var lineDeltaY: Double?
+    public var scrollPhase: ScrollPhase?
+    public var momentumPhase: MomentumPhase?
 
     public init(kind: Kind) { self.kind = kind }
 
@@ -284,6 +299,12 @@ public struct RemoteInput: Codable, Sendable {
               (0...2).contains(button), keyCode <= 127, (0...3).contains(clicks),
               deltaX.isFinite, deltaY.isFinite, abs(deltaX) <= 3000, abs(deltaY) <= 3000 else {
             throw DeskError.invalid("远端输入参数无效")
+        }
+        let lines = [lineDeltaX, lineDeltaY].compactMap { $0 }
+        guard kind == .scroll || (lines.isEmpty && scrollPhase == nil && momentumPhase == nil),
+              lines.isEmpty || (lines.count == 2 && scrollPhase == nil && momentumPhase == nil
+                                && lines.allSatisfy { $0.isFinite && abs($0) <= Self.maximumLineDelta }) else {
+            throw DeskError.invalid("远端滚动参数无效")
         }
     }
 }

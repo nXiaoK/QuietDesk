@@ -104,7 +104,7 @@ final class DeskModel: ObservableObject {
     var videoQualityHelp: String {
         guard mode == .viewer, supportsMediaTransport else { return "当前编码帧率上限与目标码率" }
         let help = localNetworkQuality
-            ? "局域网优先保持所选画质：\(viewerSettings.summary)。延迟达到 150 ms 持续 5 秒才降档，低于 50 ms 持续 3 秒恢复；实际帧率仍受屏幕和硬件限制。"
+            ? "局域网优先保持所选画质：\(viewerSettings.summary)。延迟达到 80 ms 持续 2 秒才降码率，之后画面有活动且延迟低于 50 ms 时逐档回升；实际帧率仍受屏幕和硬件限制。"
             : "当前生效的帧率上限与目标码率，按网络丢包、延迟和编解码速度自动调整，不超过所选：\(viewerSettings.summary)"
         return automaticQualityNote.isEmpty ? help : help + "\n" + automaticQualityNote
     }
@@ -114,7 +114,7 @@ final class DeskModel: ObservableObject {
     static func qualityNote(_ adjustment: MediaQualityPolicy.Adjustment?, applied: StreamSettings) -> String {
         switch adjustment {
         case .localLatency?:
-            return "局域网延迟达到 150 ms 持续 5 秒，已自动调整为 \(applied.summary)"
+            return "局域网延迟达到 80 ms 持续 2 秒，已自动调整为 \(applied.summary)"
         case .network?:
             return "网络丢包或延迟升高，已自动调整为 \(applied.summary)"
         case .compute(let cause, let milliseconds?)? where milliseconds.isFinite && milliseconds > 0:

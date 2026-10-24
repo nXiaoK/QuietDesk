@@ -465,6 +465,11 @@ public struct MediaQualityPolicy: Sendable {
     public static let computeRateTolerance = 0.85
     // A higher frame rate needs the measured time per frame to fit this share of its frame interval.
     public static let computeHeadroom = 0.85
+    // Local links reduce only for delay. The host keeps at most three frames in flight, so about 100 ms of
+    // queueing already caps the frame rate near 30 fps; scrolling was seen to hold steady near 120 ms.
+    public static let localDelayedMilliseconds = 80.0
+    public static let localReductionDelay: TimeInterval = 2
+    public static let localHealthyMilliseconds = 50.0
 
     /// Why the last automatic recommendation was made, for diagnostics and the quality tooltip.
     public enum Adjustment: Equatable, Sendable {
@@ -499,6 +504,8 @@ public struct MediaQualityPolicy: Sendable {
     private var peakComputeMilliseconds: Double?
     // Produced edges a compute reduction left, and when; not retried before the longest upgrade hold.
     private var slowEdges: [Int: TimeInterval] = [:]
+    // Local delay reduced the load on this route, so its recovery climbs one step at a time.
+    private var localLatencyLimited = false
 
     /// `bitRates` are the steps the host accepts; the ceiling itself always comes from the user or host.
     public init(hostDefault: StreamSettings, preferred: StreamSettings? = nil, applied: StreamSettings? = nil,
@@ -532,7 +539,7 @@ public struct MediaQualityPolicy: Sendable {
         preferred = settings; upperBound = settings
         resetEvidence(); lastObservationAt = now; lastChangeAt = now
         upgradeHold = Self.initialUpgradeHold; bitrateHold = Self.initialBitrateHold; upgraded = nil
-        slowEdges.removeAll(); lastAdjustment = nil
+        slowEdges.removeAll(); lastAdjustment = nil; localLatencyLimited = false
         pending = effective == settings ? nil : settings
         pendingUpgrade = nil
         return pending
@@ -542,6 +549,7 @@ public struct MediaQualityPolicy: Sendable {
     public mutating func setLocalNetwork(_ enabled: Bool, now: TimeInterval) {
         guard accept(now), isLocalNetwork != enabled else { return }
         isLocalNetwork = enabled
+        localLatencyLimited = false
         lastObservationAt = now
         resetEvidence()
     }
@@ -605,25 +613,37 @@ public struct MediaQualityPolicy: Sendable {
                 resetEvidence()
                 return nil
             }
-            if delay >= 150 {
-                healthyDuration = 0
+            if delay >= Self.localDelayedMilliseconds {
+                healthyDuration = 0; filledDuration = 0
                 congestedDuration += elapsed
-                guard congestedDuration + mediaPolicyTimeTolerance >= 5 else { return nil }
+                guard congestedDuration + mediaPolicyTimeTolerance >= Self.localReductionDelay else { return nil }
                 congestedDuration = 0
                 let current = StreamSettings(longestEdge: min(effective.longestEdge, upperBound.longestEdge),
                                              framesPerSecond: min(effective.framesPerSecond, upperBound.framesPerSecond),
                                              megabits: min(effective.megabits, upperBound.megabits))
                 let next = networkReduction(from: current, factor: 0.75)
                 guard next != effective else { return nil }
-                lastAdjustment = .localLatency
-                return recommend(next, now: now)
+                localLatencyLimited = true
+                return recommendReduction(next, adjustment: .localLatency, now: now)
             }
             congestedDuration = 0
-            guard delay < 50, sample.decodedFrames > 0 else { healthyDuration = 0; return nil }
+            guard delay < Self.localHealthyMilliseconds, sample.decodedFrames > 0 else {
+                healthyDuration = 0; filledDuration = 0
+                return nil
+            }
             healthyDuration += elapsed
-            guard healthyDuration + mediaPolicyTimeTolerance >= 3, effective != upperBound else { return nil }
-            lastAdjustment = .raise
-            return recommend(upperBound, now: now)
+            if !localLatencyLimited {
+                // Below the ceiling for another reason, such as a cautious start: restore it at once.
+                guard healthyDuration + mediaPolicyTimeTolerance >= 3, effective != upperBound else { return nil }
+                lastAdjustment = .raise
+                return recommend(upperBound, now: now)
+            }
+            // Delay already showed what this route carries. A quiet screen has low delay at any bitrate,
+            // so climb one step at a time, and only on windows in which video used a real share of it.
+            if let received = sample.receivedMegabits, received >= Double(effective.megabits) * Self.filledShare {
+                filledDuration += elapsed
+            }
+            return upgrade(now: now)
         }
         if let cause = sample.bottleneck, cause != .network {
             congestedDuration = 0; healthyDuration = 0; filledDuration = 0; peakComputeMilliseconds = nil

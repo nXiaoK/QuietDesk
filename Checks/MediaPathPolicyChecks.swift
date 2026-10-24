@@ -31,31 +31,108 @@ func runMediaPathPolicyChecks() {
                   "Local adaptation replaced the requested quality")
     }
 
-    run("Either local RTT or delivery delay at 150 ms must persist for five seconds before each reduction") {
+    run("Either local RTT or delivery delay at 80 ms must persist for two seconds before each reduction") {
         for useRoundTrip in [false, true] {
             let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 120, megabits: 100)
             var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling,
                                                bitRates: StreamSettings.adaptiveBitRates, appliedSize: (3024, 1964), now: 0)
             quality.setLocalNetwork(true, now: 0)
             for time in 1...10 {
-                try check(quality.observe(sample(delivery: 149.999, local: true, roundTrip: 149.999), now: Double(time)) == nil,
-                          "Local delay below 150 ms caused a reduction")
+                try check(quality.observe(sample(delivery: 79.999, local: true, roundTrip: 79.999), now: Double(time)) == nil,
+                          "Local delay below 80 ms caused a reduction")
             }
-            let delayed = sample(frames: 0, loss: 1, encode: 80, decode: 60, delivery: useRoundTrip ? 20 : 150,
-                                 local: true, roundTrip: useRoundTrip ? 150 : 3)
-            for time in 11...14 {
-                try check(quality.observe(delayed, now: Double(time)) == nil, "Local overload reduced quality before five seconds")
-            }
-            guard let first = quality.observe(delayed, now: 15) else { throw CheckFailure("Sustained local delay did not reduce load") }
+            let delayed = sample(frames: 0, loss: 1, encode: 80, decode: 60, delivery: useRoundTrip ? 20 : 80,
+                                 local: true, roundTrip: useRoundTrip ? 80 : 3)
+            try check(quality.observe(delayed, now: 11) == nil, "Local overload reduced quality before two seconds")
+            guard let first = quality.observe(delayed, now: 12) else { throw CheckFailure("Sustained local delay did not reduce load") }
             try check(first == StreamSettings(longestEdge: 8192, framesPerSecond: 120, megabits: 60)
                       && quality.lastAdjustment == .localLatency, "Local delay reduced size or reported codec pressure first")
-            try check(quality.confirmApplied(first, now: 15), "Local reduction was not confirmed")
-            try quality.synchronizeApplied(first, size: (3024, 1964), now: 15)
-            for time in 16...19 {
-                try check(quality.observe(delayed, now: Double(time)) == nil, "One delayed window caused repeated local reductions")
-            }
-            try check(quality.observe(delayed, now: 20)?.megabits == 40, "The next five seconds did not reduce bitrate again")
+            try check(quality.confirmApplied(first, now: 12), "Local reduction was not confirmed")
+            try quality.synchronizeApplied(first, size: (3024, 1964), now: 12)
+            try check(quality.observe(delayed, now: 13) == nil, "One delayed window caused repeated local reductions")
+            try check(quality.observe(delayed, now: 14)?.megabits == 40, "The next two seconds did not reduce bitrate again")
             try check(quality.preferred == ceiling && quality.upperBound == ceiling, "Local delay overwrote the user's ceiling")
+        }
+    }
+
+    run("After local delay reduces the load, quiet windows keep it and filled ones climb one bitrate step at a time") {
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 100)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling,
+                                           bitRates: StreamSettings.adaptiveBitRates, appliedSize: (3024, 1964), now: 0)
+        quality.setLocalNetwork(true, now: 0)
+        let delayed = sample(local: true, roundTrip: 120)
+        _ = quality.observe(delayed, now: 1)
+        guard let reduced = quality.observe(delayed, now: 2), reduced.megabits == 60 else {
+            throw CheckFailure("Local delay did not reduce the bitrate")
+        }
+        try check(quality.confirmApplied(reduced, now: 2), "Local reduction was not confirmed")
+        let quiet = sample(received: 0.1, local: true, roundTrip: 3)
+        for time in 3...40 {
+            try check(quality.observe(quiet, now: Double(time)) == nil, "A quiet low-delay screen restored bitrate after local delay")
+        }
+        let filled = sample(received: 30, local: true, roundTrip: 3)
+        for time in 41...43 {
+            try check(quality.observe(filled, now: Double(time)) == nil, "Local recovery raised bitrate before four filled seconds")
+        }
+        guard let step = quality.observe(filled, now: 44) else { throw CheckFailure("Filled low-delay windows did not raise bitrate") }
+        try check(step == StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 80) && quality.lastAdjustment == .raise,
+                  "Local recovery jumped past the next bitrate step")
+        try check(quality.confirmApplied(step, now: 44), "Local bitrate step was not confirmed")
+        let busier = sample(received: 40, local: true, roundTrip: 3)
+        for time in 45...47 {
+            try check(quality.observe(busier, now: Double(time)) == nil, "Local recovery repeated a step before four filled seconds")
+        }
+        try check(quality.observe(busier, now: 48) == ceiling, "The next filled seconds did not restore the ceiling")
+    }
+
+    run("A local delay reduction soon after a bitrate step doubles the time the next step needs") {
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 100)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling,
+                                           bitRates: StreamSettings.adaptiveBitRates, appliedSize: (3024, 1964), now: 0)
+        quality.setLocalNetwork(true, now: 0)
+        let delayed = sample(local: true, roundTrip: 120), filled = sample(received: 50, local: true, roundTrip: 3)
+        _ = quality.observe(delayed, now: 1)
+        guard let reduced = quality.observe(delayed, now: 2) else { throw CheckFailure("Local delay did not reduce the bitrate") }
+        _ = quality.confirmApplied(reduced, now: 2)
+        for time in 3...5 { _ = quality.observe(filled, now: Double(time)) }
+        guard let step = quality.observe(filled, now: 6), step.megabits == 80 else { throw CheckFailure("Expected one local bitrate step") }
+        _ = quality.confirmApplied(step, now: 6)
+        _ = quality.observe(delayed, now: 7)
+        guard let again = quality.observe(delayed, now: 8), again.megabits == 60, quality.lastAdjustment == .localLatency else {
+            throw CheckFailure("Delay after the step did not reduce it again")
+        }
+        try check(quality.bitrateHold == MediaQualityPolicy.initialBitrateHold * 2, "A failed local step did not double its hold")
+        _ = quality.confirmApplied(again, now: 8)
+        for time in 9...15 {
+            try check(quality.observe(filled, now: Double(time)) == nil, "A failed local step was retried before its doubled hold")
+        }
+        try check(quality.observe(filled, now: 16)?.megabits == 80, "The doubled hold did not allow the next step")
+    }
+
+    run("A new local route or a manual choice ends stepwise local recovery") {
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 100)
+        for manual in [false, true] {
+            var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling,
+                                               bitRates: StreamSettings.adaptiveBitRates, appliedSize: (3024, 1964), now: 0)
+            quality.setLocalNetwork(true, now: 0)
+            let delayed = sample(local: true, roundTrip: 120), quiet = sample(received: 0.1, local: true, roundTrip: 3)
+            _ = quality.observe(delayed, now: 1)
+            guard let reduced = quality.observe(delayed, now: 2) else { throw CheckFailure("Local delay did not reduce the bitrate") }
+            _ = quality.confirmApplied(reduced, now: 2)
+            for time in 3...10 {
+                try check(quality.observe(quiet, now: Double(time)) == nil, "Quiet windows restored a delay-limited route")
+            }
+            if manual {
+                try check(try quality.chooseManually(ceiling, now: 11) == ceiling, "The manual choice was not requested")
+                quality.rejectPending(now: 12)
+            } else {
+                quality.setLocalNetwork(false, now: 11)
+                quality.setLocalNetwork(true, now: 12)
+            }
+            for time in 13...14 {
+                try check(quality.observe(quiet, now: Double(time)) == nil, "Recovery skipped its three low-delay seconds")
+            }
+            try check(quality.observe(quiet, now: 15) == ceiling, "Stepwise recovery outlived a new route or manual choice")
         }
     }
 
@@ -103,28 +180,23 @@ func runMediaPathPolicyChecks() {
 
     run("Missing, inactive, invalid and intermediate local samples break continuous delay evidence") {
         let interruptions = [sample(local: true), sample(active: false, local: true, roundTrip: 200),
-                             sample(local: true, roundTrip: .nan), sample(local: true, roundTrip: 100),
+                             sample(local: true, roundTrip: .nan), sample(local: true, roundTrip: 60),
                              sample(local: true, roundTrip: 3)]
         for interruption in interruptions {
             var quality = try MediaQualityPolicy(hostDefault: .highest, now: 0)
             quality.setLocalNetwork(true, now: 0)
             let delayed = sample(local: true, roundTrip: 500)
-            for time in 1...4 { _ = quality.observe(delayed, now: Double(time)) }
-            try check(quality.pending == nil && quality.observe(interruption, now: 5) == nil,
-                      "An incomplete local delay run reduced quality")
-            for time in 6...9 {
-                try check(quality.observe(delayed, now: Double(time)) == nil, "Interrupted local delay evidence was retained")
-            }
-            try check(quality.observe(delayed, now: 10) != nil, "A new five-second local delay run did not reduce quality")
+            try check(quality.observe(delayed, now: 1) == nil && quality.observe(interruption, now: 2) == nil
+                      && quality.pending == nil, "An incomplete local delay run reduced quality")
+            try check(quality.observe(delayed, now: 3) == nil, "Interrupted local delay evidence was retained")
+            try check(quality.observe(delayed, now: 4) != nil, "A new two-second local delay run did not reduce quality")
         }
         var gap = try MediaQualityPolicy(hostDefault: .highest, now: 0)
         gap.setLocalNetwork(true, now: 0)
-        for time in 1...4 { _ = gap.observe(sample(local: true, roundTrip: 200), now: Double(time)) }
-        for time in 10...13 {
-            try check(gap.observe(sample(local: true, roundTrip: 200), now: Double(time)) == nil,
-                      "A sampling gap completed an old local delay run")
-        }
-        try check(gap.observe(sample(local: true, roundTrip: 200), now: 14) != nil, "Complete post-gap evidence did not reduce quality")
+        _ = gap.observe(sample(local: true, roundTrip: 200), now: 1)
+        try check(gap.observe(sample(local: true, roundTrip: 200), now: 10) == nil,
+                  "A sampling gap completed an old local delay run")
+        try check(gap.observe(sample(local: true, roundTrip: 200), now: 11) != nil, "Complete post-gap evidence did not reduce quality")
     }
 
     run("Quiet or unmeasured local windows cannot accumulate recovery") {
@@ -148,28 +220,26 @@ func runMediaPathPolicyChecks() {
         var quality = try MediaQualityPolicy(hostDefault: .highest, now: 0)
         quality.setLocalNetwork(true, now: 0)
         let delayed = sample(local: true, roundTrip: 200)
-        for time in 1...4 { _ = quality.observe(delayed, now: Double(time)) }
-        _ = quality.observe(sample(), now: 5)
+        _ = quality.observe(delayed, now: 1)
+        _ = quality.observe(sample(), now: 2)
         try check(!quality.isLocalNetwork, "The current sample did not leave local mode")
-        for time in 6...10 {
+        for time in 3...4 {
             try check(quality.observe(delayed, now: Double(time)) == nil, "A route change reused previous delay evidence")
         }
-        guard let reduction = quality.observe(delayed, now: 11) else { throw CheckFailure("New local route did not complete observation") }
-        quality.setLocalNetwork(false, now: 12)
-        quality.setLocalNetwork(true, now: 13)
-        for time in 14...20 {
+        guard let reduction = quality.observe(delayed, now: 5) else { throw CheckFailure("New local route did not complete observation") }
+        quality.setLocalNetwork(false, now: 6)
+        quality.setLocalNetwork(true, now: 7)
+        for time in 8...14 {
             try check(quality.observe(delayed, now: Double(time)) == nil && quality.pending == reduction,
                       "A pending settings change was overwritten")
         }
-        quality.rejectPending(now: 20)
-        try quality.synchronizeApplied(.highest, now: 20)
-        for time in 21...24 {
-            try check(quality.observe(delayed, now: Double(time)) == nil, "Failed requests retained delay evidence")
-        }
-        try check(quality.observe(delayed, now: 25) == reduction, "Failed local reduction could not be retried after fresh evidence")
-        _ = quality.confirmApplied(reduction, now: 25)
-        quality.setLocalNetwork(false, now: 26)
-        try check(quality.reduceLoad(for: .encoder, computeMilliseconds: 25, now: 28) != nil,
+        quality.rejectPending(now: 14)
+        try quality.synchronizeApplied(.highest, now: 14)
+        try check(quality.observe(delayed, now: 15) == nil, "Failed requests retained delay evidence")
+        try check(quality.observe(delayed, now: 16) == reduction, "Failed local reduction could not be retried after fresh evidence")
+        _ = quality.confirmApplied(reduction, now: 16)
+        quality.setLocalNetwork(false, now: 17)
+        try check(quality.reduceLoad(for: .encoder, computeMilliseconds: 25, now: 19) != nil,
                   "Leaving the local route disabled the existing nonlocal codec policy")
     }
 

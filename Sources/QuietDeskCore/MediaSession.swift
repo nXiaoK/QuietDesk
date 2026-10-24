@@ -1233,9 +1233,10 @@ public final class MediaSession: @unchecked Sendable {
                 collectLoss()
                 let duration = min(5, now - sampleStartedAt)
                 let localNetwork = reportLocalNetwork()
-                // Control heartbeats arrive every five seconds. Never reuse an old route's UDP RTT,
-                // or the initial 10 ms estimate, as evidence that the current video path is healthy.
-                var measuredRoundTrip = controlRoundTrip.flatMap { now - $0.at < 6 ? $0.milliseconds : nil }
+                // Control heartbeats arrive every five seconds; each counts only in the window it arrived in, so
+                // one delayed heartbeat cannot stand for several windows of local delay. Never reuse an old route's
+                // UDP RTT, or the initial 10 ms estimate, as evidence that the current video path is healthy.
+                var measuredRoundTrip = controlRoundTrip.flatMap { $0.at >= sampleStartedAt ? $0.milliseconds : nil }
                 if (transaction?.path ?? active?.path) == .udp, udpVerified, lastPongAt > 0, now - lastPongAt < 1 {
                     measuredRoundTrip = max(measuredRoundTrip ?? 0, roundTrip * 1_000)
                 }

@@ -234,17 +234,20 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
         } else {
             try require(roundTripSamples.get().allSatisfy { $0.roundTripMilliseconds == nil },
                         "Initial TCP RTT used an unmeasured default estimate")
+            let before=roundTripSamples.get().count
             viewerSession.get()?.recordControlRoundTrip(milliseconds:200)
             for invalid in [-1.0, .nan, .infinity, 60_001] { viewerSession.get()?.recordControlRoundTrip(milliseconds:invalid) }
-            try wait(roundTripSampled,"A measured control RTT did not reach the media sample",seconds:3)
-            try require(roundTripSamples.get().last?.roundTripMilliseconds == 200,
-                        "Valid control RTT was lost or overwritten by an invalid observation")
-            let deadline=SessionClock.now+7
-            while roundTripSamples.get().last?.roundTripMilliseconds != nil, SessionClock.now<deadline {
-                try wait(roundTripSampled,"RTT observation stopped before expiry",seconds:2)
+            func counted() -> Int? { roundTripSamples.get().indices.first { $0 >= before && roundTripSamples.get()[$0].roundTripMilliseconds == 200 } }
+            let deadline=SessionClock.now+5
+            while counted().map({ roundTripSamples.get().count <= $0+1 }) ?? true, SessionClock.now<deadline {
+                try wait(roundTripSampled,"RTT observation stopped before the window after the control RTT",seconds:2)
             }
-            try require(roundTripSamples.get().last?.roundTripMilliseconds == nil,
-                        "Control RTT remained usable more than six seconds after its observation")
+            let samples=roundTripSamples.get()
+            guard let index=counted() else { throw Failure(message:"Valid control RTT was lost or overwritten by an invalid observation") }
+            try require(samples[before..<index].allSatisfy { $0.roundTripMilliseconds == nil },
+                        "An invalid control RTT reached the media sample")
+            try require(samples.count>index+1 && samples[index+1].roundTripMilliseconds == nil,
+                        "One control RTT counted in more than the sample window it arrived in")
         }
     }
     if delayedDecode {
@@ -436,7 +439,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
   }
   if !CommandLine.arguments.contains("--skip-network") {
    run("Local-network classification excludes loopback UDP and reports authenticated RTT") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,inspectRoundTrip:true) }
-   run("Local-network classification excludes loopback TCP and expires measured control RTT") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false,inspectRoundTrip:true) }
+   run("Local-network classification excludes loopback TCP and counts a control RTT only in its own window") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false,inspectRoundTrip:true) }
    run("Local-network classification excludes framed shared loopback TCP") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false) }
    run("Optional onPrepareStream binds each exact generation before candidate video and commit") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true,prepareHook:.boundStream) }
    run("Absent onPrepareStream preserves default onPrepareRecovery for candidates and configuration hold") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true,prepareHook:.fallback) }

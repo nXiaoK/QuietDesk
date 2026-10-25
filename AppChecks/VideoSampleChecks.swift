@@ -149,6 +149,16 @@ private struct VideoSampleChecks {
             try require(try decodes(h264[1]), "A rejected frame broke the running H.264 stream")
         }
 
+        run("Encoders at 60 fps and above leave VideoToolbox real-time throttling off; lower rates keep it") {
+            for codec in VideoEncoder.hardwareHEVCAvailable ? [VideoCodec.h264, .hevc] : [.h264] {
+                for rate in [10, 15, 30, 60, 90, 120, 240] {
+                    let encoder = try VideoEncoder(width: 320, height: 180, settings: .init(framesPerSecond: rate), codec: codec)
+                    defer { encoder.stop() }
+                    try require(encoder.realTimeMode == (rate < 60), "\(codec) at \(rate) fps used real-time mode \(String(describing: encoder.realTimeMode))")
+                }
+            }
+        }
+
         run("CoreMedia directly references immutable storage and releases its owner with the block") {
             var block: CMBlockBuffer?
             weak var observed: NSData?

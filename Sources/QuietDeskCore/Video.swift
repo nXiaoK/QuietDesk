@@ -50,7 +50,8 @@ public final class VideoEncoder {
         }
         session = created
         do {
-            try set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
+            try set(kVTCompressionPropertyKey_RealTime,
+                    Self.usesRealTimeMode(framesPerSecond: settings.framesPerSecond) ? kCFBooleanTrue : kCFBooleanFalse)
             try set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
             try set(kVTCompressionPropertyKey_ProfileLevel,
                     codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel)
@@ -71,6 +72,18 @@ public final class VideoEncoder {
             session = nil
             throw error
         }
+    }
+
+    // Real-time mode lets VideoToolbox slow the encoder toward the expected rate to save energy. At 60 fps and above
+    // that throttle holds a native share well below the hardware's speed, and after a still screen the sparse capture
+    // timestamps can leave it slow while motion continues. Lower rates keep the energy saving.
+    static func usesRealTimeMode(framesPerSecond: Int) -> Bool { framesPerSecond < 60 }
+
+    var realTimeMode: Bool? {
+        guard let session else { return nil }
+        var value: Unmanaged<CFTypeRef>?
+        guard VTSessionCopyProperty(session, key: kVTCompressionPropertyKey_RealTime, allocator: nil, valueOut: &value) == noErr else { return nil }
+        return (value?.takeRetainedValue() as? NSNumber)?.boolValue
     }
 
     static func output(status: OSStatus, info: VTEncodeInfoFlags, sample: CMSampleBuffer?,

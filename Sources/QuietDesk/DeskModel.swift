@@ -62,6 +62,9 @@ final class DeskModel: ObservableObject {
         return connectionError
     }
     @Published var traffic = "0.00 Mbps"
+    /// What the current viewer connection has sent and received on all of its channels, for the full-screen status;
+    /// empty until the host's hello, and an automatic reconnect starts a new count like `connectedSince`.
+    @Published private(set) var sessionTraffic = ""
     let trafficHistory: TrafficHistoryFeed
     @Published private(set) var trafficHistoryStatus = "按网址/IP＋端口累计；旧版按设备统计单独保留。"
     @Published var frameRate = "0 fps"
@@ -2193,6 +2196,7 @@ final class DeskModel: ObservableObject {
             dataChannel?.configureVideo(canvas.makeVideoReceiver(diagnostics: performanceDiagnostics))
             connected = true
             connectedSince = Date()
+            sessionTraffic = peer.trafficMeter.snapshot().totals.runningTotalLabel
             working = false
             remoteName = hello.name
             reconnecting = false
@@ -3551,6 +3555,10 @@ final class DeskModel: ObservableObject {
                 let frameRate = String(format: "%.0f fps", Double(metrics.frames) / seconds)
                 if self.traffic != traffic { self.traffic = traffic }
                 if self.frameRate != frameRate { self.frameRate = frameRate }
+                if self.mode == .viewer, self.connected, let peer = self.peer {
+                    let sessionTraffic = peer.trafficMeter.snapshot().totals.runningTotalLabel
+                    if self.sessionTraffic != sessionTraffic { self.sessionTraffic = sessionTraffic }
+                }
                 if let measured = self.viewerSession.lastLatencyAt, SessionClock.now - measured > 15, self.latency != "— ms" {
                     self.latency = "— ms"
                 }
@@ -3696,6 +3704,7 @@ final class DeskModel: ObservableObject {
         peer = nil
         connected = false
         connectedSince = nil
+        sessionTraffic = ""
         working = false
         controlling = false
         canControl = false

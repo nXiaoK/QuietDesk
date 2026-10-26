@@ -139,6 +139,18 @@ func runTrafficChecks() {
                   "The displayed combined total overflowed")
     }
 
+    run("Running totals combine both directions with fixed decimals and step up instead of printing 1000") {
+        let cases: [(sent: UInt64, received: UInt64, label: String)] = [
+            (0, 0, "0 B"), (400, 599, "999 B"), (1_000, 0, "1.0 KB"), (0, 123_456, "123.5 KB"), (2_000, 0, "2.0 KB"),
+            (999_949, 0, "999.9 KB"), (999_950, 0, "1.0 MB"), (100_000_000, 23_400_000, "123.4 MB"),
+            (999_950_000, 0, "1.00 GB"), (12_345_678_901, 0, "12.35 GB"), (999_995_000_000, 0, "1.00 TB"),
+            (.max, .max, "36.89 EB")]
+        for value in cases {
+            let label = TrafficTotals(sentBytes: value.sent, receivedBytes: value.received).runningTotalLabel
+            try check(label == value.label, "\(value.sent) sent and \(value.received) received read \(label), not \(value.label)")
+        }
+    }
+
     if !CommandLine.arguments.contains("--skip-network") {
         run("Directional meters count exact framed application bytes over authenticated loopback") {
             let key = try PairingKey.generate()

@@ -78,6 +78,20 @@ public struct TrafficTotals: Codable, Equatable, Sendable {
         guard !sent.overflow, !received.overflow else { throw DeskError.invalid("流量计数超出可保存的整数范围") }
         sentBytes = sent.partialValue; receivedBytes = received.partialValue
     }
+
+    /// Sent plus received for a count that keeps growing on screen: 1 KB = 1000 bytes as in the history sheet,
+    /// with fixed decimals per unit (none for B, one for KB and MB, two from GB) so the text keeps its width.
+    public var runningTotalLabel: String {
+        let units = ["B", "KB", "MB", "GB", "TB", "PB", "EB"]
+        func decimals(_ unit: Int) -> Int { unit == 0 ? 0 : unit < 3 ? 1 : 2 }
+        var amount = Double(sentBytes) + Double(receivedBytes), unit = 0
+        // Step up before rounding would print 1000 of the smaller unit.
+        while unit < units.count - 1, amount >= 1000 - 0.5 / pow(10, Double(decimals(unit))) {
+            amount /= 1000
+            unit += 1
+        }
+        return String(format: "%.\(decimals(unit))f %@", amount, units[unit])
+    }
 }
 
 public struct TrafficSnapshot: Equatable, Sendable {

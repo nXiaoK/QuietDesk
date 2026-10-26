@@ -483,6 +483,7 @@ struct DeskView: View {
             }
             Text(model.frameRate)
             Text(model.traffic)
+            if !model.sessionTraffic.isEmpty { Text("累计 " + model.sessionTraffic) }
             Text(model.latency)
             if !model.mediaLoss.isEmpty {
                 if model.mediaLossHigh { Text(model.mediaLoss).foregroundStyle(Color.red) } else { Text(model.mediaLoss) }

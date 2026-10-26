@@ -322,8 +322,8 @@ struct DeskView: View {
         }
         .overlay {
             if immersive && model.showFullScreenStatistics {
-                FullScreenStatusOverlay(position: $model.fullScreenStatusPosition, opacity: model.fullScreenStatusOpacity,
-                    backdrop: { [canvas = model.canvas] in canvas.backdropLuminance(in: $0, container: $1) },
+                FullScreenStatusOverlay(position: $model.fullScreenStatusPosition,
+                    backgroundOpacity: model.fullScreenStatusBackgroundOpacity,
                     beginDrag: { model.canvas.releaseControl() }) {
                     fullScreenMetrics
                 }

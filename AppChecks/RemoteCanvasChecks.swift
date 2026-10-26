@@ -426,8 +426,7 @@ private struct RemoteCanvasChecks {
             canvas.onRelease = { releases += 1 }
             canvas.onInput = { inputs.append($0) }
             let hosting = NSHostingView(rootView: CanvasView(canvas: canvas).overlay {
-                FullScreenStatusOverlay(position: Binding(get: { position }, set: { position = $0 }), opacity: 0.6,
-                    backdrop: { canvas.backdropLuminance(in: $0, container: $1) },
+                FullScreenStatusOverlay(position: Binding(get: { position }, set: { position = $0 }), backgroundOpacity: 0.6,
                     beginDrag: { canvas.releaseControl() }) {
                     Text("0:49"); Text("中继 UDP 视频"); Text("30 fps"); Text("14 ms"); Text("1920 × 1246")
                 }
@@ -485,6 +484,58 @@ private struct RemoteCanvasChecks {
             try require(position == savedPosition && abs(cancelledOrigin.x - savedOrigin.x) < 1
                         && abs(cancelledOrigin.y - savedOrigin.y) < 1 && inputs.isEmpty,
                         "Losing window focus retained or saved an unfinished drag")
+        }
+
+        run("Status text stays white while only its background follows the chosen opacity") {
+            // Rendered over a white picture, where the earlier brightness-following text turned black.
+            @MainActor func render(_ opacity: Double?) throws -> (background: Double, brightest: Double) {
+                let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200), styleMask: .borderless,
+                                      backing: .buffered, defer: false)
+                window.isReleasedWhenClosed = false
+                defer { window.close() }
+                let hosting = NSHostingView(rootView: ZStack {
+                    Color.white
+                    FullScreenStatusOverlay(position: .constant(nil), backgroundOpacity: opacity, beginDrag: {}) {
+                        Text("0:49"); Text("30 fps"); Text("14 ms")
+                    }
+                }.frame(width: 300, height: 200))
+                window.contentView = hosting
+                for _ in 0..<3 {
+                    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+                    hosting.layoutSubtreeIfNeeded()
+                }
+                func dragView(_ view: NSView) -> StatusDragView? {
+                    if let view = view as? StatusDragView { return view }
+                    return view.subviews.lazy.compactMap { dragView($0) }.first
+                }
+                guard let target = dragView(hosting), let bitmap = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) else {
+                    throw CanvasCheckFailure("Status or its bitmap was not available")
+                }
+                hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+                // Bitmap rows run from the top; the box is converted to match whichever way the view is flipped.
+                let box = target.convert(target.bounds, to: hosting)
+                let top = hosting.isFlipped ? box.minY : hosting.bounds.height - box.maxY
+                let scale = CGFloat(bitmap.pixelsWide) / hosting.bounds.width
+                // Read in the bitmap's own space, where the background was blended; converting would move mid-greys.
+                func brightness(_ x: CGFloat, _ y: CGFloat) -> Double {
+                    guard let color = bitmap.colorAt(x: Int(x * scale), y: Int(y * scale)),
+                          color.type == .componentBased, color.colorSpace.colorSpaceModel == .rgb else { return -1 }
+                    return Double(color.redComponent)
+                }
+                // The left padding is clear of the text and its shadow; the rest of the box holds the text.
+                var brightest = 0.0
+                for x in stride(from: box.minX + 6, to: box.maxX - 6, by: 0.5) {
+                    for y in stride(from: top + 4, to: top + box.height - 4, by: 0.5) { brightest = max(brightest, brightness(x, y)) }
+                }
+                return (brightness(box.minX + 2, top + box.height / 2), brightest)
+            }
+            let opaque = try render(1), chosen = try render(0.4), clear = try render(0), standard = try render(nil)
+            try require(opaque.background < 0.05 && opaque.brightest > 0.9, "An opaque background did not show white text on black: \(opaque)")
+            try require(abs(chosen.background - 0.6) < 0.05 && chosen.brightest > 0.95,
+                        "A 60% transparent background or its white text was wrong over white: \(chosen)")
+            try require(clear.background > 0.95, "A fully transparent background still darkened the picture: \(clear)")
+            try require(abs(standard.background - (1 - FullScreenStatusPlacement.defaultBackgroundOpacity)) < 0.05,
+                        "The default background opacity was not applied: \(standard)")
         }
 
         run("Keyboard routing follows the actual first responder and rejects other windows") {
@@ -1005,49 +1056,6 @@ private struct RemoteCanvasChecks {
             try require(captures == 1 && inputs.count == 1 && inputs[0].keyCode == 1, "Plain ⌘S no longer reaches the remote Mac")
             canvas.reset()
             try require(canvas.displayedFrame == nil, "A capturable frame outlived the session")
-        }
-
-        run("Status brightness reads the frame on screen under the status and counts black bands as black") {
-            let display = CanvasDisplayLayerProbe()
-            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300), videoLayer: display)
-            let decoder = CanvasDecoderProbe()
-            let receiver = canvas.makeMediaReceiver(makeDecoder: { _ in decoder })
-            defer { receiver.stop(); canvas.reset() }
-            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
-            let corner = CGRect(x: 300, y: 200, width: 90, height: 90), screen = CGSize(width: 400, height: 300)
-            try require(canvas.backdropLuminance(in: corner, container: screen) == nil, "Brightness was reported without a frame")
-            receiver.receive(try mediaFrame(stream: stream, id: 1, keyFrame: true)) { _ in }
-            decoder.finish(1, .success(try decoderLikePixel(width: 64, height: 48, luma: 235)))
-            try require(receiver.commit(stream: stream), "Decoded frame did not commit")
-            drainCanvasDisplay()
-            guard let white = canvas.backdropLuminance(in: corner, container: screen) else { throw CanvasCheckFailure("White frame was not read") }
-            try require(abs(white - 1) < 0.001, "Video-range white was not read as full brightness: \(white)")
-            // A 400 × 400 screen fits the 4:3 picture between 50-point bands; this strip is half picture, half band.
-            guard let straddling = canvas.backdropLuminance(in: CGRect(x: 0, y: 330, width: 400, height: 40),
-                                                             container: CGSize(width: 400, height: 400)),
-                  let band = canvas.backdropLuminance(in: CGRect(x: 0, y: 355, width: 400, height: 40),
-                                                      container: CGSize(width: 400, height: 400)) else {
-                throw CanvasCheckFailure("Banded areas were not read")
-            }
-            try require(abs(straddling - 0.5) < 0.001 && band == 0, "Black bands were not counted as black: \(straddling), \(band)")
-            receiver.receive(try mediaFrame(stream: stream, id: 2, keyFrame: false)) { _ in }
-            decoder.finish(2, .success(try decoderLikePixel(width: 64, height: 48, luma: 16)))
-            drainCanvasDisplay()
-            try require(canvas.backdropLuminance(in: corner, container: screen) == 0, "Video-range black was not read as black")
-            var bgra: CVPixelBuffer?
-            guard CVPixelBufferCreate(nil, 64, 48, kCVPixelFormatType_32BGRA, nil, &bgra) == kCVReturnSuccess, let bgra else {
-                throw CanvasCheckFailure("Could not create a synthetic BGRA frame")
-            }
-            CVPixelBufferLockBaseAddress(bgra, [])
-            memset(CVPixelBufferGetBaseAddress(bgra), 255, CVPixelBufferGetBytesPerRow(bgra) * 48)
-            CVPixelBufferUnlockBaseAddress(bgra, [])
-            receiver.receive(try mediaFrame(stream: stream, id: 3, keyFrame: false)) { _ in }
-            decoder.finish(3, .success(bgra))
-            drainCanvasDisplay()
-            guard let rgbWhite = canvas.backdropLuminance(in: corner, container: screen) else { throw CanvasCheckFailure("BGRA frame was not read") }
-            try require(abs(rgbWhite - 1) < 0.001, "BGRA white was not read as full brightness: \(rgbWhite)")
-            canvas.reset()
-            try require(canvas.backdropLuminance(in: corner, container: screen) == nil, "Brightness outlived the session")
         }
 
         run("Decode time leaves out the wait behind earlier frames of a burst") {

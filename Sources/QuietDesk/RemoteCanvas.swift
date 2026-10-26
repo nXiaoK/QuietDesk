@@ -624,52 +624,6 @@ final class RemoteCanvas: NSView {
         diagnostics?.record(.displayEnqueue, since: enqueueStarted, kind: .video, identifier: received.sequence.map(UInt64.init))
     }
 
-    /// Mean brightness (0–1) of what is shown under `rect`, given in a view of `container` size laid over this
-    /// canvas; the black bands beside the fitted picture count as black. Nil without a frame or for a pixel format
-    /// it cannot read. Reads a few dozen luma samples from the frame on screen, which is never written again.
-    func backdropLuminance(in rect: CGRect, container: CGSize) -> Double? {
-        guard let frame = displayedFrame else { return nil }
-        let samples = FullScreenStatusContrast.samplePoints(status: rect, container: container,
-            picture: (CVPixelBufferGetWidth(frame), CVPixelBufferGetHeight(frame)))
-        let total = samples.pixels.count + samples.outside
-        guard total > 0, let sum = Self.lumaSum(frame, at: samples.pixels) else { return nil }
-        return sum / Double(total)
-    }
-
-    private static func lumaSum(_ frame: CVPixelBuffer, at pixels: [(x: Int, y: Int)]) -> Double? {
-        guard !pixels.isEmpty else { return 0 }
-        guard CVPixelBufferLockBaseAddress(frame, .readOnly) == kCVReturnSuccess else { return nil }
-        defer { CVPixelBufferUnlockBaseAddress(frame, .readOnly) }
-        let format = CVPixelBufferGetPixelFormatType(frame)
-        switch format {
-        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
-            guard let base = CVPixelBufferGetBaseAddressOfPlane(frame, 0) else { return nil }
-            let row = CVPixelBufferGetBytesPerRowOfPlane(frame, 0)
-            let width = CVPixelBufferGetWidthOfPlane(frame, 0), height = CVPixelBufferGetHeightOfPlane(frame, 0)
-            let luma = base.assumingMemoryBound(to: UInt8.self)
-            let videoRange = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            var sum = 0.0
-            for pixel in pixels where pixel.x < width && pixel.y < height {
-                let value = Double(luma[pixel.y * row + pixel.x])
-                sum += videoRange ? min(1, max(0, (value - 16) / 219)) : value / 255
-            }
-            return sum
-        case kCVPixelFormatType_32BGRA:
-            guard let base = CVPixelBufferGetBaseAddress(frame) else { return nil }
-            let row = CVPixelBufferGetBytesPerRow(frame)
-            let width = CVPixelBufferGetWidth(frame), height = CVPixelBufferGetHeight(frame)
-            let bytes = base.assumingMemoryBound(to: UInt8.self)
-            var sum = 0.0
-            for pixel in pixels where pixel.x < width && pixel.y < height {
-                let offset = pixel.y * row + pixel.x * 4
-                sum += (0.0722 * Double(bytes[offset]) + 0.7152 * Double(bytes[offset + 1]) + 0.2126 * Double(bytes[offset + 2])) / 255
-            }
-            return sum
-        default:
-            return nil
-        }
-    }
-
     func reset() {
         cancelPointerMoves()
         cursorState = CursorPresentationState(); cursorImage = nil; localCursor = .arrow

@@ -2,20 +2,15 @@ import AppKit
 import SwiftUI
 import QuietDeskCore
 
-/// One value per line, drawn straight over the remote picture in a colour that follows its brightness.
+/// One value per line in white on a rounded black background; the viewer sets how transparent the background is.
 struct FullScreenStatusOverlay<Content: View>: View {
     @Binding var position: CGPoint?
-    let opacity: Double?
-    /// Brightness (0–1) of the remote picture under a rectangle of this overlay; nil keeps the current colour.
-    let backdrop: (CGRect, CGSize) -> Double?
+    let backgroundOpacity: Double?
     let beginDrag: () -> Void
     @ViewBuilder let content: Content
     @State private var statusSize: CGSize = .zero
     @State private var dragOrigin: CGPoint?
     @State private var translation: CGSize = .zero
-    @State private var darkText = false
-    // Sampling state lives outside SwiftUI state so a sample that keeps the colour does not redraw.
-    @State private var contrast = ContrastSampler()
 
     var body: some View {
         GeometryReader { geometry in
@@ -24,17 +19,20 @@ struct FullScreenStatusOverlay<Content: View>: View {
             let proposed = dragOrigin.map { CGPoint(x: $0.x + translation.width, y: $0.y + translation.height) } ?? saved
             let normalized = FullScreenStatusPlacement.position(for: proposed, container: geometry.size, status: statusSize)
             let origin = FullScreenStatusPlacement.origin(for: normalized, container: geometry.size, status: statusSize)
-            let ink: Color = darkText ? .black : .white
+            let background = backgroundOpacity.flatMap { $0.isFinite ? min(1, max(0, $0)) : nil }
+                ?? FullScreenStatusPlacement.defaultBackgroundOpacity
             VStack(alignment: .leading, spacing: 1) { content }
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: 11, weight: .semibold))
                 .monospacedDigit()
                 .lineLimit(1)
-                .foregroundStyle(ink)
-                .shadow(color: (darkText ? Color.white : Color.black).opacity(0.6), radius: 1)
+                .foregroundStyle(.white)
+                // Fades in as the background clears, so the text stays readable over a bright picture.
+                .shadow(color: .black.opacity(0.6 * (1 - background)), radius: 1)
                 .fixedSize()
-                .padding(4)
+                .padding(.horizontal, 6).padding(.vertical, 4)
                 .background {
-                    if dragOrigin != nil { RoundedRectangle(cornerRadius: 8).strokeBorder(ink.opacity(0.5)) }
+                    RoundedRectangle(cornerRadius: 6).fill(.black.opacity(background))
+                    if dragOrigin != nil { RoundedRectangle(cornerRadius: 6).strokeBorder(.white.opacity(0.5)) }
                 }
                 // Measured directly: a size preference would be reset by the drag target, a sibling that reports
                 // the key's default, which left every position computed for a zero-sized status.
@@ -59,28 +57,10 @@ struct FullScreenStatusOverlay<Content: View>: View {
                     })
                 }
                 // The corner position needs the measured size; stay hidden for the first pass instead of flashing off-screen.
-                .opacity(statusSize == .zero ? 0
-                         : opacity.flatMap { $0.isFinite ? min(1, max(0.1, $0)) : nil } ?? FullScreenStatusPlacement.defaultOpacity)
+                .opacity(statusSize == .zero ? 0 : 1)
                 .offset(x: origin.x, y: origin.y)
-                .animation(.easeInOut(duration: 0.2), value: darkText)
-                .task(id: BackdropArea(rect: CGRect(origin: origin, size: statusSize), container: geometry.size)) {
-                    let rect = CGRect(origin: origin, size: statusSize), container = geometry.size
-                    while !Task.isCancelled {
-                        if contrast.state.observe(backdrop(rect, container)) { darkText = contrast.state.darkText }
-                        try? await Task.sleep(for: .milliseconds(500))
-                    }
-                }
         }
     }
-}
-
-private final class ContrastSampler {
-    var state = FullScreenStatusContrast()
-}
-
-private struct BackdropArea: Equatable {
-    let rect: CGRect
-    let container: CGSize
 }
 
 private struct StatusDragTarget: NSViewRepresentable {
@@ -143,7 +123,7 @@ final class StatusDragView: NSView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        toolTip = "拖动连接状态可调整位置；在控制与设置中调整透明度或恢复自动位置"
+        toolTip = "拖动连接状态可调整位置；在控制与设置中调整背景透明度或恢复自动位置"
         setAccessibilityLabel("连接状态，可拖动调整位置")
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }

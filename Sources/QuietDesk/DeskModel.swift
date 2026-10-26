@@ -149,13 +149,15 @@ final class DeskModel: ObservableObject {
             } else { UserDefaults.standard.removeObject(forKey: Self.fullScreenStatusPositionKey) }
         }
     }
-    // Missing means the default opacity of the text-only status.
-    @Published var fullScreenStatusOpacity = UserDefaults.standard.object(forKey: "fullScreenStatusOpacity") as? Double {
-        didSet { UserDefaults.standard.set(fullScreenStatusOpacity, forKey: "fullScreenStatusOpacity") }
+    // Opacity of the black background behind the white status text; missing means the default. The text opacity
+    // saved before the background existed ("fullScreenStatusOpacity") is left for older versions and not reused.
+    private static let fullScreenStatusBackgroundOpacityKey = "fullScreenStatusBackgroundOpacity"
+    @Published var fullScreenStatusBackgroundOpacity = UserDefaults.standard.object(forKey: DeskModel.fullScreenStatusBackgroundOpacityKey) as? Double {
+        didSet { UserDefaults.standard.set(fullScreenStatusBackgroundOpacity, forKey: Self.fullScreenStatusBackgroundOpacityKey) }
     }
-    var fullScreenStatusEffectiveOpacity: Double {
-        if let value = fullScreenStatusOpacity, value.isFinite { return min(1, max(0.1, value)) }
-        return FullScreenStatusPlacement.defaultOpacity
+    var fullScreenStatusEffectiveBackgroundOpacity: Double {
+        if let value = fullScreenStatusBackgroundOpacity, value.isFinite { return min(1, max(0, value)) }
+        return FullScreenStatusPlacement.defaultBackgroundOpacity
     }
     @Published var resolution = ""
     @Published var remoteName = ""

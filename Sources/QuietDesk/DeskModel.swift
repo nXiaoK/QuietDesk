@@ -1184,7 +1184,7 @@ final class DeskModel: ObservableObject {
                 host.captureTask = Task { [weak self, weak candidate, weak host] in
                     await cleanup?.value
                     guard let self, let candidate, let host, self.hostSession === host else { return }
-                    defer { host.startupDeadline.cancel() }
+                    defer { host.startupDeadline.cancel(); host.captureTask = nil }
                     do {
                         guard self.generation == token, self.peer === candidate, self.hostSession === host, !Task.isCancelled else { return }
                         self.installHostSessionEffects(for: candidate)

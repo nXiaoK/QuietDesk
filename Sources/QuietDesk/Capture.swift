@@ -307,6 +307,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     var onDiagnosticError: ((Error) -> Void)?
     var onUserStop: (() -> Void)?
     private var stream: SCStream?
+    private var lifecycle: CaptureLifecycle?
     private var encoder: VideoEncoder?
     private var encoderID = UUID()
     private var displayID: CGDirectDisplayID?
@@ -525,12 +526,14 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     func start(_ capture: CapturePlan) async throws {
+        try Task.checkCancellation()
         let width = capture.width, height = capture.height, settings = capture.settings
         let id = UUID()
         let encoder = try makeEncoder(width: width, height: height, settings: settings, id: id)
         let stream = SCStream(filter: capture.filter,
             configuration: Self.configuration(width: width, height: height, settings: settings), delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        let lifecycle = CaptureLifecycle(stream: stream)
         queue.sync {
             self.encoder = encoder
             encoderHardwareChecked = false
@@ -541,6 +544,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             encodingTimingLock.withLock { encodingStarted.removeAll(); encodeTiming.cancel() }
             lastCaptureDiagnostics = nil
             self.stream = stream
+            self.lifecycle = lifecycle
             excludedWindowIDs = []
             displayID = capture.displayID
             outputWidth = width
@@ -563,7 +567,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             watchdog.resume()
         }
         do {
-            try await stream.startCapture()
+            try await lifecycle.start()
+            try Task.checkCancellation()
             let current = queue.sync { () -> Bool in
                 guard self.stream === stream, running else { return false }
                 captureStarted = true
@@ -571,7 +576,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             }
             guard current else {
                 try? stream.removeStreamOutput(self, type: .screen)
-                try? await stream.stopCapture()
+                await lifecycle.stop()
                 throw CancellationError()
             }
         } catch { await stop(); throw error }
@@ -1018,7 +1023,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     func stop() async {
-        let old: SCStream? = queue.sync {
+        let old: CaptureLifecycle? = queue.sync {
             running = false
             captureStarted = false
             reconfiguring = false
@@ -1045,16 +1050,18 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             watchdog = nil
             encoder?.stop()
             encoder = nil
-            let old = stream
+            let old = lifecycle
+            if let stream { try? stream.removeStreamOutput(self, type: .screen) }
             stream = nil
+            lifecycle = nil
             return old
         }
-        try? await old?.stopCapture()
+        await old?.stop()
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         queue.async { [weak self] in
-            guard let self, self.running else { return }
+            guard let self, self.running, self.stream === stream else { return }
             if let waiter = self.cursorFrameWaiter { self.finishCursorFrameWaiter(waiter.id, result: .failure(error)) }
             if (error as NSError).domain == SCStreamErrorDomain,
                (error as NSError).code == SCStreamError.Code.userStopped.rawValue {

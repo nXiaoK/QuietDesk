@@ -27,7 +27,9 @@ public final class RelayTLSChannel: @unchecked Sendable {
     private var ready = false
     private var closed = false
     private var handshakeID: UUID?
+    private var handshakeDeadline = 0.0
     private var readID: UUID?
+    private var readDeadline = 0.0
     private var readCompletion: ((Result<RelayMessage, Error>) -> Void)?
     private var local: NWConnection?
     private var raw = false
@@ -94,11 +96,13 @@ public final class RelayTLSChannel: @unchecked Sendable {
             guard !started, !closed else { return }
             started = true
             let id = UUID(); handshakeID = id
+            // A suspended process cannot answer a wall-clock timer, so the deadline follows time the process runs.
+            handshakeDeadline = SessionClock.running + 10
             connection.stateUpdateHandler = { [weak self] state in
                 guard let self, !self.closed else { return }
                 switch state {
                 case .ready:
-                    self.ready = true; self.handshakeID = nil; self.onReady?()
+                    self.ready = true; self.handshakeID = nil; self.handshakeDeadline = 0; self.onReady?()
                 case .failed(let error):
                     self.finish(Self.failure(for: error))
                 case .waiting(let error):
@@ -108,10 +112,18 @@ public final class RelayTLSChannel: @unchecked Sendable {
                 }
             }
             connection.start(queue: queue)
-            queue.asyncAfter(deadline: .now() + 10) { [weak self] in
-                guard let self, self.handshakeID == id else { return }
-                self.finish(RelayTransportError.timeout)
-            }
+            arm(handshake: id)
+        }
+    }
+
+    /// Re-checks a deadline against time the process actually ran, so sleep or App Nap cannot expire it.
+    private func arm(handshake id: UUID) {
+        let remaining = handshakeDeadline - SessionClock.running
+        guard handshakeID == id, remaining.isFinite else { return }
+        queue.asyncAfter(deadline: .now() + min(5, max(0.05, remaining))) { [weak self] in
+            guard let self, self.handshakeID == id else { return }
+            if SessionClock.running >= self.handshakeDeadline { self.finish(RelayTransportError.timeout) }
+            else { self.arm(handshake: id) }
         }
     }
 
@@ -149,6 +161,7 @@ public final class RelayTLSChannel: @unchecked Sendable {
                 completion(.failure(RelayTransportError.network)); return
             }
             let id = UUID(); readID = id; readCompletion = completion
+            readDeadline = SessionClock.running + timeout
             readExactly(4, id: id) { [weak self] prefix in
                 guard let self else { return }
                 do {
@@ -159,16 +172,23 @@ public final class RelayTLSChannel: @unchecked Sendable {
                         guard let self, self.readID == id else { return }
                         do {
                             let message = try RelayMessage.decode(body)
-                            let callback = self.readCompletion; self.readCompletion = nil; self.readID = nil
+                            let callback = self.readCompletion; self.readCompletion = nil; self.readID = nil; self.readDeadline = 0
                             callback?(.success(message))
                         } catch { self.finish(RelayServiceError.invalid) }
                     }
                 } catch { self.finish(RelayServiceError.invalid) }
             }
-            queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
-                guard let self, self.readID == id else { return }
-                self.finish(RelayTransportError.timeout)
-            }
+            arm(read: id)
+        }
+    }
+
+    private func arm(read id: UUID) {
+        let remaining = readDeadline - SessionClock.running
+        guard readID == id, remaining.isFinite else { return }
+        queue.asyncAfter(deadline: .now() + min(5, max(0.05, remaining))) { [weak self] in
+            guard let self, self.readID == id else { return }
+            if SessionClock.running >= self.readDeadline { self.finish(RelayTransportError.timeout) }
+            else { self.arm(read: id) }
         }
     }
 
@@ -222,7 +242,7 @@ public final class RelayTLSChannel: @unchecked Sendable {
 
     private func finish(_ error: Error) {
         guard !closed else { return }
-        closed = true; ready = false; handshakeID = nil; readID = nil
+        closed = true; ready = false; handshakeID = nil; handshakeDeadline = 0; readID = nil; readDeadline = 0
         credit.withLock { creditClosed = true }
         connection.stateUpdateHandler = nil; connection.cancel()
         local?.stateUpdateHandler = nil; local?.cancel(); local = nil

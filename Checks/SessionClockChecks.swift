@@ -12,6 +12,9 @@ func runSessionClockChecks() {
         }
         Thread.sleep(forTimeInterval: 0.02)
         try check(SessionClock.now - first >= 0.015, "Session clock does not use elapsed seconds")
+        let running = SessionClock.running
+        Thread.sleep(forTimeInterval: 0.02)
+        try check(SessionClock.running - running >= 0.015, "Running clock does not advance while the process runs")
     }
 
     run("A simulated sleep gap expires idle and RTT state in the same continuous time domain") {
@@ -26,5 +29,14 @@ func runSessionClockChecks() {
         guard let current = probe.begin(at: afterWake) else { throw CheckFailure("No post-wake probe") }
         try check(probe.complete(old, at: afterWake + 0.01) == nil, "Old echo completed a post-wake probe")
         try check(probe.complete(current, at: afterWake + 0.02) != nil, "Fresh post-wake probe did not recover")
+    }
+
+    run("Running time advances with the process and stays finite") {
+        // Liveness uses this clock because it stops while the process is suspended; that property
+        // belongs to mach_absolute_time and cannot be exercised without actually suspending.
+        let first = SessionClock.running
+        Thread.sleep(forTimeInterval: 0.02)
+        let elapsed = SessionClock.running - first
+        try check(elapsed.isFinite && elapsed >= 0.015 && elapsed < 2, "Running clock did not track scheduled time")
     }
 }

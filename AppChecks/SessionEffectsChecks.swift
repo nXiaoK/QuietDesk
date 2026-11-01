@@ -1,4 +1,5 @@
 import CoreGraphics
+import Darwin
 import Foundation
 import QuietDeskCore
 
@@ -331,10 +332,100 @@ private struct FileBrightness: DisplayBrightnessIO {
     func setBrightness(_ value: Float) throws { try String(value).write(toFile: path, atomically: true, encoding: .utf8) }
 }
 
+// Exercises the real client pipes and exit handling without opening an audio device.
+private func runAudioCheckHelper() -> Bool {
+    guard let index = CommandLine.arguments.firstIndex(of: "--quietdesk-audio-check-helper"),
+          index + 1 < CommandLine.arguments.count else { return false }
+    let mode = CommandLine.arguments[index + 1]
+    if mode != "normal" { signal(SIGTERM, SIG_IGN) }
+    while let line = readLine(), let data = line.data(using: .utf8),
+          let request = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let id = request["id"] as? String, let command = request["command"] as? String {
+        var reply: [String: Any] = ["id": id, "muted": command == "mute", "snapshots": []]
+        if command == "restore", mode == "restoreError" { reply["error"] = "synthetic restore failure" }
+        guard var bytes = try? JSONSerialization.data(withJSONObject: reply) else { return true }
+        bytes.append(10)
+        try? FileHandle.standardOutput.write(contentsOf: bytes)
+        if command == "restore" {
+            if mode == "normal" { return true }
+            // Bound a failed regression run as well; the production client must kill us first.
+            alarm(15)
+            while true { pause() }
+        }
+    }
+    return true
+}
+
+@MainActor
+private func checkAudioClientExit() async -> (count: Int, failures: Int) {
+    var failures = 0
+    for mode in ["normal", "hangExit", "restoreError"] {
+        var processes: [Process] = []
+        let client = SessionAudioClient(makeProcess: {
+            let process = Process()
+            process.executableURL = Bundle.main.executableURL
+            process.arguments = ["--quietdesk-audio-check-helper", mode]
+            processes.append(process)
+            return process
+        })
+        do {
+            try await client.enable()
+            let started = ContinuousClock.now
+            let first = Task { @MainActor () -> String? in
+                do { try await client.restoreAndStop(); return nil }
+                catch { return error.localizedDescription }
+            }
+            let second = Task { @MainActor () -> String? in
+                do { try await client.restoreAndStop(); return nil }
+                catch { return error.localizedDescription }
+            }
+            let firstError = await first.value, secondError = await second.value
+            let elapsed = started.duration(to: .now)
+            guard let process = processes.first, !process.isRunning, !client.isMuted,
+                  firstError == secondError else { throw DeskError.invalid("Cleanup callers escaped before the helper ended or disagreed") }
+            switch mode {
+            case "normal":
+                guard firstError == nil, process.terminationReason == .exit, process.terminationStatus == 0 else {
+                    throw DeskError.invalid("Normal cleanup changed: \(firstError ?? "nil")")
+                }
+                try await client.enable()
+                try await Task.sleep(for: .milliseconds(4_200))
+                guard processes.count == 2, processes[1].isRunning, client.isMuted else {
+                    throw DeskError.invalid("An old exit deadline stopped a new helper")
+                }
+                try await client.restoreAndStop()
+            case "hangExit":
+                guard firstError?.contains("退出超时") == true,
+                      process.terminationReason == .uncaughtSignal, process.terminationStatus == SIGKILL,
+                      elapsed >= .seconds(6), elapsed < .seconds(12) else {
+                    throw DeskError.invalid("A successful reply left cleanup unbounded: \(firstError ?? "nil"), \(elapsed), signal \(process.terminationStatus)")
+                }
+            default:
+                guard firstError == "synthetic restore failure", process.terminationReason == .uncaughtSignal,
+                      process.terminationStatus == SIGKILL, elapsed < .seconds(6) else {
+                    throw DeskError.invalid("Restore failure lost its original cleanup path: \(firstError ?? "nil")")
+                }
+            }
+            print("PASS audio client \(mode): concurrent cleanup waits for exit and preserves its result")
+        } catch {
+            failures += 1
+            print("FAIL audio client \(mode): \(error)")
+            for process in processes where process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        }
+    }
+    return (3, failures)
+}
+
 @main
 enum SessionEffectsCancellationChecks {
     @MainActor static func main() async {
+        if runAudioCheckHelper() { exit(0) }
         if DisplayDimWatchdog.runIfRequested(io: { FileBrightness(display: $0) }, isLocked: { false }) { exit(0) }
+        if CommandLine.arguments.contains("--audio-client-only") {
+            let checks = await checkAudioClientExit()
+            print("\(checks.count - checks.failures) passed, \(checks.failures) failed")
+            exit(checks.failures == 0 ? 0 : 1)
+        }
         var failures = 0
         let privacy = FakeSessionPrivacy()
         let audio = FakeSessionAudio()
@@ -718,7 +809,9 @@ enum SessionEffectsCancellationChecks {
         } catch { failures += 1; print("FAIL helper process setup: \(error)") }
         let cursorChecks = await checkPrivacyCursorLifecycle()
         failures += cursorChecks.failures
-        print("\(23 + cursorChecks.count - failures) passed, \(failures) failed")
+        let audioChecks = await checkAudioClientExit()
+        failures += audioChecks.failures
+        print("\(23 + cursorChecks.count + audioChecks.count - failures) passed, \(failures) failed")
         exit(failures == 0 ? 0 : 1)
     }
 }

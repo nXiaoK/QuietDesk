@@ -501,7 +501,7 @@ final class SessionAudioExitBarrier {
 }
 
 @MainActor
-private final class SessionAudioClient: SessionAudioControlling {
+final class SessionAudioClient: SessionAudioControlling {
     static let watchdogArgument = "--quietdesk-session-audio-watchdog-v1"
     private static let readerQueue = DispatchQueue(label: "quietdesk.session-audio.reader")
     private(set) var isMuted = false
@@ -522,6 +522,17 @@ private final class SessionAudioClient: SessionAudioControlling {
         let timeout: Task<Void, Never>
     }
     private var pending: [UUID: Pending] = [:]
+    private let makeProcess: () throws -> Process
+
+    init(makeProcess: @escaping () throws -> Process = {
+        guard let executable = Bundle.main.executableURL else { throw DeskError.invalid("无法找到静音恢复子进程") }
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = [SessionAudioClient.watchdogArgument]
+        return process
+    }) {
+        self.makeProcess = makeProcess
+    }
 
     func enable() async throws {
         guard !closing else { throw DeskError.invalid("正在恢复上一项会话静音，请稍后重试") }
@@ -559,8 +570,18 @@ private final class SessionAudioClient: SessionAudioControlling {
                 self.input = nil
                 if requestError != nil { self.stopProcess() }
             }
+            // A successful restore reply precedes the helper's final driver/listener cleanup.
+            // Bound that exit too, but keep the barrier until the process and its output really end.
+            var exitTimedOut = false
+            let exitTimeout = Task { @MainActor [weak self] in
+                do { try await Task.sleep(for: .seconds(4)) } catch { return }
+                guard let self, self.processID == token, self.process?.isRunning == true else { return }
+                exitTimedOut = true
+                self.stopProcess()
+            }
+            defer { exitTimeout.cancel() }
             let exitError = await self.exitBarrier.wait(for: token)
-            let errors = [requestError, exitError].compactMap { $0 }
+            let errors = [requestError, exitError, exitTimedOut ? "静音恢复子进程退出超时，已结束子进程" : nil].compactMap { $0 }
             if !errors.isEmpty { throw DeskError.invalid(Array(Set(errors)).sorted().joined(separator: "；")) }
         }
         restoreTask = task
@@ -568,10 +589,7 @@ private final class SessionAudioClient: SessionAudioControlling {
     }
 
     private func start() throws {
-        guard let executable = Bundle.main.executableURL else { throw DeskError.invalid("无法找到静音恢复子进程") }
-        let process = Process(), incoming = Pipe(), outgoing = Pipe()
-        process.executableURL = executable
-        process.arguments = [Self.watchdogArgument]
+        let process = try makeProcess(), incoming = Pipe(), outgoing = Pipe()
         process.standardInput = incoming
         process.standardOutput = outgoing
         process.standardError = FileHandle.nullDevice

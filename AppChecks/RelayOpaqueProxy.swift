@@ -3,7 +3,7 @@ import Network
 import QuietDeskCore
 
 // Test-only ciphertext proxy. TLS endpoints retain all keys. No UDP listener is
-// opened, and only video-role application records can be deliberately dropped.
+// opened. Checks may drop video records or close the first ClientHello without a TLS reply.
 final class RelayOpaqueProxy: @unchecked Sendable {
     private let queue = DispatchQueue(label: "checks.relay.opaque-proxy")
     private let listener: NWListener
@@ -12,12 +12,14 @@ final class RelayOpaqueProxy: @unchecked Sendable {
     private let lock = NSLock()
     private var drop = false
     private var dropped = 0
+    private var abortFirstHandshake: Bool
     var port: UInt16? { listener.port?.rawValue }
     var droppedRecords: Int { lock.withLock { dropped } }
     var onReady: (() -> Void)?
 
-    init(target: UInt16) throws {
+    init(target: UInt16, abortFirstHandshake: Bool = false) throws {
         self.target = NWEndpoint.Port(rawValue: target)!
+        self.abortFirstHandshake = abortFirstHandshake
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
         listener = try NWListener(using: parameters)
@@ -29,6 +31,7 @@ final class RelayOpaqueProxy: @unchecked Sendable {
             guard let self else { connection.cancel(); return }
             let id = UUID()
             let pipe = Pipe(incoming: connection, target: self.target, queue: self.queue)
+            pipe.abortHandshake = self.abortFirstHandshake; self.abortFirstHandshake = false
             self.pipes[id] = pipe
             pipe.shouldDrop = { [weak self] in
                 guard let self else { return false }
@@ -55,6 +58,7 @@ final class RelayOpaqueProxy: @unchecked Sendable {
         var ready = 0
         var closed = false
         var video = false
+        var abortHandshake = false
         var serverApplications = 0
         init(incoming: NWConnection, target: NWEndpoint.Port, queue: DispatchQueue) {
             self.incoming = incoming; self.queue = queue
@@ -84,6 +88,10 @@ final class RelayOpaqueProxy: @unchecked Sendable {
                     guard let self, !self.closed else { return }
                     guard error == nil, let payload, payload.count == length else { self.close(); return }
                     if client, bytes[0] == 22, payload.first == 1 {
+                        if self.abortHandshake {
+                            self.incoming.send(content: nil, isComplete: true, completion: .contentProcessed { [weak self] _ in self?.close() })
+                            return
+                        }
                         self.video = payload.range(of: Data(MediaChannelRole.video.applicationProtocol.utf8)) != nil
                     }
                     if !client, bytes[0] == 23, self.video {

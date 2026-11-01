@@ -455,6 +455,32 @@ private func rejectedRelay(_ fixture: Fixture, wrongKey: Bool) throws {
             } else if CommandLine.arguments.contains("--private-udp-port") {
                 run("A private node listen port cannot redirect public-endpoint DTLS forwarding") { try exerciseRelay(fixture, udp: true, pinned: true) }
             } else {
+            run("A TLS handshake interrupted by the network retries and registers the same host without restart") {
+                let proxy = try RelayOpaqueProxy(target: fixture.endpoint.port, abortFirstHandshake: true)
+                let listening = DispatchSemaphore(value: 0), online = DispatchSemaphore(value: 0)
+                let attempts = RelayBox(0), failures = RelayBox<[RelayTransportError]>([])
+                proxy.onReady = { listening.signal() }
+                proxy.start(); defer { proxy.stop() }
+                try waitRelay(listening, "Handshake interruption fixture did not start")
+                guard let port = proxy.port else { throw RelayCheckFailure(message: "Proxy has no loopback port") }
+                let endpoint = try RelayEndpoint(address: "tls://127.0.0.1:\(port)")
+                let certificate = try RelayNodeCertificate(data: fixture.authorities[0])
+                let host = try RelayHostRegistration(endpoint: endpoint, accessKey: fixture.accessKey, deviceID: UUID(),
+                    ownerKey: PairingKey.generate().data, localPort: 9, trustedCertificate: certificate)
+                host.onStatus = { status in
+                    switch status {
+                    case .connecting: attempts.update { $0 += 1 }
+                    case .online: online.signal()
+                    case .failed(let error):
+                        if let error = error as? RelayTransportError { failures.update { $0.append(error) } }
+                    }
+                }
+                host.start(); defer { host.stop() }
+                try waitRelay(online, "Interrupted TLS registration never recovered: \(failures.read())", seconds: 15)
+                try requireRelay(attempts.read() >= 2 && failures.read().contains(.network)
+                                 && failures.read().allSatisfy(\.retryable),
+                                 "Interrupted handshake bypassed failure or stopped retries: \(failures.read())")
+            }
             run("Native endpoints preserve inner desktop TLS, independent TCP video and bulk through the Go relay") { try exerciseRelay(fixture, udp: false) }
             run("Native endpoints preserve inner desktop DTLS media through authenticated Go datagram routing") { try exerciseRelay(fixture, udp: true) }
             run("Assisted relay UDP punches a direct path, keeps DTLS video flowing and returns to the node when turned off") {

@@ -37,6 +37,18 @@ public final class RelayTLSChannel: @unchecked Sendable {
     private var sends: [UUID: (bytes: Int, complete: (Bool) -> Void)] = [:]
     private static let maximumPendingBytes = 1_024 * 1_024
 
+    static func failure(for error: NWError) -> RelayTransportError {
+        guard case .tls(let status) = error else { return .network }
+        // TLS also reports socket shutdowns and timeouts. Treating them as certificate
+        // failures permanently stops registration retries after a transient outage.
+        switch status {
+        case errSSLClosedGraceful, errSSLClosedAbort, errSSLClosedNoNotify,
+             errSSLConnectionRefused, errSSLTransportReset: return .network
+        case errSSLNetworkTimeout: return .timeout
+        default: return .certificate
+        }
+    }
+
     public init(endpoint: RelayEndpoint, queue: DispatchQueue, certificateAuthorities: [Data] = [],
                 trustedCertificate: RelayNodeCertificate? = nil) throws {
         self.queue = queue
@@ -88,10 +100,9 @@ public final class RelayTLSChannel: @unchecked Sendable {
                 case .ready:
                     self.ready = true; self.handshakeID = nil; self.onReady?()
                 case .failed(let error):
-                    if case .tls = error { self.finish(RelayTransportError.certificate) }
-                    else { self.finish(RelayTransportError.network) }
+                    self.finish(Self.failure(for: error))
                 case .waiting(let error):
-                    if case .tls = error { self.finish(RelayTransportError.certificate) }
+                    if case .tls = error { self.finish(Self.failure(for: error)) }
                 case .cancelled: self.finish(RelayTransportError.network)
                 default: break
                 }

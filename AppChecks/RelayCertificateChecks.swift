@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import Security
 @testable import QuietDeskCore
 
@@ -23,6 +24,28 @@ private func reject(_ message: String, _ body: () throws -> Void) throws {
             let certificate = try RelayNodeCertificate(data: pem)
             let endpoint = try RelayEndpoint(address: "tls://127.0.0.1:7443")
             print("Relay certificate checks on \(ProcessInfo.processInfo.operatingSystemVersionString)")
+            run("TLS transport shutdowns and timeouts remain retryable without restarting registration") {
+                for status in [errSSLClosedGraceful, errSSLClosedAbort, errSSLClosedNoNotify,
+                               errSSLConnectionRefused, errSSLTransportReset] {
+                    let error = RelayTLSChannel.failure(for: .tls(status))
+                    try require(error == .network && error.retryable, "TLS transport error \(status) stopped recovery")
+                }
+                let timeout = RelayTLSChannel.failure(for: .tls(errSSLNetworkTimeout))
+                try require(timeout == .timeout && timeout.retryable, "TLS network timeout stopped recovery")
+                try require(RelayTLSChannel.failure(for: .posix(.ECONNRESET)) == .network,
+                            "Socket errors changed their recovery behavior")
+            }
+            run("Certificate, security and unknown TLS failures never become automatic retries") {
+                for status in [errSSLXCertChainInvalid, errSSLBadCert, errSSLUnknownRootCert, errSSLNoRootCert,
+                               errSSLCertExpired, errSSLCertNotYetValid, errSSLHostNameMismatch,
+                               errSSLPeerBadCert, errSSLPeerCertRevoked, errSSLPeerUnknownCA,
+                               errSSLBadRecordMac, errSSLPeerBadRecordMac, errSSLHandshakeFail,
+                               errSSLProtocol, errSSLConfigurationFailed, OSStatus(-99_999)] {
+                    let error = RelayTLSChannel.failure(for: .tls(status))
+                    try require(error == .certificate && !error.retryable,
+                                "TLS security failure \(status) became retryable")
+                }
+            }
             run("Bounded PEM/DER imports produce the same OpenSSL SHA-256 fingerprint") {
                 try require(certificate == RelayNodeCertificate(data: der), "PEM and DER differ")
                 let expected = try String(contentsOf: directory.appendingPathComponent("fingerprint.txt"))

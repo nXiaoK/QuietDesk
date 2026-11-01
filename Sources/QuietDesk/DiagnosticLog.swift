@@ -6,7 +6,7 @@ final class DiagnosticLog: @unchecked Sendable {
     enum Event: String, Codable {
         case applicationStarted, applicationStopped
         case connectionStarted, connectionReady, connectionClosed, connectionFailed, connectionMetrics, reconnectScheduled, inputFailed
-        case hostStarted, hostStopped, captureStarted, captureStopped, captureFailed
+        case hostStarted, hostStopped, captureStarted, captureStopped, captureFailed, startupTimedOut
         case streamConfigured, displayChanged, sessionPaused, sessionResumed, sessionEffectsChanged, screenLock, privacyCurtain, sessionUnlock
         case displayDim
         case clipboardOffered, clipboardOfferReceived, clipboardAccepted, clipboardRejected
@@ -17,6 +17,7 @@ final class DiagnosticLog: @unchecked Sendable {
         case updateCheck, updatePreferenceChanged, updateDownload, updateInstall, updateCancelled
     }
     enum Role: String, Codable { case viewer, host }
+    enum StartupPhase: Int { case shareableContent = 1, listener, sessionPreparation, hello }
     enum State: String, Codable {
         case requested, ready, succeeded, failed, cancelled, enabled, disabled
         case accepted, rejected, local, remote

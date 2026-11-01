@@ -344,6 +344,8 @@ final class DeskModel: ObservableObject {
     private var systemSleeping = false
     private var displayRefreshTask: Task<Void, Never>?
     private var hostPreparationTask: Task<Void, Never>?
+    private let hostStartupDeadline = ConnectionStartupDeadline()
+    private var hostStartupPhase = DiagnosticLog.StartupPhase.shareableContent
     private let trafficHistoryStore: TrafficHistoryStore
     private var trafficSession: TrafficSession?
     private var effectsCleanupTask: Task<Void, Never>?
@@ -985,6 +987,16 @@ final class DeskModel: ObservableObject {
         relayHostStatus = parts.joined(separator: "；")
     }
 
+    private static func loadShareableContent() async throws -> SCShareableContent {
+        try await CallbackOperation.run { finish in
+            SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
+                if let error { finish(.failure(error)) }
+                else if let content { finish(.success(content)) }
+                else { finish(.failure(DeskError.invalid("系统未返回可共享的屏幕信息"))) }
+            }
+        }
+    }
+
     func startHosting(interactive: Bool = true) {
         guard !active, !working, !systemSleeping else { return }
         prepareHostCode()
@@ -1013,15 +1025,23 @@ final class DeskModel: ObservableObject {
             status = "正在准备共享…"
             let token = UUID()
             generation = token
+            hostStartupPhase = .shareableContent
+            hostStartupDeadline.arm { [weak self] in
+                guard let self, self.generation == token, self.hostingRequested else { return }
+                DiagnosticLog.shared.record(.startupTimedOut, role: .host, state: .failed,
+                    values: [.statusCode: self.hostStartupPhase.rawValue])
+                self.restartHostAfterFailure("共享准备超过 30 秒未完成，正在重新开启共享")
+            }
             hostPreparationTask = Task { [weak self] in
                 guard let self else { return }
                 defer { if self.generation == token { self.hostPreparationTask = nil } }
                 do {
-                    let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                    let content = try await Self.loadShareableContent()
                     guard self.generation == token, self.hostingRequested, !Task.isCancelled else { return }
                     self.refreshDisplays()
                     _ = try self.selectShareableDisplay(content.displays)
                     let listener = try NWListener(using: MediaSecureTransport.tlsParameters(key: key, roles: MediaChannelRole.allCases), on: port)
+                    self.hostStartupPhase = .listener
                     let admission = PendingHandshakeGate()
                     // Every relayed channel arrives from the local forwarder, so with relay enabled loopback
                     // sources get their own pending budget instead of sharing one per-address rate limit.
@@ -1049,6 +1069,7 @@ final class DeskModel: ObservableObject {
                             guard let self, self.generation == token else { return }
                             switch state {
                             case .ready:
+                                self.hostStartupDeadline.cancel()
                                 DiagnosticLog.shared.record(.hostStarted, role: .host, state: .ready)
                                 self.working = false
                                 self.hostBackoff.reset()
@@ -1057,18 +1078,33 @@ final class DeskModel: ObservableObject {
                             case .failed(let error):
                                 self.recordDiagnosticFailure(.hostStopped, error: error)
                                 self.restartHostAfterFailure("监听失败：\(error.localizedDescription)")
+                            case .waiting:
+                                guard !self.hostStartupDeadline.isArmed else { return }
+                                self.hostStartupPhase = .listener
+                                self.hostStartupDeadline.arm { [weak self] in
+                                    guard let self, self.generation == token, self.hostingRequested else { return }
+                                    DiagnosticLog.shared.record(.startupTimedOut, role: .host, state: .failed,
+                                        values: [.statusCode: DiagnosticLog.StartupPhase.listener.rawValue])
+                                    self.restartHostAfterFailure("监听等待网络超过 30 秒，正在重新开启共享")
+                                }
+                            case .cancelled:
+                                self.restartHostAfterFailure("监听意外结束，正在重新开启共享")
                             default: break
                             }
                         }
                     }
                     self.listener = listener
                     self.active = true
-                    self.activity = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled, .idleDisplaySleepDisabled],
-                                                                         reason: "远程桌面共享")
+                    // Sharing must answer heartbeats while the window is hidden. Without this assertion App Nap
+                    // freezes the process, and the first thing it does on waking is fail every idle deadline.
+                    self.activity = ProcessInfo.processInfo.beginActivity(
+                        options: [.idleSystemSleepDisabled, .idleDisplaySleepDisabled, .userInitiated, .latencyCritical],
+                        reason: "远程桌面共享")
                     self.beginMetrics()
                     listener.start(queue: DispatchQueue(label: "quietdesk.listener"))
                 } catch {
                     guard self.generation == token, self.hostingRequested, !Task.isCancelled else { return }
+                    self.hostStartupDeadline.cancel()
                     self.working = false
                     self.recordDiagnosticFailure(.hostStopped, error: error)
                     self.status = "共享未启动：\(error.localizedDescription)"
@@ -1136,16 +1172,27 @@ final class DeskModel: ObservableObject {
                 }
                 self.status = "正在准备连接画面…"
                 let host = self.hostSession
+                host.startupDeadline.arm { [weak self, weak candidate, weak host] in
+                    guard let self, let candidate, let host, self.generation == token,
+                          self.peer === candidate, self.hostSession === host else { return }
+                    DiagnosticLog.shared.record(.startupTimedOut, role: .host, state: .failed,
+                        values: [.statusCode: host.startupPhase.rawValue])
+                    candidate.close("共享画面准备超过 30 秒未完成，重新建立会话", retryable: true)
+                }
                 host.usesRelayControl = relayed
                 self.controlTransportStatus = relayed ? "中继控制" : "直连控制"
+                let cleanup = self.effectsCleanupTask
                 host.captureTask = Task { [weak self, weak candidate, weak host] in
+                    await cleanup?.value
                     guard let self, let candidate, let host, self.hostSession === host else { return }
+                    defer { host.startupDeadline.cancel() }
                     do {
-                        await self.effectsCleanupTask?.value
                         guard self.generation == token, self.peer === candidate, self.hostSession === host, !Task.isCancelled else { return }
                         self.installHostSessionEffects(for: candidate)
-                        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                        host.startupPhase = .shareableContent
+                        let content = try await Self.loadShareableContent()
                         guard self.generation == token, self.active, self.peer === candidate, self.hostSession === host, !Task.isCancelled else { return }
+                        host.startupPhase = .sessionPreparation
                         self.refreshDisplays()
                         let (display, snapshot) = try self.selectShareableDisplay(content.displays)
                         let preferredSettings = self.settings
@@ -1239,7 +1286,16 @@ final class DeskModel: ObservableObject {
                                 self.recordDiagnosticFailure(.captureFailed, error: error)
                             }
                         }
-                        streamer.onError = { [weak candidate] in candidate?.close($0, retryable: true) }
+                        streamer.onError = { [weak self, weak candidate, weak host] message in
+                            DispatchQueue.main.async {
+                                guard let self, let candidate, let host,
+                                      self.peer === candidate, self.hostSession === host else { return }
+                                // A capture that dies while the control connection stays up leaves a live session with
+                                // a frozen picture. Closing it lets the viewer reconnect instead of waiting forever.
+                                self.recordDisconnect(message)
+                                candidate.close(message, retryable: true)
+                            }
+                        }
                         streamer.onUserStop = { [weak self, weak candidate, weak host] in
                             DispatchQueue.main.async {
                                 guard let self, let candidate, let host, self.peer === candidate, self.hostSession === host else { return }
@@ -1876,9 +1932,16 @@ final class DeskModel: ObservableObject {
             }
         }
         status = reconnecting ? "正在重新建立加密连接…" : "正在建立加密连接…"
-        candidate.onReady = { [weak self, weak candidate] in
+        candidate.onReady = { [weak self, weak candidate, weak viewer] in
             DispatchQueue.main.async {
-                guard let self, let candidate, self.peer === candidate else { return }
+                guard let self, let candidate, let viewer, self.peer === candidate, self.viewerSession === viewer else { return }
+                viewer.helloDeadline.arm { [weak self, weak candidate, weak viewer] in
+                    guard let self, let candidate, let viewer, self.peer === candidate,
+                          self.viewerSession === viewer, !viewer.helloReceived else { return }
+                    DiagnosticLog.shared.record(.startupTimedOut, role: .viewer, state: .failed,
+                        values: [.statusCode: DiagnosticLog.StartupPhase.hello.rawValue])
+                    candidate.close("加密连接建立后超过 30 秒未收到共享信息，重新建立会话", retryable: true)
+                }
                 DiagnosticLog.shared.record(.connectionReady, role: .viewer, state: .ready,
                     values: viaRelay ? [.relayControl: 1] : ackStretchingDisabled.map { [.tcpAckStretchingDisabled: $0 ? 1 : 0] } ?? [:])
                 self.controlTransportStatus = viaRelay ? "中继控制" : "直连控制"
@@ -2188,6 +2251,7 @@ final class DeskModel: ObservableObject {
                 return
             }
             viewerSession.helloReceived = true
+            viewerSession.helloDeadline.cancel()
             if hello.sessionTerminationV1 == true {
                 viewerSession.terminationSubscribed = true
                 peer.send(try SessionTermination(.subscribe).message())
@@ -3479,6 +3543,8 @@ final class DeskModel: ObservableObject {
         systemSleeping = true
         reconnectTask?.cancel()
         hostRetryTask?.cancel()
+        hostPreparationTask?.cancel()
+        hostStartupDeadline.cancel()
         if mode == .host {
             let resume = hostingRequested
             if active || working { stop() }
@@ -3498,6 +3564,8 @@ final class DeskModel: ObservableObject {
     private func systemDidWake() {
         systemSleeping = false
         refreshPermissions(checkScreenCapture: mode == .host, retryCapsLock: true)
+        // A host left idle across sleep keeps its listener. Rebuild it: ScreenCaptureKit and a socket
+        // that slept for a long time do not reliably resume, which is what forces a manual relaunch.
         if mode == .host, hostingRequested {
             hostRetryTask?.cancel()
             hostBackoff.reset()
@@ -3580,6 +3648,8 @@ final class DeskModel: ObservableObject {
         if mode == .viewer, target != nil, sessionInputSuspended { freshFrameRequiredOnReconnect = true }
         let oldHost = hostSession
         let oldViewer = viewerSession
+        oldHost.startupDeadline.cancel()
+        oldViewer.helloDeadline.cancel()
         oldHost.media?.stop()
         oldViewer.media?.stop()
         oldViewer.mediaReceiver?.stop()
@@ -3753,6 +3823,7 @@ final class DeskModel: ObservableObject {
         hostRetryTask?.cancel()
         hostPreparationTask?.cancel()
         hostPreparationTask = nil
+        hostStartupDeadline.cancel()
         reconnectTask?.cancel()
         target = nil
         reconnecting = false

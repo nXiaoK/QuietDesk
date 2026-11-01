@@ -4,6 +4,8 @@ import QuietDeskCore
 // These resources belong to one connection. Reconnect intent and UI state live in DeskModel.
 @MainActor
 final class HostSession {
+    let startupDeadline = ConnectionStartupDeadline()
+    var startupPhase = DiagnosticLog.StartupPhase.sessionPreparation
     var terminationSubscribed = false
     var usesRelayControl = false
     var media: MediaSession?
@@ -37,6 +39,7 @@ final class HostSession {
 
 @MainActor
 final class ViewerSession {
+    let helloDeadline = ConnectionStartupDeadline()
     var relayBridge: RelayViewerBridge?
     var mediaRelayBridge: RelayViewerBridge?
     var usesRelayControl = false

@@ -32,6 +32,32 @@ func runTransportChecks() {
     }
 
     if CommandLine.arguments.contains("--skip-network") { return }
+    run("A locally stalled peer queue gets a response window, then still closes a silent peer") {
+        let key = try PairingKey.generate()
+        let listener = try makeListener(key, queue: DispatchQueue(label: "checks.stalled-peer"))
+        guard let port = listener.port else { throw CheckFailure("No port") }
+        let server = Box<Peer?>(nil), ready = DispatchSemaphore(value: 0), closed = DispatchSemaphore(value: 0)
+        listener.newConnectionHandler = { connection in
+            let peer = Peer(connection: connection, idleTimeout: 10, heartbeatInterval: 10)
+            server.set(peer); peer.onReady = { ready.signal() }; peer.start()
+        }
+        let client = Peer(connection: NWConnection(host: "127.0.0.1", port: port,
+            using: SecureTransport.parameters(key: key)), idleTimeout: 0.5, heartbeatInterval: 0.05)
+        client.onClose = { _ in closed.signal() }
+        defer { client.close(); server.read()?.close(); listener.cancel() }
+        client.start()
+        try wait(ready, "TLS did not become ready")
+        let resumed = DispatchSemaphore(value: 0)
+        client.queue.async { Thread.sleep(forTimeInterval: 1); resumed.signal() }
+        try wait(resumed, "Synthetic local queue stall did not finish")
+        Thread.sleep(forTimeInterval: 0.2)
+        try check(closed.wait(timeout: .now()) == .timedOut, "Local stall was mistaken for peer death")
+        guard let host = server.read() else { throw CheckFailure("Missing host") }
+        host.queue.suspend()
+        defer { host.queue.resume() }
+        try wait(closed, seconds: 3, "A silent peer survived regular liveness checks")
+        try check(client.closeIsRetryable, "Idle failure lost retry semantics")
+    }
     run("A refused loopback connection stops automatic reconnect before the handshake timeout") {
         let key = try PairingKey.generate()
         let queue = DispatchQueue(label: "checks.refused-connection")

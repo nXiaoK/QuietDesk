@@ -205,6 +205,7 @@ public struct MediaPathPolicy: Sendable {
     private var probeDeadline: TimeInterval?
     private var selectionStartedAt: TimeInterval?
     private var lastPongAt: TimeInterval?
+    private var livenessGraceUntil: TimeInterval = 0
     private var udpSelectedAt: TimeInterval?
     private var trialDuration: TimeInterval = 0
     private var trialHasFrame = false
@@ -232,7 +233,7 @@ public struct MediaPathPolicy: Sendable {
         if let probeDeadline, now >= probeDeadline, let probeID {
             return probeFailed(id: probeID, now: now, reason: .probeTimeout)
         }
-        if targetPath == .udp, let lastPongAt, now - lastPongAt >= 1 {
+        if targetPath == .udp, now >= livenessGraceUntil, let lastPongAt, now - lastPongAt >= 1 {
             return fallBack(now: now, reason: .noPong)
         }
         if phase == .trialUDP, !trialHasFrame, let selectionStartedAt, now - selectionStartedAt >= 2 {
@@ -274,6 +275,13 @@ public struct MediaPathPolicy: Sendable {
     public mutating func receivedPong(epoch: UInt32, now: TimeInterval) {
         guard accept(now), phase != .stopped, self.epoch == epoch, targetPath == .udp else { return }
         lastPongAt = now
+    }
+
+    // Only the local media timer calls this after a scheduling gap, never for a remote packet.
+    mutating func allowLivenessRecovery(now: TimeInterval) {
+        guard accept(now), !paused, phase != .stopped else { return }
+        livenessGraceUntil = now + 1
+        if let probeDeadline { self.probeDeadline = max(probeDeadline, livenessGraceUntil) }
     }
 
     // The coordinator calls this only after an actual media attempt fails. A capture

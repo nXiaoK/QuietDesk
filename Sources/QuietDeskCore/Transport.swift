@@ -69,7 +69,8 @@ public final class Peer {
     private var closed = false
     private var started = false
     private var ready = false
-    private var lastReceived = SessionClock.running
+    private var lastReceived = SessionClock.uptime
+    private var livenessGrace = LocalSchedulingGrace()
     private var timer: DispatchSourceTimer?
     private var pendingBytes = 0
     private var deliverySequence: UInt64 = 0
@@ -119,6 +120,7 @@ public final class Peer {
         queue.async { [self] in
             guard !started, !closed else { return }
             started = true
+            livenessGrace = LocalSchedulingGrace()
             diagnosticsObserver = diagnostics?.observeEnableChanges { [weak self] in
                 self?.queue.async { [weak self] in self?.updateTransportDiagnostics() }
             }
@@ -127,8 +129,10 @@ public final class Peer {
             timer.setEventHandler { [weak self] in
                 guard let self else { return }
                 self.collectTransportDiagnostics()
-                // `running` stops while the process sleeps or is napped, so a frozen app is not mistaken for a dead peer.
-                if SessionClock.running - self.lastReceived > (self.ready ? self.idleTimeout : self.handshakeTimeout) {
+                let now = SessionClock.uptime
+                let timeout = self.ready ? self.idleTimeout : self.handshakeTimeout
+                self.livenessGrace.observe(now: now, interval: self.heartbeatInterval, allowance: min(5, timeout))
+                if !self.livenessGrace.isActive(at: now), now - self.lastReceived > timeout {
                     self.closeAllowsAlternateRoute = !self.ready
                     self.finish(self.ready ? "连接超过 \(Int(self.idleTimeout)) 秒无数据" : "建立连接超时，请检查地址或远端状态")
                 } else if self.ready {
@@ -142,7 +146,7 @@ public final class Peer {
                 switch state {
                 case .ready:
                     self.ready = true
-                    self.lastReceived = SessionClock.running
+                    self.lastReceived = SessionClock.uptime
                     self.updateTransportDiagnostics()
                     self.onReady?()
                     if self.onRoundTripMilliseconds != nil { self.sendHeartbeat() }
@@ -446,7 +450,7 @@ public final class Peer {
             guard let self, !self.closed else { return }
             if let data, !data.isEmpty {
                 buffer.data.append(data)
-                self.lastReceived = SessionClock.running
+                self.lastReceived = SessionClock.uptime
                 self.trafficMeter.record(receivedBytes: UInt64(data.count))
                 self.onTraffic?(data.count)
             }

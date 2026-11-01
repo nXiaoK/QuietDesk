@@ -455,6 +455,24 @@ private func rejectedRelay(_ fixture: Fixture, wrongKey: Bool) throws {
             } else if CommandLine.arguments.contains("--private-udp-port") {
                 run("A private node listen port cannot redirect public-endpoint DTLS forwarding") { try exerciseRelay(fixture, udp: true, pinned: true) }
             } else {
+            run("A stalled relay reader gets bounded grace without losing its missing-response timeout") {
+                let queue = DispatchQueue(label: "checks.relay.stalled-read")
+                let channel = try RelayTLSChannel(endpoint: fixture.endpoint, queue: queue,
+                    certificateAuthorities: fixture.authorities)
+                let ready = DispatchSemaphore(value: 0), closed = DispatchSemaphore(value: 0)
+                let failure = RelayBox<Error?>(nil)
+                channel.onReady = { ready.signal() }
+                channel.onClose = { error in failure.update { $0 = error }; closed.signal() }
+                channel.start(); defer { channel.close() }
+                try waitRelay(ready, "Relay TLS did not become ready")
+                channel.readMessage(timeout: 0.5) { _ in }
+                let resumed = DispatchSemaphore(value: 0)
+                queue.async { Thread.sleep(forTimeInterval: 1.5); resumed.signal() }
+                try waitRelay(resumed, "Reader queue did not resume")
+                try requireRelay(closed.wait(timeout: .now() + 0.15) == .timedOut, "Reader expired immediately after local stall")
+                try waitRelay(closed, "Reader grace masked a missing reply", seconds: 2)
+                try requireRelay(failure.read() as? RelayTransportError == .timeout, "Missing reply lost timeout classification")
+            }
             run("A TLS handshake interrupted by the network retries and registers the same host without restart") {
                 let proxy = try RelayOpaqueProxy(target: fixture.endpoint.port, abortFirstHandshake: true)
                 let listening = DispatchSemaphore(value: 0), online = DispatchSemaphore(value: 0)

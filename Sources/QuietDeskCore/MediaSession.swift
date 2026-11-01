@@ -154,6 +154,7 @@ public final class MediaSession: @unchecked Sendable {
     private var lastPingAt: TimeInterval = 0
     private var lastPongAt: TimeInterval = 0
     private var livenessResumedAt: TimeInterval = 0
+    private var livenessGrace = LocalSchedulingGrace()
     private var roundTrip: TimeInterval = 0.01
     private var controlRoundTrip: (milliseconds: Double, at: TimeInterval)?
     private var reportedLocalNetwork: Bool?
@@ -238,6 +239,7 @@ public final class MediaSession: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, !self.started, !self.stopped else { return }
             self.started = true
+            self.livenessGrace = LocalSchedulingGrace()
             let monitor = NWPathMonitor()
             monitor.pathUpdateHandler = { [weak self] path in
                 guard let self, !self.stopped else { return }
@@ -328,7 +330,7 @@ public final class MediaSession: @unchecked Sendable {
             guard let self, !self.stopped, self.paused != value else { return }
             self.paused = value
             self.reliableDeliveryFailures = 0; self.reliableFailureNotified = false
-            if !value { self.livenessResumedAt = SessionClock.running }
+            if !value { self.livenessResumedAt = SessionClock.uptime }
             self.handleActions(self.policy.setPaused(value, now: SessionClock.now))
             self.clearDatagrams()
             if value { self.abortTransaction(retry: false) }
@@ -399,7 +401,7 @@ public final class MediaSession: @unchecked Sendable {
             guard let self, !self.stopped else { return }
             guard self.negotiated else { return }
             self.configurationSuspended = false
-            self.livenessResumedAt = SessionClock.running
+            self.livenessResumedAt = SessionClock.uptime
             self.handleActions(self.policy.setPaused(self.paused, now: SessionClock.now))
             if !self.paused {
                 self.requestedRecoveryAt = 0
@@ -807,8 +809,7 @@ public final class MediaSession: @unchecked Sendable {
 
     private func sendPing() {
         guard !paused, udpPeer != nil else { return }
-        // Liveness follows time the process runs: a nap or sleep must not age out a challenge that was never sent.
-        let now = SessionClock.running
+        let now = SessionClock.uptime
         // Retransmit the outstanding challenge without invalidating a pong taking
         // longer than the 200 ms send interval, but never extend its one-second lifetime.
         if challenge == nil || now - challengeSentAt >= 1 {
@@ -830,12 +831,12 @@ public final class MediaSession: @unchecked Sendable {
                 receivedChallenge = true
                 var response = data; response[response.startIndex] = 2
                 sendDatagram(response)
-                if !udpVerified, lastPongAt > 0, SessionClock.running - lastPongAt < 1 {
+                if !udpVerified, lastPongAt > 0, SessionClock.uptime - lastPongAt < 1 {
                     verifiedUDP(receivedPong: false)
                 }
             case 2:
                 guard data.count == 1024, let challenge, data.dropFirst().prefix(16) == challenge else { return }
-                let now = SessionClock.running
+                let now = SessionClock.uptime
                 let measured = now - challengeSentAt
                 guard measured >= 0, measured < 1 else { return }
                 self.challenge = nil
@@ -1194,15 +1195,22 @@ public final class MediaSession: @unchecked Sendable {
 
     private func tick() {
         guard !stopped else { return }
+        let uptime = SessionClock.uptime
+        if livenessGrace.observe(now: uptime, interval: 0.01, allowance: 1), negotiated, !paused, !configurationSuspended {
+            // Never accept a pre-stall nonce as a fresh RTT sample. Both peers get a new response window.
+            challenge = nil
+            sendPing()
+            policy.allowLivenessRecovery(now: SessionClock.now)
+        }
         let now = SessionClock.now
         if let pending = transaction, now - pending.started > 8 {
             let header = MediaFrameHeader(stream: pending.stream, frameID: 1, isIDR: true)
             abortTransaction(retry: true, mediaFailure: pending.frameSubmitted && pending.stage == .producing && !reassembledAtPeer.contains(header))
         }
         guard negotiated, !paused, !configurationSuspended else { return }
-        // Ping age uses time the process ran, so a suspended app does not tear down a path that never missed a beat.
-        if udpPeer != nil, SessionClock.running - lastPingAt >= 0.2 { sendPing() }
-        if side == .host, udpVerified, SessionClock.running - max(lastPongAt, livenessResumedAt) >= 1 {
+        if udpPeer != nil, SessionClock.uptime - lastPingAt >= 0.2 { sendPing() }
+        if side == .host, udpVerified, !livenessGrace.isActive(at: uptime),
+           uptime - max(lastPongAt, livenessResumedAt) >= 1 {
             udpVerified = false
             udpPeer?.close("媒体路径保活超时")
         }
@@ -1216,7 +1224,7 @@ public final class MediaSession: @unchecked Sendable {
                     handleActions(actions)
                 }
             }
-            if udpAvailable, transaction == nil || SessionClock.running - lastPongAt >= 1 { handleActions(policy.tick(now: now)) }
+            if udpAvailable, transaction == nil || SessionClock.uptime - lastPongAt >= 1 { handleActions(policy.tick(now: now)) }
             if transaction == nil, now >= retryAt {
                 if retryAt > 0 {
                     if retryPath == .udp, !udpVerified, udpPeer != nil {
@@ -1239,7 +1247,7 @@ public final class MediaSession: @unchecked Sendable {
                 // one delayed heartbeat cannot stand for several windows of local delay. Never reuse an old route's
                 // UDP RTT, or the initial 10 ms estimate, as evidence that the current video path is healthy.
                 var measuredRoundTrip = controlRoundTrip.flatMap { $0.at >= sampleStartedAt ? $0.milliseconds : nil }
-                if (transaction?.path ?? active?.path) == .udp, udpVerified, lastPongAt > 0, SessionClock.running - lastPongAt < 1 {
+                if (transaction?.path ?? active?.path) == .udp, udpVerified, lastPongAt > 0, SessionClock.uptime - lastPongAt < 1 {
                     measuredRoundTrip = max(measuredRoundTrip ?? 0, roundTrip * 1_000)
                 }
                 let sample = MediaPathSample(duration: duration,

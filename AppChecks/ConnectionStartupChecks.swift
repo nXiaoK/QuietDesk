@@ -1,6 +1,7 @@
 import Foundation
+import Darwin
 import Network
-import QuietDeskCore
+@testable import QuietDeskCore
 
 private struct CheckFailure: Error { let message: String }
 private final class Box<Value>: @unchecked Sendable {
@@ -15,6 +16,16 @@ private final class Box<Value>: @unchecked Sendable {
 struct ConnectionStartupChecks {
     @MainActor
     static func main() async {
+        if CommandLine.arguments.contains("--suspended-clock-helper") {
+            let before = SessionClock.uptime
+            var grace = LocalSchedulingGrace(now: before)
+            print("ready"); fflush(stdout)
+            _ = readLine()
+            let after = SessionClock.uptime
+            let recovered = grace.observe(now: after, interval: 0.01, allowance: 0.5)
+            print(recovered && after - before >= 0.5 && grace.isActive(at: after) ? "recovered" : "failed")
+            return
+        }
         var passed = 0, failed = 0
         func require(_ condition: Bool, _ message: String) throws {
             if !condition { throw CheckFailure(message: message) }
@@ -29,6 +40,26 @@ struct ConnectionStartupChecks {
         func run(_ name: String, _ body: () async throws -> Void) async {
             do { try await body(); passed += 1; print("PASS \(name)") }
             catch { failed += 1; print("FAIL \(name): \(error)") }
+        }
+
+        await run("A real suspended child proves uptime advances and recovery comes from scheduling grace") {
+            let child = Process(), input = Pipe(), output = Pipe()
+            child.executableURL = Bundle.main.executableURL
+            child.arguments = ["--suspended-clock-helper"]
+            child.standardInput = input; child.standardOutput = output
+            try child.run()
+            defer {
+                if child.isRunning { kill(child.processIdentifier, SIGCONT); kill(child.processIdentifier, SIGKILL) }
+            }
+            try require(String(data: output.fileHandleForReading.availableData, encoding: .utf8) == "ready\n", "Child did not start")
+            try require(kill(child.processIdentifier, SIGSTOP) == 0, "Could not suspend the isolated child")
+            try await Task.sleep(for: .milliseconds(700))
+            try require(kill(child.processIdentifier, SIGCONT) == 0, "Could not resume the isolated child")
+            try input.fileHandleForWriting.write(contentsOf: Data("continue\n".utf8))
+            try require(String(data: output.fileHandleForReading.availableData, encoding: .utf8) == "recovered\n",
+                        "Suspended child did not receive liveness grace")
+            child.waitUntilExit()
+            try require(child.terminationStatus == 0, "Child did not exit normally")
         }
 
         await run("Callback completion supports synchronous results, errors and duplicate callbacks") {

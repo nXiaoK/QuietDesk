@@ -1095,8 +1095,7 @@ final class DeskModel: ObservableObject {
                     }
                     self.listener = listener
                     self.active = true
-                    // Sharing must answer heartbeats while the window is hidden. Without this assertion App Nap
-                    // freezes the process, and the first thing it does on waking is fail every idle deadline.
+                    // Keep hidden sharing responsive; a clock alone cannot exempt App Nap scheduling delays.
                     self.activity = ProcessInfo.processInfo.beginActivity(
                         options: [.idleSystemSleepDisabled, .idleDisplaySleepDisabled, .userInitiated, .latencyCritical],
                         reason: "远程桌面共享")
@@ -1848,6 +1847,10 @@ final class DeskModel: ObservableObject {
         if reconnecting {
             _ = idlePolicy.tick(now: SessionClock.now, attended: sessionWindowAttended)
             if idlePolicy.isPaused { deferReconnectForIdle("离开窗口 10 分钟"); return }
+        }
+        if activity == nil {
+            activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
+                reason: "远程桌面连接保活")
         }
         if relaySelectedForTarget, let relay = target.relay, let access = target.relayAccessKey {
             if target.relayRoutes.count > 1, !target.relayRoutesOrdered { orderRelayRoutes(target); return }
@@ -3637,6 +3640,7 @@ final class DeskModel: ObservableObject {
     }
 
     private func clearSession() {
+        if mode == .viewer, let activity { ProcessInfo.processInfo.endActivity(activity); self.activity = nil }
         performanceTimer?.cancel()
         performanceTimer = nil
         flushPerformanceDiagnostics()

@@ -1,5 +1,5 @@
 import Foundation
-import QuietDeskCore
+@testable import QuietDeskCore
 
 func runSessionClockChecks() {
     run("Session clock reports finite monotonic seconds") {
@@ -12,9 +12,9 @@ func runSessionClockChecks() {
         }
         Thread.sleep(forTimeInterval: 0.02)
         try check(SessionClock.now - first >= 0.015, "Session clock does not use elapsed seconds")
-        let running = SessionClock.running
+        let uptime = SessionClock.uptime
         Thread.sleep(forTimeInterval: 0.02)
-        try check(SessionClock.running - running >= 0.015, "Running clock does not advance while the process runs")
+        try check(SessionClock.uptime - uptime >= 0.015, "Uptime does not use elapsed seconds")
     }
 
     run("A simulated sleep gap expires idle and RTT state in the same continuous time domain") {
@@ -31,12 +31,39 @@ func runSessionClockChecks() {
         try check(probe.complete(current, at: afterWake + 0.02) != nil, "Fresh post-wake probe did not recover")
     }
 
-    run("Running time advances with the process and stays finite") {
-        // Liveness uses this clock because it stops while the process is suspended; that property
-        // belongs to mach_absolute_time and cannot be exercised without actually suspending.
-        let first = SessionClock.running
-        Thread.sleep(forTimeInterval: 0.02)
-        let elapsed = SessionClock.running - first
-        try check(elapsed.isFinite && elapsed >= 0.015 && elapsed < 2, "Running clock did not track scheduled time")
+    run("Regular local ticks never extend a dead peer's liveness deadline") {
+        var grace = LocalSchedulingGrace(now: 0)
+        for tick in 1...100 {
+            let now = Double(tick) * 0.1
+            try check(!grace.observe(now: now, interval: 0.1, allowance: 1), "Regular tick looked suspended")
+            try check(!grace.isActive(at: now), "Regular tick granted grace")
+        }
+    }
+    run("A scheduling gap grants only a bounded fresh response window") {
+        var grace = LocalSchedulingGrace(now: 0)
+        try check(grace.observe(now: 60, interval: 0.1, allowance: 1), "Suspension was not detected")
+        try check(grace.until == 61 && grace.isActive(at: 60), "Missing fresh response window")
+        for tick in 1...10 { grace.observe(now: 60 + Double(tick) * 0.1, interval: 0.1, allowance: 1) }
+        try check(!grace.isActive(at: 61), "Normal ticks extended grace indefinitely")
+        try check(!grace.observe(now: .nan, interval: 0.1, allowance: 1), "Accepted NaN")
+        try check(!grace.observe(now: 0, interval: 0.1, allowance: 1), "Accepted backwards time")
+        try check(grace.observe(now: 120, interval: 0.1, allowance: 1), "A later local suspension was ignored")
+    }
+    run("Media liveness recovery does not invent a pong or permanently preserve a dead route") {
+        var policy = MediaPathPolicy(capable: true, now: 0)
+        _ = policy.tick(now: 0)
+        guard let probe = policy.probeID else { throw CheckFailure("No probe") }
+        _ = policy.probeSucceeded(id: probe, now: 0.1)
+        _ = policy.mediaBecameUsable(epoch: policy.epoch, path: .udp, now: 0.2)
+        policy.allowLivenessRecovery(now: 60)
+        try check(policy.tick(now: 60).isEmpty, "Local stall immediately killed UDP")
+        try check(policy.tick(now: 60.9).isEmpty, "Grace ended before a fresh pong could arrive")
+        try check(!policy.tick(now: 61).isEmpty && policy.lastReason == .noPong, "Dead UDP survived grace")
+
+        var pending = MediaPathPolicy(capable: true, now: 0)
+        _ = pending.tick(now: 0)
+        pending.allowLivenessRecovery(now: 60)
+        try check(pending.tick(now: 60).isEmpty, "A pending probe expired at resume")
+        try check(!pending.tick(now: 61).isEmpty && pending.lastReason == .probeTimeout, "Probe lost its timeout")
     }
 }

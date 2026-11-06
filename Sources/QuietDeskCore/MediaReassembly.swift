@@ -106,6 +106,7 @@ public final class MediaFrameReassembler {
         let fragmented: Bool
         let firstReceivedAt: TimeInterval
         var lastProgressAt: TimeInterval
+        var highestReceivedAt: TimeInterval
         var lastNackAt: TimeInterval?
         var bytes: Data
         var received: [Bool]
@@ -122,6 +123,7 @@ public final class MediaFrameReassembler {
             fragmented = true
             firstReceivedAt = now
             lastProgressAt = now
+            highestReceivedAt = now
             bytes = Data(count: totalBytes)
             received = Array(repeating: false, count: fragmentCount)
             requested = Array(repeating: false, count: fragmentCount)
@@ -134,6 +136,7 @@ public final class MediaFrameReassembler {
             fragmented = false
             firstReceivedAt = now
             lastProgressAt = now
+            highestReceivedAt = now
             self.bytes = bytes
             received = Array(repeating: true, count: fragmentCount)
             requested = Array(repeating: false, count: fragmentCount)
@@ -247,7 +250,12 @@ public final class MediaFrameReassembler {
             assembly.bytes.replaceSubrange(range, with: fragment.payload)
             assembly.received[index] = true
             assembly.receivedCount += 1
-            assembly.highestReceivedIndex = max(assembly.highestReceivedIndex, index)
+            if index > assembly.highestReceivedIndex {
+                assembly.highestReceivedIndex = index
+                assembly.highestReceivedAt = now
+            } else if now - assembly.highestReceivedAt >= limits.reorderDelay {
+                assembly.requested[index] = true
+            }
             assembly.lastProgressAt = now
             if assembly.receivedCount == assembly.fragmentCount {
                 do {
@@ -328,8 +336,14 @@ public final class MediaFrameReassembler {
             let missing = assembly.missingRanges(includeTail: includeTail)
             if !missing.isEmpty, let feedback = try? MediaFeedback(kind: .nack, header: assembly.header, missingRanges: missing) {
                 assembly.lastNackAt = now
-                for range in missing { assembly.requested.replaceSubrange(Int(range.first)..<Int(range.first) + Int(range.count),
-                                                                         with: repeatElement(true, count: Int(range.count))) }
+                let holeEnd = max(0, assembly.highestReceivedIndex)
+                for range in missing {
+                    let start = Int(range.first)
+                    let end = min(holeEnd, start + Int(range.count))
+                    if start < end {
+                        assembly.requested.replaceSubrange(start..<end, with: repeatElement(true, count: end - start))
+                    }
+                }
                 events.append(.feedback(feedback))
             }
         }

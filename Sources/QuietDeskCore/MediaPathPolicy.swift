@@ -505,10 +505,12 @@ public struct MediaQualityPolicy: Sendable {
     private var computeDuration: TimeInterval = 0
     private var congestedDuration: TimeInterval = 0
     private var healthyDuration: TimeInterval = 0
+    private var activeDuration: TimeInterval = 0
     private var filledDuration: TimeInterval = 0
     private var lastBottleneck: MediaBottleneck?
     private var pendingUpgrade: UpgradeKind?
-    private var upgraded: (kind: UpgradeKind, at: TimeInterval)?
+    private var bitrateUpgradedAt: TimeInterval?
+    private var pixelsUpgradedAt: TimeInterval?
     public private(set) var lastAdjustment: Adjustment?
     // The slowest codec time per frame in the current run of healthy windows.
     private var peakComputeMilliseconds: Double?
@@ -550,7 +552,8 @@ public struct MediaQualityPolicy: Sendable {
         guard accept(now) else { return nil }
         preferred = settings; upperBound = settings
         resetEvidence(); lastObservationAt = now; lastChangeAt = now
-        upgradeHold = Self.initialUpgradeHold; bitrateHold = Self.initialBitrateHold; upgraded = nil
+        upgradeHold = Self.initialUpgradeHold; bitrateHold = Self.initialBitrateHold
+        bitrateUpgradedAt = nil; pixelsUpgradedAt = nil
         slowEdges.removeAll(); lastAdjustment = nil; localLatencyLimited = false; localRoundTrip = nil
         pending = effective == settings ? nil : settings
         pendingUpgrade = nil
@@ -640,11 +643,11 @@ public struct MediaQualityPolicy: Sendable {
             guard let delay = [sample.deliveryMilliseconds, sample.roundTripMilliseconds].compactMap({ $0 }).max() else {
                 // Missing per-second measurements are normal between TCP heartbeats. Preserve only
                 // their bounded run; no delivery or recovery evidence accrues in an unmeasured window.
-                healthyDuration = 0; filledDuration = 0
+                healthyDuration = 0; activeDuration = 0; filledDuration = 0
                 return nil
             }
             if delay >= Self.localDelayedMilliseconds {
-                healthyDuration = 0; filledDuration = 0
+                healthyDuration = 0; activeDuration = 0; filledDuration = 0
                 guard sustainedRoundTrip || congestedDuration + mediaPolicyTimeTolerance >= Self.localReductionDelay else { return nil }
                 congestedDuration = 0; localRoundTripCongestedDuration = 0
                 let current = StreamSettings(longestEdge: min(effective.longestEdge, upperBound.longestEdge),
@@ -659,7 +662,7 @@ public struct MediaQualityPolicy: Sendable {
             // veto across settings requests, until a new healthy RTT arrives or the route is reset.
             guard delay < Self.localHealthyMilliseconds, sample.decodedFrames > 0,
                   localRoundTrip.map({ $0.milliseconds < Self.localHealthyMilliseconds }) ?? true else {
-                healthyDuration = 0; filledDuration = 0
+                healthyDuration = 0; activeDuration = 0; filledDuration = 0
                 return nil
             }
             healthyDuration += elapsed
@@ -671,13 +674,16 @@ public struct MediaQualityPolicy: Sendable {
             }
             // Delay already showed what this route carries. A quiet screen has low delay at any bitrate,
             // so climb one step at a time, and only on windows in which video used a real share of it.
-            if let received = sample.receivedMegabits, received >= Double(effective.megabits) * Self.filledShare {
-                filledDuration += elapsed
+            if let received = sample.receivedMegabits {
+                if received >= Double(effective.megabits) * Self.filledShare { filledDuration += elapsed }
+                if received >= min(Double(effective.megabits) * Self.filledShare, megabits(Self.minimumBitsPerPixel, for: effective)) {
+                    activeDuration += elapsed
+                }
             }
             return upgrade(now: now)
         }
         if let cause = sample.bottleneck, cause != .network {
-            congestedDuration = 0; healthyDuration = 0; filledDuration = 0; peakComputeMilliseconds = nil
+            congestedDuration = 0; healthyDuration = 0; activeDuration = 0; filledDuration = 0; peakComputeMilliseconds = nil
             if cause != lastBottleneck { computeDuration = 0 }
             lastBottleneck = cause; computeDuration += elapsed
             guard computeDuration + mediaPolicyTimeTolerance >= 3 else { return nil }
@@ -686,10 +692,10 @@ public struct MediaQualityPolicy: Sendable {
         computeDuration = 0; lastBottleneck = nil
         switch sample.networkCondition {
         case .severe?:
-            congestedDuration = 0; healthyDuration = 0; filledDuration = 0
+            congestedDuration = 0; healthyDuration = 0; activeDuration = 0; filledDuration = 0
             return reduceLoad(for: .network, severe: true, now: now)
         case .congested?:
-            healthyDuration = 0; filledDuration = 0; peakComputeMilliseconds = nil
+            healthyDuration = 0; activeDuration = 0; filledDuration = 0; peakComputeMilliseconds = nil
             congestedDuration += elapsed
             guard congestedDuration + mediaPolicyTimeTolerance >= 2 else { return nil }
             return reduceLoad(for: .network, now: now)
@@ -698,8 +704,11 @@ public struct MediaQualityPolicy: Sendable {
             guard sample.decodedFrames > 0 else { return nil }
             healthyDuration += elapsed
             if let compute = sample.computeMilliseconds { peakComputeMilliseconds = max(peakComputeMilliseconds ?? 0, compute) }
-            if let received = sample.receivedMegabits, received >= Double(effective.megabits) * Self.filledShare {
-                filledDuration += elapsed
+            if let received = sample.receivedMegabits {
+                if received >= Double(effective.megabits) * Self.filledShare { filledDuration += elapsed }
+                if received >= min(Double(effective.megabits) * Self.filledShare, megabits(Self.minimumBitsPerPixel, for: effective)) {
+                    activeDuration += elapsed
+                }
             }
             return upgrade(now: now)
         case nil:
@@ -713,7 +722,12 @@ public struct MediaQualityPolicy: Sendable {
     public mutating func confirmApplied(_ settings: StreamSettings, now: TimeInterval) -> Bool {
         guard accept(now), pending == settings else { return false }
         effective = settings; pending = nil; lastChangeAt = now; lastObservationAt = now
-        if let pendingUpgrade { upgraded = (pendingUpgrade, now) }
+        if let pendingUpgrade {
+            switch pendingUpgrade {
+            case .bitrate: bitrateUpgradedAt = now
+            case .pixels: pixelsUpgradedAt = now
+            }
+        }
         pendingUpgrade = nil
         resetEvidence()
         return true
@@ -821,19 +835,20 @@ public struct MediaQualityPolicy: Sendable {
     private mutating func upgrade(now: TimeInterval) -> StreamSettings? {
         guard now - lastChangeAt + mediaPolicyTimeTolerance >= 3 else { return nil }
         var next = effective
-        if let higher = StreamSettings.frameRates.first(where: { $0 > next.framesPerSecond && $0 <= upperBound.framesPerSecond }) {
-            var candidate = next; candidate.framesPerSecond = higher
-            if Double(next.megabits) >= megabits(Self.comfortableBitsPerPixel, for: candidate), computeFits(higher) {
-                guard healthyDuration + mediaPolicyTimeTolerance >= upgradeHold else { return nil }
-                return recommendUpgrade(candidate, kind: .pixels, now: now)
+        let pixelsDuration = localLatencyLimited ? filledDuration : (next.megabits < upperBound.megabits ? activeDuration : healthyDuration)
+        if pixelsDuration + mediaPolicyTimeTolerance >= upgradeHold {
+            if let higher = StreamSettings.frameRates.first(where: { $0 > next.framesPerSecond && $0 <= upperBound.framesPerSecond }) {
+                var candidate = next; candidate.framesPerSecond = higher
+                if Double(next.megabits) >= megabits(Self.comfortableBitsPerPixel, for: candidate), computeFits(higher) {
+                    return recommendUpgrade(candidate, kind: .pixels, now: now)
+                }
             }
-        }
-        if shownEdge(next) < shownEdge(upperBound),
-           let higher = StreamSettings.longestEdges.first(where: { $0 > next.longestEdge && $0 <= upperBound.longestEdge }) {
-            var candidate = next; candidate.longestEdge = higher
-            if Double(next.megabits) >= megabits(Self.comfortableBitsPerPixel, for: candidate), !recentlySlow(candidate, now: now) {
-                guard healthyDuration + mediaPolicyTimeTolerance >= upgradeHold else { return nil }
-                return recommendUpgrade(candidate, kind: .pixels, now: now)
+            if shownEdge(next) < shownEdge(upperBound),
+               let higher = StreamSettings.longestEdges.first(where: { $0 > next.longestEdge && $0 <= upperBound.longestEdge }) {
+                var candidate = next; candidate.longestEdge = higher
+                if Double(next.megabits) >= megabits(Self.comfortableBitsPerPixel, for: candidate), !recentlySlow(candidate, now: now) {
+                    return recommendUpgrade(candidate, kind: .pixels, now: now)
+                }
             }
         }
         guard next.megabits < upperBound.megabits, filledDuration + mediaPolicyTimeTolerance >= bitrateHold else { return nil }
@@ -859,28 +874,31 @@ public struct MediaQualityPolicy: Sendable {
     private mutating func recommendReduction(_ settings: StreamSettings, adjustment: Adjustment,
                                              now: TimeInterval) -> StreamSettings {
         lastAdjustment = adjustment
-        if let upgraded {
-            switch upgraded.kind {
-            case .bitrate: bitrateHold = min(Self.maximumBitrateHold, bitrateHold * 2)
-            case .pixels: upgradeHold = min(Self.maximumUpgradeHold, upgradeHold * 2)
-            }
-            self.upgraded = nil
+        if bitrateUpgradedAt != nil {
+            bitrateHold = min(Self.maximumBitrateHold, bitrateHold * 2)
+            bitrateUpgradedAt = nil
+        }
+        if pixelsUpgradedAt != nil {
+            upgradeHold = min(Self.maximumUpgradeHold, upgradeHold * 2)
+            pixelsUpgradedAt = nil
         }
         return recommend(settings, now: now)
     }
 
     // An applied upgrade that survives probation proves that level; later pressure starts from the short hold.
     private mutating func settleUpgrade(now: TimeInterval) {
-        guard let upgraded, now - upgraded.at + mediaPolicyTimeTolerance >= Self.upgradeProbation else { return }
-        self.upgraded = nil
-        switch upgraded.kind {
-        case .bitrate: bitrateHold = Self.initialBitrateHold
-        case .pixels: upgradeHold = Self.initialUpgradeHold
+        if let at = bitrateUpgradedAt, now - at + mediaPolicyTimeTolerance >= Self.upgradeProbation {
+            bitrateUpgradedAt = nil
+            bitrateHold = Self.initialBitrateHold
+        }
+        if let at = pixelsUpgradedAt, now - at + mediaPolicyTimeTolerance >= Self.upgradeProbation {
+            pixelsUpgradedAt = nil
+            upgradeHold = Self.initialUpgradeHold
         }
     }
 
     private mutating func resetEvidence() {
-        computeDuration = 0; congestedDuration = 0; healthyDuration = 0; filledDuration = 0; lastBottleneck = nil
+        computeDuration = 0; congestedDuration = 0; healthyDuration = 0; activeDuration = 0; filledDuration = 0; lastBottleneck = nil
         peakComputeMilliseconds = nil; localRoundTripCongestedDuration = 0
     }
 }

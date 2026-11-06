@@ -1007,6 +1007,44 @@ func runMediaPathPolicyChecks() {
         _ = failing.confirmApplied(down, now: time)
         try check(failing.bitrateHold == MediaQualityPolicy.initialBitrateHold * 2, "A bitrate step that failed soon did not back off")
         try check(failing.upgradeHold == MediaQualityPolicy.initialUpgradeHold, "A bitrate failure delayed frame rate or size upgrades")
+        // When both pixel and bitrate upgrades are in probation, a subsequent bitrate step does not erase pixel probation,
+        // and quiet screens do not trigger pixel upgrades while bitrate is below the ceiling.
+        let mixedCeiling = StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 60)
+        let mixedStart = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 10)
+        var mixed = try MediaQualityPolicy(hostDefault: mixedCeiling, preferred: mixedCeiling, applied: mixedStart,
+                                           bitRates: StreamSettings.adaptiveBitRates, appliedSize: (1920, 1200), now: 0)
+        for quietTime in 1...30 {
+            try check(mixed.observe(sample(received: 0.2), now: Double(quietTime)) == nil,
+                      "A quiet screen below the bitrate ceiling triggered an upgrade")
+        }
+        var mixedTime = 30.0, mixedBitrate: StreamSettings?
+        for _ in 0..<4 where mixedBitrate == nil {
+            mixedTime += 1
+            mixedBitrate = mixed.observe(sample(received: 8), now: mixedTime)
+        }
+        // At t=34 (4 filled seconds), bitrate upgrades first (10 -> 15) instead of being blocked by the 10-second pixel hold.
+        try check(mixedBitrate == StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 15) && mixedTime == 34,
+                  "Bitrate upgrade was blocked by the longer pixel hold: \(String(describing: mixedBitrate))")
+        _ = mixed.confirmApplied(mixedBitrate!, now: mixedTime)
+        // If the stream no longer fills 50% of 15 Mbps (e.g. 5 Mbps at 30 fps) until pixel rate rises, allow pixel upgrade at 15 Mbps once filled earlier,
+        // or when filled at 15 Mbps for 10 seconds after a pixel upgrade, test combined probation:
+        var bothProbation = try MediaQualityPolicy(hostDefault: mixedCeiling, preferred: mixedCeiling,
+                                                   applied: StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 40),
+                                                   bitRates: StreamSettings.adaptiveBitRates, appliedSize: (1920, 1200), now: 0)
+        var pTime = 0.0, firstUp: StreamSettings?
+        while firstUp == nil, pTime < 20 { pTime += 1; firstUp = bothProbation.observe(sample(received: 10), now: pTime) }
+        try check(firstUp == StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 40), "Expected FPS upgrade first when bitrate is not filled")
+        _ = bothProbation.confirmApplied(firstUp!, now: pTime)
+        var secondUp: StreamSettings?
+        while secondUp == nil, pTime < 30 { pTime += 1; secondUp = bothProbation.observe(sample(received: 30), now: pTime) }
+        try check(secondUp == StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 50), "Expected bitrate upgrade within probation")
+        _ = bothProbation.confirmApplied(secondUp!, now: pTime)
+        pTime += 1
+        guard let bothReduced = bothProbation.observe(sample(loss: 0.2), now: pTime) else { throw CheckFailure("Expected reduction after combined upgrade") }
+        _ = bothProbation.confirmApplied(bothReduced, now: pTime)
+        try check(bothProbation.bitrateHold == MediaQualityPolicy.initialBitrateHold * 2
+                  && bothProbation.upgradeHold == MediaQualityPolicy.initialUpgradeHold * 2,
+                  "A bitrate upgrade inside pixel probation erased the pixel upgrade backoff")
     }
 
     run("A narrow path starts from a capped bitrate, and the output size teaches the real screen size") {

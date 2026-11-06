@@ -293,6 +293,19 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         let reliable = try MediaFrameReassembler(stream: stream)
         _ = try reliable.receive(frame(1, idr: true, bytes: 8_192))
         try require(reliable.takeFragmentCounts() == (0, 0), "A complete TCP envelope was counted as UDP fragments")
+        // A paced frame whose tail arrives after a tail NACK without any reordering hole is not packet loss.
+        let paced = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        let pacedParts = try MediaFragment.fragment(frame: frame(1, idr: true, bytes: 8_192))
+        time.now = 30
+        _ = try paced.receive(pacedParts[0]); _ = try paced.receive(pacedParts[1])
+        time.now = 30.015
+        try require(feedback(paced.poll(), .nack).count == 1, "Tail probe did not fire after progress paused")
+        for part in pacedParts.dropFirst(2) {
+            time.now += 0.001
+            _ = try paced.receive(part)
+        }
+        try require(paced.takeFragmentCounts() == (pacedParts.count, 0),
+                    "In-order paced tail fragments after a tail NACK were miscounted as lost")
     }
 
     run("Loss window reports a five-second share only with enough fragments") {

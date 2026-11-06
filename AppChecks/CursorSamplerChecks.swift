@@ -181,6 +181,26 @@ private struct CursorSamplerChecks {
                         "Position update re-encoded the same shape")
         }
 
+        run("Changing pixels in the same cursor bitmap updates the sampled shape") {
+            let source = try image()
+            let cursor = CursorProbe(image: source, hotSpot: .zero)
+            let sampler = HostCursorSampler(display: display(), cursorProvider: { cursor },
+                locationProvider: { CGPoint(x: 100, y: 100) },
+                screenFrameProvider: { _ in CGRect(x: 0, y: 0, width: 1440, height: 900) })
+            var samples: [HostCursorSample] = []
+            sampler.onSample = { samples.append($0) }; sampler.start(); defer { sampler.stop() }
+            guard let rep = source.representations.first as? NSBitmapImageRep, let pixels = rep.bitmapData else {
+                throw CursorSamplerCheckFailure("Missing synthetic cursor pixels")
+            }
+            for offset in stride(from: 0, to: rep.bytesPerRow * rep.pixelsHigh, by: 4) {
+                pixels[offset] = 0; pixels[offset + 2] = 255
+            }
+            source.recache()
+            sampler.sampleNow()
+            try require(samples.count == 2 && samples[1].shapeChanged && samples[1].image != nil
+                        && samples[1].image?.png != samples[0].image?.png, "A changed bitmap reused the old shape")
+        }
+
         run("Shape and hotspot changes update independently of cursor identity") {
             let red = try image(), blue = try image(blue: true)
             var cursor: NSCursor? = CursorProbe(image: red, hotSpot: .zero)

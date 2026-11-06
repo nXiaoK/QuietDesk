@@ -19,6 +19,10 @@ final class RelayTCPForwarder {
     }
 
     func start() {
+        local.pathUpdateHandler = { [weak self] _ in
+            guard let self, self.localReady, !self.closed else { return }
+            self.onLocalReady?(self.local)
+        }
         local.stateUpdateHandler = { [weak self] state in
             guard let self, !self.closed else { return }
             switch state {
@@ -51,6 +55,7 @@ final class RelayTCPForwarder {
 
     private func forwardIfReady() {
         guard localReady, remoteReady, !forwarding, !closed else { return }
+        onLocalReady?(local)
         forwarding = true; channel.forward(to: local)
     }
 
@@ -61,7 +66,7 @@ final class RelayTCPForwarder {
         closed = true
         let callback = onClose; onClose = nil; onLocalReady = nil
         callback?(error)
-        local.stateUpdateHandler = nil; local.cancel(); channel.close()
+        local.pathUpdateHandler = nil; local.stateUpdateHandler = nil; local.cancel(); channel.close()
     }
 
     deinit { local.cancel(); channel.close() }

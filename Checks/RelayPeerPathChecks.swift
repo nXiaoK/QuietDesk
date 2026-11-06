@@ -162,6 +162,29 @@ func runRelayPeerPathChecks() {
                   RelayCandidate.canonicalAddress("2001:DB8:0:0::1", allowLoopback: false) == "2001:db8::1" &&
                   RelayCandidate.canonicalAddress("127.0.0.1", allowLoopback: false) == nil &&
                   RelayCandidate.canonicalAddress("::1", allowLoopback: true) == "::1", "Candidate addresses were not canonicalized")
+        let port = NWEndpoint.Port(rawValue: 54321)!
+        let loopbackEndpoints: [NWEndpoint] = [
+            .hostPort(host: .ipv4(IPv4Address("127.0.0.1")!), port: port),
+            .hostPort(host: .ipv4(IPv4Address("127.0.0.1%lo0") ?? IPv4Address("127.0.0.1")!), port: port),
+            .hostPort(host: .ipv6(IPv6Address("::1")!), port: port),
+            .hostPort(host: .ipv6(IPv6Address("::ffff:127.0.0.1")!), port: port),
+            .hostPort(host: .name("127.0.0.1%lo0", nil), port: port),
+            .hostPort(host: .name("::ffff:127.0.0.1%lo0", nil), port: port),
+        ]
+        for endpoint in loopbackEndpoints {
+            try check(RelayHostRegistration.loopbackPort(of: endpoint) == 54321,
+                      "Loopback endpoint \(endpoint) did not extract port 54321")
+        }
+        let nonLoopbackEndpoints: [NWEndpoint] = [
+            .hostPort(host: .ipv4(IPv4Address("192.168.1.10")!), port: port),
+            .hostPort(host: .ipv6(IPv6Address("::ffff:192.168.1.10")!), port: port),
+            .hostPort(host: .ipv6(IPv6Address("2001:db8::1")!), port: port),
+            .hostPort(host: .name("192.168.1.10%en0", nil), port: port),
+        ]
+        for endpoint in nonLoopbackEndpoints {
+            try check(RelayHostRegistration.loopbackPort(of: endpoint) == nil,
+                      "Non-loopback endpoint \(endpoint) matched as loopback")
+        }
     }
     run("Direct-path packets are authenticated, path-bound and never replayed") {
         let lease = Data(repeating: 9, count: 16)

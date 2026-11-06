@@ -1050,7 +1050,7 @@ final class DeskModel: ObservableObject {
                         let address: String?
                         if case .hostPort(let host, _) = connection.endpoint { address = host.debugDescription }
                         else { address = nil }
-                        let gate = address == "127.0.0.1" ? relayAdmission ?? admission : admission
+                        let gate = RelayHostRegistration.loopbackPort(of: connection.endpoint) != nil ? relayAdmission ?? admission : admission
                         guard let id = gate.reserve(address: gate === admission ? address : nil, now: SessionClock.now) else {
                             connection.cancel()
                             return

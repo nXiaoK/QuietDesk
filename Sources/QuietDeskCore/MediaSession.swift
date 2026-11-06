@@ -863,6 +863,9 @@ public final class MediaSession: @unchecked Sendable {
 
     private func verifiedUDP(receivedPong: Bool = true) {
         udpVerified = true
+        if side == .host, !udpRelayed, let peer = udpPeer {
+            udpRelayed = isRelayedDatagram?(peer.endpoint) == true
+        }
         if udpRelayed, let peer = udpPeer, assistAnnouncedPeer !== peer, let datagramKey, let sessionID {
             assistAnnouncedPeer = peer
             onRelayedDatagramAuthenticated?(peer.endpoint, Self.peerAssistSecret(datagramKey: datagramKey, sessionID: sessionID))

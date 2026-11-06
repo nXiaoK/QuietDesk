@@ -44,12 +44,47 @@ public final class RelayHostRegistration: @unchecked Sendable {
         self.peerInterfaceCandidates = peerInterfaceCandidates
     }
 
+    public static func loopbackPort(of endpoint: NWEndpoint) -> UInt16? {
+        guard case .hostPort(let host, let port) = endpoint, port.rawValue > 0 else { return nil }
+        switch host {
+        case .ipv4(let address):
+            guard address.rawValue.first == 127 else { return nil }
+            return port.rawValue
+        case .ipv6(let address):
+            let raw = [UInt8](address.rawValue)
+            let isV6Loopback = raw.count == 16 && raw.dropLast().allSatisfy { $0 == 0 } && raw.last == 1
+            let isMappedV4Loopback = raw.count == 16 && raw.prefix(10).allSatisfy { $0 == 0 }
+                && raw[10] == 0xff && raw[11] == 0xff && raw[12] == 127
+            guard isV6Loopback || isMappedV4Loopback else { return nil }
+            return port.rawValue
+        case .name(let name, _):
+            let base = name.split(separator: "%", maxSplits: 1).first.map(String.init)?.lowercased() ?? ""
+            guard base == "127.0.0.1" || base == "::1" || base == "::ffff:127.0.0.1" || base == "localhost" else { return nil }
+            return port.rawValue
+        @unknown default:
+            return nil
+        }
+    }
+
+    private static func localEndpointPort(of connection: NWConnection) -> UInt16? {
+        guard case .hostPort(_, let port) = connection.currentPath?.localEndpoint, port.rawValue > 0 else { return nil }
+        return port.rawValue
+    }
+
     /// The host media session authenticated the relayed DTLS flow arriving from `localDatagramEndpoint`.
     public func enablePeerAssist(localDatagramEndpoint endpoint: NWEndpoint, secret: Data) {
-        guard case .hostPort(let host, let port) = endpoint, host.debugDescription == "127.0.0.1" else { return }
+        guard let port = Self.loopbackPort(of: endpoint) else { return }
         queue.async { [self] in
-            let id = endpointLock.withLock { datagramSources.first { $0.value == port.rawValue }?.key }
-            if let id { routes[id]?.enableAssist(secret: secret) }
+            for (id, route) in routes {
+                if let localPort = route.localEndpointPort {
+                    endpointLock.withLock { datagramSources[id] = localPort }
+                }
+            }
+            if let id = endpointLock.withLock({ datagramSources.first { $0.value == port }?.key }) {
+                routes[id]?.enableAssist(secret: secret)
+            } else if routes.count == 1, let route = routes.values.first {
+                route.enableAssist(secret: secret)
+            }
         }
     }
 
@@ -64,13 +99,13 @@ public final class RelayHostRegistration: @unchecked Sendable {
     }
 
     public func ownsLocalEndpoint(_ endpoint: NWEndpoint) -> Bool {
-        guard case .hostPort(let host, let port) = endpoint, host.debugDescription == "127.0.0.1" else { return false }
-        return endpointLock.withLock { localSources.values.contains(port.rawValue) }
+        guard let port = Self.loopbackPort(of: endpoint) else { return false }
+        return endpointLock.withLock { localSources.values.contains(port) }
     }
 
     public func ownsLocalDatagramEndpoint(_ endpoint: NWEndpoint) -> Bool {
-        guard case .hostPort(let host, let port) = endpoint, host.debugDescription == "127.0.0.1" else { return false }
-        return endpointLock.withLock { datagramSources.values.contains(port.rawValue) }
+        guard let port = Self.loopbackPort(of: endpoint) else { return false }
+        return endpointLock.withLock { datagramSources.values.contains(port) }
     }
 
     public func start() {
@@ -139,8 +174,8 @@ public final class RelayHostRegistration: @unchecked Sendable {
                                                   registration: registration, circuitID: circuit))
                         self.forwarders[id] = forwarder
                         forwarder.onLocalReady = { [weak self] connection in
-                            guard let self, case .hostPort(_, let port) = connection.currentPath?.localEndpoint else { return }
-                            self.endpointLock.withLock { self.localSources[id] = port.rawValue }
+                            guard let self, let port = Self.localEndpointPort(of: connection) else { return }
+                            self.endpointLock.withLock { self.localSources[id] = port }
                         }
                         forwarder.onClose = { [weak self] _ in
                             guard let self else { return }
@@ -163,8 +198,8 @@ public final class RelayHostRegistration: @unchecked Sendable {
                         }
                         route.onPathState = { [weak self] state in self?.reportPeerPath(state) }
                         route.onLocalReady = { [weak self] connection in
-                            guard let self, case .hostPort(_, let port) = connection.currentPath?.localEndpoint else { return }
-                            self.endpointLock.withLock { self.datagramSources[id] = port.rawValue }
+                            guard let self, let port = Self.localEndpointPort(of: connection) else { return }
+                            self.endpointLock.withLock { self.datagramSources[id] = port }
                         }
                         route.onClose = { [weak self, weak route] in
                             guard let self, let route, self.routes[id] === route else { return }
@@ -229,6 +264,10 @@ private final class HostDatagramRoute {
         get { assistedPipe?.onPathState } set { assistedPipe?.onPathState = newValue }
     }
     var assisted: Bool { assistedPipe != nil }
+    var localEndpointPort: UInt16? {
+        guard case .hostPort(_, let port) = local.currentPath?.localEndpoint, port.rawValue > 0 else { return nil }
+        return port.rawValue
+    }
     private let pipe: RelayDatagramPipe
     private let assistedPipe: RelayAssistedPipe?
     private let local: NWConnection
@@ -258,9 +297,14 @@ private final class HostDatagramRoute {
         pipe.onReady = { [weak self] in self?.pipeReady = true; self?.receiveIfReady() }
         pipe.onPayload = { [weak self] data, complete in
             guard let self, self.localReady, !self.closed else { complete(false); return }
+            self.onLocalReady?(self.local)
             self.local.send(content: data, completion: .contentProcessed { error in complete(error == nil) })
         }
         pipe.onClose = { [weak self] _ in self?.close() }
+        local.pathUpdateHandler = { [weak self] _ in
+            guard let self, self.localReady, !self.closed else { return }
+            self.onLocalReady?(self.local)
+        }
         local.stateUpdateHandler = { [weak self] state in
             guard let self, !self.closed else { return }
             switch state {
@@ -292,7 +336,7 @@ private final class HostDatagramRoute {
     }
     func close() {
         guard !closed else { return }; closed = true; reading = false; sending = 0
-        pipe.onClose = nil; pipe.close(); local.stateUpdateHandler = nil; local.cancel()
+        pipe.onClose = nil; pipe.close(); local.pathUpdateHandler = nil; local.stateUpdateHandler = nil; local.cancel()
         let callback = onClose; onClose = nil; callback?()
     }
     deinit { local.cancel() }

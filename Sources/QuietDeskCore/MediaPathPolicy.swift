@@ -473,7 +473,7 @@ public struct MediaQualityPolicy: Sendable {
     public static let computeRateTolerance = 0.85
     // A higher frame rate needs the measured time per frame to fit this share of its frame interval.
     public static let computeHeadroom = 0.85
-    // Local links reduce only for delay. The host keeps at most three frames in flight, so about 100 ms of
+    // Local links reduce only for delay. With the legacy three-frame window, about 100 ms of
     // queueing already caps the frame rate near 30 fps; scrolling was seen to hold steady near 120 ms.
     public static let localDelayedMilliseconds = 80.0
     public static let localReductionDelay: TimeInterval = 2

@@ -5,9 +5,9 @@ import QuietDeskCore
 
 // Encoder and acknowledgement state share one queue with the capture pump.
 struct VideoFrameFlow {
-    static let maximumOutstandingFrames = 3
-    static func maximumOutstandingFrames(for settings: StreamSettings) -> Int {
-        settings.framesPerSecond >= 60 ? 6 : 4
+    static func maximumOutstandingFrames(for settings: StreamSettings, receiverLimit: Int?) -> Int {
+        min(receiverLimit ?? MediaBufferLimits.legacyFrameWindow,
+            settings.framesPerSecond >= 60 ? MediaBufferLimits.receiveFrameWindow : 4)
     }
     struct Encoding {
         let sequence: UInt32
@@ -41,12 +41,12 @@ struct VideoFrameFlow {
     var outstanding: Int { encoding.count + waiting.count }
 
     mutating func begin(at now: TimeInterval, maximumConcurrentEncodes: Int = 1,
-                        maximumOutstandingFrames: Int = Self.maximumOutstandingFrames,
+                        maximumOutstandingFrames: Int = MediaBufferLimits.legacyFrameWindow,
                         isRefinement: Bool = false) -> Encoding? {
         // Encoding and completed-but-not-yet-delivered output share the bounded credit window.
         // A forced IDR is serialized so its drop cannot leave an already-submitted P frame behind it.
         guard !encodingFailed, encoding.count < min(2, max(1, maximumConcurrentEncodes)),
-              outstanding < max(1, maximumOutstandingFrames),
+              outstanding < maximumOutstandingFrames,
               !encoding.contains(where: { $0.forceKeyFrame }), !forceKeyFrame || encoding.isEmpty,
               !isRefinement || encoding.isEmpty,
               !mediaHold || mediaRecoveryRequested else { return nil }
@@ -324,6 +324,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var latest: (CVPixelBuffer, CMTime, PerformanceDiagnostics.Token?)?
     private var lastCapture: (CVPixelBuffer, CMTime, PerformanceDiagnostics.Token?)?
     private var frameFlow = VideoFrameFlow()
+    private var receiverFrameWindow: Int?
     private var refinement = StaticFrameRefinement()
     private var refinementTimer: DispatchSourceTimer?
     private var lastCaptureAt: TimeInterval = 0
@@ -1022,6 +1023,13 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
+    func setReceiverFrameWindow(_ limit: Int?) {
+        queue.async { [self] in
+            receiverFrameWindow = limit
+            pump()
+        }
+    }
+
     func acknowledge(_ number: UInt32) {
         queue.async { [weak self] in
             guard let self, self.frameFlow.acknowledge(number) else { return }
@@ -1177,7 +1185,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         guard let encoder,
               let frame = frameFlow.begin(at: SessionClock.now,
                 maximumConcurrentEncodes: currentSettings.framesPerSecond >= 60 ? 2 : 1,
-                maximumOutstandingFrames: VideoFrameFlow.maximumOutstandingFrames(for: currentSettings),
+                maximumOutstandingFrames: VideoFrameFlow.maximumOutstandingFrames(for: currentSettings, receiverLimit: receiverFrameWindow),
                 isRefinement: latestIsRefinement) else { return }
         self.latest = nil
         latestIsRefinement = false

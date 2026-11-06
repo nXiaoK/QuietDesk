@@ -16,6 +16,8 @@ public struct MediaControl: Codable, Sendable {
     public let mediaFailure: Bool?
     public let encodeMilliseconds: Double?
     public let relayRouting: Bool?
+    // Advertised by the viewer in its request. Older viewers accept three outstanding frames.
+    public let receiveFrameWindow: Int?
     // Host stats only: how far recent frame delivery (send to reassembly) exceeds its recent minimum.
     public let deliveryMilliseconds: Double?
 
@@ -23,12 +25,13 @@ public struct MediaControl: Codable, Sendable {
                 datagramKey: Data? = nil, role: MediaChannelRole? = nil, transactionID: UUID? = nil,
                 transportEpoch: UInt32? = nil, codecEpoch: UInt32? = nil, path: String? = nil,
                 mediaFailure: Bool? = nil, encodeMilliseconds: Double? = nil, relayRouting: Bool? = nil,
-                deliveryMilliseconds: Double? = nil) {
+                deliveryMilliseconds: Double? = nil, receiveFrameWindow: Int? = nil) {
         self.operation = operation; self.sessionID = sessionID; self.token = token
         self.datagramKey = datagramKey; self.role = role; self.transactionID = transactionID
         self.transportEpoch = transportEpoch; self.codecEpoch = codecEpoch; self.path = path
         self.mediaFailure = mediaFailure; self.encodeMilliseconds = encodeMilliseconds
         self.relayRouting = relayRouting; self.deliveryMilliseconds = deliveryMilliseconds
+        self.receiveFrameWindow = receiveFrameWindow
     }
 
     public func validate() throws {
@@ -36,6 +39,7 @@ public struct MediaControl: Codable, Sendable {
               path == nil || ["udp", "tcp", "shared"].contains(path!),
               mediaFailure == nil || operation == .abort || operation == .recover,
               relayRouting == nil || operation == .request || operation == .offer,
+              receiveFrameWindow.map({ operation == .request && $0 > 0 }) ?? true,
               encodeMilliseconds == nil || operation == .stats,
               deliveryMilliseconds.map({ operation == .stats && $0.isFinite && (0...60_000).contains($0) }) ?? true else {
             throw DeskError.invalid("媒体协商参数无效")

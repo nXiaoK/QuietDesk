@@ -41,6 +41,7 @@ public final class MediaSession: @unchecked Sendable {
     public var diagnostics: PerformanceDiagnostics?
     public var onVideo: ((MediaFrame, @escaping (Bool) -> Void) -> Void)?
     public var onCommitStream: ((MediaStreamID, VideoPacket) -> Void)?
+    public var onReceiveFrameWindow: ((Int?) -> Void)?
     public var onPrepareRecovery: ((@escaping (Bool) -> Void) -> Void)?
     public var onPrepareStream: ((MediaStreamID, @escaping (Bool) -> Void) -> Void)?
     public var onProduceRecoveryFrame: (() -> Void)?
@@ -255,7 +256,8 @@ public final class MediaSession: @unchecked Sendable {
             timer.setEventHandler { [weak self] in self?.tick() }
             self.timer = timer; timer.resume()
             if self.side == .viewer {
-                self.sendControl(MediaControl(.request, relayRouting: self.relayRoutingEnabled ? true : nil))
+                self.sendControl(MediaControl(.request, relayRouting: self.relayRoutingEnabled ? true : nil,
+                                              receiveFrameWindow: MediaBufferLimits.receiveFrameWindow))
                 self.onState?("正在优化传输")
             }
         }
@@ -477,6 +479,7 @@ public final class MediaSession: @unchecked Sendable {
             sessionID = identifier; bindingToken = token; datagramKey = sessionKey
             grant = try MediaBindingGrant(sessionID: identifier, token: token, now: SessionClock.now)
             negotiated = true
+            onReceiveFrameWindow?(value.receiveFrameWindow)
             prepareListener(sessionKey: sessionKey, identifier: identifier)
             return
         }
@@ -924,7 +927,7 @@ public final class MediaSession: @unchecked Sendable {
 
     private var expectedStream: MediaStreamID? { transaction?.stream ?? active?.stream }
     private var bufferLimits: MediaBufferLimits {
-        MediaBufferLimits(maximumFrames: 6,
+        MediaBufferLimits(maximumFrames: MediaBufferLimits.receiveFrameWindow,
                           frameTimeToLive: (transaction?.path ?? active?.path) == .udp ? max(0.25, roundTrip * 3 + 0.08) : 5,
                           keyFrameTimeToLive: 5, completedFrameTimeToLive: 5)
     }
@@ -1059,7 +1062,7 @@ public final class MediaSession: @unchecked Sendable {
             deliveryEstimator.add(max(0, SessionClock.now - sent.at - sent.paced), at: SessionClock.now)
         }
         if (feedback.kind == .reassembled || feedback.kind == .decoded),
-           sentHeaders.contains(feedback.header), reassembledAtPeer.count < 6 {
+           sentHeaders.contains(feedback.header), reassembledAtPeer.count < MediaBufferLimits.receiveFrameWindow {
             reassembledAtPeer.insert(feedback.header)
             discardQueued(feedback.header)
         }

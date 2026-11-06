@@ -1227,6 +1227,7 @@ final class DeskModel: ObservableObject {
                             do { _ = try channel.receive(message) }
                             catch { candidate?.close(error.localizedDescription) }
                         }
+                        media.onReceiveFrameWindow = { [weak streamer] limit in streamer?.setReceiverFrameWindow(limit) }
                         media.onPrepareRecovery = { [weak streamer] completion in
                             guard let streamer else { completion(false); return }
                             streamer.prepareMediaRecovery(completion: completion)

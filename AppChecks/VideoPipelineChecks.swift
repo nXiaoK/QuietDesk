@@ -154,18 +154,37 @@ private struct VideoPipelineChecks {
                         "An ACK did not return exactly its own credit")
         }
 
-        run("High-refresh settings expand the in-flight frame credit window while keeping two encoder slots") {
-            try require(VideoFrameFlow.maximumOutstandingFrames(for: StreamSettings(framesPerSecond: 30)) == 4
-                        && VideoFrameFlow.maximumOutstandingFrames(for: StreamSettings(framesPerSecond: 60)) == 6,
-                        "Frame-rate credit scaling did not match 30/60 fps targets")
-            var flow = predictiveFlow()
-            for index in 1...6 {
-                let frame = flow.begin(at: Double(index), maximumConcurrentEncodes: 2, maximumOutstandingFrames: 6)
-                try require(frame != nil, "High-refresh window stalled before 6 outstanding frames at \(index)")
-                _ = flow.encoded(frame!.sequence, at: Double(index))
+        run("Frame credits respect the viewer's receive window when the frame rate changes") {
+            for advertised: Int? in [nil, MediaBufferLimits.receiveFrameWindow] {
+                let request = try MediaControl.read(MediaControl(.request, receiveFrameWindow: advertised).message().payload)
+                let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
+                let limits = MediaBufferLimits(maximumFrames: advertised ?? 3)
+                let receiver = try MediaFrameReassembler(stream: stream, limits: limits, clock: { 0 })
+                var flow = VideoFrameFlow()
+                func submit(atFPS fps: Int) throws -> MediaFrameHeader? {
+                    let limit = VideoFrameFlow.maximumOutstandingFrames(for: StreamSettings(framesPerSecond: fps),
+                                                                        receiverLimit: request.receiveFrameWindow)
+                    guard let frame = flow.begin(at: 0, maximumConcurrentEncodes: 2,
+                                                 maximumOutstandingFrames: limit) else { return nil }
+                    _ = flow.encoded(frame.sequence, at: 0)
+                    let header = MediaFrameHeader(stream: stream, frameID: UInt64(frame.sequence), isIDR: frame.forceKeyFrame)
+                    let packet = VideoPacket(sequence: frame.sequence, sps: frame.forceKeyFrame ? Data([0x67]) : Data(),
+                        pps: frame.forceKeyFrame ? Data([0x68]) : Data(), avcc: Data([0, 0, 0, 1, frame.forceKeyFrame ? 0x65 : 0x41]))
+                    _ = try receiver.receive(MediaFrame(header: header, packet: packet))
+                    return header
+                }
+
+                guard let initial = try submit(atFPS: 30) else { throw VideoCheckFailure("Initial IDR had no credit") }
+                _ = receiver.decoded(initial, success: true)
+                _ = flow.acknowledge(UInt32(initial.frameID))
+                for _ in 0..<7 { _ = try submit(atFPS: 30) }
+                try require(flow.waiting.count == (advertised == nil ? 3 : 4), "Wrong frame window at 30 fps")
+                for _ in 0..<7 { _ = try submit(atFPS: 60) }
+                try require(flow.waiting.count == (advertised == nil ? 3 : 6) && !receiver.requiresRecovery,
+                            "An unacknowledged frame overflowed the viewer's reassembly window")
+                let afterReduction = try submit(atFPS: 30)
+                try require(afterReduction == nil, "Lowering the frame rate released another credit")
             }
-            try require(flow.waiting.count == 6 && flow.begin(at: 7, maximumConcurrentEncodes: 2, maximumOutstandingFrames: 6) == nil,
-                        "The 6-frame window overflowed")
         }
 
         run("Out-of-order encoder completions are bounded and delivered in submission order") {

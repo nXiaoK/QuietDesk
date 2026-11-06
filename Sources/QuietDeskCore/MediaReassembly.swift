@@ -1,6 +1,8 @@
 import Foundation
 
 public struct MediaBufferLimits: Sendable {
+    public static let legacyFrameWindow = 3
+    public static let receiveFrameWindow = 6
     public let maximumFrameBytes: Int
     public let maximumBufferedBytes: Int
     public let maximumFrames: Int
@@ -15,7 +17,7 @@ public struct MediaBufferLimits: Sendable {
     public let repairSafetyMargin: TimeInterval
 
     public init(maximumFrameBytes: Int = MediaFrame.maximumPacketBytes,
-                maximumBufferedBytes: Int = 32 * 1_024 * 1_024, maximumFrames: Int = 3,
+                maximumBufferedBytes: Int = 32 * 1_024 * 1_024, maximumFrames: Int = Self.legacyFrameWindow,
                 frameTimeToLive: TimeInterval = 0.15, keyFrameTimeToLive: TimeInterval = 2.0,
                 reorderDelay: TimeInterval = 0.003,
                 nackInterval: TimeInterval = 0.01, acknowledgementRepeatInterval: TimeInterval = 0.02,

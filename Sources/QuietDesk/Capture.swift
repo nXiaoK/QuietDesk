@@ -751,7 +751,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     /// `codec` nil keeps the running encoder's codec.
     func reconfigure(_ settings: StreamSettings, codec: VideoCodec? = nil) async throws -> VideoStreamState {
         try settings.validateControlValues()
-        let snapshot = try queue.sync { () throws -> (SCStream, Int, Int, Int, Int, StreamSettings, Bool, VideoCodec) in
+        let snapshot = try queue.sync { () throws -> (SCStream, Int, Int, Int, Int, StreamSettings, Bool, VideoCodec, Bool) in
             guard running, captureStarted, let stream, displayID != nil else { throw DeskError.invalid("屏幕采集尚未就绪，请稍后调整") }
             if let operation = cursorOperationID { cancelCursorOperation(operation); throw DeskError.invalid("光标采集正在更新，请稍后调整画质") }
             if let waiter = cursorFrameWaiter {
@@ -759,26 +759,36 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 throw DeskError.invalid("正在等待光标采集的新画面")
             }
             return (stream, sourceWidth, sourceHeight, outputWidth, outputHeight, currentSettings, cursorGate.included,
-                    encoder?.codec ?? .h264)
+                    encoder?.codec ?? .h264, encoder != nil && !frameFlow.encodingFailed)
         }
         let (width, height) = settings.dimensions(width: snapshot.1, height: snapshot.2)
+        let targetCodec = codec ?? snapshot.7
+        let canUpdateInPlace = snapshot.8 && width == snapshot.3 && height == snapshot.4 && targetCodec == snapshot.7
         let id = UUID()
-        let replacement = try makeEncoder(width: width, height: height, settings: settings, codec: codec ?? snapshot.7, id: id)
+        let replacement = canUpdateInPlace ? nil : try makeEncoder(width: width, height: height, settings: settings, codec: targetCodec, id: id)
         do { try await pauseAtFrameBoundary() }
-        catch { replacement.stop(); throw error }
+        catch { replacement?.stop(); throw error }
         do {
             try Task.checkCancellation()
             try await snapshot.0.updateConfiguration(Self.configuration(width: width, height: height, settings: settings, includesCursor: snapshot.6))
             try Task.checkCancellation()
             try queue.sync {
                 guard running, stream === snapshot.0 else { throw CancellationError() }
-                let old = encoder
-                encoderID = id
-                encoder = replacement
-                encodingTimingLock.withLock { encodingStarted.removeAll(); encodeTiming.cancel() }
+                if canUpdateInPlace, frameFlow.encoding.isEmpty, !frameFlow.encodingFailed,
+                   let existing = encoder, (try? existing.updateEncodingParameters(settings: settings)) != nil {
+                    encodingTimingLock.withLock { encodingStarted.removeAll(); encodeTiming.cancel() }
+                } else {
+                    let nextEncoder = try replacement ?? makeEncoder(width: width, height: height, settings: settings, codec: targetCodec, id: id)
+                    let old = encoder
+                    encoderID = id
+                    encoder = nextEncoder
+                    encodingTimingLock.withLock { encodingStarted.removeAll(); encodeTiming.cancel() }
+                    encoderHardwareChecked = false
+                    encoderHardware = nil
+                    presentationTimeline = VideoPresentationTimeline()
+                    old?.stop()
+                }
                 lastCaptureDiagnostics = nil
-                encoderHardwareChecked = false
-                encoderHardware = nil
                 outputWidth = width
                 outputHeight = height
                 currentSettings = settings
@@ -787,19 +797,17 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 // The media coordinator suspended this configuration before draining capture. Its
                 // replacement must still wait for a new recovery IDR and the coordinator's commit.
                 if wasMediaHeld { frameFlow.prepareMediaRecovery() }
-                presentationTimeline = VideoPresentationTimeline()
                 cancelRefinement()
                 latest = cursorGate.needsFreshFrame ? nil : lastCapture
                 if cursorGate.needsFreshFrame { lastCapture = nil; appliedCursorIncluded = nil }
                 // Replaying a retained frame is intentional, not capture-queue congestion.
                 latest?.2 = nil
                 discardMismatchedFrame()
-                old?.stop()
             }
             // The caller sends the settings result before resuming the new encoder.
             return VideoStreamState(settings: settings, width: width, height: height)
         } catch {
-            replacement.stop()
+            replacement?.stop()
             if queue.sync(execute: { running && stream === snapshot.0 }) {
                 do {
                     try await snapshot.0.updateConfiguration(Self.configuration(width: snapshot.3, height: snapshot.4, settings: snapshot.5, includesCursor: snapshot.6))
@@ -946,38 +954,43 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
-    // Completion runs on the capture queue. A new encoder fences outputs still arriving from the old epoch.
+    // Completion runs on the capture queue. When no frame is currently in flight in VideoToolbox,
+    // the running encoder can emit the next recovery IDR directly; otherwise a new encoder fences old callbacks.
     func prepareMediaRecovery(completion: @escaping (Bool) -> Void) {
         queue.async { [weak self] in
             guard let self, self.running, self.captureStarted, !self.reconfiguring, !self.sessionPaused else {
                 completion(false)
                 return
             }
-            let id = UUID()
-            let replacement: VideoEncoder
-            do { replacement = try self.makeEncoder(width: self.outputWidth, height: self.outputHeight, settings: self.currentSettings,
-                                                    codec: self.encoder?.codec ?? .h264, id: id) }
-            catch {
-                self.onDiagnosticError?(error)
-                completion(false)
-                return
+            if self.frameFlow.encoding.isEmpty, !self.frameFlow.encodingFailed, self.encoder != nil {
+                self.encodingTimingLock.withLock { self.encodingStarted.removeAll(); self.encodeTiming.cancel() }
+            } else {
+                let id = UUID()
+                let replacement: VideoEncoder
+                do { replacement = try self.makeEncoder(width: self.outputWidth, height: self.outputHeight, settings: self.currentSettings,
+                                                        codec: self.encoder?.codec ?? .h264, id: id) }
+                catch {
+                    self.onDiagnosticError?(error)
+                    completion(false)
+                    return
+                }
+                let old = self.encoder
+                self.encoderID = id
+                self.encoder = replacement
+                self.encoderHardwareChecked = false
+                self.encoderHardware = nil
+                self.encodingTimingLock.withLock { self.encodingStarted.removeAll(); self.encodeTiming.cancel() }
+                self.presentationTimeline = VideoPresentationTimeline()
+                // Completing an old encoder must not block the new epoch or wait for a lost decoder ACK.
+                self.encoderCleanupQueue.async { old?.stop() }
             }
-            let old = self.encoder
-            self.encoderID = id
-            self.encoder = replacement
-            self.encoderHardwareChecked = false
-            self.encoderHardware = nil
-            self.encodingTimingLock.withLock { self.encodingStarted.removeAll(); self.encodeTiming.cancel() }
             self.lastCaptureDiagnostics = nil
             self.acknowledgements.removeAll()
             self.frameFlow.prepareMediaRecovery()
-            self.presentationTimeline = VideoPresentationTimeline()
             self.cancelRefinement()
             self.latest = self.lastCapture
             self.latest?.2 = nil
             self.discardMismatchedFrame()
-            // Completing an old encoder must not block the new epoch or wait for a lost decoder ACK.
-            self.encoderCleanupQueue.async { old?.stop() }
             completion(true)
         }
     }

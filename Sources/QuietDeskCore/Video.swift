@@ -107,6 +107,16 @@ public final class VideoEncoder {
         try set(kVTCompressionPropertyKey_DataRateLimits, [NSNumber(value: megabits * 1_000_000 / 8), NSNumber(value: 1)] as CFArray)
     }
 
+    // Updates rate control and frame-rate properties in place when output dimensions and codec remain unchanged.
+    public func updateEncodingParameters(settings: StreamSettings) throws {
+        try set(kVTCompressionPropertyKey_RealTime,
+                Self.usesRealTimeMode(framesPerSecond: settings.framesPerSecond) ? kCFBooleanTrue : kCFBooleanFalse)
+        try set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: settings.framesPerSecond))
+        try updateBitrate(megabits: settings.megabits)
+        do { try setKeyFrameInterval(seconds: 3_600, framesPerSecond: settings.framesPerSecond) }
+        catch { try setKeyFrameInterval(seconds: 4, framesPerSecond: settings.framesPerSecond) }
+    }
+
     private func setKeyFrameInterval(seconds: Int, framesPerSecond: Int) throws {
         try set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: framesPerSecond * seconds))
         try set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: seconds))

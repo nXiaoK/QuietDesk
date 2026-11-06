@@ -1696,8 +1696,10 @@ final class DeskModel: ObservableObject {
 
     private func sendCursorRequest() {
         guard mode == .viewer, connected, supportsIndependentCursor, let peer,
-              viewerSession.mediaCommitted, viewerSession.cursorRequestID == nil else { return }
+              viewerSession.mediaCommitted, viewerSession.cursorRequestID == nil,
+              viewerSession.cursorConfigured || videoTuning?.pending == nil else { return }
         let viewer = viewerSession, id = UUID()
+        viewer.cursorConfigured = true
         viewer.cursorRequestID = id
         viewer.cursorRequestedEnabled = lowLatencyCursorEnabled
         cursorStatus = "正在切换光标…"
@@ -2460,6 +2462,7 @@ final class DeskModel: ObservableObject {
                 }
             }
             sendNextVideoSettings()
+            if !viewerSession.cursorConfigured { sendCursorRequest() }
         default: throw DeskError.invalid("收到当前角色不支持的消息")
         }
     }

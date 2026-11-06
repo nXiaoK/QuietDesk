@@ -49,6 +49,7 @@ final class ViewerSession {
     var relayFallbackRequested = false
     var cursorRequestID: UUID?
     var cursorRequestedEnabled = false
+    var cursorConfigured = false
     var cursorTimeout: Task<Void, Never>?
     var media: MediaSession?
     var mediaReceiver: MediaCanvasReceiver?

@@ -910,6 +910,56 @@ private struct VideoPipelineChecks {
                         "A live bitrate change failed or forced a keyframe: \(frames), errors \(errors)")
         }
 
+        run("Updating encoding parameters and forcing recovery IDR in place preserves timeline and decodes") {
+            var pixelBuffer: CVPixelBuffer?
+            let status = CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nil, &pixelBuffer)
+            guard status == kCVReturnSuccess, let pixelBuffer else { throw VideoCheckFailure("Could not create an offline video buffer") }
+            final class Outputs: @unchecked Sendable {
+                private let lock = NSLock(); private var packets: [VideoPacket] = []; private var errors = 0
+                func add(_ result: Result<VideoPacket, Error>) {
+                    lock.withLock {
+                        if case .success(let packet) = result { packets.append(packet) }
+                        else { errors += 1 }
+                    }
+                }
+                func decoded(_ result: Result<CVPixelBuffer, Error>) {
+                    lock.withLock {
+                        if case .success(let image) = result, CVPixelBufferGetWidth(image) == 64, CVPixelBufferGetHeight(image) == 64 {}
+                        else { errors += 1 }
+                    }
+                }
+                var snapshot: ([VideoPacket], Int) { lock.withLock { (packets, errors) } }
+            }
+            let outputs = Outputs(), done = DispatchSemaphore(value: 0)
+            let encoderID = UUID()
+            var timeline = VideoPresentationTimeline()
+            let encoder = try VideoEncoder(width: 64, height: 64, settings: StreamSettings(framesPerSecond: 30, megabits: 8))
+            encoder.onOutput = { outputs.add($0); done.signal() }
+            encoder.onDropped = { _ in done.signal() }
+            defer { encoder.stop() }
+            try require(encoder.realTimeMode == true, "30 fps encoder did not start in real-time mode")
+            let capturedAt = CMTime(value: 10, timescale: 60)
+            try encoder.encode(pixelBuffer, time: try timeline.next(encoderID: encoderID, time: capturedAt), sequence: 1, forceKeyFrame: true)
+            guard done.wait(timeout: .now() + 10) == .success else { throw VideoCheckFailure("Initial frame did not complete") }
+            try encoder.updateEncodingParameters(settings: StreamSettings(framesPerSecond: 60, megabits: 20))
+            try require(encoder.realTimeMode == false, "In-place 60 fps parameter update kept real-time throttling")
+            try encoder.encode(pixelBuffer, time: try timeline.next(encoderID: encoderID, time: capturedAt), sequence: 2, forceKeyFrame: true)
+            guard done.wait(timeout: .now() + 10) == .success else { throw VideoCheckFailure("Replayed recovery IDR did not complete") }
+            try encoder.encode(pixelBuffer, time: try timeline.next(encoderID: encoderID, time: CMTime(value: 11, timescale: 60)), sequence: 3)
+            guard done.wait(timeout: .now() + 10) == .success else { throw VideoCheckFailure("Post-recovery P frame did not complete") }
+            let (packets, errors) = outputs.snapshot
+            try require(errors == 0 && packets.count >= 2, "In-place encoder parameter update or recovery IDR failed")
+            let recoveryIDR = try MediaFrame.containsIDR(packets[1].avcc)
+            try require(recoveryIDR && !packets[1].sps.isEmpty && !packets[1].pps.isEmpty && packets[1].sequence == 2,
+                        "In-place recovery on replayed capture did not emit a parameter-set IDR")
+            let decoder = VideoDecoder()
+            for packet in packets.dropFirst() {
+                decoder.decode(packet) { outputs.decoded($0); done.signal() }
+                try require(done.wait(timeout: .now() + 10) == .success, "Post-recovery stream did not decode")
+            }
+            try require(outputs.snapshot.1 == 0, "Decoded frames after in-place parameter update had errors")
+        }
+
         print("Video pipeline checks: \(passed) passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

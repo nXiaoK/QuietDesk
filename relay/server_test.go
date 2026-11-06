@@ -565,11 +565,15 @@ func TestAssistedLeaseExchangesCandidatesOnlyAfterBothConsent(t *testing.T) {
 	}
 	write(t, lease, Message{Op: "assist", DatagramID: id[:], Candidates: []Candidate{{Kind: "host", Address: "192.0.2.10", Port: 5000}}})
 	// One consent alone must not reveal either Mac's address.
-	silent(t, lease, 300*time.Millisecond)
-	silent(t, registration, 50*time.Millisecond)
+	silent(t, lease, 80*time.Millisecond)
+	silent(t, registration, 40*time.Millisecond)
+	consentStarted := time.Now()
 	write(t, registration, Message{Op: "assist", DatagramID: id[:], Candidates: []Candidate{{Kind: "host", Address: "2001:db8::7", Port: 6000}}})
 	viewerList := read(t, lease, "peerCandidates").Candidates
 	hostList := read(t, registration, "peerCandidates").Candidates
+	if elapsed := time.Since(consentStarted); elapsed >= 500*time.Millisecond {
+		t.Fatalf("initial candidate exchange waited for rebinding throttle: %v", elapsed)
+	}
 	port := func(conn *net.UDPConn) int { return conn.LocalAddr().(*net.UDPAddr).Port }
 	expectedViewer := []Candidate{{"srflx", "127.0.0.1", port(hostSocket)}, {"host", "2001:db8::7", 6000}}
 	expectedHost := []Candidate{{"srflx", "127.0.0.1", port(viewerSocket)}, {"host", "192.0.2.10", 5000}}

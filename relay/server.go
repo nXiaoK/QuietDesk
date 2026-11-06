@@ -467,8 +467,11 @@ func (s *Server) acceptAssist(h *host, datagramID []byte, side byte, candidates 
 	}
 	lease.consent[side] = true
 	lease.local[side] = local
+	ready := lease.consent[0] && lease.consent[1]
 	s.mu.Unlock()
-	lease.wake()
+	if ready {
+		lease.wake()
+	}
 	return true
 }
 
@@ -481,11 +484,11 @@ func candidateKey(candidates []Candidate) string {
 }
 
 // announce sends each side the other's node-observed address and self-reported candidates when they changed.
-func (s *Server) announce(id [16]byte, lease *datagramLease) {
+func (s *Server) announce(id [16]byte, lease *datagramLease) bool {
 	s.mu.Lock()
 	if s.datagrams[id] != lease || !lease.consent[0] || !lease.consent[1] {
 		s.mu.Unlock()
-		return
+		return false
 	}
 	var lists [2][]Candidate
 	var changed [2]bool
@@ -511,6 +514,7 @@ func (s *Server) announce(id [16]byte, lease *datagramLease) {
 	if changed[1] {
 		h.send(Message{Op: "peerCandidates", DatagramID: id[:], Candidates: lists[1]})
 	}
+	return changed[0] || changed[1]
 }
 
 func (h *host) send(message Message) error {
@@ -656,7 +660,9 @@ func (s *Server) openDatagram(conn net.Conn, message Message) {
 				case <-lease.done:
 					return
 				}
-				s.announce(id, lease)
+				if !s.announce(id, lease) {
+					continue
+				}
 				// Coalesce NAT rebinding bursts into at most one update per second.
 				select {
 				case <-time.After(time.Second):
@@ -717,7 +723,7 @@ func (s *Server) serveUDP(conn net.PacketConn) {
 		if side == 1 && lease.addresses[side] == nil {
 			close(lease.hostReady)
 		}
-		if previous := lease.addresses[side]; lease.assist && (previous == nil || previous.String() != address.String()) {
+		if previous := lease.addresses[side]; lease.assist && lease.consent[0] && lease.consent[1] && (previous == nil || previous.String() != address.String()) {
 			lease.wake()
 		}
 		lease.addresses[side] = address

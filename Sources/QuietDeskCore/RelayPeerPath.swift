@@ -78,6 +78,24 @@ public struct RelayPeerAddress: Hashable, Sendable, CustomStringConvertible {
         }
     }
 
+    public static func isRoutable(_ address: RelayPeerAddress) -> Bool {
+        let descriptor = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
+        guard descriptor >= 0 else { return false }
+        defer { Darwin.close(descriptor) }
+        var zero: Int32 = 0
+        _ = setsockopt(descriptor, IPPROTO_IPV6, IPV6_V6ONLY, &zero, socklen_t(MemoryLayout<Int32>.size))
+        return address.withSocketAddress { connect(descriptor, $0, $1) == 0 } ?? false
+    }
+
+    public static func selectResolved(_ candidates: [RelayPeerAddress], isRoutable: (RelayPeerAddress) -> Bool = Self.isRoutable) -> RelayPeerAddress? {
+        guard !candidates.isEmpty else { return nil }
+        let v4 = candidates.filter { IPv4Address($0.host) != nil }
+        let v6 = candidates.filter { IPv4Address($0.host) == nil }
+        if let routableV4 = v4.first(where: isRoutable) { return routableV4 }
+        if let routableV6 = v6.first(where: isRoutable) { return routableV6 }
+        return v4.first ?? candidates.first
+    }
+
     /// Blocking resolution of the configured node; callers run it off their transport queue.
     static func resolve(host: String, port: UInt16) -> RelayPeerAddress? {
         if let canonical = RelayCandidate.canonicalAddress(host, allowLoopback: true) { return RelayPeerAddress(host: canonical, port: port) }
@@ -85,13 +103,17 @@ public struct RelayPeerAddress: Hashable, Sendable, CustomStringConvertible {
         var result: UnsafeMutablePointer<addrinfo>?
         guard getaddrinfo(host, String(port), &hints, &result) == 0, let first = result else { return nil }
         defer { freeaddrinfo(result) }
+        var resolvedList: [RelayPeerAddress] = []
         for entry in sequence(first: first, next: { $0.pointee.ai_next }) {
             guard let address = entry.pointee.ai_addr else { continue }
             var storage = sockaddr_storage()
             withUnsafeMutableBytes(of: &storage) { $0.copyMemory(from: UnsafeRawBufferPointer(start: address, count: Int(entry.pointee.ai_addrlen))) }
-            if let resolved = RelayPeerAddress(storage: storage) { return RelayPeerAddress(host: resolved.host, port: port) }
+            if let resolved = RelayPeerAddress(storage: storage) {
+                let candidate = RelayPeerAddress(host: resolved.host, port: port)
+                if !resolvedList.contains(candidate) { resolvedList.append(candidate) }
+            }
         }
-        return nil
+        return selectResolved(resolvedList)
     }
 }
 
@@ -672,30 +694,82 @@ final class RelayPeerSocket {
     deinit { close() }
 }
 
-enum RelayPeerLocalCandidates {
+public enum RelayPeerLocalCandidates {
+    public static func isUsableInterface(name: String, ipv4 bytes: Data) -> Bool {
+        guard bytes.count == 4 else { return false }
+        // Exclude proxy TUN Fake-IP benchmark range (198.18.0.0/15) and Class E reserved (240.0.0.0/4).
+        if bytes[0] == 198 && (bytes[1] & 0xfe) == 18 { return false }
+        if bytes[0] >= 240 { return false }
+        let ignoredPrefixes = ["awdl", "llw", "anpi", "ipsec", "gif", "stf", "xhc", "pktap"]
+        let lower = name.lowercased()
+        if ignoredPrefixes.contains(where: { lower.hasPrefix($0) }) { return false }
+        return true
+    }
+
+    public static func interfacePriority(name: String, address: String, preferred: String?, tunnel: Bool) -> Int {
+        if address == preferred { return 0 }
+        let lower = name.lowercased()
+        if !tunnel && lower.hasPrefix("en") { return 1 }
+        if !tunnel { return 2 }
+        return 3
+    }
+
     /// Interface addresses another Mac on the same LAN or IPv6 internet can try. Loopback,
     /// link-local and multicast addresses are never reported.
-    static func gather(port: UInt16) -> [RelayCandidate] {
-        var addresses: [(address: String, tunnel: Bool)] = []
+    public static func gather(port: UInt16) -> [RelayCandidate] {
+        let preferred = preferredIPv4()
+        var addresses: [(address: String, priority: Int)] = []
         var head: UnsafeMutablePointer<ifaddrs>?
         if getifaddrs(&head) == 0, let first = head {
             defer { freeifaddrs(head) }
             for pointer in sequence(first: first, next: { $0.pointee.ifa_next }) {
                 let entry = pointer.pointee, flags = Int32(entry.ifa_flags)
                 guard flags & IFF_UP != 0, flags & IFF_RUNNING != 0, flags & IFF_LOOPBACK == 0,
+                      let namePointer = entry.ifa_name,
                       let address = entry.ifa_addr, address.pointee.sa_family == sa_family_t(AF_INET) else { continue }
+                let name = String(cString: namePointer)
                 let bytes = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { pointer in
                     withUnsafeBytes(of: pointer.pointee.sin_addr) { Data($0) }
                 }
-                guard let canonical = RelayCandidate.canonicalAddress(RelayPeerAddress.text(v4: bytes), allowLoopback: false),
-                      !addresses.contains(where: { $0.address == canonical }) else { continue }
-                addresses.append((canonical, flags & IFF_POINTOPOINT != 0))
+                guard isUsableInterface(name: name, ipv4: bytes),
+                      let canonical = RelayCandidate.canonicalAddress(RelayPeerAddress.text(v4: bytes), allowLoopback: false) else { continue }
+                let tunnel = flags & IFF_POINTOPOINT != 0 || name.lowercased().hasPrefix("utun")
+                let priority = interfacePriority(name: name, address: canonical, preferred: preferred, tunnel: tunnel)
+                if let existing = addresses.firstIndex(where: { $0.address == canonical }) {
+                    addresses[existing].priority = min(addresses[existing].priority, priority)
+                } else {
+                    addresses.append((canonical, priority))
+                }
             }
         }
-        var result = (addresses.filter { !$0.tunnel } + addresses.filter(\.tunnel)).prefix(3)
-            .map { RelayCandidate(kind: .host, address: $0.address, port: port) }
+        let ordered = addresses.enumerated()
+            .sorted { $0.element.priority != $1.element.priority ? $0.element.priority < $1.element.priority : $0.offset < $1.offset }
+            .map(\.element.address)
+        var result = ordered.prefix(3)
+            .map { RelayCandidate(kind: .host, address: $0, port: port) }
         if let v6 = preferredIPv6() { result.append(RelayCandidate(kind: .host, address: v6, port: port)) }
         return Array(result.prefix(RelayCandidate.maximumLocal))
+    }
+
+    private static func preferredIPv4() -> String? {
+        let descriptor = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        guard descriptor >= 0 else { return nil }
+        defer { Darwin.close(descriptor) }
+        var remote = sockaddr_in()
+        remote.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        remote.sin_family = sa_family_t(AF_INET)
+        remote.sin_port = UInt16(9).bigEndian
+        remote.sin_addr.s_addr = inet_addr("192.0.2.1")
+        let connected = withUnsafePointer(to: &remote) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
+        var storage = sockaddr_storage(), length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        guard connected, withUnsafeMutablePointer(to: &storage, {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(descriptor, $0, &length) == 0 }
+        }), let local = RelayPeerAddress(storage: storage) else { return nil }
+        return RelayCandidate.canonicalAddress(local.host, allowLoopback: false)
     }
 
     // connect() on a UDP socket only consults the routing table, so this sends nothing. The chosen

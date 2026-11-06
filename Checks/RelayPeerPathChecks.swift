@@ -190,6 +190,24 @@ func runRelayPeerPathChecks() {
             try check(RelayHostRegistration.loopbackPort(of: endpoint) == nil,
                       "Non-loopback endpoint \(endpoint) matched as loopback")
         }
+        try check(!RelayPeerLocalCandidates.isUsableInterface(name: "utun4", ipv4: Data([198, 18, 0, 1])) &&
+                  !RelayPeerLocalCandidates.isUsableInterface(name: "utun5", ipv4: Data([198, 19, 255, 1])) &&
+                  !RelayPeerLocalCandidates.isUsableInterface(name: "awdl0", ipv4: Data([192, 168, 1, 5])) &&
+                  !RelayPeerLocalCandidates.isUsableInterface(name: "llw0", ipv4: Data([192, 168, 1, 6])) &&
+                  RelayPeerLocalCandidates.isUsableInterface(name: "en0", ipv4: Data([192, 168, 1, 5])) &&
+                  RelayPeerLocalCandidates.isUsableInterface(name: "utun3", ipv4: Data([100, 64, 1, 2])),
+                  "Local interface filtering did not reject Fake-IP/AWDL or preserve LAN/VPN interfaces")
+        try check(RelayPeerLocalCandidates.interfacePriority(name: "en0", address: "192.168.1.5", preferred: "192.168.1.5", tunnel: false) == 0 &&
+                  RelayPeerLocalCandidates.interfacePriority(name: "en1", address: "192.168.2.5", preferred: "192.168.1.5", tunnel: false) == 1 &&
+                  RelayPeerLocalCandidates.interfacePriority(name: "bridge0", address: "192.168.3.1", preferred: "192.168.1.5", tunnel: false) == 2 &&
+                  RelayPeerLocalCandidates.interfacePriority(name: "utun3", address: "100.64.1.2", preferred: "192.168.1.5", tunnel: true) == 3,
+                  "Local interface priority ordering was wrong")
+        let v6Addr = RelayPeerAddress(host: "2001:db8::1", port: 28443)
+        let v4Addr = RelayPeerAddress(host: "203.0.113.10", port: 28443)
+        try check(RelayPeerAddress.selectResolved([v6Addr, v4Addr], isRoutable: { _ in true }) == v4Addr,
+                  "Dual-stack resolution did not prefer routable IPv4 for NAT mapping compatibility")
+        try check(RelayPeerAddress.selectResolved([v4Addr, v6Addr], isRoutable: { $0 == v6Addr }) == v6Addr,
+                  "Resolution did not fall back to routable IPv6 when IPv4 is unreachable")
     }
     run("Direct-path packets are authenticated, path-bound and never replayed") {
         let lease = Data(repeating: 9, count: 16)

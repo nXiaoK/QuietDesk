@@ -81,6 +81,8 @@ final class RelayUDPPipe {
     private var replay = RelayReplayWindow()
     private var ready = false
     private var closed = false
+    private var receiving = false
+    private var delivering = 0
     private var pendingBytes = 0
     private var sends: [UUID: (Int, (Bool) -> Void)] = [:]
     private var keepalive: DispatchSourceTimer?
@@ -130,27 +132,35 @@ final class RelayUDPPipe {
     }
 
     private func receive() {
-        guard !closed else { return }
+        guard !closed, !receiving, delivering < 64 else { return }
+        receiving = true
         connection.receiveMessage { [weak self] data, _, complete, error in
             guard let self, !self.closed else { return }
+            self.receiving = false
             guard error == nil else { self.finish(RelayTransportError.network); return }
             guard complete, let data, let packet = try? RelayDatagram.decode(data, key: self.key),
                   packet.id == self.id, packet.side == self.side, packet.downstream,
                   self.replay.accept(packet.sequence), !packet.payload.isEmpty else { self.receive(); return }
             guard let callback = self.onPayload else { self.receive(); return }
+            self.delivering += 1
             let once = NSLock(); var finished = false
             callback(packet.payload) { [weak self] _ in
                 let first = once.withLock { () -> Bool in if finished { return false }; finished = true; return true }
                 guard first else { return }
-                self?.queue.async { [weak self] in self?.receive() }
+                self?.queue.async { [weak self] in
+                    guard let self else { return }
+                    self.delivering = max(0, self.delivering - 1)
+                    self.receive()
+                }
             }
+            self.receive()
         }
     }
 
     func close() { finish(RelayTransportError.cancelled) }
     private func finish(_ error: Error) {
         guard !closed else { return }
-        closed = true; ready = false
+        closed = true; ready = false; receiving = false; delivering = 0
         keepalive?.cancel(); keepalive = nil
         connection.stateUpdateHandler = nil; connection.cancel()
         let callbacks = Array(sends.values); sends.removeAll(); pendingBytes = 0

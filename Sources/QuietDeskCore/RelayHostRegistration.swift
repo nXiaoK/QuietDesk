@@ -274,20 +274,24 @@ private final class HostDatagramRoute {
         local.start(queue: queue)
     }
     private var reading = false
+    private var sending = 0
     private func receiveIfReady() {
-        guard pipeReady, localReady, !closed, !reading else { return }
+        guard pipeReady, localReady, !closed, !reading, sending < 64 else { return }
         reading = true
         local.receiveMessage { [weak self] data, _, complete, error in
             guard let self, !self.closed else { return }; self.reading = false
             guard error == nil, complete, let data, !data.isEmpty, data.count <= RelayDatagram.maximumPayloadBytes else { self.close(); return }
+            self.sending += 1
             self.pipe.send(data) { [weak self] succeeded in
                 guard let self, !self.closed else { return }
+                self.sending = max(0, self.sending - 1)
                 if succeeded { self.receiveIfReady() } else { self.close() }
             }
+            self.receiveIfReady()
         }
     }
     func close() {
-        guard !closed else { return }; closed = true
+        guard !closed else { return }; closed = true; reading = false; sending = 0
         pipe.onClose = nil; pipe.close(); local.stateUpdateHandler = nil; local.cancel()
         let callback = onClose; onClose = nil; callback?()
     }

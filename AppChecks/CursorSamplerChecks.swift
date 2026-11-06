@@ -166,13 +166,15 @@ private struct CursorSamplerChecks {
         }
 
         run("Pixel hash coalesces equivalent cursor instances and encodes PNG once") {
-            let source = try image()
+            var source = try image()
             var point = CGPoint(x: 100, y: 100), encodes = 0, samples: [HostCursorSample] = []
             let sampler = HostCursorSampler(display: display(), cursorProvider: { CursorProbe(image: source, hotSpot: .zero) },
                 locationProvider: { point }, screenFrameProvider: { _ in CGRect(x: 0, y: 0, width: 1440, height: 900) },
                 pngEncoder: { bitmap in encodes += 1; return bitmap.representation(using: .png, properties: [:]) })
             sampler.onSample = { samples.append($0) }; sampler.start(); defer { sampler.stop() }
             for _ in 0..<20 { sampler.sampleNow() }
+            source = try image()
+            sampler.sampleNow()
             try require(encodes == 1 && samples.count == 1, "Unchanged cursors were re-encoded or emitted each poll")
             point = CGPoint(x: 120, y: 130); sampler.sampleNow()
             try require(encodes == 1 && samples.count == 2 && !samples[1].shapeChanged && samples[1].image != nil,

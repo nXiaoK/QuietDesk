@@ -36,6 +36,7 @@ public final class RelayViewerBridge: @unchecked Sendable {
     private var datagramHeartbeat: DispatchSourceTimer?
     private var datagramGeneration = UUID()
     private var datagramReading = false
+    private var datagramSending = 0
     private var datagramReady = false
     private var pendingDatagrams: [Data] = []
     private let failureLock = NSLock()
@@ -209,10 +210,15 @@ public final class RelayViewerBridge: @unchecked Sendable {
                             self.datagramReady = true
                             let pending = self.pendingDatagrams; self.pendingDatagrams.removeAll()
                             for packet in pending {
+                                self.datagramSending += 1
                                 pipe.send(packet) { [weak self] success in
-                                    if !success { self?.datagramFailed(RelayTransportError.network, token: token) }
+                                    guard let self, self.datagramGeneration == token, !self.stopped else { return }
+                                    self.datagramSending = max(0, self.datagramSending - 1)
+                                    if success { self.receiveLocalDatagram(token: token) }
+                                    else { self.datagramFailed(RelayTransportError.network, token: token) }
                                 }
                             }
+                            self.receiveLocalDatagram(token: token)
                         }
                         pipe.onPayload = { [weak self] data, complete in
                             guard let self, self.datagramGeneration == token, let local = self.datagramLocal, !self.stopped else { complete(false); return }
@@ -234,7 +240,7 @@ public final class RelayViewerBridge: @unchecked Sendable {
     }
 
     private func receiveLocalDatagram(token: UUID) {
-        guard !stopped, datagramGeneration == token, !datagramReading, let local = datagramLocal else { return }
+        guard !stopped, datagramGeneration == token, !datagramReading, datagramSending < 64, let local = datagramLocal else { return }
         datagramReading = true
         local.receiveMessage { [weak self] data, _, complete, error in
             guard let self, self.datagramGeneration == token, !self.stopped else { return }
@@ -243,11 +249,14 @@ public final class RelayViewerBridge: @unchecked Sendable {
                 self.datagramFailed(RelayTransportError.network, token: token); return
             }
             if self.datagramReady, let pipe = self.datagramPipe {
+                self.datagramSending += 1
                 pipe.send(data) { [weak self] success in
-                    guard let self, self.datagramGeneration == token else { return }
+                    guard let self, self.datagramGeneration == token, !self.stopped else { return }
+                    self.datagramSending = max(0, self.datagramSending - 1)
                     if success { self.receiveLocalDatagram(token: token) }
                     else { self.datagramFailed(RelayTransportError.network, token: token) }
                 }
+                self.receiveLocalDatagram(token: token)
             } else {
                 guard self.pendingDatagrams.count < 8 else { self.datagramFailed(RelayTransportError.queueFull, token: token); return }
                 self.pendingDatagrams.append(data); self.receiveLocalDatagram(token: token)
@@ -276,7 +285,7 @@ public final class RelayViewerBridge: @unchecked Sendable {
     public func retireDatagramPath() { queue.async { [self] in closeDatagram() } }
 
     private func closeDatagram() {
-        datagramGeneration = UUID(); datagramReady = false; datagramReading = false; pendingDatagrams.removeAll()
+        datagramGeneration = UUID(); datagramReady = false; datagramReading = false; datagramSending = 0; pendingDatagrams.removeAll()
         datagramHeartbeat?.cancel(); datagramHeartbeat = nil
         let channel = datagramChannel; datagramChannel = nil; channel?.close()
         let pipe = datagramPipe; datagramPipe = nil; assistedPipe = nil; datagramID = nil; pipe?.close()

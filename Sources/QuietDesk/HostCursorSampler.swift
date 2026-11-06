@@ -25,6 +25,14 @@ final class HostCursorSampler {
         let y: Double
         let inside: Bool
     }
+    private struct LastRaster {
+        let imageID: ObjectIdentifier
+        let representationIDs: [ObjectIdentifier]
+        let size: CGSize
+        let hotSpot: CGPoint
+        let fingerprint: Data
+        let image: CursorImage
+    }
     private let interval: TimeInterval
     private let cursorProvider: CursorProvider
     private let locationProvider: LocationProvider
@@ -40,6 +48,7 @@ final class HostCursorSampler {
     private var sampledShape = false
     private var cachedImages: [Data: CursorImage] = [:]
     private var cacheOrder: [Data] = []
+    private var lastRaster: LastRaster?
     private var failedRaster: (fingerprint: Data, retryAt: TimeInterval)?
 
     init(display: DisplaySnapshot, interval: TimeInterval = 1.0 / 30,
@@ -82,7 +91,7 @@ final class HostCursorSampler {
         generation &+= 1
         timer?.invalidate(); timer = nil
         previousPosition = nil; previousShape = nil; sampledShape = false
-        cachedImages.removeAll(); cacheOrder.removeAll()
+        cachedImages.removeAll(); cacheOrder.removeAll(); lastRaster = nil
         failedRaster = nil
     }
 
@@ -140,7 +149,15 @@ final class HostCursorSampler {
         guard size.width.isFinite, size.height.isFinite, (0.5...256).contains(size.width),
               (0.5...256).contains(size.height), hotSpot.x.isFinite, hotSpot.y.isFinite,
               hotSpot.x >= 0, hotSpot.y >= 0, hotSpot.x <= size.width, hotSpot.y <= size.height else { return nil }
-        let representationScale = image.representations.compactMap { representation -> CGFloat? in
+        let representations = image.representations
+        let imageID = ObjectIdentifier(image)
+        let representationIDs = representations.map(ObjectIdentifier.init)
+        if failedRaster == nil, let lastRaster,
+           lastRaster.imageID == imageID, lastRaster.representationIDs == representationIDs,
+           lastRaster.size == size, lastRaster.hotSpot == hotSpot {
+            return (lastRaster.fingerprint, lastRaster.image)
+        }
+        let representationScale = representations.compactMap { representation -> CGFloat? in
             guard representation.pixelsWide > 0, representation.pixelsHigh > 0 else { return nil }
             return min(CGFloat(representation.pixelsWide) / size.width, CGFloat(representation.pixelsHigh) / size.height)
         }.max() ?? 2
@@ -161,12 +178,17 @@ final class HostCursorSampler {
         image.draw(in: rect, from: CGRect(origin: .zero, size: size), operation: .copy, fraction: 1,
                    respectFlipped: false, hints: nil)
         NSGraphicsContext.restoreGraphicsState()
-        var bytes = Data(bytes: pixels, count: width * height * 4)
-        for value in [Double(size.width), Double(size.height), Double(hotSpot.x), Double(hotSpot.y)] { bytes.put(value.bitPattern) }
-        bytes.put(UInt16(width)); bytes.put(UInt16(height))
-        let fingerprint = Data(SHA256.hash(data: bytes))
+        var hasher = SHA256()
+        hasher.update(bufferPointer: UnsafeRawBufferPointer(start: pixels, count: width * height * 4))
+        var metadata = Data(capacity: 36)
+        for value in [Double(size.width), Double(size.height), Double(hotSpot.x), Double(hotSpot.y)] { metadata.put(value.bitPattern) }
+        metadata.put(UInt16(width)); metadata.put(UInt16(height))
+        hasher.update(data: metadata)
+        let fingerprint = Data(hasher.finalize())
         if let cached = cachedImages[fingerprint] {
             cacheOrder.removeAll { $0 == fingerprint }; cacheOrder.append(fingerprint)
+            lastRaster = LastRaster(imageID: imageID, representationIDs: representationIDs,
+                                    size: size, hotSpot: hotSpot, fingerprint: fingerprint, image: cached)
             return (fingerprint, cached)
         }
         let now = clock()
@@ -175,6 +197,7 @@ final class HostCursorSampler {
               let value = try? CursorImage(png: png, pixelWidth: width, pixelHeight: height,
                   logicalWidth: Double(size.width), logicalHeight: Double(size.height),
                   hotSpotX: Double(hotSpot.x), hotSpotY: Double(hotSpot.y)) else {
+            lastRaster = nil
             failedRaster = (fingerprint, now.isFinite ? now + 1 : 0)
             return nil
         }
@@ -183,6 +206,8 @@ final class HostCursorSampler {
             cacheOrder.removeFirst(); cachedImages.removeValue(forKey: oldest)
         }
         cachedImages[fingerprint] = value; cacheOrder.append(fingerprint)
+        lastRaster = LastRaster(imageID: imageID, representationIDs: representationIDs,
+                                size: size, hotSpot: hotSpot, fingerprint: fingerprint, image: value)
         return (fingerprint, value)
     }
 

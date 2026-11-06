@@ -943,7 +943,7 @@ public final class MediaSession: @unchecked Sendable {
             if cache?.stream != target.0 { cache = try MediaRetransmissionCache(stream: target.0, limits: bufferLimits); nextFrameID = 1 }
             let header = MediaFrameHeader(stream: target.0, frameID: nextFrameID, isIDR: isIDR)
             let frame = try MediaFrame(header: header, packet: packet)
-            let bytes = try packet.encode().count
+            let bytes = frame.packetBytes.count
             let budget = target.1 != .udp ? 5
                 : isIDR ? max(1, Double(bytes) / bytesPerSecond + roundTrip * 2 + 0.2) : max(0.25, roundTrip * 3 + 0.08)
             let fragments = try cache!.insert(frame, deadline: SessionClock.now + min(5, budget))

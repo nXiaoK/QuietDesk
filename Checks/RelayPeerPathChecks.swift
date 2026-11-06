@@ -248,6 +248,9 @@ func runRelayPeerPathChecks() {
             try check(fresh.receive(damaged, from: source, now: 0).actions.isEmpty, "Modified direct packet byte \(index) authenticated")
         }
         try check(host.sealData(Data([23, 1])) == nil, "Host sent video directly before any nomination")
+        try check(answered.count == 1 && (1...110).allSatisfy { step in
+            host.tick(now: 0.01 + Double(step) * 0.05).isEmpty
+        }, "One authenticated packet started a probe round toward an unverified source")
         let silent = try RelayPeerAgent(side: 1, leaseID: lease, secret: Data(repeating: 1, count: 32), mode: .off)
         try check(silent.receive(probe, from: source, now: 0).actions.isEmpty, "A host with assistance off answered a direct check")
     }
@@ -280,6 +283,38 @@ func runRelayPeerPathChecks() {
         try check(network.sendVideo(Data([23, 7])), "Host could not use the learned mapping")
         network.run(for: 0.1)
         try check(network.viewer.delivered == [Data([23, 7])], "Learned mapping did not deliver video")
+    }
+    run("A proved NAT remapping can replace an old peer-reflexive candidate at capacity") {
+        let network = try SimulatedPeerNetwork(viewerNAT: .symmetric, hostNAT: .fullCone, mode: .on)
+        network.announce()
+        let hostAddress = network.mapping(network.host, toward: network.relay)
+        for _ in 0..<13 {
+            network.run(for: 2)
+            let current = network.mapping(network.viewer, toward: hostAddress)
+            try check(network.bothDirect && network.host.agent.selected == current,
+                      "The host could not nominate the viewer's newly verified NAT mapping")
+            network.perform(network.viewer.agent.setMode(.off, now: network.now), by: network.viewer)
+            network.run(for: 0.2)
+            network.viewer.mappings.removeValue(forKey: hostAddress.description)
+            network.perform(network.viewer.agent.setMode(.on, now: network.now), by: network.viewer)
+        }
+    }
+    run("A late check acknowledgement cannot restart punching after either side withdraws") {
+        for hostWithdraws in [false, true] {
+            let network = try SimulatedPeerNetwork(viewerNAT: .fullCone, hostNAT: .fullCone, mode: .on)
+            network.relayLatency = 0.01
+            network.directLatency = 0.1
+            network.announce()
+            network.run(for: 0.12) // Both checks arrived; their direct replies are still in flight.
+            let side = hostWithdraws ? network.host : network.viewer
+            network.perform(side.agent.setMode(.off, now: network.now), by: side)
+            network.run(for: 0.05)
+            try check(network.host.agent.state == .relay, "Withdrawal did not stop host checks")
+            let stateCount = network.host.states.count
+            network.run(for: 0.5)
+            try check(network.host.agent.state == .relay && network.host.states.count == stateCount,
+                      "An outstanding acknowledgement restarted host probes after withdrawal")
+        }
     }
     run("Macs behind one public address meet on their LAN addresses") {
         let network = try SimulatedPeerNetwork(viewerNAT: .portRestricted, hostNAT: .portRestricted, sharedPublicIP: true)

@@ -180,6 +180,7 @@ public final class RelayPeerAgent {
         var due: TimeInterval
         var sent = 0
         var roundTrip: TimeInterval?
+        var lastReply: TimeInterval = -.infinity
     }
     private struct Pending { let target: RelayPeerAddress?; let sent: TimeInterval; let keepalive: Bool }
 
@@ -210,9 +211,9 @@ public final class RelayPeerAgent {
     private let allowLoopback: Bool
     private var phase = Phase.idle(next: nil)
     private var remotes: [Remote] = []
+    private static let maximumRemotes = 12
     private var cursor = 0
     private var pending: [UInt64: Pending] = [:]
-    private var transaction: UInt64
     private var failures = 0
     private var hostChecksUntil: TimeInterval = 0
     private var lastDirectReceive: TimeInterval = 0
@@ -236,7 +237,6 @@ public final class RelayPeerAgent {
         self.side = side; self.leaseID = leaseID; self.mode = mode; self.allowLoopback = allowLoopback; self.timing = timing
         sendKey = side == 0 ? keys.viewer : keys.host
         receiveKey = side == 0 ? keys.host : keys.viewer
-        transaction = UInt64.random(in: 1...(UInt64.max / 2))
     }
 
     // MARK: Inputs
@@ -248,7 +248,7 @@ public final class RelayPeerAgent {
             let address = RelayPeerAddress(host: host, port: candidate.port)
             if !merged.contains(where: { $0.address == address }) { merged.append(Remote(address: address, kind: candidate.kind, due: now)) }
         }
-        for learned in remotes where learned.kind == .prflx && !merged.contains(where: { $0.address == learned.address }) && merged.count < 12 {
+        for learned in remotes where learned.kind == .prflx && !merged.contains(where: { $0.address == learned.address }) && merged.count < Self.maximumRemotes {
             merged.append(learned)
         }
         let changed = Set(merged.map(\.address)) != Set(remotes.map(\.address))
@@ -270,6 +270,7 @@ public final class RelayPeerAgent {
         degradedSince = nil
         if newMode == .off {
             let actions = releaseNotice()
+            pending.removeAll()
             selected = nil; phase = .idle(next: nil); hostChecksUntil = 0
             return actions + setState(.relay)
         }
@@ -311,30 +312,14 @@ public final class RelayPeerAgent {
             return (source == nil ? nil : payload, [])
         case .check:
             guard mode != .off, payload.count == 8 else { return (nil, []) }
-            var actions: [Action] = []
             if let source {
                 lastDirectCheckReceived = now
-                learn(source, now)
-                if side == 1, selected == nil, now >= hostChecksUntil {
-                    actions += beginHostChecks(now)
-                }
-                if let index = remotes.firstIndex(where: { $0.address == source }), remotes[index].roundTrip == nil {
-                    remotes[index].due = min(remotes[index].due, now)
-                    cursor = index
-                    let checking: Bool
-                    if case .checking = phase { checking = side == 0 } else { checking = side == 1 && selected == nil && now < hostChecksUntil }
-                    if checking, !pending.values.contains(where: { !$0.keepalive && $0.target == source && now - $0.sent < timing.tick }) {
-                        let interval = max(0.1, timing.tick * Double(remotes.count))
-                        remotes[index].due = now + interval
-                        remotes[index].sent += 1
-                        cursor = (index + 1) % remotes.count
-                        actions += check(source, now, keepalive: false)
-                    }
+                if !verified(source), let challenge = newChallenge(to: source, now: now) {
+                    return (nil, challenge)
                 }
             }
-            guard let reply = seal(.checkAck, payload, viaRelay: source == nil) else { return (nil, actions) }
-            actions.append(source.map { .send(reply, $0) } ?? .sendViaRelay(reply))
-            return (nil, actions)
+            guard let reply = seal(.checkAck, payload, viaRelay: source == nil) else { return (nil, []) }
+            return (nil, [source.map { .send(reply, $0) } ?? .sendViaRelay(reply)])
         case .checkAck:
             guard let id = Self.transaction(payload), let entry = pending.removeValue(forKey: id) else { return (nil, []) }
             let roundTrip = max(0.0005, now - entry.sent)
@@ -348,14 +333,17 @@ public final class RelayPeerAgent {
                 directRoundTrip = Self.smooth(directRoundTrip, roundTrip); Self.record(&directSamples, true, limit: 40)
                 // A symmetric NAT may answer from another mapping; the completed round trip still proves the path.
                 if target == selected { lastDirectReceive = now }
-            } else if let index = remotes.firstIndex(where: { $0.address == target }) {
+            } else if let index = indexForVerifiedRemote(target, now: now) {
                 remotes[index].roundTrip = remotes[index].roundTrip.map { min($0, roundTrip) } ?? roundTrip
+                remotes[index].lastReply = now
                 if case .checking(let started, nil) = phase { phase = .checking(started: started, firstSuccess: now) }
             }
             return (nil, [])
         case .nominate:
             guard side == 1, mode != .off, let source, payload.count == 8 else { return (nil, []) }
-            learn(source, now)
+            if !verified(source) {
+                return (nil, newChallenge(to: source, now: now) ?? [])
+            }
             var actions: [Action] = []
             if selected != source {
                 selected = source; phase = .direct(since: now)
@@ -373,7 +361,7 @@ public final class RelayPeerAgent {
             return (nil, setState(.direct(kind)))
         case .release:
             if side == 1 {
-                guard selected != nil || hostChecksUntil > now else { return (nil, []) }
+                pending.removeAll()
                 selected = nil; phase = .idle(next: nil); hostChecksUntil = 0
                 return (nil, setState(.relay))
             }
@@ -551,9 +539,26 @@ public final class RelayPeerAgent {
         }
     }
 
-    private func learn(_ source: RelayPeerAddress, _ now: TimeInterval) {
-        guard !remotes.contains(where: { $0.address == source }), remotes.count < 12 else { return }
-        remotes.append(Remote(address: source, kind: .prflx, due: now))
+    private func verified(_ address: RelayPeerAddress) -> Bool {
+        selected == address || remotes.contains { $0.address == address && $0.roundTrip != nil }
+    }
+
+    // A new source gets at most one reply per incoming packet. It enters the timed
+    // probe schedule only after answering a challenge sent to that address.
+    private func newChallenge(to source: RelayPeerAddress, now: TimeInterval) -> [Action]? {
+        guard !pending.values.contains(where: { $0.target == source }) else { return nil }
+        return check(source, now, keepalive: false)
+    }
+
+    private func indexForVerifiedRemote(_ address: RelayPeerAddress, now: TimeInterval) -> Int? {
+        if let index = remotes.firstIndex(where: { $0.address == address }) { return index }
+        if remotes.count == Self.maximumRemotes {
+            let replaceable = remotes.indices.filter { remotes[$0].kind == .prflx && remotes[$0].address != selected }
+            guard let oldest = replaceable.min(by: { remotes[$0].lastReply < remotes[$1].lastReply }) else { return nil }
+            remotes.remove(at: oldest)
+        }
+        remotes.append(Remote(address: address, kind: .prflx, due: now))
+        return remotes.count - 1
     }
 
     private func releaseNotice() -> [Action] {
@@ -568,7 +573,12 @@ public final class RelayPeerAgent {
         return [.state(next)]
     }
 
-    private func nextTransaction() -> UInt64 { transaction &+= 1; return transaction }
+    private func nextTransaction() -> UInt64 {
+        // A paired peer can observe earlier IDs. Its next challenge must still be unpredictable.
+        var id: UInt64
+        repeat { id = UInt64.random(in: 1...UInt64.max) } while pending[id] != nil
+        return id
+    }
 
     private static func transaction(_ payload: Data) -> UInt64? {
         guard payload.count == 8 else { return nil }

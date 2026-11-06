@@ -187,6 +187,8 @@ public final class RelayPeerAgent {
     private var failures = 0
     private var hostChecksUntil: TimeInterval = 0
     private var lastDirectReceive: TimeInterval = 0
+    private var lastDirectCheckReceived: TimeInterval = -.infinity
+    private var lastAttemptSent: TimeInterval = -.infinity
     private var lastKeepalive: TimeInterval = 0
     private var lastRelayProbe: TimeInterval = -.infinity
     private var candidatesChanged: TimeInterval = -.infinity
@@ -226,7 +228,7 @@ public final class RelayPeerAgent {
         remotes = merged
         guard changed else { return [] }
         guard mode != .off else { return [] }
-        if side == 1 { return beginHostChecks(now) }
+        if side == 1 { return beginHostChecks(now, reset: true) }
         if case .direct = phase { return [] }
         failures = 0
         return startAttempt(now)
@@ -280,9 +282,30 @@ public final class RelayPeerAgent {
             return (source == nil ? nil : payload, [])
         case .check:
             guard mode != .off, payload.count == 8 else { return (nil, []) }
-            if let source { learn(source, now) }
-            guard let reply = seal(.checkAck, payload, viaRelay: source == nil) else { return (nil, []) }
-            return (nil, [source.map { .send(reply, $0) } ?? .sendViaRelay(reply)])
+            var actions: [Action] = []
+            if let source {
+                lastDirectCheckReceived = now
+                learn(source, now)
+                if side == 1, selected == nil, now >= hostChecksUntil {
+                    actions += beginHostChecks(now)
+                }
+                if let index = remotes.firstIndex(where: { $0.address == source }), remotes[index].roundTrip == nil {
+                    remotes[index].due = min(remotes[index].due, now)
+                    cursor = index
+                    let checking: Bool
+                    if case .checking = phase { checking = side == 0 } else { checking = side == 1 && selected == nil && now < hostChecksUntil }
+                    if checking, !pending.values.contains(where: { !$0.keepalive && $0.target == source && now - $0.sent < timing.tick }) {
+                        let interval = max(0.1, timing.tick * Double(remotes.count))
+                        remotes[index].due = now + interval
+                        remotes[index].sent += 1
+                        cursor = (index + 1) % remotes.count
+                        actions += check(source, now, keepalive: false)
+                    }
+                }
+            }
+            guard let reply = seal(.checkAck, payload, viaRelay: source == nil) else { return (nil, actions) }
+            actions.append(source.map { .send(reply, $0) } ?? .sendViaRelay(reply))
+            return (nil, actions)
         case .checkAck:
             guard let id = Self.transaction(payload), let entry = pending.removeValue(forKey: id) else { return (nil, []) }
             let roundTrip = max(0.0005, now - entry.sent)
@@ -291,12 +314,13 @@ public final class RelayPeerAgent {
                 return (nil, [])
             }
             guard source != nil else { return (nil, []) }
+            lastDirectCheckReceived = now
             if entry.keepalive {
                 directRoundTrip = Self.smooth(directRoundTrip, roundTrip); Self.record(&directSamples, true, limit: 40)
                 // A symmetric NAT may answer from another mapping; the completed round trip still proves the path.
                 if target == selected { lastDirectReceive = now }
-            } else if let index = remotes.firstIndex(where: { $0.address == target }), remotes[index].roundTrip == nil {
-                remotes[index].roundTrip = roundTrip
+            } else if let index = remotes.firstIndex(where: { $0.address == target }) {
+                remotes[index].roundTrip = remotes[index].roundTrip.map { min($0, roundTrip) } ?? roundTrip
                 if case .checking(let started, nil) = phase { phase = .checking(started: started, firstSuccess: now) }
             }
             return (nil, [])
@@ -349,6 +373,11 @@ public final class RelayPeerAgent {
             return now >= until ? startAttempt(now) : []
         case .checking(let started, let firstSuccess):
             var actions = dueCheck(now)
+            if firstSuccess == nil, lastDirectCheckReceived < started,
+               now - lastAttemptSent >= 0.5, now - started < timing.attempt - 1 {
+                lastAttemptSent = now
+                if let packet = seal(.attempt, Data(), viaRelay: true) { actions.append(.sendViaRelay(packet)) }
+            }
             if now - lastRelayProbe >= timing.checkingRelayProbe { actions += probeRelay(now) }
             if let firstSuccess, let best = remotes.filter({ $0.roundTrip != nil }).min(by: { $0.roundTrip! < $1.roundTrip! }) {
                 let settled = now - firstSuccess >= timing.grace || remotes.allSatisfy { $0.roundTrip != nil }
@@ -388,6 +417,7 @@ public final class RelayPeerAgent {
         guard !remotes.isEmpty else { phase = .idle(next: nil); return [] }
         reschedule(now); pending.removeAll(); selected = nil
         phase = .checking(started: now, firstSuccess: nil)
+        lastAttemptSent = now
         // Ask the host to punch toward us at the same time; one-sided checks cannot open port-restricted NATs.
         var actions = seal(.attempt, Data(), viaRelay: true).map { [Action.sendViaRelay($0)] } ?? []
         actions += setState(.checking)
@@ -428,9 +458,12 @@ public final class RelayPeerAgent {
 
     // MARK: Host
 
-    private func beginHostChecks(_ now: TimeInterval) -> [Action] {
-        hostChecksUntil = now + timing.attempt
-        reschedule(now)
+    private func beginHostChecks(_ now: TimeInterval, reset: Bool = false) -> [Action] {
+        let alreadyChecking = now < hostChecksUntil
+        hostChecksUntil = max(hostChecksUntil, now + timing.attempt)
+        if reset || !alreadyChecking {
+            reschedule(now)
+        }
         return (selected == nil ? setState(.checking) : []) + hostTick(now)
     }
 
@@ -459,12 +492,15 @@ public final class RelayPeerAgent {
         guard !remotes.isEmpty else { return [] }
         let interval = max(0.1, timing.tick * Double(remotes.count))
         let limit = Int((timing.attempt / interval).rounded(.up))
-        for offset in 0..<remotes.count {
-            let index = (cursor + offset) % remotes.count
-            guard remotes[index].roundTrip == nil, remotes[index].due <= now, remotes[index].sent < limit else { continue }
-            remotes[index].due = now + interval; remotes[index].sent += 1
-            cursor = (index + 1) % remotes.count
-            return check(remotes[index].address, now, keepalive: false)
+        for pass in 0..<2 {
+            for offset in 0..<remotes.count {
+                let index = (cursor + offset) % remotes.count
+                guard (pass == 0) == (remotes[index].roundTrip == nil),
+                      remotes[index].due <= now, remotes[index].sent < limit else { continue }
+                remotes[index].due = now + interval; remotes[index].sent += 1
+                cursor = (index + 1) % remotes.count
+                return check(remotes[index].address, now, keepalive: false)
+            }
         }
         return []
     }
@@ -713,6 +749,7 @@ final class RelayAssistedPipe: RelayDatagramPipe {
     private var agent: RelayPeerAgent?
     private var secret: Data?
     private var peerCandidates: [RelayCandidate]?
+    private var pendingRelayPackets: [Data] = []
     private var lastConsent: [RelayCandidate]?
     private var sequence: UInt64 = 0
     private var replay = RelayReplayWindow()
@@ -795,6 +832,14 @@ final class RelayAssistedPipe: RelayDatagramPipe {
         self.agent = agent
         consent(localCandidates(port: socket.port))
         if let peerCandidates { perform(agent.updateCandidates(peerCandidates, now: SessionClock.now)) }
+        if !pendingRelayPackets.isEmpty {
+            let buffered = pendingRelayPackets
+            pendingRelayPackets.removeAll()
+            let now = SessionClock.now
+            for packet in buffered {
+                perform(agent.receive(packet, from: nil, now: now).actions)
+            }
+        }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + timing.tick, repeating: timing.tick)
         timer.setEventHandler { [weak self] in
@@ -831,7 +876,11 @@ final class RelayAssistedPipe: RelayDatagramPipe {
                   replay.accept(packet.sequence), !packet.payload.isEmpty else { return }
             // DTLS records begin with a content type of 20-25, never the "QDP1" magic.
             if RelayPeerAgent.isPeerPacket(packet.payload) {
-                if let agent { perform(agent.receive(packet.payload, from: nil, now: SessionClock.now).actions) }
+                if let agent {
+                    perform(agent.receive(packet.payload, from: nil, now: SessionClock.now).actions)
+                } else if pendingRelayPackets.count < 4 {
+                    pendingRelayPackets.append(packet.payload)
+                }
                 return
             }
             counter.record(relayed: packet.payload.count)

@@ -25,6 +25,7 @@ private final class SimulatedPeerNetwork {
     let host: Endpoint
     var directLatency: TimeInterval = 0.02
     var relayLatency: TimeInterval = 0.06
+    var dropNextRelayPackets = 0
     var blackhole = false
     var sameLAN = false
     private(set) var milliseconds = 0
@@ -65,6 +66,10 @@ private final class SimulatedPeerNetwork {
             switch action {
             case .state(let state): sender.states.append(state)
             case .sendViaRelay(let data):
+                if dropNextRelayPackets > 0 {
+                    dropNextRelayPackets -= 1
+                    continue
+                }
                 schedule(relayLatency) { [self] in
                     let result = peer.agent.receive(data, from: nil, now: now)
                     perform(result.actions, by: peer)
@@ -302,5 +307,34 @@ func runRelayPeerPathChecks() {
         refusing.perform(refusing.host.agent.setMode(.off, now: refusing.now), by: refusing.host)
         refusing.run(for: 1)
         try check(refusing.viewer.agent.selected == nil && refusing.host.agent.selected == nil, "Host turning assistance off was ignored")
+    }
+    run("Port-restricted NATs still punch when candidates arrive asynchronously or initial attempt drops") {
+        let network = try SimulatedPeerNetwork(viewerNAT: .portRestricted, hostNAT: .portRestricted)
+        let viewerMapping = network.mapping(network.viewer, toward: network.relay)
+        let hostMapping = network.mapping(network.host, toward: network.relay)
+        network.dropNextRelayPackets = 1
+        network.perform(network.viewer.agent.updateCandidates([
+            RelayCandidate(kind: .srflx, address: hostMapping.host, port: hostMapping.port),
+            RelayCandidate(kind: .host, address: network.host.privateAddress.host, port: network.host.privateAddress.port),
+        ], now: network.now), by: network.viewer)
+        network.run(for: 0.35)
+        network.perform(network.host.agent.updateCandidates([
+            RelayCandidate(kind: .srflx, address: viewerMapping.host, port: viewerMapping.port),
+            RelayCandidate(kind: .host, address: network.viewer.privateAddress.host, port: network.viewer.privateAddress.port),
+        ], now: network.now), by: network.host)
+        network.run(for: 2.0)
+        try check(network.bothDirect && network.viewer.agent.state == .direct(.srflx),
+                  "Asynchronous candidates or dropped initial attempt prevented punching: \(network.viewer.states)")
+    }
+    run("Automatic mode ignores a single burst-inflated initial direct sample when subsequent checks are fast") {
+        let network = try SimulatedPeerNetwork(viewerNAT: .portRestricted, hostNAT: .portRestricted)
+        network.relayLatency = 0.03
+        network.directLatency = 0.09
+        network.announce()
+        network.run(for: 0.05)
+        network.directLatency = 0.015
+        network.run(for: 2.0)
+        try check(network.bothDirect && network.viewer.agent.state == .direct(.srflx),
+                  "Initial burst jitter falsely rejected direct path: \(network.viewer.states)")
     }
 }

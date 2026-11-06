@@ -1213,10 +1213,11 @@ final class DeskModel: ObservableObject {
                         let media = try MediaSession.host(control: candidate, key: key, port: listeningPort, settings: settings,
                                                           relayRouting: true)
                         // Video may arrive through any node, also when control came directly.
-                        media.isRelayedDatagram = { endpoint in relayRegistrations.contains { $0.ownsLocalDatagramEndpoint(endpoint) } }
-                        media.onRelayedDatagramAuthenticated = { endpoint, secret in
-                            relayRegistrations.first { $0.ownsLocalDatagramEndpoint(endpoint) }?
-                                .enablePeerAssist(localDatagramEndpoint: endpoint, secret: secret)
+                        media.hostDatagramBinding = { endpoint in
+                            for registration in relayRegistrations {
+                                if let binding = registration.datagramBinding(for: endpoint) { return binding }
+                            }
+                            return nil
                         }
                         media.diagnostics = diagnostics
                         host.media = media

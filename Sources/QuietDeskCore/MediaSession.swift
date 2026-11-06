@@ -58,9 +58,10 @@ public final class MediaSession: @unchecked Sendable {
     public var onLocalNetwork: ((Bool) -> Void)?
     public var prepareAlternateDatagramPath: ((@escaping (DatagramEndpoint?) -> Void) -> Void)?
     public var onDatagramPathRetired: (() -> Void)?
-    public var isRelayedDatagram: ((NWEndpoint) -> Bool)?
+    // Resolve the host lease at admission, before DTLS authentication can outlive that lease.
+    public var hostDatagramBinding: ((NWEndpoint) -> ((Data) -> Void)?)?
     public var onReliablePathFailure: (() -> Void)?
-    // On the media queue, once per relayed DTLS flow after it passed the session-key handshake and a
+    // Viewer only, once per relayed DTLS flow after it passed the session-key handshake and a
     // challenge in both directions. The secret lets the relay bridges authenticate a direct path.
     public var onRelayedDatagramAuthenticated: ((NWEndpoint, Data) -> Void)?
     // Viewer only, on the media queue, once per sample window: the share of UDP video fragments that
@@ -126,6 +127,7 @@ public final class MediaSession: @unchecked Sendable {
     private var alternateEndpoint: DatagramEndpoint?
     private var reliableDeliveryFailures = 0
     private var reliableFailureNotified = false
+    private var hostAssist: ((Data) -> Void)?
     private var udpRelayed = false
     private var settings: StreamSettings
     private var stopped = false
@@ -618,6 +620,7 @@ public final class MediaSession: @unchecked Sendable {
                 let address: String?
                 if case .hostPort(let host, _) = connection.endpoint { address = host.debugDescription } else { address = nil }
                 guard let reservation = admission.reserve(address: address, now: SessionClock.now) else { connection.cancel(); return }
+                let binding = self.hostDatagramBinding?(connection.endpoint)
                 self.queue.async { [weak self] in
                     guard let self, !self.stopped,
                           self.udpPeer == nil || self.relayRoutingNegotiated && self.pendingDatagramPeers.count < 2 else {
@@ -626,7 +629,7 @@ public final class MediaSession: @unchecked Sendable {
                     do {
                         let peer = try BoundedDatagramPeer(connection: connection,
                             maximumDatagramBytes: MediaFragment.maximumDatagramBytes + 1, queue: self.queue)
-                        if self.udpPeer == nil { self.installDatagram(peer, release: { admission.release(reservation) }) }
+                        if self.udpPeer == nil { self.installDatagram(peer, hostBinding: binding, release: { admission.release(reservation) }) }
                         else {
                             let id = ObjectIdentifier(peer)
                             self.pendingDatagramPeers[id] = peer
@@ -635,7 +638,7 @@ public final class MediaSession: @unchecked Sendable {
                                 guard let self, let peer, !self.stopped,
                                       self.pendingDatagramPeers.removeValue(forKey: id) === peer else { return }
                                 let previous = self.udpPeer
-                                self.installDatagram(peer, start: false)
+                                self.installDatagram(peer, hostBinding: binding, start: false)
                                 previous?.close("已认证的新媒体路径替代旧路径")
                             }
                             peer.onClose = { [weak self] _ in
@@ -761,12 +764,12 @@ public final class MediaSession: @unchecked Sendable {
         }
     }
 
-    private func installDatagram(_ peer: BoundedDatagramPeer, start: Bool = true, release: @escaping () -> Void = {}) {
+    private func installDatagram(_ peer: BoundedDatagramPeer, hostBinding: ((Data) -> Void)? = nil, start: Bool = true, release: @escaping () -> Void = {}) {
+        if side == .host { hostAssist = hostBinding; udpRelayed = hostBinding != nil }
         udpPeer = peer; udpVerified = false; receivedChallenge = false; challenge = nil; lastPongAt = 0
         peer.onReady = { [weak self, weak peer] in
             release()
             guard let self, let peer, !self.stopped, self.udpPeer === peer else { return }
-            if self.side == .host { self.udpRelayed = self.isRelayedDatagram?(peer.endpoint) == true }
             self.sendPing()
         }
         peer.onDatagram = { [weak self, weak peer] data in
@@ -785,10 +788,7 @@ public final class MediaSession: @unchecked Sendable {
             }
         }
         if start { peer.start() }
-        else {
-            udpRelayed = isRelayedDatagram?(peer.endpoint) == true
-            sendPing()
-        }
+        else { sendPing() }
     }
 
     private func startUDP() {
@@ -863,12 +863,11 @@ public final class MediaSession: @unchecked Sendable {
 
     private func verifiedUDP(receivedPong: Bool = true) {
         udpVerified = true
-        if side == .host, !udpRelayed, let peer = udpPeer {
-            udpRelayed = isRelayedDatagram?(peer.endpoint) == true
-        }
         if udpRelayed, let peer = udpPeer, assistAnnouncedPeer !== peer, let datagramKey, let sessionID {
             assistAnnouncedPeer = peer
-            onRelayedDatagramAuthenticated?(peer.endpoint, Self.peerAssistSecret(datagramKey: datagramKey, sessionID: sessionID))
+            let secret = Self.peerAssistSecret(datagramKey: datagramKey, sessionID: sessionID)
+            if side == .host { hostAssist?(secret) }
+            else { onRelayedDatagramAuthenticated?(peer.endpoint, secret) }
         }
         if side == .viewer {
             if receivedPong { policy.receivedPong(epoch: policy.epoch, now: SessionClock.now) }

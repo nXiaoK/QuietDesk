@@ -5,6 +5,34 @@ public enum RelayRegistrationStatus {
     case connecting, online, failed(Error)
 }
 
+// A binding is captured when a DTLS peer is admitted. Only the registration queue
+// mutates leases, so its queued authentication cannot race a removal or port reuse.
+final class RelayHostDatagramBindings {
+    private let queue: DispatchQueue
+    private let lock = NSLock()
+    private var leases: [UUID: (port: UInt16, activate: (Data) -> Void)] = [:]
+
+    init(queue: DispatchQueue) { self.queue = queue }
+
+    func record(_ lease: UUID, port: UInt16, activate: @escaping (Data) -> Void) {
+        lock.withLock { leases[lease] = (port, activate) }
+    }
+
+    func remove(_ lease: UUID) { _ = lock.withLock { leases.removeValue(forKey: lease) } }
+    func removeAll() { lock.withLock { leases.removeAll() } }
+
+    func binding(for port: UInt16) -> ((Data) -> Void)? {
+        guard let lease = lock.withLock({ leases.first { $0.value.port == port }?.key }) else { return nil }
+        return { [weak self] secret in
+            guard let self else { return }
+            queue.async {
+                let current = self.lock.withLock { self.leases[lease] }
+                if let current, current.port == port { current.activate(secret) }
+            }
+        }
+    }
+}
+
 public final class RelayHostRegistration: @unchecked Sendable {
     public var onStatus: ((RelayRegistrationStatus) -> Void)?
     /// Outer path of the most recently authenticated assisted video route; reported on the registration queue.
@@ -17,7 +45,7 @@ public final class RelayHostRegistration: @unchecked Sendable {
     private let localPort: UInt16
     private let authorities: [Data]
     private let trustedCertificate: RelayNodeCertificate?
-    private let queue = DispatchQueue(label: "quietdesk.relay-host", qos: .userInitiated)
+    private let queue: DispatchQueue
     private var channel: RelayTLSChannel?
     private var heartbeat: DispatchSourceTimer?
     private var registration: String?
@@ -29,7 +57,7 @@ public final class RelayHostRegistration: @unchecked Sendable {
     private var routes: [Data: HostDatagramRoute] = [:]
     private let endpointLock = NSLock()
     private var localSources: [UUID: UInt16] = [:]
-    private var datagramSources: [Data: UInt16] = [:]
+    private let datagramBindings: RelayHostDatagramBindings
     private var peerAssist: RelayPeerAssistMode
     private let peerInterfaceCandidates: Bool
     private var peerPath = RelayPeerPathState.relay
@@ -38,6 +66,8 @@ public final class RelayHostRegistration: @unchecked Sendable {
                 certificateAuthorities: [Data] = [], trustedCertificate: RelayNodeCertificate? = nil,
                 peerAssist: RelayPeerAssistMode = .off, peerInterfaceCandidates: Bool = true) throws {
         guard accessKey.count == 32, ownerKey.count == 32, localPort > 0 else { throw RelayServiceError.invalid }
+        queue = DispatchQueue(label: "quietdesk.relay-host", qos: .userInitiated)
+        datagramBindings = RelayHostDatagramBindings(queue: queue)
         self.endpoint = endpoint; self.accessKey = accessKey; self.deviceID = deviceID
         self.ownerKey = ownerKey; self.localPort = localPort; authorities = certificateAuthorities
         self.trustedCertificate = trustedCertificate; self.peerAssist = peerAssist
@@ -71,21 +101,8 @@ public final class RelayHostRegistration: @unchecked Sendable {
         return port.rawValue
     }
 
-    /// The host media session authenticated the relayed DTLS flow arriving from `localDatagramEndpoint`.
-    public func enablePeerAssist(localDatagramEndpoint endpoint: NWEndpoint, secret: Data) {
-        guard let port = Self.loopbackPort(of: endpoint) else { return }
-        queue.async { [self] in
-            for (id, route) in routes {
-                if let localPort = route.localEndpointPort {
-                    endpointLock.withLock { datagramSources[id] = localPort }
-                }
-            }
-            if let id = endpointLock.withLock({ datagramSources.first { $0.value == port }?.key }) {
-                routes[id]?.enableAssist(secret: secret)
-            } else if routes.count == 1, let route = routes.values.first {
-                route.enableAssist(secret: secret)
-            }
-        }
+    public func datagramBinding(for endpoint: NWEndpoint) -> ((Data) -> Void)? {
+        Self.loopbackPort(of: endpoint).flatMap { datagramBindings.binding(for: $0) }
     }
 
     /// Automatic/on switch immediately; turning assistance back on after "off" needs a new registration.
@@ -101,11 +118,6 @@ public final class RelayHostRegistration: @unchecked Sendable {
     public func ownsLocalEndpoint(_ endpoint: NWEndpoint) -> Bool {
         guard let port = Self.loopbackPort(of: endpoint) else { return false }
         return endpointLock.withLock { localSources.values.contains(port) }
-    }
-
-    public func ownsLocalDatagramEndpoint(_ endpoint: NWEndpoint) -> Bool {
-        guard let port = Self.loopbackPort(of: endpoint) else { return false }
-        return endpointLock.withLock { datagramSources.values.contains(port) }
     }
 
     public func start() {
@@ -197,13 +209,14 @@ public final class RelayHostRegistration: @unchecked Sendable {
                             connection.send(RelayMessage(.assist, datagramID: id, candidates: candidates))
                         }
                         route.onPathState = { [weak self] state in self?.reportPeerPath(state) }
-                        route.onLocalReady = { [weak self] connection in
+                        let lease = UUID()
+                        route.onLocalReady = { [weak self, weak route] connection in
                             guard let self, let port = Self.localEndpointPort(of: connection) else { return }
-                            self.endpointLock.withLock { self.datagramSources[id] = port }
+                            self.datagramBindings.record(lease, port: port) { [weak route] secret in route?.enableAssist(secret: secret) }
                         }
                         route.onClose = { [weak self, weak route] in
                             guard let self, let route, self.routes[id] === route else { return }
-                            self.endpointLock.withLock { _ = self.datagramSources.removeValue(forKey: id) }
+                            self.datagramBindings.remove(lease)
                             self.routes.removeValue(forKey: id)
                             if route.assisted { self.reportPeerPath(.relay) }
                         }
@@ -238,7 +251,8 @@ public final class RelayHostRegistration: @unchecked Sendable {
     private func closeRoutes() {
         let forwards = Array(forwarders.values); forwarders.removeAll()
         let datagrams = Array(routes.values); routes.removeAll()
-        endpointLock.withLock { localSources.removeAll(); datagramSources.removeAll() }
+        endpointLock.withLock { localSources.removeAll() }
+        datagramBindings.removeAll()
         for forward in forwards { forward.close() }
         for route in datagrams { route.close() }
     }
@@ -264,10 +278,6 @@ private final class HostDatagramRoute {
         get { assistedPipe?.onPathState } set { assistedPipe?.onPathState = newValue }
     }
     var assisted: Bool { assistedPipe != nil }
-    var localEndpointPort: UInt16? {
-        guard case .hostPort(_, let port) = local.currentPath?.localEndpoint, port.rawValue > 0 else { return nil }
-        return port.rawValue
-    }
     private let pipe: RelayDatagramPipe
     private let assistedPipe: RelayAssistedPipe?
     private let local: NWConnection

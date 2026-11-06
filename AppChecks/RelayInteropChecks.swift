@@ -187,7 +187,7 @@ private func exerciseMixedRelay(_ fixture: Fixture, drop: Bool, blocked: Bool = 
             do {
                 let media = try MediaSession.host(control: peer, key: key, port: hostPort.read(), settings: settings, relayRouting: true)
                 host.update { $0 = media }
-                media.isRelayedDatagram = { agentBox.read()?.ownsLocalDatagramEndpoint($0) == true }
+                media.hostDatagramBinding = { agentBox.read()?.datagramBinding(for: $0) }
                 media.onPrepareRecovery = { $0(true) }
                 media.onProduceRecoveryFrame = { [weak media] in
                     sequence.update { $0 += 1 }; media?.sendVideo(relayPacket(sequence.read(), idr: true))
@@ -329,10 +329,7 @@ private func exerciseAssistedRelay(_ fixture: Fixture) throws {
             do {
                 let media = try MediaSession.host(control: peer, key: key, port: hostPort.read(), settings: settings)
                 hostMedia.update { $0 = media }
-                media.isRelayedDatagram = { hostAgent.read()?.ownsLocalDatagramEndpoint($0) == true }
-                media.onRelayedDatagramAuthenticated = { endpoint, secret in
-                    hostAgent.read()?.enablePeerAssist(localDatagramEndpoint: endpoint, secret: secret)
-                }
+                media.hostDatagramBinding = { hostAgent.read()?.datagramBinding(for: $0) }
                 media.onPrepareRecovery = { $0(true) }
                 media.onProduceRecoveryFrame = { [weak media] in
                     sequence.update { $0 += 1 }; media?.sendVideo(relayPacket(sequence.read(), idr: true))

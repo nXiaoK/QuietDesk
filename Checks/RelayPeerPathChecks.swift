@@ -1,6 +1,6 @@
 import Foundation
 import Network
-import QuietDeskCore
+@testable import QuietDeskCore
 
 // Drives the real RelayPeerAgent through a synthetic two-NAT network with a millisecond clock.
 private final class SimulatedPeerNetwork {
@@ -132,6 +132,22 @@ private final class SimulatedPeerNetwork {
 }
 
 func runRelayPeerPathChecks() {
+    run("A delayed DTLS authentication stays bound to its admitted relay lease") {
+        let queue = DispatchQueue(label: "relay-lease-test")
+        let bindings = RelayHostDatagramBindings(queue: queue)
+        let first = UUID(), second = UUID()
+        var deliveries: [Data] = []
+        try queue.sync {
+            bindings.record(first, port: 51000) { deliveries.append($0) }
+            guard let stale = bindings.binding(for: 51000) else { throw CheckFailure("Missing original binding") }
+            stale(Data([1]))
+            bindings.remove(first)
+            bindings.record(second, port: 51000) { deliveries.append($0) }
+            bindings.binding(for: 51000)?(Data([2]))
+        }
+        queue.sync {}
+        try check(deliveries == [Data([2])], "Authentication crossed a lease replacement on the same port")
+    }
     run("Assisted relay messages stay optional, bounded and limited to literal addresses") {
         let id = Data(repeating: 1, count: 16)
         let legacy = try JSONEncoder().encode(RelayMessage(.datagram, accessKey: Data(count: 32), deviceID: UUID()))

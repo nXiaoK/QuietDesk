@@ -401,6 +401,9 @@ public final class RelayPeerAgent {
                 let relayKnown = relayRoundTrip != nil || mode == .on || now - firstSuccess >= timing.relayWait
                 guard settled, relayKnown else { return actions }
                 if mode == .automatic, let relay = relayRoundTrip, Self.slower(best.roundTrip!, than: relay) {
+                    // With a single candidate, allSatisfy is true on the first reply. Let later
+                    // probes correct startup jitter before committing to the relay retry interval.
+                    if remotes.count == 1, now - firstSuccess < timing.grace { return actions }
                     phase = .relayPreferred(until: now + timing.reevaluate)
                     return actions + setState(.relayFaster)
                 }

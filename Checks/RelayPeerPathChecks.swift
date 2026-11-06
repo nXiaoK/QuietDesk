@@ -52,12 +52,18 @@ private final class SimulatedPeerNetwork {
     }
 
     /// The node announces each side's relay-facing mapping plus the other side's interface address.
-    func announce() {
-        let viewerMapping = mapping(viewer, toward: relay), hostMapping = mapping(host, toward: relay)
-        perform(viewer.agent.updateCandidates([RelayCandidate(kind: .srflx, address: hostMapping.host, port: hostMapping.port),
-                                               RelayCandidate(kind: .host, address: host.privateAddress.host, port: host.privateAddress.port)], now: now), by: viewer)
-        perform(host.agent.updateCandidates([RelayCandidate(kind: .srflx, address: viewerMapping.host, port: viewerMapping.port),
-                                             RelayCandidate(kind: .host, address: viewer.privateAddress.host, port: viewer.privateAddress.port)], now: now), by: host)
+    func announce(includeInterfaceCandidates: Bool = true) {
+        func candidates(for endpoint: Endpoint) -> [RelayCandidate] {
+            let mapped = mapping(endpoint, toward: relay)
+            var result = [RelayCandidate(kind: .srflx, address: mapped.host, port: mapped.port)]
+            if includeInterfaceCandidates {
+                result.append(RelayCandidate(kind: .host, address: endpoint.privateAddress.host, port: endpoint.privateAddress.port))
+            }
+            return result
+        }
+        let viewerCandidates = candidates(for: viewer), hostCandidates = candidates(for: host)
+        perform(viewer.agent.updateCandidates(hostCandidates, now: now), by: viewer)
+        perform(host.agent.updateCandidates(viewerCandidates, now: now), by: host)
     }
 
     func perform(_ actions: [RelayPeerAgent.Action], by sender: Endpoint) {
@@ -394,6 +400,19 @@ func runRelayPeerPathChecks() {
         network.run(for: 2.0)
         try check(network.bothDirect && network.viewer.agent.state == .direct(.srflx),
                   "Asynchronous candidates or dropped initial attempt prevented punching: \(network.viewer.states)")
+    }
+    run("One mapped candidate survives a slow first RTT but yields to a consistently faster relay") {
+        for recovers in [true, false] {
+            let network = try SimulatedPeerNetwork(viewerNAT: .portRestricted, hostNAT: .portRestricted)
+            network.relayLatency = 0.02; network.directLatency = 0.08
+            network.announce(includeInterfaceCandidates: false)
+            network.run(for: 0.20)
+            try check(network.viewer.agent.state == .checking, "One slow direct sample prematurely selected the relay")
+            if recovers { network.directLatency = 0.01 }
+            network.run(for: 0.8)
+            let chosen = recovers ? network.bothDirect : network.viewer.agent.state == .relayFaster
+            try check(chosen, "The single candidate did not settle after the sampling grace period")
+        }
     }
     run("Automatic mode ignores a single burst-inflated initial direct sample when subsequent checks are fast") {
         let network = try SimulatedPeerNetwork(viewerNAT: .portRestricted, hostNAT: .portRestricted)

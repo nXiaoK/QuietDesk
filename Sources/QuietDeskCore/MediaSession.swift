@@ -122,6 +122,8 @@ public final class MediaSession: @unchecked Sendable {
     private let relayRoutingEnabled: Bool
     private let initialDatagramRelayed: Bool
     private var relayRoutingNegotiated = false
+    private var viewerAcceptsMarkedRepairs = false
+    private static let repairedFragmentKind: UInt8 = 5
     private var alternateRequested = false
     private var alternateProbePending = false
     private var alternateRetryDeferred = false
@@ -257,7 +259,7 @@ public final class MediaSession: @unchecked Sendable {
             self.timer = timer; timer.resume()
             if self.side == .viewer {
                 self.sendControl(MediaControl(.request, relayRouting: self.relayRoutingEnabled ? true : nil,
-                                              receiveFrameWindow: MediaBufferLimits.receiveFrameWindow))
+                                              receiveFrameWindow: MediaBufferLimits.receiveFrameWindow, markedRepairs: true))
                 self.onState?("正在优化传输")
             }
         }
@@ -474,6 +476,7 @@ public final class MediaSession: @unchecked Sendable {
         if value.operation == .request {
             guard side == .host else { throw DeskError.invalid("媒体能力请求方向无效") }
             if sessionID != nil { if offerSent { sendOffer() }; return }
+            viewerAcceptsMarkedRepairs = value.markedRepairs == true
             relayRoutingNegotiated = relayRoutingEnabled && value.relayRouting == true
             let identifier = UUID(), token = try randomBytes(32), sessionKey = try randomBytes(32)
             sessionID = identifier; bindingToken = token; datagramKey = sessionKey
@@ -847,12 +850,12 @@ public final class MediaSession: @unchecked Sendable {
                 roundTrip = max(0.001, min(2, measured))
                 recordDuration(.mediaRoundTrip, seconds: measured)
                 if receivedChallenge { verifiedUDP() }
-            case 3:
+            case 3, Self.repairedFragmentKind:
                 guard side == .viewer, udpVerified else { return }
                 let fragment = try MediaFragment.decode(Data(data.dropFirst()))
                 guard fragment.header.stream == expectedStream else { return }
                 samplePackets += 1; sampleBytes += data.count; lastVideoAt = SessionClock.now
-                handleReceiveEvents(try receiver?.receive(fragment) ?? [])
+                handleReceiveEvents(try receiver?.receive(fragment, isRepair: kind == Self.repairedFragmentKind) ?? [])
             case 4:
                 guard side == .host, udpVerified else { return }
                 receiveFeedback(try MediaFeedback.decode(Data(data.dropFirst())))
@@ -1119,7 +1122,8 @@ public final class MediaSession: @unchecked Sendable {
         let bytes = fragments.reduce(0) { $0 + $1.encode().count + 1 }
         guard bytes <= 32 * 1024 * 1024 - pendingDatagramBytes else { requestRecovery(); return }
         for fragment in fragments {
-            var data = Data([3]); data.append(fragment.encode())
+            var data = Data([repair && viewerAcceptsMarkedRepairs ? Self.repairedFragmentKind : 3])
+            data.append(fragment.encode())
             pendingDatagrams.append(Datagram(header: fragment.header, fragmentIndex: fragment.fragmentIndex,
                                              data: data, repair: repair)); pendingDatagramBytes += data.count
         }

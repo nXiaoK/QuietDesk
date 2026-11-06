@@ -18,6 +18,7 @@ public struct MediaControl: Codable, Sendable {
     public let relayRouting: Bool?
     // Advertised by the viewer in its request. Older viewers accept three outstanding frames.
     public let receiveFrameWindow: Int?
+    public let markedRepairs: Bool?
     // Host stats only: how far recent frame delivery (send to reassembly) exceeds its recent minimum.
     public let deliveryMilliseconds: Double?
 
@@ -25,13 +26,14 @@ public struct MediaControl: Codable, Sendable {
                 datagramKey: Data? = nil, role: MediaChannelRole? = nil, transactionID: UUID? = nil,
                 transportEpoch: UInt32? = nil, codecEpoch: UInt32? = nil, path: String? = nil,
                 mediaFailure: Bool? = nil, encodeMilliseconds: Double? = nil, relayRouting: Bool? = nil,
-                deliveryMilliseconds: Double? = nil, receiveFrameWindow: Int? = nil) {
+                deliveryMilliseconds: Double? = nil, receiveFrameWindow: Int? = nil, markedRepairs: Bool? = nil) {
         self.operation = operation; self.sessionID = sessionID; self.token = token
         self.datagramKey = datagramKey; self.role = role; self.transactionID = transactionID
         self.transportEpoch = transportEpoch; self.codecEpoch = codecEpoch; self.path = path
         self.mediaFailure = mediaFailure; self.encodeMilliseconds = encodeMilliseconds
         self.relayRouting = relayRouting; self.deliveryMilliseconds = deliveryMilliseconds
         self.receiveFrameWindow = receiveFrameWindow
+        self.markedRepairs = markedRepairs
     }
 
     public func validate() throws {
@@ -40,6 +42,7 @@ public struct MediaControl: Codable, Sendable {
               mediaFailure == nil || operation == .abort || operation == .recover,
               relayRouting == nil || operation == .request || operation == .offer,
               receiveFrameWindow.map({ operation == .request && $0 > 0 }) ?? true,
+              markedRepairs == nil || operation == .request,
               encodeMilliseconds == nil || operation == .stats,
               deliveryMilliseconds.map({ operation == .stats && $0.isFinite && (0...60_000).contains($0) }) ?? true else {
             throw DeskError.invalid("媒体协商参数无效")

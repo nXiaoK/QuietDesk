@@ -110,9 +110,10 @@ public final class MediaFrameReassembler {
         var lastProgressAt: TimeInterval
         var highestReceivedAt: TimeInterval
         var lastNackAt: TimeInterval?
+        var requestedThroughTail = false
         var bytes: Data
         var received: [Bool]
-        var requested: [Bool]
+        var late: [Bool]
         var receivedCount = 0
         var highestReceivedIndex = -1
         var frame: MediaFrame?
@@ -128,7 +129,7 @@ public final class MediaFrameReassembler {
             highestReceivedAt = now
             bytes = Data(count: totalBytes)
             received = Array(repeating: false, count: fragmentCount)
-            requested = Array(repeating: false, count: fragmentCount)
+            late = Array(repeating: false, count: fragmentCount)
         }
 
         init(_ frame: MediaFrame, bytes: Data, now: TimeInterval) {
@@ -141,7 +142,7 @@ public final class MediaFrameReassembler {
             highestReceivedAt = now
             self.bytes = bytes
             received = Array(repeating: true, count: fragmentCount)
-            requested = Array(repeating: false, count: fragmentCount)
+            late = Array(repeating: false, count: fragmentCount)
             receivedCount = fragmentCount
             highestReceivedIndex = fragmentCount - 1
             self.frame = frame
@@ -187,7 +188,7 @@ public final class MediaFrameReassembler {
         for assembly in assemblies.values where assembly.fragmented && assembly.frame == nil {
             let end = now - assembly.lastProgressAt >= limits.reorderDelay ? assembly.fragmentCount : assembly.highestReceivedIndex + 1
             settledFragments += end
-            lateFragments += (0..<end).lazy.filter { !assembly.received[$0] || assembly.requested[$0] }.count
+            lateFragments += (0..<end).lazy.filter { !assembly.received[$0] || assembly.late[$0] }.count
         }
         assemblies.removeAll()
         bufferedBytes = 0
@@ -209,7 +210,7 @@ public final class MediaFrameReassembler {
         lastAcknowledgementAt = nil
     }
 
-    public func receive(_ fragment: MediaFragment) throws -> [MediaReceiveEvent] {
+    public func receive(_ fragment: MediaFragment, isRepair: Bool = false) throws -> [MediaReceiveEvent] {
         guard fragment.header.stream == stream, !requiresRecovery else { return [] }
         let now = currentTime()
         var events = expire(at: now)
@@ -252,11 +253,11 @@ public final class MediaFrameReassembler {
             assembly.bytes.replaceSubrange(range, with: fragment.payload)
             assembly.received[index] = true
             assembly.receivedCount += 1
+            let reorderedLate = index < assembly.highestReceivedIndex && now - assembly.highestReceivedAt >= limits.reorderDelay
+            if reorderedLate || (isRepair && assembly.requestedThroughTail) { assembly.late[index] = true }
             if index > assembly.highestReceivedIndex {
                 assembly.highestReceivedIndex = index
                 assembly.highestReceivedAt = now
-            } else if now - assembly.highestReceivedAt >= limits.reorderDelay {
-                assembly.requested[index] = true
             }
             assembly.lastProgressAt = now
             if assembly.receivedCount == assembly.fragmentCount {
@@ -264,7 +265,7 @@ public final class MediaFrameReassembler {
                     assembly.frame = try MediaFrame(header: assembly.header, packetBytes: assembly.bytes)
                     assembly.completedAt = now
                     settledFragments += assembly.fragmentCount
-                    lateFragments += assembly.requested.lazy.filter { $0 }.count
+                    lateFragments += assembly.late.lazy.filter { $0 }.count
                 } catch {
                     _ = invalidate(at: fragment.header)
                     throw error
@@ -338,12 +339,16 @@ public final class MediaFrameReassembler {
             let missing = assembly.missingRanges(includeTail: includeTail)
             if !missing.isEmpty, let feedback = try? MediaFeedback(kind: .nack, header: assembly.header, missingRanges: missing) {
                 assembly.lastNackAt = now
+                // Once a NACK spans the final fragment it has requested every remaining hole in this frame.
+                if let last = missing.last, Int(last.first) + Int(last.count) == assembly.fragmentCount {
+                    assembly.requestedThroughTail = true
+                }
                 let holeEnd = max(0, assembly.highestReceivedIndex)
                 for range in missing {
                     let start = Int(range.first)
                     let end = min(holeEnd, start + Int(range.count))
                     if start < end {
-                        assembly.requested.replaceSubrange(start..<end, with: repeatElement(true, count: end - start))
+                        assembly.late.replaceSubrange(start..<end, with: repeatElement(true, count: end - start))
                     }
                 }
                 events.append(.feedback(feedback))
@@ -418,7 +423,7 @@ public final class MediaFrameReassembler {
         requiresRecovery = true
         for assembly in assemblies.values where assembly.fragmented && assembly.frame == nil {
             settledFragments += assembly.fragmentCount
-            lateFragments += zip(assembly.received, assembly.requested).lazy.filter { !$0.0 || $0.1 }.count
+            lateFragments += zip(assembly.received, assembly.late).lazy.filter { !$0.0 || $0.1 }.count
         }
         assemblies.removeAll()
         bufferedBytes = 0

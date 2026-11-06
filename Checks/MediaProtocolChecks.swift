@@ -303,6 +303,7 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         for part in pacedParts.dropFirst(2) {
             time.now += 0.001
             _ = try paced.receive(part)
+            _ = try paced.receive(part, isRepair: true)
         }
         try require(paced.takeFragmentCounts() == (pacedParts.count, 0),
                     "In-order paced tail fragments after a tail NACK were miscounted as lost")
@@ -326,11 +327,12 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         let time = MediaCheckClock()
         let limits = MediaBufferLimits(reorderDelay: 0.02, nackInterval: 0.005)
         let receiver = try MediaFrameReassembler(stream: stream, limits: limits, clock: { time.now })
+        let sender = try MediaRetransmissionCache(stream: stream, limits: limits, clock: { time.now })
         let initial = try frame(1, idr: true, bytes: 8_192)
-        let parts = try MediaFragment.fragment(frame: initial)
+        let parts = try sender.insert(initial, deadline: 1)
         for (index, fragment) in parts.dropLast().enumerated() {
             time.now = Double(index) * 0.001
-            _ = try receiver.receive(fragment)
+            _ = try receiver.receive(fragment, isRepair: index == 0) // Unsolicited repair label.
         }
         let lastProgress = time.now
         time.now = lastProgress + 0.019
@@ -339,9 +341,13 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         let nacks = feedback(receiver.poll(), .nack)
         try require(nacks.count == 1 && nacks[0].missingRanges == [.init(first: UInt16(parts.count - 1), count: 1)],
                     "A stopped tail was never repaired or included already received fragments")
-        let recovered = ready(try receiver.receive(parts[parts.count - 1]))
-        try require(recovered.count == 1 && recovered[0].packet.avcc == initial.packet.avcc,
-                    "Repairing the final fragment did not reconstruct the IDR")
+        guard case .retransmit(let repairs)? = sender.handle(nacks[0], estimatedRoundTrip: 0.01).first,
+              repairs.count == 1 else { throw MediaCheckFailure(message: "Sender did not repair the tail") }
+        let recovered = ready(try receiver.receive(repairs[0], isRepair: true))
+        _ = try receiver.receive(repairs[0], isRepair: true)
+        try require(recovered.count == 1 && recovered[0].packet.avcc == initial.packet.avcc
+                    && receiver.takeFragmentCounts() == (parts.count, 1),
+                    "A genuine tail repair must reconstruct the IDR and count exactly one lost fragment")
         try require(feedback(receiver.decoded(initial.header, success: true), .decoded).count == 1
                     && receiver.pendingFrameCount == 0 && receiver.bufferedBytes == 0,
                     "Tail recovery could not complete the decode contract and release its buffer")

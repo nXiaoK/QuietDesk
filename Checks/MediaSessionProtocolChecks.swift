@@ -62,6 +62,11 @@ func runMediaSessionProtocolChecks() {
             try MediaControl(.recover, sessionID: session, transportEpoch: 1, codecEpoch: 1, relayRouting: true).validate()
         }
     }
+    run("A media request can opt in to marked repairs and legacy requests omit the capability") {
+        let legacy = try MediaControl.read(Data(#"{"operation":"request"}"#.utf8))
+        let modern = try MediaControl.read(MediaControl(.request, markedRepairs: true).message().payload)
+        try check(legacy.markedRepairs == nil && modern.markedRepairs == true, "Lost the viewer's repair capability")
+    }
     run("Auxiliary bindings are session-bound, expiring and consumed once per role") {
         let session = UUID(), token = Data(repeating: 0xA6, count: 32)
         var grant = try MediaBindingGrant(sessionID: session, token: token, now: 10)

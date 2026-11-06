@@ -1324,6 +1324,37 @@ final class DeskModel: ObservableObject {
             do {
                 if try channel.receive(message) { resume(); return }
             } catch { candidate?.close(error.localizedDescription); resume(); return }
+            if message.kind == .input {
+                let decodedInput: RemoteInput
+                do {
+                    decodedInput = try Wire.readJSON(RemoteInput.self, message.payload)
+                    try decodedInput.validate()
+                } catch {
+                    DispatchQueue.main.async {
+                        defer { resume() }
+                        guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
+                        self.recordDiagnosticFailure(.connectionFailed, error: error)
+                        candidate.close(error.localizedDescription)
+                    }
+                    return
+                }
+                if decodedInput.kind != .switchInputSource {
+                    DispatchQueue.main.async {
+                        defer { resume() }
+                        guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
+                        guard self.connected else {
+                            candidate.close("屏幕共享尚未就绪", retryable: true)
+                            return
+                        }
+                        do { try self.handleHostImmediateInput(decodedInput, peer: candidate) }
+                        catch {
+                            self.recordDiagnosticFailure(.connectionFailed, error: error)
+                            candidate.close(error.localizedDescription)
+                        }
+                    }
+                    return
+                }
+            }
             Task { @MainActor in
                 defer { resume() }
                 guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
@@ -2158,13 +2189,11 @@ final class DeskModel: ObservableObject {
         case .input:
             let input = try Wire.readJSON(RemoteInput.self, message.payload)
             try input.validate()
-            if hostSession.desktopActionTask != nil { return }
-            // Keys from the viewer must not mix into the password being typed on the lock screen.
-            if hostSession.unlocker?.typing == true, [.keyDown, .keyUp, .flags].contains(input.kind) { return }
-            if input.kind == .scroll {
-                DiagnosticLog.shared.count(.scrollReceived)
-                if !canControl || hostSession.paused || hostSession.pauseTask != nil { DiagnosticLog.shared.count(.scrollSuppressed) }
+            if input.kind != .switchInputSource {
+                try handleHostImmediateInput(input, peer: peer)
+                return
             }
+            if hostSession.desktopActionTask != nil { return }
             let host = hostSession
             if canControl, !host.paused, host.pauseTask == nil, let feedback = try await host.injector?.receive(input),
                self.hostSession === host, self.peer === peer, canControl, !host.paused, host.pauseTask == nil {
@@ -2194,6 +2223,22 @@ final class DeskModel: ObservableObject {
             let request = try Wire.readJSON(StreamSettingsRequest.self, message.payload)
             applyHostVideoSettings(request, peer: peer)
         default: throw DeskError.invalid("收到当前角色不支持的消息")
+        }
+    }
+
+    private func handleHostImmediateInput(_ input: RemoteInput, peer: Peer) throws {
+        if hostSession.desktopActionTask != nil { return }
+        // Keys from the viewer must not mix into the password being typed on the lock screen.
+        if hostSession.unlocker?.typing == true, [.keyDown, .keyUp, .flags].contains(input.kind) { return }
+        if input.kind == .scroll {
+            DiagnosticLog.shared.count(.scrollReceived)
+            if !canControl || hostSession.paused || hostSession.pauseTask != nil { DiagnosticLog.shared.count(.scrollSuppressed) }
+        }
+        let host = hostSession
+        if canControl, !host.paused, host.pauseTask == nil,
+           let feedback = try host.injector?.receiveImmediate(input, validated: true),
+           self.hostSession === host, self.peer === peer, canControl, !host.paused, host.pauseTask == nil {
+            peer.send(try Wire.json(.inputStatus, feedback))
         }
     }
 

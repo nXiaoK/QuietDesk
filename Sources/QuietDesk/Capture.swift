@@ -6,6 +6,9 @@ import QuietDeskCore
 // Encoder and acknowledgement state share one queue with the capture pump.
 struct VideoFrameFlow {
     static let maximumOutstandingFrames = 3
+    static func maximumOutstandingFrames(for settings: StreamSettings) -> Int {
+        settings.framesPerSecond >= 60 ? 6 : 4
+    }
     struct Encoding {
         let sequence: UInt32
         let startedAt: TimeInterval
@@ -37,11 +40,13 @@ struct VideoFrameFlow {
     var isIdle: Bool { encoding.isEmpty && waiting.isEmpty }
     var outstanding: Int { encoding.count + waiting.count }
 
-    mutating func begin(at now: TimeInterval, maximumConcurrentEncodes: Int = 1, isRefinement: Bool = false) -> Encoding? {
-        // Encoding and completed-but-not-yet-delivered output share the same three-frame credit window.
+    mutating func begin(at now: TimeInterval, maximumConcurrentEncodes: Int = 1,
+                        maximumOutstandingFrames: Int = Self.maximumOutstandingFrames,
+                        isRefinement: Bool = false) -> Encoding? {
+        // Encoding and completed-but-not-yet-delivered output share the bounded credit window.
         // A forced IDR is serialized so its drop cannot leave an already-submitted P frame behind it.
         guard !encodingFailed, encoding.count < min(2, max(1, maximumConcurrentEncodes)),
-              outstanding < Self.maximumOutstandingFrames,
+              outstanding < max(1, maximumOutstandingFrames),
               !encoding.contains(where: { $0.forceKeyFrame }), !forceKeyFrame || encoding.isEmpty,
               !isRefinement || encoding.isEmpty,
               !mediaHold || mediaRecoveryRequested else { return nil }
@@ -1172,6 +1177,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         guard let encoder,
               let frame = frameFlow.begin(at: SessionClock.now,
                 maximumConcurrentEncodes: currentSettings.framesPerSecond >= 60 ? 2 : 1,
+                maximumOutstandingFrames: VideoFrameFlow.maximumOutstandingFrames(for: currentSettings),
                 isRefinement: latestIsRefinement) else { return }
         self.latest = nil
         latestIsRefinement = false
@@ -1251,6 +1257,30 @@ final class InputInjector {
         if input.independentCapsLock == true || input.kind == .switchInputSource || input.kind == .toggleCapsLock {
             if remoteCapsLock == nil { remoteCapsLock = capsLockState() }
         }
+        if input.kind == .switchInputSource, !inputSources.requiresKeyboardRefocus, remoteCapsLock != true {
+            do {
+                let selected = try await inputSources.toggle()
+                guard isTrusted() else { releaseAll(); return nil }
+                return InputFeedback(message: "远端输入源已确认：\(selected)", capsLocked: false)
+            } catch is CancellationError {
+                return nil
+            } catch {
+                if inputSources.requiresKeyboardRefocus {
+                    releaseAll()
+                    return InputFeedback(message: "\(error.localizedDescription)，请点击远端输入位置后继续", capsLocked: remoteCapsLock == true)
+                }
+                return InputFeedback(message: error.localizedDescription, capsLocked: remoteCapsLock == true)
+            }
+        }
+        return try receiveImmediate(input, validated: true)
+    }
+
+    func receiveImmediate(_ input: RemoteInput, validated: Bool = false) throws -> InputFeedback? {
+        if !validated { try input.validate() }
+        guard isTrusted() else { releaseAll(); return nil }
+        if input.independentCapsLock == true || input.kind == .switchInputSource || input.kind == .toggleCapsLock {
+            if remoteCapsLock == nil { remoteCapsLock = capsLockState() }
+        }
         if input.kind == .switchInputSource || input.kind == .toggleCapsLock {
             guard !inputSources.requiresKeyboardRefocus else {
                 return InputFeedback(message: "请点击远端输入位置后继续", capsLocked: remoteCapsLock == true)
@@ -1267,19 +1297,7 @@ final class InputInjector {
                 return InputFeedback(message: remoteCapsLock == true ? "远端大写锁定已开启" : "远端大写锁定已关闭",
                                      capsLocked: remoteCapsLock == true)
             }
-            do {
-                let selected = try await inputSources.toggle()
-                guard isTrusted() else { releaseAll(); return nil }
-                return InputFeedback(message: "远端输入源已确认：\(selected)", capsLocked: false)
-            } catch is CancellationError {
-                return nil
-            } catch {
-                if inputSources.requiresKeyboardRefocus {
-                    releaseAll()
-                    return InputFeedback(message: "\(error.localizedDescription)，请点击远端输入位置后继续", capsLocked: remoteCapsLock == true)
-                }
-                return InputFeedback(message: error.localizedDescription, capsLocked: remoteCapsLock == true)
-            }
+            return nil
         }
         let point = CGPoint(x: bounds.minX + input.x * max(0, bounds.width - 1),
                             y: bounds.minY + input.y * max(0, bounds.height - 1))

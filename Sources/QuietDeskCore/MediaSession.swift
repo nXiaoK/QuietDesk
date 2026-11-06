@@ -922,7 +922,8 @@ public final class MediaSession: @unchecked Sendable {
 
     private var expectedStream: MediaStreamID? { transaction?.stream ?? active?.stream }
     private var bufferLimits: MediaBufferLimits {
-        MediaBufferLimits(frameTimeToLive: (transaction?.path ?? active?.path) == .udp ? max(0.15, roundTrip * 3 + 0.05) : 5,
+        MediaBufferLimits(maximumFrames: 6,
+                          frameTimeToLive: (transaction?.path ?? active?.path) == .udp ? max(0.25, roundTrip * 3 + 0.08) : 5,
                           keyFrameTimeToLive: 5, completedFrameTimeToLive: 5)
     }
 
@@ -944,7 +945,7 @@ public final class MediaSession: @unchecked Sendable {
             let frame = try MediaFrame(header: header, packet: packet)
             let bytes = try packet.encode().count
             let budget = target.1 != .udp ? 5
-                : isIDR ? max(1, Double(bytes) / bytesPerSecond + roundTrip * 2 + 0.2) : max(0.2, roundTrip * 3 + 0.05)
+                : isIDR ? max(1, Double(bytes) / bytesPerSecond + roundTrip * 2 + 0.2) : max(0.25, roundTrip * 3 + 0.08)
             let fragments = try cache!.insert(frame, deadline: SessionClock.now + min(5, budget))
             sentHeaders.insert(header)
             if deliveryPath != target.1 { deliveryPath = target.1; deliveryEstimator.reset(); deliverySentAt.removeAll() }
@@ -1056,7 +1057,7 @@ public final class MediaSession: @unchecked Sendable {
             deliveryEstimator.add(max(0, SessionClock.now - sent.at - sent.paced), at: SessionClock.now)
         }
         if (feedback.kind == .reassembled || feedback.kind == .decoded),
-           sentHeaders.contains(feedback.header), reassembledAtPeer.count < 3 {
+           sentHeaders.contains(feedback.header), reassembledAtPeer.count < 6 {
             reassembledAtPeer.insert(feedback.header)
             discardQueued(feedback.header)
         }
@@ -1124,7 +1125,7 @@ public final class MediaSession: @unchecked Sendable {
 
     private func pumpDatagrams() {
         guard !stopped, !paused, let peer = udpPeer, udpVerified else { return }
-        let now = SessionClock.now, burst = min(16_384.0, max(1101, bytesPerSecond * 0.004))
+        let now = SessionClock.now, burst = min(32_768.0, max(1101, bytesPerSecond * 0.006))
         pacingCredit = min(burst, pacingCredit + max(0, now - pacingUpdatedAt) * bytesPerSecond)
         pacingUpdatedAt = now
         while datagramOffset < pendingDatagrams.count {

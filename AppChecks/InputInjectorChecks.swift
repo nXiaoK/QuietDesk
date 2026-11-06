@@ -376,6 +376,20 @@ private struct InputInjectorChecks {
             try require(recorder.events.isEmpty, "Legacy Shift release retained a held key")
         }
 
+        await run("Immediate synchronous injection handles pointer, scroll, key and Caps Lock without async hop") {
+            let recorder = EventRecorder()
+            let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 101, height: 101),
+                                         isTrusted: { true }, postEvent: recorder.post,
+                                         capsLockState: { false }, pointerLocation: { recorder.pointer })
+            var move = RemoteInput(kind: .move)
+            move.x = 0.5; move.y = 0.5
+            try require(try injector.receiveImmediate(move) == nil, "Immediate pointer move returned unexpected feedback")
+            let feedback = try injector.receiveImmediate(RemoteInput(kind: .toggleCapsLock))
+            try require(feedback?.capsLocked == true && recorder.events.count == 2
+                        && recorder.events[0].type == .mouseMoved && recorder.events[1].type == .flagsChanged,
+                        "Immediate Caps Lock or pointer event did not post synchronously")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

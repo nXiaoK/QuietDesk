@@ -154,6 +154,20 @@ private struct VideoPipelineChecks {
                         "An ACK did not return exactly its own credit")
         }
 
+        run("High-refresh settings expand the in-flight frame credit window while keeping two encoder slots") {
+            try require(VideoFrameFlow.maximumOutstandingFrames(for: StreamSettings(framesPerSecond: 30)) == 4
+                        && VideoFrameFlow.maximumOutstandingFrames(for: StreamSettings(framesPerSecond: 60)) == 6,
+                        "Frame-rate credit scaling did not match 30/60 fps targets")
+            var flow = predictiveFlow()
+            for index in 1...6 {
+                let frame = flow.begin(at: Double(index), maximumConcurrentEncodes: 2, maximumOutstandingFrames: 6)
+                try require(frame != nil, "High-refresh window stalled before 6 outstanding frames at \(index)")
+                _ = flow.encoded(frame!.sequence, at: Double(index))
+            }
+            try require(flow.waiting.count == 6 && flow.begin(at: 7, maximumConcurrentEncodes: 2, maximumOutstandingFrames: 6) == nil,
+                        "The 6-frame window overflowed")
+        }
+
         run("Out-of-order encoder completions are bounded and delivered in submission order") {
             var flow = predictiveFlow()
             let first = flow.begin(at: 1, maximumConcurrentEncodes: 2)!

@@ -449,6 +449,10 @@ private func rejectedRelay(_ fixture: Fixture, wrongKey: Bool) throws {
                 run("Failed direct TCP and blocked relay UDP preserve the old frame and request bounded reliable fallback") { try exerciseMixedRelay(fixture, drop: true, blocked: true) }
             } else if CommandLine.arguments.contains("--udp-blocked") {
                 run("Blocked relay UDP still commits independent end-to-end TCP video and reliable bulk") { try exerciseRelay(fixture, udp: true, blocked: true, pinned: true) }
+            } else if CommandLine.arguments.contains("--ipv6-udp") {
+                run("An IPv4 UDP blackhole falls back to the IPv6 node for relayed DTLS and peer assistance") {
+                    try exerciseAssistedRelay(fixture)
+                }
             } else if CommandLine.arguments.contains("--private-udp-port") {
                 run("A private node listen port cannot redirect public-endpoint DTLS forwarding") { try exerciseRelay(fixture, udp: true, pinned: true) }
             } else {

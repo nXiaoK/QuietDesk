@@ -23,9 +23,11 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 -subj '/CN=QuietDesk a
 openssl x509 -in "$fixture_directory/alternate.pem" -outform DER -out "$fixture_directory/alternate.der"
 blocked=0
 private_port=0
+ipv6_udp=0
 if [[ "${1:-}" == "--udp-blocked" || "${1:-}" == "--mixed-blocked" ]]; then blocked=1; fi
+if [[ "${1:-}" == "--ipv6-udp" ]]; then ipv6_udp=1; fi
 if [[ "${1:-}" == "--private-udp-port" ]]; then private_port=1; fi
-(cd relay && QUIETDESK_RELAY_FIXTURE_DIR="$fixture_directory" QUIETDESK_RELAY_FIXTURE_BLOCK_UDP="$blocked" QUIETDESK_RELAY_FIXTURE_PRIVATE_UDP_PORT="$private_port" go test -run '^TestNativeInteropFixture$' -count=1 -timeout=180s -v .) > "$fixture_directory/node.log" 2>&1 &
+(cd relay && QUIETDESK_RELAY_FIXTURE_DIR="$fixture_directory" QUIETDESK_RELAY_FIXTURE_BLOCK_UDP="$blocked" QUIETDESK_RELAY_FIXTURE_PRIVATE_UDP_PORT="$private_port" QUIETDESK_RELAY_FIXTURE_IPV6_UDP="$ipv6_udp" go test -run '^TestNativeInteropFixture$' -count=1 -timeout=180s -v .) > "$fixture_directory/node.log" 2>&1 &
 fixture_pid=$!
 cleanup() { touch "$fixture_directory/finish"; wait "$fixture_pid" || true; }
 trap cleanup EXIT

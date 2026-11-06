@@ -44,7 +44,7 @@ func randomKey(t *testing.T) []byte {
 }
 
 func newFixture(t *testing.T, cfg Config) *fixture {
-	return newFixtureWithDatagrams(t, cfg, false, false)
+	return newFixtureWithDatagrams(t, cfg, false, false, false)
 }
 
 type blockedDatagramSocket struct{ net.PacketConn }
@@ -65,7 +65,7 @@ func (socket privatePortSocket) LocalAddr() net.Addr {
 	return &address
 }
 
-func newFixtureWithDatagrams(t *testing.T, cfg Config, blocked, privatePort bool) *fixture {
+func newFixtureWithDatagrams(t *testing.T, cfg Config, blocked, privatePort, ipv6Datagrams bool) *fixture {
 	t.Helper()
 	if cfg.AccessKey == nil {
 		cfg.AccessKey = randomKey(t)
@@ -96,7 +96,22 @@ func newFixtureWithDatagrams(t *testing.T, cfg Config, blocked, privatePort bool
 		if err != nil {
 			t.Fatal(err)
 		}
-		packets, err := net.ListenPacket("udp", candidate.Addr().String())
+		udpAddress := candidate.Addr().String()
+		if ipv6Datagrams {
+			_, port, _ := net.SplitHostPort(udpAddress)
+			udpAddress = net.JoinHostPort("::1", port)
+			// Hold the preferred IPv4 UDP port open without answering its datagrams.
+			blackhole, err := net.ListenPacket("udp4", candidate.Addr().String())
+			if err != nil {
+				candidate.Close()
+				if attempt < 20 {
+					continue
+				}
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { blackhole.Close() })
+		}
+		packets, err := net.ListenPacket("udp", udpAddress)
 		if err != nil {
 			candidate.Close()
 			if attempt < 20 {
@@ -441,7 +456,12 @@ func TestNativeInteropFixture(t *testing.T) {
 	if directory == "" {
 		t.Skip("native interoperability fixture is opt-in")
 	}
-	f := newFixtureWithDatagrams(t, Config{}, os.Getenv("QUIETDESK_RELAY_FIXTURE_BLOCK_UDP") == "1", os.Getenv("QUIETDESK_RELAY_FIXTURE_PRIVATE_UDP_PORT") == "1")
+	ipv6Datagrams := os.Getenv("QUIETDESK_RELAY_FIXTURE_IPV6_UDP") == "1"
+	f := newFixtureWithDatagrams(t, Config{}, os.Getenv("QUIETDESK_RELAY_FIXTURE_BLOCK_UDP") == "1", os.Getenv("QUIETDESK_RELAY_FIXTURE_PRIVATE_UDP_PORT") == "1", ipv6Datagrams)
+	if ipv6Datagrams {
+		_, port, _ := net.SplitHostPort(f.address)
+		f.address = net.JoinHostPort("localhost", port)
+	}
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		t.Fatal(err)
 	}

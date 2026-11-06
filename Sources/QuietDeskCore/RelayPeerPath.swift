@@ -97,11 +97,11 @@ public struct RelayPeerAddress: Hashable, Sendable, CustomStringConvertible {
     }
 
     /// Blocking resolution of the configured node; callers run it off their transport queue.
-    static func resolve(host: String, port: UInt16) -> RelayPeerAddress? {
-        if let canonical = RelayCandidate.canonicalAddress(host, allowLoopback: true) { return RelayPeerAddress(host: canonical, port: port) }
+    static func resolve(host: String, port: UInt16) -> [RelayPeerAddress] {
+        if let canonical = RelayCandidate.canonicalAddress(host, allowLoopback: true) { return [RelayPeerAddress(host: canonical, port: port)] }
         var hints = addrinfo(); hints.ai_family = AF_UNSPEC; hints.ai_socktype = SOCK_DGRAM; hints.ai_protocol = IPPROTO_UDP
         var result: UnsafeMutablePointer<addrinfo>?
-        guard getaddrinfo(host, String(port), &hints, &result) == 0, let first = result else { return nil }
+        guard getaddrinfo(host, String(port), &hints, &result) == 0, let first = result else { return [] }
         defer { freeaddrinfo(result) }
         var resolvedList: [RelayPeerAddress] = []
         for entry in sequence(first: first, next: { $0.pointee.ai_next }) {
@@ -113,7 +113,14 @@ public struct RelayPeerAddress: Hashable, Sendable, CustomStringConvertible {
                 if !resolvedList.contains(candidate) { resolvedList.append(candidate) }
             }
         }
-        return selectResolved(resolvedList)
+        guard let preferred = selectResolved(resolvedList) else { return [] }
+        let rest = resolvedList.filter { $0 != preferred }
+        let prefersV4 = IPv4Address(preferred.host) != nil
+        // Try the other family before additional records in the primary family.
+        if let other = rest.first(where: { (IPv4Address($0.host) != nil) != prefersV4 }) {
+            return [preferred, other] + rest.filter { $0 != other }
+        }
+        return [preferred] + rest
     }
 }
 
@@ -819,7 +826,10 @@ final class RelayAssistedPipe: RelayDatagramPipe {
     private let interfaceCandidates: Bool
     private var mode: RelayPeerAssistMode
     private var socket: RelayPeerSocket?
-    private var relay: RelayPeerAddress?
+    private var attempts: [(address: RelayPeerAddress, socket: RelayPeerSocket)] = []
+    private var relayChoices: [RelayPeerAddress] = []
+    private var relayIndex = 0
+    private var firstPayload: Data?
     private var agent: RelayPeerAgent?
     private var secret: Data?
     private var peerCandidates: [RelayCandidate]?
@@ -849,34 +859,55 @@ final class RelayAssistedPipe: RelayDatagramPipe {
         started = true
         let host = endpoint.host, port = endpoint.port
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let address = RelayPeerAddress.resolve(host: host, port: port)
-            self?.queue.async { self?.open(relay: address) }
+            let addresses = RelayPeerAddress.resolve(host: host, port: port)
+            self?.queue.async { self?.open(relays: addresses) }
         }
     }
 
-    private func open(relay address: RelayPeerAddress?) {
+    private func open(relays: [RelayPeerAddress]) {
         guard !closed else { return }
-        guard let address, let socket = try? RelayPeerSocket(queue: queue) else { finish(RelayTransportError.network); return }
-        self.socket = socket; relay = address; ready = true
-        socket.onPacket = { [weak self] data, source in self?.receive(data, from: source) }
+        guard !relays.isEmpty else { finish(RelayTransportError.network); return }
+        relayChoices = relays; ready = true
         guard sendRelay(Data()) else { return }
-        onReady?()
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 15, repeating: 15)
-        timer.setEventHandler { [weak self] in _ = self?.sendRelay(Data()) }
+        let probingUntil = SessionClock.uptime + 5
+        let interval = relays.count > 1 ? 0.2 : 15
+        timer.schedule(deadline: .now() + interval, repeating: interval)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            if self.relayChoices.count > 1 {
+                self.advanceRelay()
+                // Legacy nodes register empty packets silently. Retry the first DTLS record so
+                // a viewer can solicit a reply even while the host is also trying another address.
+                if SessionClock.uptime < probingUntil {
+                    self.sendRelayedMedia(self.firstPayload ?? Data())
+                    return
+                }
+                self.firstPayload = nil
+                self.keepalive?.schedule(deadline: .now() + 15, repeating: 15)
+            }
+            self.sendRelay(Data())
+        }
         keepalive = timer; timer.resume()
+        onReady?()
         activateIfAllowed()
     }
 
     func send(_ payload: Data, completion: @escaping (Bool) -> Void) {
-        guard ready, !closed, let socket, payload.count <= RelayDatagram.maximumPayloadBytes else { completion(false); return }
+        guard ready, let socket, payload.count <= RelayDatagram.maximumPayloadBytes else { completion(false); return }
         if let agent, let (packet, destination) = agent.sealData(payload) {
             if socket.send(packet, to: destination) != .failed { counter.record(direct: payload.count); completion(true); return }
             perform(agent.directSendFailed(now: SessionClock.now))
         }
-        let sent = sendRelay(payload)
-        if sent { counter.record(relayed: payload.count) }
-        completion(sent)
+        if relayChoices.count > 1, firstPayload == nil { firstPayload = payload }
+        completion(sendRelayedMedia(payload))
+    }
+
+    @discardableResult
+    private func sendRelayedMedia(_ payload: Data) -> Bool {
+        guard sendRelay(payload) else { return false }
+        counter.record(relayed: payload.count)
+        return true
     }
 
     func enableAssist(secret: Data) {
@@ -900,7 +931,8 @@ final class RelayAssistedPipe: RelayDatagramPipe {
     func close() { finish(RelayTransportError.cancelled) }
 
     private func activateIfAllowed() {
-        guard agent == nil, mode != .off, ready, let secret, let socket, let relay else { return }
+        guard agent == nil, mode != .off, ready, let secret, let socket else { return }
+        let relay = relayChoices[relayIndex]
         let loopback = IPv4Address(relay.host)?.isLoopback == true || IPv6Address(relay.host)?.isLoopback == true
         guard let agent = try? RelayPeerAgent(side: side, leaseID: id, secret: secret, mode: mode, allowLoopback: loopback, timing: timing) else { return }
         self.agent = agent
@@ -943,11 +975,23 @@ final class RelayAssistedPipe: RelayDatagramPipe {
         onConsent?(candidates)
     }
 
-    private func receive(_ data: Data, from source: RelayPeerAddress) {
+    private func receive(_ data: Data, from source: RelayPeerAddress, on receivingSocket: RelayPeerSocket, relayAddress: RelayPeerAddress) {
         guard !closed else { return }
         if data.starts(with: Self.relayMagic) {
             guard let packet = try? RelayDatagram.decode(data, key: key), packet.id == id, packet.side == side, packet.downstream,
                   replay.accept(packet.sequence), !packet.payload.isEmpty else { return }
+            if relayChoices.count > 1 {
+                // The node learned this socket's port from our registration at relayAddress.
+                // Its reply may use a different source IP behind a load balancer.
+                relayChoices = [relayAddress]; relayIndex = 0; firstPayload = nil
+                socket = receivingSocket
+                attempts.removeAll { attempt in
+                    if attempt.socket === receivingSocket { return false }
+                    attempt.socket.close(); return true
+                }
+                keepalive?.schedule(deadline: .now() + 15, repeating: 15)
+                sendRelay(Data())
+            }
             // DTLS records begin with a content type of 20-25, never the "QDP1" magic.
             if RelayPeerAgent.isPeerPacket(packet.payload) {
                 if let agent {
@@ -977,13 +1021,38 @@ final class RelayAssistedPipe: RelayDatagramPipe {
         }
     }
 
+    private func advanceRelay() {
+        relayIndex = (relayIndex + 1) % relayChoices.count
+        socket = nil
+    }
+
+    private func relaySocket(for address: RelayPeerAddress) -> RelayPeerSocket? {
+        if let attempt = attempts.first(where: { $0.address == address }) { return attempt.socket }
+        guard let newSocket = try? RelayPeerSocket(queue: queue) else { return nil }
+        // Keep delayed replies eligible while bounding descriptors for long DNS answer lists.
+        if attempts.count >= 8 { attempts.removeFirst().socket.close() }
+        newSocket.onPacket = { [weak self, weak newSocket] data, source in
+            guard let newSocket else { return }
+            self?.receive(data, from: source, on: newSocket, relayAddress: address)
+        }
+        attempts.append((address, newSocket))
+        return newSocket
+    }
+
     @discardableResult
     private func sendRelay(_ payload: Data) -> Bool {
-        guard ready, !closed, let socket, let relay, sequence < .max else { return false }
+        guard ready, sequence < .max else { return false }
         sequence += 1
-        guard let data = try? RelayDatagram(side: side, sequence: sequence, id: id, payload: payload).encode(key: key),
-              socket.send(data, to: relay) != .failed else { finish(RelayTransportError.network); return false }
-        return true
+        guard let data = try? RelayDatagram(side: side, sequence: sequence, id: id, payload: payload).encode(key: key) else {
+            finish(RelayTransportError.network); return false
+        }
+        for _ in relayChoices.indices {
+            let address = relayChoices[relayIndex]
+            socket = socket ?? relaySocket(for: address)
+            if let socket, socket.send(data, to: address) != .failed { return true }
+            advanceRelay()
+        }
+        finish(RelayTransportError.network); return false
     }
 
     private func perform(_ actions: [RelayPeerAgent.Action]) {
@@ -999,12 +1068,12 @@ final class RelayAssistedPipe: RelayDatagramPipe {
     private func finish(_ error: Error) {
         guard !closed else { return }
         closed = true; ready = false
-        keepalive?.cancel(); ticker?.cancel(); monitor?.cancel(); socket?.close()
-        keepalive = nil; ticker = nil; monitor = nil; socket = nil; agent = nil
+        keepalive?.cancel(); ticker?.cancel(); monitor?.cancel(); attempts.forEach { $0.socket.close() }
+        keepalive = nil; ticker = nil; monitor = nil; attempts.removeAll(); socket = nil; agent = nil
         let callback = onClose
         onClose = nil; onReady = nil; onPayload = nil; onConsent = nil; onPathState = nil
         callback?(error)
     }
 
-    deinit { keepalive?.cancel(); ticker?.cancel(); monitor?.cancel(); socket?.close() }
+    deinit { keepalive?.cancel(); ticker?.cancel(); monitor?.cancel(); attempts.forEach { $0.socket.close() } }
 }

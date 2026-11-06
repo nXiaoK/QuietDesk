@@ -4,7 +4,9 @@ import CoreMedia
 import CoreVideo
 
 public final class VideoEncoder {
+    private typealias SetProperty = (CFString, CFTypeRef) throws -> Void
     private var session: VTCompressionSession?
+    private let writeProperty: (VTCompressionSession, CFString, CFTypeRef?) -> OSStatus
     public let codec: VideoCodec
     public var onOutput: ((Result<VideoPacket, Error>) -> Void)?
     public var onDropped: ((UInt32) -> Void)?
@@ -26,8 +28,14 @@ public final class VideoEncoder {
         #endif
     }()
 
-    public init(width: Int, height: Int, settings: StreamSettings, codec: VideoCodec = .h264) throws {
+    public convenience init(width: Int, height: Int, settings: StreamSettings, codec: VideoCodec = .h264) throws {
+        try self.init(width: width, height: height, settings: settings, codec: codec, writeProperty: VTSessionSetProperty)
+    }
+
+    init(width: Int, height: Int, settings: StreamSettings, codec: VideoCodec = .h264,
+         writeProperty: @escaping (VTCompressionSession, CFString, CFTypeRef?) -> OSStatus) throws {
         self.codec = codec
+        self.writeProperty = writeProperty
         var specification: [CFString: Any] = [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true]
         if codec == .hevc { specification[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder] = true }
         var created: VTCompressionSession?
@@ -49,6 +57,7 @@ public final class VideoEncoder {
             throw DeskError.system(codec == .hevc ? "无法创建 HEVC 编码器" : "无法创建 H.264 编码器", status)
         }
         session = created
+        let set: SetProperty = { try self.set($0, $1, on: created) }
         do {
             try set(kVTCompressionPropertyKey_RealTime,
                     Self.usesRealTimeMode(framesPerSecond: settings.framesPerSecond) ? kCFBooleanTrue : kCFBooleanFalse)
@@ -56,15 +65,8 @@ public final class VideoEncoder {
             try set(kVTCompressionPropertyKey_ProfileLevel,
                     codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel)
             try set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: settings.framesPerSecond))
-            try set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: settings.megabits * 1_000_000))
-            // TCP delivers every frame, and start, resume and setting changes force keyframes, so periodic ones only add
-            // bursts. Zero would let VideoToolbox pick about two seconds; an hour is effectively none. Keep the old
-            // four seconds if an encoder rejects the long interval.
-            do { try setKeyFrameInterval(seconds: 3_600, framesPerSecond: settings.framesPerSecond) }
-            catch { try setKeyFrameInterval(seconds: 4, framesPerSecond: settings.framesPerSecond) }
-            // A one-second window allows codec bursts; this is not a per-packet bandwidth ceiling.
-            try set(kVTCompressionPropertyKey_DataRateLimits,
-                    [NSNumber(value: settings.megabits * 1_000_000 / 8), NSNumber(value: 1)] as CFArray)
+            try Self.setBitrate(settings.megabits, using: set)
+            try Self.setKeyFrameInterval(framesPerSecond: settings.framesPerSecond, using: set)
             let prepared = VTCompressionSessionPrepareToEncodeFrames(created)
             guard prepared == noErr else { throw DeskError.system("无法准备视频编码器", prepared) }
         } catch {
@@ -95,31 +97,62 @@ public final class VideoEncoder {
         catch { return .failure(error) }
     }
 
-    private func set(_ key: CFString, _ value: CFTypeRef) throws {
-        guard let session else { return }
-        let result = VTSessionSetProperty(session, key: key, value: value)
+    private func set(_ key: CFString, _ value: CFTypeRef?, on session: VTCompressionSession) throws {
+        let result = writeProperty(session, key, value)
         guard result == noErr else { throw DeskError.system("设置视频参数失败：\(key)", result) }
     }
 
-    // Rate control follows the new target from the next frames; the stream format and reference chain stay intact.
+    private func updateProperties(_ change: (SetProperty) throws -> Void) throws {
+        guard let session else { throw DeskError.invalid("编码器已停止") }
+        var previous: [(key: CFString, value: CFTypeRef?)] = []
+        do {
+            try change { key, value in
+                var saved: Unmanaged<CFTypeRef>?
+                let status = VTSessionCopyProperty(session, key: key, allocator: nil, valueOut: &saved)
+                guard status == noErr else { throw DeskError.system("读取视频参数失败：\(key)", status) }
+                let oldValue = saved?.takeRetainedValue()
+                try self.set(key, value, on: session)
+                previous.append((key, oldValue))
+            }
+        } catch {
+            do {
+                for property in previous.reversed() { try set(property.key, property.value, on: session) }
+            } catch let rollbackError {
+                stop()
+                onOutput?(.failure(rollbackError))
+                throw rollbackError
+            }
+            throw error
+        }
+    }
+
     public func updateBitrate(megabits: Int) throws {
+        try updateProperties { try Self.setBitrate(megabits, using: $0) }
+    }
+
+    public func updateEncodingParameters(settings: StreamSettings) throws {
+        try updateProperties { set in
+            try set(kVTCompressionPropertyKey_RealTime,
+                    Self.usesRealTimeMode(framesPerSecond: settings.framesPerSecond) ? kCFBooleanTrue : kCFBooleanFalse)
+            try set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: settings.framesPerSecond))
+            try Self.setBitrate(settings.megabits, using: set)
+            try Self.setKeyFrameInterval(framesPerSecond: settings.framesPerSecond, using: set)
+        }
+    }
+
+    private static func setBitrate(_ megabits: Int, using set: SetProperty) throws {
         try set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: megabits * 1_000_000))
         try set(kVTCompressionPropertyKey_DataRateLimits, [NSNumber(value: megabits * 1_000_000 / 8), NSNumber(value: 1)] as CFArray)
     }
 
-    // Updates rate control and frame-rate properties in place when output dimensions and codec remain unchanged.
-    public func updateEncodingParameters(settings: StreamSettings) throws {
-        try set(kVTCompressionPropertyKey_RealTime,
-                Self.usesRealTimeMode(framesPerSecond: settings.framesPerSecond) ? kCFBooleanTrue : kCFBooleanFalse)
-        try set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: settings.framesPerSecond))
-        try updateBitrate(megabits: settings.megabits)
-        do { try setKeyFrameInterval(seconds: 3_600, framesPerSecond: settings.framesPerSecond) }
-        catch { try setKeyFrameInterval(seconds: 4, framesPerSecond: settings.framesPerSecond) }
-    }
-
-    private func setKeyFrameInterval(seconds: Int, framesPerSecond: Int) throws {
-        try set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: framesPerSecond * seconds))
-        try set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: seconds))
+    private static func setKeyFrameInterval(framesPerSecond: Int, using set: SetProperty) throws {
+        func interval(seconds: Int) throws {
+            try set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: framesPerSecond * seconds))
+            try set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: seconds))
+        }
+        // An hour avoids periodic bursts. Some encoders only accept the original four-second interval.
+        do { try interval(seconds: 3_600) }
+        catch { try interval(seconds: 4) }
     }
 
     public func encode(_ buffer: CVPixelBuffer, time: CMTime, sequence: UInt32, forceKeyFrame: Bool = false) throws {

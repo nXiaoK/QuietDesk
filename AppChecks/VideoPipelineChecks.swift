@@ -943,6 +943,61 @@ private struct VideoPipelineChecks {
                         "A live bitrate change failed or forced a keyframe: \(frames), errors \(errors)")
         }
 
+        run("A rejected live property restores earlier writes on the running encoder") {
+            var session: VTCompressionSession?, rejected: CFString?, failures = 0
+            let encoder = try VideoEncoder(width: 64, height: 64, settings: StreamSettings(framesPerSecond: 30, megabits: 8)) {
+                native, key, value in
+                session = native
+                if key == rejected { failures += 1; return kVTParameterErr }
+                return VTSessionSetProperty(native, key: key, value: value)
+            }
+            defer { encoder.stop() }
+            guard let session else { throw VideoCheckFailure("Missing native encoder session") }
+            func snapshot() throws -> [NSObject] {
+                try [kVTCompressionPropertyKey_RealTime, kVTCompressionPropertyKey_ExpectedFrameRate,
+                     kVTCompressionPropertyKey_AverageBitRate, kVTCompressionPropertyKey_DataRateLimits,
+                     kVTCompressionPropertyKey_MaxKeyFrameInterval, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration].map { key in
+                    var value: Unmanaged<CFTypeRef>?
+                    guard VTSessionCopyProperty(session, key: key, allocator: nil, valueOut: &value) == noErr,
+                          let property = value?.takeRetainedValue() as? NSObject else { throw VideoCheckFailure("Cannot read encoder property") }
+                    return property
+                }
+            }
+            let initial = try snapshot()
+            for bitrateOnly in [true, false] {
+                rejected = bitrateOnly ? kVTCompressionPropertyKey_DataRateLimits : kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration
+                failures = 0
+                do {
+                    if bitrateOnly { try encoder.updateBitrate(megabits: 20) }
+                    else { try encoder.updateEncodingParameters(settings: StreamSettings(framesPerSecond: 60, megabits: 20)) }
+                    throw VideoCheckFailure("Rejected live update reported success")
+                } catch is DeskError {}
+                let restored = try snapshot()
+                try require(failures > 0 && restored == initial, "Partial live update changed the old encoder settings")
+            }
+        }
+
+        run("A failed property rollback retires the damaged encoder and reports a fatal output error") {
+            var inject = false, failedForward = false, fatalErrors = 0
+            let encoder = try VideoEncoder(width: 64, height: 64, settings: StreamSettings(megabits: 8)) { session, key, value in
+                if inject && key == kVTCompressionPropertyKey_DataRateLimits { failedForward = true; return kVTParameterErr }
+                if failedForward && key == kVTCompressionPropertyKey_AverageBitRate { return kVTParameterErr }
+                return VTSessionSetProperty(session, key: key, value: value)
+            }
+            encoder.onOutput = { if case .failure = $0 { fatalErrors += 1 } }
+            inject = true
+            do {
+                try encoder.updateBitrate(megabits: 20)
+                throw VideoCheckFailure("Irrecoverable update reported success")
+            } catch is DeskError {}
+            guard let pixel = CMSampleBufferGetImageBuffer(try cursorSample(.zero)) else { throw VideoCheckFailure("Missing test pixels") }
+            do {
+                try encoder.encode(pixel, time: .zero, sequence: 1)
+                throw VideoCheckFailure("Damaged encoder accepted another frame")
+            } catch is DeskError {}
+            try require(failedForward && fatalErrors == 1, "Loss of the old encoder state was not reported")
+        }
+
         run("Updating encoding parameters and forcing recovery IDR in place preserves timeline and decodes") {
             var pixelBuffer: CVPixelBuffer?
             let status = CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nil, &pixelBuffer)
@@ -972,21 +1027,34 @@ private struct VideoPipelineChecks {
             defer { encoder.stop() }
             try require(encoder.realTimeMode == true, "30 fps encoder did not start in real-time mode")
             let capturedAt = CMTime(value: 10, timescale: 60)
-            try encoder.encode(pixelBuffer, time: try timeline.next(encoderID: encoderID, time: capturedAt), sequence: 1, forceKeyFrame: true)
-            guard done.wait(timeout: .now() + 10) == .success else { throw VideoCheckFailure("Initial frame did not complete") }
+            var sequence: UInt32 = 0
+            func nextFrame(forceKeyFrame: Bool) throws -> VideoPacket {
+                let deadline = DispatchTime.now() + 10
+                for _ in 0..<8 {
+                    sequence += 1
+                    let time = forceKeyFrame ? capturedAt : CMTime(value: 10 + Int64(sequence), timescale: 60)
+                    try encoder.encode(pixelBuffer, time: try timeline.next(encoderID: encoderID, time: time),
+                                       sequence: sequence, forceKeyFrame: forceKeyFrame)
+                    guard done.wait(timeout: deadline) == .success else { throw VideoCheckFailure("Encoder callback timed out") }
+                    let (packets, errors) = outputs.snapshot
+                    try require(errors == 0, "Encoder failed during recovery")
+                    guard let packet = packets.last, packet.sequence == sequence else { continue }
+                    let idr = try MediaFrame.containsIDR(packet.avcc)
+                    if forceKeyFrame {
+                        try require(idr && packet.hasParameterSets, "Forced recovery did not produce a parameter-set IDR")
+                        return packet
+                    }
+                    if !idr { return packet }
+                }
+                throw VideoCheckFailure("Expected recovery frame was not produced within eight submissions")
+            }
+            _ = try nextFrame(forceKeyFrame: true)
             try encoder.updateEncodingParameters(settings: StreamSettings(framesPerSecond: 60, megabits: 20))
             try require(encoder.realTimeMode == false, "In-place 60 fps parameter update kept real-time throttling")
-            try encoder.encode(pixelBuffer, time: try timeline.next(encoderID: encoderID, time: capturedAt), sequence: 2, forceKeyFrame: true)
-            guard done.wait(timeout: .now() + 10) == .success else { throw VideoCheckFailure("Replayed recovery IDR did not complete") }
-            try encoder.encode(pixelBuffer, time: try timeline.next(encoderID: encoderID, time: CMTime(value: 11, timescale: 60)), sequence: 3)
-            guard done.wait(timeout: .now() + 10) == .success else { throw VideoCheckFailure("Post-recovery P frame did not complete") }
-            let (packets, errors) = outputs.snapshot
-            try require(errors == 0 && packets.count >= 2, "In-place encoder parameter update or recovery IDR failed")
-            let recoveryIDR = try MediaFrame.containsIDR(packets[1].avcc)
-            try require(recoveryIDR && !packets[1].sps.isEmpty && !packets[1].pps.isEmpty && packets[1].sequence == 2,
-                        "In-place recovery on replayed capture did not emit a parameter-set IDR")
+            let recovery = try nextFrame(forceKeyFrame: true)
+            _ = try nextFrame(forceKeyFrame: false)
             let decoder = VideoDecoder()
-            for packet in packets.dropFirst() {
+            for packet in outputs.snapshot.0 where packet.sequence >= recovery.sequence {
                 decoder.decode(packet) { outputs.decoded($0); done.signal() }
                 try require(done.wait(timeout: .now() + 10) == .success, "Post-recovery stream did not decode")
             }

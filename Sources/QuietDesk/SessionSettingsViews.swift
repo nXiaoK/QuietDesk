@@ -93,6 +93,10 @@ struct ConnectionSettingsView: View {
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     if model.relayEnabled { RelayPeerAssistPicker(model: model) }
                     Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
+                    Toggle("连接诊断", isOn: $model.connectionDiagnosticsEnabled)
+                        .disabled(model.isControllingAnotherMac)
+                    Text("连接前开启，结束后自动显示整段会话的线路、延迟、UDP 丢包、帧率和吞吐量。报告仅在本机内存中保留。")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     Toggle(isOn: $model.showFullScreenStatistics) { Text("全屏显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
                     if model.showFullScreenStatistics { FullScreenStatusSettings(model: model) }
                     Text("每行一项，依次为连接时长、视频线路、解码 FPS、收发流量、本次连接累计流量、往返延迟、UDP 丢包（达到 3% 时为红色）、分辨率。线路名精简显示，白字黑底，默认在右下角；背景透明度可调，可直接拖动状态调整位置。累计流量含视频、控制和剪贴板的收发，断线自动重连后重新累计。往返延迟约每 5 秒更新；不代表画面上屏延迟。静止画面 FPS 可能为 0。")

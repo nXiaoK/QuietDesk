@@ -100,6 +100,7 @@ public final class MediaFrameReassembler {
     // again or never arrived. Complete TCP envelopes are not fragments and are never counted.
     private var settledFragments = 0
     private var lateFragments = 0
+    var onSettledFragments: ((_ settled: Int, _ lost: Int) -> Void)?
 
     private final class Assembly {
         let header: MediaFrameHeader
@@ -181,14 +182,19 @@ public final class MediaFrameReassembler {
         return (settledFragments, lateFragments)
     }
 
+    private func settleFragments(_ count: Int, lost: Int) {
+        settledFragments += count
+        lateFragments += lost
+        onSettledFragments?(count, lost)
+    }
+
     /// Settles unfinished frames before this reassembler is dropped. Holes below received progress,
     /// requested fragments and a stalled tail count as lost; a tail that may still be arriving does not.
     public func abandon() {
         let now = currentTime()
         for assembly in assemblies.values where assembly.fragmented && assembly.frame == nil {
             let end = now - assembly.lastProgressAt >= limits.reorderDelay ? assembly.fragmentCount : assembly.highestReceivedIndex + 1
-            settledFragments += end
-            lateFragments += (0..<end).lazy.filter { !assembly.received[$0] || assembly.late[$0] }.count
+            settleFragments(end, lost: (0..<end).lazy.filter { !assembly.received[$0] || assembly.late[$0] }.count)
         }
         assemblies.removeAll()
         bufferedBytes = 0
@@ -264,8 +270,7 @@ public final class MediaFrameReassembler {
                 do {
                     assembly.frame = try MediaFrame(header: assembly.header, packetBytes: assembly.bytes)
                     assembly.completedAt = now
-                    settledFragments += assembly.fragmentCount
-                    lateFragments += assembly.late.lazy.filter { $0 }.count
+                    settleFragments(assembly.fragmentCount, lost: assembly.late.lazy.filter { $0 }.count)
                 } catch {
                     _ = invalidate(at: fragment.header)
                     throw error
@@ -422,8 +427,7 @@ public final class MediaFrameReassembler {
         guard !requiresRecovery else { return [] }
         requiresRecovery = true
         for assembly in assemblies.values where assembly.fragmented && assembly.frame == nil {
-            settledFragments += assembly.fragmentCount
-            lateFragments += zip(assembly.received, assembly.late).lazy.filter { !$0.0 || $0.1 }.count
+            settleFragments(assembly.fragmentCount, lost: zip(assembly.received, assembly.late).lazy.filter { !$0.0 || $0.1 }.count)
         }
         assemblies.removeAll()
         bufferedBytes = 0

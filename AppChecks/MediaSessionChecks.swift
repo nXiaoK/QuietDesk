@@ -50,6 +50,9 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     let reductions=Box<[MediaBottleneck]>([])
     let localRoutes=Box<[Bool]>([]), roundTripSamples=Box<[MediaPathSample]>([])
     let roundTripSampled=DispatchSemaphore(value:0)
+    let reportPaths = Box<[MediaSession.DiagnosticVideoPath]>([])
+    let reportRoundTrips = Box<[Double]>([]), reportFragments = Box((trial: 0, committed: 0, lost: 0))
+    let reportTailFrame = DispatchSemaphore(value: 0)
     let pathSwitches=Box<[(String,MediaSwitchCause)]>([])
     let overlapSent=Box(false)
     let cursorID = UUID()
@@ -122,6 +125,24 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             let session=try MediaSession.viewer(control:client,key:key,host:"127.0.0.1",port:listener.port!.rawValue,settings:settings,udpEnabled:udp)
             viewerSession.update{$0=session}
             session.diagnostics=diagnostics
+            if inspectRoundTrip {
+                session.onDiagnosticVideoPath = { path in reportPaths.update { $0.append(path) } }
+                session.onDiagnosticUDPRoundTrip = { milliseconds in
+                    if committedCount.get() == 0 { errors.update { $0.append("A candidate UDP probe reached the report") } }
+                    reportRoundTrips.update { $0.append(milliseconds) }
+                }
+                session.onDiagnosticUDPLoss = { settled, lost in
+                    let path = reportPaths.get().last
+                    reportFragments.update { counts in
+                        switch path {
+                        case .trialUDP(relayed: false): counts.trial += settled
+                        case .committed(.udp, relayedUDP: false): counts.committed += settled
+                        default: errors.update { $0.append("UDP fragments arrived outside their receiver's path") }
+                        }
+                        counts.lost += lost
+                    }
+                }
+            }
             session.onLocalNetwork={ local in localRoutes.update{$0.append(local)} }
             session.onReduceLoad={ cause in
                 if localRoutes.get().last != false { errors.update{$0.append("Loopback reduction preceded its non-LAN classification")} }
@@ -138,6 +159,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             }
             session.onVideo={ frame,complete in
                 decoded.update{$0.append(frame.header.frameID)}
+                if inspectRoundTrip, frame.header.frameID == 3 { reportTailFrame.signal() }
                 let expected = packet(frame.packet.sequence,idr:frame.header.isIDR,largeIDR:largeIDR,hevc:hevc)
                 if frame.packet.codec != expected.codec || frame.packet.vps != expected.vps || frame.packet.sps != expected.sps {
                     errors.update{$0.append("Media frame changed its codec or parameter sets in transit")}
@@ -388,6 +410,27 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
         } else {
             try require(prepared.get() == 3 && streamPreparations.get().isEmpty && streamBindings.get().isEmpty,
                         "Absent optional stream hook changed default candidate/configuration recovery behavior")
+        }
+    }
+    if inspectRoundTrip {
+        let paths = reportPaths.get()
+        let expected: MediaSession.Path = udp ? .udp : auxiliary ? .tcp : .shared
+        try require(paths.first == .preparing && paths.last == .committed(expected, relayedUDP: false),
+                    "Report did not distinguish preparation and the committed media path: \(paths)")
+        if udp {
+            try require(reportFragments.get().trial == 1 && reportFragments.get().committed == 1,
+                        "Initial IDR and P-frame were not attributed to the trial and committed paths")
+            hostSession.get()?.sendVideo(nextPacket(false))
+            try wait(reportTailFrame, "Final UDP frame did not reach the viewer")
+            let final = reportFragments.get()
+            try require(final.trial == 1 && final.committed == 2 && final.lost == 0,
+                        "Final UDP fragment was missing from the report at frame delivery")
+            let measured = reportRoundTrips.get()
+            try require(!measured.isEmpty && measured.allSatisfy { (0..<1_000).contains($0) },
+                        "Report missed authenticated post-commit UDP pongs")
+        } else {
+            try require(reportRoundTrips.get().isEmpty && reportFragments.get().trial + reportFragments.get().committed == 0,
+                        "TCP exposed UDP RTT or fragment counts")
         }
     }
     try require(errors.get().isEmpty,"Session reported errors: \(errors.get())")

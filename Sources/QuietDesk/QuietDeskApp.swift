@@ -37,6 +37,9 @@ struct QuietDeskApp: App {
         _updates = StateObject(wrappedValue: updater)
         appDelegate.models = models
         appDelegate.updates = updater
+        viewer.onConnectionDiagnosticReport = { [weak appDelegate] report in
+            appDelegate?.showConnectionReport(report)
+        }
     }
 
     var body: some Scene {
@@ -83,11 +86,33 @@ private struct RemoteControlCommands: Commands {
 }
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     weak var models: DeskModels?
     weak var updates: UpdateController?
     private(set) var launchedAtLogin = false
     private let quitHandler = SystemQuitHandler()
+    private var reportWindows = Set<NSWindow>()
+
+    func showConnectionReport(_ report: ConnectionDiagnosticReport) {
+        let window = NSWindow(contentViewController: NSHostingController(rootView: ConnectionDiagnosticReportView(report: report)))
+        window.title = "连接诊断 · " + report.remoteName
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.isReleasedWhenClosed = false
+        window.isRestorable = false
+        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        window.setContentSize(NSSize(width: 800, height: 720))
+        window.contentMinSize = NSSize(width: 620, height: 440)
+        if let previous = reportWindows.first(where: { $0.isVisible }) {
+            window.cascadeTopLeft(from: NSPoint(x: previous.frame.minX, y: previous.frame.maxY))
+        } else { window.center() }
+        window.delegate = self
+        reportWindows.insert(window)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if let window = notification.object as? NSWindow { reportWindows.remove(window) }
+    }
     func applicationWillFinishLaunching(_ notification: Notification) {
         launchedAtLogin = NSAppleEventManager.shared().currentAppleEvent?
             .paramDescriptor(forKeyword: AEKeyword(keyAELaunchedAsLogInItem))?.booleanValue == true
@@ -126,6 +151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     func applicationWillTerminate(_ notification: Notification) {
         updates?.shutdown()
+        models?.viewer.onConnectionDiagnosticReport = nil
         models?.stopAll()
         DiagnosticLog.shared.record(.applicationStopped)
         DiagnosticLog.shared.flush()

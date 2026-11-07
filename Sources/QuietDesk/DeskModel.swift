@@ -137,6 +137,11 @@ final class DeskModel: ObservableObject {
     var mediaLossHigh: Bool { (mediaLossFraction ?? 0) >= 0.03 }
     private var mediaRouteValue = ""
     private var peerPathState = RelayPeerPathState.relay
+    @Published var connectionDiagnosticsEnabled = UserDefaults.standard.bool(forKey: "connectionDiagnosticsEnabled") {
+        didSet { UserDefaults.standard.set(connectionDiagnosticsEnabled, forKey: "connectionDiagnosticsEnabled") }
+    }
+    var onConnectionDiagnosticReport: ((ConnectionDiagnosticReport) -> Void)?
+    private var connectionDiagnostics: ViewerConnectionDiagnostics?
     @Published private(set) var performanceDiagnosticsEnabled = false
     @Published var showFullScreenStatistics = UserDefaults.standard.bool(forKey: "showFullScreenStatistics") {
         didSet { UserDefaults.standard.set(showFullScreenStatistics, forKey: "showFullScreenStatistics") }
@@ -1451,6 +1456,7 @@ final class DeskModel: ObservableObject {
             savedTarget = false
             retryBackoff.reset()
             generation = UUID()
+            if connectionDiagnosticsEnabled { connectionDiagnostics = ViewerConnectionDiagnostics() }
             beginMetrics()
             beginConnection(target)
         } catch {
@@ -1488,6 +1494,11 @@ final class DeskModel: ObservableObject {
                                             settings: settings, udpEnabled: !mediaTCPOnly, relayRouting: relayRouting,
                                             relayedDatagram: viewer.usesRelayControl)
         media.diagnostics = performanceDiagnostics
+        if let diagnostics = connectionDiagnostics {
+            media.onDiagnosticVideoPath = { diagnostics.setVideoPath($0, on: channel) }
+            media.onDiagnosticUDPRoundTrip = { diagnostics.recordVideoRTT($0, on: channel) }
+            media.onDiagnosticUDPLoss = { channel.recordDiagnosticFragments(settled: $0, lost: $1) }
+        }
         media.onDatagramLoss = { [weak self, weak viewer] fraction in
             DispatchQueue.main.async {
                 guard let self, let viewer, self.viewerSession === viewer else { return }
@@ -1639,6 +1650,8 @@ final class DeskModel: ObservableObject {
     }
 
     private func observePeerPath(_ bridge: RelayViewerBridge, viewer: ViewerSession) {
+        // A new lease starts on the relay even if its predecessor had confirmed a punched path.
+        setPeerPath(.relay, role: .viewer)
         bridge.onPeerPath = { [weak self, weak viewer, weak bridge] state in
             DispatchQueue.main.async {
                 guard let self, let viewer, let bridge, self.viewerSession === viewer,
@@ -1662,6 +1675,7 @@ final class DeskModel: ObservableObject {
     private func setPeerPath(_ state: RelayPeerPathState, role: DiagnosticLog.Role) {
         guard state != peerPathState else { return }
         peerPathState = state
+        connectionDiagnostics?.setPeerPath(state)
         relayPeerStatus = Self.peerPathDescription(state)
         if !mediaRouteValue.isEmpty { mediaTransportStatus = Self.peerRouteLabel(mediaRouteValue, peerPath: state) }
         var values: [DiagnosticLog.Field: Int] = [.peerPath: state.diagnosticCode]
@@ -1844,6 +1858,7 @@ final class DeskModel: ObservableObject {
 
     /// Measures the candidate nodes and connects through them best first.
     private func orderRelayRoutes(_ target: Target) {
+        connectionDiagnostics?.waiting(.negotiating)
         let token = generation
         let endpoints = target.relayRoutes.map(\.info.endpoint)
         active = true; working = true
@@ -1891,6 +1906,7 @@ final class DeskModel: ObservableObject {
             if target.relayRoutes.count > 1, !target.relayRoutesOrdered { orderRelayRoutes(target); return }
             let viewer = viewerSession
             guard viewer.relayBridge == nil else { return }
+            connectionDiagnostics?.waiting(.negotiating, node: relay.endpoint.address)
             do {
                 let bridge = try RelayViewerBridge(endpoint: relay.endpoint, accessKey: access, deviceID: relay.deviceID, udpEnabled: !mediaTCPOnly,
                                                   trustedCertificate: target.relayCertificate, peerAssist: relayPeerAssist)
@@ -1923,14 +1939,15 @@ final class DeskModel: ObservableObject {
                                     self.relaySelectedForTarget = false; self.relayFallbackFailed()
                                 }
                                 self.scheduleReconnect(reason)
-                            } else { self.stop(); self.status = reason; self.connectionError = reason }
+                            } else { self.stop(reason: reason); self.status = reason; self.connectionError = reason }
                         }
                     }
                 }
                 bridge.start()
-            } catch { stop(); status = error.localizedDescription; connectionError = error.localizedDescription }
+            } catch { stop(reason: error.localizedDescription); status = error.localizedDescription; connectionError = error.localizedDescription }
             return
         }
+        connectionDiagnostics?.waiting(.negotiating)
         beginPeerConnection(target, host: target.address, port: target.port, viaRelay: false)
     }
 
@@ -1963,6 +1980,7 @@ final class DeskModel: ObservableObject {
                     DiagnosticLog.shared.record(.connectionMetrics, role: .viewer, values: [.roundTripMicroseconds: microseconds])
                 }
                 self.latency = String(format: milliseconds < 10 ? "%.1f ms" : "%.0f ms", milliseconds)
+                self.connectionDiagnostics?.recordControlRTT(milliseconds)
                 viewer.lastLatencyAt = SessionClock.now
                 viewer.media?.recordControlRoundTrip(milliseconds: milliseconds)
                 self.viewerQualityPolicy.observeRoundTrip(milliseconds)
@@ -1973,6 +1991,7 @@ final class DeskModel: ObservableObject {
         candidate.onReady = { [weak self, weak candidate, weak viewer] in
             DispatchQueue.main.async {
                 guard let self, let candidate, let viewer, self.peer === candidate, self.viewerSession === viewer else { return }
+                self.connectionDiagnostics?.attach(channel, relayed: viaRelay, node: target.relay?.endpoint.address)
                 viewer.helloDeadline.arm { [weak self, weak candidate, weak viewer] in
                     guard let self, let candidate, let viewer, self.peer === candidate,
                           self.viewerSession === viewer, !viewer.helloReceived else { return }
@@ -2032,7 +2051,7 @@ final class DeskModel: ObservableObject {
                     }
                     self.scheduleReconnect(reason)
                 } else {
-                    self.stop()
+                    self.stop(reason: reason)
                     self.status = reason
                     self.connectionError = reason
                 }
@@ -2055,6 +2074,7 @@ final class DeskModel: ObservableObject {
             self.target = target
         }
         let delay = retryBackoff.next()
+        connectionDiagnostics?.waiting(.reconnecting)
         DiagnosticLog.shared.record(.reconnectScheduled, role: .viewer, state: .requested,
             values: [.retryAttempt: retryBackoff.attempt])
         let token = generation
@@ -2078,6 +2098,7 @@ final class DeskModel: ObservableObject {
     }
 
     private func deferReconnectForIdle(_ reason: String) {
+        connectionDiagnostics?.waiting(.paused)
         reconnectTask?.cancel()
         active = true; working = false; reconnecting = true
         reconnectDeferredForIdle = true
@@ -2265,7 +2286,7 @@ final class DeskModel: ObservableObject {
             guard notification.operation == .ended else { throw DeskError.invalid("结束连接消息方向无效") }
             // Invalidate this attempt before the transport's EOF/failure or a relay fallback can retry it.
             recordDisconnect(SessionTermination.hostEndedReason)
-            stop()
+            stop(reason: SessionTermination.hostEndedReason)
             status = SessionTermination.hostEndedReason
             connectionError = SessionTermination.hostEndedReason
         case .cursorControl:
@@ -2394,6 +2415,9 @@ final class DeskModel: ObservableObject {
                 applyInitialVideoQualityIfReady()
                 sendNextVideoSettings()
             } else { videoSettingsStatus = "主机需更新到 0.4.0 才能动态调整画质" }
+            if viewer.media == nil, let channel = dataChannel {
+                connectionDiagnostics?.setVideoPath(.committed(.shared, relayedUDP: false), on: channel)
+            }
             supportsIndependentCursor = viewerSession.media != nil && hello.independentCursorV1 == true
             sendCursorRequest()
             publishSessionPause()
@@ -3102,6 +3126,7 @@ final class DeskModel: ObservableObject {
 
     private func publishSessionPause() {
         if mode == .viewer {
+            connectionDiagnostics?.setPaused(pauseTransmission.appliedPaused)
             sessionPaused = idlePolicy.isPaused || pauseTransmission.desiredPaused || pauseTransmission.appliedPaused
             sessionPauseWorking = pauseTransmission.pending != nil || pauseTransmission.freshFrameToken != nil
         } else { sessionPaused = hostSession.paused; sessionPauseWorking = hostSession.pauseTask != nil }
@@ -3485,7 +3510,7 @@ final class DeskModel: ObservableObject {
     func setAutoReconnect(_ enabled: Bool) {
         autoReconnect = enabled
         UserDefaults.standard.set(enabled, forKey: "autoReconnect")
-        if !enabled, reconnecting { stop() }
+        if !enabled, reconnecting { stop(reason: "已关闭自动重连") }
     }
 
     func setLoginEnabled(_ enabled: Bool) {
@@ -3606,6 +3631,7 @@ final class DeskModel: ObservableObject {
         } else if target != nil, active || working || reconnecting {
             let candidate = peer
             clearSession()
+            connectionDiagnostics?.waiting(.paused)
             candidate?.close("本机进入睡眠，等待唤醒后重新连接")
             active = true
             reconnecting = autoReconnect
@@ -3633,7 +3659,7 @@ final class DeskModel: ObservableObject {
             clearSession()
             candidate?.close("系统唤醒，重新建立连接")
             guard autoReconnect else {
-                stop()
+                stop(reason: "系统已唤醒，自动重连已关闭")
                 status = "系统已唤醒，请重新连接"
                 return
             }
@@ -3670,6 +3696,7 @@ final class DeskModel: ObservableObject {
                 }
                 if self.mode == .host, self.hostSession.effects?.state.privacy != true { self.removeStrayPrivacyCovers() }
                 let seconds = max(0.01, SessionClock.now - self.lastMetrics)
+                self.connectionDiagnostics?.sample()
                 let metrics = self.dataChannel?.takeMetrics() ?? (bytes: 0, frames: 0)
                 // @Published notifies on every assignment; a static picture keeps the same strings each second.
                 let traffic = String(format: "%.2f Mbps", Double(metrics.bytes) * 8 / seconds / 1_000_000)
@@ -3690,6 +3717,7 @@ final class DeskModel: ObservableObject {
     }
 
     private func clearSession() {
+        connectionDiagnostics?.detach()
         if mode == .viewer, let activity { ProcessInfo.processInfo.endActivity(activity); self.activity = nil }
         performanceTimer?.cancel()
         performanceTimer = nil
@@ -3858,7 +3886,18 @@ final class DeskModel: ObservableObject {
         oldPeer.closeAfterSessionTermination(notify: subscribed)
     }
 
-    func stop() {
+    func stop(reason: String? = nil) {
+        let report: ConnectionDiagnosticReport?
+        if let diagnostics = connectionDiagnostics {
+            let name: String
+            if !remoteName.isEmpty { name = remoteName }
+            else if let target, !target.address.isEmpty { name = target.trafficEndpoint.label }
+            else if let relay = target?.relay { name = "设备 " + relay.deviceID.uuidString }
+            else { name = "远端 Mac" }
+            let end = reason ?? (reconnecting ? "已停止重连" : connected ? "已主动断开连接" : "已取消连接")
+            report = diagnostics.finish(remoteName: name, reason: end)
+            connectionDiagnostics = nil
+        } else { report = nil }
         if peer != nil { DiagnosticLog.shared.record(.connectionClosed, role: diagnosticRole, state: .cancelled) }
         if mode == .host, active || working { DiagnosticLog.shared.record(.hostStopped, role: .host, state: .cancelled) }
         idlePolicy = SessionIdlePolicy(now: SessionClock.now)
@@ -3901,6 +3940,7 @@ final class DeskModel: ObservableObject {
         clipboardStatus = ""
         inputStatus = ""
         status = mode == .host ? "共享已停止" : "已断开连接"
+        if let report { onConnectionDiagnosticReport?(report) }
     }
 
     deinit {

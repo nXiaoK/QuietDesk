@@ -69,6 +69,11 @@ public final class MediaSession: @unchecked Sendable {
     // missed the reorder window over about five seconds. Nil while video is not being received over
     // UDP (committed or on trial) or too few fragments arrived. Display and diagnostics only; path and quality policy do not use it.
     public var onDatagramLoss: ((Double?) -> Void)?
+    // Viewer report observations are ordered on the media queue. An outgoing receiver settles its
+    // fragments before the new receiver's trial or preparation event is published.
+    public var onDiagnosticVideoPath: ((DiagnosticVideoPath) -> Void)?
+    public var onDiagnosticUDPRoundTrip: ((Double) -> Void)?
+    public var onDiagnosticUDPLoss: ((_ settled: Int, _ lost: Int) -> Void)?
 
     public static func peerAssistSecret(datagramKey: Data, sessionID: UUID) -> Data {
         HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: datagramKey), salt: Data(sessionID.uuidString.utf8),
@@ -76,7 +81,12 @@ public final class MediaSession: @unchecked Sendable {
     }
 
     private enum Side { case host, viewer }
-    private enum Path: String { case udp, tcp, shared }
+    public enum Path: String, Sendable { case udp, tcp, shared }
+    public enum DiagnosticVideoPath: Equatable, Sendable {
+        case preparing
+        case trialUDP(relayed: Bool)
+        case committed(Path, relayedUDP: Bool)
+    }
     private enum Stage { case preparing, ready, producing, decoded, committed }
     private struct Transaction {
         let id: UUID
@@ -258,6 +268,7 @@ public final class MediaSession: @unchecked Sendable {
             timer.setEventHandler { [weak self] in self?.tick() }
             self.timer = timer; timer.resume()
             if self.side == .viewer {
+                self.onDiagnosticVideoPath?(.preparing)
                 self.sendControl(MediaControl(.request, relayRouting: self.relayRoutingEnabled ? true : nil,
                                               receiveFrameWindow: MediaBufferLimits.receiveFrameWindow, markedRepairs: true))
                 self.onState?("正在优化传输")
@@ -567,6 +578,8 @@ public final class MediaSession: @unchecked Sendable {
                 guard pending.stage == .preparing else { return }
                 collectLoss(abandoning: true)
                 receiver = try MediaFrameReassembler(stream: stream, limits: bufferLimits)
+                if path == .udp { receiver?.onSettledFragments = onDiagnosticUDPLoss }
+                onDiagnosticVideoPath?(path == .udp ? .trialUDP(relayed: udpRelayed) : .preparing)
                 decoding.removeAll(); reassembledLocally.removeAll()
                 pending.stage = .ready; transaction = pending
                 sendTransaction(.ready, pending)
@@ -602,6 +615,7 @@ public final class MediaSession: @unchecked Sendable {
             transaction = nil
             reliableDeliveryFailures = 0
             reliableFailureNotified = false
+            onDiagnosticVideoPath?(.committed(path, relayedUDP: path == .udp && udpRelayed))
             onState?(stateLabel(path))
         case .committed:
             guard side == .host, let pending = transaction, pending.id == id,
@@ -849,6 +863,10 @@ public final class MediaSession: @unchecked Sendable {
                 lastPongAt = now
                 roundTrip = max(0.001, min(2, measured))
                 recordDuration(.mediaRoundTrip, seconds: measured)
+                if let onDiagnosticUDPRoundTrip, let active, active.path == .udp, receiver?.stream == active.stream,
+                   transaction == nil, udpVerified, !paused, !configurationSuspended {
+                    onDiagnosticUDPRoundTrip(measured * 1_000)
+                }
                 if receivedChallenge { verifiedUDP() }
             case 3, Self.repairedFragmentKind:
                 guard side == .viewer, udpVerified else { return }
@@ -918,6 +936,7 @@ public final class MediaSession: @unchecked Sendable {
             // A failed UDP attempt settles its lost fragments only now; report them before any switch.
             if pending.path == .udp { onDatagramLoss?(lossWindow.fraction(at: SessionClock.now)) }
             receiver = nil; decoding.removeAll(); reassembledLocally.removeAll()
+            onDiagnosticVideoPath?(.preparing)
             onState?("正在恢复画面")
             if mediaFailure { reportReduction(.network, localNetwork: pending.localNetwork) }
             if mediaFailure, pending.path != .udp { reliableDeliveryFailed() }

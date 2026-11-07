@@ -334,6 +334,8 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
     let hostSession = BlackholeBox<MediaSession?>(nil), viewerSession = BlackholeBox<MediaSession?>(nil)
     let hostPeers = BlackholeBox<[Peer]>([]), errors = BlackholeBox<[String]>([]), states = BlackholeBox<[String]>([])
     let lossReports = BlackholeBox<[Double?]>([]), highestLoss = BlackholeBox<Double>(0)
+    let reportFragments = BlackholeBox((settled: 0, lost: 0)), reportPongs = BlackholeBox(0)
+    let reportPaths = BlackholeBox<[MediaSession.DiagnosticVideoPath]>([])
     let sequence = BlackholeBox<UInt32>(100), udpPreparations = BlackholeBox(0), tcpPreparations = BlackholeBox(0)
     let videoConnections = BlackholeBox(0), committed = BlackholeBox<[MediaStreamID]>([])
     let teardown = BlackholeBox(false), decodedFrames = BlackholeBox(0)
@@ -412,6 +414,14 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
                 lossReports.update { $0.append(fraction) }
                 if let fraction { highestLoss.update { $0 = max($0, fraction) } }
             }
+            media.onDiagnosticVideoPath = { path in reportPaths.update { $0.append(path) } }
+            media.onDiagnosticUDPLoss = { settled, lost in
+                if reportPaths.get().last != .trialUDP(relayed: false) {
+                    recordError("UDP trial loss was settled after the report had already left the trial path")
+                }
+                reportFragments.update { $0.settled += settled; $0.lost += lost }
+            }
+            media.onDiagnosticUDPRoundTrip = { _ in reportPongs.update { $0 += 1 } }
             media.onVideo = { frame, complete in
                 let expected = blackholePacket(sequence: frame.packet.sequence, idr: frame.header.isIDR)
                 guard frame.packet.sps == expected.sps, frame.packet.pps == expected.pps, frame.packet.avcc == expected.avcc else {
@@ -460,6 +470,14 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
     print("BLACKHOLE LOSS highest=\(String(format: "%.3f", highestLoss.get())) last=\(String(describing: lossReports.get().last ?? nil))")
     print("BLACKHOLE COMMIT path=TCP 视频 elapsed=\(String(format: "%.3f", elapsed))s udpPrepare=\(udpPreparations.get()) tcpPrepare=\(tcpPreparations.get()) videoTLSConnections=\(videoConnections.get()) tcpRelays=\(stats.tcpConnections) networkLoadReductions=\(networkLoadReductions.get())")
 
+    let fragments = reportFragments.get()
+    let paths = reportPaths.get(), trial = MediaSession.DiagnosticVideoPath.trialUDP(relayed: false)
+    try requireBlackhole(paths.first == .preparing && paths.last == .committed(.tcp, relayedUDP: false),
+                         "Report missed preparation or the final independent TCP path: \(paths)")
+    try requireBlackhole(paths.filter { $0 == trial }.count == udpPreparations.get()
+                         && zip(paths, paths.dropFirst()).allSatisfy { $0 != trial || $1 == .preparing },
+                         "Failed UDP trials were omitted, committed, or lost their individual boundaries: \(paths)")
+    try requireBlackhole(reportPongs.get() == 0, "Uncommitted UDP probe pongs reached the video RTT report")
     if blockAllUDP {
         try requireBlackhole(stats.blockedClientDatagrams > 0, "Default UDP mode never attempted a real datagram")
         try requireBlackhole(udpPreparations.get() == 0 && tcpPreparations.get() == 1,
@@ -467,12 +485,15 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
         try requireBlackhole(elapsed >= 1 && elapsed < 4,
                              "Fully blocked UDP did not fall back within the probe budget plus TCP IDR delivery margin")
         try requireBlackhole(highestLoss.get() == 0, "UDP loss was reported although no UDP video was ever received")
+        try requireBlackhole(fragments.settled == 0, "A completely blocked probe produced video fragment observations")
     } else {
         try requireBlackhole(stats.droppedHostDatagrams >= 100, "Fixture did not blackhole most large IDR fragments")
         try requireBlackhole(stats.forwardedProbeSizedAfterDrop >= 2 && pongSamples >= 2,
                              "Media fallback coincided with lost UDP liveness instead of surviving authenticated pongs")
         try requireBlackhole(networkLoadReductions.get() >= 1, "Actual media blackhole did not request network load reduction")
         try requireBlackhole(highestLoss.get() >= 0.5, "Dropped IDR fragments were not reported as UDP loss: \(highestLoss.get())")
+        try requireBlackhole(fragments.lost > 0 && fragments.lost <= fragments.settled,
+                             "Dropped IDR fragments did not reach session diagnostic counters: \(fragments)")
         try requireBlackhole(udpPreparations.get() == MediaPathPolicy.udpMediaFailureLimit && tcpPreparations.get() >= 1,
                              "UDP media was not retried at lower quality, or kept retrying instead of falling back")
         try requireBlackhole(networkLoadReductions.get() >= MediaPathPolicy.udpMediaFailureLimit,

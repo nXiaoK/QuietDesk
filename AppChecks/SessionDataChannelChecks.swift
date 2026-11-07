@@ -243,6 +243,52 @@ private struct SessionDataChannelChecks {
             try require(second.bytes == 0 && second.frames == 0, "Metrics were drained more than once")
         }
 
+        run("Diagnostic route boundaries, reconnection and display polling share accurate channel counters") {
+            var now: TimeInterval = 0
+            let recording = ViewerConnectionDiagnostics(startedAt: Date(), clock: { now })
+            let first = SessionDataChannel(send: { _ in }, onFreshFrame: { _ in })
+            let node = "tls://relay.example:7443"
+            first.recordBytes(16) // hello arrived before the main queue handled readiness
+            now = 0.5
+            recording.attach(first, relayed: false, node: node)
+            try onBackground {
+                recording.setVideoPath(.trialUDP(relayed: true), on: first)
+                first.recordDiagnosticFragments(settled: 25, lost: 20)
+                now = 1
+                recording.setVideoPath(.committed(.udp, relayedUDP: true), on: first)
+            }
+            first.recordBytes(400); first.recordFrame(); first.recordDiagnosticFragments(settled: 100, lost: 4)
+            _ = first.takeMetrics()
+            now = 2
+            recording.setPeerPath(.direct(.srflx))
+            first.recordBytes(600); first.recordDiagnosticFragments(settled: 300, lost: 1)
+            now = 3
+            recording.detach()
+            first.invalidate()
+            recording.waiting(.reconnecting)
+            now = 7
+            recording.sample()
+
+            let next = SessionDataChannel(send: { _ in }, onFreshFrame: { _ in })
+            now = 8
+            recording.attach(next, relayed: true, node: node)
+            recording.setVideoPath(.committed(.shared, relayedUDP: false), on: next)
+            recording.setVideoPath(.committed(.udp, relayedUDP: true), on: first)
+            next.recordBytes(200)
+            now = 8.5
+            let report = recording.finish(remoteName: "Fixture", reason: "Ended")
+            try require(report.routes.first { $0.route.media == .udpTrial }?.quality.loss.lostFragments == 20,
+                        "Loss during a UDP trial was discarded or charged to the committed path")
+            let relayed = report.routes.first { $0.route.media == .relayUDP }
+            let direct = report.routes.first { $0.route.media == .punchedUDP }
+            try require(relayed?.route.control == .direct && relayed?.route.node == node && relayed?.quality.bytes == 400
+                        && relayed?.quality.loss.lostFragments == 4 && direct?.quality.loss.lostFragments == 1,
+                        "Did not partition direct control / relayed video and punched video at the switch")
+            try require(report.routes.contains { $0.route.media == .relayCompatibleTCP && $0.quality.loss.mean == nil }
+                        && report.totals.bytes == 1216 && report.totals.frames == 1 && report.totals.measuredSeconds == 3,
+                        "Lost a partial interval, counted the offline gap or reused a previous channel")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

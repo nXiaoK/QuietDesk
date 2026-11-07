@@ -16,6 +16,9 @@ final class SessionDataChannel: @unchecked Sendable {
     private var mediaFreshFrame: (stream: MediaStreamID, token: UUID?)?
     private var bytes = 0
     private var frames = 0
+    private var settledFragments = 0
+    private var lostFragments = 0
+    private var lastDisplaySample = (bytes: 0, frames: 0)
     private let onFreshFrame: (UUID) -> Void
 
     init(send: @escaping (Message) -> Void, onFreshFrame: @escaping (UUID) -> Void) {
@@ -87,7 +90,20 @@ final class SessionDataChannel: @unchecked Sendable {
         if let token { onFreshFrame(token) }
     }
     func takeMetrics() -> (bytes: Int, frames: Int) {
-        lock.withLock { defer { bytes = 0; frames = 0 }; return (bytes, frames) }
+        lock.withLock {
+            defer { lastDisplaySample = (bytes, frames) }
+            return (bytes - lastDisplaySample.bytes, frames - lastDisplaySample.frames)
+        }
+    }
+
+    func recordDiagnosticFragments(settled: Int, lost: Int) {
+        lock.withLock {
+            if valid { settledFragments += settled; lostFragments += lost }
+        }
+    }
+
+    func metricsSnapshot() -> (bytes: Int, frames: Int, settled: Int, lost: Int) {
+        lock.withLock { (bytes, frames, settledFragments, lostFragments) }
     }
 
     func invalidate() {
@@ -101,6 +117,8 @@ final class SessionDataChannel: @unchecked Sendable {
             mediaFreshFrame = nil
             freshFrameToken = nil
             bytes = 0; frames = 0
+            lastDisplaySample = (0, 0)
+            settledFragments = 0; lostFragments = 0
         }
     }
 }

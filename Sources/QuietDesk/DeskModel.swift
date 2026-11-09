@@ -173,6 +173,7 @@ final class DeskModel: ObservableObject {
     @Published private(set) var pendingFileOffer: ClipboardFileOffer?
     @Published private(set) var receivingFileID: UUID?
     @Published private(set) var receivedFilesKeptInFolder = false
+    @Published private(set) var fileTransferNotice: FileTransferNotice?
     @Published var canControl = false
     @Published private(set) var localAccessibility = false
     @Published private(set) var localInputMonitoring = false
@@ -3440,6 +3441,14 @@ final class DeskModel: ObservableObject {
                 }
             clipboardHandledChange = nil
             clipboardSync = sync
+            sync.onFileTransferStarted = { [weak self, weak sync] in
+                guard let self, let sync, self.clipboardSync === sync else { return }
+                self.fileTransferNotice = nil
+            }
+            sync.onFileResult = { [weak self, weak sync] result, keptLocalCopy in
+                guard let self, let sync, self.clipboardSync === sync else { return }
+                self.fileTransferNotice = FileTransferNotice(result: result, keptLocalCopy: keptLocalCopy)
+            }
             sync.onFileReceptionChanged = { [weak self, weak sync] id in
                 guard let self, let sync, self.clipboardSync === sync else { return }
                 self.receivingFileID = id
@@ -3488,6 +3497,7 @@ final class DeskModel: ObservableObject {
             dismissClipboardPrompt(); clipboardFilePrompt = nil
             pendingFileOffer = nil
             receivedFilesKeptInFolder = false
+            fileTransferNotice = nil
             if connected { clipboardStatus = supportsClipboard ? "自动剪贴板已关闭" : "对端版本较旧，可使用手动文字同步" }
         }
     }
@@ -3500,7 +3510,7 @@ final class DeskModel: ObservableObject {
         NSWorkspace.shared.open(folder)
     }
 
-    func dismissReceivedFilesNotice() { receivedFilesKeptInFolder = false }
+    func dismissReceivedFilesNotice() { receivedFilesKeptInFolder = false; fileTransferNotice = nil }
 
     func cancelFileReception(id: UUID) {
         guard receivingFileID == id else { return }
@@ -3844,6 +3854,7 @@ final class DeskModel: ObservableObject {
         dismissClipboardPrompt(); clipboardFilePrompt = nil
         pendingFileOffer = nil
         receivedFilesKeptInFolder = false
+        fileTransferNotice = nil
         canvas.synchronizesClipboard = false
         supportsClipboard = false
         remoteClipboardEnabled = false

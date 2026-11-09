@@ -559,6 +559,8 @@ private struct ClipboardFocusChecks {
                 try originalBytes.write(to: original); try nextBytes.write(to: next)
                 var offer: ClipboardFileOffer?, returnOffer: ClipboardFileOffer?, reception: UUID?, held: Message?
                 var senderEvents: [ClipboardSync.DiagnosticEvent] = [], kept = 0
+                var fileResults: [(ClipboardFileResult, Bool)] = []
+                pair.localSync.onFileResult = { fileResults.append(($0, $1)) }
                 pair.localSync.onFileOffer = { offer = $0 }
                 pair.localSync.onFileReceptionChanged = { reception = $0 }
                 pair.localSync.onReceivedFilesKept = { kept += 1 }
@@ -593,6 +595,9 @@ private struct ClipboardFocusChecks {
                 try require(batches.count == 1 && Data(contentsOf: batches[0].appendingPathComponent("incoming.bin")) == originalBytes,
                             "The completed file was missing or its bytes changed")
                 try require(pair.local.writes == 0 && kept == 1, "Completing the file overwrote the newer local copy or lost its folder notice")
+                try require(fileResults.count == 1 && fileResults[0].0.outcome == .completed && fileResults[0].1
+                            && fileResults[0].0.files.count == 1 && Data(contentsOf: fileResults[0].0.files[0]) == originalBytes,
+                            "Typed result lost completed file URLs or the newer-copy preservation state")
                 if kind == "files" {
                     try eventually("The newer local file was not offered after receiving finished") { returnOffer != nil }
                     try require(pair.remote.writes == 0, "The newer file bypassed receiver approval")
@@ -745,6 +750,46 @@ private struct ClipboardFocusChecks {
                     try require(kept == 0, "A file published on the clipboard reported it was kept only in the folder")
                 }
             }
+        }
+
+        run("A retained file result survives later text sync until dismissed or a new file starts") { folder in
+            let pair = ClipboardPair(storage: folder, remoteAllowed: true)
+            defer { pair.stop() }
+            let file = folder.appendingPathComponent("result.bin"), bytes = Data([1, 3, 5])
+            try bytes.write(to: file)
+            var offer: ClipboardFileOffer?, result: ClipboardFileResult?, results = 0, starts = 0
+            pair.localSync.onFileOffer = { offer = $0 }
+            pair.localSync.onFileTransferStarted = { result = nil; starts += 1 }
+            pair.localSync.onFileResult = { value, _ in result = value; results += 1 }
+            pair.remote.copy(.files([file]))
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("File offer missing") { offer != nil }
+            pair.localSync.respondToFileOffer(id: offer!.id, accept: true)
+            try eventually("Completed file result missing") { result?.outcome == .completed }
+            let id = result!.id
+            pair.remote.copy(.text(Data("later sync".utf8)))
+            try eventually("Later text did not synchronize") { pair.local.copiedText == "later sync" }
+            pump(for: 1.1)
+            try require(result?.id == id && results == 1 && result!.files.count == 1,
+                        "A later sync or the former one-second timeout discarded the file result")
+            result = nil
+            pair.remote.copy(.text(Data("after dismissal".utf8)))
+            try eventually("Text after dismissal did not synchronize") { pair.local.copiedText == "after dismissal" }
+            try require(result == nil && results == 1, "Text resurrected a dismissed result")
+            pair.remote.copy(.files([file]))
+            try eventually("A new file did not reset the result state") { starts == 2 && offer != nil }
+        }
+
+        run("Stopping clipboard sync suppresses queued file results from the old session") { folder in
+            let pair = ClipboardPair(storage: folder, localAllowed: true)
+            defer { pair.stop() }
+            var results = 0
+            pair.localSync.onFileResult = { _, _ in results += 1 }
+            pair.local.copy(.files([folder.appendingPathComponent("does-not-exist")]))
+            pair.localSync.setAutomaticSendingAllowed(true)
+            pair.localSync.stop()
+            pump(for: 0.15)
+            try require(results == 0, "A stopped sync published a stale file result")
         }
 
         run("A new local copy replaces pending file approval; stale acceptance cannot download") { folder in
@@ -1030,7 +1075,8 @@ private struct ClipboardFocusChecks {
             try Data([1, 2, 3]).write(to: file)
             pair.remote.rejectsWrites = true
             var receiving: ClipboardFileOffer?, returned: ClipboardFileOffer?
-            var failed = false
+            var failed = false, fileResult: ClipboardFileResult?
+            pair.remoteSync.onFileResult = { result, _ in fileResult = result }
             pair.remoteSync.onFileOffer = { receiving = $0 }
             pair.localSync.onFileOffer = { returned = $0 }
             pair.localSync.onStatus = { if $0.contains("无法写入") { failed = true } }
@@ -1044,6 +1090,9 @@ private struct ClipboardFocusChecks {
             let receivedDirectory = folder.appendingPathComponent("remote/received")
             let saved = try FileManager.default.contentsOfDirectory(at: receivedDirectory, includingPropertiesForKeys: nil)
             try require(saved.count == 1, "Expected the completed file to remain available after clipboard rejection")
+            try eventually("Failed publication lost its actionable saved-file result") { fileResult?.outcome == .failed }
+            try require(fileResult!.files.count == 1 && Data(contentsOf: fileResult!.files[0]) == Data([1, 2, 3]),
+                        "Clipboard rejection fabricated or lost the completed file action")
             pair.remote.rejectsWrites = false
             pair.remote.copy(.files([saved[0].appendingPathComponent("failed.bin")]))
             pair.remoteSync.setAutomaticSendingAllowed(true)

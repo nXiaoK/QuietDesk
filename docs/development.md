@@ -119,6 +119,7 @@ python3 scripts/check-update-tool.py \
 ```sh
 swift run --disable-sandbox QuietDeskChecks
 ./scripts/run-app-checks.sh
+./scripts/run-file-result-checks.sh
 ./scripts/run-input-checks.sh
 ./scripts/run-video-checks.sh
 ./scripts/run-session-quality-checks.sh
@@ -138,7 +139,8 @@ python3 -m unittest discover -s scripts/tests -v
 | 检查 | 范围 |
 | --- | --- |
 | `QuietDeskChecks` | 协议、兼容、视频、剪贴板传输、画质、流量、空闲策略，以及更新清单签名、版本/URL 规则、首次询问与安装可用性纯逻辑；网络检查仅使用 `127.0.0.1` |
-| `run-app-checks.sh` | 实际 `ClipboardSync` 配合内存剪贴板和临时目录，验证焦点与传输顺序 |
+| `run-app-checks.sh` | 实际 `ClipboardSync` 配合内存剪贴板和临时目录，验证焦点、传输顺序与独立文件结果回调 |
+| `run-file-result-checks.sh` | 仅临时文件和进程内消息，验证文件结果、目录入口依据、最终确认、迟到回调、授权/取消、旧端窗口与存储完整性；不操作真实剪贴板、不建立连接 |
 | `run-input-checks.sh` | 验证真实 AppKit 鼠标、滚轮事件到远程输入的转换，以及被控端 CGEvent 字段；使用离屏画布与假提交器，不向系统注入输入 |
 | `run-video-checks.sh` | 编码丢帧恢复、三帧窗口和画质/暂停边界，CoreMedia 数据持有与合成 H.264/HEVC 编解码；不采集屏幕 |
 | `run-session-quality-checks.sh` | 画质展示的准备请求、等待确认、连续选择合并、实际生效与错误隔离，以及现有画质协议、旧端兼容、偏好恢复和合成编解码；不建立连接、不操作真实记录或凭据 |

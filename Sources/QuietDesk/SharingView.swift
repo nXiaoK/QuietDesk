@@ -383,7 +383,10 @@ struct SharingView: View {
                     if let id = model.receivingFileID {
                         Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }.controlSize(.small)
                     }
-                    if model.receivedFilesKeptInFolder {
+                    if let notice = model.fileTransferNotice {
+                        FileTransferResultView(notice: notice, openFolder: { model.openReceivedFiles() },
+                                               dismiss: { model.dismissReceivedFilesNotice() })
+                    } else if model.receivedFilesKeptInFolder {
                         Text(ClipboardSync.keptFilesNotice).font(.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }

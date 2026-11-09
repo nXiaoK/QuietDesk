@@ -97,6 +97,8 @@ final class ClipboardSync {
         .appendingPathComponent("\(AppDataLocation.folderName())/Clipboard", isDirectory: true)
     static let keptFilesNotice = "接收的文件已保存到接收目录，未放入剪贴板；保留了新的本机复制内容"
     var onStatus: ((String) -> Void)?
+    var onFileTransferStarted: (() -> Void)?
+    var onFileResult: ((ClipboardFileResult, Bool) -> Void)?
     var onFileOffer: ((ClipboardFileOffer?) -> Void)?
     var onFileReceptionChanged: ((UUID?) -> Void)?
     /// 接收完成时本机已有更新的复制，文件只留在接收目录；之后的同步状态会覆盖状态行，提示需单独保留。
@@ -160,6 +162,18 @@ final class ClipboardSync {
             }
         }
         transfer.onStatus = { [weak self] status in DispatchQueue.main.async { self?.onStatus?(status) } }
+        transfer.onFileTransferStarted = { [weak self] in
+            DispatchQueue.main.async {
+                guard let self, self.running else { return }
+                self.onFileTransferStarted?()
+            }
+        }
+        transfer.onFileResult = { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self, self.running else { return }
+                self.onFileResult?(result, result.direction == .receiving && self.receivedFilesKeptLocally)
+            }
+        }
         transfer.onFileReceptionChanged = { [weak self] id in
             DispatchQueue.main.async {
                 guard let self, self.running else { return }

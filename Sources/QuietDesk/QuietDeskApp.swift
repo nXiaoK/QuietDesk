@@ -184,10 +184,12 @@ struct DeskView: View {
     private var sessionLayout: Bool { model.mode == .viewer && (model.connected || model.reconnecting) }
     private var immersive: Bool { model.isFullScreen && model.mode == .viewer }
     private var remoteTitle: String { model.remoteName.isEmpty ? model.address : model.remoteName }
-    private var showClipboardActivity: Bool {
+    private var showClipboardActivity: Bool { model.fileTransferNotice != nil || showClipboardStatus }
+    private var showKeptFilesFallback: Bool { model.receivedFilesKeptInFolder && model.fileTransferNotice == nil }
+    private var showClipboardStatus: Bool {
         Self.showsClipboardActivity(status: model.clipboardStatus, dismissedStatus: dismissedClipboardStatus,
                                     receivingFileID: model.receivingFileID, dismissedReceptionID: dismissedReceptionID,
-                                    keptInFolder: model.receivedFilesKeptInFolder)
+                                    keptInFolder: showKeptFilesFallback)
     }
 
     /// 接收进度约每 0.5 秒更新状态；按 × 收起的是这次接收，结束后的结果仍会显示。
@@ -292,9 +294,9 @@ struct DeskView: View {
         }
         .task(id: clipboardNoticeRevision) {
             let message = model.clipboardStatus
-            guard !message.isEmpty, model.receivingFileID == nil, !model.receivedFilesKeptInFolder else { return }
+            guard !message.isEmpty, model.receivingFileID == nil, !showKeptFilesFallback else { return }
             do { try await Task.sleep(for: .seconds(1)) } catch { return }
-            guard model.receivingFileID == nil, !model.receivedFilesKeptInFolder else { return }
+            guard model.receivingFileID == nil, !showKeptFilesFallback else { return }
             dismissedClipboardStatus = message
         }
         .onChange(of: model.controlling) { _, controlling in if controlling { showFullScreenMenu = false; showOptions = false } }
@@ -520,35 +522,32 @@ struct DeskView: View {
         }
     }
 
+    private func dismissClipboardStatus() {
+        dismissedClipboardStatus = model.clipboardStatus
+        dismissedReceptionID = model.receivingFileID
+    }
+
+    private func dismissClipboardActivity() {
+        dismissClipboardStatus()
+        model.dismissReceivedFilesNotice()
+    }
+
     private var clipboardActivity: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: model.pendingFileOffer == nil ? "arrow.triangle.2.circlepath" : "doc.on.doc")
-                .foregroundStyle(model.pendingFileOffer == nil ? Color.accentColor : Color.orange)
-            VStack(alignment: .leading, spacing: 7) {
-                Text(model.pendingFileOffer == nil ? "剪贴板与文件" : "1 个文件请求待确认").font(.headline)
-                Text(model.clipboardStatus).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                if model.receivedFilesKeptInFolder {
-                    Text(ClipboardSync.keptFilesNotice).font(.caption).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if let id = model.receivingFileID {
-                    Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }.controlSize(.small)
-                }
-                if model.clipboardStatus.contains("接收完成") || model.receivedFilesKeptInFolder {
-                    Button("打开接收文件目录") { model.openReceivedFiles() }.controlSize(.small)
-                }
-            }.frame(maxWidth: .infinity, alignment: .leading)
-            Button {
-                dismissedClipboardStatus = model.clipboardStatus
-                dismissedReceptionID = model.receivingFileID
-                model.dismissReceivedFilesNotice()
-            } label: { Image(systemName: "xmark") }
-                .buttonStyle(.plain).foregroundStyle(.secondary).help("收起状态提示")
-        }
-        .padding(14).frame(width: 320)
-        .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color(nsColor: .separatorColor)))
-        .shadow(color: .black.opacity(0.16), radius: 12, y: 4)
+        ClipboardActivityView(notice: model.fileTransferNotice,
+                              status: showClipboardStatus ? model.clipboardStatus : nil,
+                              pendingOffer: model.pendingFileOffer != nil,
+                              keptFilesMessage: showKeptFilesFallback ? ClipboardSync.keptFilesNotice : nil,
+                              cancelReception: model.receivingFileID.map { id in { model.cancelFileReception(id: id) } },
+                              openFolder: { model.canvas.releaseControl(); model.openReceivedFiles() },
+                              dismissResult: { model.dismissReceivedFilesNotice() },
+                              dismissStatus: {
+                                  if model.fileTransferNotice == nil { dismissClipboardActivity() }
+                                  else { dismissClipboardStatus() }
+                              })
+            .padding(14).frame(width: 320)
+            .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color(nsColor: .separatorColor)))
+            .shadow(color: .black.opacity(0.16), radius: 12, y: 4)
     }
 }
 

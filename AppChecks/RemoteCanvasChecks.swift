@@ -416,6 +416,40 @@ private struct RemoteCanvasChecks {
             }
         }
 
+        run("Shared session tools consume only their panel and button while exposed video remains remote") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
+            let window = NSWindow(contentRect: canvas.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            defer { window.close() }
+            canvas.canControl = true
+            let presentation = SessionToolsPresentation(connected: true, reconnecting: false, hasSession: true,
+                fullScreen: true, remoteName: "Synthetic Mac", latency: "12 ms",
+                control: SessionControlPresentation(reconnecting: false, sessionPaused: false,
+                    inputSuspended: false, canControl: true, controlling: false), keyboardSummary: "Caps Lock 待生效")
+            let hosting = NSHostingView(rootView: CanvasView(canvas: canvas).overlay {
+                GeometryReader { geometry in
+                    HStack(spacing: 16) {
+                        Spacer(minLength: 0)
+                        SessionToolsView(presentation: presentation, settings: Text("Synthetic settings"),
+                            keyboard: Text("Synthetic keyboard"), desktop: Text("Synthetic desktop"), perform: { _ in }, close: {})
+                            .frame(height: min(568, max(0, geometry.size.height - 32)))
+                        Button {} label: { Image(systemName: "slider.horizontal.3").frame(width: 44, height: 44) }
+                    }.padding(.trailing, 16).frame(maxHeight: .infinity)
+                }
+            }.frame(width: 900, height: 600))
+            window.contentView = hosting
+            hosting.layoutSubtreeIfNeeded()
+            try require(canvas.window === window, "Shared tools fixture did not attach the canvas")
+            for (point, remote) in [(CGPoint(x: 20, y: 20), true), (CGPoint(x: 400, y: 300), true),
+                                    (CGPoint(x: 660, y: 300), false), (CGPoint(x: 862, y: 300), false)] {
+                guard let event = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [],
+                    timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) else {
+                    throw CanvasCheckFailure("Could not create a shared tools hit-test event")
+                }
+                try require(canvas.isInputTarget(of: event) == remote, "Panel overlay changed input ownership at \(point)")
+            }
+        }
+
         run("Dragging the status releases control and consumes only the status rectangle") {
             let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
             let window = NSWindow(contentRect: canvas.bounds, styleMask: .borderless, backing: .buffered, defer: false)

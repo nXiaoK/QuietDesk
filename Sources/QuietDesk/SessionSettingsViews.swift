@@ -76,62 +76,18 @@ struct ConnectionSettingsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                SessionQualitySection(model: model, compact: false)
-                Divider()
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("连接").font(.headline)
-                    Toggle("本地即时光标", isOn: $model.lowLatencyCursorEnabled)
-                        .disabled(model.connected && !model.supportsIndependentCursor)
-                        .help("减少双光标跟随；远端形状不可用时使用通用指针。")
-                    if model.connected {
-                        Text(model.controlTransportStatus).font(.caption).foregroundStyle(.secondary)
-                        Text(model.supportsIndependentCursor ? model.cursorStatus : "对端版本不支持独立光标")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    Toggle("仅使用 TCP（下次连接生效）", isOn: $model.mediaTCPOnly)
-                    Text(model.connected ? model.mediaRouteSummary : (model.mediaTCPOnly ? "视频使用 TCP" : "视频优先 UDP，不可用时自动使用 TCP"))
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    if model.relayEnabled { RelayPeerAssistPicker(model: model) }
-                    Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
-                    Toggle("连接诊断", isOn: $model.connectionDiagnosticsEnabled)
-                        .disabled(model.isControllingAnotherMac)
-                    Text("连接前开启，结束后自动显示整段会话的线路、延迟、UDP 丢包、帧率和吞吐量。报告仅在本机内存中保留。")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    Toggle(isOn: $model.showFullScreenStatistics) { Text("全屏显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
-                    if model.showFullScreenStatistics { FullScreenStatusSettings(model: model) }
-                    Text("每行一项，依次为连接时长、视频线路、解码 FPS、收发流量、本次连接累计流量、往返延迟、UDP 丢包（达到 3% 时为红色）、分辨率。线路名精简显示，白字黑底，默认在右下角；背景透明度可调，可直接拖动状态调整位置。累计流量含视频、控制和剪贴板的收发，断线自动重连后重新累计。往返延迟约每 5 秒更新；不代表画面上屏延迟。静止画面 FPS 可能为 0。")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    Button(action: openTraffic) { Label("设备历史流量…", systemImage: "chart.bar.xaxis") }
-                    Button(action: openEffects) { Label("被控端隐私与安全…", systemImage: "lock.shield") }
-                }
-                Divider()
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("剪贴板与文件").font(.headline)
-                    Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) { Text("双向同步文字、图片和文件").frame(maxWidth: .infinity, alignment: .leading) }
-                    Text("文字和图片按控制端焦点同步；文件需逐次确认后下载，完成后再粘贴。")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    Button { model.openReceivedFiles() } label: {
-                        Label("打开接收文件目录", systemImage: "folder")
-                    }
-                    .help(ClipboardSync.receivingDirectory)
-                    if let id = model.receivingFileID {
-                        Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }
-                    }
-                }
+                ConnectionOptionsSections(model: model, compact: false)
                 Divider()
                 HStack(spacing: 8) {
-                    Label("Caps Lock 转发", systemImage: "capslock")
+                    Label("键盘与快捷键", systemImage: "keyboard")
                     CapsLockStateLabel(model: model)
                     Spacer(minLength: 0)
                     Button("设置…", action: openCaps).buttonStyle(.link)
                 }
                 Text(model.systemShortcutStatus).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                if !model.lastDisconnect.isEmpty {
-                    Text("上次断开：\(model.lastDisconnect)")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .lineLimit(3).textSelection(.enabled).help(model.lastDisconnect)
-                }
+                Button(action: openEffects) { Label("被控端隐私与安全…", systemImage: "lock.shield") }
+                Button(action: openTraffic) { Label("设备历史流量…", systemImage: "chart.bar.xaxis") }
             }
             .font(.system(size: 13))
             .toggleStyle(.switch).controlSize(.small)
@@ -139,6 +95,62 @@ struct ConnectionSettingsView: View {
             .background(Color(nsColor: .windowBackgroundColor))
         }
         .frame(width: 340).frame(maxHeight: 560)
+    }
+}
+
+private struct ConnectionOptionsSections: View {
+    @ObservedObject var model: DeskModel
+    let compact: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SessionQualitySection(model: model, compact: compact)
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                Text("连接").font(.headline)
+                Toggle("本地即时光标", isOn: $model.lowLatencyCursorEnabled)
+                    .disabled(model.connected && !model.supportsIndependentCursor)
+                    .help("减少双光标跟随；远端形状不可用时使用通用指针。")
+                if model.connected {
+                    Text(model.controlTransportStatus).font(.caption).foregroundStyle(.secondary)
+                    Text(model.supportsIndependentCursor ? model.cursorStatus : "对端版本不支持独立光标")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Toggle("仅使用 TCP（下次连接生效）", isOn: $model.mediaTCPOnly)
+                Text(model.connected ? model.mediaRouteSummary : (model.mediaTCPOnly ? "视频使用 TCP" : "视频优先 UDP，不可用时自动使用 TCP"))
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                if model.relayEnabled { RelayPeerAssistPicker(model: model) }
+                Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
+                Toggle("连接诊断", isOn: $model.connectionDiagnosticsEnabled)
+                    .disabled(model.isControllingAnotherMac)
+                Text("连接前开启，结束后自动显示整段会话的线路、延迟、UDP 丢包、帧率和吞吐量。报告仅在本机内存中保留。")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Toggle(isOn: $model.showFullScreenStatistics) { Text("全屏显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
+                if model.showFullScreenStatistics { FullScreenStatusSettings(model: model) }
+                Text("每行一项，依次为连接时长、视频线路、解码 FPS、收发流量、本次连接累计流量、往返延迟、UDP 丢包（达到 3% 时为红色）、分辨率。线路名精简显示，白字黑底，默认在右下角；背景透明度可调，可直接拖动状态调整位置。累计流量含视频、控制和剪贴板的收发，断线自动重连后重新累计。往返延迟约每 5 秒更新；不代表画面上屏延迟。静止画面 FPS 可能为 0。")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                Text("剪贴板与文件").font(.headline)
+                Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) { Text("双向同步文字、图片和文件").frame(maxWidth: .infinity, alignment: .leading) }
+                Text("文字和图片按控制端焦点同步；文件需逐次确认后下载，完成后再粘贴。")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Button { model.canvas.releaseControl(); model.openReceivedFiles() } label: {
+                    Label("打开接收文件目录", systemImage: "folder")
+                }
+                .help(ClipboardSync.receivingDirectory)
+                if let id = model.receivingFileID {
+                    Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }
+                }
+            }
+            if !model.lastDisconnect.isEmpty {
+                Text("上次断开：\(model.lastDisconnect)")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(3).textSelection(.enabled).help(model.lastDisconnect)
+            }
+        }
+        .toggleStyle(.switch).controlSize(.small)
     }
 }
 
@@ -177,171 +189,49 @@ struct CapsLockSettingsView: View {
     }
 }
 
-struct FullScreenSettingsView: View {
+struct SessionControlsView: View {
     @ObservedObject var model: DeskModel
     let close: () -> Void
     let openTraffic: () -> Void
     let openEffects: () -> Void
-    @State private var showingCaps = false
-    @State private var showingDesktopActions = false
+
+    private var presentation: SessionToolsPresentation {
+        SessionToolsPresentation(connected: model.connected, reconnecting: model.reconnecting,
+            hasSession: model.active || model.working || model.reconnecting,
+            fullScreen: model.isFullScreen, remoteName: model.remoteName, latency: model.latency,
+            control: SessionControlPresentation(reconnecting: model.reconnecting, sessionPaused: model.sessionPaused,
+                inputSuspended: model.sessionInputSuspended, canControl: model.canControl, controlling: model.controlling),
+            keyboardSummary: "Caps Lock " + (!model.capsLockEnabled ? "关闭" : model.capsLockRunning ? "已就绪" : "待生效"))
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 8) {
-                if showingCaps || showingDesktopActions {
-                    Button { showingCaps = false; showingDesktopActions = false } label: { Image(systemName: "chevron.left") }
-                        .buttonStyle(.plain).frame(width: 20, height: 24).help("返回控制与设置")
-                }
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(showingCaps ? "键盘与快捷键" : showingDesktopActions ? "远端桌面" : (model.remoteName.isEmpty ? "控制与设置" : model.remoteName))
-                        .font(.system(size: 13, weight: .semibold)).lineLimit(1)
-                    if showingCaps {
-                        Text("仅在远程画面获得焦点时捕获")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                    } else {
-                        HStack(spacing: 5) {
-                            Circle().fill(model.connected ? Color.green : Color.orange).frame(width: 5, height: 5)
-                            Text("\(model.connected ? "已连接" : (model.reconnecting ? "正在重连" : "未连接")) · \(model.latency)")
-                        }
-                        .font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit()
-                    }
-                }
-                Spacer(minLength: 0)
-                Button(action: close) { Image(systemName: "xmark").frame(width: 22, height: 22) }
-                    .buttonStyle(.plain).foregroundStyle(.secondary).help("收起控制与设置")
-            }
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    if showingCaps {
-                        CapsLockDetails(model: model, compact: true)
-                    } else if showingDesktopActions {
-                        RemoteDesktopActionsView(unavailableReason: model.desktopActionUnavailableReason,
-                            status: model.desktopActionStatus, privacyEnabled: model.sessionEffects.privacy,
-                            perform: model.sendDesktopAction)
-                    } else {
-                        HStack(spacing: 8) {
-                            Button { model.canvas.releaseControl() } label: {
-                                VStack(spacing: 3) {
-                                    Label("释放控制", systemImage: "cursorarrow")
-                                    Text("⌃⌥ Esc").font(.system(size: 10)).foregroundStyle(.secondary)
-                                }.frame(maxWidth: .infinity)
-                            }
-                            Button { close(); model.toggleFullScreen() } label: {
-                                VStack(spacing: 3) {
-                                    Label("退出全屏", systemImage: "arrow.down.right.and.arrow.up.left")
-                                    Text("⌃⌘F").font(.system(size: 10)).foregroundStyle(.secondary)
-                                }.frame(maxWidth: .infinity)
-                            }
-                        }
-                        .buttonStyle(.bordered).controlSize(.regular)
-                        Button {
-                            model.canvas.releaseControl()
-                            showingDesktopActions = true
-                        } label: {
-                            HStack {
-                                Label("桌面", systemImage: "rectangle.3.group")
-                                Spacer(minLength: 4)
-                                Image(systemName: "chevron.right")
-                            }.frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered).controlSize(.regular)
-                        Button { model.copyRemoteFrame() } label: {
-                            HStack {
-                                Label("截取远端画面到剪贴板", systemImage: "camera.viewfinder")
-                                Spacer(minLength: 4)
-                                Text("⌃⌘S").font(.system(size: 10)).foregroundStyle(.secondary)
-                            }.frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered).controlSize(.regular).disabled(!model.connected)
-                        .help("截图来自收到的远端画面，防窥遮罩不会出现在里面")
-                        Divider()
-                        SessionQualitySection(model: model, compact: true)
-                        Divider()
-                        VStack(spacing: 6) {
-                            Toggle("本地即时光标", isOn: $model.lowLatencyCursorEnabled)
-                                .disabled(!model.supportsIndependentCursor)
-                            Text(model.cursorStatus).font(.caption).foregroundStyle(.secondary)
-                            Toggle(isOn: $model.showFullScreenStatistics) { Text("显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
-                                .help("在右下角竖排显示连接时长、线路、FPS、流量、本次累计流量、RTT、丢包、分辨率，线路名精简显示，白字黑底，背景透明度可调；可直接拖动调整位置。累计流量断线重连后重新累计。RTT 不代表画面上屏延迟。")
-                            if model.showFullScreenStatistics { FullScreenStatusSettings(model: model) }
-                            Text(model.mediaRouteSummary).font(.caption).foregroundStyle(.secondary)
-                            Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
-                            Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) { Text("双向同步文字、图片和文件").frame(maxWidth: .infinity, alignment: .leading) }
-                                .help("文字和图片按控制端焦点同步；文件需逐次确认后下载，完成后再粘贴。")
-                        }
-                        .toggleStyle(.switch).controlSize(.small)
-                        Text(model.systemShortcutStatus).font(.system(size: 10)).foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Divider()
-                        VStack(spacing: 0) {
-                            Button(action: openEffects) {
-                                HStack {
-                                    Label("被控端隐私与安全", systemImage: "lock.shield")
-                                    Spacer()
-                                    Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
-                                }.frame(minHeight: 28)
-                            }
-                            Button(action: openTraffic) {
-                                HStack {
-                                    Label("设备历史流量", systemImage: "chart.bar.xaxis")
-                                    Spacer()
-                                    Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
-                                }.frame(minHeight: 28)
-                            }
-                            Button { model.openReceivedFiles() } label: {
-                                HStack {
-                                    Label("打开接收文件目录", systemImage: "folder")
-                                    Spacer()
-                                    Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
-                                }.frame(minHeight: 28)
-                            }
-                            .help(ClipboardSync.receivingDirectory)
-                            if let id = model.receivingFileID {
-                                Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }
-                                    .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
-                            }
-                            Button {
-                                showingCaps = true
-                                model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
-                            } label: {
-                                HStack(spacing: 8) {
-                                    Label("Caps Lock 转发", systemImage: "capslock")
-                                    CapsLockStateLabel(model: model)
-                                    Spacer(minLength: 0)
-                                    Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
-                                }.frame(minHeight: 28)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        if !model.lastDisconnect.isEmpty {
-                            Text("上次断开：\(model.lastDisconnect)")
-                                .font(.system(size: 10)).foregroundStyle(.secondary)
-                                .lineLimit(2).textSelection(.enabled).help(model.lastDisconnect)
-                        }
-                    }
-                }
-            }
-            Spacer(minLength: 0)
-            Divider()
-            HStack(spacing: 7) {
-                Button { model.pushClipboard() } label: { Label("发送文字", systemImage: "doc.badge.arrow.up") }
-                    .disabled(!model.connected)
-                Button { model.pullClipboard() } label: { Label("获取文字", systemImage: "arrow.down.doc") }
-                    .disabled(!model.connected)
-                Spacer(minLength: 0)
-                Button(model.active ? "断开" : "返回连接") {
-                    close()
-                    if model.active { model.stop() } else { model.toggleFullScreen() }
-                }
-                .foregroundStyle(model.active ? Color.red : Color.primary)
-            }
-            .buttonStyle(.bordered).controlSize(.small)
-        }
-        .font(.system(size: 12))
-        .padding(14).frame(width: 324, height: 568)
-        .background(Color(nsColor: .windowBackgroundColor))
+        SessionToolsView(presentation: presentation,
+            settings: ConnectionOptionsSections(model: model, compact: true),
+            keyboard: CapsLockDetails(model: model, compact: true),
+            desktop: RemoteDesktopActionsView(unavailableReason: model.desktopActionUnavailableReason,
+                status: model.desktopActionStatus, privacyEnabled: model.sessionEffects.privacy,
+                perform: model.sendDesktopAction),
+            perform: perform, close: close)
         .onChange(of: model.active) { _, active in if !active { close() } }
-        .onExitCommand(perform: close)
+    }
+
+    private func perform(_ action: SessionToolAction) {
+        presentation.perform(action, releaseControl: { model.canvas.releaseControl() }) {
+            switch action {
+            case .releaseControl, .desktop: break
+            case .fullScreen: close(); model.toggleFullScreen()
+            case .sendText: model.pushClipboard()
+            case .receiveText: model.pullClipboard()
+            case .captureFrame: model.copyRemoteFrame()
+            case .keyboard: model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
+            case .privacy: openEffects()
+            case .traffic: openTraffic()
+            case .endSession:
+                close()
+                if model.active || model.working || model.reconnecting { model.stop() }
+                else if model.isFullScreen { model.toggleFullScreen() }
+            }
+        }
     }
 }
 

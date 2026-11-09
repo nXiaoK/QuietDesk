@@ -236,25 +236,30 @@ struct DeskView: View {
             }
             ToolbarItemGroup(placement: .primaryAction) {
                 if sessionLayout {
-                    Button { model.canvas.releaseControl(); model.pushClipboard() } label: { Label("发送文字", systemImage: "doc.badge.arrow.up") }
-                        .help("发送本机剪贴板文字").disabled(!model.connected)
-                    Button { model.canvas.releaseControl(); model.pullClipboard() } label: { Label("获取文字", systemImage: "arrow.down.doc") }
-                        .help("获取远端剪贴板文字").disabled(!model.connected)
-                    Button { model.copyRemoteFrame() } label: { Label("截取画面", systemImage: "camera.viewfinder") }
-                        .help("把当前远端画面复制到剪贴板（⌃⌘S），防窥遮罩不会出现在截图里").disabled(!model.connected)
+                    Button { model.canvas.releaseControl(); model.pushClipboard() } label: {
+                        Label(SessionToolAction.sendText.title(), systemImage: SessionToolAction.sendText.symbol())
+                    }.help(SessionToolAction.sendText.help).disabled(!model.connected)
+                    Button { model.canvas.releaseControl(); model.pullClipboard() } label: {
+                        Label(SessionToolAction.receiveText.title(), systemImage: SessionToolAction.receiveText.symbol())
+                    }.help(SessionToolAction.receiveText.help).disabled(!model.connected)
+                    Button { model.canvas.releaseControl(); model.copyRemoteFrame() } label: {
+                        Label(SessionToolAction.captureFrame.title(), systemImage: SessionToolAction.captureFrame.symbol())
+                    }.help(SessionToolAction.captureFrame.help).disabled(!model.connected)
                     desktopActionButton(.missionControl)
                     desktopActionButton(.previousSpace)
                     desktopActionButton(.nextSpace)
-                    Button { model.canvas.releaseControl(); showCapsSettings = true } label: { Label("键盘设置", systemImage: "keyboard") }
-                        .help("全屏系统快捷键与 Caps Lock 转发设置")
-                    Button { model.canvas.releaseControl(); showOptions.toggle() } label: { Label("画质与连接", systemImage: "slider.horizontal.3") }
-                        .help("本次会话画质、连接与剪贴板")
+                    Button { model.canvas.releaseControl(); showCapsSettings = true } label: {
+                        Label(SessionToolAction.keyboard.title(), systemImage: SessionToolAction.keyboard.symbol())
+                    }.help(SessionToolAction.keyboard.help)
+                    Button { model.canvas.releaseControl(); showOptions.toggle() } label: { Label("控制与设置", systemImage: "slider.horizontal.3") }
+                        .help("控制状态、连接画质、键盘、剪贴板与文件；与全屏使用同一面板")
                         .popover(isPresented: $showOptions, arrowEdge: .top) {
-                            ConnectionSettingsView(model: model, openCaps: { showOptions = false; showCapsSettings = true },
-                                                   openTraffic: openTrafficStatistics, openEffects: openSessionEffects)
+                            SessionControlsView(model: model, close: { showOptions = false },
+                                                openTraffic: openTrafficStatistics, openEffects: openSessionEffects)
                         }
-                    Button { model.toggleFullScreen() } label: { Label("全屏", systemImage: "arrow.up.left.and.arrow.down.right") }
-                        .help("进入全屏（⌃⌘F）")
+                    Button { model.canvas.releaseControl(); model.toggleFullScreen() } label: {
+                        Label(SessionToolAction.fullScreen.title(), systemImage: SessionToolAction.fullScreen.symbol())
+                    }.help(SessionToolAction.fullScreen.help)
                     Divider()
                     Button("断开") { model.stop() }
                 } else if model.mode == .viewer {
@@ -382,31 +387,35 @@ struct DeskView: View {
         }
         .overlay(alignment: .trailing) {
             if immersive {
-                HStack(spacing: 16) {
-                    if showFullScreenMenu {
-                        FullScreenSettingsView(model: model, close: { showFullScreenMenu = false },
-                                               openTraffic: openTrafficStatistics, openEffects: openSessionEffects)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                            .shadow(color: .black.opacity(0.3), radius: 16, y: 6)
+                GeometryReader { geometry in
+                    HStack(spacing: 16) {
+                        Spacer(minLength: 0)
+                        if showFullScreenMenu {
+                            SessionControlsView(model: model, close: { showFullScreenMenu = false },
+                                                openTraffic: openTrafficStatistics, openEffects: openSessionEffects)
+                                .frame(height: min(568, max(0, geometry.size.height - 32)))
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                                .shadow(color: .black.opacity(0.3), radius: 16, y: 6)
+                        }
+                        Button {
+                            model.canvas.releaseControl()
+                            showFullScreenMenu.toggle()
+                        } label: {
+                            Image(systemName: "slider.horizontal.3")
+                                .font(.system(size: 20, weight: .medium)).frame(width: 44, height: 44)
+                                .foregroundStyle(showFullScreenMenu ? Color.white : Color.primary)
+                                .background {
+                                    if showFullScreenMenu { Circle().fill(Color.accentColor) }
+                                    else { Circle().fill(.regularMaterial) }
+                                }
+                                .overlay(Circle().stroke(.white.opacity(0.2)))
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain).help(showFullScreenMenu ? "收起控制与设置" : "展开控制与设置")
+                        .accessibilityLabel(showFullScreenMenu ? "收起控制与设置" : "展开控制与设置")
                     }
-                    Button {
-                        model.canvas.releaseControl()
-                        showFullScreenMenu.toggle()
-                    } label: {
-                        Image(systemName: "slider.horizontal.3")
-                            .font(.system(size: 20, weight: .medium)).frame(width: 44, height: 44)
-                            .foregroundStyle(showFullScreenMenu ? Color.white : Color.primary)
-                            .background {
-                                if showFullScreenMenu { Circle().fill(Color.accentColor) }
-                                else { Circle().fill(.regularMaterial) }
-                            }
-                            .overlay(Circle().stroke(.white.opacity(0.2)))
-                            .contentShape(Circle())
-                    }
-                    .buttonStyle(.plain).help(showFullScreenMenu ? "收起控制与设置" : "展开控制与设置")
-                    .accessibilityLabel(showFullScreenMenu ? "收起控制与设置" : "展开控制与设置")
+                    .padding(.trailing, 16).frame(maxHeight: .infinity)
                 }
-                .padding(.trailing, 16)
             }
         }
     }
@@ -470,11 +479,8 @@ struct DeskView: View {
     }
 
     private var controlStatus: String {
-        if model.sessionPaused && model.reconnecting { return "空闲暂停 · 返回窗口后继续连接" }
-        if model.sessionInputSuspended { return "画面暂停或恢复中 · 暂不发送键盘鼠标" }
-        if model.reconnecting { return "自动重连中 · 键盘鼠标暂不发送" }
-        if !model.canControl { return "仅观看 · 共享端辅助功能未生效" }
-        return model.controlling ? "正在控制远端 · ⌃⌥Esc 释放键盘鼠标" : "已释放 · 点按画面开始控制"
+        SessionControlPresentation(reconnecting: model.reconnecting, sessionPaused: model.sessionPaused,
+            inputSuspended: model.sessionInputSuspended, canControl: model.canControl, controlling: model.controlling).title
     }
 
     @ViewBuilder private var metrics: some View {

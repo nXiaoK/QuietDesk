@@ -233,6 +233,11 @@ final class DeskModel: ObservableObject {
     @Published private(set) var sessionPauseWorking = false
     @Published private(set) var sessionPauseStatus = ""
     var sessionInputSuspended: Bool { mode == .viewer && (idlePolicy.isPaused || pauseTransmission.inputSuspended) }
+    var remoteKeyboardNextStep: PermissionNextStep {
+        .remoteKeyboard(connected: connected, reconnecting: reconnecting, canControl: canControl,
+            livePermissionUpdates: controlStatusUpdatesEnabled, supportsInputActions: supportsInputActions,
+            inputSuspended: sessionInputSuspended)
+    }
     @Published private(set) var activeVideoState: VideoStreamState?
     // The host's running encoder; on the viewer, what the host last confirmed. A new connection starts with H.264.
     @Published private(set) var activeVideoCodec = VideoCodec.h264

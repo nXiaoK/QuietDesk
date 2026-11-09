@@ -82,6 +82,16 @@ private struct PermissionGuideChecks {
             try require(panel.contentView != nil && !guide.isVisible, "The guide is empty or visible before presentation")
         }
 
+        run("Each settings destination explains its local purpose without granting or starting work") {
+            try require(PermissionGuide.Kind.screenRecording.purpose.contains("不会自动开始"), "Screen permission implies automatic sharing")
+            try require(PermissionGuide.Kind.accessibility.purpose.contains("两台 Mac 的授权不能互相代替"), "Accessibility mixes the two Macs")
+            try require(PermissionGuide.Kind.inputMonitoring.purpose.contains("这台控制 Mac"), "Input Monitoring points to wrong device")
+            for (kind, pane) in [(PermissionGuide.Kind.screenRecording, "Privacy_ScreenCapture"),
+                                 (.accessibility, "Privacy_Accessibility"), (.inputMonitoring, "Privacy_ListenEvent")] {
+                try require(kind.settingsURL?.absoluteString.hasSuffix(pane) == true, "Wrong settings destination")
+            }
+        }
+
         for kind in [PermissionGuide.Kind.screenRecording, .accessibility, .inputMonitoring] {
             run("\(kind.title): a pending permission stays visible until effective") {
                 let state = SyntheticPermissionState()

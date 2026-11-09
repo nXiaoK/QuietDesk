@@ -304,6 +304,7 @@ private struct CapsLockDetails: View {
                 .toggleStyle(.switch).controlSize(.small)
                 .padding(compact ? 9 : 11)
                 .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+            PermissionNextStepView(step: model.remoteKeyboardNextStep, compact: compact, perform: permissionAction)
             VStack(alignment: .leading, spacing: 8) {
                 Text("按键行为").font(.headline)
                 if compact {
@@ -336,9 +337,9 @@ private struct CapsLockDetails: View {
                 Text("当前应用：\(Bundle.main.bundleURL.path)")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                     .lineLimit(compact ? 2 : 3).textSelection(.enabled).help(Bundle.main.bundleURL.path)
-                Text("两项权限均生效后才能监听。系统中已勾选但未生效时，请完全退出后重开，无需反复添加。")
-                    .font(.system(size: compact ? 10 : 11)).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                PermissionNextStepView(step: .localKeyboard(accessibility: model.localAccessibility,
+                    inputMonitoring: model.localInputMonitoring, capsEnabled: model.capsLockEnabled,
+                    capsRunning: model.capsLockRunning), compact: compact, perform: permissionAction)
             }
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 7) {
@@ -355,6 +356,15 @@ private struct CapsLockDetails: View {
                 }
             }
             .font(.system(size: compact ? 10 : 11))
+        }
+    }
+
+    private func permissionAction(_ action: PermissionNextStep.Action) {
+        switch action {
+        case .screenRecording: model.openScreenPermission()
+        case .accessibility: model.requestAccessibility()
+        case .inputMonitoring: model.requestInputMonitoring()
+        case .recheck: model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
         }
     }
 }

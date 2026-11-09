@@ -15,6 +15,14 @@ final class PermissionGuide: NSWindowController {
             }
         }
 
+        var purpose: String {
+            switch self {
+            case .screenRecording: return "用于被控 Mac 传送画面；生效后请返回“共享这台 Mac”点“开启共享”，不会自动开始。"
+            case .accessibility: return "在被控 Mac 上用于接受键盘鼠标控制；在控制 Mac 上用于本机键盘监听。两台 Mac 的授权不能互相代替。"
+            case .inputMonitoring: return "用于这台控制 Mac 监听 Caps Lock 与全屏系统快捷键；不代替被控 Mac 的控制授权。"
+            }
+        }
+
         var settingsURL: URL? {
             let pane: String
             switch self {
@@ -41,6 +49,9 @@ final class PermissionGuide: NSWindowController {
 
     init(bundleURL: URL = Bundle.main.bundleURL,
          permissionCheck: @escaping (Kind) -> Bool = { $0.isEffective },
+         openSettings: @escaping (Kind) -> Void = { kind in
+             if let url = kind.settingsURL { NSWorkspace.shared.open(url) }
+         },
          onRefresh: @escaping () -> Void) {
         state = PermissionGuideState(bundleURL: bundleURL)
         self.permissionCheck = permissionCheck
@@ -57,7 +68,7 @@ final class PermissionGuide: NSWindowController {
         panel.animationBehavior = .utilityWindow
         super.init(window: panel)
         let content = PermissionGuideHostingView(rootView: PermissionGuideView(state: state,
-            onRefresh: { [weak self] in self?.onRefresh() }))
+            onRefresh: { [weak self] in self?.onRefresh() }, openSettings: openSettings))
         panel.contentView = content
         panel.setContentSize(content.fittingSize)
     }
@@ -119,6 +130,7 @@ private final class PermissionGuideHostingView: NSHostingView<PermissionGuideVie
 private struct PermissionGuideView: View {
     @ObservedObject var state: PermissionGuideState
     let onRefresh: () -> Void
+    let openSettings: (PermissionGuide.Kind) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 13) {
@@ -148,6 +160,9 @@ private struct PermissionGuideView: View {
                     }
                 }
             }
+            Text(state.kind.purpose).font(.system(size: 11)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("打开\(state.kind.title)系统设置…") { openSettings(state.kind) }.controlSize(.small)
             Divider()
             HStack(spacing: 8) {
                 Image(systemName: state.effective ? "checkmark.circle.fill" : "circle.dashed")

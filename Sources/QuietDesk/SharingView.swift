@@ -152,7 +152,7 @@ struct SharingView: View {
                 }
                 Divider()
                 HStack {
-                    Text("需要的权限").font(.subheadline.weight(.medium))
+                    Text("本机共享权限").font(.subheadline.weight(.medium))
                     Spacer()
                     Button("重新检测") { model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true) }
                         .controlSize(.small)
@@ -163,6 +163,15 @@ struct SharingView: View {
                     }
                     permissionRow("辅助功能", symbol: "accessibility", granted: model.localAccessibility) {
                         model.requestAccessibility()
+                    }
+                }
+                PermissionNextStepView(step: .sharing(screenRecording: model.localScreenRecording,
+                    accessibility: model.localAccessibility, started: locked), compact: false) { action in
+                    switch action {
+                    case .screenRecording: model.openScreenPermission()
+                    case .accessibility: model.requestAccessibility()
+                    case .inputMonitoring: model.requestInputMonitoring()
+                    case .recheck: model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
                     }
                 }
                 VStack(alignment: .leading, spacing: 4) {

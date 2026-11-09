@@ -134,6 +134,7 @@ swift run --disable-sandbox QuietDeskChecks
 ./scripts/run-log-checks.sh
 ./scripts/run-credential-checks.sh
 ./scripts/run-permission-checks.sh
+./scripts/run-permission-next-step-checks.sh
 ./scripts/run-update-controller-checks.sh
 ./scripts/run-update-checks.sh
 python3 -m unittest discover -s scripts/tests -v
@@ -159,6 +160,7 @@ python3 -m unittest discover -s scripts/tests -v
 | `run-log-checks.sh` | 临时目录中的日志轮转、并发聚合、隐私字段、文件权限与导出错误恢复 |
 | `run-credential-checks.sh` | 临时目录中的凭据往返、权限、损坏保留、原子写入失败、并发更新及连接记录匹配；不访问真实凭据或钥匙串 |
 | `run-permission-checks.sh` | 独立 bundle ID 的透明面板与合成权限，验证引导自动关闭、切换及手动关闭；检查设置入口不调用主动授权 API |
+| `run-permission-next-step-checks.sh` | 合成状态下区分共享画面/控制、本机权限/监听、被控端授权/能力与旧端更新范围，检查下一步及动作选择；不查询或修改系统权限、不实例化模型 |
 | `run-update-controller-checks.sh` | 独立 bundle ID、隔离偏好与回环服务，检查更新控制器、首次询问时机、自动检查间隔及清单获取边界 |
 | `run-update-checks.sh` | 独立 bundle ID、临时目录、合成签名应用和回环服务；检查更新下载、暂存、独立安装进程、重启与故障恢复 |
 | Python 检查 | 版本分配、参数校验、打包、更新构建配置、plist 注入及发布前置顺序等规则；更新工具另用临时密钥检查签名与篡改拒绝 |

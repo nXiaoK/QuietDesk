@@ -372,108 +372,14 @@ private struct SessionQualitySection: View {
     @ObservedObject var model: DeskModel
     let compact: Bool
 
-    private var changing: Bool {
-        guard model.connected, model.supportsLiveSettings, let tuning = model.videoTuning else { return false }
-        return tuning.pending != nil || tuning.desired != tuning.applied.settings
-    }
-
-    private var settingsMessage: String? {
-        let status = model.videoSettingsStatus
-        guard !status.isEmpty, !status.hasPrefix("当前生效："), !status.hasPrefix("已生效："), !status.hasPrefix("正在应用：") else { return nil }
-        return status
-    }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: compact ? 7 : 9) {
-            HStack(spacing: 7) {
-                Text("本次会话画质").font(.headline)
-                Text("仅本次会话")
-                    .font(.system(size: 10)).foregroundStyle(Color.accentColor)
-                    .padding(.horizontal, 5).padding(.vertical, 2)
-                    .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 4))
-                Spacer(minLength: 0)
-            }
-            Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: compact ? 5 : 7) {
-                GridRow {
-                    Text("最长边").foregroundStyle(.secondary)
-                    Picker("最长边", selection: Binding(get: { model.viewerSettings.longestEdge }, set: { value in
-                        var settings = model.viewerSettings; settings.longestEdge = value; model.chooseViewerSettings(settings)
-                    })) {
-                        ForEach(model.viewerLongestEdges, id: \.self) { Text(StreamSettings.resolutionLabel($0)).tag($0) }
-                    }
-                    .labelsHidden().frame(maxWidth: .infinity)
-                }
-                GridRow {
-                    Text("帧率上限").foregroundStyle(.secondary)
-                    Picker("帧率上限", selection: Binding(get: { model.viewerSettings.framesPerSecond }, set: { value in
-                        var settings = model.viewerSettings; settings.framesPerSecond = value; model.chooseViewerSettings(settings)
-                    })) {
-                        ForEach(model.viewerFrameRates, id: \.self) { Text("\($0) fps").tag($0) }
-                    }
-                    .labelsHidden().frame(maxWidth: .infinity)
-                }
-                GridRow {
-                    Text("目标码率").foregroundStyle(.secondary)
-                    Picker("目标码率", selection: Binding(get: { model.viewerSettings.megabits }, set: { value in
-                        var settings = model.viewerSettings; settings.megabits = value; model.chooseViewerSettings(settings)
-                    })) {
-                        ForEach(model.viewerBitRates, id: \.self) { Text("\($0) Mbps").tag($0) }
-                    }
-                    .labelsHidden().frame(maxWidth: .infinity)
-                }
-            }
-            .pickerStyle(.menu).controlSize(.small)
-            .disabled(!model.connected || !model.supportsLiveSettings)
-            if !model.connected {
-                Text("连接后可即时调整画质，无需停止共享。")
-                    .foregroundStyle(.secondary)
-            } else if !model.supportsLiveSettings {
-                Label("共享端版本不支持会话中调整画质", systemImage: "exclamationmark.circle")
-                    .foregroundStyle(Color.orange)
-                Text("当前使用共享端画质。请将家里 Mac 的 QuietDesk 更新到 0.4.0 或更新版本。")
-                    .foregroundStyle(.secondary)
-            } else if changing {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.mini)
-                    Text("正在应用…")
-                }
-                if let state = model.activeVideoState {
-                    Text("当前仍为 \(state.settings.summary)").foregroundStyle(.secondary).monospacedDigit()
-                }
-            } else if let message = settingsMessage {
-                Label {
-                    Text(message).textSelection(.enabled)
-                } icon: { Image(systemName: "exclamationmark.triangle.fill") }
-                .foregroundStyle(Color.red).fixedSize(horizontal: false, vertical: true)
-                .lineLimit(compact ? 3 : nil).help(message)
-                if let state = model.activeVideoState {
-                    Text("当前生效 \(state.settings.summary)").foregroundStyle(.secondary).monospacedDigit()
-                }
-            } else if let state = model.activeVideoState {
-                HStack(spacing: 5) {
-                    Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.green)
-                    Text("已生效")
-                    Spacer(minLength: 0)
-                    Text("视频尺寸 \(state.width) × \(state.height)").foregroundStyle(.secondary).monospacedDigit()
-                }
-                if model.supportsMediaTransport {
-                    Text("实际生效：\(state.settings.summary)").foregroundStyle(.secondary).monospacedDigit()
-                }
-            }
-            if model.localNetworkQuality {
-                Text("局域网优先所选画质 · 持续高延迟时才降档")
-                    .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    .help(model.videoQualityHelp)
-            } else if !compact {
-                Text(model.supportsAdaptiveVideo ? "以上为上限。实际画质按丢包和延迟自动调整：先调码率，码率过低时再降帧率和最长边，网络好转后逐步恢复。"
-                     : model.supportsMediaTransport ? "已保存画质与手动选择作为自动调节上限；实际画质随网络负载调整。" : model.supportsExtendedVideoSettings ? "已保存画质与手动选择优先；旧传输首次 RTT <10 ms 的新连接默认最高画质。" : "已保存的连接会恢复画质；原分辨率和 30 Mbps 需共享端更新后使用。")
-                    .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            }
-            Text("帧率为上限，实际受被控屏幕刷新率、硬件和网络限制；超过 60 fps 需两端更新。")
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-        }
-        .font(.system(size: compact ? 11 : 12))
-        .help("画质调整只改变当前共享会话，不修改共享端默认值；同一连接记录会恢复手动确认的画质。自动调节不覆盖已保存选择。RTT 不代表网络类型或画面上屏延迟。原分辨率不放大，上限单边 8192 像素、总计 3600 万像素。最高可选 240 fps，超过 60 fps 需两端更新；实际帧率受被控屏幕刷新率、硬件和网络限制。60/100 Mbps 需两端支持；H.264 / 4:2:0 仍为有损，两端都有 HEVC 硬件编解码时自动改用同为 4:2:0 的 HEVC。可连续选择，等待时合并为最新设置。")
+        SessionQualityView(settings: Binding(get: { model.viewerSettings }, set: { model.chooseViewerSettings($0) }),
+            presentation: SessionQualityPresentation(connected: model.connected, supportsLiveSettings: model.supportsLiveSettings,
+                applied: model.activeVideoState, tuning: model.videoTuning, status: model.videoSettingsStatus),
+            longestEdges: model.viewerLongestEdges, frameRates: model.viewerFrameRates, bitRates: model.viewerBitRates,
+            supportsMediaTransport: model.supportsMediaTransport, supportsExtendedVideoSettings: model.supportsExtendedVideoSettings,
+            supportsAdaptiveVideo: model.supportsAdaptiveVideo, localNetworkQuality: model.localNetworkQuality,
+            qualityHelp: model.videoQualityHelp, compact: compact)
     }
 }
 

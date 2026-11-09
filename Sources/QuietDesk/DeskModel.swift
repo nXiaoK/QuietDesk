@@ -251,6 +251,7 @@ final class DeskModel: ObservableObject {
     @Published private(set) var connections = ConnectionStore.load()
     @Published var autoReconnect = UserDefaults.standard.object(forKey: "autoReconnect") as? Bool ?? true
     @Published var reconnecting = false
+    @Published private(set) var reconnectWait: ReconnectWait?
     @Published var lastDisconnect = UserDefaults.standard.string(forKey: "lastDisconnect") ?? ""
     @Published var clipboardEnabled = UserDefaults.standard.object(forKey: "clipboardEnabled") as? Bool ?? true
     @Published var loginEnabled = LaunchSettings.enabled
@@ -1899,6 +1900,7 @@ final class DeskModel: ObservableObject {
             _ = idlePolicy.tick(now: SessionClock.now, attended: sessionWindowAttended)
             if idlePolicy.isPaused { deferReconnectForIdle("离开窗口 10 分钟"); return }
         }
+        reconnectWait = nil
         if activity == nil {
             activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
                 reason: "远程桌面连接保活")
@@ -2063,6 +2065,7 @@ final class DeskModel: ObservableObject {
 
     private func scheduleReconnect(_ reason: String) {
         reconnectTask?.cancel()
+        reconnectWait = nil
         guard !systemSleeping else { return }
         _ = idlePolicy.tick(now: SessionClock.now, attended: sessionWindowAttended)
         if idlePolicy.isPaused {
@@ -2075,6 +2078,8 @@ final class DeskModel: ObservableObject {
             self.target = target
         }
         let delay = retryBackoff.next()
+        let wait = ReconnectWait(attempt: retryBackoff.attempt, delay: delay, reason: reason, now: SessionClock.now)
+        reconnectWait = wait
         connectionDiagnostics?.waiting(.reconnecting)
         DiagnosticLog.shared.record(.reconnectScheduled, role: .viewer, state: .requested,
             values: [.retryAttempt: retryBackoff.attempt])
@@ -2082,9 +2087,9 @@ final class DeskModel: ObservableObject {
         active = true
         working = true
         reconnecting = true
-        status = "\(Int(delay)) 秒后第 \(retryBackoff.attempt) 次重连 · \(reason)"
+        status = wait.status
         reconnectTask = Task { [weak self] in
-            do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+            do { try await Task.sleep(for: .seconds(wait.delay)) } catch { return }
             guard let self, self.generation == token, let target = self.target, self.autoReconnect,
                   !Task.isCancelled, self.peer == nil else { return }
             self.beginConnection(target)
@@ -2101,6 +2106,7 @@ final class DeskModel: ObservableObject {
     private func deferReconnectForIdle(_ reason: String) {
         connectionDiagnostics?.waiting(.paused)
         reconnectTask?.cancel()
+        reconnectWait = nil
         active = true; working = false; reconnecting = true
         reconnectDeferredForIdle = true
         pauseTransmission.choose(paused: true)
@@ -3630,6 +3636,7 @@ final class DeskModel: ObservableObject {
     private func systemWillSleep() {
         systemSleeping = true
         reconnectTask?.cancel()
+        reconnectWait = nil
         hostRetryTask?.cancel()
         hostPreparationTask?.cancel()
         hostStartupDeadline.cancel()
@@ -3727,6 +3734,7 @@ final class DeskModel: ObservableObject {
     }
 
     private func clearSession() {
+        reconnectWait = nil
         connectionDiagnostics?.detach()
         if mode == .viewer, let activity { ProcessInfo.processInfo.endActivity(activity); self.activity = nil }
         performanceTimer?.cancel()
@@ -3929,6 +3937,7 @@ final class DeskModel: ObservableObject {
         hostPreparationTask = nil
         hostStartupDeadline.cancel()
         reconnectTask?.cancel()
+        reconnectWait = nil
         target = nil
         reconnecting = false
         if mode == .viewer, isFullScreen { canvas.window?.toggleFullScreen(nil) }

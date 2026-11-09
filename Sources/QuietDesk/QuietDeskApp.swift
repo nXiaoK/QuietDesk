@@ -331,22 +331,9 @@ struct DeskView: View {
                 .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
             }
             if !model.connected {
-                VStack(spacing: 14) {
-                    if model.sessionPaused {
-                        Image(systemName: "pause.circle").font(.system(size: 28)).foregroundStyle(.secondary)
-                    } else { ProgressView().controlSize(.small) }
-                    Text(model.sessionPaused ? "空闲暂停，等待返回窗口" : model.reconnecting ? "连接中断，正在自动重连…" : "尚未连接").font(.title3.weight(.semibold))
-                    Text(model.reconnecting ? model.status : "退出全屏后输入地址和配对码")
-                        .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                    if model.reconnecting {
-                        Text("重连期间不发送键盘鼠标").font(.caption).foregroundStyle(.secondary)
-                        Button("停止重连") { model.stop() }
-                    } else {
-                        Button("返回连接") { model.toggleFullScreen() }
-                    }
-                }
-                .padding(24).frame(maxWidth: 420)
-                .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+                ConnectionRecoveryView(reconnecting: model.reconnecting, paused: model.sessionPaused,
+                    wait: model.reconnectWait, status: model.status, now: { SessionClock.now },
+                    stop: { model.stop() }, returnToConnection: { model.toggleFullScreen() })
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

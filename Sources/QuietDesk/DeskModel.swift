@@ -79,6 +79,12 @@ final class DeskModel: ObservableObject {
             if oldValue != lowLatencyCursorEnabled { sendCursorRequest() }
         }
     }
+    @Published var canvasScalingMode = RemoteCanvasScalingMode(rawValue: UserDefaults.standard.string(forKey: "canvasScalingMode") ?? "") ?? .fitWindow {
+        didSet {
+            UserDefaults.standard.set(canvasScalingMode.rawValue, forKey: "canvasScalingMode")
+            canvas.scalingMode = canvasScalingMode
+        }
+    }
     @Published var mediaTCPOnly = UserDefaults.standard.bool(forKey: "mediaTCPOnly") {
         didSet { UserDefaults.standard.set(mediaTCPOnly, forKey: "mediaTCPOnly") }
     }
@@ -417,6 +423,7 @@ final class DeskModel: ObservableObject {
             }
         }
 
+        canvas.scalingMode = canvasScalingMode
         canvas.onUserActivity = { [weak self] in self?.recordSessionActivity() }
         canvas.onInput = { [weak self] value in
             guard let self else { return }

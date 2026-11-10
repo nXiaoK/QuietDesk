@@ -1,6 +1,58 @@
 import QuietDeskCore
 import SwiftUI
 
+enum SessionQualityPreset: String, CaseIterable, Equatable {
+    case dataSaver
+    case clearOffice
+    case highRefresh
+    case original
+
+    var title: String {
+        switch self {
+        case .dataSaver: return "省流"
+        case .clearOffice: return "清晰办公"
+        case .highRefresh: return "高刷流畅"
+        case .original: return "原画"
+        }
+    }
+
+    func resolvedSettings(longestEdges: [Int], frameRates: [Int], bitRates: [Int]) -> StreamSettings {
+        let edge: Int
+        let fps: Int
+        let mbps: Int
+        switch self {
+        case .dataSaver:
+            edge = longestEdges.contains(1280) ? 1280 : (longestEdges.filter { $0 > 0 }.min() ?? 1280)
+            fps = frameRates.contains(30) ? 30 : (frameRates.min() ?? 30)
+            mbps = bitRates.filter { $0 <= 3 }.max() ?? (bitRates.min() ?? 3)
+        case .clearOffice:
+            edge = longestEdges.contains(2560) ? 2560 : (longestEdges.filter { $0 > 0 && $0 <= 2560 }.max() ?? 1920)
+            fps = frameRates.contains(30) ? 30 : (frameRates.filter { $0 <= 30 }.max() ?? 30)
+            mbps = bitRates.filter { $0 <= 12 }.max() ?? 8
+        case .highRefresh:
+            edge = longestEdges.contains(1920) ? 1920 : (longestEdges.filter { $0 > 0 && $0 <= 1920 }.max() ?? 1920)
+            fps = frameRates.filter { $0 <= 120 }.max() ?? (frameRates.max() ?? 60)
+            mbps = bitRates.filter { $0 <= 30 }.max() ?? (bitRates.max() ?? 12)
+        case .original:
+            edge = longestEdges.contains(StreamSettings.nativeLongestEdge)
+                ? StreamSettings.nativeLongestEdge
+                : (longestEdges.max() ?? 1920)
+            fps = frameRates.contains(60) ? 60 : (frameRates.filter { $0 <= 60 }.max() ?? 30)
+            mbps = bitRates.filter { $0 <= 60 }.max() ?? (bitRates.max() ?? 30)
+        }
+        return StreamSettings(longestEdge: edge, framesPerSecond: fps, megabits: mbps)
+    }
+
+    static func matching(_ settings: StreamSettings,
+                         longestEdges: [Int],
+                         frameRates: [Int],
+                         bitRates: [Int]) -> SessionQualityPreset? {
+        allCases.first {
+            $0.resolvedSettings(longestEdges: longestEdges, frameRates: frameRates, bitRates: bitRates) == settings
+        }
+    }
+}
+
 struct SessionQualityPresentation {
     enum Availability { case disconnected, unsupported, ready }
     enum Update: Equatable {
@@ -52,6 +104,23 @@ struct SessionQualityView: View {
             }
             Text("手动选择确认后按连接记录保存，不改共享端默认。自动调节不覆盖已保存选择。")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Text("场景预设").fontWeight(.medium)
+            HStack(spacing: compact ? 4 : 6) {
+                ForEach(SessionQualityPreset.allCases, id: \.self) { preset in
+                    let resolved = preset.resolvedSettings(longestEdges: longestEdges, frameRates: frameRates, bitRates: bitRates)
+                    let isSelected = settings == resolved
+                    Button {
+                        settings = resolved
+                    } label: {
+                        Text(preset.title).frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(isSelected ? Color.accentColor : nil)
+                    .controlSize(.small)
+                    .help("\(preset.title)：\(resolved.summary)")
+                }
+            }
+            .disabled(presentation.availability != .ready)
             Text("所选上限").fontWeight(.medium)
             Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: compact ? 5 : 7) {
                 GridRow {

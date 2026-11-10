@@ -291,6 +291,18 @@ struct VideoDisplayFormatCache {
     }
 }
 
+enum RemoteCanvasScalingMode: String, CaseIterable, Equatable {
+    case fitWindow
+    case original1To1
+
+    var title: String {
+        switch self {
+        case .fitWindow: return "适应窗口"
+        case .original1To1: return "原始比例 1:1"
+        }
+    }
+}
+
 @MainActor
 final class RemoteCanvas: NSView {
     private let videoLayer: AVSampleBufferDisplayLayer
@@ -349,7 +361,24 @@ final class RemoteCanvas: NSView {
     var onFullScreen: ((Bool) -> Void)?
     var onToggleFullScreen: (() -> Void)?
     var onCaptureFrame: (() -> Void)?
-    var remoteSize = CGSize(width: 16, height: 10)
+    var remoteSize = CGSize(width: 16, height: 10) {
+        didSet {
+            guard oldValue != remoteSize else { return }
+            needsLayout = true
+            updateLayerFrame()
+            window?.invalidateCursorRects(for: self)
+            updateCursorPresentation()
+        }
+    }
+    var scalingMode: RemoteCanvasScalingMode = .fitWindow {
+        didSet {
+            guard oldValue != scalingMode else { return }
+            needsLayout = true
+            updateLayerFrame()
+            window?.invalidateCursorRects(for: self)
+            updateCursorPresentation()
+        }
+    }
     var canControl = false {
         didSet {
             if !canControl { cancelPointerMoves(); activeScroll = nil }
@@ -421,13 +450,17 @@ final class RemoteCanvas: NSView {
 
     override func layout() {
         super.layout()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        videoLayer.frame = bounds
-        videoLayer.contentsScale = window?.backingScaleFactor ?? 1
-        CATransaction.commit()
+        updateLayerFrame()
         showLatestFrame()
         updateCursorPresentation()
+    }
+
+    private func updateLayerFrame() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        videoLayer.frame = scalingMode == .fitWindow ? bounds : pictureRect
+        videoLayer.contentsScale = window?.backingScaleFactor ?? 1
+        CATransaction.commit()
     }
 
     override func viewDidChangeBackingProperties() {
@@ -770,12 +803,15 @@ final class RemoteCanvas: NSView {
         onSystemShortcutStatus?(message, running)
     }
 
-    private var pictureRect: CGRect {
-        let scale = min(bounds.width / max(1, remoteSize.width), bounds.height / max(1, remoteSize.height))
+    func pictureRect(for bounds: CGRect) -> CGRect {
+        let fitScale = min(bounds.width / max(1, remoteSize.width), bounds.height / max(1, remoteSize.height))
+        let scale = scalingMode == .original1To1 ? min(1, fitScale) : fitScale
         let size = CGSize(width: remoteSize.width * scale, height: remoteSize.height * scale)
         return CGRect(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2,
                       width: size.width, height: size.height)
     }
+
+    private var pictureRect: CGRect { pictureRect(for: bounds) }
 
     private func pointer(_ event: NSEvent, _ kind: RemoteInput.Kind) {
         guard canControl, !pointerInputSuspended else { return }

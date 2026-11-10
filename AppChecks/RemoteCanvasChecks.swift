@@ -1154,6 +1154,32 @@ private struct RemoteCanvasChecks {
                         "Resized format description had wrong dimensions: \(resizedDimensions)")
         }
 
+        run("Original 1:1 scaling centers smaller remote pictures without upscaling and maps pointer coordinates accurately") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            canvas.remoteSize = CGSize(width: 200, height: 100)
+            canvas.canControl = true
+            defer { canvas.reset() }
+            try require(canvas.pictureRect(for: canvas.bounds) == CGRect(x: 0, y: 50, width: 400, height: 200),
+                        "Fit-window mode did not scale up to fill the width")
+            canvas.scalingMode = .original1To1
+            canvas.layout()
+            try require(canvas.pictureRect(for: canvas.bounds) == CGRect(x: 100, y: 100, width: 200, height: 100),
+                        "Original 1:1 mode did not preserve 1:1 dimensions centered in the view: \(canvas.pictureRect(for: canvas.bounds))")
+            var inputs: [RemoteInput] = []
+            canvas.onInput = { inputs.append($0) }
+            // Outside the 1:1 picture rect (x=50 is inside fit-window rect, but outside 1:1 rect x=100..300)
+            canvas.mouseDown(with: try mouse(.leftMouseDown, point: CGPoint(x: 50, y: 150)))
+            try require(inputs.isEmpty, "Click outside 1:1 picture margin was not ignored")
+            // Center of the 1:1 picture rect (x=200, y=150 -> normalized 0.5, 0.5)
+            canvas.mouseDown(with: try mouse(.leftMouseDown, point: CGPoint(x: 200, y: 150)))
+            try require(inputs.count == 1 && inputs[0].x == 0.5 && inputs[0].y == 0.5,
+                        "Click inside 1:1 picture rect did not map to (0.5, 0.5): \(inputs)")
+            // When the remote size is larger than the window, 1:1 mode still fits within bounds without clipping
+            canvas.remoteSize = CGSize(width: 800, height: 400)
+            try require(canvas.pictureRect(for: canvas.bounds) == CGRect(x: 0, y: 50, width: 400, height: 200),
+                        "Oversized remote picture in 1:1 mode overflowed the window bounds")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

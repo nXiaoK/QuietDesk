@@ -138,6 +138,32 @@ private struct SessionQualityChecks {
             let status = "超过 60 fps 的档位需两端更新后使用"
             try check(presentation(nil, status: status).message == status, "Compatibility error was discarded")
         }
+        run("Scenario quality presets resolve within peer capabilities and match selected settings") {
+            let modernEdges = StreamSettings.longestEdges
+            let modernFPS = StreamSettings.frameRates
+            let modernBits = StreamSettings.bitRates
+            let saver = SessionQualityPreset.dataSaver.resolvedSettings(longestEdges: modernEdges, frameRates: modernFPS, bitRates: modernBits)
+            let office = SessionQualityPreset.clearOffice.resolvedSettings(longestEdges: modernEdges, frameRates: modernFPS, bitRates: modernBits)
+            let highRefresh = SessionQualityPreset.highRefresh.resolvedSettings(longestEdges: modernEdges, frameRates: modernFPS, bitRates: modernBits)
+            let original = SessionQualityPreset.original.resolvedSettings(longestEdges: modernEdges, frameRates: modernFPS, bitRates: modernBits)
+            try check(saver == StreamSettings(longestEdge: 1280, framesPerSecond: 30, megabits: 3), "Unexpected dataSaver preset: \(saver)")
+            try check(office == StreamSettings(longestEdge: 2560, framesPerSecond: 30, megabits: 12), "Unexpected clearOffice preset: \(office)")
+            try check(highRefresh == StreamSettings(longestEdge: 1920, framesPerSecond: 120, megabits: 30), "Unexpected highRefresh preset: \(highRefresh)")
+            try check(original == StreamSettings(longestEdge: StreamSettings.nativeLongestEdge, framesPerSecond: 60, megabits: 60),
+                      "Unexpected original preset: \(original)")
+            try check(SessionQualityPreset.matching(highRefresh, longestEdges: modernEdges, frameRates: modernFPS, bitRates: modernBits) == .highRefresh,
+                      "Preset matching failed for highRefresh")
+
+            let legacyEdges = StreamSettings.legacyLongestEdges
+            let legacyFPS = StreamSettings.legacyFrameRates
+            let legacyBits = StreamSettings.legacyBitRates
+            for preset in SessionQualityPreset.allCases {
+                let resolved = preset.resolvedSettings(longestEdges: legacyEdges, frameRates: legacyFPS, bitRates: legacyBits)
+                try resolved.validateControlValues()
+                try check(legacyEdges.contains(resolved.longestEdge) && legacyFPS.contains(resolved.framesPerSecond) && legacyBits.contains(resolved.megabits),
+                          "Preset \(preset) exceeded legacy peer capabilities: \(resolved)")
+            }
+        }
 
         runLiveSettingsChecks()
         print("\(successes) passed, \(failures) failed")

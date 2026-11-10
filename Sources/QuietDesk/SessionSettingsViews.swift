@@ -108,6 +108,16 @@ private struct ConnectionOptionsSections: View {
             Divider()
             VStack(alignment: .leading, spacing: 8) {
                 Text("连接").font(.headline)
+                HStack(spacing: 8) {
+                    Text("画面显示").foregroundStyle(.secondary)
+                    Picker("画面显示", selection: $model.canvasScalingMode) {
+                        ForEach(RemoteCanvasScalingMode.allCases, id: \.self) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                }
                 Toggle("本地即时光标", isOn: $model.lowLatencyCursorEnabled)
                     .disabled(model.connected && !model.supportsIndependentCursor)
                     .help("减少双光标跟随；远端形状不可用时使用通用指针。")

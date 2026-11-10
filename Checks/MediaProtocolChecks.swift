@@ -547,4 +547,34 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         try rejects { _ = try MediaFrameReassembler(stream: stream, firstFrameID: UInt64.max) }
         try rejects { _ = try MediaRetransmissionCache(stream: stream, firstFrameID: UInt64.max) }
     }
+
+    run("Media reassembler extends P-frame TTL while unique paced fragments actively arrive and updates RTT limits") {
+        let time = MediaCheckClock()
+        let receiver = try MediaFrameReassembler(stream: stream,
+            limits: MediaBufferLimits(frameTimeToLive: 0.15, nackInterval: 0.02), clock: { time.now })
+        let first = try frame(1, idr: true)
+        _ = try receiver.receive(first)
+        _ = receiver.decoded(first.header, success: true)
+        let pacedPredicted = try frame(2, bytes: 12_000)
+        let parts = try MediaFragment.fragment(frame: pacedPredicted)
+        try require(parts.count >= 10, "Fixture did not produce enough fragments for paced arrival")
+        var completed: [MediaFrame] = []
+        for (index, part) in parts.enumerated() {
+            time.now = Double(index) * 0.022
+            completed += ready(try receiver.receive(part))
+        }
+        try require(completed.count == 1 && !receiver.requiresRecovery,
+                    "A large P-frame actively making progress across 200 ms expired prematurely")
+        _ = receiver.decoded(pacedPredicted.header, success: true)
+        receiver.updateLimits(MediaBufferLimits(frameTimeToLive: 0.45, nackInterval: 0.02))
+        receiver.updateLimits(MediaBufferLimits(frameTimeToLive: .nan))
+        let thirdParts = try MediaFragment.fragment(frame: frame(3, bytes: 3_000))
+        _ = try receiver.receive(thirdParts[0])
+        time.now += 0.30
+        try require(feedback(receiver.poll(), .expired).isEmpty && !receiver.requiresRecovery,
+                    "Updated RTT-derived frameTimeToLive was not applied")
+        time.now += 0.20
+        try require(feedback(receiver.poll(), .expired).count == 1 && receiver.requiresRecovery,
+                    "Stalled P-frame did not expire after updated frameTimeToLive")
+    }
 }

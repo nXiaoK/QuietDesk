@@ -86,7 +86,7 @@ public final class MediaFrameReassembler {
     public private(set) var requiresRecovery = false
     public private(set) var bufferedBytes = 0
     public var pendingFrameCount: Int { assemblies.count }
-    private let limits: MediaBufferLimits
+    private var limits: MediaBufferLimits
     private let clock: () -> TimeInterval
     private var lastNow: TimeInterval
     private var expectedFrameID: UInt64
@@ -200,6 +200,11 @@ public final class MediaFrameReassembler {
         bufferedBytes = 0
         awaitingDecode = nil
         gapStartedAt = nil
+    }
+
+    public func updateLimits(_ limits: MediaBufferLimits) {
+        guard (try? limits.validate()) != nil else { return }
+        self.limits = limits
     }
 
     public func replaceStream(_ stream: MediaStreamID, firstFrameID: UInt64 = 1) {
@@ -415,7 +420,13 @@ public final class MediaFrameReassembler {
             if let completedAt = $0.completedAt, let timeout = limits.completedFrameTimeToLive {
                 return now - completedAt >= timeout
             }
-            return now - $0.firstReceivedAt >= ($0.header.isIDR ? limits.keyFrameTimeToLive : limits.frameTimeToLive)
+            let baseTTL = $0.header.isIDR ? limits.keyFrameTimeToLive : limits.frameTimeToLive
+            // While unique fragments of a large paced P-frame are actively arriving within the NACK/reorder
+            // cadence, allow the sender's pacing span (bounded by one baseTTL) before declaring expiry.
+            let activePacing = !$0.header.isIDR && $0.receivedCount > 4
+                && now - $0.lastProgressAt < max(limits.reorderDelay, limits.nackInterval) * 2
+                ? min(baseTTL, max(0, $0.lastProgressAt - $0.firstReceivedAt)) : 0
+            return now - $0.firstReceivedAt >= baseTTL + activePacing
         })
             .min(by: { $0.header.frameID < $1.header.frameID }) {
             return invalidate(at: oldest.header)

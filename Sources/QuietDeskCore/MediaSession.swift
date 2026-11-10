@@ -342,6 +342,7 @@ public final class MediaSession: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
             self.controlRoundTrip = (milliseconds, SessionClock.now)
+            if self.side == .viewer { self.receiver?.updateLimits(self.bufferLimits) }
         }
     }
 
@@ -868,6 +869,7 @@ public final class MediaSession: @unchecked Sendable {
                 self.challenge = nil
                 lastPongAt = now
                 roundTrip = max(0.001, min(2, measured))
+                if side == .viewer { receiver?.updateLimits(bufferLimits) }
                 recordDuration(.mediaRoundTrip, seconds: measured)
                 if let onDiagnosticUDPRoundTrip, let active, active.path == .udp, receiver?.stream == active.stream,
                    transaction == nil, udpVerified, !paused, !configurationSuspended {
@@ -977,8 +979,9 @@ public final class MediaSession: @unchecked Sendable {
             let header = MediaFrameHeader(stream: target.0, frameID: nextFrameID, isIDR: isIDR)
             let frame = try MediaFrame(header: header, packet: packet)
             let bytes = frame.packetBytes.count
+            let paced = Double(bytes) / bytesPerSecond
             let budget = target.1 != .udp ? 5
-                : isIDR ? max(1, Double(bytes) / bytesPerSecond + roundTrip * 2 + 0.2) : max(0.25, roundTrip * 3 + 0.08)
+                : isIDR ? max(1, paced + roundTrip * 2 + 0.2) : max(0.25, paced + roundTrip * 3 + 0.08)
             let fragments = try cache!.insert(frame, deadline: SessionClock.now + min(5, budget))
             sentHeaders.insert(header)
             if deliveryPath != target.1 { deliveryPath = target.1; deliveryEstimator.reset(); deliverySentAt.removeAll() }
@@ -1161,7 +1164,7 @@ public final class MediaSession: @unchecked Sendable {
         pumpDatagrams()
     }
 
-    private var bytesPerSecond: Double { Double(settings.megabits) * 1_000_000 / 8 * 1.2 }
+    private var bytesPerSecond: Double { max(1_500_000, Double(settings.megabits) * 1_000_000 / 8 * 1.6) }
 
     private func pumpDatagrams() {
         guard !stopped, !paused, let peer = udpPeer, udpVerified else { return }

@@ -167,6 +167,61 @@ struct StaticFrameRefinement {
     }
 }
 
+struct TimeBudgetFrameDropper {
+    static let standardFrameRates = [30, 60, 90, 120, 144, 240]
+    private(set) var lastSubmittedAt: TimeInterval?
+
+    static func normalizedFramesPerSecond(_ fps: Int) -> Int {
+        let clamped = max(1, fps)
+        if let standard = standardFrameRates.first(where: { abs($0 - clamped) <= 2 }) {
+            return standard
+        }
+        return clamped
+    }
+
+    static func minimumInterval(framesPerSecond: Int) -> TimeInterval {
+        (1.0 / Double(normalizedFramesPerSecond(framesPerSecond))) * 0.85
+    }
+
+    static func hasDirtyRegions(_ attachments: [[SCStreamFrameInfo: Any]]?) -> Bool {
+        guard let rawRects = attachments?.first?[.dirtyRects] else { return true }
+        guard let rects = rawRects as? [NSDictionary] else { return true }
+        return rects.contains { dictionary in
+            guard let rect = CGRect(dictionaryRepresentation: dictionary as CFDictionary) else { return false }
+            return !rect.isEmpty && rect.width > 0 && rect.height > 0
+        }
+    }
+
+    func retryDelay(at now: TimeInterval, framesPerSecond: Int, forceKeyFrame: Bool, isRefinement: Bool) -> TimeInterval? {
+        guard now.isFinite, !forceKeyFrame, !isRefinement,
+              let last = lastSubmittedAt, now >= last else { return nil }
+        let interval = Self.minimumInterval(framesPerSecond: framesPerSecond)
+        let elapsed = now - last
+        guard elapsed + 0.000_5 < interval else { return nil }
+        return max(0.001, interval - elapsed)
+    }
+
+    mutating func recordSubmission(at now: TimeInterval, isRefinement: Bool) {
+        if !isRefinement, now.isFinite {
+            lastSubmittedAt = now
+        }
+    }
+
+    mutating func shouldSubmit(at now: TimeInterval, framesPerSecond: Int, forceKeyFrame: Bool,
+                               isRefinement: Bool) -> (allow: Bool, retryAfter: TimeInterval?) {
+        if let delay = retryDelay(at: now, framesPerSecond: framesPerSecond,
+                                  forceKeyFrame: forceKeyFrame, isRefinement: isRefinement) {
+            return (false, delay)
+        }
+        recordSubmission(at: now, isRefinement: isRefinement)
+        return (true, nil)
+    }
+
+    mutating func reset() {
+        lastSubmittedAt = nil
+    }
+}
+
 struct VideoEncodeTiming {
     private var encoderID: UUID?
     private var started: [UInt32: TimeInterval] = [:]
@@ -327,6 +382,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var receiverFrameWindow: Int?
     private var refinement = StaticFrameRefinement()
     private var refinementTimer: DispatchSourceTimer?
+    private var frameDropper = TimeBudgetFrameDropper()
+    private var framePacingTimer: DispatchSourceTimer?
     private var lastCaptureAt: TimeInterval = 0
     // `latest` holds a refinement pass rather than a capture; submitted frames retain that identity.
     private var latestIsRefinement = false
@@ -410,7 +467,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         configuration.width = width
         configuration.height = height
         configuration.captureResolution = .best
-        configuration.minimumFrameInterval = CMTime(value: 1, timescale: Int32(settings.framesPerSecond))
+        let targetFPS = TimeBudgetFrameDropper.normalizedFramesPerSecond(settings.framesPerSecond)
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: Int32(targetFPS))
         configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         // Two retained encoder inputs plus the newest capture still leave producer buffers available.
         configuration.queueDepth = settings.framesPerSecond >= 60 ? 5 : 3
@@ -546,6 +604,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             encoderHardware = nil
             encoderID = id
             frameFlow = VideoFrameFlow(sequence: frameFlow.sequence)
+            frameDropper.reset()
             presentationTimeline = VideoPresentationTimeline()
             encodingTimingLock.withLock { encodingStarted.removeAll(); encodeTiming.cancel() }
             lastCaptureDiagnostics = nil
@@ -833,6 +892,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 // The media coordinator suspended this configuration before draining capture. Its
                 // replacement must still wait for a new recovery IDR and the coordinator's commit.
                 if wasMediaHeld { frameFlow.prepareMediaRecovery() }
+                frameDropper.reset()
                 cancelRefinement()
                 latest = cursorGate.needsFreshFrame ? nil : lastCapture
                 if cursorGate.needsFreshFrame { lastCapture = nil; appliedCursorIncluded = nil }
@@ -1024,6 +1084,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             self.lastCaptureDiagnostics = nil
             self.acknowledgements.removeAll()
             self.frameFlow.prepareMediaRecovery()
+            self.frameDropper.reset()
             self.cancelRefinement()
             self.latest = self.lastCapture
             self.latest?.2 = nil
@@ -1090,6 +1151,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             cancelRefinement()
             refinementTimer?.cancel()
             refinementTimer = nil
+            frameDropper.reset()
+            framePacingTimer?.cancel()
+            framePacingTimer = nil
             if let waiter = cursorFrameWaiter { finishCursorFrameWaiter(waiter.id, result: .failure(CancellationError())) }
             cursorGate = CursorCaptureGate()
             appliedCursorIncluded = nil
@@ -1101,6 +1165,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             encodingTimingLock.withLock { encodingStarted.removeAll(); encodeTiming.cancel() }
             acknowledgements.removeAll()
             frameFlow = VideoFrameFlow(sequence: frameFlow.sequence)
+            frameDropper.reset()
             presentationTimeline = VideoPresentationTimeline()
             if let waiter = idleWaiter { idleWaiter = nil; waiter.1.resume(throwing: CancellationError()) }
             watchdog?.cancel()
@@ -1138,6 +1203,11 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         if !reconfiguring, (CVPixelBufferGetWidth(buffer) != outputWidth || CVPixelBufferGetHeight(buffer) != outputHeight) { return }
         let cursorFrame = cursorGate.observe(sampleBuffer, displayTime: attachments.first?[.displayTime] as? UInt64)
         guard cursorFrame.retain else { return }
+        if cursorFrame.completed == nil, !cursorGate.needsFreshFrame, lastCapture != nil,
+           !frameFlow.forceKeyFrame, !frameFlow.mediaHold,
+           !TimeBudgetFrameDropper.hasDirtyRegions(attachments) {
+            return
+        }
         if captureStarted, !sessionPaused, !reconfiguring, diagnostics?.isEnabled == true {
             diagnostics?.record(.captureInterval, since: lastCaptureDiagnostics, kind: .video)
             lastCaptureDiagnostics = diagnostics?.start()
@@ -1205,6 +1275,18 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         if let latest, CVPixelBufferGetWidth(latest.0) != outputWidth || CVPixelBufferGetHeight(latest.0) != outputHeight { self.latest = nil }
     }
 
+    private func armFramePacingTimer(after delay: TimeInterval) {
+        let timer: DispatchSourceTimer
+        if let framePacingTimer { timer = framePacingTimer }
+        else {
+            timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.setEventHandler { [weak self] in self?.pump() }
+            framePacingTimer = timer
+            timer.resume()
+        }
+        timer.schedule(deadline: .now() + max(0.001, delay), leeway: .milliseconds(1))
+    }
+
     private func pump() {
         guard running, !reconfiguring, !sessionPaused, !cursorGate.needsFreshFrame, !frameFlow.encodingFailed else { return }
         discardMismatchedFrame()
@@ -1213,11 +1295,19 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             armRefinementTimer()
             return
         }
+        let now = SessionClock.now
+        if let delay = frameDropper.retryDelay(at: now, framesPerSecond: currentSettings.framesPerSecond,
+                                               forceKeyFrame: frameFlow.forceKeyFrame || frameFlow.mediaHold,
+                                               isRefinement: latestIsRefinement) {
+            armFramePacingTimer(after: delay)
+            return
+        }
         guard let encoder,
-              let frame = frameFlow.begin(at: SessionClock.now,
+              let frame = frameFlow.begin(at: now,
                 maximumConcurrentEncodes: currentSettings.framesPerSecond >= 60 ? 2 : 1,
                 maximumOutstandingFrames: VideoFrameFlow.maximumOutstandingFrames(for: currentSettings, receiverLimit: receiverFrameWindow),
                 isRefinement: latestIsRefinement) else { return }
+        frameDropper.recordSubmission(at: now, isRefinement: latestIsRefinement)
         self.latest = nil
         latestIsRefinement = false
         let presentationTime: CMTime
@@ -1248,7 +1338,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
-    deinit { watchdog?.cancel(); refinementTimer?.cancel() }
+    deinit { watchdog?.cancel(); refinementTimer?.cancel(); framePacingTimer?.cancel() }
 }
 
 final class HostImmediateInputQueue: @unchecked Sendable {

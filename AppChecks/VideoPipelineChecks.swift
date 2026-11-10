@@ -1114,6 +1114,41 @@ private struct VideoPipelineChecks {
                         "Reused encoder recovery frame was not a standalone IDR")
         }
 
+        run("TimeBudgetFrameDropper normalizes standard refresh rates, filters empty dirtyRects, and paces bursts") {
+            try require(TimeBudgetFrameDropper.normalizedFramesPerSecond(29) == 30, "29 fps should snap to 30 fps")
+            try require(TimeBudgetFrameDropper.normalizedFramesPerSecond(61) == 60, "61 fps should snap to 60 fps")
+            try require(TimeBudgetFrameDropper.normalizedFramesPerSecond(118) == 120, "118 fps should snap to 120 fps")
+            try require(TimeBudgetFrameDropper.normalizedFramesPerSecond(143) == 144, "143 fps should snap to 144 fps")
+            try require(TimeBudgetFrameDropper.normalizedFramesPerSecond(15) == 15, "15 fps should remain 15 fps")
+            try require(TimeBudgetFrameDropper.normalizedFramesPerSecond(75) == 75, "75 fps should remain 75 fps")
+
+            try require(TimeBudgetFrameDropper.hasDirtyRegions(nil), "Missing attachments should default to dirty")
+            try require(TimeBudgetFrameDropper.hasDirtyRegions([[:]]), "Missing dirtyRects key should default to dirty")
+            try require(!TimeBudgetFrameDropper.hasDirtyRegions([[.dirtyRects: [NSDictionary]()]]),
+                        "Empty dirtyRects array should be detected as static")
+            let zeroRect = CGRect.zero.dictionaryRepresentation as NSDictionary
+            try require(!TimeBudgetFrameDropper.hasDirtyRegions([[.dirtyRects: [zeroRect]]]),
+                        "Zero-sized dirtyRect should be detected as static")
+            let nonEmptyRect = CGRect(x: 10, y: 12, width: 64, height: 32).dictionaryRepresentation as NSDictionary
+            try require(TimeBudgetFrameDropper.hasDirtyRegions([[.dirtyRects: [zeroRect, nonEmptyRect]]]),
+                        "Non-empty dirtyRect should be detected as changed")
+
+            var dropper = TimeBudgetFrameDropper()
+            let first = dropper.shouldSubmit(at: 1.0, framesPerSecond: 60, forceKeyFrame: false, isRefinement: false)
+            try require(first.allow && first.retryAfter == nil, "First frame should always be allowed")
+            let burst = dropper.shouldSubmit(at: 1.005, framesPerSecond: 60, forceKeyFrame: false, isRefinement: false)
+            try require(!burst.allow && (burst.retryAfter ?? 0) > 0.008,
+                        "Burst frame arriving after 5ms at 60fps should be held with a retry delay")
+            let forced = dropper.shouldSubmit(at: 1.006, framesPerSecond: 60, forceKeyFrame: true, isRefinement: false)
+            try require(forced.allow && forced.retryAfter == nil, "Forced keyframe must bypass the time-budget gate")
+            let refine = dropper.shouldSubmit(at: 1.008, framesPerSecond: 60, forceKeyFrame: false, isRefinement: true)
+            try require(refine.allow && refine.retryAfter == nil && dropper.lastSubmittedAt == 1.006,
+                        "Static refinement pass must bypass the time-budget gate without shifting capture submission timestamp")
+            let onTime = dropper.shouldSubmit(at: 1.021, framesPerSecond: 60, forceKeyFrame: false, isRefinement: false)
+            try require(onTime.allow && onTime.retryAfter == nil,
+                        "Frame arriving after the 85% budget interval should be allowed")
+        }
+
         print("Video pipeline checks: \(passed) passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

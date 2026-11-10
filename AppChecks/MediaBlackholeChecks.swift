@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Network
 import QuietDeskCore
@@ -20,6 +21,44 @@ private func requireBlackhole(_ condition: Bool, _ message: String) throws {
 
 private func waitBlackhole(_ semaphore: DispatchSemaphore, _ message: @autoclosure () -> String, seconds: Double = 8) throws {
     if semaphore.wait(timeout: .now() + seconds) != .success { throw BlackholeCheckFailure(description: message()) }
+}
+
+private final class BlackholePortReservation {
+    let port: NWEndpoint.Port
+    private var descriptor: Int32
+
+    init() throws {
+        for _ in 0..<20 {
+            let udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP), tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+            guard udp >= 0, tcp >= 0 else {
+                if udp >= 0 { close(udp) }; if tcp >= 0 { close(tcp) }
+                throw BlackholeCheckFailure(description: "Could not create fixture port reservations")
+            }
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let reserved = withUnsafeMutablePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
+                    bind(udp, raw, length) == 0 && getsockname(udp, raw, &length) == 0 && bind(tcp, raw, length) == 0
+                }
+            }
+            close(tcp)
+            if reserved {
+                descriptor = udp
+                port = NWEndpoint.Port(rawValue: UInt16(bigEndian: address.sin_port))!
+                return
+            }
+            close(udp)
+        }
+        throw BlackholeCheckFailure(description: "No paired TCP/UDP fixture port was available")
+    }
+
+    func release() {
+        if descriptor >= 0 { close(descriptor); descriptor = -1 }
+    }
+
+    deinit { release() }
 }
 
 private func blackholeTCPParameters() -> NWParameters {
@@ -215,8 +254,9 @@ private final class LoopbackMediaBlackhole {
     func start() throws -> NWEndpoint.Port {
         let tcpReady = DispatchSemaphore(value: 0)
         let tcpIsReady = BlackholeBox(false)
+        let reservation = try BlackholePortReservation()
         let tcpParameters = blackholeTCPParameters()
-        tcpParameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+        tcpParameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: reservation.port)
         let tcp = try NWListener(using: tcpParameters)
         tcp.newConnectionHandler = { [weak self] connection in self?.acceptTCP(connection) }
         tcp.stateUpdateHandler = { state in
@@ -232,6 +272,7 @@ private final class LoopbackMediaBlackhole {
         let udpIsReady = BlackholeBox(false)
         let udpParameters = NWParameters.udp
         udpParameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: proxyPort)
+        reservation.release()
         let udp = try NWListener(using: udpParameters)
         udp.newConnectionHandler = { [weak self] connection in self?.acceptUDP(connection) }
         udp.stateUpdateHandler = { state in
@@ -329,8 +370,9 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
     let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 12)
     let diagnostics = PerformanceDiagnostics(enabled: true)
     let hostQueue = DispatchQueue(label: "checks.media-blackhole.host")
+    let reservation = try BlackholePortReservation()
     let parameters = try MediaSecureTransport.tlsParameters(key: key, roles: MediaChannelRole.allCases)
-    parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+    parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: reservation.port)
     let listener = try NWListener(using: parameters)
     let listenerReady = DispatchSemaphore(value: 0), committedTCP = DispatchSemaphore(value: 0)
     let predictedFrame = DispatchSemaphore(value: 0), controlPong = DispatchSemaphore(value: 0)
@@ -398,6 +440,7 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
     listener.start(queue: hostQueue)
     try waitBlackhole(listenerReady, "Host TLS listener did not bind loopback")
     guard let hostPort = listener.port else { throw BlackholeCheckFailure(description: "Host TLS port is missing") }
+    reservation.release()
     let proxy = LoopbackMediaBlackhole(hostPort: hostPort, blockAllUDP: blockAllUDP, probeDelay: probeDelay)
     defer {
         teardown.update { $0 = true }

@@ -754,6 +754,36 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
+    // Same-size, same-codec changes (bitrate and/or frame rate) update the running encoder and
+    // capture interval in place without draining in-flight frames or restarting the media epoch.
+    func updateEncodingParameters(_ settings: StreamSettings, codec: VideoCodec? = nil) throws -> VideoStreamState {
+        try settings.validateControlValues()
+        return try queue.sync {
+            guard running, captureStarted, let stream, let encoder, !reconfiguring, !frameFlow.encodingFailed,
+                  cursorOperationID == nil, cursorFrameWaiter == nil else {
+                throw DeskError.invalid("画质正在调整，请稍后再试")
+            }
+            let targetCodec = codec ?? encoder.codec
+            let (width, height) = settings.dimensions(width: sourceWidth, height: sourceHeight)
+            guard targetCodec == encoder.codec, width == outputWidth, height == outputHeight else {
+                throw DeskError.invalid("画质尺寸或编码格式变化需要重新配置")
+            }
+            let frameRateChanged = settings.framesPerSecond != currentSettings.framesPerSecond
+            if frameRateChanged {
+                try encoder.updateEncodingParameters(settings: settings)
+            } else if settings.megabits != currentSettings.megabits {
+                try encoder.updateBitrate(megabits: settings.megabits)
+            }
+            currentSettings = settings
+            if frameRateChanged {
+                stream.updateConfiguration(Self.configuration(width: outputWidth, height: outputHeight,
+                    settings: settings, includesCursor: cursorGate.included), completionHandler: nil)
+                pump()
+            }
+            return VideoStreamState(settings: settings, width: outputWidth, height: outputHeight)
+        }
+    }
+
     /// `codec` nil keeps the running encoder's codec.
     func reconfigure(_ settings: StreamSettings, codec: VideoCodec? = nil) async throws -> VideoStreamState {
         try settings.validateControlValues()

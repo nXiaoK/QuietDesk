@@ -59,12 +59,15 @@ func runLiveSettingsChecks() {
         let request = StreamSettingsRequest(settings: medium, codec: .hevc)
         let older = try JSONDecoder().decode(OlderRequest.self, from: JSONEncoder().encode(request))
         try check(older.id == request.id && older.settings == medium, "An older host could not read an HEVC request")
-        let result = StreamSettingsResult(id: request.id, state: state(medium), codec: .hevc)
+        let result = StreamSettingsResult(id: request.id, state: state(medium), codec: .hevc, restartsStream: false)
         let olderResult = try JSONDecoder().decode(OlderResult.self, from: JSONEncoder().encode(result))
         try check(olderResult.state == result.state && olderResult.error == nil, "An older viewer could not read a codec reply")
+        let decodedInPlace = try Wire.readJSON(StreamSettingsResult.self, JSONEncoder().encode(result))
+        try check(decodedInPlace.restartsStream == false, "In-place stream settings result lost restartsStream flag")
         try check(try Wire.readJSON(StreamSettingsRequest.self, JSONEncoder().encode(StreamSettingsRequest(settings: medium))).codec == nil
-                  && Wire.readJSON(StreamSettingsResult.self, JSONEncoder().encode(StreamSettingsResult(id: request.id, state: initial))).codec == nil,
-                  "A message without a codec did not mean H.264")
+                  && Wire.readJSON(StreamSettingsResult.self, JSONEncoder().encode(StreamSettingsResult(id: request.id, state: initial))).codec == nil
+                  && Wire.readJSON(StreamSettingsResult.self, JSONEncoder().encode(StreamSettingsResult(id: request.id, state: initial))).restartsStream == nil,
+                  "A message without a codec did not mean H.264 or fabricated restartsStream")
         let unknown = #"{"id":"\#(UUID().uuidString)","settings":{"longestEdge":1920,"framesPerSecond":15,"megabits":3},"codec":"av1"}"#
         try rejects("An unknown codec was accepted") { _ = try Wire.readJSON(StreamSettingsRequest.self, Data(unknown.utf8)) }
         let hello = Hello(name: "host", width: 1920, height: 1080, settings: .init(), canControl: true, hevcVideoV1: true)

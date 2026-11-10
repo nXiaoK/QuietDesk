@@ -30,8 +30,11 @@ public struct StreamSettingsResult: Codable, Sendable {
     public let error: String?
     // The codec the host encodes with, echoed only to a request that named one; missing means H.264.
     public let codec: VideoCodec?
-    public init(id: UUID, state: VideoStreamState, error: String? = nil, codec: VideoCodec? = nil) {
-        self.id = id; self.state = state; self.error = error; self.codec = codec
+    // False when the host updated its running encoder and capture interval in place without restarting the media epoch.
+    public let restartsStream: Bool?
+    public init(id: UUID, state: VideoStreamState, error: String? = nil, codec: VideoCodec? = nil,
+                restartsStream: Bool? = nil) {
+        self.id = id; self.state = state; self.error = error; self.codec = codec; self.restartsStream = restartsStream
     }
 }
 

@@ -2519,10 +2519,12 @@ final class DeskModel: ObservableObject {
             videoTuning = tuning
             activeVideoState = result.state
             activeVideoCodec = tuning.appliedCodec
-            // An adaptive host changed only the running encoder's bitrate, so the current stream continues.
-            let bitrateOnly = supportsAdaptiveVideo && previous.longestEdge == result.state.settings.longestEdge
-                && previous.framesPerSecond == result.state.settings.framesPerSecond && previousCodec == tuning.appliedCodec
-            viewerSession.media?.updateSettings(result.state.settings, restartsStream: !bitrateOnly)
+            // An adaptive host that updated the running encoder in place keeps the current media stream.
+            let inPlace = supportsAdaptiveVideo && (result.restartsStream.map { !$0 }
+                ?? (previous.longestEdge == result.state.settings.longestEdge
+                    && previous.framesPerSecond == result.state.settings.framesPerSecond
+                    && previousCodec == tuning.appliedCodec))
+            viewerSession.media?.updateSettings(result.state.settings, restartsStream: !inPlace)
             if result.error == nil {
                 _ = viewerSession.mediaQuality?.confirmApplied(result.state.settings, now: SessionClock.now)
             } else { viewerSession.mediaQuality?.rejectPending(now: SessionClock.now) }
@@ -3246,21 +3248,22 @@ final class DeskModel: ObservableObject {
         if host.settingsRequestID == request.id { return }
         // Only a viewer that named a codec can decode HEVC, and only it hears which codec is running.
         let codec: VideoCodec = request.codec == .hevc && VideoEncoder.hardwareHEVCAvailable ? .hevc : .h264
-        let reply = { [weak self] (state: VideoStreamState, error: String?) -> StreamSettingsResult in
+        let reply = { [weak self] (state: VideoStreamState, error: String?, restartsStream: Bool?) -> StreamSettingsResult in
             StreamSettingsResult(id: request.id, state: state, error: error,
-                                 codec: request.codec == nil ? nil : self?.activeVideoCodec ?? .h264)
+                                 codec: request.codec == nil ? nil : self?.activeVideoCodec ?? .h264,
+                                 restartsStream: restartsStream)
         }
         if host.settingsRequestID != nil {
-            if let result = try? Wire.json(.streamSettingsResult, reply(state, "正在处理上一项画质调整")) { peer.send(result) }
+            if let result = try? Wire.json(.streamSettingsResult, reply(state, "正在处理上一项画质调整", false)) { peer.send(result) }
             return
         }
         do { try request.settings.validateControlValues() }
         catch {
-            if let result = try? Wire.json(.streamSettingsResult, reply(state, error.localizedDescription)) { peer.send(result) }
+            if let result = try? Wire.json(.streamSettingsResult, reply(state, error.localizedDescription, false)) { peer.send(result) }
             return
         }
         if request.settings == state.settings, codec == activeVideoCodec {
-            if let result = try? Wire.json(.streamSettingsResult, reply(state, nil)) { peer.send(result) }
+            if let result = try? Wire.json(.streamSettingsResult, reply(state, nil, false)) { peer.send(result) }
             return
         }
         host.settingsRequestID = request.id
@@ -3283,16 +3286,16 @@ final class DeskModel: ObservableObject {
                 await effects?.value
                 guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
                       host.settingsRequestID == request.id, !Task.isCancelled else { return }
-                // Automatic adaptation mostly changes bitrate; keep the stream running instead of rebuilding it.
-                if let current = self.activeVideoState, request.settings.longestEdge == current.settings.longestEdge,
-                   request.settings.framesPerSecond == current.settings.framesPerSecond, codec == self.activeVideoCodec,
-                   let updated = try? streamer.updateBitrate(request.settings) {
+                // Same-size, same-codec changes (bitrate and/or frame rate) update the running encoder in place.
+                if self.activeVideoState != nil, codec == self.activeVideoCodec,
+                   let updated = try? streamer.updateEncodingParameters(request.settings, codec: codec) {
                     self.activeVideoState = updated
                     self.recordVideoConfiguration(updated)
                     self.videoSettingsStatus = "控制端已调整：\(updated.settings.summary)"
+                        + (self.activeVideoCodec == .hevc ? " · HEVC" : "")
                     peer.setVideoPacing(VideoSendPacing(megabits: updated.settings.megabits))
                     host.media?.updateSettings(updated.settings, restartsStream: false)
-                    peer.send(try Wire.json(.streamSettingsResult, reply(updated, nil)))
+                    peer.send(try Wire.json(.streamSettingsResult, reply(updated, nil, false)))
                     return
                 }
                 await self.suspendMediaForConfiguration(host.media)
@@ -3308,7 +3311,7 @@ final class DeskModel: ObservableObject {
                     + (self.activeVideoCodec == .hevc ? " · HEVC" : "")
                 peer.setVideoPacing(VideoSendPacing(megabits: updated.settings.megabits))
                 host.media?.updateSettings(updated.settings)
-                peer.send(try Wire.json(.streamSettingsResult, reply(updated, nil)))
+                peer.send(try Wire.json(.streamSettingsResult, reply(updated, nil, true)))
                 streamer.resumeAfterReconfiguration()
                 if !host.paused { host.media?.resumeAfterConfiguration() }
             } catch {
@@ -3316,7 +3319,7 @@ final class DeskModel: ObservableObject {
                       !Task.isCancelled, let actual = self.activeVideoState else { return }
                 self.recordDiagnosticFailure(.streamConfigured, error: error)
                 if !host.paused { host.media?.resumeAfterConfiguration() }
-                if let result = try? Wire.json(.streamSettingsResult, reply(actual, error.localizedDescription)) { peer.send(result) }
+                if let result = try? Wire.json(.streamSettingsResult, reply(actual, error.localizedDescription, nil)) { peer.send(result) }
             }
         }
     }

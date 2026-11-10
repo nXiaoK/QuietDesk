@@ -1061,6 +1061,59 @@ private struct VideoPipelineChecks {
             try require(outputs.snapshot.1 == 0, "Decoded frames after in-place parameter update had errors")
         }
 
+        run("Media recovery reuses a healthy running encoder across in-flight submissions and fences old callbacks") {
+            var pixelBuffer: CVPixelBuffer?
+            let status = CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nil, &pixelBuffer)
+            guard status == kCVReturnSuccess, let pixelBuffer else { throw VideoCheckFailure("Could not create an offline video buffer") }
+            var flow = VideoFrameFlow()
+            var timing = VideoEncodeTiming()
+            var timeline = VideoPresentationTimeline()
+            let encoderID = UUID()
+            let initial = flow.begin(at: 0, maximumConcurrentEncodes: 2)!
+            _ = flow.encoded(initial.sequence, at: 0.001)
+            let inFlight = flow.begin(at: 0.002, maximumConcurrentEncodes: 2)!
+            _ = timing.begin(encoderID: encoderID, sequence: inFlight.sequence, at: 0.002)
+            try require(!flow.encoding.isEmpty, "Expected an in-flight frame before media recovery")
+            timing.cancel()
+            flow.prepareMediaRecovery()
+            flow.requestMediaRecoveryFrame()
+            let recovery = flow.begin(at: 0.003, maximumConcurrentEncodes: 2)!
+            _ = timing.begin(encoderID: encoderID, sequence: recovery.sequence, at: 0.003)
+            try require(timing.complete(encoderID: encoderID, sequence: inFlight.sequence, at: 0.004) == nil,
+                        "In-flight pre-recovery frame polluted post-recovery encode timing")
+            let encoder = try VideoEncoder(width: 64, height: 64, settings: StreamSettings(framesPerSecond: 60, megabits: 12))
+            let done = DispatchSemaphore(value: 0)
+            let lock = NSLock()
+            var acceptedPackets: [VideoPacket] = []
+            encoder.onOutput = { result in
+                lock.withLock {
+                    if case .success(let packet) = result,
+                       flow.complete(.init(sequence: packet.sequence, packet: packet, callbackAt: 0.005, duration: 0.002, diagnostic: nil)) {
+                        while let (frame, completed) = flow.takeCompleted(), let output = completed.packet {
+                            if flow.encoded(frame.sequence, at: 0.005) { acceptedPackets.append(output) }
+                        }
+                    }
+                }
+                done.signal()
+            }
+            encoder.onDropped = { _ in done.signal() }
+            defer { encoder.stop() }
+            let capturedAt = CMTime(value: 1, timescale: 60)
+            try encoder.encode(pixelBuffer, time: try timeline.next(encoderID: encoderID, time: capturedAt),
+                               sequence: inFlight.sequence, forceKeyFrame: true)
+            try encoder.encode(pixelBuffer, time: try timeline.next(encoderID: encoderID, time: capturedAt),
+                               sequence: recovery.sequence, forceKeyFrame: recovery.forceKeyFrame)
+            for _ in 0..<2 {
+                guard done.wait(timeout: .now() + 10) == .success else { throw VideoCheckFailure("Encoder callback timed out") }
+            }
+            let accepted = lock.withLock { acceptedPackets }
+            try require(accepted.map(\.sequence) == [recovery.sequence],
+                        "Pre-recovery callback leaked past VideoFrameFlow on the reused encoder: \(accepted.map(\.sequence))")
+            let isIDR = try MediaFrame.containsIDR(accepted[0].avcc)
+            try require(accepted[0].hasParameterSets && isIDR,
+                        "Reused encoder recovery frame was not a standalone IDR")
+        }
+
         print("Video pipeline checks: \(passed) passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

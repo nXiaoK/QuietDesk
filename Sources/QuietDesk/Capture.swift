@@ -960,15 +960,16 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
-    // Completion runs on the capture queue. When no frame is currently in flight in VideoToolbox,
-    // the running encoder can emit the next recovery IDR directly; otherwise a new encoder fences old callbacks.
+    // Completion runs on the capture queue. When the running encoder is healthy, it emits the next
+    // recovery IDR directly while VideoFrameFlow fences any earlier in-flight callbacks; only a failed
+    // or missing encoder requires a replacement VTCompressionSession.
     func prepareMediaRecovery(completion: @escaping (Bool) -> Void) {
         queue.async { [weak self] in
             guard let self, self.running, self.captureStarted, !self.reconfiguring, !self.sessionPaused else {
                 completion(false)
                 return
             }
-            if self.frameFlow.encoding.isEmpty, !self.frameFlow.encodingFailed, self.encoder != nil {
+            if !self.frameFlow.encodingFailed, self.encoder != nil {
                 self.encodingTimingLock.withLock { self.encodingStarted.removeAll(); self.encodeTiming.cancel() }
             } else {
                 let id = UUID()

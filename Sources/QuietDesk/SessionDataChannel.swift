@@ -12,6 +12,9 @@ final class SessionDataChannel: @unchecked Sendable {
     private var clipboard: ((Message) -> Void)?
     private var media: ((Message) -> Bool)?
     private var reliableData: ((Message) -> Void)?
+    private var cursorPosition: ((CursorPosition) -> Void)?
+    private var latestCursorPosition: CursorPosition?
+    private var cursorFlushScheduled = false
     private var freshFrameToken: UUID?
     private var mediaFreshFrame: (stream: MediaStreamID, token: UUID?)?
     private var bytes = 0
@@ -31,6 +34,25 @@ final class SessionDataChannel: @unchecked Sendable {
     func configureClipboard(_ handler: ((Message) -> Void)?) { lock.withLock { if valid { clipboard = handler } } }
     func configureMedia(_ handler: @escaping (Message) -> Bool) { lock.withLock { if valid { media = handler } } }
     func configureReliableData(_ handler: @escaping (Message) -> Void) { lock.withLock { if valid { reliableData = handler } } }
+    func configureCursorPosition(_ handler: ((CursorPosition) -> Void)?) {
+        lock.withLock {
+            guard valid else { return }
+            cursorPosition = handler
+            if handler == nil { latestCursorPosition = nil; cursorFlushScheduled = false }
+        }
+    }
+    func flushCursorPosition() {
+        let next = lock.withLock { () -> (CursorPosition, (CursorPosition) -> Void)? in
+            cursorFlushScheduled = false
+            guard valid, let position = latestCursorPosition, let handler = cursorPosition else {
+                latestCursorPosition = nil
+                return nil
+            }
+            latestCursorPosition = nil
+            return (position, handler)
+        }
+        if let (position, handler) = next { handler(position) }
+    }
     func sendReliableData(_ message: Message) {
         let handler = lock.withLock { valid ? (reliableData ?? send) : nil }
         handler?(message)
@@ -65,6 +87,21 @@ final class SessionDataChannel: @unchecked Sendable {
             guard message.payload.count == 4 else { throw DeskError.invalid("画面确认无效") }
             var reader = ByteReader(message.payload)
             acknowledgement(try reader.take())
+            return true
+        case .cursorPosition:
+            let configured = lock.withLock { valid && cursorPosition != nil }
+            guard configured else { return false }
+            let position = try CursorPosition.decode(message.payload)
+            let shouldSchedule = lock.withLock { () -> Bool in
+                guard valid, cursorPosition != nil else { return false }
+                latestCursorPosition = position
+                guard !cursorFlushScheduled else { return false }
+                cursorFlushScheduled = true
+                return true
+            }
+            if shouldSchedule {
+                DispatchQueue.main.async { [weak self] in self?.flushCursorPosition() }
+            }
             return true
         case .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel:
             guard let clipboard = handlers.3 else { return false }
@@ -114,6 +151,9 @@ final class SessionDataChannel: @unchecked Sendable {
             clipboard = nil
             media = nil
             reliableData = nil
+            cursorPosition = nil
+            latestCursorPosition = nil
+            cursorFlushScheduled = false
             mediaFreshFrame = nil
             freshFrameToken = nil
             bytes = 0; frames = 0

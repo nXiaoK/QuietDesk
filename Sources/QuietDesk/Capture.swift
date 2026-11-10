@@ -1251,6 +1251,57 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     deinit { watchdog?.cancel(); refinementTimer?.cancel() }
 }
 
+final class HostImmediateInputQueue: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [RemoteInput] = []
+    private var backpressureResumes: [() -> Void] = []
+    private var flushScheduled = false
+    let capacity: Int
+
+    init(capacity: Int = 64) {
+        self.capacity = max(1, capacity)
+    }
+
+    func enqueue(_ input: RemoteInput, resume: @escaping () -> Void) -> Bool {
+        let result = lock.withLock { () -> (resumeNow: Bool, scheduleFlush: Bool) in
+            if let last = pending.last, Self.canCoalesce(previous: last, next: input) {
+                pending[pending.count - 1] = input
+            } else {
+                pending.append(input)
+            }
+            let resumeNow = pending.count < capacity && backpressureResumes.isEmpty
+            if !resumeNow {
+                backpressureResumes.append(resume)
+            }
+            let scheduleFlush = !flushScheduled
+            flushScheduled = true
+            return (resumeNow, scheduleFlush)
+        }
+        if result.resumeNow { resume() }
+        return result.scheduleFlush
+    }
+
+    func drain() -> (inputs: [RemoteInput], resumes: [() -> Void]) {
+        lock.withLock {
+            flushScheduled = false
+            let inputs = pending
+            let resumes = backpressureResumes
+            pending.removeAll(keepingCapacity: true)
+            backpressureResumes.removeAll()
+            return (inputs, resumes)
+        }
+    }
+
+    private static func canCoalesce(previous: RemoteInput, next: RemoteInput) -> Bool {
+        guard previous.flags == next.flags, previous.independentCapsLock == next.independentCapsLock else { return false }
+        switch (previous.kind, next.kind) {
+        case (.move, .move): return true
+        case (.drag, .drag): return previous.button == next.button
+        default: return false
+        }
+    }
+}
+
 @MainActor
 final class InputInjector {
     private static let modifierDeviceBits: [UInt16: UInt64] = [

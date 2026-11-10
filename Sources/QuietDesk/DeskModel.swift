@@ -1247,9 +1247,10 @@ final class DeskModel: ObservableObject {
                         media.onPrepareStream = { [weak self, weak streamer, weak host, weak candidate] stream, completion in
                             guard let streamer else { completion(false); return }
                             streamer.prepareMediaRecovery { ready in
+                                guard ready else { completion(false); return }
                                 DispatchQueue.main.async {
                                     guard let self, let host, let candidate, self.hostSession === host,
-                                          self.peer === candidate, ready else { completion(false); return }
+                                          self.peer === candidate else { completion(false); return }
                                     host.mediaPrepared = true
                                     if host.cursorSubscribed {
                                         guard let included = streamer.currentCursorIncluded else { completion(false); return }
@@ -1334,6 +1335,28 @@ final class DeskModel: ObservableObject {
                 }
             }
         }
+        let immediateInputs = HostImmediateInputQueue()
+        let flushImmediateInputs: @MainActor () -> Bool = { [weak self, weak candidate] in
+            let (inputs, resumes) = immediateInputs.drain()
+            defer { for resume in resumes { resume() } }
+            guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return false }
+            guard !inputs.isEmpty else { return true }
+            guard self.connected else {
+                candidate.close("屏幕共享尚未就绪", retryable: true)
+                return false
+            }
+            do {
+                for input in inputs {
+                    guard self.generation == token, self.active, self.peer === candidate, self.connected else { return false }
+                    try self.handleHostImmediateInput(input, peer: candidate)
+                }
+                return true
+            } catch {
+                self.recordDiagnosticFailure(.connectionFailed, error: error)
+                candidate.close(error.localizedDescription)
+                return false
+            }
+        }
         candidate.onMessageHandled = { [weak self, weak candidate] message, resume in
             do {
                 if try channel.receive(message) { resume(); return }
@@ -1346,6 +1369,7 @@ final class DeskModel: ObservableObject {
                 } catch {
                     DispatchQueue.main.async {
                         defer { resume() }
+                        _ = flushImmediateInputs()
                         guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
                         self.recordDiagnosticFailure(.connectionFailed, error: error)
                         candidate.close(error.localizedDescription)
@@ -1353,24 +1377,15 @@ final class DeskModel: ObservableObject {
                     return
                 }
                 if decodedInput.kind != .switchInputSource {
-                    DispatchQueue.main.async {
-                        defer { resume() }
-                        guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
-                        guard self.connected else {
-                            candidate.close("屏幕共享尚未就绪", retryable: true)
-                            return
-                        }
-                        do { try self.handleHostImmediateInput(decodedInput, peer: candidate) }
-                        catch {
-                            self.recordDiagnosticFailure(.connectionFailed, error: error)
-                            candidate.close(error.localizedDescription)
-                        }
+                    if immediateInputs.enqueue(decodedInput, resume: resume) {
+                        DispatchQueue.main.async { _ = flushImmediateInputs() }
                     }
                     return
                 }
             }
             Task { @MainActor in
                 defer { resume() }
+                guard flushImmediateInputs() else { return }
                 guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
                 guard self.connected else {
                     if message.kind != .releaseInput { candidate.close("屏幕共享尚未就绪", retryable: true) }
@@ -2303,6 +2318,7 @@ final class DeskModel: ObservableObject {
             connectionError = SessionTermination.hostEndedReason
         case .cursorControl:
             guard supportsIndependentCursor else { throw DeskError.invalid("光标功能未协商") }
+            dataChannel?.flushCursorPosition()
             let control = try CursorControl.read(message.payload)
             if control.operation == .status {
                 guard control.requestID == viewerSession.cursorRequestID else { return }
@@ -2431,6 +2447,12 @@ final class DeskModel: ObservableObject {
                 connectionDiagnostics?.setVideoPath(.committed(.shared, relayedUDP: false), on: channel)
             }
             supportsIndependentCursor = viewerSession.media != nil && hello.independentCursorV1 == true
+            if supportsIndependentCursor {
+                let canvas = self.canvas
+                dataChannel?.configureCursorPosition { [weak canvas] position in
+                    MainActor.assumeIsolated { canvas?.receiveCursorPosition(position) }
+                }
+            }
             sendCursorRequest()
             publishSessionPause()
             sendNextSessionPause()

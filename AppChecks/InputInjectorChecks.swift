@@ -390,6 +390,33 @@ private struct InputInjectorChecks {
                         "Immediate Caps Lock or pointer event did not post synchronously")
         }
 
+        await run("Immediate input queue coalesces trailing move and drag events while preserving click barriers and backpressure") {
+            let queue = HostImmediateInputQueue(capacity: 3)
+            var resumed = 0
+            func move(_ x: Double) -> RemoteInput {
+                var input = RemoteInput(kind: .move); input.x = x; input.y = 0.5; return input
+            }
+            func drag(_ x: Double, button: Int = 0) -> RemoteInput {
+                var input = RemoteInput(kind: .drag); input.x = x; input.y = 0.5; input.button = button; return input
+            }
+            let firstSchedule = queue.enqueue(move(0.1)) { resumed += 1 }
+            let secondSchedule = queue.enqueue(move(0.2)) { resumed += 1 }
+            try require(firstSchedule && !secondSchedule && resumed == 2,
+                        "Coalesced moves did not resume immediately or scheduled duplicate flushes")
+            var down = RemoteInput(kind: .down); down.x = 0.2; down.y = 0.5
+            _ = queue.enqueue(down) { resumed += 1 }
+            try require(resumed == 3, "Click below capacity did not resume immediately")
+            _ = queue.enqueue(drag(0.3)) { resumed += 1 }
+            _ = queue.enqueue(drag(0.4)) { resumed += 1 }
+            try require(resumed == 3, "Events at capacity bypassed backpressure before drain")
+            let batch = queue.drain()
+            for resume in batch.resumes { resume() }
+            try require(resumed == 5, "Drain did not release held backpressure continuations")
+            try require(batch.inputs.map(\.kind) == [.move, .down, .drag]
+                        && batch.inputs[0].x == 0.2 && batch.inputs[2].x == 0.4,
+                        "Coalescing lost click ordering or kept stale intermediate pointer coordinates")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

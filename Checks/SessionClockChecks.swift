@@ -49,6 +49,17 @@ func runSessionClockChecks() {
         try check(!grace.observe(now: 0, interval: 0.1, allowance: 1), "Accepted backwards time")
         try check(grace.observe(now: 120, interval: 0.1, allowance: 1), "A later local suspension was ignored")
     }
+    run("Local scheduling recovery clears interrupted-playback pressure without inventing delivery") {
+        var policy = MediaPathPolicy(capable: true, now: 0)
+        _ = policy.tick(now: 0)
+        _ = policy.probeSucceeded(id: policy.probeID!, now: 0.1)
+        _ = policy.mediaBecameUsable(epoch: policy.epoch, path: .udp, now: 0.2)
+        _ = policy.mediaInterrupted(epoch: policy.epoch, now: 1)
+        _ = policy.mediaInterrupted(epoch: policy.epoch, now: 2)
+        policy.allowLivenessRecovery(now: 3)
+        try check(policy.mediaInterrupted(epoch: policy.epoch, now: 4).isEmpty && policy.targetPath == .udp,
+                  "Local scheduling recovery retained pre-stall interruption pressure")
+    }
     run("Media liveness recovery does not invent a pong or permanently preserve a dead route") {
         var policy = MediaPathPolicy(capable: true, now: 0)
         _ = policy.tick(now: 0)

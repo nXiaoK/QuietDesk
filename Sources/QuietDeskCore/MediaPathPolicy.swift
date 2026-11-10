@@ -212,11 +212,14 @@ public struct MediaPathPolicy: Sendable {
     private var pausedAt: TimeInterval?
     private var resumeProbeIsInitial: Bool?
     private var alternateProbeUsed = false
-    // UDP is kept while it can carry video at all; only this many failed UDP keyframes in a row,
-    // each followed by a lower quality and a fresh UDP attempt, fall back to TCP.
+    // Failed candidate keyframes get lower-quality UDP retries before TCP. Interruptions after
+    // a successful commit have their own bounded budget, so intermittent IDRs cannot hide broken playback.
     public static let udpMediaFailureLimit = 3
     public static let udpRetryDelay: TimeInterval = 1
     public private(set) var udpMediaFailures = 0
+    // A usable IDR does not prove that the following reference chain survives. Keep a separate,
+    // bounded window of actual playback delivery failures across successful same-path recoveries.
+    private var udpInterruptions: [TimeInterval] = []
     private let initialProbeTimeout: TimeInterval
 
     public init(capable: Bool, now: TimeInterval, initialEpoch: UInt32 = 0, initialProbeTimeout: TimeInterval = 1.5) {
@@ -251,6 +254,7 @@ public struct MediaPathPolicy: Sendable {
         guard initial || phase == .probingRecovery else { return [] }
         guard advanceEpoch() else { return [.cancelProbe(id: id), .restartSession(reason: .epochExhausted)] }
         probeID = nil; probeDeadline = nil; nextRecoveryAt = nil; udpMediaFailures = 0
+        udpInterruptions.removeAll()
         targetPath = .udp; phase = .trialUDP
         selectionStartedAt = now; lastPongAt = now; udpSelectedAt = now
         lastObservationAt = now
@@ -277,10 +281,16 @@ public struct MediaPathPolicy: Sendable {
         lastPongAt = now
     }
 
-    // Only the local media timer calls this after a scheduling gap, never for a remote packet.
+    mutating func mediaConfigurationChanged(now: TimeInterval) {
+        guard accept(now), phase != .stopped else { return }
+        udpInterruptions.removeAll()
+    }
+
+    // Only the local scheduling observer grants this grace, never a remote packet's timestamp.
     mutating func allowLivenessRecovery(now: TimeInterval) {
         guard accept(now), !paused, phase != .stopped else { return }
         livenessGraceUntil = now + 1
+        udpInterruptions.removeAll()
         if let probeDeadline { self.probeDeadline = max(probeDeadline, livenessGraceUntil) }
     }
 
@@ -290,6 +300,20 @@ public struct MediaPathPolicy: Sendable {
         guard accept(now), !paused, self.epoch == epoch, targetPath == .udp,
               phase == .trialUDP || phase == .udp else { return [] }
         return udpMediaFailed(now: now, abandonAttempt: false)
+    }
+
+    // Called once when delivery of the committed UDP reference chain fails, not for configuration,
+    // decode failures or unsuccessful initial keyframes. Three interruptions within ten seconds
+    // request reliable video; isolated loss still gets a same-path recovery and quality adaptation.
+    public mutating func mediaInterrupted(epoch: UInt32, now: TimeInterval) -> [MediaPathAction] {
+        guard accept(now), !paused, self.epoch == epoch, targetPath == .udp, activePath == .udp,
+              phase == .trialUDP || phase == .udp else { return [] }
+        udpInterruptions.removeAll { now - $0 > 10 }
+        if let last = udpInterruptions.last, now - last < 0.25 { return [] }
+        udpInterruptions.append(now)
+        guard udpInterruptions.count >= 3 else { return [] }
+        udpInterruptions.removeAll()
+        return fallBack(now: now, reason: .networkDegraded)
     }
 
     // The coordinator already lowered quality for a failure it reported; a silent trial needs both.
@@ -357,6 +381,7 @@ public struct MediaPathPolicy: Sendable {
     public mutating func setPaused(_ value: Bool, now: TimeInterval) -> [MediaPathAction] {
         guard accept(now), phase != .legacyTCP, phase != .stopped, paused != value else { return [] }
         paused = value; resetEvidence(); lastObservationAt = now
+        udpInterruptions.removeAll()
         if value {
             pausedAt = now
             if let id = probeID {
@@ -387,6 +412,7 @@ public struct MediaPathPolicy: Sendable {
         selectionStartedAt = nil; lastPongAt = nil; pausedAt = nil; udpSelectedAt = nil
         if epoch < .max { epoch += 1 }
         phase = .stopped; activePath = nil
+        udpInterruptions.removeAll()
         resetEvidence()
         return action.map { [$0] } ?? []
     }
@@ -419,6 +445,7 @@ public struct MediaPathPolicy: Sendable {
         // minute or so keeps escalating, instead of switching paths every 30 seconds forever.
         if let udpSelectedAt, now - udpSelectedAt + mediaPolicyTimeTolerance >= 300 { recoveryAttempt = 0 }
         udpSelectedAt = nil
+        udpInterruptions.removeAll()
         targetPath = .tcp; phase = .switchingTCP
         selectionStartedAt = now; lastPongAt = nil; lastObservationAt = now
         lastReason = reason; scheduleRecovery(now: now); resetEvidence()

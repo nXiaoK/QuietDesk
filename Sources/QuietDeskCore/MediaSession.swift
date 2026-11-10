@@ -194,6 +194,7 @@ public final class MediaSession: @unchecked Sendable {
     private var retryAt: TimeInterval = 0
     private var retryPath: Path?
     private var requestedRecoveryAt: TimeInterval = 0
+    private var interruptedStream: MediaStreamID?
     private var pendingDatagrams: [Datagram] = []
     private var datagramOffset = 0
     private var pendingDatagramBytes = 0
@@ -313,13 +314,15 @@ public final class MediaSession: @unchecked Sendable {
     }
 
     /// `restartsStream` is false when the host changed only the running encoder's bitrate, so the
-    /// current reference chain stays valid and no new keyframe transaction is needed.
+    /// current reference chain stays valid and no new keyframe transaction is needed. A restarting
+    /// configuration establishes a new playback observation window even when only the codec changed.
     public func updateSettings(_ value: StreamSettings, restartsStream: Bool = true) {
         guard (try? value.validateControlValues()) != nil else { return }
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
             let changed = self.settings != value
             self.settings = value
+            if restartsStream { self.policy.mediaConfigurationChanged(now: SessionClock.now) }
             self.videoPeer?.setVideoPacing(VideoSendPacing(megabits: value.megabits))
             if changed, restartsStream, self.active != nil, !self.configurationSuspended { self.requestRecovery() }
         }
@@ -451,6 +454,7 @@ public final class MediaSession: @unchecked Sendable {
 
     private func receiveMessage(_ message: Message, auxiliary: Peer?, role: MediaChannelRole? = nil) {
         guard !stopped else { return }
+        observeLocalScheduling()
         do {
             switch message.kind {
             case .mediaControl:
@@ -520,8 +524,9 @@ public final class MediaSession: @unchecked Sendable {
             guard value.transportEpoch == active?.stream.transportEpoch,
                   value.codecEpoch == active?.stream.codecEpoch else { return }
             if side == .viewer {
-                if relayRoutingNegotiated, value.mediaFailure == true, active?.path != .udp { reliableDeliveryFailed() }
-                requestRecovery()
+                let deliveryFailed = hasDeliveryFailureEvidence && relayRoutingNegotiated && value.mediaFailure == true
+                if deliveryFailed, active?.path != .udp { reliableDeliveryFailed() }
+                requestRecovery(mediaFailure: deliveryFailed)
             }
             return
         }
@@ -625,7 +630,7 @@ public final class MediaSession: @unchecked Sendable {
             onState?(stateLabel(path)); onResumeFrames?()
         case .abort:
             guard transaction?.id == id, transaction?.stream == stream else { return }
-            abortTransaction(retry: true, notify: false, mediaFailure: value.mediaFailure == true)
+            abortTransaction(retry: true, notify: false, mediaFailure: hasDeliveryFailureEvidence && value.mediaFailure == true)
         default: throw DeskError.invalid("控制通道不接受媒体绑定消息")
         }
     }
@@ -844,6 +849,7 @@ public final class MediaSession: @unchecked Sendable {
 
     private func receiveDatagram(_ data: Data) {
         guard let kind = data.first else { return }
+        observeLocalScheduling()
         do {
             switch kind {
             case 1:
@@ -1002,6 +1008,7 @@ public final class MediaSession: @unchecked Sendable {
                     self?.queue.async { [weak self] in
                         guard let self, !self.stopped, self.expectedStream == frame.header.stream,
                               self.decoding.remove(frame.header) != nil else { return }
+                        self.observeLocalScheduling()
                         if success {
                             let now = SessionClock.now
                             if let last = self.lastDecodedAt { self.recordDuration(.mediaDecodeInterval, seconds: now - last, identifier: frame.header.frameID) }
@@ -1036,10 +1043,10 @@ public final class MediaSession: @unchecked Sendable {
                 if feedback.kind == .expired { diagnostics?.recordValue(.mediaExpired, 1, kind: .mediaFrame, identifier: feedback.header.frameID) }
                 if !decoderFailure || feedback.kind != .expired { sendFeedback(feedback) }
             case .recoveryRequired(let header):
-                let deliveryFailed = !decoderFailure && !reassembledLocally.contains(header)
+                let deliveryFailed = hasDeliveryFailureEvidence && !decoderFailure && !reassembledLocally.contains(header)
                 reassembledLocally.remove(header)
                 if transaction?.stream == header.stream { abortTransaction(retry: true, mediaFailure: deliveryFailed) }
-                else { requestRecovery() }
+                else { requestRecovery(mediaFailure: deliveryFailed) }
             }
         }
     }
@@ -1059,9 +1066,9 @@ public final class MediaSession: @unchecked Sendable {
                 enqueue(fragments, repair: true)
             case .recoveryRequired(let header):
                 if transaction?.stream == header.stream {
-                    abortTransaction(retry: true, mediaFailure: transaction?.frameSubmitted == true && !reassembledAtPeer.contains(header))
+                    abortTransaction(retry: true, mediaFailure: hasDeliveryFailureEvidence && transaction?.frameSubmitted == true && !reassembledAtPeer.contains(header))
                 }
-                else { requestRecovery(mediaFailure: active?.path != .udp && !reassembledAtPeer.contains(header)) }
+                else { requestRecovery(mediaFailure: hasDeliveryFailureEvidence && !reassembledAtPeer.contains(header)) }
                 reassembledAtPeer.removeAll()
             }
         }
@@ -1104,6 +1111,11 @@ public final class MediaSession: @unchecked Sendable {
         requestedRecoveryAt = SessionClock.now
         diagnostics?.recordValue(.mediaRecovery, 1, kind: .mediaFrame)
         if side == .viewer {
+            if mediaFailure, let active, active.path == .udp, interruptedStream != active.stream {
+                interruptedStream = active.stream
+                let actions = policy.mediaInterrupted(epoch: policy.epoch, now: SessionClock.now)
+                if !actions.isEmpty { handleActions(actions); return }
+            }
             if active?.path == .udp, udpAvailable, !udpVerified, udpPeer != nil {
                 retryAt = SessionClock.now + 0.3; retryPath = .udp
                 return
@@ -1222,19 +1234,26 @@ public final class MediaSession: @unchecked Sendable {
         }
     }
 
-    private func tick() {
-        guard !stopped else { return }
-        let uptime = SessionClock.uptime
-        if livenessGrace.observe(now: uptime, interval: 0.01, allowance: 1), negotiated, !paused, !configurationSuspended {
-            // Never accept a pre-stall nonce as a fresh RTT sample. Both peers get a new response window.
+    private func observeLocalScheduling() {
+        if livenessGrace.observe(now: SessionClock.uptime, interval: 0.01, allowance: 1), negotiated, !paused, !configurationSuspended {
+            // A queued packet may run before the timer after a stall. Neither can prove delivery failure
+            // from an old deadline, or accept a pre-stall nonce as a fresh RTT sample.
             challenge = nil
             sendPing()
             policy.allowLivenessRecovery(now: SessionClock.now)
         }
+    }
+
+    private var hasDeliveryFailureEvidence: Bool { !livenessGrace.isActive(at: SessionClock.uptime) }
+
+    private func tick() {
+        guard !stopped else { return }
+        observeLocalScheduling()
+        let uptime = SessionClock.uptime
         let now = SessionClock.now
         if let pending = transaction, now - pending.started > 8 {
             let header = MediaFrameHeader(stream: pending.stream, frameID: 1, isIDR: true)
-            abortTransaction(retry: true, mediaFailure: pending.frameSubmitted && pending.stage == .producing && !reassembledAtPeer.contains(header))
+            abortTransaction(retry: true, mediaFailure: hasDeliveryFailureEvidence && pending.frameSubmitted && pending.stage == .producing && !reassembledAtPeer.contains(header))
         }
         guard negotiated, !paused, !configurationSuspended else { return }
         if udpPeer != nil, SessionClock.uptime - lastPingAt >= 0.2 { sendPing() }

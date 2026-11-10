@@ -312,16 +312,19 @@ private final class LoopbackMediaBlackhole {
     }
 }
 
-private func blackholePacket(sequence: UInt32, idr: Bool) -> VideoPacket {
+private func blackholePacket(sequence: UInt32, idr: Bool, interruptedStream: Bool = false, wholeFrameLoss: Bool = false) -> VideoPacket {
     var avcc = Data()
-    let nal = Data([idr ? 0x65 : 0x41]) + Data(repeating: 0x7D, count: idr ? 512 * 1_024 - 1 : 31)
+    // Make every P-frame fragment full-sized when testing sender-only failure evidence.
+    let predictedBytes = wholeFrameLoss ? 8 * MediaFragment.maximumPayloadBytes - 12 : 8 * 1_024
+    let bytes = interruptedStream ? (idr ? 32 : predictedBytes) : (idr ? 512 * 1_024 : 32)
+    let nal = Data([idr ? 0x65 : 0x41]) + Data(repeating: 0x7D, count: bytes - 1)
     avcc.put(UInt32(nal.count))
     avcc.append(nal)
     return VideoPacket(sequence: sequence, sps: idr ? Data([0x67, 0x42, 0x00, 0x1F]) : Data(),
                        pps: idr ? Data([0x68, 0xCE, 0x06]) : Data(), avcc: avcc)
 }
 
-private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeInterval = 0) throws {
+private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeInterval = 0, interruptedStream: Bool = false, wholeFrameLoss: Bool = false) throws {
     let key = try PairingKey.generate()
     let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 12)
     let diagnostics = PerformanceDiagnostics(enabled: true)
@@ -340,7 +343,15 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
     let videoConnections = BlackholeBox(0), committed = BlackholeBox<[MediaStreamID]>([])
     let teardown = BlackholeBox(false), decodedFrames = BlackholeBox(0)
     let requireNewControlPong = BlackholeBox(false)
-    let networkLoadReductions = BlackholeBox(0)
+    let networkLoadReductions = BlackholeBox(0), deliveryHints = BlackholeBox(0)
+    if wholeFrameLoss {
+        let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
+        let frame = try MediaFrame(header: MediaFrameHeader(stream: stream, frameID: 1, isIDR: false),
+                                   packet: blackholePacket(sequence: 1, idr: false, interruptedStream: true, wholeFrameLoss: true))
+        let fragments = try MediaFragment.fragment(frame: frame)
+        try requireBlackhole(fragments.count == 8 && fragments.allSatisfy { $0.encode().count == MediaFragment.maximumDatagramBytes },
+                             "Sender-only fixture left a partial fragment visible to the viewer")
+    }
 
     func recordError(_ message: String) {
         guard !teardown.get() else { return }
@@ -348,7 +359,7 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
     }
     func nextPacket(_ idr: Bool) -> VideoPacket {
         sequence.update { $0 += 1 }
-        return blackholePacket(sequence: sequence.get(), idr: idr)
+        return blackholePacket(sequence: sequence.get(), idr: idr, interruptedStream: interruptedStream, wholeFrameLoss: wholeFrameLoss)
     }
 
     listener.newConnectionHandler = { connection in
@@ -365,7 +376,7 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
             }
             do {
                 guard let port = listener.port else { throw BlackholeCheckFailure(description: "Host port disappeared") }
-                let media = try MediaSession.host(control: peer, key: key, port: port.rawValue, settings: settings)
+                let media = try MediaSession.host(control: peer, key: key, port: port.rawValue, settings: settings, relayRouting: wholeFrameLoss)
                 hostSession.update { $0 = media }
                 media.onPrepareRecovery = { $0(true) }
                 media.onProduceRecoveryFrame = { [weak media] in media?.sendVideo(nextPacket(true)) }
@@ -406,7 +417,7 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
     client.onReady = {
         do {
             let media = try MediaSession.viewer(control: client, key: key, host: "127.0.0.1", port: proxyPort.rawValue,
-                                                settings: settings, udpEnabled: true)
+                                                settings: settings, udpEnabled: true, relayRouting: wholeFrameLoss)
             viewerSession.update { $0 = media }
             media.diagnostics = diagnostics
             media.onReduceLoad = { cause in if cause == .network { networkLoadReductions.update { $0 += 1 } } }
@@ -416,14 +427,15 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
             }
             media.onDiagnosticVideoPath = { path in reportPaths.update { $0.append(path) } }
             media.onDiagnosticUDPLoss = { settled, lost in
-                if reportPaths.get().last != .trialUDP(relayed: false) {
-                    recordError("UDP trial loss was settled after the report had already left the trial path")
+                let path = reportPaths.get().last
+                if path != .trialUDP(relayed: false) && !(interruptedStream && path == .committed(.udp, relayedUDP: false)) {
+                    recordError("UDP loss was settled outside its current trial or committed path")
                 }
                 reportFragments.update { $0.settled += settled; $0.lost += lost }
             }
             media.onDiagnosticUDPRoundTrip = { _ in reportPongs.update { $0 += 1 } }
             media.onVideo = { frame, complete in
-                let expected = blackholePacket(sequence: frame.packet.sequence, idr: frame.header.isIDR)
+                let expected = blackholePacket(sequence: frame.packet.sequence, idr: frame.header.isIDR, interruptedStream: interruptedStream, wholeFrameLoss: wholeFrameLoss)
                 guard frame.packet.sps == expected.sps, frame.packet.pps == expected.pps, frame.packet.avcc == expected.avcc else {
                     recordError("Reassembled media changed bytes")
                     complete(false)
@@ -434,8 +446,8 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
                 if !frame.header.isIDR { predictedFrame.signal() }
             }
             media.onCommitStream = { stream, packet in
-                if packet.avcc != blackholePacket(sequence: packet.sequence, idr: true).avcc {
-                    recordError("Committed IDR payload is not the 512 KiB fixture")
+                if packet.avcc != blackholePacket(sequence: packet.sequence, idr: true, interruptedStream: interruptedStream, wholeFrameLoss: wholeFrameLoss).avcc {
+                    recordError("Committed IDR payload changed from the fixture")
                 }
                 committed.update { $0.append(stream) }
             }
@@ -444,7 +456,12 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
                 print("BLACKHOLE STATE", state)
                 if state == "TCP 视频" { committedTCP.signal() }
             }
-            client.onMessageHandled = { message, resume in _ = media.receive(message); resume() }
+            client.onMessageHandled = { message, resume in
+                if message.kind == .mediaControl, let value = try? MediaControl.read(message.payload),
+                   value.operation == .recover, value.mediaFailure == true { deliveryHints.update { $0 += 1 } }
+                _ = media.receive(message)
+                resume()
+            }
             media.start()
         } catch { recordError("Viewer setup: \(error)") }
     }
@@ -458,6 +475,28 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
     try waitBlackhole(predictedFrame, "TCP committed an IDR but did not resume its P-frame chain", seconds: 3)
     requireNewControlPong.update { $0 = true }
     try waitBlackhole(controlPong, "TLS control stopped responding during media fallback", seconds: 2)
+    if interruptedStream {
+        let stats = proxy.snapshot()
+        let paths = reportPaths.get()
+        let summaries = diagnostics.drain()
+        let pongs = summaries.filter { $0.metric == .mediaRoundTrip }.reduce(0) { $0 + $1.count }
+        try requireBlackhole(stats.droppedHostDatagrams > 0 && stats.forwardedProbeSizedAfterDrop > 0 && pongs > 0,
+                             "Interrupted video did not retain authenticated UDP liveness")
+        try requireBlackhole(paths.contains(.committed(.udp, relayedUDP: false))
+                             && paths.last == .committed(.tcp, relayedUDP: false),
+                             "Intermittently working UDP did not move its broken P-frame chain to TCP: \(paths)")
+        try requireBlackhole(udpPreparations.get() >= 3 && udpPreparations.get() <= 6 && tcpPreparations.get() == 1,
+                             "Successful UDP IDRs bypassed the bounded interruption budget: \(udpPreparations.get())")
+        if wholeFrameLoss {
+            let fragments = reportFragments.get()
+            // Each committed UDP IDR has one fragment; no dropped P-frame fragment can settle here.
+            try requireBlackhole(fragments.settled == committed.get().count - 1 && fragments.lost == 0 && deliveryHints.get() >= 3,
+                                 "Whole-frame loss lacked sender evidence or exposed P-frame fragments: settled \(fragments), hints \(deliveryHints.get())")
+        }
+        try requireBlackhole(errors.get().isEmpty, "Interrupted video damaged its control connection: \(errors.get())")
+        print("INTERRUPTED UDP wholeFrameLoss=\(wholeFrameLoss) committedIDRs=\(committed.get().count - 1) udpPrepare=\(udpPreparations.get()) tcpPrepare=\(tcpPreparations.get()) authenticatedPongs=\(pongs) deliveryHints=\(deliveryHints.get()) elapsed=\(SessionClock.now - droppedAt)s")
+        return
+    }
     // One more sample window on TCP must clear the UDP loss figure.
     let reportsBeforeSettling = lossReports.get().count
     for _ in 0..<40 where lossReports.get().count < reportsBeforeSettling + 2 { Thread.sleep(forTimeInterval: 0.05) }
@@ -512,6 +551,16 @@ private func exerciseMediaBlackhole(blockAllUDP: Bool = false, probeDelay: TimeI
 private struct MediaBlackholeChecks {
     static func main() {
         var failures = 0
+        for wholeFrameLoss in [false, true] {
+            do {
+                try exerciseMediaBlackhole(interruptedStream: true, wholeFrameLoss: wholeFrameLoss)
+                print("PASS Repeated successful UDP IDRs cannot hide a broken predicted-frame chain, whole-frame loss \(wholeFrameLoss)")
+            } catch {
+                failures += 1
+                print("FAIL Interrupted UDP playback, whole-frame loss \(wholeFrameLoss): \(error)")
+            }
+        }
+        if CommandLine.arguments.contains("--unstable-only") { exit(failures > 0 ? 1 : 0) }
         for (blockAllUDP, probeDelay) in [(false, 0.0), (true, 0.0), (false, 0.3)] {
             let name = blockAllUDP ? "Fully blocked UDP probes fall back to independent TCP without preparing UDP video"
                 : "Live UDP pongs with dropped large media fall back to independent TCP"

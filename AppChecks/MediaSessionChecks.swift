@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Network
 import QuietDeskCore
@@ -13,12 +14,13 @@ func require(_ value: Bool, _ message: String) throws { if !value { throw Failur
 func wait(_ value: DispatchSemaphore, _ message: String, seconds: Double = 8) throws {
     try require(value.wait(timeout:.now()+seconds) == .success,message)
 }
-func packet(_ seq: UInt32, idr: Bool, largeIDR: Bool = false, hevc: Bool = false) -> VideoPacket {
+func packet(_ seq: UInt32, idr: Bool, largeIDR: Bool = false, hevc: Bool = false, largePredicted: Bool = false) -> VideoPacket {
     // HEVC NAL headers are two bytes: IDR_N_LP is type 20, TRAIL_R type 1, VPS/SPS/PPS types 32/33/34.
     let header: [UInt8] = hevc ? (idr ? [0x28,0x01] : [0x02,0x01]) : [idr ? 0x65 : 0x41]
     var avcc=Data();avcc.put(UInt32(header.count+3));avcc.append(contentsOf:header);avcc.append(contentsOf:[1,2,3])
-    if idr && largeIDR {
-        let nal=Data(header)+Data(repeating:0x7D,count:512*1024-header.count)
+    if idr && largeIDR || !idr && largePredicted {
+        let bytes = idr ? 512*1024 : 64*1024
+        let nal=Data(header)+Data(repeating:0x7D,count:bytes-header.count)
         avcc=Data();avcc.put(UInt32(nal.count));avcc.append(nal)
     }
     if hevc {
@@ -28,15 +30,45 @@ func packet(_ seq: UInt32, idr: Bool, largeIDR: Bool = false, hevc: Bool = false
     return VideoPacket(sequence:seq,sps:idr ? Data([0x67,0x42,0x00,0x1f]):Data(),pps:idr ? Data([0x68,0xce,0x06]):Data(),
         avcc:avcc)
 }
+func reserveMediaPort() throws -> (socket: Int32, port: UInt16) {
+    for _ in 0..<20 {
+        let udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP), tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        guard udp >= 0, tcp >= 0 else {
+            if udp >= 0 { close(udp) };if tcp >= 0 { close(tcp) }
+            throw Failure(message:"Could not create fixture port reservations")
+        }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let reserved = withUnsafeMutablePointer(to:&address) { pointer in
+            pointer.withMemoryRebound(to:sockaddr.self,capacity:1) { raw in
+                bind(udp,raw,length) == 0 && getsockname(udp,raw,&length) == 0 && bind(tcp,raw,length) == 0
+            }
+        }
+        close(tcp)
+        if reserved { return (udp,UInt16(bigEndian:address.sin_port)) }
+        close(udp)
+    }
+    throw Failure(message:"No paired TCP/UDP fixture port was available")
+}
 enum PrepareHookCheck { case unchecked, boundStream, fallback }
+enum RecoveryConfigurationCheck { case none, restart, unchanged, bitrate }
 func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
               failRecoveryCandidate: Bool = false, pauseResume: Bool = false, stopCandidate: Bool = false, pathFailure: Bool = false, legacy: Bool = false, restoreUDP: Bool = false, inspectDiagnostics: Bool = false, largeIDR: Bool = false, overlapPrepare: Bool = false, prepareHook: PrepareHookCheck = .unchecked,
               delayedDecode: Bool = false, stalledDecode: Bool = false, liveBitrate: Bool = false,
-              inspectRoundTrip: Bool = false, hevc: Bool = false) throws {
+              inspectRoundTrip: Bool = false, hevc: Bool = false, recoveries: Bool = false,
+              deliveryHints: Bool = false, duplicateHints: Bool = false,
+              recoveryConfiguration: RecoveryConfigurationCheck = .none, retryHints: Bool = false,
+              schedulingStall: Bool = false) throws {
     let key = try PairingKey.generate(), settings = StreamSettings(longestEdge:1920,framesPerSecond:60,megabits:12)
     let queue = DispatchQueue(label:"session.loopback-listener")
+    // A random TCP port can already belong to UDP. Reserve both protocols before choosing it.
+    let reservation = try reserveMediaPort()
+    var udpReservation = reservation.socket
+    defer { if udpReservation >= 0 { close(udpReservation) } }
     let params = try MediaSecureTransport.tlsParameters(key:key,roles:MediaChannelRole.allCases)
-    params.requiredLocalEndpoint = .hostPort(host:"127.0.0.1",port:.any)
+    params.requiredLocalEndpoint = .hostPort(host:"127.0.0.1",port:NWEndpoint.Port(rawValue:reservation.port)!)
     let listener = try NWListener(using:params)
     let listenReady = DispatchSemaphore(value:0), committed = DispatchSemaphore(value:0), dataDone = DispatchSemaphore(value:0), pathStable = DispatchSemaphore(value:0)
     let deliverySampled = DispatchSemaphore(value:0)
@@ -58,7 +90,11 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     let cursorID = UUID()
     let streamPreparations = Box<[MediaStreamID]>([]), streamBindings = Box<[MediaStreamID]>([])
     let streamVideos = Box<[MediaStreamID]>([]), streamCommits = Box<[MediaStreamID]>([])
-    func nextPacket(_ idr: Bool) -> VideoPacket { sequence.update{$0 += 1}; return packet(sequence.get(),idr:idr,largeIDR:largeIDR,hevc:hevc) }
+    let currentStream = Box<MediaStreamID?>(nil), hostControl = Box<Peer?>(nil)
+    let rejectedHintAttempts = Box(0), hintRetryRejected = DispatchSemaphore(value:0), hostResumed = DispatchSemaphore(value:0)
+    let stallNextFrame = Box(false), stallDatagrams = Box(0)
+    let localStallFinished = DispatchSemaphore(value:0)
+    func nextPacket(_ idr: Bool) -> VideoPacket { sequence.update{$0 += 1}; return packet(sequence.get(),idr:idr,largeIDR:largeIDR,hevc:hevc,largePredicted:schedulingStall) }
     listener.newConnectionHandler = { connection in
         let peer = Peer(connection:connection); peers.update{$0.append(peer)}
         peer.onClose={ reason in if !reason.contains("test") { errors.update{$0.append(reason)} } }
@@ -70,11 +106,17 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
                 return
             }
             do {
-                let session = try MediaSession.host(control:peer,key:key,port:listener.port!.rawValue,settings:settings)
+                let session = try MediaSession.host(control:peer,key:key,port:listener.port!.rawValue,settings:settings,relayRouting:deliveryHints)
+                hostControl.update{$0=peer}
                 hostSession.update{$0=session}
                 session.diagnostics=diagnostics
                 session.onPrepareRecovery={ complete in
                     prepared.update{$0 += 1}
+                    if retryHints, committedCount.get() == 1, rejectedHintAttempts.get() < 3 {
+                        rejectedHintAttempts.update{$0 += 1}
+                        complete(false)
+                        return
+                    }
                     complete(!rejectFirst || prepared.get()>1)
                 }
                 try require(session.onPrepareStream == nil, "Optional stream preparation was enabled by default")
@@ -89,11 +131,24 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
                     }
                 }
                 session.onProduceRecoveryFrame={ [weak session] in session?.sendVideo(nextPacket(true)) }
-                session.onResumeFrames={ [weak session] in session?.sendVideo(nextPacket(false)) }
+                session.onResumeFrames={ [weak session] in
+                    if !schedulingStall { session?.sendVideo(nextPacket(false)) }
+                    hostResumed.signal()
+                }
                 session.onState={ state in print("HOST",state) }
                 session.onAcknowledged={ seq in print("ACK",seq) }
-                session.onReliableData={ _ in dataDone.signal() }
-                peer.onMessageHandled={ message,resume in _=session.receive(message);resume() }
+                let receivedData: (Message) -> Void = { message in
+                    if message.kind != .clipboardCancel || message.payload != Data([1,2,3]) {
+                        errors.update{$0.append("Reliable fixture data changed bytes")}
+                    }
+                    dataDone.signal()
+                }
+                session.onReliableData=receivedData
+                peer.onMessageHandled={ message,resume in
+                    // Before auxiliary binding finishes, reliable data legitimately uses control TCP.
+                    if !session.receive(message) { receivedData(message) }
+                    resume()
+                }
                 session.start()
                 if legacy { session.sendVideo(nextPacket(true)) }
             } catch { errors.update{$0.append("host init \(error)")} }
@@ -103,6 +158,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     listener.stateUpdateHandler={ if case .ready=$0 { listenReady.signal() } }
     listener.start(queue:queue)
     try wait(listenReady,"listener ready")
+    close(udpReservation);udpReservation = -1
     let connection=NWConnection(host:"127.0.0.1",port:listener.port!,using:try MediaSecureTransport.tlsParameters(key:key,roles:[.control]))
     let client=Peer(connection:connection)
     client.onClose={ reason in errors.update{$0.append("control \(reason)")} }
@@ -122,7 +178,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             return
         }
         do {
-            let session=try MediaSession.viewer(control:client,key:key,host:"127.0.0.1",port:listener.port!.rawValue,settings:settings,udpEnabled:udp)
+            let session=try MediaSession.viewer(control:client,key:key,host:"127.0.0.1",port:listener.port!.rawValue,settings:settings,udpEnabled:udp,relayRouting:deliveryHints)
             viewerSession.update{$0=session}
             session.diagnostics=diagnostics
             if inspectRoundTrip {
@@ -143,6 +199,17 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
                     }
                 }
             }
+            if schedulingStall {
+                session.onBytes = { _ in
+                    guard stallNextFrame.get() else { return }
+                    stallDatagrams.update{$0 += 1}
+                    if stallDatagrams.get() == 3 {
+                        stallNextFrame.update{$0=false}
+                        Thread.sleep(forTimeInterval:0.35)
+                        localStallFinished.signal()
+                    }
+                }
+            }
             session.onLocalNetwork={ local in localRoutes.update{$0.append(local)} }
             session.onReduceLoad={ cause in
                 if localRoutes.get().last != false { errors.update{$0.append("Loopback reduction preceded its non-LAN classification")} }
@@ -160,7 +227,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             session.onVideo={ frame,complete in
                 decoded.update{$0.append(frame.header.frameID)}
                 if inspectRoundTrip, frame.header.frameID == 3 { reportTailFrame.signal() }
-                let expected = packet(frame.packet.sequence,idr:frame.header.isIDR,largeIDR:largeIDR,hevc:hevc)
+                let expected = packet(frame.packet.sequence,idr:frame.header.isIDR,largeIDR:largeIDR,hevc:hevc,largePredicted:schedulingStall)
                 if frame.packet.codec != expected.codec || frame.packet.vps != expected.vps || frame.packet.sps != expected.sps {
                     errors.update{$0.append("Media frame changed its codec or parameter sets in transit")}
                 }
@@ -197,6 +264,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
                 complete(true) // A duplicate decoder completion must not duplicate a commit or credit.
             }
             session.onCommitStream={ stream,_ in
+                currentStream.update{$0=stream}
                 if prepareHook != .unchecked {
                     if prepareHook == .boundStream, !streamBindings.get().contains(stream) {
                         errors.update { $0.append("Media commit preceded its exact stream binding") }
@@ -207,7 +275,10 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             }
             session.onState={ state in states.update{$0.append(state)};if ["UDP 视频","TCP 视频","TCP 兼容模式"].contains(state) { pathStable.signal() };print("VIEWER",state) }
             client.onMessageHandled={ message,resume in
-                if message.kind == .cursorControl, prepareHook != .unchecked {
+                if retryHints, message.kind == .mediaControl, let value = try? MediaControl.read(message.payload), value.operation == .abort {
+                    _=session.receive(message)
+                    hintRetryRejected.signal()
+                } else if message.kind == .cursorControl, prepareHook != .unchecked {
                     do {
                         let binding = try CursorControl.read(message.payload)
                         guard binding.operation == .binding, binding.cursorID == cursorID, binding.epoch == 1,
@@ -377,6 +448,88 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             try require(states.get().last=="UDP 视频","Decoder rejection incorrectly forced TCP")
         }
     }
+    if schedulingStall {
+        guard let host = hostSession.get(), let control = hostControl.get() else { throw Failure(message:"Missing scheduling fixture host") }
+        try wait(hostResumed,"Initial host commit did not resume")
+        Thread.sleep(forTimeInterval:0.3)
+        stallDatagrams.update{$0=0};stallNextFrame.update{$0=true}
+        host.sendVideo(nextPacket(false))
+        try wait(localStallFinished,"No queued fragment exercised the local scheduling stall")
+        try wait(committed,"Local stall did not establish a fresh reference chain")
+        try wait(pathStable,"Local-stall recovery did not publish its path")
+        try wait(hostResumed,"Local-stall recovery did not resume the host")
+        Thread.sleep(forTimeInterval:1.1)
+        for _ in 0..<2 {
+            guard let stream = currentStream.get() else { throw Failure(message:"Missing post-stall stream") }
+            control.send(try MediaControl(.recover,sessionID:stream.sessionID,transportEpoch:stream.transportEpoch,
+                                         codecEpoch:stream.codecEpoch,mediaFailure:true).message())
+            try wait(committed,"Post-stall delivery recovery did not commit")
+            try wait(pathStable,"Post-stall path did not settle")
+            try wait(hostResumed,"Post-stall host did not resume")
+            Thread.sleep(forTimeInterval:0.3)
+        }
+        try require(states.get().last == "UDP 视频" && pathSwitches.get().count == 1 && committedCount.get() == 4,
+                    "Local scheduling stall was counted as a network interruption: \(states.get())")
+    }
+    if retryHints {
+        guard let control = hostControl.get(), let original = currentStream.get() else { throw Failure(message:"Missing interrupted stream") }
+        for copy in 0..<3 {
+            Thread.sleep(forTimeInterval:0.3)
+            control.send(try MediaControl(.recover,sessionID:original.sessionID,transportEpoch:original.transportEpoch,
+                                         codecEpoch:original.codecEpoch,mediaFailure:true).message())
+            try wait(hintRetryRejected,"Duplicate hint did not reach a rejected recovery prepare")
+            if copy > 0 { try require(currentStream.get() == original,"Rejected prepare changed the active stream") }
+        }
+        try wait(committed,"Recovery did not resume after rejected prepares")
+        try wait(pathStable,"Recovered path was not published")
+        try require(states.get().last == "UDP 视频" && pathSwitches.get().count == 1 && committedCount.get() == 2,
+                    "Hints for one active stream exhausted the playback failure budget: \(states.get())")
+    }
+    if recoveries {
+        guard let control = hostControl.get() else { throw Failure(message:"Missing fixture host control") }
+        try wait(hostResumed,"Initial host commit did not resume")
+        for round in 1...4 {
+            guard let stream = currentStream.get() else { throw Failure(message:"Missing committed stream") }
+            Thread.sleep(forTimeInterval:0.3)
+            for copy in 0..<(duplicateHints && round == 1 ? 3 : 1) {
+                if copy > 0 { Thread.sleep(forTimeInterval:0.3) }
+                control.send(try MediaControl(.recover,sessionID:stream.sessionID,transportEpoch:stream.transportEpoch,
+                                             codecEpoch:stream.codecEpoch,mediaFailure:deliveryHints && (!duplicateHints || round <= 2) ? true : nil).message())
+            }
+            try wait(committed,"Repeated recovery did not commit round \(round)")
+            try wait(pathStable,"Repeated recovery did not publish its path")
+            try wait(hostResumed,"Repeated recovery did not resume the host")
+            let expectedPath = deliveryHints && !duplicateHints && recoveryConfiguration != .restart && round >= 3 ? "TCP 视频" : "UDP 视频"
+            try require(states.get().last == expectedPath,"Recovery misclassified normal reconfiguration, duplicate hints or failed playback: \(states.get())")
+            if round == 2, recoveryConfiguration != .none {
+                guard let host = hostSession.get(), let viewer = viewerSession.get() else { throw Failure(message:"Missing configuration sessions") }
+                let updated = StreamSettings(longestEdge:1920,framesPerSecond:recoveryConfiguration == .restart ? 30 : 60,
+                                             megabits:recoveryConfiguration == .unchanged ? 12 : 8)
+                if recoveryConfiguration == .restart {
+                    Thread.sleep(forTimeInterval:0.3)
+                    let suspended = DispatchSemaphore(value:0)
+                    host.suspendForConfiguration { suspended.signal() }
+                    try wait(suspended,"Host configuration did not suspend")
+                    host.updateSettings(updated)
+                    viewer.updateSettings(updated)
+                    host.resumeAfterConfiguration()
+                    try wait(committed,"Configuration after interrupted playback did not commit")
+                    try wait(pathStable,"Configuration path was not published")
+                    try wait(hostResumed,"Configuration did not resume the host")
+                } else {
+                    host.updateSettings(updated,restartsStream:false)
+                    viewer.updateSettings(updated,restartsStream:false)
+                }
+            }
+        }
+        try require(committedCount.get() == (recoveryConfiguration == .restart ? 6 : 5),"Repeated or stale delivery hints created extra stream commits")
+        let switches = pathSwitches.get()
+        let fallsBack = deliveryHints && !duplicateHints && recoveryConfiguration != .restart
+        try require(switches.count == (fallsBack ? 2 : 1),"Normal or duplicated recovery hints exhausted the UDP interruption budget")
+        if fallsBack {
+            try require(switches.last?.1 == .policy(.networkDegraded),"Repeated delivery failures omitted their fallback reason")
+        }
+    }
     if inspectDiagnostics {
         hostSession.get()?.recordComputeTiming(encodeMilliseconds:45)
         viewerSession.get()?.recordComputeTiming(decodeMilliseconds:2)
@@ -439,6 +592,9 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
  static func main() {
   var passed=0,failed=0
   func run(_ name: String, _ body: () throws -> Void) {
+   if let index = CommandLine.arguments.firstIndex(of:"--match"), index+1 < CommandLine.arguments.count,
+      !name.contains(CommandLine.arguments[index+1]) { return }
+   if CommandLine.arguments.contains("--recovery-only") && !name.contains("Recovery accounting") { return }
    if CommandLine.arguments.contains("--large-only") && !name.contains("512 KiB") { return }
    if CommandLine.arguments.contains("--prepare-only") && !name.contains("onPrepare") { return }
    if CommandLine.arguments.contains("--local-network-only") && !name.contains("Local-network") { return }
@@ -501,6 +657,14 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
    run("Optional onPrepareStream binds each exact generation before candidate video and commit") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true,prepareHook:.boundStream) }
    run("Absent onPrepareStream preserves default onPrepareRecovery for candidates and configuration hold") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true,prepareHook:.fallback) }
    run("Legacy peers keep configuration and pause recovery unchanged") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false,legacy:true) }
+   run("Recovery accounting keeps repeated legacy reconfiguration on UDP") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,recoveries:true) }
+   run("Recovery accounting falls back after three negotiated playback delivery failures") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,recoveries:true,deliveryHints:true) }
+   run("Recovery accounting counts repeated and stale hints only once per committed stream") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,recoveries:true,deliveryHints:true,duplicateHints:true) }
+   run("Recovery accounting clears pre-configuration interruptions at the viewer's applied restart") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,recoveries:true,deliveryHints:true,recoveryConfiguration:.restart) }
+   run("Recovery accounting preserves delivery failures across unchanged settings") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,recoveries:true,deliveryHints:true,recoveryConfiguration:.unchanged) }
+   run("Recovery accounting preserves delivery failures across a live bitrate change") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,recoveries:true,deliveryHints:true,recoveryConfiguration:.bitrate) }
+   run("Recovery accounting deduplicates an active stream while rejected candidates wait to retry") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,deliveryHints:true,retryHints:true) }
+   run("Recovery accounting excludes old deadlines after a local scheduling stall") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,deliveryHints:true,schedulingStall:true) }
    run("UDP first choice, bulk binding and configuration cutover") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true) }
    run("TCP-only choice uses its independent media connection") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false) }
    run("Independent TCP tolerates a 350 ms complete-frame decode without recovery") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false,delayedDecode:true) }

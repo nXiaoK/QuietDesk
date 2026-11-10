@@ -541,6 +541,58 @@ func runMediaPathPolicyChecks() {
         try check(recovering.mediaFailed(epoch: recoveringEpoch, now: 37.5) == [.selectPath(.tcp, epoch: recoveringEpoch + 1, reason: .mediaTimeout)],
                   "TCP recoveries between UDP retries let UDP keep failing past the limit")
     }
+    run("Successful UDP recovery keyframes do not erase repeated playback interruptions") {
+        var policy = try udp()
+        let epoch = policy.epoch
+        for step in 1...3 {
+            let now = Double(step)
+            policy.receivedPong(epoch: epoch, now: now)
+            let actions = policy.mediaInterrupted(epoch: epoch, now: now)
+            if step < 3 {
+                try check(actions.isEmpty, "A single interruption abandoned UDP before its bounded recovery budget")
+                _ = policy.mediaBecameUsable(epoch: epoch, path: .udp, now: now + 0.1)
+            } else {
+                try check(actions == [.selectPath(.tcp, epoch: epoch + 1, reason: .networkDegraded)]
+                          && policy.nextRecoveryAt == now + 30, "Repeated interrupted playback stayed on UDP")
+            }
+        }
+        try check(policy.mediaInterrupted(epoch: epoch, now: 3.2).isEmpty, "A stale interruption replaced the fallback epoch")
+        try check(policy.mediaBecameUsable(epoch: policy.epoch, path: .tcp, now: 3.3), "Interruption fallback could not commit TCP")
+        try check(policy.tick(now: 32.99).isEmpty && policy.tick(now: 33).count == 1,
+                  "Interruption fallback bypassed or lost the normal UDP recovery cooldown")
+    }
+    run("Isolated playback interruptions, normal pause and invalid callbacks do not exhaust UDP") {
+        var isolated = try udp()
+        for now in [1.0, 12, 23, 34] {
+            isolated.receivedPong(epoch: isolated.epoch, now: now)
+            try check(isolated.mediaInterrupted(epoch: isolated.epoch, now: now).isEmpty, "Isolated interruptions accumulated forever")
+            _ = isolated.mediaBecameUsable(epoch: isolated.epoch, path: .udp, now: now + 0.1)
+        }
+        var paused = try udp()
+        _ = paused.mediaInterrupted(epoch: paused.epoch, now: 1)
+        _ = paused.mediaInterrupted(epoch: paused.epoch, now: 2)
+        _ = paused.setPaused(true, now: 3)
+        try check(paused.mediaInterrupted(epoch: paused.epoch, now: 4).isEmpty, "Paused playback counted as interrupted")
+        _ = paused.setPaused(false, now: 5)
+        try check(paused.mediaInterrupted(epoch: paused.epoch, now: 6).isEmpty, "Resume retained pre-pause interruptions")
+        for now in [Double.nan, .infinity, 5] {
+            try check(paused.mediaInterrupted(epoch: paused.epoch, now: now).isEmpty, "An invalid clock counted as interrupted playback")
+        }
+        try check(paused.mediaInterrupted(epoch: paused.epoch - 1, now: 7).isEmpty, "An old path counted as interrupted playback")
+        _ = paused.stop()
+        try check(paused.mediaInterrupted(epoch: paused.epoch, now: 8).isEmpty, "Late interruption revived a stopped policy")
+        var legacy = MediaPathPolicy(capable: false, now: 0)
+        try check(legacy.mediaInterrupted(epoch: 0, now: 1).isEmpty, "Legacy TCP enabled UDP interruption policy")
+    }
+    run("Initial UDP preparation cannot manufacture playback interruptions") {
+        var initial = MediaPathPolicy(capable: true, now: 0)
+        _ = initial.tick(now: 0)
+        let id = initial.probeID!
+        _ = initial.probeSucceeded(id: id, now: 0.1)
+        for now in [0.2, 0.3, 0.4] {
+            try check(initial.mediaInterrupted(epoch: initial.epoch, now: now).isEmpty, "An uncommitted UDP trial counted as interrupted playback")
+        }
+    }
     run("Network degradation never changes the path; quality adaptation owns it") {
         var policy = try udp()
         for step in 1...20 {

@@ -65,10 +65,5 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 python3 scripts/configure-update-feed.py --plist "$APP/Contents/Info.plist"
-if [[ -n "${SIGNING_IDENTITY:-}" ]]; then
-  codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$APP"
-else
-  codesign --force --sign - "$APP"
-fi
-codesign --verify --deep --strict "$APP"
+./scripts/sign.sh "$APP"
 print "已生成: $APP ($ARCH · $APP_VERSION · build $APP_BUILD)"

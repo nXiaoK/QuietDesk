@@ -28,15 +28,33 @@
 
 ## 本地签名
 
-未设置 `SIGNING_IDENTITY` 时使用 ad-hoc 临时签名，未经过 Apple 公证。使用本机钥匙串中有效的签名身份时，例如：
+`./build-app.sh` 会调用 `./scripts/sign.sh`，按以下顺序选择签名身份：
+
+1. 显式环境变量 `SIGNING_IDENTITY`（或仓库外私有配置 `~/.config/QuietDesk/signing.env`）。
+2. 本机钥匙串中已信任的固定自签名代码签名证书（自动探测 `QuietDesk Self-Signed Code Signing` 或已有的 `RDesk Self-Signed Code Signing`，使用 `--timestamp=none` 签名以生成锚定证书指纹的 Designated Requirement）。
+3. 未找到上述证书（如在 CI 环境）或设置 `QUIETDESK_ADHOC_SIGNING=1` 时，自动回退为 ad-hoc 临时签名（`--sign -`）。
+
+首次在本机准备固定自签名代码签名证书可执行：
+
+```sh
+./scripts/setup-cert.sh
+```
+
+单独对已有应用包重新签名并校验指定要求（`codesign -d -r-`）与可选证书 SHA-1 指纹固定（`QUIETDESK_SIGNING_LEAF_SHA1`）：
+
+```sh
+./scripts/sign.sh dist/QuietDesk.app
+```
+
+使用 Apple 颁发的证书身份时，例如：
 
 ```sh
 SIGNING_IDENTITY='Developer ID Application: …' ./build-app.sh
 ```
 
-请将示例替换为实际身份。证书、私钥、密码、描述文件及私人签名配置保存在仓库外，不提交或加入源码包。指定身份只改变签名方式，不会自动完成 Apple 公证；开发签名也不等于 Developer ID 分发签名。
+请将示例替换为实际身份。证书、私钥、密码、描述文件及私人签名配置保存在仓库外，不提交或加入源码包。指定身份只改变签名方式，不会自动完成 Apple 公证；开发签名或本地自签证书也不等于 Developer ID 分发签名。
 
-仓库默认发布继续使用临时签名，每次更新后需要在本机重新授予屏幕录制、辅助功能和输入监控权限。自行签名时，保持身份、bundle ID 和安装路径稳定有助于系统识别应用，但也不能保证更新后免于重新授权。构建脚本会执行严格签名校验。
+仓库默认发布继续使用临时签名，每次更新后需要在本机重新授予屏幕录制、辅助功能和输入监控权限。在本机使用同一张已信任的自签代码签名证书签名、保持 `CFBundleIdentifier`（`local.quietdesk.app`）和安装路径稳定时，指定要求（Designated Requirement）锚定在该证书指纹上而非每次变化的二进制 CDHash，有助于本机重装或覆盖更新后由 macOS 继续识别已有授权，但仍受系统版本及 TCC 策略约束，不能保证所有场景下永久免于重新授权。构建脚本会执行严格签名校验。
 
 ## 打包
 

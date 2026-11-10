@@ -38,10 +38,16 @@ private final class CanvasDecoderProbe: MediaCanvasDecoding, @unchecked Sendable
 private final class CanvasDisplayLayerProbe: AVSampleBufferDisplayLayer, @unchecked Sendable {
     var acceptsFrames = true
     private(set) var displayedImage: CVPixelBuffer?
+    private(set) var displayedFormats: [CMFormatDescription] = []
     private(set) var removals = 0
     private var readyRequest: (DispatchQueue, @Sendable () -> Void)?
     override var isReadyForMoreMediaData: Bool { acceptsFrames }
-    override func enqueue(_ sampleBuffer: CMSampleBuffer) { displayedImage = CMSampleBufferGetImageBuffer(sampleBuffer) }
+    override func enqueue(_ sampleBuffer: CMSampleBuffer) {
+        displayedImage = CMSampleBufferGetImageBuffer(sampleBuffer)
+        if let format = CMSampleBufferGetFormatDescription(sampleBuffer) {
+            displayedFormats.append(format)
+        }
+    }
     override func flush() {}
     override func flushAndRemoveImage() { removals += 1; displayedImage = nil }
     override func requestMediaDataWhenReady(on queue: DispatchQueue, using block: @escaping @Sendable () -> Void) {
@@ -1116,6 +1122,36 @@ private struct RemoteCanvasChecks {
             decoder.finish(5, .success(try decoderLikePixel(width: 64, height: 48, luma: 128)))
             let later = times.read()
             try require(later.count == 4 && later[3] >= 15 && later[3] < 200, "A failed decode was timed or an idle frame lost its time: \(later)")
+        }
+
+        run("RemoteCanvas reuses CMVideoFormatDescription across matching frames and refreshes on dimension change") {
+            let display = CanvasDisplayLayerProbe()
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300), videoLayer: display)
+            let decoder = CanvasDecoderProbe()
+            let receiver = canvas.makeMediaReceiver(makeDecoder: { _ in decoder })
+            defer { receiver.stop(); canvas.reset() }
+            let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1)
+            let frame1 = try decoderLikePixel(width: 64, height: 48, luma: 100)
+            let frame2 = try decoderLikePixel(width: 64, height: 48, luma: 180)
+            let resized = try decoderLikePixel(width: 96, height: 64, luma: 210)
+            receiver.receive(try mediaFrame(stream: stream, id: 1, keyFrame: true)) { _ in }
+            decoder.finish(1, .success(frame1))
+            try require(receiver.commit(stream: stream), "Initial stream did not commit")
+            drainCanvasDisplay()
+            receiver.receive(try mediaFrame(stream: stream, id: 2, keyFrame: false)) { _ in }
+            decoder.finish(2, .success(frame2))
+            drainCanvasDisplay()
+            receiver.receive(try mediaFrame(stream: stream, id: 3, keyFrame: false)) { _ in }
+            decoder.finish(3, .success(resized))
+            drainCanvasDisplay()
+            try require(display.displayedFormats.count == 3, "Expected three enqueued sample buffers")
+            try require(display.displayedFormats[0] === display.displayedFormats[1],
+                        "Matching consecutive frames recreated CMVideoFormatDescription instead of reusing the cached instance")
+            try require(display.displayedFormats[1] !== display.displayedFormats[2],
+                        "Resized frame reused a stale CMVideoFormatDescription")
+            let resizedDimensions = CMVideoFormatDescriptionGetDimensions(display.displayedFormats[2])
+            try require(resizedDimensions.width == 96 && resizedDimensions.height == 64,
+                        "Resized format description had wrong dimensions: \(resizedDimensions)")
         }
 
         print("\(passed) passed, \(failed) failed")

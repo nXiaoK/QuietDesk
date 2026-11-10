@@ -260,11 +260,43 @@ final class MediaCanvasReceiver: @unchecked Sendable {
     deinit { stop() }
 }
 
+struct VideoDisplayFormatCache {
+    private var cached: (width: Int, height: Int, pixelFormat: OSType, description: CMVideoFormatDescription)?
+    private(set) var hits = 0
+    private(set) var misses = 0
+
+    mutating func formatDescription(for image: CVPixelBuffer) -> CMVideoFormatDescription? {
+        let width = CVPixelBufferGetWidth(image)
+        let height = CVPixelBufferGetHeight(image)
+        let pixelFormat = CVPixelBufferGetPixelFormatType(image)
+        if let cached,
+           cached.width == width,
+           cached.height == height,
+           cached.pixelFormat == pixelFormat,
+           CMVideoFormatDescriptionMatchesImageBuffer(cached.description, imageBuffer: image) {
+            hits += 1
+            return cached.description
+        }
+        var created: CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: image,
+                                                           formatDescriptionOut: &created) == noErr,
+              let format = created else { return nil }
+        cached = (width, height, pixelFormat, format)
+        misses += 1
+        return format
+    }
+
+    mutating func reset() {
+        cached = nil
+    }
+}
+
 @MainActor
 final class RemoteCanvas: NSView {
     private let videoLayer: AVSampleBufferDisplayLayer
     private var decoder: MediaCanvasDecoding = VideoDecoder()
     private var mailbox = LatestFrameMailbox()
+    private var formatCache = VideoDisplayFormatCache()
     private var diagnostics: PerformanceDiagnostics?
     private var mediaReceiver: MediaCanvasReceiver?
     private var mediaReceiverID: UUID?
@@ -569,6 +601,7 @@ final class RemoteCanvas: NSView {
                 self.awaitingDisplay = false
                 self.videoLayer.flush()
                 self.displayedFrame = nil
+                self.formatCache.reset()
                 self.mailbox = inbox
             }
             self.showLatestFrame()
@@ -596,11 +629,9 @@ final class RemoteCanvas: NSView {
         guard let received = mailbox.takeWithTiming() else { return }
         let image = received.frame
         let enqueueStarted = diagnostics?.start()
-        var format: CMVideoFormatDescription?
         var sample: CMSampleBuffer?
         var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
-        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: image,
-            formatDescriptionOut: &format) == noErr, let format,
+        guard let format = formatCache.formatDescription(for: image),
               CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: image,
                 formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample) == noErr,
               let sample else { return }
@@ -644,6 +675,7 @@ final class RemoteCanvas: NSView {
         videoLayer.stopRequestingMediaData()
         videoLayer.flushAndRemoveImage()
         displayedFrame = nil
+        formatCache.reset()
         awaitingDisplay = false
     }
 

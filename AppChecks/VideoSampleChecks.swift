@@ -357,6 +357,138 @@ private struct VideoSampleChecks {
                         "A sample rejected before submission reported decoder work")
         }
 
+        run("Hardware HEVC Main 4:4:4 encodes BGRA pixels with P3/sRGB VUI tags, crosses wire, and decodes to 444v") {
+            #if arch(arm64)
+            try require(VideoEncoder.hardwareHEVC444Available && VideoDecoder.hardwareHEVC444Available,
+                        "Apple silicon did not report hardware HEVC Main 4:4:4 encode and decode")
+            #else
+            try require(!VideoEncoder.hardwareHEVC444Available && !VideoDecoder.hardwareHEVC444Available,
+                        "An Intel Mac unexpectedly advertised hardware HEVC 4:4:4")
+            #endif
+            guard VideoEncoder.hardwareHEVC444Available, VideoDecoder.hardwareHEVC444Available else { return }
+
+            var rejectedH264444 = false
+            do {
+                _ = try VideoEncoder(width: 320, height: 180, settings: .init(), codec: .h264, chromaSubsampling: .yuv444)
+            } catch { rejectedH264444 = true }
+            try require(rejectedH264444, "H.264 accepted 4:4:4 chroma subsampling")
+
+            var bgra: CVPixelBuffer?
+            let created = CVPixelBufferCreate(nil, 320, 180, kCVPixelFormatType_32BGRA,
+                                              [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &bgra)
+            guard created == kCVReturnSuccess, let bgra else {
+                throw SampleCheckFailure("Creating synthetic BGRA pixels failed: \(created)")
+            }
+            CVPixelBufferLockBaseAddress(bgra, [])
+            if let base = CVPixelBufferGetBaseAddress(bgra) {
+                let stride = CVPixelBufferGetBytesPerRow(bgra)
+                for y in 0..<180 {
+                    let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt8.self)
+                    for x in 0..<320 {
+                        let o = x * 4
+                        let accent = (x + y) % 5 == 0
+                        row[o + 0] = accent ? 245 : 30
+                        row[o + 1] = accent ? 65 : 28
+                        row[o + 2] = accent ? 235 : 26
+                        row[o + 3] = 255
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(bgra, [])
+
+            for space in [VideoColorSpace.sRGB, .displayP3] {
+                var recordedWrites: [(String, String)] = []
+                let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 12)
+                let encoder = try VideoEncoder(
+                    width: 320,
+                    height: 180,
+                    settings: settings,
+                    codec: .hevc,
+                    chromaSubsampling: .yuv444,
+                    colorSpace: space,
+                    writeProperty: { session, key, value in
+                        recordedWrites.append((key as String, value.map { "\($0)" } ?? "nil"))
+                        return VTSessionSetProperty(session, key: key, value: value)
+                    }
+                )
+                defer { encoder.stop() }
+                try require(encoder.usesHardware && encoder.chromaSubsampling == .yuv444 && encoder.colorSpace == space,
+                            "HEVC 4:4:4 encoder did not run in hardware or lost metadata")
+
+                let ready = DispatchSemaphore(value: 0)
+                let box = ResultBox<Result<VideoPacket, Error>?>(nil)
+                encoder.onOutput = { box.set($0); ready.signal() }
+                encoder.onDropped = { _ in box.set(.failure(SampleCheckFailure("Synthetic 4:4:4 frame dropped"))); ready.signal() }
+
+                // Frame 1: IDR, Frame 2: static refinement pass 2, Frame 3: normal motion frame restoring rate control.
+                for (seq, refine): (UInt32, Int?) in [(1, nil), (2, 2), (3, nil)] {
+                    recordedWrites.removeAll()
+                    try encoder.encode(bgra, time: CMTime(value: Int64(seq), timescale: 60),
+                                       sequence: seq, forceKeyFrame: seq == 1, refinementPass: refine)
+                    try require(ready.wait(timeout: .now() + 10) == .success, "HEVC 4:4:4 encode timed out")
+                    guard let packet = try box.get()?.get() else { throw SampleCheckFailure("Missing HEVC 4:4:4 packet") }
+                    let wirePacket = try VideoPacket.decode(packet.encode())
+                    if refine != nil {
+                        try require(recordedWrites.contains { $0.0 == (kVTCompressionPropertyKey_Quality as String) },
+                                    "Static refinement pass did not apply quality boost")
+                    } else if seq == 3 {
+                        try require(recordedWrites.contains {
+                            $0.0 == (kVTCompressionPropertyKey_ExpectedFrameRate as String) && $0.1 == "60"
+                        }, "Motion frame after refinement did not restore ExpectedFrameRate")
+                    }
+                    if seq == 1 {
+                        let samples = VideoSamples()
+                        let sample = try samples.sample(for: wirePacket)
+                        guard let format = CMSampleBufferGetFormatDescription(sample),
+                              let extensions = CMFormatDescriptionGetExtensions(format) as? [CFString: Any] else {
+                            throw SampleCheckFailure("Decoded HEVC 4:4:4 sample lacked format extensions")
+                        }
+                        let primaries = extensions[kCMFormatDescriptionExtension_ColorPrimaries] as? String
+                        let expectedPrimaries = (space == .displayP3
+                            ? kCMFormatDescriptionColorPrimaries_P3_D65
+                            : kCMFormatDescriptionColorPrimaries_ITU_R_709_2) as String
+                        try require(primaries == expectedPrimaries,
+                                    "VUI color primaries mismatch for \(space): got \(String(describing: primaries))")
+                    }
+                }
+            }
+
+            // Verify a single VideoDecoder transitions cleanly from HEVC 4:2:0 to HEVC 4:4:4 (`444v`) and back.
+            let packets420 = try encodedPackets(framesPerSecond: 60, codec: .hevc, count: 2)
+            let encoder444 = try VideoEncoder(width: 320, height: 180, settings: .init(framesPerSecond: 60, megabits: 12),
+                                              codec: .hevc, chromaSubsampling: .yuv444, colorSpace: .displayP3)
+            defer { encoder444.stop() }
+            let ready444 = DispatchSemaphore(value: 0)
+            let out444 = ResultBox<Result<VideoPacket, Error>?>(nil)
+            encoder444.onOutput = { out444.set($0); ready444.signal() }
+            var packets444: [VideoPacket] = []
+            for seq in UInt32(1)...2 {
+                try encoder444.encode(bgra, time: CMTime(value: Int64(seq), timescale: 60), sequence: seq, forceKeyFrame: seq == 1)
+                try require(ready444.wait(timeout: .now() + 10) == .success, "4:4:4 encode timed out")
+                packets444.append(try VideoPacket.decode(out444.get()!.get().encode()))
+            }
+
+            let decoder = VideoDecoder()
+            defer { decoder.stop() }
+            var formats: [OSType] = []
+            for packet in packets420 + packets444 + packets420 {
+                let done = DispatchSemaphore(value: 0)
+                let pixelType = ResultBox<OSType?>(nil)
+                decoder.decode(packet) { result in
+                    if case .success(let image) = result {
+                        pixelType.set(CVPixelBufferGetPixelFormatType(image))
+                    }
+                    done.signal()
+                }
+                try require(done.wait(timeout: .now() + 10) == .success, "Decoder timed out")
+                guard let ostype = pixelType.get() else { throw SampleCheckFailure("Frame failed during 4:2:0 <-> 4:4:4 switch") }
+                formats.append(ostype)
+            }
+            try require(formats[2] == kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange
+                        && formats[3] == kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange,
+                        "HEVC 4:4:4 packets did not decode to 444v: \(formats)")
+        }
+
         print("Video sample checks: \(passed) passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

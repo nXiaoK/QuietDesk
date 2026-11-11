@@ -278,7 +278,13 @@ private struct SessionQualitySection: View {
                 applied: model.activeVideoState, tuning: model.videoTuning, status: model.videoSettingsStatus),
             longestEdges: model.viewerLongestEdges, frameRates: model.viewerFrameRates, bitRates: model.viewerBitRates,
             supportsMediaTransport: model.supportsMediaTransport, supportsExtendedVideoSettings: model.supportsExtendedVideoSettings,
-            supportsAdaptiveVideo: model.supportsAdaptiveVideo, localNetworkQuality: model.localNetworkQuality,
+            supportsAdaptiveVideo: model.supportsAdaptiveVideo,
+            supportsTrueColor: model.supportsHEVC444Video,
+            trueColor: Binding(get: { model.viewerTrueColor }, set: { model.setViewerTrueColor($0) }),
+            appliedCodec: model.activeVideoCodec,
+            appliedChroma: model.activeVideoChroma,
+            onSelectPreset: { model.chooseViewerPreset($0) },
+            localNetworkQuality: model.localNetworkQuality,
             qualityHelp: model.videoQualityHelp, compact: compact)
     }
 }

@@ -19,8 +19,14 @@ public struct StreamSettingsRequest: Codable, Sendable {
     public let settings: StreamSettings
     // Sent only to a host that advertised hevcVideoV1. Missing means H.264, which an older viewer can decode.
     public let codec: VideoCodec?
-    public init(id: UUID = UUID(), settings: StreamSettings, codec: VideoCodec? = nil) {
-        self.id = id; self.settings = settings; self.codec = codec
+    // Sent only to a host that advertised hevc444VideoV1. Missing means 4:2:0.
+    public let chromaSubsampling: VideoChromaSubsampling?
+    public init(id: UUID = UUID(), settings: StreamSettings, codec: VideoCodec? = nil,
+                chromaSubsampling: VideoChromaSubsampling? = nil) {
+        self.id = id
+        self.settings = settings
+        self.codec = codec
+        self.chromaSubsampling = chromaSubsampling
     }
 }
 
@@ -30,11 +36,18 @@ public struct StreamSettingsResult: Codable, Sendable {
     public let error: String?
     // The codec the host encodes with, echoed only to a request that named one; missing means H.264.
     public let codec: VideoCodec?
+    // The chroma subsampling the host encodes with, echoed only to a request that named one; missing means 4:2:0.
+    public let chromaSubsampling: VideoChromaSubsampling?
     // False when the host updated its running encoder and capture interval in place without restarting the media epoch.
     public let restartsStream: Bool?
     public init(id: UUID, state: VideoStreamState, error: String? = nil, codec: VideoCodec? = nil,
-                restartsStream: Bool? = nil) {
-        self.id = id; self.state = state; self.error = error; self.codec = codec; self.restartsStream = restartsStream
+                chromaSubsampling: VideoChromaSubsampling? = nil, restartsStream: Bool? = nil) {
+        self.id = id
+        self.state = state
+        self.error = error
+        self.codec = codec
+        self.chromaSubsampling = chromaSubsampling
+        self.restartsStream = restartsStream
     }
 }
 
@@ -45,6 +58,8 @@ public struct VideoTuningSession {
     public private(set) var pending: StreamSettingsRequest?
     public private(set) var appliedCodec: VideoCodec = .h264
     public private(set) var desiredCodec: VideoCodec = .h264
+    public private(set) var appliedChroma: VideoChromaSubsampling = .yuv420
+    public private(set) var desiredChroma: VideoChromaSubsampling = .yuv420
     public init(applied: VideoStreamState, preferred: StreamSettings? = nil) throws {
         try applied.validate()
         if let preferred { try preferred.validateControlValues() }
@@ -56,21 +71,36 @@ public struct VideoTuningSession {
         desired = settings
     }
     /// Asks for this codec from the next request on; only for a host that advertised it.
-    public mutating func chooseCodec(_ codec: VideoCodec) { desiredCodec = codec }
+    public mutating func chooseCodec(_ codec: VideoCodec) {
+        desiredCodec = codec
+        if codec == .h264 { desiredChroma = .yuv420 }
+    }
+    /// Asks for 4:4:4 or 4:2:0 chroma subsampling from the next request on; 4:4:4 implies HEVC.
+    public mutating func chooseChromaSubsampling(_ chroma: VideoChromaSubsampling) {
+        desiredChroma = chroma
+        if chroma == .yuv444 { desiredCodec = .hevc }
+    }
     public mutating func nextRequest() -> StreamSettingsRequest? {
-        guard pending == nil, desired != applied.settings || desiredCodec != appliedCodec else { return nil }
-        // H.264 on both sides keeps the request exactly as older hosts know it.
-        let request = StreamSettingsRequest(settings: desired,
-                                            codec: desiredCodec == .h264 && appliedCodec == .h264 ? nil : desiredCodec)
-        pending = request
-        return request
+        guard pending == nil,
+              desired != applied.settings || desiredCodec != appliedCodec || desiredChroma != appliedChroma else {
+            return nil
+        }
+        return makeRequest()
     }
     /// Confirms initial settings to a host awaiting single-start negotiation even when desired matches hello.
     public mutating func initialConfirmationRequest() -> StreamSettingsRequest? {
         guard pending == nil else { return nil }
         if let request = nextRequest() { return request }
-        let request = StreamSettingsRequest(settings: desired,
-                                            codec: desiredCodec == .h264 && appliedCodec == .h264 ? nil : desiredCodec)
+        return makeRequest()
+    }
+    private mutating func makeRequest() -> StreamSettingsRequest {
+        // H.264 / 4:2:0 on both sides keeps the request exactly as older hosts know it.
+        let effectiveChroma: VideoChromaSubsampling = desiredCodec == .hevc ? desiredChroma : .yuv420
+        let request = StreamSettingsRequest(
+            settings: desired,
+            codec: desiredCodec == .h264 && appliedCodec == .h264 ? nil : desiredCodec,
+            chromaSubsampling: effectiveChroma == .yuv420 && appliedChroma == .yuv420 ? nil : effectiveChroma
+        )
         pending = request
         return request
     }
@@ -80,9 +110,12 @@ public struct VideoTuningSession {
         guard result.state.settings.framesPerSecond <= maximumFrameRate else { throw DeskError.invalid("画质回复超过已协商的帧率上限") }
         applied = result.state
         if desired == pending.settings { desired = result.state.settings }
-        // A host that kept H.264 (no hardware HEVC at this size, or a failed change) is not asked again.
+        // A host that kept H.264 or 4:2:0 (no hardware support at this size, or a failed change) is not asked again.
         appliedCodec = result.codec ?? .h264
-        if desiredCodec == pending.codec ?? .h264 { desiredCodec = appliedCodec }
+        if desiredCodec == (pending.codec ?? .h264) { desiredCodec = appliedCodec }
+        appliedChroma = appliedCodec == .hevc ? (result.chromaSubsampling ?? .yuv420) : .yuv420
+        if desiredChroma == (pending.chromaSubsampling ?? .yuv420) { desiredChroma = appliedChroma }
+        if desiredCodec == .h264 { desiredChroma = .yuv420 }
         self.pending = nil
         return true
     }

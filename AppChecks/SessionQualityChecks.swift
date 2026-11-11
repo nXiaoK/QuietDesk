@@ -161,8 +161,30 @@ private struct SessionQualityChecks {
                 let resolved = preset.resolvedSettings(longestEdges: legacyEdges, frameRates: legacyFPS, bitRates: legacyBits)
                 try resolved.validateControlValues()
                 try check(legacyEdges.contains(resolved.longestEdge) && legacyFPS.contains(resolved.framesPerSecond) && legacyBits.contains(resolved.megabits),
-                          "Preset \(preset) exceeded legacy peer capabilities: \(resolved)")
+                          "Preset \(preset) exceeded legacy capabilities: \(resolved)")
             }
+            try check(SessionQualityPreset.clearOffice.prefersTrueColor && SessionQualityPreset.original.prefersTrueColor,
+                      "Office and Original presets should prefer 4:4:4 true color when available")
+            try check(!SessionQualityPreset.dataSaver.prefersTrueColor && !SessionQualityPreset.highRefresh.prefersTrueColor,
+                      "Data-saver and High-refresh presets should keep 4:2:0")
+        }
+        run("Chroma-only 4:4:4 updates wait for host acknowledgement before showing idle") {
+            var tuning = try VideoTuningSession(applied: initial)
+            tuning.chooseCodec(.hevc)
+            let codecReq = tuning.nextRequest()!
+            _ = try tuning.receive(StreamSettingsResult(id: codecReq.id, state: initial, codec: .hevc))
+            try check(presentation(tuning).update == .idle, "Confirmed HEVC 4:2:0 was not idle")
+            tuning.chooseChromaSubsampling(.yuv444)
+            try check(presentation(tuning).update == .preparing(initial.settings),
+                      "Debounced 4:4:4 toggle appeared idle before sending request")
+            let chromaReq = tuning.nextRequest()!
+            try check(presentation(tuning).update == .awaiting(initial.settings, latest: nil),
+                      "In-flight 4:4:4 request appeared idle before acknowledgement")
+            _ = try tuning.receive(StreamSettingsResult(id: chromaReq.id, state: initial, codec: .hevc, chromaSubsampling: .yuv444))
+            try check(presentation(tuning, status: "已生效：\(initial.settings.summary) · HEVC 4:4:4").update == .idle,
+                      "Confirmed 4:4:4 stream stayed pending")
+            try check(presentation(tuning, status: "已生效：\(initial.settings.summary) · HEVC 4:4:4").message == nil,
+                      "Status with HEVC 4:4:4 suffix leaked as an error message")
         }
 
         runLiveSettingsChecks()

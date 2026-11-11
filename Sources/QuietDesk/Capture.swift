@@ -160,6 +160,9 @@ struct StaticFrameRefinement {
 
     func isDue(at now: TimeInterval) -> Bool { dueAt.map { now + 0.001 >= $0 } ?? false }
 
+    /// 1-based pass index (1...delays.count) for the next scheduled static refinement pass.
+    var nextPassNumber: Int? { remaining > 0 ? (Self.delays.count - remaining + 1) : nil }
+
     /// A pass was handed to the encoder, or a new capture replaced the picture; its output schedules the next.
     mutating func wait() { dueAt = nil }
 
@@ -387,6 +390,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         fileprivate let settings: StreamSettings
         let width: Int
         let height: Int
+        let colorSpace: VideoColorSpace
     }
 
     let queue = DispatchQueue(label: "quietdesk.capture", qos: .userInteractive)
@@ -416,6 +420,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var lastCaptureAt: TimeInterval = 0
     // `latest` holds a refinement pass rather than a capture; submitted frames retain that identity.
     private var latestIsRefinement = false
+    private var latestRefinementPass: Int?
+    private var captureColorSpace: VideoColorSpace = .sRGB
     private var lastCaptureDiagnostics: PerformanceDiagnostics.Token?
     private let diagnostics: PerformanceDiagnostics?
     private let encodingTimingLock = NSLock()
@@ -460,6 +466,16 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         return DispatchQueue.getSpecific(key: queueIdentity) == true ? read() : queue.sync(execute: read)
     }
 
+    var videoChromaSubsampling: VideoChromaSubsampling {
+        let read = { [self] in encoder?.chromaSubsampling ?? .yuv420 }
+        return DispatchQueue.getSpecific(key: queueIdentity) == true ? read() : queue.sync(execute: read)
+    }
+
+    var videoColorSpace: VideoColorSpace {
+        let read = { [self] in encoder?.colorSpace ?? captureColorSpace }
+        return DispatchQueue.getSpecific(key: queueIdentity) == true ? read() : queue.sync(execute: read)
+    }
+
     private func cursorState() -> (actual: Bool?, target: Bool?) {
         let read = { [self] in
             (actual: running && captureStarted ? appliedCursorIncluded : nil, target: running ? cursorGate.included : nil)
@@ -476,12 +492,17 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                                pixelHeight: height ?? CGDisplayPixelsHigh(id), bounds: CGDisplayBounds(id))
     }
 
+    static func displayColorSpace(_ id: CGDirectDisplayID) -> VideoColorSpace {
+        CGDisplayCopyColorSpace(id).isWideGamutRGB ? .displayP3 : .sRGB
+    }
+
     static func prepareCapture(display: SCDisplay, settings: StreamSettings) -> CapturePlan {
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let source = sourceDimensions(filter: filter, displayID: display.displayID)
         let (width, height) = settings.dimensions(width: source.width, height: source.height)
         return CapturePlan(filter: filter, displayID: display.displayID, sourceWidth: source.width,
-                           sourceHeight: source.height, settings: settings, width: width, height: height)
+                           sourceHeight: source.height, settings: settings, width: width, height: height,
+                           colorSpace: displayColorSpace(display.displayID))
     }
 
     private static func sourceDimensions(filter: SCContentFilter, displayID: CGDirectDisplayID) -> (width: Int, height: Int) {
@@ -492,29 +513,46 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             fallbackHeight: fallback.pixelHeight)
     }
 
-    static func configuration(width: Int, height: Int, settings: StreamSettings, includesCursor: Bool = true) -> SCStreamConfiguration {
+    static func configuration(width: Int, height: Int, settings: StreamSettings, includesCursor: Bool = true,
+                              chromaSubsampling: VideoChromaSubsampling = .yuv420,
+                              colorSpace: VideoColorSpace = .sRGB) -> SCStreamConfiguration {
         let configuration = SCStreamConfiguration()
         configuration.width = width
         configuration.height = height
         configuration.captureResolution = .best
         let targetFPS = TimeBudgetFrameDropper.normalizedFramesPerSecond(settings.framesPerSecond)
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: Int32(targetFPS))
-        configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         // Two retained encoder inputs plus the newest capture still leave producer buffers available.
         configuration.queueDepth = settings.framesPerSecond >= 60 ? 5 : 3
         configuration.showsCursor = includesCursor
         configuration.capturesAudio = false
-        configuration.colorSpaceName = CGColorSpace.sRGB
-        configuration.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
+        configuration.colorSpaceName = colorSpace == .displayP3 ? CGColorSpace.displayP3 : CGColorSpace.sRGB
+        if chromaSubsampling == .yuv444 {
+            configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        } else {
+            configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            configuration.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
+        }
         return configuration
     }
 
     private func makeEncoder(width: Int, height: Int, settings: StreamSettings, codec: VideoCodec = .h264,
-                             id: UUID) throws -> VideoEncoder {
-        // A size or mode the hardware HEVC encoder rejects keeps the share on H.264; the viewer decodes either.
+                             chromaSubsampling: VideoChromaSubsampling = .yuv420,
+                             colorSpace: VideoColorSpace = .sRGB, id: UUID) throws -> VideoEncoder {
+        // A size or mode the hardware HEVC / 4:4:4 encoder rejects gracefully steps down to 4:2:0 or H.264.
         let encoder: VideoEncoder
-        if codec == .hevc, let hevc = try? VideoEncoder(width: width, height: height, settings: settings, codec: .hevc) { encoder = hevc }
-        else { encoder = try VideoEncoder(width: width, height: height, settings: settings) }
+        if codec == .hevc, chromaSubsampling == .yuv444,
+           let hevc444 = try? VideoEncoder(width: width, height: height, settings: settings, codec: .hevc,
+                                           chromaSubsampling: .yuv444, colorSpace: colorSpace) {
+            encoder = hevc444
+        } else if codec == .hevc,
+                  let hevc = try? VideoEncoder(width: width, height: height, settings: settings, codec: .hevc,
+                                               chromaSubsampling: .yuv420, colorSpace: colorSpace) {
+            encoder = hevc
+        } else {
+            encoder = try VideoEncoder(width: width, height: height, settings: settings, codec: .h264,
+                                       chromaSubsampling: .yuv420, colorSpace: colorSpace)
+        }
         encoder.onOutput = { [weak self] result in
             guard let self else { return }
             let callbackAt = SessionClock.now
@@ -619,17 +657,22 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         onError?(message ?? error.localizedDescription)
     }
 
-    func start(_ capture: CapturePlan, codec: VideoCodec = .h264) async throws {
+    func start(_ capture: CapturePlan, codec: VideoCodec = .h264,
+               chromaSubsampling: VideoChromaSubsampling = .yuv420) async throws {
         try Task.checkCancellation()
         let width = capture.width, height = capture.height, settings = capture.settings
         let id = UUID()
-        let encoder = try makeEncoder(width: width, height: height, settings: settings, codec: codec, id: id)
+        let encoder = try makeEncoder(width: width, height: height, settings: settings, codec: codec,
+                                      chromaSubsampling: chromaSubsampling, colorSpace: capture.colorSpace, id: id)
         let stream = SCStream(filter: capture.filter,
-            configuration: Self.configuration(width: width, height: height, settings: settings), delegate: self)
+            configuration: Self.configuration(width: width, height: height, settings: settings,
+                                              chromaSubsampling: encoder.chromaSubsampling,
+                                              colorSpace: capture.colorSpace), delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         let lifecycle = CaptureLifecycle(stream: stream)
         queue.sync {
             self.encoder = encoder
+            self.captureColorSpace = capture.colorSpace
             encoderHardwareChecked = false
             encoderHardware = nil
             encoderID = id
@@ -767,7 +810,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                     timer.resume()
                     let width = outputWidth, height = outputHeight
                     let updatedConfiguration = Self.configuration(width: width, height: height,
-                                                                  settings: currentSettings, includesCursor: included)
+                                                                  settings: currentSettings, includesCursor: included,
+                                                                  chromaSubsampling: encoder?.chromaSubsampling ?? .yuv420,
+                                                                  colorSpace: captureColorSpace)
                     activeStream.updateConfiguration(updatedConfiguration, completionHandler: { [weak self] error in
                             self?.queue.async { [weak self] in
                                 guard let self, self.running, self.stream.map(ObjectIdentifier.init) == expectedStreamID,
@@ -891,9 +936,10 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
-    // Same-size, same-codec changes (bitrate and/or frame rate) update the running encoder and
+    // Same-size, same-codec, same-chroma changes (bitrate and/or frame rate) update the running encoder and
     // capture interval in place without draining in-flight frames or restarting the media epoch.
-    func updateEncodingParameters(_ settings: StreamSettings, codec: VideoCodec? = nil) throws -> VideoStreamState {
+    func updateEncodingParameters(_ settings: StreamSettings, codec: VideoCodec? = nil,
+                                  chromaSubsampling: VideoChromaSubsampling? = nil) throws -> VideoStreamState {
         try settings.validateControlValues()
         return try queue.sync {
             guard running, captureStarted, let stream, let encoder, !reconfiguring, !frameFlow.encodingFailed,
@@ -901,8 +947,12 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 throw DeskError.invalid("画质正在调整，请稍后再试")
             }
             let targetCodec = codec ?? encoder.codec
+            let targetChroma: VideoChromaSubsampling = targetCodec == .hevc
+                ? (chromaSubsampling ?? encoder.chromaSubsampling)
+                : .yuv420
             let (width, height) = settings.dimensions(width: sourceWidth, height: sourceHeight)
-            guard targetCodec == encoder.codec, width == outputWidth, height == outputHeight else {
+            guard targetCodec == encoder.codec, targetChroma == encoder.chromaSubsampling,
+                  width == outputWidth, height == outputHeight else {
                 throw DeskError.invalid("画质尺寸或编码格式变化需要重新配置")
             }
             let frameRateChanged = settings.framesPerSecond != currentSettings.framesPerSecond
@@ -914,17 +964,19 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             currentSettings = settings
             if frameRateChanged {
                 stream.updateConfiguration(Self.configuration(width: outputWidth, height: outputHeight,
-                    settings: settings, includesCursor: cursorGate.included), completionHandler: nil)
+                    settings: settings, includesCursor: cursorGate.included,
+                    chromaSubsampling: encoder.chromaSubsampling, colorSpace: captureColorSpace), completionHandler: nil)
                 pump()
             }
             return VideoStreamState(settings: settings, width: outputWidth, height: outputHeight)
         }
     }
 
-    /// `codec` nil keeps the running encoder's codec.
-    func reconfigure(_ settings: StreamSettings, codec: VideoCodec? = nil) async throws -> VideoStreamState {
+    /// `codec` and `chromaSubsampling` nil keep the running encoder's values.
+    func reconfigure(_ settings: StreamSettings, codec: VideoCodec? = nil,
+                     chromaSubsampling: VideoChromaSubsampling? = nil) async throws -> VideoStreamState {
         try settings.validateControlValues()
-        let snapshot = try queue.sync { () throws -> (SCStream, Int, Int, Int, Int, StreamSettings, Bool, VideoCodec, Bool) in
+        let snapshot = try queue.sync { () throws -> (SCStream, Int, Int, Int, Int, StreamSettings, Bool, VideoCodec, VideoChromaSubsampling, VideoColorSpace, SCContentFilter?, Bool) in
             guard running, captureStarted, let stream, displayID != nil else { throw DeskError.invalid("屏幕采集尚未就绪，请稍后调整") }
             if let operation = cursorOperationID { cancelCursorOperation(operation); throw DeskError.invalid("光标采集正在更新，请稍后调整画质") }
             if let waiter = cursorFrameWaiter {
@@ -932,18 +984,35 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 throw DeskError.invalid("正在等待光标采集的新画面")
             }
             return (stream, sourceWidth, sourceHeight, outputWidth, outputHeight, currentSettings, cursorGate.included,
-                    encoder?.codec ?? .h264, encoder != nil && !frameFlow.encodingFailed)
+                    encoder?.codec ?? .h264, encoder?.chromaSubsampling ?? .yuv420, captureColorSpace, activeFilter,
+                    encoder != nil && !frameFlow.encodingFailed)
         }
         let (width, height) = settings.dimensions(width: snapshot.1, height: snapshot.2)
         let targetCodec = codec ?? snapshot.7
-        let canUpdateInPlace = snapshot.8 && width == snapshot.3 && height == snapshot.4 && targetCodec == snapshot.7
+        let requestedChroma: VideoChromaSubsampling = targetCodec == .hevc ? (chromaSubsampling ?? snapshot.8) : .yuv420
+        let canUpdateInPlace = snapshot.11 && width == snapshot.3 && height == snapshot.4
+            && targetCodec == snapshot.7 && requestedChroma == snapshot.8
         let id = UUID()
-        let replacement = canUpdateInPlace ? nil : try makeEncoder(width: width, height: height, settings: settings, codec: targetCodec, id: id)
+        let replacement = canUpdateInPlace ? nil : try makeEncoder(width: width, height: height, settings: settings,
+                                                                   codec: targetCodec, chromaSubsampling: requestedChroma,
+                                                                   colorSpace: snapshot.9, id: id)
+        let effectiveChroma = replacement?.chromaSubsampling ?? snapshot.8
+        let nextConfiguration = Self.configuration(width: width, height: height, settings: settings,
+                                                   includesCursor: snapshot.6, chromaSubsampling: effectiveChroma,
+                                                   colorSpace: snapshot.9)
         do { try await pauseAtFrameBoundary() }
         catch { replacement?.stop(); throw error }
         do {
             try Task.checkCancellation()
-            try await snapshot.0.updateConfiguration(Self.configuration(width: width, height: height, settings: settings, includesCursor: snapshot.6))
+            try await snapshot.0.updateConfiguration(nextConfiguration)
+            try Task.checkCancellation()
+            var freshStaticSample: (CVPixelBuffer, CMTime)?
+            if effectiveChroma != snapshot.8 || width != snapshot.3 || height != snapshot.4,
+               let filter = snapshot.10, !queue.sync(execute: { cursorGate.needsFreshFrame }),
+               let sample = try? await SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: nextConfiguration),
+               CMSampleBufferIsValid(sample), let image = CMSampleBufferGetImageBuffer(sample) {
+                freshStaticSample = (image, CMSampleBufferGetPresentationTimeStamp(sample))
+            }
             try Task.checkCancellation()
             try queue.sync {
                 guard running, stream === snapshot.0 else { throw CancellationError() }
@@ -951,7 +1020,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                    let existing = encoder, (try? existing.updateEncodingParameters(settings: settings)) != nil {
                     encodingTimingLock.withLock { encodingStarted.removeAll(); encodeTiming.cancel() }
                 } else {
-                    let nextEncoder = try replacement ?? makeEncoder(width: width, height: height, settings: settings, codec: targetCodec, id: id)
+                    let nextEncoder = try replacement ?? makeEncoder(width: width, height: height, settings: settings,
+                                                                     codec: targetCodec, chromaSubsampling: requestedChroma,
+                                                                     colorSpace: snapshot.9, id: id)
                     let old = encoder
                     encoderID = id
                     encoder = nextEncoder
@@ -972,10 +1043,19 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 if wasMediaHeld { frameFlow.prepareMediaRecovery() }
                 frameDropper.reset()
                 cancelRefinement()
-                latest = cursorGate.needsFreshFrame ? nil : lastCapture
-                if cursorGate.needsFreshFrame { lastCapture = nil; appliedCursorIncluded = nil }
-                // Replaying a retained frame is intentional, not capture-queue congestion.
-                latest?.2 = nil
+                if cursorGate.needsFreshFrame {
+                    latest = nil
+                    lastCapture = nil
+                    appliedCursorIncluded = nil
+                } else if let freshStaticSample {
+                    latest = (freshStaticSample.0, freshStaticSample.1, nil)
+                    lastCapture = latest
+                    lastCaptureAt = SessionClock.now
+                } else {
+                    latest = lastCapture
+                    // Replaying a retained frame is intentional, not capture-queue congestion.
+                    latest?.2 = nil
+                }
                 discardMismatchedFrame()
             }
             // The caller sends the settings result before resuming the new encoder.
@@ -984,7 +1064,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             replacement?.stop()
             if queue.sync(execute: { running && stream === snapshot.0 }) {
                 do {
-                    try await snapshot.0.updateConfiguration(Self.configuration(width: snapshot.3, height: snapshot.4, settings: snapshot.5, includesCursor: snapshot.6))
+                    try await snapshot.0.updateConfiguration(Self.configuration(width: snapshot.3, height: snapshot.4,
+                        settings: snapshot.5, includesCursor: snapshot.6,
+                        chromaSubsampling: snapshot.8, colorSpace: snapshot.9))
                     queue.sync {
                         guard running, stream === snapshot.0 else { return }
                         frameFlow.requestKeyFrame()
@@ -1143,8 +1225,13 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             } else {
                 let id = UUID()
                 let replacement: VideoEncoder
-                do { replacement = try self.makeEncoder(width: self.outputWidth, height: self.outputHeight, settings: self.currentSettings,
-                                                        codec: self.encoder?.codec ?? .h264, id: id) }
+                do {
+                    replacement = try self.makeEncoder(width: self.outputWidth, height: self.outputHeight,
+                                                       settings: self.currentSettings,
+                                                       codec: self.encoder?.codec ?? .h264,
+                                                       chromaSubsampling: self.encoder?.chromaSubsampling ?? .yuv420,
+                                                       colorSpace: self.captureColorSpace, id: id)
+                }
                 catch {
                     self.onDiagnosticError?(error)
                     completion(false)
@@ -1298,6 +1385,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         lastCapture = latest
         lastCaptureAt = SessionClock.now
         latestIsRefinement = false
+        latestRefinementPass = nil
         refinement.wait()
         if let request = cursorFrame.completed {
             appliedCursorIncluded = cursorGate.included
@@ -1340,15 +1428,17 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
               !frameFlow.mediaHold, !frameFlow.encodingFailed,
               refinement.isDue(at: now), latest == nil, let last = lastCapture,
               CVPixelBufferGetWidth(last.0) == outputWidth, CVPixelBufferGetHeight(last.0) == outputHeight else { return }
+        let passNumber = refinement.nextPassNumber
         refinement.wait()
         latest = (last.0, CMTimeAdd(last.1, CMTime(seconds: max(0, now - lastCaptureAt), preferredTimescale: 1_000_000)), nil)
         latestIsRefinement = true
+        latestRefinementPass = passNumber
         pump()
     }
 
     private func cancelRefinement() {
         refinement.cancel()
-        if latestIsRefinement { latest = nil; latestIsRefinement = false }
+        if latestIsRefinement { latest = nil; latestIsRefinement = false; latestRefinementPass = nil }
     }
 
     private func discardMismatchedFrame() {
@@ -1388,8 +1478,10 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 maximumOutstandingFrames: VideoFrameFlow.maximumOutstandingFrames(for: currentSettings, receiverLimit: receiverFrameWindow),
                 isRefinement: latestIsRefinement) else { return }
         frameDropper.recordSubmission(at: now, isRefinement: latestIsRefinement)
+        let submittedRefinementPass = latestIsRefinement ? latestRefinementPass : nil
         self.latest = nil
         latestIsRefinement = false
+        latestRefinementPass = nil
         let presentationTime: CMTime
         do { presentationTime = try presentationTimeline.next(encoderID: encoderID, time: latest.1) }
         catch { failEncoding(error); return }
@@ -1410,7 +1502,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
         let submitTiming = diagnostics?.start()
         do {
-            try encoder.encode(latest.0, time: presentationTime, sequence: frame.sequence, forceKeyFrame: frame.forceKeyFrame)
+            try encoder.encode(latest.0, time: presentationTime, sequence: frame.sequence,
+                               forceKeyFrame: frame.forceKeyFrame,
+                               refinementPass: frame.isRefinement ? (submittedRefinementPass ?? 1) : nil)
             diagnostics?.record(.encodeSubmit, since: submitTiming, kind: .video, identifier: UInt64(frame.sequence))
         } catch {
             diagnostics?.record(.encodeSubmit, since: submitTiming, kind: .video, identifier: UInt64(frame.sequence))

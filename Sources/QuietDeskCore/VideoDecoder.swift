@@ -20,6 +20,49 @@ public final class VideoDecoder {
     /// A viewer asks for HEVC only when it decodes it in hardware; software decoding would cost the frame rate HEVC buys.
     public static var hardwareHEVCAvailable: Bool { VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC) }
 
+    /// Whether this Mac decodes HEVC Main 4:4:4 in hardware.
+    public static let hardwareHEVC444Available: Bool = {
+        #if arch(arm64)
+        let vps: [UInt8] = [64, 1, 12, 1, 255, 255, 4, 8, 0, 0, 3, 0, 190, 8, 0, 0, 3, 0, 0, 123, 23, 2, 64]
+        let sps: [UInt8] = [66, 1, 1, 4, 8, 0, 0, 3, 0, 190, 8, 0, 0, 3, 0, 0, 123, 144, 0, 120, 16, 2, 32,
+                            248, 156, 64, 189, 200, 178, 41, 127, 229, 207, 226, 127, 83, 80, 192, 208, 16, 8]
+        let pps: [UInt8] = [68, 1, 192, 114, 240, 83, 36]
+        let joined = vps + sps + pps
+        let sizes = [vps.count, sps.count, pps.count]
+        var format: CMFormatDescription?
+        let status = joined.withUnsafeBufferPointer { bytes -> OSStatus in
+            var offset = 0
+            let pointers = sizes.map { size -> UnsafePointer<UInt8> in
+                defer { offset += size }
+                return bytes.baseAddress! + offset
+            }
+            return pointers.withUnsafeBufferPointer { pointerBuffer in
+                sizes.withUnsafeBufferPointer { sizeBuffer in
+                    CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                        allocator: nil, parameterSetCount: 3, parameterSetPointers: pointerBuffer.baseAddress!,
+                        parameterSetSizes: sizeBuffer.baseAddress!, nalUnitHeaderLength: 4, extensions: nil,
+                        formatDescriptionOut: &format
+                    )
+                }
+            }
+        }
+        guard status == noErr, let format else { return false }
+        var session: VTDecompressionSession?
+        let created = VTDecompressionSessionCreate(
+            allocator: nil, formatDescription: format,
+            decoderSpecification: [
+                kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: kCFBooleanTrue,
+                kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: kCFBooleanTrue
+            ] as CFDictionary,
+            imageBufferAttributes: nil, outputCallback: nil, decompressionSessionOut: &session
+        )
+        if let session { VTDecompressionSessionInvalidate(session) }
+        return created == noErr && session != nil
+        #else
+        return false
+        #endif
+    }()
+
     public func decode(_ packet: VideoPacket, completion: @escaping (Result<CVPixelBuffer, Error>) -> Void) {
         let timingID: UUID? = diagnostics?.start().flatMap { token in
             timingLock.withLock {

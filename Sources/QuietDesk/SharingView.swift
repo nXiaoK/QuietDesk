@@ -114,7 +114,7 @@ struct SharingView: View {
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                             if model.connected, let state = model.activeVideoState {
-                                Text("当前会话：\(state.settings.summary)\(model.activeVideoCodec == .hevc ? " · HEVC" : "")（控制端临时调整，不修改下方默认值）")
+                                Text("当前会话：\(state.settings.summary)\(model.activeVideoFormatSuffix)（控制端临时调整，不修改下方默认值）")
                                     .font(.callout)
                                     .foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)

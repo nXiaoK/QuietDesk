@@ -16,6 +16,15 @@ enum SessionQualityPreset: String, CaseIterable, Equatable {
         }
     }
 
+    /// True-color HEVC 4:4:4 eliminates 2×2 chroma subsampling blur on fine colored UI text; motion-first
+    /// or low-bandwidth presets keep 4:2:0 for lighter frame cost.
+    var prefersTrueColor: Bool {
+        switch self {
+        case .clearOffice, .original: return true
+        case .dataSaver, .highRefresh: return false
+        }
+    }
+
     func resolvedSettings(longestEdges: [Int], frameRates: [Int], bitRates: [Int]) -> StreamSettings {
         let edge: Int
         let fps: Int
@@ -72,7 +81,10 @@ struct SessionQualityPresentation {
         guard availability == .ready else { update = .idle; message = nil; return }
         if let tuning, let pending = tuning.pending {
             update = .awaiting(pending.settings, latest: tuning.desired == pending.settings ? nil : tuning.desired)
-        } else if let tuning, tuning.desired != tuning.applied.settings || tuning.desiredCodec != tuning.appliedCodec {
+        } else if let tuning,
+                  tuning.desired != tuning.applied.settings
+                  || tuning.desiredCodec != tuning.appliedCodec
+                  || tuning.desiredChroma != tuning.appliedChroma {
             update = .preparing(tuning.desired)
         } else { update = .idle }
         message = status.isEmpty || status.hasPrefix("当前生效：") || status.hasPrefix("已生效：") || status.hasPrefix("正在应用：") ? nil : status
@@ -88,6 +100,11 @@ struct SessionQualityView: View {
     let supportsMediaTransport: Bool
     let supportsExtendedVideoSettings: Bool
     let supportsAdaptiveVideo: Bool
+    var supportsTrueColor: Bool = false
+    var trueColor: Binding<Bool>? = nil
+    var appliedCodec: VideoCodec = .h264
+    var appliedChroma: VideoChromaSubsampling = .yuv420
+    var onSelectPreset: ((SessionQualityPreset) -> Void)? = nil
     let localNetworkQuality: Bool
     let qualityHelp: String
     let compact: Bool
@@ -109,15 +126,21 @@ struct SessionQualityView: View {
                 ForEach(SessionQualityPreset.allCases, id: \.self) { preset in
                     let resolved = preset.resolvedSettings(longestEdges: longestEdges, frameRates: frameRates, bitRates: bitRates)
                     let isSelected = settings == resolved
+                        && (!supportsTrueColor || (trueColor?.wrappedValue ?? false) == preset.prefersTrueColor)
                     Button {
-                        settings = resolved
+                        if let onSelectPreset {
+                            onSelectPreset(preset)
+                        } else {
+                            settings = resolved
+                            if supportsTrueColor { trueColor?.wrappedValue = preset.prefersTrueColor }
+                        }
                     } label: {
                         Text(preset.title).frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
                     .tint(isSelected ? Color.accentColor : nil)
                     .controlSize(.small)
-                    .help("\(preset.title)：\(resolved.summary)")
+                    .help("\(preset.title)：\(resolved.summary)\(supportsTrueColor && preset.prefersTrueColor ? " · 4:4:4 真彩" : "")")
                 }
             }
             .disabled(presentation.availability != .ready)
@@ -147,6 +170,18 @@ struct SessionQualityView: View {
             }
             .pickerStyle(.menu).controlSize(.small)
             .disabled(presentation.availability != .ready)
+            if supportsTrueColor, let trueColor {
+                Toggle(isOn: trueColor) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("4:4:4 真彩（文字锐利）")
+                        Text("硬件 HEVC Main 4:4:4，消除彩色代码与细线条色度模糊")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .toggleStyle(.switch).controlSize(.small)
+                .disabled(presentation.availability != .ready)
+            }
             switch presentation.availability {
             case .disconnected:
                 Text("连接后可即时调整画质，无需停止共享。")
@@ -168,7 +203,13 @@ struct SessionQualityView: View {
             }
             if let state = presentation.applied {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("当前生效").fontWeight(.medium)
+                    HStack(spacing: 6) {
+                        Text("当前生效").fontWeight(.medium)
+                        Text(appliedCodec == .hevc ? (appliedChroma == .yuv444 ? "HEVC 4:4:4" : "HEVC 4:2:0") : "H.264 4:2:0")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 4))
+                    }
                     Text(state.settings.summary).monospacedDigit()
                     Text("视频尺寸 \(state.width) × \(state.height)").foregroundStyle(.secondary).monospacedDigit()
                 }

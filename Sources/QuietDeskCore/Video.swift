@@ -5,9 +5,14 @@ import CoreVideo
 
 public final class VideoEncoder {
     private typealias SetProperty = (CFString, CFTypeRef) throws -> Void
+    public static let hevcMain444AutoLevel: CFString = "HEVC_Main444_AutoLevel" as CFString
     private var session: VTCompressionSession?
     private let writeProperty: (VTCompressionSession, CFString, CFTypeRef?) -> OSStatus
     public let codec: VideoCodec
+    public let chromaSubsampling: VideoChromaSubsampling
+    public let colorSpace: VideoColorSpace
+    private var configuredSettings: StreamSettings
+    private var refinementBoostActive = false
     public var onOutput: ((Result<VideoPacket, Error>) -> Void)?
     public var onDropped: ((UInt32) -> Void)?
 
@@ -28,13 +33,46 @@ public final class VideoEncoder {
         #endif
     }()
 
-    public convenience init(width: Int, height: Int, settings: StreamSettings, codec: VideoCodec = .h264) throws {
-        try self.init(width: width, height: height, settings: settings, codec: codec, writeProperty: VTSessionSetProperty)
+    /// Whether Apple silicon's hardware media engine supports HEVC Main 4:4:4 true-color encoding.
+    public static let hardwareHEVC444Available: Bool = {
+        #if arch(arm64)
+        var created: VTCompressionSession?
+        let status = VTCompressionSessionCreate(allocator: nil, width: 1280, height: 720, codecType: kCMVideoCodecType_HEVC,
+            encoderSpecification: [
+                kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true,
+                kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true
+            ] as CFDictionary,
+            imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: nil, refcon: nil,
+            compressionSessionOut: &created)
+        guard status == noErr, let created else { return false }
+        defer { VTCompressionSessionInvalidate(created) }
+        guard VTSessionSetProperty(created, key: kVTCompressionPropertyKey_ProfileLevel, value: hevcMain444AutoLevel) == noErr else {
+            return false
+        }
+        return VTCompressionSessionPrepareToEncodeFrames(created) == noErr
+        #else
+        return false
+        #endif
+    }()
+
+    public convenience init(width: Int, height: Int, settings: StreamSettings, codec: VideoCodec = .h264,
+                            chromaSubsampling: VideoChromaSubsampling = .yuv420,
+                            colorSpace: VideoColorSpace = .sRGB) throws {
+        try self.init(width: width, height: height, settings: settings, codec: codec,
+                      chromaSubsampling: chromaSubsampling, colorSpace: colorSpace,
+                      writeProperty: VTSessionSetProperty)
     }
 
     init(width: Int, height: Int, settings: StreamSettings, codec: VideoCodec = .h264,
+         chromaSubsampling: VideoChromaSubsampling = .yuv420, colorSpace: VideoColorSpace = .sRGB,
          writeProperty: @escaping (VTCompressionSession, CFString, CFTypeRef?) -> OSStatus) throws {
+        guard chromaSubsampling == .yuv420 || codec == .hevc else {
+            throw DeskError.invalid("4:4:4 真彩模式需要 HEVC 编码")
+        }
         self.codec = codec
+        self.chromaSubsampling = chromaSubsampling
+        self.colorSpace = colorSpace
+        self.configuredSettings = settings
         self.writeProperty = writeProperty
         var specification: [CFString: Any] = [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: true]
         if codec == .hevc { specification[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder] = true }
@@ -62,8 +100,13 @@ public final class VideoEncoder {
             try set(kVTCompressionPropertyKey_RealTime,
                     Self.usesRealTimeMode(framesPerSecond: settings.framesPerSecond) ? kCFBooleanTrue : kCFBooleanFalse)
             try set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
-            try set(kVTCompressionPropertyKey_ProfileLevel,
-                    codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel)
+            let profile: CFString = codec == .h264
+                ? kVTProfileLevel_H264_High_AutoLevel
+                : (chromaSubsampling == .yuv444 ? Self.hevcMain444AutoLevel : kVTProfileLevel_HEVC_Main_AutoLevel)
+            try set(kVTCompressionPropertyKey_ProfileLevel, profile)
+            Self.applyColorSpaceTags(colorSpace) { key, value in
+                _ = self.writeProperty(created, key, value)
+            }
             try set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: settings.framesPerSecond))
             try Self.setBitrate(settings.megabits, using: set)
             try Self.setKeyFrameInterval(framesPerSecond: settings.framesPerSecond, using: set)
@@ -128,6 +171,8 @@ public final class VideoEncoder {
 
     public func updateBitrate(megabits: Int) throws {
         try updateProperties { try Self.setBitrate(megabits, using: $0) }
+        configuredSettings.megabits = megabits
+        refinementBoostActive = false
     }
 
     public func updateEncodingParameters(settings: StreamSettings) throws {
@@ -138,6 +183,30 @@ public final class VideoEncoder {
             try Self.setBitrate(settings.megabits, using: set)
             try Self.setKeyFrameInterval(framesPerSecond: settings.framesPerSecond, using: set)
         }
+        configuredSettings = settings
+        refinementBoostActive = false
+    }
+
+    private static func applyColorSpaceTags(_ colorSpace: VideoColorSpace, using write: (CFString, CFTypeRef) -> Void) {
+        switch colorSpace {
+        case .displayP3:
+            write(kVTCompressionPropertyKey_ColorPrimaries, kCMFormatDescriptionColorPrimaries_P3_D65)
+            write(kVTCompressionPropertyKey_TransferFunction, kCMFormatDescriptionTransferFunction_sRGB)
+            write(kVTCompressionPropertyKey_YCbCrMatrix, kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2)
+        case .sRGB:
+            write(kVTCompressionPropertyKey_ColorPrimaries, kCMFormatDescriptionColorPrimaries_ITU_R_709_2)
+            write(kVTCompressionPropertyKey_TransferFunction, kCMFormatDescriptionTransferFunction_ITU_R_709_2)
+            write(kVTCompressionPropertyKey_YCbCrMatrix, kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2)
+        }
+    }
+
+    public static func refinementParameters(for settings: StreamSettings, pass: Int) -> (megabits: Int, expectedFPS: Int, quality: Double) {
+        let clampedPass = min(max(1, pass), 4)
+        let boostedMegabits = min(StreamSettings.bitRates.last!, max(settings.megabits, min(settings.megabits * 2, settings.megabits + 24)))
+        let expectedFPS = max(1, min(settings.framesPerSecond, 15))
+        let baseQuality = settings.megabits >= 8 ? 0.78 : 0.72
+        let quality = min(0.96, baseQuality + Double(clampedPass) * 0.04)
+        return (boostedMegabits, expectedFPS, quality)
     }
 
     private static func setBitrate(_ megabits: Int, using set: SetProperty) throws {
@@ -155,8 +224,25 @@ public final class VideoEncoder {
         catch { try interval(seconds: 4) }
     }
 
-    public func encode(_ buffer: CVPixelBuffer, time: CMTime, sequence: UInt32, forceKeyFrame: Bool = false) throws {
+    public func encode(_ buffer: CVPixelBuffer, time: CMTime, sequence: UInt32, forceKeyFrame: Bool = false,
+                       refinementPass: Int? = nil) throws {
         guard let session else { throw DeskError.invalid("编码器已停止") }
+        if let pass = refinementPass, !forceKeyFrame {
+            let boost = Self.refinementParameters(for: configuredSettings, pass: pass)
+            _ = writeProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: boost.expectedFPS))
+            _ = writeProperty(session, kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: boost.megabits * 1_000_000))
+            _ = writeProperty(session, kVTCompressionPropertyKey_DataRateLimits,
+                              [NSNumber(value: boost.megabits * 1_000_000 / 8), NSNumber(value: 1)] as CFArray)
+            _ = writeProperty(session, kVTCompressionPropertyKey_Quality, NSNumber(value: boost.quality))
+            refinementBoostActive = true
+        } else if refinementBoostActive {
+            _ = writeProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: configuredSettings.framesPerSecond))
+            _ = writeProperty(session, kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: configuredSettings.megabits * 1_000_000))
+            _ = writeProperty(session, kVTCompressionPropertyKey_DataRateLimits,
+                              [NSNumber(value: configuredSettings.megabits * 1_000_000 / 8), NSNumber(value: 1)] as CFArray)
+            _ = writeProperty(session, kVTCompressionPropertyKey_Quality, nil)
+            refinementBoostActive = false
+        }
         let properties = forceKeyFrame ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
         let status = VTCompressionSessionEncodeFrame(session, imageBuffer: buffer, presentationTimeStamp: time,
             duration: .invalid, frameProperties: properties,

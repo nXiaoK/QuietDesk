@@ -1183,6 +1183,32 @@ private struct VideoPipelineChecks {
                         "Frame arriving after the 85% budget interval should be allowed")
         }
 
+        run("ScreenStreamer 4:4:4 configuration selects BGRA without YCbCr colorMatrix and tracks progressive refinement passes") {
+            let cfg420 = ScreenStreamer.configuration(width: 2560, height: 1440, settings: .init(framesPerSecond: 60, megabits: 12),
+                                                      chromaSubsampling: .yuv420, colorSpace: .sRGB)
+            try require(cfg420.pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                        && cfg420.colorSpaceName == CGColorSpace.sRGB,
+                        "4:2:0 sRGB configuration changed pixelFormat or colorSpaceName")
+
+            let cfg444 = ScreenStreamer.configuration(width: 2560, height: 1440, settings: .init(framesPerSecond: 60, megabits: 12),
+                                                      chromaSubsampling: .yuv444, colorSpace: .displayP3)
+            try require(cfg444.pixelFormat == kCVPixelFormatType_32BGRA
+                        && cfg444.colorSpaceName == CGColorSpace.displayP3,
+                        "4:4:4 Display P3 configuration did not use BGRA + displayP3")
+
+            var refine = StaticFrameRefinement()
+            try require(refine.nextPassNumber == nil, "Idle StaticFrameRefinement reported a pass number")
+            refine.encoded(bytes: 50_000, keyFrame: true, budgetBytes: 20_000, at: 10.0)
+            for expectedPass in 1...4 {
+                try require(refine.nextPassNumber == expectedPass, "Expected refinement pass \(expectedPass), got \(String(describing: refine.nextPassNumber))")
+                let params = VideoEncoder.refinementParameters(for: StreamSettings(framesPerSecond: 60, megabits: 12), pass: expectedPass)
+                try require(params.expectedFPS == 15 && params.megabits == 24 && params.quality > 0.8 && params.quality <= 0.96,
+                            "Unexpected refinement boost parameters on pass \(expectedPass): \(params)")
+                refine.refined(at: 10.0 + Double(expectedPass))
+            }
+            try require(refine.nextPassNumber == nil && refine.remaining == 0, "Completed refinement schedule still had passes")
+        }
+
         print("Video pipeline checks: \(passed) passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

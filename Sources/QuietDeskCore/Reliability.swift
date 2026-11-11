@@ -31,14 +31,16 @@ public struct ConnectionRecord: Codable, Identifiable, Equatable {
     public var name: String
     public var lastConnected: Date
     public var videoSettings: StreamSettings?
+    public var chromaSubsampling: VideoChromaSubsampling?
     public var relay: RelayConnectionInfo?
-    public init(id: UUID = UUID(), address: String, port: UInt16, name: String, lastConnected: Date = Date(), videoSettings: StreamSettings? = nil, relay: RelayConnectionInfo? = nil) {
+    public init(id: UUID = UUID(), address: String, port: UInt16, name: String, lastConnected: Date = Date(), videoSettings: StreamSettings? = nil, chromaSubsampling: VideoChromaSubsampling? = nil, relay: RelayConnectionInfo? = nil) {
         self.id = id; self.address = address; self.port = port; self.name = name; self.lastConnected = lastConnected
         self.videoSettings = videoSettings
+        self.chromaSubsampling = chromaSubsampling
         self.relay = relay
     }
     private enum CodingKeys: String, CodingKey {
-        case id, address, port, name, lastConnected, videoSettings, relay, higherFrameRateVideoSettings
+        case id, address, port, name, lastConnected, videoSettings, chromaSubsampling, relay, higherFrameRateVideoSettings
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -48,6 +50,7 @@ public struct ConnectionRecord: Codable, Identifiable, Equatable {
         name = try values.decode(String.self, forKey: .name)
         lastConnected = try values.decode(Date.self, forKey: .lastConnected)
         videoSettings = try values.decodeIfPresent(StreamSettings.self, forKey: .videoSettings)
+        chromaSubsampling = try? values.decode(VideoChromaSubsampling.self, forKey: .chromaSubsampling)
         relay = try values.decodeIfPresent(RelayConnectionInfo.self, forKey: .relay)
         if let higher = try? values.decode(StreamSettings.self, forKey: .higherFrameRateVideoSettings),
            higher.framesPerSecond > 60, (try? higher.validateControlValues()) != nil,
@@ -63,6 +66,7 @@ public struct ConnectionRecord: Codable, Identifiable, Equatable {
         try values.encode(name, forKey: .name)
         try values.encode(lastConnected, forKey: .lastConnected)
         try values.encodeIfPresent(videoSettings?.highRefreshCompatible, forKey: .videoSettings)
+        try values.encodeIfPresent(chromaSubsampling, forKey: .chromaSubsampling)
         try values.encodeIfPresent(relay, forKey: .relay)
         if let videoSettings, videoSettings.framesPerSecond > 60 {
             try values.encode(videoSettings, forKey: .higherFrameRateVideoSettings)

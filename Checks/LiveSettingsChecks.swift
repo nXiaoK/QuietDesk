@@ -498,4 +498,63 @@ func runLiveSettingsChecks() {
         try check(upgradedReq.settings == high && upgradedReq.codec == .hevc,
                   "Initial confirmation did not carry desired high settings and HEVC")
     }
+
+    run("HEVC 4:4:4 negotiation, fallback settling, wire omission and saved connection preferences preserve compatibility") {
+        let plainHello = Hello(name: "host", width: 1920, height: 1080, settings: .init(), canControl: true, hevcVideoV1: true)
+        try check(!String(decoding: try JSONEncoder().encode(plainHello), as: UTF8.self).contains("hevc444VideoV1")
+                  && Wire.readJSON(Hello.self, JSONEncoder().encode(plainHello)).hevc444VideoV1 == nil,
+                  "Host without HEVC 4:4:4 advertised hevc444VideoV1")
+        let trueColorHello = Hello(name: "host", width: 1920, height: 1080, settings: .init(), canControl: true,
+                                   hevcVideoV1: true, hevc444VideoV1: true)
+        let decodedHello = try Wire.readJSON(Hello.self, JSONEncoder().encode(trueColorHello))
+        try decodedHello.validate()
+        try check(decodedHello.hevc444VideoV1 == true, "HEVC 4:4:4 capability lost over wire")
+
+        var tuning = try VideoTuningSession(applied: initial)
+        tuning.chooseCodec(.hevc)
+        let hevc420Req = tuning.nextRequest()!
+        try check(hevc420Req.chromaSubsampling == nil
+                  && !String(decoding: try JSONEncoder().encode(hevc420Req), as: UTF8.self).contains("chromaSubsampling"),
+                  "4:2:0 HEVC request emitted unnecessary chromaSubsampling field")
+        try check(try tuning.receive(StreamSettingsResult(id: hevc420Req.id, state: initial, codec: .hevc)),
+                  "4:2:0 HEVC result rejected")
+
+        tuning.chooseChromaSubsampling(.yuv444)
+        guard let req444 = tuning.nextRequest() else { throw CheckFailure("Choosing 4:4:4 sent no request") }
+        try check(req444.codec == .hevc && req444.chromaSubsampling == .yuv444, "4:4:4 request lacked HEVC or yuv444")
+        try check(try tuning.receive(StreamSettingsResult(id: req444.id, state: initial, codec: .hevc, chromaSubsampling: .yuv444)),
+                  "4:4:4 reply rejected")
+        try check(tuning.appliedChroma == .yuv444 && tuning.desiredChroma == .yuv444 && tuning.nextRequest() == nil,
+                  "Confirmed 4:4:4 stream did not settle")
+
+        // Stepping back to 4:2:0 while currently on 4:4:4 must explicitly send .yuv420 so the host reconfigures.
+        tuning.chooseChromaSubsampling(.yuv420)
+        guard let stepDown = tuning.nextRequest() else { throw CheckFailure("Stepping down from 4:4:4 to 4:2:0 sent no request") }
+        try check(stepDown.codec == .hevc && stepDown.chromaSubsampling == .yuv420,
+                  "Stepping down from 4:4:4 did not explicitly carry yuv420")
+        try check(try tuning.receive(StreamSettingsResult(id: stepDown.id, state: initial, codec: .hevc, chromaSubsampling: .yuv420)),
+                  "4:2:0 step-down reply rejected")
+        try check(tuning.appliedChroma == .yuv420 && tuning.desiredChroma == .yuv420 && tuning.nextRequest() == nil,
+                  "4:2:0 step-down did not settle")
+
+        // Host fallback (keeps 4:2:0 when 4:4:4 was requested) settles desiredChroma to avoid endless retries.
+        tuning.chooseChromaSubsampling(.yuv444)
+        let fallbackReq = tuning.nextRequest()!
+        try check(try tuning.receive(StreamSettingsResult(id: fallbackReq.id, state: initial, codec: .hevc, chromaSubsampling: .yuv420)),
+                  "4:2:0 fallback reply rejected")
+        try check(tuning.appliedChroma == .yuv420 && tuning.desiredChroma == .yuv420 && tuning.nextRequest() == nil,
+                  "Host fallback from 4:4:4 to 4:2:0 did not settle desiredChroma")
+
+        // ConnectionRecord persists optional chromaSubsampling cleanly and ignores malformed values.
+        let saved444 = ConnectionRecord(address: "studio.local", port: 5908, name: "Studio",
+                                        videoSettings: medium, chromaSubsampling: .yuv444)
+        let savedData = try JSONEncoder().encode(saved444)
+        try check(try JSONDecoder().decode(ConnectionRecord.self, from: savedData) == saved444,
+                  "ConnectionRecord lost chromaSubsampling")
+        var raw = try JSONSerialization.jsonObject(with: savedData) as! [String: Any]
+        raw["chromaSubsampling"] = "yuv422_unknown"
+        let recovered = try JSONDecoder().decode(ConnectionRecord.self, from: JSONSerialization.data(withJSONObject: raw))
+        try check(recovered.id == saved444.id && recovered.chromaSubsampling == nil && recovered.videoSettings == medium,
+                  "Malformed chromaSubsampling hid saved ConnectionRecord")
+    }
 }

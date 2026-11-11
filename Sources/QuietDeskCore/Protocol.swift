@@ -210,7 +210,9 @@ public struct Hello: Codable, Sendable {
     public let hevcVideoV1: Bool?
     // The host briefly awaits the viewer's initial stream settings/codec before starting capture once.
     public let initialStreamNegotiationV1: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil) {
+    // The host has a hardware HEVC Main 4:4:4 encoder and accepts chromaSubsampling == .yuv444.
+    public let hevc444VideoV1: Bool?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -244,6 +246,7 @@ public struct Hello: Codable, Sendable {
         self.desktopActionsV1 = desktopActionsV1
         self.hevcVideoV1 = hevcVideoV1
         self.initialStreamNegotiationV1 = initialStreamNegotiationV1
+        self.hevc444VideoV1 = hevc444VideoV1
     }
 
     public func validate() throws {
@@ -352,6 +355,14 @@ public struct RemoteInput: Codable, Sendable {
 // HEVC is sent only after the viewer asked for it in a stream settings request, so an older peer never receives it.
 public enum VideoCodec: String, Codable, Sendable {
     case h264, hevc
+}
+
+public enum VideoChromaSubsampling: String, Codable, Equatable, Sendable {
+    case yuv420, yuv444
+}
+
+public enum VideoColorSpace: String, Codable, Equatable, Sendable {
+    case sRGB, displayP3
 }
 
 public struct VideoPacket: Sendable {

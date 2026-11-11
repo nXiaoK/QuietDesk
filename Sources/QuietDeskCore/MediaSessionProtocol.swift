@@ -25,13 +25,18 @@ public struct MediaControl: Codable, Sendable {
     public let encodeIdle: Bool?
     // Negotiated over request/offer to allow authenticated DTLS datagrams for cursor positions and sequenced pointer moves.
     public let datagramInteractive: Bool?
+    // Negotiated over request/offer so both peers scale frame credits dynamically with FPS and measured RTT (up to 24).
+    public let dynamicFrameWindow: Bool?
+    // Negotiated over request/offer so UDP video streams can protect multi-fragment P-frames with single-packet XOR parity FEC.
+    public let parityFEC: Bool?
 
     public init(_ operation: Operation, sessionID: UUID? = nil, token: Data? = nil,
                 datagramKey: Data? = nil, role: MediaChannelRole? = nil, transactionID: UUID? = nil,
                 transportEpoch: UInt32? = nil, codecEpoch: UInt32? = nil, path: String? = nil,
                 mediaFailure: Bool? = nil, encodeMilliseconds: Double? = nil, relayRouting: Bool? = nil,
                 deliveryMilliseconds: Double? = nil, receiveFrameWindow: Int? = nil, markedRepairs: Bool? = nil,
-                encodeIdle: Bool? = nil, datagramInteractive: Bool? = nil) {
+                encodeIdle: Bool? = nil, datagramInteractive: Bool? = nil, dynamicFrameWindow: Bool? = nil,
+                parityFEC: Bool? = nil) {
         self.operation = operation; self.sessionID = sessionID; self.token = token
         self.datagramKey = datagramKey; self.role = role; self.transactionID = transactionID
         self.transportEpoch = transportEpoch; self.codecEpoch = codecEpoch; self.path = path
@@ -41,6 +46,8 @@ public struct MediaControl: Codable, Sendable {
         self.markedRepairs = markedRepairs
         self.encodeIdle = encodeIdle
         self.datagramInteractive = datagramInteractive
+        self.dynamicFrameWindow = dynamicFrameWindow
+        self.parityFEC = parityFEC
     }
 
     public func validate() throws {
@@ -51,6 +58,8 @@ public struct MediaControl: Codable, Sendable {
               receiveFrameWindow.map({ operation == .request && $0 > 0 }) ?? true,
               markedRepairs == nil || operation == .request,
               datagramInteractive == nil || operation == .request || operation == .offer,
+              dynamicFrameWindow == nil || operation == .request || operation == .offer,
+              parityFEC == nil || operation == .request || operation == .offer,
               encodeMilliseconds == nil || operation == .stats,
               encodeIdle == nil || operation == .stats,
               deliveryMilliseconds.map({ operation == .stats && $0.isFinite && (0...60_000).contains($0) }) ?? true else {

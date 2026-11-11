@@ -636,4 +636,95 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         try require(ready(try receiver.receive(idrRepairs[0], isRepair: true)).map(\.header.frameID) == [4],
                     "Repaired mid-stream IDR did not enter decode")
     }
+
+    run("Adaptive XOR parity FEC recovers any single missing fragment in 0 RTT regardless of arrival order") {
+        let time = MediaCheckClock()
+        let first = try frame(1, idr: true, bytes: 3_500)
+        let firstParts = try MediaFragment.fragment(frame: first)
+        try require(firstParts.count == 4 && firstParts.last!.payload.count < firstParts[0].payload.count,
+                    "Fixture must span multiple fragments with a shorter final fragment")
+        let firstParity = try MediaFrameParity.make(header: first.header, frameBytes: firstParts[0].frameBytes, fragments: firstParts)
+        let wireParity = try MediaFrameParity.decode(firstParity.encode())
+        try require(wireParity == firstParity && firstParity.encode().count <= 1_100,
+                    "Parity wire round-trip changed or exceeded UDP datagram budget")
+        guard case .parity(let asDatagram) = try MediaDatagram.decode(firstParity.encode()), asDatagram == firstParity else {
+            throw MediaCheckFailure(message: "MediaDatagram did not dispatch parity packet")
+        }
+
+        // Order A: fragments arrive with middle fragment #1 dropped, then parity arrives past reorderDelay -> 0-RTT completion & 1 lost counted.
+        let receiverA = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        for (idx, part) in firstParts.enumerated() where idx != 1 {
+            try require(ready(try receiverA.receive(part)).isEmpty, "Incomplete frame entered decode early")
+        }
+        time.now = 0.004
+        let recoveredA = ready(try receiverA.receive(wireParity))
+        try require(recoveredA.count == 1 && recoveredA[0].packet.avcc == first.packet.avcc,
+                    "Parity arriving last did not reconstruct missing middle fragment")
+        try require(feedback(receiverA.poll(), .nack).isEmpty, "FEC-completed frame still emitted a NACK")
+        try require(receiverA.takeFragmentCounts() == (firstParts.count, 1),
+                    "FEC-recovered loss past reorderDelay was not accounted as 1 lost fragment")
+        _ = receiverA.decoded(first.header, success: true)
+
+        // Order B: parity arrives BEFORE all fragments within reorderDelay, shorter final fragment missing -> 0-RTT completion without false loss from reordering.
+        let second = try frame(2, bytes: 2_600)
+        let secondParts = try MediaFragment.fragment(frame: second)
+        try require(secondParts.count == 3, "Expected 3 fragments for P-frame fixture")
+        let secondParity = try MediaFrameParity.make(header: second.header, frameBytes: secondParts[0].frameBytes, fragments: secondParts)
+        try require(ready(try receiverA.receive(secondParity)).isEmpty, "Parity alone completed a frame")
+        try require(ready(try receiverA.receive(secondParts[0])).isEmpty, "1/3 + parity completed prematurely")
+        let recoveredB = ready(try receiverA.receive(secondParts[1]))
+        try require(recoveredB.count == 1 && recoveredB[0].packet.avcc == second.packet.avcc,
+                    "Parity arriving first did not reconstruct missing shorter final fragment")
+        try require(receiverA.takeFragmentCounts() == (secondParts.count, 0),
+                    "Brief reordering inside reorderDelay was miscounted as packet loss")
+        _ = receiverA.decoded(second.header, success: true)
+
+        // Corrupted trailing bytes beyond shorter tail fragment must be rejected rather than silently truncated.
+        let third = try frame(3, bytes: 2_600)
+        let thirdParts = try MediaFragment.fragment(frame: third)
+        var corruptedXor = Data(thirdParts[0].payload)
+        for byteIndex in 0..<thirdParts[1].payload.count { corruptedXor[byteIndex] ^= thirdParts[1].payload[byteIndex] }
+        for byteIndex in 0..<thirdParts[2].payload.count { corruptedXor[byteIndex] ^= thirdParts[2].payload[byteIndex] }
+        corruptedXor[corruptedXor.count - 1] ^= 0xFF
+        let badParity = try MediaFrameParity(header: third.header, frameBytes: thirdParts[0].frameBytes,
+                                             fragmentCount: UInt16(thirdParts.count), parityPayload: corruptedXor)
+        _ = try receiverA.receive(thirdParts[0])
+        _ = try receiverA.receive(thirdParts[1])
+        try rejects { _ = try receiverA.receive(badParity) }
+
+        // Bounds: 1-fragment and >8-fragment frames decline single-packet parity.
+        let tiny = try frame(4, bytes: 400)
+        let tinyParts = try MediaFragment.fragment(frame: tiny)
+        try rejects { _ = try MediaFrameParity.make(header: tiny.header, frameBytes: tinyParts[0].frameBytes, fragments: tinyParts) }
+        let large = try frame(5, idr: true, bytes: 12_000)
+        let largeParts = try MediaFragment.fragment(frame: large)
+        try require(largeParts.count > MediaFrameParity.maximumProtectedFragments,
+                    "Large fixture did not exceed maximumProtectedFragments")
+        try rejects { _ = try MediaFrameParity.make(header: large.header, frameBytes: largeParts[0].frameBytes, fragments: largeParts) }
+    }
+
+    run("Dynamic BDP frame window scales with FPS and RTT up to 24 while preserving static default") {
+        try require(MediaBufferLimits.receiveFrameWindow == 6 && MediaBufferLimits.maximumDynamicFrameWindow == 24,
+                    "Baseline or dynamic ceiling changed unexpectedly")
+        try require(MediaBufferLimits.recommendedFrameWindow(framesPerSecond: 30, roundTripSeconds: 0.002) == 4,
+                    "Low-RTT 30 fps exceeded its 4-frame baseline")
+        try require(MediaBufferLimits.recommendedFrameWindow(framesPerSecond: 60, roundTripSeconds: 0.002) == 6,
+                    "Low-RTT 60 fps exceeded its 6-frame baseline")
+        try require(MediaBufferLimits.recommendedFrameWindow(framesPerSecond: 120, roundTripSeconds: 0.002) == 8,
+                    "Low-RTT 120 fps did not grant 8-frame high-refresh baseline")
+        let wan120 = MediaBufferLimits.recommendedFrameWindow(framesPerSecond: 120, roundTripSeconds: 0.080)
+        try require(wan120 >= 18 && wan120 <= 24, "120 fps @ 80 ms RTT did not scale BDP window: \(wan120)")
+        try require(MediaBufferLimits.recommendedFrameWindow(framesPerSecond: 240, roundTripSeconds: 0.250) == 24,
+                    "Extreme BDP window was not capped at 24 frames")
+
+        let cache = try MediaRetransmissionCache(stream: stream, limits: MediaBufferLimits(maximumFrames: 4), clock: { 0 })
+        let initialIDR = try frame(1, idr: true, sequence: 1)
+        _ = try cache.insert(initialIDR, deadline: 1)
+        _ = cache.handle(try MediaFeedback(kind: .decoded, header: initialIDR.header), estimatedRoundTrip: 0.005)
+        for id in UInt64(2)...UInt64(5) { _ = try cache.insert(frame(id, sequence: UInt32(id)), deadline: 1) }
+        try rejects { _ = try cache.insert(frame(6, sequence: 6), deadline: 1) }
+        cache.updateLimits(MediaBufferLimits(maximumFrames: 10))
+        for id in UInt64(6)...UInt64(11) { _ = try cache.insert(frame(id, sequence: UInt32(id)), deadline: 1) }
+        try require(cache.pendingFrameCount == 10, "Updating sender cache limits did not unlock expanded BDP window")
+    }
 }

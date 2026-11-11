@@ -65,6 +65,15 @@ public struct VideoTuningSession {
         pending = request
         return request
     }
+    /// Confirms initial settings to a host awaiting single-start negotiation even when desired matches hello.
+    public mutating func initialConfirmationRequest() -> StreamSettingsRequest? {
+        guard pending == nil else { return nil }
+        if let request = nextRequest() { return request }
+        let request = StreamSettingsRequest(settings: desired,
+                                            codec: desiredCodec == .h264 && appliedCodec == .h264 ? nil : desiredCodec)
+        pending = request
+        return request
+    }
     public mutating func receive(_ result: StreamSettingsResult, maximumFrameRate: Int = StreamSettings.frameRates.last!) throws -> Bool {
         guard let pending, pending.id == result.id else { return false }
         try result.state.validate()

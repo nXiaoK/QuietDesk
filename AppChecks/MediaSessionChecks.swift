@@ -14,11 +14,15 @@ func require(_ value: Bool, _ message: String) throws { if !value { throw Failur
 func wait(_ value: DispatchSemaphore, _ message: String, seconds: Double = 8) throws {
     try require(value.wait(timeout:.now()+seconds) == .success,message)
 }
-func packet(_ seq: UInt32, idr: Bool, largeIDR: Bool = false, hevc: Bool = false, largePredicted: Bool = false) -> VideoPacket {
+func packet(_ seq: UInt32, idr: Bool, largeIDR: Bool = false, hevc: Bool = false, largePredicted: Bool = false,
+            payloadBytes: Int? = nil) -> VideoPacket {
     // HEVC NAL headers are two bytes: IDR_N_LP is type 20, TRAIL_R type 1, VPS/SPS/PPS types 32/33/34.
     let header: [UInt8] = hevc ? (idr ? [0x28,0x01] : [0x02,0x01]) : [idr ? 0x65 : 0x41]
     var avcc=Data();avcc.put(UInt32(header.count+3));avcc.append(contentsOf:header);avcc.append(contentsOf:[1,2,3])
-    if idr && largeIDR || !idr && largePredicted {
+    if let payloadBytes, payloadBytes > header.count {
+        let nal = Data(header) + Data(repeating: 0x7D, count: payloadBytes - header.count)
+        avcc = Data(); avcc.put(UInt32(nal.count)); avcc.append(nal)
+    } else if idr && largeIDR || !idr && largePredicted {
         let bytes = idr ? 512*1024 : 64*1024
         let nal=Data(header)+Data(repeating:0x7D,count:bytes-header.count)
         avcc=Data();avcc.put(UInt32(nal.count));avcc.append(nal)
@@ -776,6 +780,79 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
        viewer.setPaused(true)
        Thread.sleep(forTimeInterval: 0.05)
        try require(!viewer.sendInteractiveInput(move), "Paused session did not fall back from UDP fast lane")
+   }
+   run("Negotiated dynamic BDP frame window and parity FEC scale with RTT and deliver multi-fragment frames over UDP") {
+       let key = try PairingKey.generate()
+       let queue = DispatchQueue(label: "checks.dynamic-window-fec")
+       let reservation = try reserveMediaPort()
+       var udpReservation = reservation.socket
+       defer { if udpReservation >= 0 { close(udpReservation) } }
+       let port = reservation.port
+       let highFPS = StreamSettings(longestEdge: 2560, framesPerSecond: 120, megabits: 60)
+       let listener = try NWListener(using: MediaSecureTransport.tlsParameters(key: key, roles: MediaChannelRole.allCases),
+                                     on: NWEndpoint.Port(rawValue: port)!)
+       let listenReady = DispatchSemaphore(value: 0)
+       let committed = DispatchSemaphore(value: 0)
+       let multiFragmentDelivered = DispatchSemaphore(value: 0)
+       let hostBox = Box<MediaSession?>(nil)
+       let viewerBox = Box<MediaSession?>(nil)
+       let peers = Box<[Peer]>([])
+       let windows = Box<[Int]>([])
+       let receivedFrames = Box<Int>(0)
+       listener.newConnectionHandler = { incoming in
+           let peer = Peer(connection: incoming)
+           peers.update { $0.append(peer) }
+           peer.onReady = {
+               if let role = MediaSecureTransport.negotiatedRole(on: incoming), role != .control {
+                   hostBox.get()?.acceptAuxiliary(peer, role: role)
+                   return
+               }
+               guard let host = try? MediaSession.host(control: peer, key: key, port: port, settings: highFPS) else { return }
+               hostBox.update { $0 = host }
+               host.onReceiveFrameWindow = { limit in if let limit { windows.update { $0.append(limit) } } }
+               host.onPrepareRecovery = { $0(true) }
+               host.onProduceRecoveryFrame = { host.sendVideo(packet(1, idr: true, payloadBytes: 3_600)) }
+               peer.onMessageHandled = { message, resume in _ = host.receive(message); resume() }
+               host.start()
+           }
+           peer.start()
+       }
+       listener.stateUpdateHandler = { if case .ready = $0 { listenReady.signal() } }
+       listener.start(queue: queue)
+       try wait(listenReady, "Dynamic window listener ready")
+       close(udpReservation); udpReservation = -1
+       let client = Peer(connection: NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!,
+                                                  using: try MediaSecureTransport.tlsParameters(key: key, roles: [.control])))
+       client.onReady = {
+           guard let viewer = try? MediaSession.viewer(control: client, key: key, host: "127.0.0.1", port: port,
+                                                       settings: highFPS, udpEnabled: true) else { return }
+           viewerBox.update { $0 = viewer }
+           viewer.onVideo = { frame, complete in
+               complete(true)
+               if frame.packet.sequence == 2 {
+                   receivedFrames.update { $0 += 1 }
+                   multiFragmentDelivered.signal()
+               }
+           }
+           viewer.onCommitStream = { _, _ in committed.signal() }
+           client.onMessageHandled = { message, resume in _ = viewer.receive(message); resume() }
+           viewer.start()
+       }
+       defer {
+           viewerBox.get()?.stop(); hostBox.get()?.stop()
+           client.close("done"); peers.get().forEach { $0.close("done") }; listener.cancel()
+       }
+       client.start()
+       try wait(committed, "Dynamic window UDP stream did not commit", seconds: 8)
+       guard let host = hostBox.get() else { throw Failure(message: "Missing host media session") }
+       host.recordControlRoundTrip(milliseconds: 80)
+       Thread.sleep(forTimeInterval: 0.05)
+       let observedWindows = windows.get()
+       try require(observedWindows.contains(where: { $0 >= 18 && $0 <= 24 }),
+                   "Host did not expand dynamic frame window for 120 fps @ 80 ms RTT: \(observedWindows)")
+       host.sendVideo(packet(2, idr: false, payloadBytes: 3_200))
+       try wait(multiFragmentDelivered, "Multi-fragment parity-protected P-frame did not arrive")
+       try require(receivedFrames.get() == 1, "Multi-fragment P-frame delivered duplicate copies")
    }
   }
   print("Media session checks: \(passed) passed, \(failed) failed")

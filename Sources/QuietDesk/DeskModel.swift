@@ -1313,26 +1313,34 @@ final class DeskModel: ObservableObject {
                             }
                         }
                         media.onReceiveFrameWindow = { [weak streamer] limit in streamer?.setReceiverFrameWindow(limit) }
-                        media.onPrepareRecovery = { [weak streamer] completion in
-                            guard let streamer else { completion(false); return }
-                            streamer.prepareMediaRecovery(completion: completion)
+                        media.onPrepareRecovery = { [weak self, weak streamer, weak host, weak candidate] completion in
+                            Task { @MainActor in
+                                if let startup = host?.captureTask { await startup.value }
+                                guard let self, let streamer, let host, let candidate,
+                                      self.hostSession === host, self.peer === candidate else { completion(false); return }
+                                streamer.prepareMediaRecovery(completion: completion)
+                            }
                         }
                         media.onPrepareStream = { [weak self, weak streamer, weak host, weak candidate] stream, completion in
-                            guard let streamer else { completion(false); return }
-                            streamer.prepareMediaRecovery { ready in
-                                guard ready else { completion(false); return }
-                                DispatchQueue.main.async {
-                                    guard let self, let host, let candidate, self.hostSession === host,
-                                          self.peer === candidate else { completion(false); return }
-                                    host.mediaPrepared = true
-                                    if host.cursorSubscribed {
-                                        guard let included = streamer.currentCursorIncluded else { completion(false); return }
-                                        do {
-                                            candidate.send(try CursorControl(.binding, cursorID: host.cursorID,
-                                                epoch: host.cursorEpoch, enabled: !included, stream: stream).message())
-                                        } catch { candidate.close(error.localizedDescription); completion(false); return }
+                            Task { @MainActor in
+                                if let startup = host?.captureTask { await startup.value }
+                                guard let self, let streamer, let host, let candidate,
+                                      self.hostSession === host, self.peer === candidate else { completion(false); return }
+                                streamer.prepareMediaRecovery { [weak self, weak host, weak candidate] ready in
+                                    guard ready else { completion(false); return }
+                                    DispatchQueue.main.async {
+                                        guard let self, let host, let candidate, self.hostSession === host,
+                                              self.peer === candidate else { completion(false); return }
+                                        host.mediaPrepared = true
+                                        if host.cursorSubscribed {
+                                            guard let included = streamer.currentCursorIncluded else { completion(false); return }
+                                            do {
+                                                candidate.send(try CursorControl(.binding, cursorID: host.cursorID,
+                                                    epoch: host.cursorEpoch, enabled: !included, stream: stream).message())
+                                            } catch { candidate.close(error.localizedDescription); completion(false); return }
+                                        }
+                                        completion(true)
                                     }
-                                    completion(true)
                                 }
                             }
                         }
@@ -1363,7 +1371,8 @@ final class DeskModel: ObservableObject {
                             higherFrameRateVideoV1: true, preferredHigherFrameRateSettings: preferredSettings,
                             displayDimmingV1: true, builtInDisplayDimmable: host.effects?.canDimBuiltInDisplay == true,
                             sessionTerminationV1: true, desktopActionsV1: true,
-                            hevcVideoV1: VideoEncoder.hardwareHEVCAvailable ? true : nil)))
+                            hevcVideoV1: VideoEncoder.hardwareHEVCAvailable ? true : nil,
+                            initialStreamNegotiationV1: true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -1390,15 +1399,56 @@ final class DeskModel: ObservableObject {
                                 self.stop()
                             }
                         }
-                        try await streamer.start(capture)
+                        let negotiatedInitial = await host.awaitInitialSettings(
+                            grace: host.usesRelayControl ? .milliseconds(160) : .milliseconds(60)
+                        )
+                        defer {
+                            if let request = negotiatedInitial, host.settingsRequestID == request.id {
+                                host.settingsRequestID = nil
+                            }
+                        }
+                        guard self.generation == token, self.active, self.peer === candidate,
+                              self.hostSession === host, !Task.isCancelled else { return }
+                        var activeCapture = capture
+                        var activeCodec: VideoCodec = .h264
+                        if let request = negotiatedInitial {
+                            activeCodec = request.codec == .hevc && VideoEncoder.hardwareHEVCAvailable ? .hevc : .h264
+                            if request.settings != settings {
+                                activeCapture = ScreenStreamer.prepareCapture(display: display, settings: request.settings)
+                            }
+                        }
+                        try await streamer.start(activeCapture, codec: activeCodec)
                         guard self.generation == token, self.active, self.peer === candidate, self.hostSession === host, !Task.isCancelled else {
                             await streamer.stop()
                             return
                         }
+                        if let request = negotiatedInitial {
+                            let updatedState = VideoStreamState(settings: request.settings,
+                                                                width: activeCapture.width,
+                                                                height: activeCapture.height)
+                            if host.settingsRequestID == request.id { host.settingsRequestID = nil }
+                            if updatedState != state || streamer.videoCodec != .h264 {
+                                self.activeVideoState = updatedState
+                                self.activeVideoCodec = streamer.videoCodec
+                                self.resolution = "\(updatedState.width) × \(updatedState.height)"
+                                self.recordVideoConfiguration(updatedState)
+                                self.videoSettingsStatus = "控制端已调整：\(updatedState.settings.summary)"
+                                    + (self.activeVideoCodec == .hevc ? " · HEVC" : "")
+                                candidate.setVideoPacing(VideoSendPacing(megabits: updatedState.settings.megabits))
+                                media.updateSettings(updatedState.settings, restartsStream: false)
+                            }
+                            candidate.send(try Wire.json(.streamSettingsResult, StreamSettingsResult(
+                                id: request.id,
+                                state: updatedState,
+                                error: nil,
+                                codec: request.codec == nil ? nil : streamer.videoCodec,
+                                restartsStream: false
+                            )))
+                        }
                         DiagnosticLog.shared.record(.captureStarted, role: .host, state: .ready,
-                            values: [.width: width, .height: height, .pixelWidth: capture.sourceWidth,
-                                     .pixelHeight: capture.sourceHeight, .logicalWidth: Int(snapshot.bounds.width),
-                                     .logicalHeight: Int(snapshot.bounds.height)])
+                            values: [.width: activeCapture.width, .height: activeCapture.height,
+                                     .pixelWidth: activeCapture.sourceWidth, .pixelHeight: activeCapture.sourceHeight,
+                                     .logicalWidth: Int(snapshot.bounds.width), .logicalHeight: Int(snapshot.bounds.height)])
                     } catch {
                         guard self.generation == token, self.active, self.peer === candidate, self.hostSession === host, !Task.isCancelled else { return }
                         self.recordDiagnosticFailure(.captureFailed, error: error)
@@ -2514,6 +2564,7 @@ final class DeskModel: ObservableObject {
                 }
                 applyInitialVideoQualityIfReady()
                 sendNextVideoSettings()
+                if hello.initialStreamNegotiationV1 == true { sendInitialVideoConfirmationIfNeeded() }
             } else { videoSettingsStatus = "主机需更新到 0.4.0 才能动态调整画质" }
             if viewer.media == nil, let channel = dataChannel {
                 connectionDiagnostics?.setVideoPath(.committed(.shared, relayedUDP: false), on: channel)
@@ -3109,6 +3160,18 @@ final class DeskModel: ObservableObject {
         videoTuning = tuning
         viewerSession.pendingVideoPreferenceCanSave = viewerQualityPolicy.maySaveCurrentChoice && viewerSession.automaticVideoSettings != request.settings
         videoSettingsStatus = "正在应用：\(request.settings.summary)"
+        dispatchVideoSettingsRequest(request, peer: peer)
+    }
+
+    private func sendInitialVideoConfirmationIfNeeded() {
+        guard connected, supportsLiveSettings, let peer, var tuning = videoTuning,
+              tuning.pending == nil, let request = tuning.initialConfirmationRequest() else { return }
+        videoTuning = tuning
+        viewerSession.pendingVideoPreferenceCanSave = false
+        dispatchVideoSettingsRequest(request, peer: peer)
+    }
+
+    private func dispatchVideoSettingsRequest(_ request: StreamSettingsRequest, peer: Peer) {
         do { peer.send(try Wire.json(.streamSettingsRequest, request)) }
         catch { videoSettingsStatus = error.localizedDescription; peer.close(error.localizedDescription); return }
         viewerSession.videoRequestTimeout?.cancel()
@@ -3380,6 +3443,11 @@ final class DeskModel: ObservableObject {
         do { try request.settings.validateControlValues() }
         catch {
             if let result = try? Wire.json(.streamSettingsResult, reply(state, error.localizedDescription, false)) { peer.send(result) }
+            return
+        }
+        if host.isAwaitingInitialSettings {
+            host.settingsRequestID = request.id
+            host.resolveInitialSettings(request)
             return
         }
         if request.settings == state.settings, codec == activeVideoCodec {
@@ -3899,6 +3967,7 @@ final class DeskModel: ObservableObject {
         oldHost.pauseTask?.cancel()
         oldHost.effectsTask?.cancel()
         oldHost.settingsTask?.cancel()
+        oldHost.cancelInitialSettingsWait()
         oldHost.captureTask?.cancel()
         oldViewer.pauseRequestTimeout?.cancel()
         oldViewer.effectsRequestTimeout?.cancel()

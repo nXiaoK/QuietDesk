@@ -6,8 +6,11 @@ import QuietDeskCore
 // Encoder and acknowledgement state share one queue with the capture pump.
 struct VideoFrameFlow {
     static func maximumOutstandingFrames(for settings: StreamSettings, receiverLimit: Int?) -> Int {
-        min(receiverLimit ?? MediaBufferLimits.legacyFrameWindow,
-            settings.framesPerSecond >= 60 ? MediaBufferLimits.receiveFrameWindow : 4)
+        guard let receiverLimit else { return MediaBufferLimits.legacyFrameWindow }
+        if receiverLimit > MediaBufferLimits.receiveFrameWindow {
+            return min(MediaBufferLimits.maximumDynamicFrameWindow, receiverLimit)
+        }
+        return min(receiverLimit, settings.framesPerSecond >= 60 ? MediaBufferLimits.receiveFrameWindow : 4)
     }
     struct Encoding {
         let sequence: UInt32
@@ -616,11 +619,11 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         onError?(message ?? error.localizedDescription)
     }
 
-    func start(_ capture: CapturePlan) async throws {
+    func start(_ capture: CapturePlan, codec: VideoCodec = .h264) async throws {
         try Task.checkCancellation()
         let width = capture.width, height = capture.height, settings = capture.settings
         let id = UUID()
-        let encoder = try makeEncoder(width: width, height: height, settings: settings, id: id)
+        let encoder = try makeEncoder(width: width, height: height, settings: settings, codec: codec, id: id)
         let stream = SCStream(filter: capture.filter,
             configuration: Self.configuration(width: width, height: height, settings: settings), delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)

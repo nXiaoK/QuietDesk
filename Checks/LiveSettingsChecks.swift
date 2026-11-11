@@ -467,4 +467,35 @@ func runLiveSettingsChecks() {
             encoder.stop()
         }
     }
+
+    run("Single-start initial negotiation capability is optional and confirms unchanged settings once") {
+        let legacyHello = Hello(name: "legacy", width: 1920, height: 1080, settings: .init(), canControl: true)
+        try check(Wire.readJSON(Hello.self, JSONEncoder().encode(legacyHello)).initialStreamNegotiationV1 == nil,
+                  "Legacy hello unexpectedly advertised initialStreamNegotiationV1")
+        let modernHello = Hello(name: "modern", width: 1920, height: 1080, settings: .init(), canControl: true,
+                                initialStreamNegotiationV1: true)
+        try check(Wire.readJSON(Hello.self, JSONEncoder().encode(modernHello)).initialStreamNegotiationV1 == true,
+                  "Modern hello lost initialStreamNegotiationV1")
+
+        var unchanged = try VideoTuningSession(applied: initial)
+        try check(unchanged.nextRequest() == nil, "Unchanged tuning emitted an unsolicited legacy request")
+        guard let confirm = unchanged.initialConfirmationRequest() else {
+            throw CheckFailure("Initial confirmation request was nil for idle session")
+        }
+        try check(confirm.settings == initial.settings && confirm.codec == nil && unchanged.pending?.id == confirm.id,
+                  "Initial confirmation altered settings or codec")
+        try check(unchanged.initialConfirmationRequest() == nil, "Duplicate initial confirmation sent while pending")
+        try check(try unchanged.receive(StreamSettingsResult(id: confirm.id, state: initial, restartsStream: false)),
+                  "Initial confirmation result was rejected")
+        try check(unchanged.pending == nil && unchanged.nextRequest() == nil,
+                  "Completed initial confirmation left pending work")
+
+        var upgraded = try VideoTuningSession(applied: initial, preferred: high)
+        upgraded.chooseCodec(.hevc)
+        guard let upgradedReq = upgraded.initialConfirmationRequest() else {
+            throw CheckFailure("Initial confirmation dropped preferred upgrade")
+        }
+        try check(upgradedReq.settings == high && upgradedReq.codec == .hevc,
+                  "Initial confirmation did not carry desired high settings and HEVC")
+    }
 }

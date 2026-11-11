@@ -3,6 +3,16 @@ import Foundation
 public struct MediaBufferLimits: Sendable {
     public static let legacyFrameWindow = 3
     public static let receiveFrameWindow = 6
+    public static let maximumDynamicFrameWindow = 24
+
+    public static func recommendedFrameWindow(framesPerSecond: Int, roundTripSeconds: TimeInterval? = nil) -> Int {
+        let fps = max(1, min(240, framesPerSecond))
+        let baseline = fps > 60 ? 8 : fps >= 60 ? Self.receiveFrameWindow : 4
+        guard let rtt = roundTripSeconds, rtt.isFinite, rtt > 0 else { return baseline }
+        let bdp = Int(ceil(Double(fps) * min(1.0, rtt) * 1.5)) + 3
+        return min(Self.maximumDynamicFrameWindow, max(baseline, bdp))
+    }
+
     public let maximumFrameBytes: Int
     public let maximumBufferedBytes: Int
     public let maximumFrames: Int
@@ -123,6 +133,7 @@ public final class MediaFrameReassembler {
         var late: [Bool]
         var receivedCount = 0
         var highestReceivedIndex = -1
+        var parityPayload: Data?
         var frame: MediaFrame?
         var completedAt: TimeInterval?
 
@@ -137,6 +148,20 @@ public final class MediaFrameReassembler {
             bytes = Data(count: totalBytes)
             received = Array(repeating: false, count: fragmentCount)
             late = Array(repeating: false, count: fragmentCount)
+        }
+
+        init(_ parity: MediaFrameParity, now: TimeInterval) {
+            header = parity.header
+            totalBytes = parity.frameBytes
+            fragmentCount = Int(parity.fragmentCount)
+            fragmented = true
+            firstReceivedAt = now
+            lastProgressAt = now
+            highestReceivedAt = now
+            bytes = Data(count: totalBytes)
+            received = Array(repeating: false, count: fragmentCount)
+            late = Array(repeating: false, count: fragmentCount)
+            parityPayload = parity.parityPayload
         }
 
         init(_ frame: MediaFrame, bytes: Data, now: TimeInterval) {
@@ -295,11 +320,108 @@ public final class MediaFrameReassembler {
                     throw error
                 }
                 events.append(.feedback(try MediaFeedback(kind: .reassembled, header: assembly.header)))
+            } else {
+                try tryCompleteWithParity(assembly, now: now, events: &events)
             }
         }
         updateGap(at: now)
         events += readyFrame()
         return events
+    }
+
+    public func receive(_ parity: MediaFrameParity) throws -> [MediaReceiveEvent] {
+        guard parity.header.stream == stream, !requiresRecovery else { return [] }
+        let now = currentTime()
+        var events = expire(at: now)
+        guard !requiresRecovery else { return events }
+        if parity.header.frameID < expectedFrameID {
+            if let lastDecoded { events.append(.feedback(try MediaFeedback(kind: .decoded, header: lastDecoded))) }
+            return events
+        }
+        let distance = parity.header.frameID - expectedFrameID
+        guard distance < UInt64(limits.maximumFrames), parity.header.frameID < UInt64.max,
+              parity.frameBytes <= limits.maximumFrameBytes else {
+            return events + invalidate(at: parity.header)
+        }
+        let assembly: Assembly
+        if let existing = assemblies[parity.header.frameID] {
+            guard existing.header == parity.header, existing.totalBytes == parity.frameBytes,
+                  existing.fragmentCount == Int(parity.fragmentCount) else {
+                _ = invalidate(at: parity.header)
+                throw DeskError.invalid("同一媒体帧的校验元数据冲突")
+            }
+            if let existingParity = existing.parityPayload {
+                guard existingParity == parity.parityPayload else {
+                    _ = invalidate(at: parity.header)
+                    throw DeskError.invalid("重复媒体异或校验内容冲突")
+                }
+            } else {
+                existing.parityPayload = parity.parityPayload
+            }
+            assembly = existing
+        } else {
+            guard assemblies.count < limits.maximumFrames,
+                  parity.frameBytes <= limits.maximumBufferedBytes - bufferedBytes else {
+                return events + invalidate(at: parity.header)
+            }
+            _ = missingFrames.removeValue(forKey: parity.header.frameID)
+            assembly = Assembly(parity, now: now)
+            assemblies[parity.header.frameID] = assembly
+            bufferedBytes += parity.frameBytes
+        }
+        if assembly.frame == nil {
+            assembly.lastProgressAt = now
+            try tryCompleteWithParity(assembly, now: now, events: &events)
+        }
+        updateGap(at: now)
+        events += readyFrame()
+        return events
+    }
+
+    private func tryCompleteWithParity(_ assembly: Assembly, now: TimeInterval, events: inout [MediaReceiveEvent]) throws {
+        guard assembly.frame == nil,
+              assembly.receivedCount == assembly.fragmentCount - 1,
+              let parity = assembly.parityPayload,
+              let missingIndex = assembly.received.firstIndex(of: false) else { return }
+        var recovered = [UInt8](parity)
+        assembly.bytes.withUnsafeBytes { rawBuffer in
+            guard let base = rawBuffer.bindMemory(to: UInt8.self).baseAddress else { return }
+            for index in 0..<assembly.fragmentCount where index != missingIndex {
+                let start = index * MediaFragment.maximumPayloadBytes
+                let length = min(MediaFragment.maximumPayloadBytes, assembly.totalBytes - start)
+                for offset in 0..<length {
+                    recovered[offset] ^= base[start + offset]
+                }
+            }
+        }
+        let missingStart = missingIndex * MediaFragment.maximumPayloadBytes
+        let expectedLength = min(MediaFragment.maximumPayloadBytes, assembly.totalBytes - missingStart)
+        if expectedLength < MediaFragment.maximumPayloadBytes,
+           recovered[expectedLength..<MediaFragment.maximumPayloadBytes].contains(where: { $0 != 0 }) {
+            _ = invalidate(at: assembly.header)
+            throw DeskError.invalid("媒体异或校验恢复尾部非零")
+        }
+        if now - assembly.firstReceivedAt >= limits.reorderDelay {
+            assembly.late[missingIndex] = true
+        }
+        assembly.bytes.replaceSubrange(missingStart..<(missingStart + expectedLength),
+                                       with: recovered.prefix(expectedLength))
+        assembly.received[missingIndex] = true
+        assembly.receivedCount = assembly.fragmentCount
+        if missingIndex > assembly.highestReceivedIndex {
+            assembly.highestReceivedIndex = missingIndex
+            assembly.highestReceivedAt = now
+        }
+        assembly.lastProgressAt = now
+        do {
+            assembly.frame = try MediaFrame(header: assembly.header, packetBytes: assembly.bytes)
+            assembly.completedAt = now
+            settleFragments(assembly.fragmentCount, lost: assembly.late.lazy.filter { $0 }.count)
+        } catch {
+            _ = invalidate(at: assembly.header)
+            throw error
+        }
+        events.append(.feedback(try MediaFeedback(kind: .reassembled, header: assembly.header)))
     }
 
     // TCP already provides a complete envelope, but reference ordering and epoch fences remain identical.
@@ -523,7 +645,7 @@ public final class MediaRetransmissionCache {
     public private(set) var requiresRecovery = false
     public private(set) var bufferedBytes = 0
     public var pendingFrameCount: Int { frames.count }
-    private let limits: MediaBufferLimits
+    private var limits: MediaBufferLimits
     private let clock: () -> TimeInterval
     private var lastNow: TimeInterval
     private var nextFrameID: UInt64
@@ -554,6 +676,11 @@ public final class MediaRetransmissionCache {
         self.limits = limits
         self.clock = clock
         lastNow = now
+    }
+
+    public func updateLimits(_ limits: MediaBufferLimits) {
+        guard (try? limits.validate()) != nil else { return }
+        self.limits = limits
     }
 
     // On an insertion error after encoding, the caller must abandon that reference chain and replace the epoch.

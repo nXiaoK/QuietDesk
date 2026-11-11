@@ -279,14 +279,78 @@ public struct MediaFeedback: Equatable, Sendable {
     }
 }
 
+public struct MediaFrameParity: Equatable, Sendable {
+    public static let maximumProtectedFragments = 8
+    public static let encodedHeaderBytes = MediaWire.headerBytes + 6
+    public let header: MediaFrameHeader
+    public let frameBytes: Int
+    public let fragmentCount: UInt16
+    public let parityPayload: Data
+
+    public init(header: MediaFrameHeader, frameBytes: Int, fragmentCount: UInt16, parityPayload: Data) throws {
+        guard frameBytes > MediaFragment.maximumPayloadBytes, frameBytes <= MediaFrame.maximumPacketBytes else {
+            throw DeskError.invalid("媒体校验帧总长度无效")
+        }
+        let count = (frameBytes + MediaFragment.maximumPayloadBytes - 1) / MediaFragment.maximumPayloadBytes
+        guard (2...Self.maximumProtectedFragments).contains(count), Int(fragmentCount) == count,
+              parityPayload.count == MediaFragment.maximumPayloadBytes else {
+            throw DeskError.invalid("媒体异或校验元数据无效")
+        }
+        self.header = header
+        self.frameBytes = frameBytes
+        self.fragmentCount = fragmentCount
+        self.parityPayload = parityPayload
+    }
+
+    public static func make(header: MediaFrameHeader, frameBytes: Int, fragments: [MediaFragment]) throws -> MediaFrameParity {
+        guard (2...maximumProtectedFragments).contains(fragments.count) else {
+            throw DeskError.invalid("媒体异或校验分片数超出范围")
+        }
+        var parity = [UInt8](repeating: 0, count: MediaFragment.maximumPayloadBytes)
+        for fragment in fragments {
+            guard fragment.header == header, fragment.frameBytes == frameBytes,
+                  Int(fragment.fragmentCount) == fragments.count else {
+                throw DeskError.invalid("媒体异或校验分片头不一致")
+            }
+            fragment.payload.withUnsafeBytes { bytes in
+                for index in 0..<bytes.count {
+                    parity[index] ^= bytes[index]
+                }
+            }
+        }
+        return try MediaFrameParity(header: header, frameBytes: frameBytes,
+                                    fragmentCount: UInt16(fragments.count), parityPayload: Data(parity))
+    }
+
+    public func encode() -> Data {
+        var data = MediaWire.begin(4, header: header)
+        data.put(UInt32(frameBytes))
+        data.put(fragmentCount)
+        data.append(parityPayload)
+        return data
+    }
+
+    public static func decode(_ data: Data) throws -> MediaFrameParity {
+        guard data.count <= MediaFragment.maximumDatagramBytes else { throw DeskError.invalid("媒体校验数据报过大") }
+        var reader = ByteReader(data)
+        let header = try MediaWire.header(&reader, kind: 4)
+        let frameBytes: UInt32 = try reader.take()
+        let count: UInt16 = try reader.take()
+        return try MediaFrameParity(header: header, frameBytes: Int(frameBytes), fragmentCount: count,
+                                    parityPayload: reader.bytes(reader.remaining))
+    }
+}
+
 public enum MediaDatagram: Sendable {
     case fragment(MediaFragment)
     case feedback(MediaFeedback)
+    case parity(MediaFrameParity)
 
     public func encode() -> Data {
         switch self {
         case .fragment(let fragment): return fragment.encode()
         case .feedback(let feedback): return feedback.encode()
+        case .parity(let parity): return parity.encode()
         }
     }
 
@@ -297,6 +361,7 @@ public enum MediaDatagram: Sendable {
         switch data[data.startIndex + 3] {
         case 2: return .fragment(try MediaFragment.decode(data))
         case 3: return .feedback(try MediaFeedback.decode(data))
+        case 4: return .parity(try MediaFrameParity.decode(data))
         default: throw DeskError.invalid("未知媒体数据报类型")
         }
     }

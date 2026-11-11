@@ -69,6 +69,35 @@ final class HostSession {
     var lastDesktopActionResult: DesktopActionResult?
     var unlocker: HostScreenUnlocker?
     var unlockTask: Task<Void, Never>?
+    private var initialSettingsContinuation: CheckedContinuation<StreamSettingsRequest?, Never>?
+    private var initialSettingsTimeout: Task<Void, Never>?
+
+    var isAwaitingInitialSettings: Bool {
+        initialSettingsContinuation != nil
+    }
+
+    func awaitInitialSettings(grace: Duration) async -> StreamSettingsRequest? {
+        cancelInitialSettingsWait()
+        return await withCheckedContinuation { continuation in
+            initialSettingsContinuation = continuation
+            initialSettingsTimeout = Task { [weak self] in
+                do { try await Task.sleep(for: grace) } catch { return }
+                self?.resolveInitialSettings(nil)
+            }
+        }
+    }
+
+    func resolveInitialSettings(_ request: StreamSettingsRequest?) {
+        initialSettingsTimeout?.cancel()
+        initialSettingsTimeout = nil
+        guard let continuation = initialSettingsContinuation else { return }
+        initialSettingsContinuation = nil
+        continuation.resume(returning: request)
+    }
+
+    func cancelInitialSettingsWait() {
+        resolveInitialSettings(nil)
+    }
 }
 
 @MainActor

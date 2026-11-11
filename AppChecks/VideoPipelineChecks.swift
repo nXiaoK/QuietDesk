@@ -185,6 +185,11 @@ private struct VideoPipelineChecks {
                 let afterReduction = try submit(atFPS: 30)
                 try require(afterReduction == nil, "Lowering the frame rate released another credit")
             }
+            try require(VideoFrameFlow.maximumOutstandingFrames(for: StreamSettings(framesPerSecond: 120), receiverLimit: 18) == 18,
+                        "Dynamic BDP receiver limit above 6 was clamped back to static window")
+            try require(VideoFrameFlow.maximumOutstandingFrames(for: StreamSettings(framesPerSecond: 240), receiverLimit: 40)
+                        == MediaBufferLimits.maximumDynamicFrameWindow,
+                        "Dynamic BDP receiver limit exceeded maximumDynamicFrameWindow")
         }
 
         run("Out-of-order encoder completions are bounded and delivered in submission order") {

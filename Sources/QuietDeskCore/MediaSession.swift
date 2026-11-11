@@ -103,7 +103,7 @@ public final class MediaSession: @unchecked Sendable {
     }
     private struct Datagram {
         let header: MediaFrameHeader
-        let fragmentIndex: UInt16
+        let fragmentIndex: UInt16?
         let data: Data
         let repair: Bool
     }
@@ -136,11 +136,18 @@ public final class MediaSession: @unchecked Sendable {
     private var relayRoutingNegotiated = false
     private var viewerAcceptsMarkedRepairs = false
     private var datagramInteractiveNegotiated = false
+    private var dynamicFrameWindowNegotiated = false
+    private var parityFECNegotiated = false
+    private var advertisedReceiveFrameWindow: Int?
+    private var lastReportedReceiveWindow: Int?
+    private var hasMeasuredRoundTrip = false
+    private var lastHostNackAt: TimeInterval?
     private let interactiveDatagramLock = NSLock()
     private var interactiveDatagramAvailable = false
     private static let repairedFragmentKind: UInt8 = 5
     private static let cursorPositionDatagramKind: UInt8 = 6
     private static let interactiveInputDatagramKind: UInt8 = 7
+    private static let parityDatagramKind: UInt8 = 8
     private var alternateRequested = false
     private var alternateProbePending = false
     private var alternateRetryDeferred = false
@@ -282,7 +289,7 @@ public final class MediaSession: @unchecked Sendable {
                 self.onDiagnosticVideoPath?(.preparing)
                 self.sendControl(MediaControl(.request, relayRouting: self.relayRoutingEnabled ? true : nil,
                                               receiveFrameWindow: MediaBufferLimits.receiveFrameWindow, markedRepairs: true,
-                                              datagramInteractive: true))
+                                              datagramInteractive: true, dynamicFrameWindow: true, parityFEC: true))
                 self.onState?("正在优化传输")
             }
         }
@@ -385,6 +392,8 @@ public final class MediaSession: @unchecked Sendable {
             self.settings = value
             if restartsStream { self.policy.mediaConfigurationChanged(now: SessionClock.now) }
             self.videoPeer?.setVideoPacing(VideoSendPacing(megabits: value.megabits))
+            if self.side == .viewer { self.receiver?.updateLimits(self.bufferLimits) }
+            else { self.refreshHostFrameWindow() }
             if changed, restartsStream, self.active != nil, !self.configurationSuspended { self.requestRecovery() }
         }
     }
@@ -404,6 +413,7 @@ public final class MediaSession: @unchecked Sendable {
             guard let self, !self.stopped else { return }
             self.controlRoundTrip = (milliseconds, SessionClock.now)
             if self.side == .viewer { self.receiver?.updateLimits(self.bufferLimits) }
+            else { self.refreshHostFrameWindow() }
         }
     }
 
@@ -429,6 +439,7 @@ public final class MediaSession: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
             self.udpVerified = false
+            self.hasMeasuredRoundTrip = false
             self.refreshInteractiveDatagramAvailability()
             self.controlRoundTrip = nil
             self.udpJitter.reset()
@@ -567,12 +578,15 @@ public final class MediaSession: @unchecked Sendable {
             viewerAcceptsMarkedRepairs = value.markedRepairs == true
             relayRoutingNegotiated = relayRoutingEnabled && value.relayRouting == true
             datagramInteractiveNegotiated = value.datagramInteractive == true
+            dynamicFrameWindowNegotiated = value.dynamicFrameWindow == true
+            parityFECNegotiated = value.parityFEC == true
+            advertisedReceiveFrameWindow = value.receiveFrameWindow
             let identifier = UUID(), token = try randomBytes(32), sessionKey = try randomBytes(32)
             sessionID = identifier; bindingToken = token; datagramKey = sessionKey
             grant = try MediaBindingGrant(sessionID: identifier, token: token, now: SessionClock.now)
             negotiated = true
             refreshInteractiveDatagramAvailability()
-            onReceiveFrameWindow?(value.receiveFrameWindow)
+            refreshHostFrameWindow(forceNotify: true)
             prepareListener(sessionKey: sessionKey, identifier: identifier)
             return
         }
@@ -583,6 +597,8 @@ public final class MediaSession: @unchecked Sendable {
             negotiated = true; udpAvailable = udpEnabled && value.path != "tcp"
             relayRoutingNegotiated = relayRoutingEnabled && value.relayRouting == true
             datagramInteractiveNegotiated = value.datagramInteractive == true
+            dynamicFrameWindowNegotiated = value.dynamicFrameWindow == true
+            parityFECNegotiated = value.parityFEC == true
             refreshInteractiveDatagramAvailability()
             fallbackAt = SessionClock.now + 1.5
             openAuxiliary(.video); openAuxiliary(.bulk)
@@ -776,7 +792,9 @@ public final class MediaSession: @unchecked Sendable {
         offerSent = true
         sendControl(MediaControl(.offer, sessionID: sessionID, token: token, datagramKey: datagramKey,
                                  path: udpAvailable ? "udp" : "tcp", relayRouting: relayRoutingNegotiated ? true : nil,
-                                 datagramInteractive: datagramInteractiveNegotiated ? true : nil))
+                                 datagramInteractive: datagramInteractiveNegotiated ? true : nil,
+                                 dynamicFrameWindow: dynamicFrameWindowNegotiated ? true : nil,
+                                 parityFEC: parityFECNegotiated ? true : nil))
     }
 
     private func openAuxiliary(_ role: MediaChannelRole) {
@@ -952,8 +970,10 @@ public final class MediaSession: @unchecked Sendable {
                 self.challenge = nil
                 lastPongAt = now
                 roundTrip = max(0.001, min(2, measured))
+                hasMeasuredRoundTrip = true
                 udpJitter.observeRoundTrip(measured)
                 if side == .viewer { receiver?.updateLimits(bufferLimits) }
+                else { refreshHostFrameWindow() }
                 recordDuration(.mediaRoundTrip, seconds: measured)
                 if let onDiagnosticUDPRoundTrip, let active, active.path == .udp, receiver?.stream == active.stream,
                    transaction == nil, udpVerified, !paused, !configurationSuspended {
@@ -966,6 +986,13 @@ public final class MediaSession: @unchecked Sendable {
                 guard fragment.header.stream == expectedStream else { return }
                 samplePackets += 1; sampleBytes += data.count; lastVideoAt = SessionClock.now
                 handleReceiveEvents(try receiver?.receive(fragment, isRepair: kind == Self.repairedFragmentKind) ?? [])
+                scheduleReceiverPoll()
+            case Self.parityDatagramKind:
+                guard side == .viewer, parityFECNegotiated, udpVerified else { return }
+                let parity = try MediaFrameParity.decode(Data(data.dropFirst()))
+                guard parity.header.stream == expectedStream else { return }
+                samplePackets += 1; sampleBytes += data.count; lastVideoAt = SessionClock.now
+                handleReceiveEvents(try receiver?.receive(parity) ?? [])
                 scheduleReceiverPoll()
             case 4:
                 guard side == .host, udpVerified else { return }
@@ -1064,10 +1091,60 @@ public final class MediaSession: @unchecked Sendable {
     }
 
     private var expectedStream: MediaStreamID? { transaction?.stream ?? active?.stream }
+
+    private var effectiveRoundTripSeconds: TimeInterval? {
+        let udpRTT: TimeInterval? = ((transaction?.path ?? active?.path) == .udp && hasMeasuredRoundTrip) ? roundTrip : nil
+        let ctrlRTT: TimeInterval? = controlRoundTrip.flatMap {
+            SessionClock.now - $0.at <= 15 ? $0.milliseconds / 1_000 : nil
+        }
+        switch (udpRTT, ctrlRTT) {
+        case let (u?, c?): return max(u, c)
+        case let (u?, nil): return u
+        case let (nil, c?): return c
+        case (nil, nil): return hasMeasuredRoundTrip ? roundTrip : nil
+        }
+    }
+
+    private var effectiveHostReceiveWindow: Int? {
+        guard dynamicFrameWindowNegotiated else { return advertisedReceiveFrameWindow }
+        return MediaBufferLimits.recommendedFrameWindow(framesPerSecond: settings.framesPerSecond,
+                                                        roundTripSeconds: effectiveRoundTripSeconds)
+    }
+
+    private func refreshHostFrameWindow(forceNotify: Bool = false) {
+        guard side == .host, negotiated else { return }
+        cache?.updateLimits(bufferLimits)
+        let target = effectiveHostReceiveWindow
+        if forceNotify || target != lastReportedReceiveWindow {
+            lastReportedReceiveWindow = target
+            onReceiveFrameWindow?(target)
+        }
+    }
+
     private var bufferLimits: MediaBufferLimits {
-        MediaBufferLimits(maximumFrames: MediaBufferLimits.receiveFrameWindow,
-                          frameTimeToLive: (transaction?.path ?? active?.path) == .udp ? max(0.25, roundTrip * 3 + 0.08) : 5,
-                          keyFrameTimeToLive: 5, completedFrameTimeToLive: 5)
+        let maximumFrames: Int
+        if side == .viewer {
+            maximumFrames = dynamicFrameWindowNegotiated
+                ? MediaBufferLimits.maximumDynamicFrameWindow : MediaBufferLimits.receiveFrameWindow
+        } else {
+            maximumFrames = max(MediaBufferLimits.receiveFrameWindow,
+                                effectiveHostReceiveWindow ?? MediaBufferLimits.receiveFrameWindow)
+        }
+        return MediaBufferLimits(maximumFrames: maximumFrames,
+                                 frameTimeToLive: (transaction?.path ?? active?.path) == .udp ? max(0.25, roundTrip * 3 + 0.08) : 5,
+                                 keyFrameTimeToLive: 5, completedFrameTimeToLive: 5)
+    }
+
+    private func shouldEmitParity(isIDR: Bool, fragmentCount: Int, payloadBytes: Int) -> Bool {
+        guard parityFECNegotiated, !isIDR, (2...MediaFrameParity.maximumProtectedFragments).contains(fragmentCount),
+              pendingDatagramBytes == 0 else { return false }
+        let fps = Double(max(1, settings.framesPerSecond))
+        let perFrameBudget = (Double(max(1, settings.megabits)) * 125_000.0) / fps
+        let recentLoss = lastHostNackAt.map { SessionClock.now - $0 <= 8.0 } ?? false
+        let budgetScale = (recentLoss || roundTrip >= 0.015) ? 1.0 : 0.85
+        let maxCount = (recentLoss || roundTrip >= 0.015) ? MediaFrameParity.maximumProtectedFragments : 6
+        return fragmentCount <= maxCount
+            && Double(payloadBytes + MediaFragment.maximumPayloadBytes) <= perFrameBudget * budgetScale
     }
 
     private func sendFrame(_ packet: VideoPacket) {
@@ -1099,7 +1176,11 @@ public final class MediaSession: @unchecked Sendable {
             }
             if transaction != nil { transaction?.frameSubmitted = true }
             nextFrameID += 1
-            if target.1 == .udp { enqueue(fragments) }
+            if target.1 == .udp {
+                let parity = shouldEmitParity(isIDR: isIDR, fragmentCount: fragments.count, payloadBytes: bytes)
+                    ? (try? MediaFrameParity.make(header: header, frameBytes: bytes, fragments: fragments)) : nil
+                enqueue(fragments, parity: parity)
+            }
             else {
                 let peer = target.1 == .tcp ? videoPeer : control
                 guard let peer else { requestRecovery(); return }
@@ -1193,6 +1274,7 @@ public final class MediaSession: @unchecked Sendable {
             : feedback.header
         var accepted = feedback
         if feedback.kind == .nack {
+            lastHostNackAt = SessionClock.now
             let submitted = originalSubmittedCounts[targetHeader] ?? 0
             let ranges = feedback.missingRanges.compactMap { range -> MediaFragmentRange? in
                 let first = Int(range.first), end = min(submitted, Int(range.first) + Int(range.count))
@@ -1206,7 +1288,7 @@ public final class MediaSession: @unchecked Sendable {
             deliveryEstimator.add(max(0, SessionClock.now - sent.at - sent.paced), at: SessionClock.now)
         }
         if (feedback.kind == .reassembled || feedback.kind == .decoded),
-           sentHeaders.contains(feedback.header), reassembledAtPeer.count < MediaBufferLimits.receiveFrameWindow {
+           sentHeaders.contains(feedback.header), reassembledAtPeer.count < bufferLimits.maximumFrames {
             reassembledAtPeer.insert(feedback.header)
             discardQueued(feedback.header)
         }
@@ -1264,19 +1346,30 @@ public final class MediaSession: @unchecked Sendable {
         }
     }
 
-    private func enqueue(_ fragments: [MediaFragment], repair: Bool = false) {
+    private func enqueue(_ fragments: [MediaFragment], repair: Bool = false, parity: MediaFrameParity? = nil) {
         guard !fragments.isEmpty else { return }
         let kindByte: UInt8 = repair && viewerAcceptsMarkedRepairs ? Self.repairedFragmentKind : 3
+        let encodedParity: Data? = parity.map { value in
+            let payload = value.encode()
+            var data = Data(capacity: 1 + payload.count)
+            data.append(Self.parityDatagramKind)
+            data.append(payload)
+            return data
+        }
         let bytes = fragments.reduce(0) { $0 + 1 + MediaFragment.encodedHeaderBytes + $1.payload.count }
+            + (encodedParity?.count ?? 0)
         guard bytes <= 32 * 1024 * 1024 - pendingDatagramBytes else { requestRecovery(); return }
         var encoded: [Datagram] = []
-        encoded.reserveCapacity(fragments.count)
+        encoded.reserveCapacity(fragments.count + (encodedParity == nil ? 0 : 1))
         for fragment in fragments {
             var data = Data(capacity: 1 + MediaFragment.encodedHeaderBytes + fragment.payload.count)
             data.append(kindByte)
             data.append(fragment.encode())
             encoded.append(Datagram(header: fragment.header, fragmentIndex: fragment.fragmentIndex,
                                     data: data, repair: repair))
+        }
+        if let parity, let encodedParity {
+            encoded.append(Datagram(header: parity.header, fragmentIndex: nil, data: encodedParity, repair: false))
         }
         pendingDatagramBytes += bytes
         if repair, datagramOffset < pendingDatagrams.count {
@@ -1327,8 +1420,8 @@ public final class MediaSession: @unchecked Sendable {
                 return
             }
             guard sendDatagram(item.data, using: peer, repair: item.repair) else { schedulePacing(after: 0.001); return }
-            if !item.repair {
-                originalSubmittedCounts[item.header] = max(originalSubmittedCounts[item.header] ?? 0, Int(item.fragmentIndex) + 1)
+            if !item.repair, let fragmentIndex = item.fragmentIndex {
+                originalSubmittedCounts[item.header] = max(originalSubmittedCounts[item.header] ?? 0, Int(fragmentIndex) + 1)
             }
             pacingCredit -= Double(item.data.count); pendingDatagramBytes -= item.data.count; datagramOffset += 1
         }

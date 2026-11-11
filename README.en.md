@@ -18,9 +18,10 @@ A native macOS remote desktop app for your own Macs. Connect directly over a LAN
 | --- | --- |
 | Remote control | Mouse (including side buttons 4/5 and 3D relative-mouse lock), keyboard, drag, scroll, trackpad pinch/rotate/smart-magnify gestures, and floating fullscreen controls |
 | Self-hosted relay | Single-node full-session relay by device ID, with optional direct path and separate control/media routing |
+| Route quality benchmark | Before connecting, benchmark Direct (UDP/TCP) and each Relay node (auto-punch, pure relay UDP, pure relay TCP) over 15 s / 30 s (default) / 1 min with real video traffic and UDP packet-loss metrics, then connect with one click |
 | Video transport | Updated peers prefer encrypted UDP, recover or fall back to TCP automatically, and keep input on a reliable channel |
-| Immediate cursor | Updated peers separate the cursor from video to reduce duplicate pointers; optional system shape synchronization falls back to a generic arrow |
-| Video settings | Manual choices cap automatic adaptation in the new media mode; up to 240 fps and a 100 Mbps target bitrate, 1:1 original scaling, optional HEVC 4:4:4 True Color (when supported in hardware), and progressive static-frame refinement; rates above 60 fps require both ends to be updated |
+| Immediate cursor | Updated peers negotiate cursor separation in the single initial stream startup to avoid post-connect stream restarts and duplicate pointers; optional system shape synchronization falls back to a generic arrow |
+| Video settings | Manual choices cap automatic adaptation in the new media mode; up to 240 fps and a 100 Mbps target bitrate, 1:1 original scaling, optional HEVC 4:4:4 True Color (when supported in hardware), automatic recovery back to native resolution after transient congestion, and progressive static-frame refinement; rates above 60 fps require both ends to be updated |
 | Clipboard & files | Focus-aware text and image sync; drag-and-drop onto the canvas or clipboard file transfer over a dedicated chunked channel with recipient confirmation |
 | Audio & multi-display | Updated peers support seamless in-session display switching and optional low-latency ScreenCaptureKit system audio streaming (48 kHz stereo Opus) |
 | Keyboard & permissions | Fullscreen system shortcuts, Caps Lock input-source switching, and permission guidance with a draggable app icon |

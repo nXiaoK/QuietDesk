@@ -33,6 +33,8 @@ public enum MessageKind: UInt8, Sendable {
     case displayControl = 37
     // Sent only after the host advertises remoteAudioV1 and the viewer requests remote audio.
     case audioControl = 38, audioFrame = 39
+    // Sent only after the host advertises qualityProbeV1 during a bounded manual route quality benchmark.
+    case qualityProbeControl = 40
 }
 
 public struct Message: Sendable {
@@ -228,7 +230,9 @@ public struct Hello: Codable, Sendable {
     public let trackpadGesturesV1: Bool?
     // The host accepts cursorRequestID + independentCursor in the initial StreamSettingsRequest so capture starts once without cursor reconfiguration.
     public let initialCursorNegotiationV1: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil, displaySwitchingV1: Bool? = nil, displays: [RemoteDisplayInfo]? = nil, selectedDisplayID: UInt32? = nil, remoteAudioV1: Bool? = nil, relativeMouseV1: Bool? = nil, trackpadGesturesV1: Bool? = nil, initialCursorNegotiationV1: Bool? = nil) {
+    // The host supports bounded continuous test-frame generation during manual route quality benchmarks even on a static desktop.
+    public let qualityProbeV1: Bool?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil, displaySwitchingV1: Bool? = nil, displays: [RemoteDisplayInfo]? = nil, selectedDisplayID: UInt32? = nil, remoteAudioV1: Bool? = nil, relativeMouseV1: Bool? = nil, trackpadGesturesV1: Bool? = nil, initialCursorNegotiationV1: Bool? = nil, qualityProbeV1: Bool? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -270,6 +274,7 @@ public struct Hello: Codable, Sendable {
         self.relativeMouseV1 = relativeMouseV1
         self.trackpadGesturesV1 = trackpadGesturesV1
         self.initialCursorNegotiationV1 = initialCursorNegotiationV1
+        self.qualityProbeV1 = qualityProbeV1
     }
 
     public func validate() throws {

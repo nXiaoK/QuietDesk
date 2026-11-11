@@ -95,8 +95,10 @@ final class DeskModel: ObservableObject {
             UserDefaults.standard.set(relayPeerAssist.rawValue, forKey: "relayPeerAssist")
             guard oldValue != relayPeerAssist else { return }
             sibling?.relayPeerAssist = relayPeerAssist
-            viewerSession.relayBridge?.setPeerAssistMode(relayPeerAssist)
-            viewerSession.mediaRelayBridge?.setPeerAssistMode(relayPeerAssist)
+            if activeRouteBenchmarkOverride == nil {
+                viewerSession.relayBridge?.setPeerAssistMode(relayPeerAssist)
+                viewerSession.mediaRelayBridge?.setPeerAssistMode(relayPeerAssist)
+            }
             relayHostRegistrations.forEach { $0.setPeerAssistMode(relayPeerAssist) }
         }
     }
@@ -161,6 +163,35 @@ final class DeskModel: ObservableObject {
     }
     var onConnectionDiagnosticReport: ((ConnectionDiagnosticReport) -> Void)?
     private var connectionDiagnostics: ViewerConnectionDiagnostics?
+
+    struct RouteBenchmarkAttemptSnapshot {
+        let report: ConnectionDiagnosticReport?
+        let connectMilliseconds: Double?
+        let firstFrameMilliseconds: Double?
+        let finalRouteLabel: String
+        let appliedQualitySummary: String
+        let hostSupportsQualityProbe: Bool
+        let failureReason: String?
+    }
+
+    private struct RouteBenchmarkOverride {
+        let mediaTCPOnly: Bool
+        let relayPeerAssist: RelayPeerAssistMode
+        let probeDurationSeconds: Int
+        let startedAt: TimeInterval
+        var helloAt: TimeInterval?
+        var firstFrameAt: TimeInterval?
+        var hostSupportsQualityProbe = false
+        var lastRouteLabel = ""
+        var lastAppliedQualitySummary = ""
+    }
+
+    @Published private(set) var isRunningRouteBenchmark = false
+    private var activeRouteBenchmarkOverride: RouteBenchmarkOverride?
+    private var lastRouteBenchmarkReport: ConnectionDiagnosticReport?
+    private var effectiveMediaTCPOnly: Bool { activeRouteBenchmarkOverride?.mediaTCPOnly ?? mediaTCPOnly }
+    private var effectiveRelayPeerAssist: RelayPeerAssistMode { activeRouteBenchmarkOverride?.relayPeerAssist ?? relayPeerAssist }
+    private var effectiveAutoReconnect: Bool { activeRouteBenchmarkOverride == nil && autoReconnect }
     @Published private(set) var performanceDiagnosticsEnabled = false
     @Published var showFullScreenStatistics = UserDefaults.standard.bool(forKey: "showFullScreenStatistics") {
         didSet { UserDefaults.standard.set(showFullScreenStatistics, forKey: "showFullScreenStatistics") }
@@ -1523,7 +1554,8 @@ final class DeskModel: ObservableObject {
                             remoteAudioV1: true,
                             relativeMouseV1: true,
                             trackpadGesturesV1: true,
-                            initialCursorNegotiationV1: true)))
+                            initialCursorNegotiationV1: true,
+                            qualityProbeV1: true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -1815,7 +1847,7 @@ final class DeskModel: ObservableObject {
         let viewer = viewerSession
         let renderer = canvas.makeMediaReceiver(diagnostics: performanceDiagnostics)
         let media = try MediaSession.viewer(control: peer, key: target.key, host: viewer.transportHost ?? target.address, port: viewer.transportPort ?? target.port,
-                                            settings: settings, udpEnabled: !mediaTCPOnly, relayRouting: relayRouting,
+                                            settings: settings, udpEnabled: !effectiveMediaTCPOnly, relayRouting: relayRouting,
                                             relayedDatagram: viewer.usesRelayControl)
         media.diagnostics = performanceDiagnostics
         if let diagnostics = connectionDiagnostics {
@@ -1851,11 +1883,19 @@ final class DeskModel: ObservableObject {
         channel.configureMedia { [weak media] in media?.receive($0) ?? false }
         channel.configureReliableData { [weak media] in media?.sendReliableData($0) }
         renderer.reportDecodeTime { [weak media] milliseconds in media?.recordComputeTiming(decodeMilliseconds: milliseconds) }
-        media.onVideo = { [weak renderer] frame, completion in
+        media.onVideo = { [weak self, weak viewer, weak renderer] frame, completion in
             guard let renderer else { completion(false); return }
             channel.mediaFrameReceived(frame.header)
-            renderer.receive(frame) { succeeded in
-                if succeeded { channel.recordFrame() }
+            renderer.receive(frame) { [weak self, weak viewer] succeeded in
+                if succeeded {
+                    channel.recordFrame()
+                    if let self, let viewer {
+                        DispatchQueue.main.async {
+                            guard self.viewerSession === viewer else { return }
+                            self.noteRouteBenchmarkFirstFrameIfNeeded()
+                        }
+                    }
+                }
                 completion(succeeded)
             }
         }
@@ -1922,7 +1962,7 @@ final class DeskModel: ObservableObject {
                         do {
                             viewer.mediaRelayBridge?.stop()
                             let bridge = try RelayViewerBridge(endpoint: relay.endpoint, accessKey: access, deviceID: relay.deviceID,
-                                                              trustedCertificate: target.relayCertificate, peerAssist: self.relayPeerAssist)
+                                                              trustedCertificate: target.relayCertificate, peerAssist: self.effectiveRelayPeerAssist)
                             viewer.mediaRelayBridge = bridge
                             self.observePeerPath(bridge, viewer: viewer)
                             bridge.onReady = { [weak self, weak viewer, weak bridge] port in
@@ -1954,7 +1994,7 @@ final class DeskModel: ObservableObject {
                     guard let self, let viewer, let peer, self.viewerSession === viewer, self.peer === peer,
                           !self.systemSleeping, !self.idlePolicy.isPaused, !self.pauseTransmission.desiredPaused else { return }
                     if !viewer.usesRelayControl, viewer.relayTargetVerified, target.relay?.strategy == .automatic,
-                       self.autoReconnect || !viewer.mediaCommitted {
+                       self.effectiveAutoReconnect || !viewer.mediaCommitted {
                         // A recent relay fallback failed: keep recovering over the direct route instead of alternating.
                         guard self.relayFallbackCooldown.allows(now: SessionClock.now) else { return }
                         viewer.relayFallbackRequested = true
@@ -2407,8 +2447,8 @@ final class DeskModel: ObservableObject {
             guard viewer.relayBridge == nil else { return }
             connectionDiagnostics?.waiting(.negotiating, node: relay.endpoint.address)
             do {
-                let bridge = try RelayViewerBridge(endpoint: relay.endpoint, accessKey: access, deviceID: relay.deviceID, udpEnabled: !mediaTCPOnly,
-                                                  trustedCertificate: target.relayCertificate, peerAssist: relayPeerAssist)
+                let bridge = try RelayViewerBridge(endpoint: relay.endpoint, accessKey: access, deviceID: relay.deviceID, udpEnabled: !effectiveMediaTCPOnly,
+                                                  trustedCertificate: target.relayCertificate, peerAssist: effectiveRelayPeerAssist)
                 viewer.relayBridge = bridge; viewer.usesRelayControl = true
                 observePeerPath(bridge, viewer: viewer)
                 active = true; working = true
@@ -2433,7 +2473,7 @@ final class DeskModel: ObservableObject {
                             let reason = error.localizedDescription
                             self.recordDisconnect(reason); self.clearSession()
                             if self.failOverRelay(from: target, reason: reason) { return }
-                            if retryable, self.autoReconnect, self.target != nil {
+                            if retryable, self.effectiveAutoReconnect, self.target != nil {
                                 if relay.strategy == .automatic, !target.address.isEmpty {
                                     self.relaySelectedForTarget = false; self.relayFallbackFailed()
                                 }
@@ -2538,14 +2578,14 @@ final class DeskModel: ObservableObject {
                 self.clearSession()
                 if viaRelay, relayError != nil, !wasConnected, self.failOverRelay(from: target, reason: reason) { return }
                 if !viaRelay, mayTryAlternate || mediaFallback, target.relay?.strategy == .automatic,
-                   !wasConnected || self.autoReconnect || mediaFallback,
+                   !wasConnected || self.effectiveAutoReconnect || mediaFallback,
                    !wasConnected || verifiedTarget {
                     self.relaySelectedForTarget = true
                     self.relayFallbackAttempted = true
                     // Leaving an established session is a reconnect, so idle pause still defers it.
                     if wasConnected { self.reconnecting = true }
                     self.beginConnection(target)
-                } else if retryable, self.autoReconnect, self.target != nil {
+                } else if retryable, self.effectiveAutoReconnect, self.target != nil {
                     if viaRelay, target.relay?.strategy == .automatic, !target.address.isEmpty {
                         self.relaySelectedForTarget = false; self.relayFallbackFailed()
                     }
@@ -2587,7 +2627,7 @@ final class DeskModel: ObservableObject {
         status = wait.status
         reconnectTask = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(wait.delay)) } catch { return }
-            guard let self, self.generation == token, let target = self.target, self.autoReconnect,
+            guard let self, self.generation == token, let target = self.target, self.effectiveAutoReconnect,
                   !Task.isCancelled, self.peer == nil else { return }
             self.beginConnection(target)
         }
@@ -2647,7 +2687,7 @@ final class DeskModel: ObservableObject {
     }
 
     private func saveConnection(name: String) {
-        guard !savedTarget, let target else { return }
+        guard activeRouteBenchmarkOverride == nil, !savedTarget, let target else { return }
         do {
             let existing = ConnectionStore.matching(connections, address: target.address, port: target.port, preferredID: target.recordID, relay: target.relay)
             var record = existing
@@ -2674,6 +2714,7 @@ final class DeskModel: ObservableObject {
 
     private func recordDisconnect(_ reason: String) {
         DiagnosticLog.shared.record(.connectionClosed, role: diagnosticRole)
+        guard activeRouteBenchmarkOverride == nil else { return }
         let time = DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .medium)
         lastDisconnect = "\(time) · \(reason)"
         UserDefaults.standard.set(lastDisconnect, forKey: "lastDisconnect")
@@ -2775,6 +2816,9 @@ final class DeskModel: ObservableObject {
         case .streamSettingsRequest:
             let request = try Wire.readJSON(StreamSettingsRequest.self, message.payload)
             applyHostVideoSettings(request, peer: peer)
+        case .qualityProbeControl:
+            let control = try QualityProbeControl.read(message.payload)
+            hostSession.streamer?.setQualityProbe(enabled: control.enabled, durationSeconds: control.durationSeconds)
         default: throw DeskError.invalid("收到当前角色不支持的消息")
         }
     }
@@ -2856,12 +2900,32 @@ final class DeskModel: ObservableObject {
             }
             viewerSession.helloReceived = true
             viewerSession.helloDeadline.cancel()
+            if var override = activeRouteBenchmarkOverride {
+                if override.helloAt == nil { override.helloAt = SessionClock.now }
+                override.hostSupportsQualityProbe = hello.qualityProbeV1 == true
+                activeRouteBenchmarkOverride = override
+                if hello.qualityProbeV1 == true {
+                    peer.send(try QualityProbeControl(enabled: true, durationSeconds: override.probeDurationSeconds).message())
+                }
+            }
             if hello.sessionTerminationV1 == true {
                 viewerSession.terminationSubscribed = true
                 peer.send(try SessionTermination(.subscribe).message())
             }
             if viewerSession.usesRelayControl { relayFallbackAttempted = false; relayFallbackCooldown.reset() }
-            dataChannel?.configureVideo(canvas.makeVideoReceiver(diagnostics: performanceDiagnostics))
+            let legacyReceiver = canvas.makeVideoReceiver(diagnostics: performanceDiagnostics)
+            let legacyViewer = viewerSession
+            dataChannel?.configureVideo { [weak self, weak legacyViewer] packet, acknowledged in
+                legacyReceiver(packet) {
+                    if let self, let legacyViewer {
+                        DispatchQueue.main.async {
+                            guard self.viewerSession === legacyViewer else { return }
+                            self.noteRouteBenchmarkFirstFrameIfNeeded()
+                        }
+                    }
+                    acknowledged()
+                }
+            }
             connected = true
             connectedSince = Date()
             sessionTraffic = peer.trafficMeter.snapshot().totals.runningTotalLabel
@@ -3022,7 +3086,7 @@ final class DeskModel: ObservableObject {
                 sendCursorRequest()
             }
             supportsRemoteAudio = hello.remoteAudioV1 == true
-            if supportsRemoteAudio {
+            if supportsRemoteAudio, activeRouteBenchmarkOverride == nil {
                 let viewer = viewerSession
                 let player = ViewerAudioPlayer(onError: { [weak self, weak viewer] message in
                     DispatchQueue.main.async {
@@ -3061,13 +3125,15 @@ final class DeskModel: ObservableObject {
             publishSessionPause()
             sendNextSessionPause()
             if let token = pauseTransmission.freshFrameToken { scheduleFreshFrameTimeout(token, peer: peer) }
-            if supportsSessionUnlock, hello.screenLocked == true, autoUnlockEnabled { scheduleAutoUnlock(peer: peer) }
-            // Sent after the cursor request so the host applies it once cursor capture has settled.
-            if supportsSessionEffects, let remembered = sessionEffectsMemory.connectionState {
-                let supported = SessionEffectsState(muted: remembered.muted, privacy: remembered.privacy,
-                                                    lockOnDisconnect: remembered.lockOnDisconnect && supportsSessionLock,
-                                                    dimBuiltInDisplay: remembered.dimBuiltInDisplay && hostDisplayDimmable)
-                if supported != SessionEffectsState() { requestSessionEffects(supported, automatic: true) }
+            if activeRouteBenchmarkOverride == nil {
+                if supportsSessionUnlock, hello.screenLocked == true, autoUnlockEnabled { scheduleAutoUnlock(peer: peer) }
+                // Sent after the cursor request so the host applies it once cursor capture has settled.
+                if supportsSessionEffects, let remembered = sessionEffectsMemory.connectionState {
+                    let supported = SessionEffectsState(muted: remembered.muted, privacy: remembered.privacy,
+                                                        lockOnDisconnect: remembered.lockOnDisconnect && supportsSessionLock,
+                                                        dimBuiltInDisplay: remembered.dimBuiltInDisplay && hostDisplayDimmable)
+                    if supported != SessionEffectsState() { requestSessionEffects(supported, automatic: true) }
+                }
             }
         case .sessionPauseResult:
             guard viewerSession.helloReceived, supportsSessionPause else { throw DeskError.invalid("当前连接未启用空闲暂停") }
@@ -3822,7 +3888,7 @@ final class DeskModel: ObservableObject {
     }
 
     private func saveVideoPreference(_ settings: StreamSettings) {
-        guard let target,
+        guard activeRouteBenchmarkOverride == nil, let target,
               let record = ConnectionStore.matching(connections, address: target.address, port: target.port, preferredID: target.recordID, relay: target.relay),
               let index = connections.firstIndex(where: { $0.id == record.id }),
               connections[index].videoSettings != settings
@@ -3850,7 +3916,7 @@ final class DeskModel: ObservableObject {
     }
 
     /// Idle time counts only while nobody attends the session: its window is unfocused or cannot be seen.
-    private var sessionWindowAttended: Bool { sessionWindowFocused && sessionWindowVisible }
+    private var sessionWindowAttended: Bool { activeRouteBenchmarkOverride != nil || (sessionWindowFocused && sessionWindowVisible) }
 
     private func belongsToSessionWindow(_ window: NSWindow) -> Bool {
         var current: NSWindow? = window
@@ -3934,7 +4000,7 @@ final class DeskModel: ObservableObject {
         pauseTransmission.choose(paused: false)
         sessionPauseStatus = "正在恢复画面…"
         publishSessionPause()
-        if reconnectDeferredForIdle, autoReconnect, let target {
+        if reconnectDeferredForIdle, effectiveAutoReconnect, let target {
             reconnectDeferredForIdle = false
             freshFrameRequiredOnReconnect = true
             pauseTransmission.requireFreshFrame()
@@ -4426,8 +4492,9 @@ final class DeskModel: ObservableObject {
     private var clipboardControlsRemote: Bool { mode == .viewer && controlling }
 
     private func sendClipboardPreference(to peer: Peer) throws {
-        let receives = !sessionInputSuspended && !hostSession.paused && (mode == .viewer ? !controlling : true)
-        peer.send(try Wire.json(.clipboardSettings, ClipboardPreference(enabled: clipboardEnabled,
+        let enabled = activeRouteBenchmarkOverride == nil && clipboardEnabled
+        let receives = enabled && !sessionInputSuspended && !hostSession.paused && (mode == .viewer ? !controlling : true)
+        peer.send(try Wire.json(.clipboardSettings, ClipboardPreference(enabled: enabled,
             session: clipboardSession, receivesAutomaticUpdates: receives)))
         lastClipboardReceivePreference = receives
     }
@@ -4477,7 +4544,7 @@ final class DeskModel: ObservableObject {
     }
 
     private func updateClipboardSync() {
-        let enabled = connected && supportsClipboard && clipboardEnabled && remoteClipboardEnabled
+        let enabled = activeRouteBenchmarkOverride == nil && connected && supportsClipboard && clipboardEnabled && remoteClipboardEnabled
         canvas.synchronizesClipboard = enabled
         if enabled, clipboardSync == nil, let peer, let clipboardSession {
             let channel = dataChannel
@@ -4695,7 +4762,7 @@ final class DeskModel: ObservableObject {
             connectionDiagnostics?.waiting(.paused)
             candidate?.close("本机进入睡眠，等待唤醒后重新连接")
             active = true
-            reconnecting = autoReconnect
+            reconnecting = effectiveAutoReconnect
             freshFrameRequiredOnReconnect = true
             status = "系统即将睡眠，连接已暂停"
         }
@@ -4719,7 +4786,7 @@ final class DeskModel: ObservableObject {
             let candidate = peer
             clearSession()
             candidate?.close("系统唤醒，重新建立连接")
-            guard autoReconnect else {
+            guard effectiveAutoReconnect else {
                 stop(reason: "系统已唤醒，自动重连已关闭")
                 status = "系统已唤醒，请重新连接"
                 return
@@ -4778,6 +4845,18 @@ final class DeskModel: ObservableObject {
     }
 
     private func clearSession() {
+        if activeRouteBenchmarkOverride != nil {
+            let route = (mediaTransportStatus.isEmpty || (mediaTransportStatus == "TCP 兼容模式" && !connected))
+                ? controlTransportStatus
+                : mediaTransportStatus
+            if !route.isEmpty, route != "尚未连接" {
+                activeRouteBenchmarkOverride?.lastRouteLabel = route
+            }
+            if let state = activeVideoState {
+                activeRouteBenchmarkOverride?.lastAppliedQualitySummary =
+                    "\(state.width)×\(state.height) · \(state.settings.framesPerSecond) fps · \(state.settings.megabits) Mbps" + activeVideoFormatSuffix
+            }
+        }
         reconnectWait = nil
         connectionDiagnostics?.detach()
         if mode == .viewer, let activity { ProcessInfo.processInfo.endActivity(activity); self.activity = nil }
@@ -5031,7 +5110,285 @@ final class DeskModel: ObservableObject {
         clipboardStatus = ""
         inputStatus = ""
         status = mode == .host ? "共享已停止" : "已断开连接"
-        if let report { onConnectionDiagnosticReport?(report) }
+        if activeRouteBenchmarkOverride != nil {
+            lastRouteBenchmarkReport = report
+        } else if let report {
+            onConnectionDiagnosticReport?(report)
+        }
+    }
+
+    private func noteRouteBenchmarkFirstFrameIfNeeded() {
+        guard activeRouteBenchmarkOverride != nil, activeRouteBenchmarkOverride?.firstFrameAt == nil else { return }
+        activeRouteBenchmarkOverride?.firstFrameAt = SessionClock.now
+    }
+
+    func setRouteBenchmarkMode(_ running: Bool) {
+        guard mode == .viewer else { return }
+        if running {
+            isRunningRouteBenchmark = true
+        } else {
+            if activeRouteBenchmarkOverride != nil || active || working || connected || reconnecting {
+                _ = finishRouteBenchmarkAttempt(reason: "已结束线路测速")
+            }
+            isRunningRouteBenchmark = false
+        }
+    }
+
+    var liveRouteBenchmarkTelemetry: String {
+        var parts: [String] = []
+        let route = mediaRouteSummary
+        if !route.isEmpty, route != "TCP 兼容模式" || connected {
+            parts.append(route)
+        }
+        if !traffic.isEmpty { parts.append(traffic) }
+        if !frameRate.isEmpty { parts.append(frameRate) }
+        if !latency.isEmpty, latency != "— ms" { parts.append("往返 \(latency)") }
+        if !videoQualitySummary.isEmpty { parts.append("画质 \(videoQualitySummary)") }
+        return parts.joined(separator: " · ")
+    }
+
+    func buildRouteBenchmarkPlan(for record: ConnectionRecord? = nil) -> RouteBenchmarkPlan {
+        var configured = relayNodes.compactMap { try? RelayEndpoint(address: $0) }
+        if let record, let relay = record.relay, !configured.contains(relay.endpoint) {
+            configured.insert(relay.endpoint, at: 0)
+        }
+        var credentialed = Set<String>()
+        for endpoint in configured {
+            if (try? KeyStore.load(account: endpoint.credentialAccount)) != nil {
+                credentialed.insert(endpoint.address)
+            }
+        }
+        if let record {
+            let deviceIDString: String
+            if let relay = record.relay {
+                deviceIDString = relay.deviceID.uuidString.lowercased()
+            } else if selectedConnectionID == record.id {
+                deviceIDString = targetRelayDeviceID
+            } else {
+                deviceIDString = ""
+            }
+            return RouteBenchmarkPlanner.plan(
+                address: record.address,
+                portString: String(record.port),
+                relayEnabled: relayEnabled,
+                relayDeviceIDString: deviceIDString,
+                preferredNodeAddress: record.relay?.endpoint.address ?? relayNodeChoice,
+                configuredNodes: configured,
+                nodesWithCredentials: credentialed
+            )
+        }
+        return RouteBenchmarkPlanner.plan(
+            address: address,
+            portString: port,
+            relayEnabled: relayEnabled,
+            relayDeviceIDString: targetRelayDeviceID,
+            preferredNodeAddress: relayNodeChoice,
+            configuredNodes: configured,
+            nodesWithCredentials: credentialed
+        )
+    }
+
+    func resolveRouteBenchmarkPairingKey(for record: ConnectionRecord? = nil) throws -> PairingKey {
+        if sibling?.hasIncomingControlConnection == true {
+            throw DeskError.invalid("这台 Mac 正在被另一台 Mac 控制；对方断开后才能测试其他 Mac 的线路质量")
+        }
+        if let record {
+            if let key = try KeyStore.load(account: "remote." + record.id.uuidString) {
+                return key
+            }
+            let trimmed = viewerCode.trimmingCharacters(in: .whitespacesAndNewlines)
+            if selectedConnectionID == record.id, !trimmed.isEmpty {
+                return try PairingKey(code: trimmed)
+            }
+            throw DeskError.invalid("此记录尚未保存本机配对凭据，请先在连接界面补录原配对码")
+        }
+        let trimmed = viewerCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            return try PairingKey(code: trimmed)
+        }
+        if let selectedID = selectedConnectionID,
+           let key = try KeyStore.load(account: "remote." + selectedID.uuidString) {
+            return key
+        }
+        let cleanAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsedPort = UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 5908
+        if !cleanAddress.isEmpty,
+           let matched = ConnectionStore.matching(connections, address: cleanAddress, port: parsedPort),
+           let key = try KeyStore.load(account: "remote." + matched.id.uuidString) {
+            return key
+        }
+        if let deviceUUID = UUID(uuidString: targetRelayDeviceID.trimmingCharacters(in: .whitespacesAndNewlines)),
+           let matched = connections.first(where: { $0.relay?.deviceID == deviceUUID }),
+           let key = try KeyStore.load(account: "remote." + matched.id.uuidString) {
+            return key
+        }
+        return try PairingKey(code: viewerCode)
+    }
+
+    func beginRouteBenchmarkAttempt(
+        candidate: RouteBenchmarkCandidate,
+        key: PairingKey,
+        recordPreference: ConnectionRecord?,
+        probeDurationSeconds: Int
+    ) throws {
+        guard mode == .viewer else { throw DeskError.invalid("仅控制端可执行线路质量实测") }
+        guard !active, !working, !connected, !reconnecting else {
+            throw DeskError.invalid("当前已有活动连接，请先断开后再执行线路测速")
+        }
+        if sibling?.hasIncomingControlConnection == true {
+            throw DeskError.invalid("这台 Mac 正在被另一台 Mac 控制；对方断开后才能测试其他 Mac 的线路质量")
+        }
+
+        let attemptTarget: Target
+        if candidate.kind.usesRelay {
+            guard let relayEndpoint = candidate.relayEndpoint, let deviceID = candidate.relayDeviceID else {
+                throw DeskError.invalid("中继候选线路缺少节点或设备标识")
+            }
+            guard let access = try KeyStore.load(account: relayEndpoint.credentialAccount) else {
+                throw DeskError.invalid("中继节点 \(relayEndpoint.host) 尚未保存节点接入码")
+            }
+            let info = try RelayConnectionInfo(endpoint: relayEndpoint, deviceID: deviceID, strategy: .relay)
+            let certificate = try relayCertificate(for: relayEndpoint)
+            let route = RelayRoute(info: info, accessKey: access.data, certificate: certificate)
+            let traffic = try TrafficEndpoint(address: relayEndpoint.host, port: relayEndpoint.port)
+            attemptTarget = Target(
+                address: "",
+                port: 5908,
+                key: key,
+                recordID: recordPreference?.id,
+                trafficEndpoint: traffic,
+                relay: info,
+                relayAccessKey: access.data,
+                relayCertificate: certificate,
+                relayRoutes: [route],
+                relayRoutesOrdered: true
+            )
+            relaySelectedForTarget = true
+        } else {
+            let traffic = try TrafficEndpoint(address: candidate.address, port: candidate.port)
+            attemptTarget = Target(
+                address: candidate.address,
+                port: candidate.port,
+                key: key,
+                recordID: recordPreference?.id,
+                trafficEndpoint: traffic
+            )
+            relaySelectedForTarget = false
+        }
+
+        isRunningRouteBenchmark = true
+        lastRouteBenchmarkReport = nil
+        remoteName = ""
+        connectionError = nil
+        let clampedProbe = min(QualityProbeControl.maximumDurationSeconds,
+                               max(QualityProbeControl.minimumDurationSeconds, probeDurationSeconds))
+        activeRouteBenchmarkOverride = RouteBenchmarkOverride(
+            mediaTCPOnly: candidate.kind.mediaTCPOnly,
+            relayPeerAssist: candidate.kind.relayPeerAssist,
+            probeDurationSeconds: clampedProbe,
+            startedAt: SessionClock.now
+        )
+        target = attemptTarget
+        relayFallbackAttempted = false
+        relayFallbackCooldown.reset()
+        idlePolicy = SessionIdlePolicy(now: SessionClock.now)
+        _ = idlePolicy.attentionChanged(now: SessionClock.now, attended: true, suppressWake: true)
+        pauseTransmission = SessionPauseTransmission()
+        wakeInputGate = SessionWakeInputGate()
+        reconnectDeferredForIdle = false
+        freshFrameRequiredOnReconnect = false
+        let saved = recordPreference?.videoSettings
+        viewerQualityPolicy = ViewerQualityPolicy(preferred: saved.flatMap { (try? $0.validateControlValues()) != nil ? $0 : nil })
+        savedChromaPreference = recordPreference?.chromaSubsampling
+        savedTarget = true
+        retryBackoff.reset()
+        generation = UUID()
+        connectionDiagnostics = ViewerConnectionDiagnostics()
+        beginMetrics()
+        beginConnection(attemptTarget)
+    }
+
+    func finishRouteBenchmarkAttempt(reason: String = "线路测速结束") -> RouteBenchmarkAttemptSnapshot {
+        if var override = activeRouteBenchmarkOverride {
+            let route = (mediaTransportStatus.isEmpty || (mediaTransportStatus == "TCP 兼容模式" && !connected))
+                ? controlTransportStatus
+                : mediaTransportStatus
+            if !route.isEmpty, route != "尚未连接" {
+                override.lastRouteLabel = route
+            }
+            if let state = activeVideoState {
+                override.lastAppliedQualitySummary =
+                    "\(state.width)×\(state.height) · \(state.settings.framesPerSecond) fps · \(state.settings.megabits) Mbps" + activeVideoFormatSuffix
+            }
+            activeRouteBenchmarkOverride = override
+            if override.hostSupportsQualityProbe, connected, let peer,
+               let stopProbe = try? QualityProbeControl(enabled: false, durationSeconds: 0).message() {
+                peer.send(stopProbe)
+            }
+        }
+        let preStopFailure = connectionError
+        if active || working || connected || reconnecting || connectionDiagnostics != nil || peer != nil {
+            stop(reason: reason)
+        }
+        let override = activeRouteBenchmarkOverride
+        let report = lastRouteBenchmarkReport
+        let failure = connectionError ?? preStopFailure
+        activeRouteBenchmarkOverride = nil
+        lastRouteBenchmarkReport = nil
+        connectionError = nil
+        if mode == .viewer { status = "准备就绪" }
+
+        let connectMs = override.flatMap { ov in ov.helloAt.map { max(0, ($0 - ov.startedAt) * 1000) } }
+        let firstFrameMs = override.flatMap { ov in ov.firstFrameAt.map { max(0, ($0 - ov.startedAt) * 1000) } }
+        let routeLabel = (override?.lastRouteLabel.isEmpty == false) ? override!.lastRouteLabel : "未建立媒体路径"
+        let qualitySummary = override?.lastAppliedQualitySummary ?? ""
+
+        return RouteBenchmarkAttemptSnapshot(
+            report: report,
+            connectMilliseconds: connectMs,
+            firstFrameMilliseconds: firstFrameMs,
+            finalRouteLabel: routeLabel,
+            appliedQualitySummary: qualitySummary,
+            hostSupportsQualityProbe: override?.hostSupportsQualityProbe ?? false,
+            failureReason: failure
+        )
+    }
+
+    func connectUsingBenchmarkCandidate(_ candidate: RouteBenchmarkCandidate, record: ConnectionRecord?) {
+        setRouteBenchmarkMode(false)
+        guard !active, !working else { return }
+        do {
+            let key = try resolveRouteBenchmarkPairingKey(for: record)
+            viewerCode = key.code
+        } catch {
+            connectionError = error.localizedDescription
+            return
+        }
+
+        if let record {
+            selectedConnectionID = record.id
+            if !record.address.isEmpty {
+                address = record.address
+                port = String(record.port)
+            }
+        }
+
+        mediaTCPOnly = candidate.kind.mediaTCPOnly
+        if candidate.kind.usesRelay, let endpoint = candidate.relayEndpoint, let deviceID = candidate.relayDeviceID {
+            relayPeerAssist = candidate.kind.relayPeerAssist
+            relayNodeChoice = endpoint.address
+            targetRelayDeviceID = deviceID.uuidString.lowercased()
+            relayStrategy = .relay
+            UserDefaults.standard.set(RelayConnectionStrategy.relay.rawValue, forKey: "relayStrategy")
+            UserDefaults.standard.set(targetRelayDeviceID, forKey: "targetRelayDeviceID")
+            connect()
+        } else {
+            address = candidate.address
+            port = String(candidate.port)
+            relayStrategy = .direct
+            UserDefaults.standard.set(RelayConnectionStrategy.direct.rawValue, forKey: "relayStrategy")
+            connect()
+        }
     }
 
     deinit {

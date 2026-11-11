@@ -72,6 +72,7 @@ struct ConnectionSettingsView: View {
     let openCaps: () -> Void
     let openTraffic: () -> Void
     let openEffects: () -> Void
+    var openBenchmark: (() -> Void)? = nil
 
     var body: some View {
         ScrollView {
@@ -86,6 +87,12 @@ struct ConnectionSettingsView: View {
                 }
                 Text(model.systemShortcutStatus).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                if let openBenchmark, !model.connected {
+                    Button(action: openBenchmark) {
+                        Label("连接与中继线路质量实测…", systemImage: "speedometer")
+                    }
+                    .disabled(model.active || model.working)
+                }
                 Button(action: openEffects) { Label("被控端隐私与安全…", systemImage: "lock.shield") }
                 Button(action: openTraffic) { Label("设备历史流量…", systemImage: "chart.bar.xaxis") }
             }

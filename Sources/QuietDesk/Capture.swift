@@ -459,6 +459,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private let queueIdentity = DispatchSpecificKey<Bool>()
     private var idleWaiter: (UUID, CheckedContinuation<Void, Error>)?
     private var watchdog: DispatchSourceTimer?
+    private var qualityProbeUntil: TimeInterval?
+    private var qualityProbeTimer: DispatchSourceTimer?
+    private var qualityProbeTicks: UInt64 = 0
     private let encoderCleanupQueue = DispatchQueue(label: "quietdesk.capture.encoder-cleanup", qos: .userInitiated)
 
     init(diagnostics: PerformanceDiagnostics? = nil) {
@@ -1563,6 +1566,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             frameDropper.reset()
             framePacingTimer?.cancel()
             framePacingTimer = nil
+            stopQualityProbeOnQueue()
             if let waiter = cursorFrameWaiter { finishCursorFrameWaiter(waiter.id, result: .failure(CancellationError())) }
             cursorGate = CursorCaptureGate()
             appliedCursorIncluded = nil
@@ -1695,6 +1699,68 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private func cancelRefinement() {
         refinement.cancel()
         if latestIsRefinement { latest = nil; latestIsRefinement = false; latestRefinementPass = nil }
+    }
+
+    /// Enables or stops bounded test-frame generation on a static screen during a manual route benchmark.
+    func setQualityProbe(enabled: Bool, durationSeconds: Int) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard enabled, durationSeconds > 0 else {
+                self.stopQualityProbeOnQueue()
+                return
+            }
+            let clamped = Double(min(QualityProbeControl.maximumDurationSeconds,
+                                     max(QualityProbeControl.minimumDurationSeconds, durationSeconds)))
+            self.qualityProbeUntil = SessionClock.now + clamped
+            self.qualityProbeTicks = 0
+            let timer: DispatchSourceTimer
+            if let existing = self.qualityProbeTimer {
+                timer = existing
+            } else {
+                timer = DispatchSource.makeTimerSource(queue: self.queue)
+                timer.setEventHandler { [weak self] in self?.tickQualityProbeOnQueue() }
+                self.qualityProbeTimer = timer
+                timer.resume()
+            }
+            timer.schedule(deadline: .now() + .milliseconds(33), repeating: .milliseconds(33), leeway: .milliseconds(5))
+        }
+    }
+
+    private func stopQualityProbeOnQueue() {
+        qualityProbeUntil = nil
+        qualityProbeTicks = 0
+        qualityProbeTimer?.cancel()
+        qualityProbeTimer = nil
+    }
+
+    private func tickQualityProbeOnQueue() {
+        let now = SessionClock.now
+        guard let until = qualityProbeUntil, now < until else {
+            stopQualityProbeOnQueue()
+            return
+        }
+        guard running, captureStarted, !reconfiguring, !sessionPaused, !cursorGate.needsFreshFrame,
+              !frameFlow.mediaHold, !frameFlow.encodingFailed else { return }
+        let targetFPS = max(10, min(30, currentSettings.framesPerSecond))
+        let minIdle = 0.85 / Double(targetFPS)
+        guard latest == nil, now - lastCaptureAt >= minIdle, let last = lastCapture,
+              CVPixelBufferGetWidth(last.0) == outputWidth, CVPixelBufferGetHeight(last.0) == outputHeight else { return }
+        qualityProbeTicks += 1
+        // Emit a full keyframe once per ~1s and high-quality refinement slices between them so even a motionless
+        // remote desktop exercises real multi-fragment UDP video bitrate, pacing, and packet-loss detection.
+        if qualityProbeTicks % UInt64(targetFPS) == 0 {
+            frameFlow.requestKeyFrame()
+            latestIsRefinement = false
+            latestRefinementPass = nil
+        } else if qualityProbeTicks % 8 == 0 {
+            latestIsRefinement = true
+            latestRefinementPass = 4
+        } else {
+            latestIsRefinement = false
+            latestRefinementPass = nil
+        }
+        latest = (last.0, CMTimeAdd(last.1, CMTime(seconds: max(0.001, now - lastCaptureAt), preferredTimescale: 1_000_000)), nil)
+        pump()
     }
 
     private func discardMismatchedFrame() {

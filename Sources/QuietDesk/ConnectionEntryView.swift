@@ -65,6 +65,7 @@ struct RecentConnectionsView: View {
     let connect: (ConnectionRecord) -> Void
     let remove: (ConnectionRecord) -> Void
     let manage: () -> Void
+    var benchmark: (ConnectionRecord) -> Void = { _ in }
 
     private var matches: [ConnectionRecord] { ConnectionEntryPresentation.matching(records, query: query) }
     private var searching: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -99,7 +100,8 @@ struct RecentConnectionsView: View {
             } else {
                 VStack(spacing: 8) {
                     ForEach(ConnectionEntryPresentation.visible(records, query: query, expanded: expanded)) { record in
-                        RecentConnectionRow(record: record, connect: { connect(record) }, remove: { remove(record) })
+                        RecentConnectionRow(record: record, connect: { connect(record) }, remove: { remove(record) },
+                                            benchmark: { benchmark(record) })
                             .disabled(locked)
                     }
                 }
@@ -122,6 +124,7 @@ private struct RecentConnectionRow: View {
     let record: ConnectionRecord
     let connect: () -> Void
     let remove: () -> Void
+    var benchmark: () -> Void = {}
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -141,16 +144,25 @@ private struct RecentConnectionRow: View {
                 Text("上次连接 \(record.lastConnected.formatted(date: .abbreviated, time: .shortened))")
                     .font(.caption2).foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, alignment: .leading)
+            Button("测速…", action: benchmark).controlSize(.small)
+                .help("实测此记录可用的直连与各中继线路质量及丢包情况")
+                .accessibilityLabel("测试 \(ConnectionEntryPresentation.title(record)) 的线路质量")
             Button("连接", action: connect).controlSize(.small)
                 .accessibilityLabel("连接 \(ConnectionEntryPresentation.title(record))")
             Menu {
+                Button("测试线路质量…", action: benchmark)
+                Divider()
                 Button("移除此记录", action: remove)
             } label: { Image(systemName: "ellipsis") }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 .help("记录操作").accessibilityLabel("\(ConnectionEntryPresentation.title(record)) 的记录操作")
         }
         .padding(12).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-        .contextMenu { Button("移除", action: remove) }
+        .contextMenu {
+            Button("测试线路质量…", action: benchmark)
+            Divider()
+            Button("移除", action: remove)
+        }
     }
 }
 
@@ -177,6 +189,8 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
     let openCaps: () -> Void
     let openRelay: () -> Void
     let openTraffic: () -> Void
+    var openBenchmark: () -> Void = {}
+    var benchmarkRecord: (ConnectionRecord) -> Void = { _ in }
     @State private var query = ""
     @State private var expandedRecords = false
     @State private var expandedForm = false
@@ -236,7 +250,8 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                         if records.isEmpty { firstUse }
                         else {
                             RecentConnectionsView(records: records, locked: locked, query: $query, expanded: $expandedRecords,
-                                                  connect: quickConnect, remove: remove, manage: manage)
+                                                  connect: quickConnect, remove: remove, manage: manage,
+                                                  benchmark: benchmarkRecord)
                         }
                     }
                     .frame(width: min(geometry.size.width - 48, geometry.size.width < 960 ? 560 : 640))
@@ -323,12 +338,17 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                 }
             }
             .textFieldStyle(.roundedBorder).controlSize(.large).disabled(locked)
-            HStack(spacing: 16) {
+            HStack(spacing: 14) {
                 Button(action: openOptions) { Label("连接选项…", systemImage: "slider.horizontal.3") }
                     .popover(isPresented: $showOptions, arrowEdge: .bottom) { options }
                 Button(action: openCaps) { Label("键盘设置…", systemImage: "keyboard") }
                 Button(action: openRelay) { Label("中继设置…", systemImage: "network") }
                 Spacer(minLength: 0)
+                Button("线路测速…", action: openBenchmark)
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .disabled(locked)
+                    .help("手动测试直连与各中继方式的实际帧率、延迟及 UDP 丢包情况（默认 30 秒）")
                 Button("连接", action: connect).buttonStyle(.borderedProminent).controlSize(.large)
                     .disabled(locked).help("配对码输入完成后也可按 Return 连接")
             }.buttonStyle(.link).font(.callout)

@@ -174,14 +174,15 @@ struct DeskView: View {
     @State private var showFullScreenMenu = false
     @State private var showTrafficStatistics = false
     @State private var showSessionEffects = false
+    @State private var routeBenchmarkRunner: RouteQualityBenchmarkRunner?
     @State private var dismissedClipboardStatus = ""
     @State private var dismissedReceptionID: UUID?
     @State private var clipboardNoticeRevision: UInt64 = 0
 
     // Sharing keeps running in the background; only a viewer session pins the window to its role.
-    private var roleLocked: Bool { models.viewer.isControllingAnotherMac }
+    private var roleLocked: Bool { models.viewer.isControllingAnotherMac || routeBenchmarkRunner != nil }
     private var locked: Bool { model.active || model.working }
-    private var sessionLayout: Bool { model.mode == .viewer && (model.connected || model.reconnecting) }
+    private var sessionLayout: Bool { model.mode == .viewer && !model.isRunningRouteBenchmark && (model.connected || model.reconnecting) }
     private var immersive: Bool { model.isFullScreen && model.mode == .viewer }
     private var remoteTitle: String { model.remoteName.isEmpty ? model.address : model.remoteName }
     private var showClipboardActivity: Bool { model.fileTransferNotice != nil || showClipboardStatus }
@@ -213,7 +214,8 @@ struct DeskView: View {
             } else {
                 ConnectionView(model: model, showOptions: $showOptions,
                                openCaps: { model.canvas.releaseControl(); showCapsSettings = true },
-                               openTraffic: openTrafficStatistics, openEffects: openSessionEffects)
+                               openTraffic: openTrafficStatistics, openEffects: openSessionEffects,
+                               openBenchmark: openRouteBenchmark)
             }
             if !immersive {
                 Divider()
@@ -309,6 +311,13 @@ struct DeskView: View {
                     Divider()
                     Button("断开") { model.stop() }
                 } else if model.mode == .viewer {
+                    Button {
+                        openRouteBenchmark(nil)
+                    } label: {
+                        Label("线路测速", systemImage: "speedometer")
+                    }
+                    .disabled(locked || routeBenchmarkRunner != nil)
+                    .help("手动测试直连与各中继方式的实际帧率、延迟及 UDP 丢包情况")
                     SharingBadge(host: models.host) { models.selected = .host }.disabled(roleLocked)
                 }
             }
@@ -323,13 +332,41 @@ struct DeskView: View {
         .sheet(isPresented: $showSessionEffects) {
             SessionEffectsView(model: model, done: { showSessionEffects = false })
         }
+        .sheet(item: $routeBenchmarkRunner, onDismiss: {
+            model.setRouteBenchmarkMode(false)
+        }) { runner in
+            RouteQualityBenchmarkView(
+                runner: runner,
+                onConnectCandidate: { candidate, record in
+                    routeBenchmarkRunner = nil
+                    DispatchQueue.main.async {
+                        model.connectUsingBenchmarkCandidate(candidate, record: record)
+                    }
+                },
+                onClose: {
+                    routeBenchmarkRunner = nil
+                }
+            )
+        }
         .alert("QuietDesk", isPresented: Binding(get: { model.error != nil },
             set: { if !$0 { model.error = nil } })) {
             Button("知道了", role: .cancel) { model.error = nil }
         } message: { Text(model.error ?? "") }
-        .onChange(of: immersive) { _, _ in showFullScreenMenu = false; showOptions = false; showCapsSettings = false; showTrafficStatistics = false; showSessionEffects = false }
+        .onChange(of: immersive) { _, _ in
+            showFullScreenMenu = false
+            showOptions = false
+            showCapsSettings = false
+            showTrafficStatistics = false
+            showSessionEffects = false
+            routeBenchmarkRunner?.shutdown()
+            routeBenchmarkRunner = nil
+        }
         .onReceive(NotificationCenter.default.publisher(for: SystemQuitHandler.dismissSheets)) { _ in
-            showCapsSettings = false; showTrafficStatistics = false; showSessionEffects = false
+            showCapsSettings = false
+            showTrafficStatistics = false
+            showSessionEffects = false
+            routeBenchmarkRunner?.shutdown()
+            routeBenchmarkRunner = nil
         }
         .onReceive(model.$clipboardStatus) { _ in
             dismissedClipboardStatus = ""
@@ -351,7 +388,7 @@ struct DeskView: View {
             dismissedClipboardStatus = message
         }
         .onChange(of: model.controlling) { _, controlling in if controlling { showFullScreenMenu = false; showOptions = false } }
-        .onChange(of: showOptions || showCapsSettings || showTrafficStatistics || showSessionEffects || showFullScreenMenu) { _, presented in
+        .onChange(of: showOptions || showCapsSettings || showTrafficStatistics || showSessionEffects || showFullScreenMenu || routeBenchmarkRunner != nil) { _, presented in
             updates.interfacePromptVisible = presented
         }
         .onDisappear { updates.interfacePromptVisible = false }
@@ -465,6 +502,14 @@ struct DeskView: View {
         showOptions = false
         showFullScreenMenu = false
         showSessionEffects = true
+    }
+
+    private func openRouteBenchmark(_ record: ConnectionRecord? = nil) {
+        guard model.mode == .viewer, !model.active, !model.working, routeBenchmarkRunner == nil else { return }
+        model.canvas.releaseControl()
+        showOptions = false
+        showFullScreenMenu = false
+        routeBenchmarkRunner = RouteQualityBenchmarkRunner(model: model, record: record)
     }
 
     /// One click sends the action; the reason it is unavailable replaces the tooltip.

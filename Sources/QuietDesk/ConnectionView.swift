@@ -7,6 +7,7 @@ struct ConnectionView: View {
     let openCaps: () -> Void
     let openTraffic: () -> Void
     let openEffects: () -> Void
+    let openBenchmark: (ConnectionRecord?) -> Void
     @State private var showRecords = false
     @State private var showRelaySettings = false
 
@@ -19,13 +20,16 @@ struct ConnectionView: View {
                             strategy: $model.relayStrategy, deviceID: $model.targetRelayDeviceID,
                             nodePicker: RelayNodePicker(model: model), showOptions: $showOptions,
                             options: ConnectionSettingsView(model: model, openCaps: { showOptions = false; openCaps() },
-                                                            openTraffic: openTraffic, openEffects: openEffects),
+                                                            openTraffic: openTraffic, openEffects: openEffects,
+                                                            openBenchmark: { showOptions = false; openBenchmark(nil) }),
                             connect: model.connect, cancel: { model.stop() }, quickConnect: model.quickConnect,
                             remove: model.removeConnection, manage: { showRecords = true },
                             openOptions: { model.canvas.releaseControl(); showOptions = true },
                             openCaps: openCaps,
                             openRelay: { model.canvas.releaseControl(); showRelaySettings = true },
-                            openTraffic: openTraffic)
+                            openTraffic: openTraffic,
+                            openBenchmark: { openBenchmark(nil) },
+                            benchmarkRecord: { openBenchmark($0) })
         .sheet(isPresented: $showRecords) {
             VStack(alignment: .leading, spacing: 16) {
                 Text("管理连接记录").font(.title3.weight(.semibold))
@@ -49,6 +53,7 @@ struct ConnectionView: View {
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
+                            Button("测速…") { showRecords = false; openBenchmark(record) }
                             Button("连接") { showRecords = false; model.quickConnect(record) }
                             Button("移除") { model.removeConnection(record) }
                         }.padding(.vertical, 6)

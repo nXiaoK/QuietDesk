@@ -16,11 +16,13 @@ A native macOS remote desktop app for your own Macs. Connect directly over a LAN
 
 | Feature | What it does |
 | --- | --- |
-| Remote control | Mouse, keyboard, drag, scroll, and floating fullscreen controls |
+| Remote control | Mouse (including side buttons 4/5 and 3D relative-mouse lock), keyboard, drag, scroll, trackpad pinch/rotate/smart-magnify gestures, and floating fullscreen controls |
+| Self-hosted relay | Single-node full-session relay by device ID, with optional direct path and separate control/media routing |
 | Video transport | Updated peers prefer encrypted UDP, recover or fall back to TCP automatically, and keep input on a reliable channel |
 | Immediate cursor | Updated peers separate the cursor from video to reduce duplicate pointers; optional system shape synchronization falls back to a generic arrow |
-| Video settings | Manual choices cap automatic adaptation in the new media mode; up to 240 fps and a 100 Mbps target bitrate; rates above 60 fps require both ends to be updated |
-| Clipboard & files | Focus-aware text and image sync; confirmation before transferring files or folders |
+| Video settings | Manual choices cap automatic adaptation in the new media mode; up to 240 fps and a 100 Mbps target bitrate, 1:1 original scaling, optional HEVC 4:4:4 True Color (when supported in hardware), and progressive static-frame refinement; rates above 60 fps require both ends to be updated |
+| Clipboard & files | Focus-aware text and image sync; drag-and-drop onto the canvas or clipboard file transfer over a dedicated chunked channel with recipient confirmation |
+| Audio & multi-display | Updated peers support seamless in-session display switching and optional low-latency ScreenCaptureKit system audio streaming (48 kHz stereo Opus) |
 | Keyboard & permissions | Fullscreen system shortcuts, Caps Lock input-source switching, and permission guidance with a draggable app icon |
 | Connections & idle pause | Recent connections, automatic reconnect, and pause after 10 minutes away from the window (unfocused or not visible; never while it is focused and visible), resuming when you return to the window |
 | Background sharing | Launch after login, share in the background, and recover from display changes |
@@ -66,8 +68,8 @@ Release builds remain ad-hoc signed. **After every update, grant Screen Recordin
 
 ## Before you use it
 
-- New features need support at both ends. One display and one controlling connection are supported at a time. Audio streaming, login-window control and FileVault unlock are not supported.
-- Video uses lossy H.264, switching to HEVC automatically when both Macs encode and decode it in hardware (both 4:2:0); frame rate depends on hardware and network conditions. The software black-screen overlay cannot guarantee coverage of system security screens. [Security and limitations (Chinese) →](docs/security.md)
+- New features need support at both ends. One active display stream (switchable live during a session) and one controlling connection are supported at a time, with optional remote system audio streaming. Login-window control and FileVault unlock are not supported (user-space app).
+- Video uses lossy H.264, switching to HEVC automatically when both Macs encode and decode it in hardware (4:2:0 by default, with optional HEVC 4:4:4 True Color when supported in hardware by both Macs); frame rate depends on hardware and network conditions. The software black-screen overlay cannot guarantee coverage of system security screens. [Security and limitations (Chinese) →](docs/security.md)
 - Windowed and full-screen sessions share **控制与设置**, showing the actual control state, active transport and applied video settings. **仅使用 TCP（下次连接生效）** selects TCP for the next connection. The displayed RTT measures the control connection; FPS does not measure physical screen presentation. [UDP/TCP transport (Chinese) →](docs/udp-tcp-transport.md)
 - Default builds are ad-hoc signed and not Apple-notarized. You may need to reopen the app after granting permissions. Every update requires granting permissions again; rely on the app’s actual permission checks.
 

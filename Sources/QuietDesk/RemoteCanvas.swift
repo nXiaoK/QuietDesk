@@ -25,8 +25,20 @@ protocol MediaCanvasDecoding: AnyObject {
 
 extension VideoDecoder: MediaCanvasDecoding {}
 
-@MainActor
 enum CursorBitmap {
+    private struct CacheKey: Hashable {
+        let png: Data
+        let pixelWidth: Int
+        let pixelHeight: Int
+        let logicalWidthBits: UInt64
+        let logicalHeightBits: UInt64
+    }
+
+    private static let cacheLock = NSLock()
+    private static var cachedImages: [CacheKey: NSImage] = [:]
+    private static var cachedOrder: [CacheKey] = []
+    private static let maximumCachedImages = 16
+
     private static let crcTable: [UInt32] = (0...255).map { value in
         var crc = UInt32(value)
         for _ in 0..<8 { crc = crc & 1 == 0 ? crc >> 1 : (crc >> 1) ^ 0xEDB88320 }
@@ -61,6 +73,9 @@ enum CursorBitmap {
     }
 
     static func image(_ value: CursorImage) -> NSImage? {
+        let key = CacheKey(png: value.png, pixelWidth: value.pixelWidth, pixelHeight: value.pixelHeight,
+                           logicalWidthBits: value.logicalWidth.bitPattern, logicalHeightBits: value.logicalHeight.bitPattern)
+        if let cached = cacheLock.withLock({ cachedImages[key] }) { return cached }
         guard validChunks(value.png),
               let source = CGImageSourceCreateWithData(value.png as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
               CGImageSourceGetCount(source) == 1,
@@ -71,7 +86,18 @@ enum CursorBitmap {
                   [kCGImageSourceShouldCache: true, kCGImageSourceShouldCacheImmediately: true] as CFDictionary),
               CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
               image.width == value.pixelWidth, image.height == value.pixelHeight else { return nil }
-        return NSImage(cgImage: image, size: NSSize(width: value.logicalWidth, height: value.logicalHeight))
+        let decoded = NSImage(cgImage: image, size: NSSize(width: value.logicalWidth, height: value.logicalHeight))
+        cacheLock.withLock {
+            if cachedImages[key] == nil {
+                if cachedOrder.count >= maximumCachedImages, let oldest = cachedOrder.first {
+                    cachedOrder.removeFirst()
+                    cachedImages.removeValue(forKey: oldest)
+                }
+                cachedOrder.append(key)
+                cachedImages[key] = decoded
+            }
+        }
+        return decoded
     }
 }
 

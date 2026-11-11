@@ -492,11 +492,13 @@ final class DeskModel: ObservableObject {
         canvas.onToggleFullScreen = { [weak self] in self?.toggleFullScreen() }
         canvas.onCaptureFrame = { [weak self] in self?.copyRemoteFrame() }
         canvas.onFullScreen = { [weak self] enabled in
-            self?.isFullScreen = enabled
+            guard let self, self.isFullScreen != enabled else { return }
+            self.isFullScreen = enabled
         }
         canvas.onSystemShortcutStatus = { [weak self] message, running in
-            self?.systemShortcutStatus = message
-            self?.systemShortcutsRunning = running
+            guard let self else { return }
+            if self.systemShortcutStatus != message { self.systemShortcutStatus = message }
+            if self.systemShortcutsRunning != running { self.systemShortcutsRunning = running }
         }
         canvas.capsLockMonitor.onFailure = { [weak self] message in
             let failedMonitor = self?.canvas.capsLockMonitor.generation
@@ -1696,7 +1698,8 @@ final class DeskModel: ObservableObject {
 
     private func setMediaRoute(_ label: String) {
         mediaRouteValue = label
-        mediaTransportStatus = Self.peerRouteLabel(label, peerPath: peerPathState)
+        let status = Self.peerRouteLabel(label, peerPath: peerPathState)
+        if mediaTransportStatus != status { mediaTransportStatus = status }
     }
 
     // The bridge reports its outer path from real authenticated traffic; the label changes only once
@@ -1705,8 +1708,12 @@ final class DeskModel: ObservableObject {
         guard state != peerPathState else { return }
         peerPathState = state
         connectionDiagnostics?.setPeerPath(state)
-        relayPeerStatus = Self.peerPathDescription(state)
-        if !mediaRouteValue.isEmpty { mediaTransportStatus = Self.peerRouteLabel(mediaRouteValue, peerPath: state) }
+        let description = Self.peerPathDescription(state)
+        if relayPeerStatus != description { relayPeerStatus = description }
+        if !mediaRouteValue.isEmpty {
+            let status = Self.peerRouteLabel(mediaRouteValue, peerPath: state)
+            if mediaTransportStatus != status { mediaTransportStatus = status }
+        }
         var values: [DiagnosticLog.Field: Int] = [.peerPath: state.diagnosticCode]
         if case .direct(let kind) = state { values[.candidateKind] = kind == .host ? 1 : kind == .srflx ? 2 : 3 }
         let phase: DiagnosticLog.State
@@ -2009,7 +2016,8 @@ final class DeskModel: ObservableObject {
                 if let microseconds = Int(exactly: (milliseconds * 1_000).rounded()), microseconds >= 0 {
                     DiagnosticLog.shared.record(.connectionMetrics, role: .viewer, values: [.roundTripMicroseconds: microseconds])
                 }
-                self.latency = String(format: milliseconds < 10 ? "%.1f ms" : "%.0f ms", milliseconds)
+                let latency = String(format: milliseconds < 10 ? "%.1f ms" : "%.0f ms", milliseconds)
+                if self.latency != latency { self.latency = latency }
                 self.connectionDiagnostics?.recordControlRTT(milliseconds)
                 viewer.lastLatencyAt = SessionClock.now
                 viewer.media?.recordControlRoundTrip(milliseconds: milliseconds)
@@ -3055,7 +3063,8 @@ final class DeskModel: ObservableObject {
     private func saveVideoPreference(_ settings: StreamSettings) {
         guard let target,
               let record = ConnectionStore.matching(connections, address: target.address, port: target.port, preferredID: target.recordID, relay: target.relay),
-              let index = connections.firstIndex(where: { $0.id == record.id }) else { return }
+              let index = connections.firstIndex(where: { $0.id == record.id }),
+              connections[index].videoSettings != settings else { return }
         connections[index].videoSettings = settings
         do { try ConnectionStore.save(connections) }
         catch { videoSettingsStatus = "画质已生效，但保存记录失败：\(error.localizedDescription)" }

@@ -66,7 +66,7 @@ final class TrafficHistoryStore: @unchecked Sendable {
     private var countingError: String?
     private var observer: (([EndpointTrafficRecord], [DeviceTrafficRecord], String?) -> Void)?
 
-    init(directory: URL = TrafficHistoryStore.defaultDirectory, checkpointInterval: TimeInterval = 1) {
+    init(directory: URL = TrafficHistoryStore.defaultDirectory, checkpointInterval: TimeInterval = 15) {
         url = directory.appendingPathComponent("traffic-history-v2.json")
         do { localDeviceID = try LocalDeviceIdentity.load(at: directory.appendingPathComponent("device-identity.json")) }
         catch {

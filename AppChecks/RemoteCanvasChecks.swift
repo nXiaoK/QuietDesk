@@ -953,6 +953,12 @@ private struct RemoteCanvasChecks {
             drainCanvasDisplay()
             try require(flags?.0 == true && flags?.1 == false,
                         "Failed pixel decode did not use the enabled/unknown fallback: \(String(describing: flags))")
+            let validCursor = try canvasCursorImage(canvasCursorPNG())
+            let firstDecoded = CursorBitmap.image(validCursor)
+            let secondDecoded = CursorBitmap.image(validCursor)
+            try require(firstDecoded != nil && firstDecoded === secondDecoded, "CursorBitmap did not reuse cached NSImage instance")
+            let brokenCursor = try canvasCursorImage(corruptCursorPixels(canvasCursorPNG()))
+            try require(CursorBitmap.image(brokenCursor) == nil, "Corrupted cursor PNG unexpectedly decoded")
         }
 
         run("Native mouse moves use a monotonic pacing timer and retain the final position with identical event timestamps") {

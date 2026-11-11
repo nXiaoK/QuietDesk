@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import CryptoKit
 import QuietDeskCore
@@ -400,6 +401,37 @@ private struct UpdateControllerChecks {
             try requireUpdate(controller.showBanner && !controller.installBlocked, "Banner or installation did not recover after session")
             controller.dismissBanner()
             try requireUpdate(!controller.showBanner && controller.menuTitle.contains("0.8.0"), "Dismissing banner hid the menu update")
+        }
+
+        await run("Unchanged session context bursts do not re-emit UpdateController objectWillChange") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
+            var context = UpdateSessionContext()
+            let changes = PassthroughSubject<Void, Never>()
+            let controller = UpdateController(info: fixture.info, defaults: fixture.defaults,
+                launchedAt: fixture.now.addingTimeInterval(-120), sessionContext: { context },
+                contextChanges: changes.eraseToAnyPublisher(),
+                loadFeed: { [feed = fixture.feed] url, version in try await feed.fetch(url, version) })
+            defer { controller.shutdown(); controller.later() }
+            controller.check(manual: false)
+            try await settled(controller)
+            await drain()
+            var notifications = 0
+            let cancellable = controller.objectWillChange.sink { notifications += 1 }
+            defer { cancellable.cancel() }
+            for _ in 0..<20 { changes.send() }
+            await drain()
+            try requireUpdate(notifications == 0, "Unrelated model ticks triggered \(notifications) UpdateController invalidations")
+            context.isControlling = true
+            changes.send()
+            await drain()
+            try requireUpdate(notifications == 1 && !controller.showBanner, "Entering control did not emit exactly one UpdateController invalidation")
+            for _ in 0..<10 { changes.send() }
+            await drain()
+            try requireUpdate(notifications == 1, "Repeated ticks during control re-emitted UpdateController invalidations")
+            context.isControlling = false
+            changes.send()
+            await drain()
+            try requireUpdate(notifications == 2 && controller.showBanner, "Exiting control did not restore banner with one invalidation")
         }
 
         await run("Feed network and authentication failures are reported without changing preferences") { directory in

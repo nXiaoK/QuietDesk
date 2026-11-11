@@ -4,7 +4,7 @@ import Security
 import Combine
 import QuietDeskCore
 
-struct UpdateSessionContext {
+struct UpdateSessionContext: Equatable {
     var mainWindowVisible = false
     var applicationActive = false
     var isControlling = false
@@ -66,6 +66,7 @@ final class UpdateController: ObservableObject {
     private var panel: NSWindow?
     private var consentAlert: NSAlert?
     private var contextSubscription: AnyCancellable?
+    private var lastObservedSession: UpdateSessionContext
     private let installer: any UpdateInstalling
     private var prepared: UpdateInstaller.PreparedUpdate?
     private var started = false
@@ -89,6 +90,7 @@ final class UpdateController: ObservableObject {
         self.terminateApplication = terminateApplication
         self.loadFeed = loadFeed
         self.installer = installer
+        self.lastObservedSession = sessionContext()
         bundleIdentifier = info["CFBundleIdentifier"] as? String ?? ""
         currentVersion = info["CFBundleShortVersionString"] as? String ?? "0.0.0"
         currentBuild = Int(info["CFBundleVersion"] as? String ?? "") ?? 0
@@ -115,7 +117,11 @@ final class UpdateController: ObservableObject {
         } else { usesAdHocSignature = false }
         contextSubscription = contextChanges?.receive(on: DispatchQueue.main).sink { [weak self] in
             guard let self else { return }
-            self.objectWillChange.send()
+            let current = self.session
+            if current != self.lastObservedSession {
+                self.lastObservedSession = current
+                self.objectWillChange.send()
+            }
             if self.consentAlert != nil { self.tick() }
         }
     }

@@ -809,6 +809,35 @@ private struct VideoPipelineChecks {
                         "Stopped capture retained a cursor generation or changed the next session default")
         }
 
+        run("Static-screen cursor fallback requires armed post-barrier capture time and matching dimensions") {
+            var gate = CursorCaptureGate()
+            let initial = try cursorSample(CMTime(value: 30, timescale: 60))
+            _ = gate.observe(initial, displayTime: 500)
+            let request = gate.request(included: false)
+            var validBuffer: CVPixelBuffer?
+            var wrongBuffer: CVPixelBuffer?
+            guard CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nil, &validBuffer) == kCVReturnSuccess,
+                  CVPixelBufferCreate(nil, 128, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nil, &wrongBuffer) == kCVReturnSuccess,
+                  let validBuffer, let wrongBuffer else {
+                throw VideoCheckFailure("Could not allocate static cursor check pixel buffers")
+            }
+            try require(gate.completeStaticSample(id: request, image: validBuffer, capturedAfterDisplayTime: 600) == nil,
+                        "Static cursor fallback completed before SCStream configuration armed")
+            try require(gate.arm(id: request, afterDisplayTime: 550, width: 64, height: 64), "Static cursor gate did not arm")
+            try require(gate.completeStaticSample(id: request, image: validBuffer, capturedAfterDisplayTime: 550) == nil,
+                        "Static cursor fallback accepted a pre-barrier capture timestamp")
+            try require(gate.completeStaticSample(id: request, image: wrongBuffer, capturedAfterDisplayTime: 551) == nil,
+                        "Static cursor fallback accepted mismatched dimensions")
+            guard let resolved = gate.completeStaticSample(id: request, image: validBuffer, capturedAfterDisplayTime: 551,
+                                                           sampleTime: CMTime(value: 0, timescale: 60)) else {
+                throw VideoCheckFailure("Static cursor fallback rejected a verified post-barrier screenshot")
+            }
+            try require(!gate.needsFreshFrame && CMTimeCompare(resolved, CMTime(value: 30, timescale: 60)) > 0,
+                        "Static cursor fallback did not advance watermark above previous SCK PTS")
+            try require(gate.completeStaticSample(id: request, image: validBuffer, capturedAfterDisplayTime: 552) == nil,
+                        "Static cursor fallback completed the same request twice")
+        }
+
         run("Fresh encoders produce real IDR frames when replaying the same retained pixel buffer") {
             var pixelBuffer: CVPixelBuffer?
             let status = CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nil, &pixelBuffer)

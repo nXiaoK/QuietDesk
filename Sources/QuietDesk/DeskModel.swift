@@ -3,7 +3,7 @@ import CryptoKit
 import Network
 import ScreenCaptureKit
 import IOKit.hid
-import QuietDeskCore
+@preconcurrency import QuietDeskCore
 
 @MainActor
 final class DeskModel: ObservableObject {
@@ -293,6 +293,7 @@ final class DeskModel: ObservableObject {
     private var performanceDiagnostics: PerformanceDiagnostics?
     private let performanceQueue = DispatchQueue(label: "quietdesk.performance", qos: .utility)
     private let snapshotQueue = DispatchQueue(label: "quietdesk.remote-snapshot", qos: .userInitiated)
+    private let hostInputQueue = DispatchQueue(label: "quietdesk.host-input", qos: .userInteractive)
     private var performanceTimer: DispatchSourceTimer?
     private var performanceConnectionID = 0
     private var performanceRole: DiagnosticLog.Role?
@@ -664,6 +665,7 @@ final class DeskModel: ObservableObject {
 
         if mode == .host, connected, canControl != accessibility {
             canControl = accessibility
+            syncHostInputGate()
             if !accessibility { hostSession.injector?.releaseAll() }
             status = accessibility ? "正在共享 · 允许键盘鼠标控制" : "正在共享 · 仅观看（辅助功能未生效）"
             if controlStatusUpdatesEnabled, let peer {
@@ -1228,6 +1230,7 @@ final class DeskModel: ObservableObject {
                         self.activeVideoState = state
                         self.recordVideoConfiguration(state)
                         host.injector = InputInjector(displayID: display.displayID)
+                        self.syncHostInputGate(host)
                         host.deviceIdentityAdvertised = self.trafficHistoryStore.localDeviceID != nil
                         let streamer = ScreenStreamer(diagnostics: diagnostics)
                         host.streamer = streamer
@@ -1345,24 +1348,46 @@ final class DeskModel: ObservableObject {
             }
         }
         let immediateInputs = HostImmediateInputQueue()
-        let flushImmediateInputs: @MainActor () -> Bool = { [weak self, weak candidate] in
+        let activeInputGate = hostSession.inputGate
+        let inputQueue = hostInputQueue
+        let flushImmediateInputsOnInputQueue: @Sendable () -> Bool = { [weak self, weak candidate] in
             let (inputs, resumes) = immediateInputs.drain()
             defer { for resume in resumes { resume() } }
-            guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return false }
             guard !inputs.isEmpty else { return true }
-            guard self.connected else {
-                candidate.close("屏幕共享尚未就绪", retryable: true)
+            let state = activeInputGate.snapshot()
+            guard !state.closed else { return false }
+            guard state.sessionReady else {
+                DispatchQueue.main.async { [weak self, weak candidate] in
+                    guard let self, let candidate, self.generation == token, self.active, self.peer === candidate, !self.connected else { return }
+                    candidate.close("屏幕共享尚未就绪", retryable: true)
+                }
                 return false
             }
             do {
                 for input in inputs {
-                    guard self.generation == token, self.active, self.peer === candidate, self.connected else { return false }
-                    try self.handleHostImmediateInput(input, peer: candidate)
+                    let current = activeInputGate.snapshot()
+                    guard !current.closed, current.sessionReady else { return false }
+                    if current.desktopActionRunning { continue }
+                    if current.unlocker?.typing == true, [.keyDown, .keyUp, .flags].contains(input.kind) { continue }
+                    if input.kind == .scroll {
+                        DiagnosticLog.shared.count(.scrollReceived)
+                        if !current.canInject { DiagnosticLog.shared.count(.scrollSuppressed) }
+                    }
+                    if current.canInject, let injector = current.injector,
+                       let feedback = try injector.receiveImmediateOnInputQueue(input, validated: true) {
+                        let after = activeInputGate.snapshot()
+                        if !after.closed, after.sessionReady, after.canInject, let candidate {
+                            candidate.send(try Wire.json(.inputStatus, feedback))
+                        }
+                    }
                 }
                 return true
             } catch {
-                self.recordDiagnosticFailure(.connectionFailed, error: error)
-                candidate.close(error.localizedDescription)
+                DispatchQueue.main.async { [weak self, weak candidate] in
+                    guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
+                    self.recordDiagnosticFailure(.connectionFailed, error: error)
+                    candidate.close(error.localizedDescription)
+                }
                 return false
             }
         }
@@ -1376,34 +1401,45 @@ final class DeskModel: ObservableObject {
                     decodedInput = try Wire.readJSON(RemoteInput.self, message.payload)
                     try decodedInput.validate()
                 } catch {
-                    DispatchQueue.main.async {
-                        defer { resume() }
-                        _ = flushImmediateInputs()
-                        guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
-                        self.recordDiagnosticFailure(.connectionFailed, error: error)
-                        candidate.close(error.localizedDescription)
+                    inputQueue.async {
+                        _ = flushImmediateInputsOnInputQueue()
+                        DispatchQueue.main.async {
+                            defer { resume() }
+                            guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
+                            self.recordDiagnosticFailure(.connectionFailed, error: error)
+                            candidate.close(error.localizedDescription)
+                        }
                     }
                     return
                 }
                 if decodedInput.kind != .switchInputSource {
                     if immediateInputs.enqueue(decodedInput, resume: resume) {
-                        DispatchQueue.main.async { _ = flushImmediateInputs() }
+                        if activeInputGate.snapshot().sessionReady {
+                            inputQueue.async { _ = flushImmediateInputsOnInputQueue() }
+                        } else {
+                            DispatchQueue.main.async {
+                                inputQueue.async { _ = flushImmediateInputsOnInputQueue() }
+                            }
+                        }
                     }
                     return
                 }
             }
-            Task { @MainActor in
-                defer { resume() }
-                guard flushImmediateInputs() else { return }
-                guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
-                guard self.connected else {
-                    if message.kind != .releaseInput { candidate.close("屏幕共享尚未就绪", retryable: true) }
-                    return
-                }
-                do { try await self.handleHost(message, peer: candidate) }
-                catch {
-                    self.recordDiagnosticFailure(.connectionFailed, error: error)
-                    candidate.close(error.localizedDescription)
+            inputQueue.async {
+                let flushed = flushImmediateInputsOnInputQueue()
+                Task { @MainActor in
+                    defer { resume() }
+                    guard flushed else { return }
+                    guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
+                    guard self.connected else {
+                        if message.kind != .releaseInput { candidate.close("屏幕共享尚未就绪", retryable: true) }
+                        return
+                    }
+                    do { try await self.handleHost(message, peer: candidate) }
+                    catch {
+                        self.recordDiagnosticFailure(.connectionFailed, error: error)
+                        candidate.close(error.localizedDescription)
+                    }
                 }
             }
         }
@@ -2894,10 +2930,12 @@ final class DeskModel: ObservableObject {
             }
             guard self.peer === peer, self.hostSession === host else { return }
             host.desktopActionTask = nil
+            self.syncHostInputGate(host)
             let result = DesktopActionResult(id: request.id, error: error)
             host.lastDesktopActionResult = result
             if let reply = try? Wire.json(.desktopActionResult, result) { peer.send(reply) }
         }
+        syncHostInputGate(host)
     }
 
     private func applyHostUnlock(_ request: SessionUnlockRequest, peer: Peer) {
@@ -2912,6 +2950,7 @@ final class DeskModel: ObservableObject {
         host.unlocker = unlocker
         host.desktopActionTask?.cancel()
         host.desktopActions?.cancel()
+        syncHostInputGate(host)
         host.injector?.releaseAll()
         DiagnosticLog.shared.record(.sessionUnlock, role: .host, state: .requested)
         host.unlockTask = Task { [weak self, weak peer, weak host] in
@@ -3235,6 +3274,7 @@ final class DeskModel: ObservableObject {
             defer {
                 if self.generation == token, self.peer === peer, self.hostSession === host {
                     host.pauseTask = nil
+                    self.syncHostInputGate(host)
                     self.publishSessionPause()
                 }
             }
@@ -3248,6 +3288,7 @@ final class DeskModel: ObservableObject {
             var failure: String?
             do { host.paused = try await streamer.setSessionPaused(request.paused) }
             catch { failure = error.localizedDescription }
+            self.syncHostInputGate(host)
             guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer, !Task.isCancelled else { return }
             if host.cursorSubscribed {
                 guard let actual = streamer.currentCursorIncluded else {
@@ -3277,7 +3318,26 @@ final class DeskModel: ObservableObject {
                 host.media?.resumeAfterConfiguration()
             }
         }
+        syncHostInputGate(host)
         publishSessionPause()
+    }
+
+    private func syncHostInputGate(_ targetHost: HostSession? = nil) {
+        let host = targetHost ?? hostSession
+        guard mode == .host, host === hostSession else { return }
+        let ready = connected && active && peer != nil
+        let allowed = ready && canControl && !host.paused && host.pauseTask == nil
+        let desktopRunning = host.desktopActionTask != nil
+        let injector = host.injector
+        let unlocker = host.unlocker
+        host.inputGate.update { snapshot in
+            guard !snapshot.closed else { return }
+            snapshot.sessionReady = ready
+            snapshot.canInject = allowed
+            snapshot.desktopActionRunning = desktopRunning
+            snapshot.injector = injector
+            snapshot.unlocker = unlocker
+        }
     }
 
     private func applyHostVideoSettings(_ request: StreamSettingsRequest, peer: Peer) {
@@ -3861,6 +3921,7 @@ final class DeskModel: ObservableObject {
             DiagnosticLog.shared.record(.captureStopped, role: .host)
             Task { await streamer.stop() }
         }
+        oldHost.inputGate.close()
         oldHost.injector?.releaseAll()
         // Issued here, not in the async cleanup, so the lock is requested even when the app is quitting.
         if let lock = oldHost.effects?.endSession() {

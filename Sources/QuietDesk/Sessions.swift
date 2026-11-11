@@ -1,9 +1,43 @@
 import Foundation
 import QuietDeskCore
 
+final class HostInputGate: @unchecked Sendable {
+    struct Snapshot {
+        var closed = false
+        var sessionReady = false
+        var canInject = false
+        var desktopActionRunning = false
+        var injector: InputInjector?
+        var unlocker: HostScreenUnlocker?
+    }
+
+    private let lock = NSLock()
+    private var state = Snapshot()
+
+    func update(_ body: (inout Snapshot) -> Void) {
+        lock.withLock { body(&state) }
+    }
+
+    func snapshot() -> Snapshot {
+        lock.withLock { state }
+    }
+
+    func close() {
+        lock.withLock {
+            state.closed = true
+            state.sessionReady = false
+            state.canInject = false
+            state.desktopActionRunning = false
+            state.injector = nil
+            state.unlocker = nil
+        }
+    }
+}
+
 // These resources belong to one connection. Reconnect intent and UI state live in DeskModel.
 @MainActor
 final class HostSession {
+    let inputGate = HostInputGate()
     let startupDeadline = ConnectionStartupDeadline()
     var startupPhase = DiagnosticLog.StartupPhase.sessionPreparation
     var terminationSubscribed = false

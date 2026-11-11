@@ -23,8 +23,11 @@ protocol UnlockKeyTyping: AnyObject {
 /// console, checks again before every character so nothing lands in an app after a local unlock,
 /// and never keeps the password after the attempt.
 @MainActor
-final class HostScreenUnlocker {
-    private(set) var typing = false
+final class HostScreenUnlocker: @unchecked Sendable {
+    private let typingLock = NSLock()
+    nonisolated(unsafe) private var typingValue = false
+    nonisolated var typing: Bool { typingLock.withLock { typingValue } }
+    private func setTyping(_ value: Bool) { typingLock.withLock { typingValue = value } }
     private let isLocked: () -> Bool
     private let isTrusted: () -> Bool
     private let keys: UnlockKeyTyping
@@ -43,8 +46,8 @@ final class HostScreenUnlocker {
         guard !typing else { return failed("正在输入上一次的解锁密码") }
         guard isLocked() else { return SessionUnlockResult(id: request.id, outcome: .notLocked) }
         guard isTrusted() else { return failed("被控端未授权辅助功能，无法输入锁屏密码") }
-        typing = true
-        defer { typing = false }
+        setTyping(true)
+        defer { setTyping(false) }
         keys.wake()
         await pause(.milliseconds(800))
         for character in request.password {

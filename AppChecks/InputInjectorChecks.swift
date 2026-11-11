@@ -417,6 +417,40 @@ private struct InputInjectorChecks {
                         "Coalescing lost click ordering or kept stale intermediate pointer coordinates")
         }
 
+        await run("Concurrent high-priority input queue injects pointer and keyboard events off the main actor") {
+            final class ConcurrentEventBox: @unchecked Sendable {
+                private let lock = NSLock()
+                private var events: [(CGEventType, CGPoint, Bool)] = []
+                func append(_ event: CGEvent, onMain: Bool) {
+                    lock.withLock { events.append((event.type, event.location, onMain)) }
+                }
+                func snapshot() -> [(CGEventType, CGPoint, Bool)] { lock.withLock { events } }
+            }
+            let box = ConcurrentEventBox()
+            let injector = InputInjector(concurrentBounds: CGRect(x: 0, y: 0, width: 101, height: 101),
+                                         isTrusted: { true },
+                                         postEvent: { box.append($0, onMain: Thread.isMainThread) },
+                                         capsLockState: { false },
+                                         pointerLocation: { CGPoint(x: 50, y: 50) })
+            let queue = DispatchQueue(label: "checks.host-input", qos: .userInteractive)
+            let done = DispatchSemaphore(value: 0)
+            queue.async {
+                var move = RemoteInput(kind: .move); move.x = 0.5; move.y = 0.5
+                var down = RemoteInput(kind: .down); down.x = 0.5; down.y = 0.5
+                var key = RemoteInput(kind: .keyDown); key.keyCode = 0
+                _ = try? injector.receiveImmediateOnInputQueue(move, validated: true)
+                _ = try? injector.receiveImmediateOnInputQueue(down, validated: true)
+                _ = try? injector.receiveImmediateOnInputQueue(key, validated: true)
+                injector.releaseAllOnInputQueue()
+                done.signal()
+            }
+            try require(done.wait(timeout: .now() + 3) == .success, "Off-main input queue did not finish")
+            let recorded = box.snapshot()
+            try require(recorded.map(\.0) == [.mouseMoved, .leftMouseDown, .keyDown, .keyUp, .leftMouseUp],
+                        "Off-main injection lost event order or release cleanup")
+            try require(recorded.allSatisfy { !$0.2 }, "Off-main input queue unexpectedly executed on the main thread")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

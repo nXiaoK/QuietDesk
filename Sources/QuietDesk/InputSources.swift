@@ -1,4 +1,5 @@
 import Carbon
+import Foundation
 import QuietDeskCore
 
 @MainActor
@@ -12,6 +13,7 @@ protocol InputSourceAccess {
 @MainActor
 private final class SystemInputSourceAccess: InputSourceAccess {
     private var selectable: [String: TISInputSource] = [:]
+    nonisolated init() {}
 
     func prepareContextRefresh() -> InputSourceContextRefresh? { InputSourceContextRefresh() }
 
@@ -55,13 +57,17 @@ private final class SystemInputSourceAccess: InputSourceAccess {
     }
 }
 
-@MainActor
-final class InputSources {
-    var requiresKeyboardRefocus = false
+final class InputSources: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requiresKeyboardRefocusValue = false
+    private var generation = UUID()
+    var requiresKeyboardRefocus: Bool {
+        get { lock.withLock { requiresKeyboardRefocusValue } }
+        set { lock.withLock { requiresKeyboardRefocusValue = newValue } }
+    }
     private var choice = InputSourceChoice()
     private let access: InputSourceAccess
     private let waitForChange: () async throws -> Void
-    private var generation = UUID()
 
     init(access: InputSourceAccess? = nil, waitForChange: @escaping () async throws -> Void = {
         try await Task.sleep(nanoseconds: 20_000_000)
@@ -70,6 +76,7 @@ final class InputSources {
         self.waitForChange = waitForChange
     }
 
+    @MainActor
     func toggle() async throws -> String {
         try Task.checkCancellation()
         let sources = try access.enabledSources()
@@ -78,26 +85,27 @@ final class InputSources {
             throw DeskError.invalid("请在家里 Mac 添加并启用中文输入法和 ABC / 英文键盘")
         }
         let token = UUID()
-        generation = token
+        lock.withLock { generation = token }
         let contextRefresh = target.isChinese ? access.prepareContextRefresh() : nil
         try access.select(target)
         try await confirm(target, token: token)
         if let contextRefresh {
             requiresKeyboardRefocus = true
-            try await contextRefresh.refresh { self.generation != token }
+            try await contextRefresh.refresh { self.lock.withLock { self.generation != token } }
             try await confirm(target, token: token)
         }
         requiresKeyboardRefocus = false
         return target.name
     }
 
+    @MainActor
     private func confirm(_ target: KeyboardSource, token: UUID) async throws {
         var consecutiveMatches = 0
         // Confirm the selected ID across main-loop turns; cross-process input activation
         // additionally requires the focus refresh above before later wire input can proceed.
         for _ in 0..<25 {
             try await waitForChange()
-            guard generation == token else { throw CancellationError() }
+            guard lock.withLock({ generation == token }) else { throw CancellationError() }
             try Task.checkCancellation()
             if access.currentSource()?.id == target.id { consecutiveMatches += 1 }
             else { consecutiveMatches = 0 }
@@ -106,5 +114,5 @@ final class InputSources {
         throw DeskError.invalid("尚未确认远端输入法切换生效，请重试；输入法内部的中英文模式需在远端核对")
     }
 
-    func cancel() { generation = UUID() }
+    func cancel() { lock.withLock { generation = UUID() } }
 }

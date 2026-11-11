@@ -329,6 +329,32 @@ struct CursorCaptureGate {
         return (true, id)
     }
 
+    mutating func completeStaticSample(id: UUID, image: CVPixelBuffer, capturedAfterDisplayTime: UInt64,
+                                       sampleTime: CMTime? = nil) -> CMTime? {
+        guard requestID == id, needsFreshFrame, configurationApplied,
+              let minimumDisplayTime, capturedAfterDisplayTime > minimumDisplayTime,
+              let expectedDimensions,
+              CVPixelBufferGetWidth(image) == expectedDimensions.0,
+              CVPixelBufferGetHeight(image) == expectedDimensions.1 else { return nil }
+        let resolvedTime: CMTime
+        if let sampleTime, sampleTime.isNumeric,
+           minimumPresentationTime.map({ CMTimeCompare(sampleTime, $0) > 0 }) ?? true {
+            resolvedTime = sampleTime
+        } else if let watermark = minimumPresentationTime ?? presentationWatermark {
+            resolvedTime = CMTimeAdd(watermark, CMTime(value: 1, timescale: 1_000_000))
+        } else {
+            resolvedTime = CMTime(value: 1, timescale: 1_000_000)
+        }
+        guard resolvedTime.isNumeric else { return nil }
+        if presentationWatermark.map({ CMTimeCompare(resolvedTime, $0) > 0 }) ?? true {
+            presentationWatermark = resolvedTime
+        }
+        needsFreshFrame = false
+        requestID = nil
+        configurationApplied = false
+        return resolvedTime
+    }
+
     @discardableResult
     mutating func cancel(id: UUID) -> Bool {
         guard requestID == id else { return false }
@@ -398,6 +424,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var encoderHardware: Bool?
     private var running = false
     private var captureStarted = false
+    private var activeFilter: SCContentFilter?
     private var excludedWindowIDs = Set<CGWindowID>()
     private var reconfiguring = false
     private var sessionPaused = false
@@ -610,6 +637,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             lastCaptureDiagnostics = nil
             self.stream = stream
             self.lifecycle = lifecycle
+            activeFilter = capture.filter
             excludedWindowIDs = []
             displayID = capture.displayID
             outputWidth = width
@@ -735,8 +763,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                     cursorFrameTimeout = timer
                     timer.resume()
                     let width = outputWidth, height = outputHeight
-                    activeStream.updateConfiguration(Self.configuration(width: width, height: height,
-                        settings: currentSettings, includesCursor: included), completionHandler: { [weak self] error in
+                    let updatedConfiguration = Self.configuration(width: width, height: height,
+                                                                  settings: currentSettings, includesCursor: included)
+                    activeStream.updateConfiguration(updatedConfiguration, completionHandler: { [weak self] error in
                             self?.queue.async { [weak self] in
                                 guard let self, self.running, self.stream.map(ObjectIdentifier.init) == expectedStreamID,
                                       self.cursorFrameWaiter?.id == request else { return }
@@ -748,7 +777,10 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                                 if !ignoringCancellation, self.cancelledCursorRequestID == request
                                     || operation.map({ self.cancelledCursorOperationID == $0 }) == true {
                                     self.finishCursorFrameWaiter(request, result: .failure(CancellationError()))
+                                    return
                                 }
+                                self.scheduleStaticCursorFrameFallback(request: request, expectedStreamID: expectedStreamID,
+                                                                       configuration: updatedConfiguration)
                             }
                         })
                 }
@@ -756,6 +788,49 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         } onCancel: { [weak self] in
             guard !ignoringCancellation else { return }
             self?.queue.async { [weak self] in self?.cancelCursorRequest(request) }
+        }
+    }
+
+    private func scheduleStaticCursorFrameFallback(request: UUID, expectedStreamID: ObjectIdentifier,
+                                                   configuration: SCStreamConfiguration) {
+        queue.asyncAfter(deadline: .now() + .milliseconds(80)) { [weak self] in
+            guard let self, self.running, let activeStream = self.stream,
+                  ObjectIdentifier(activeStream) == expectedStreamID,
+                  self.cursorFrameWaiter?.id == request, self.cursorGate.configurationApplied,
+                  let filter = self.activeFilter else { return }
+            activeStream.updateContentFilter(filter, completionHandler: nil)
+            self.queue.asyncAfter(deadline: .now() + .milliseconds(120)) { [weak self] in
+                guard let self, self.running, self.stream.map(ObjectIdentifier.init) == expectedStreamID,
+                      self.cursorFrameWaiter?.id == request, self.cursorGate.configurationApplied,
+                      let currentFilter = self.activeFilter else { return }
+                let capturedAfter = mach_absolute_time()
+                Task { [weak self] in
+                    struct StaticScreenshotSample: @unchecked Sendable {
+                        let image: CVPixelBuffer
+                        let sampleTime: CMTime
+                    }
+                    guard let sample = try? await SCScreenshotManager.captureSampleBuffer(contentFilter: currentFilter,
+                                                                                          configuration: configuration),
+                          CMSampleBufferIsValid(sample),
+                          let image = CMSampleBufferGetImageBuffer(sample) else { return }
+                    let captured = StaticScreenshotSample(image: image, sampleTime: CMSampleBufferGetPresentationTimeStamp(sample))
+                    self?.queue.async { [weak self] in
+                        guard let self, self.running, self.stream.map(ObjectIdentifier.init) == expectedStreamID,
+                              self.cursorFrameWaiter?.id == request else { return }
+                        guard let resolvedTime = self.cursorGate.completeStaticSample(id: request, image: captured.image,
+                            capturedAfterDisplayTime: capturedAfter, sampleTime: captured.sampleTime) else { return }
+                        self.latest = (captured.image, resolvedTime, self.diagnostics?.start())
+                        self.lastCapture = self.latest
+                        self.lastCaptureAt = SessionClock.now
+                        self.latestIsRefinement = false
+                        self.refinement.wait()
+                        self.appliedCursorIncluded = self.cursorGate.included
+                        self.lastConfirmedCursorIncluded = self.cursorGate.included
+                        self.finishCursorFrameWaiter(request, result: .success(()))
+                        self.pump()
+                    }
+                }
+            }
         }
     }
 
@@ -1009,6 +1084,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         try Task.checkCancellation()
         try queue.sync {
             guard running, stream === snapshot.0 else { throw CancellationError() }
+            activeFilter = filter
             excludedWindowIDs = wanted
             frameFlow.requestKeyFrame()
         }
@@ -1174,6 +1250,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             encoder = nil
             let old = lifecycle
             if let stream { try? stream.removeStreamOutput(self, type: .screen) }
+            activeFilter = nil
             stream = nil
             lifecycle = nil
             return old
@@ -1348,7 +1425,7 @@ final class HostImmediateInputQueue: @unchecked Sendable {
     private var flushScheduled = false
     let capacity: Int
 
-    init(capacity: Int = 64) {
+    init(capacity: Int = 256) {
         self.capacity = max(1, capacity)
     }
 
@@ -1393,30 +1470,323 @@ final class HostImmediateInputQueue: @unchecked Sendable {
 }
 
 @MainActor
-final class InputInjector {
-    private static let modifierDeviceBits: [UInt16: UInt64] = [
+final class InputInjector: @unchecked Sendable {
+    nonisolated private static let modifierDeviceBits: [UInt16: UInt64] = [
         59: 0x01, 56: 0x02, 60: 0x04, 55: 0x08,
         54: 0x10, 58: 0x20, 61: 0x40, 62: 0x2000
     ]
-    let bounds: CGRect
-    private var heldKeys = Set<UInt16>()
-    private var heldButtons = Set<Int>()
-    private var lastPoint = CGPoint.zero
-    private var inputFlags: CGEventFlags = []
-    private var scroll = ScrollAccumulator()
-    private var lineScroll = ScrollAccumulator()
-    // Gesture and momentum phases already given to apps and not yet ended.
-    private var openScrollPhase: RemoteInput.ScrollPhase?
-    private var momentumOpen = false
-    private let source = CGEventSource(stateID: .hidSystemState)
-    private let inputSources: InputSources
-    private var remoteCapsLock: Bool?
-    private let isTrusted: () -> Bool
-    private let postEvent: (CGEvent) -> Void
-    private let capsLockState: () -> Bool
-    private let pointerLocation: () -> CGPoint?
 
-    convenience init(displayID: CGDirectDisplayID) { self.init(bounds: CGDisplayBounds(displayID)) }
+    private final class Engine: @unchecked Sendable {
+        let bounds: CGRect
+        let inputSources: InputSources
+        private let lock = NSRecursiveLock()
+        private var heldKeys = Set<UInt16>()
+        private var heldButtons = Set<Int>()
+        private var lastPoint = CGPoint.zero
+        private var inputFlags: CGEventFlags = []
+        private var scroll = ScrollAccumulator()
+        private var lineScroll = ScrollAccumulator()
+        // Gesture and momentum phases already given to apps and not yet ended.
+        private var openScrollPhase: RemoteInput.ScrollPhase?
+        private var momentumOpen = false
+        private let source = CGEventSource(stateID: .hidSystemState)
+        private var remoteCapsLock: Bool?
+        private let isTrusted: () -> Bool
+        private let postEvent: (CGEvent) -> Void
+        private let capsLockState: () -> Bool
+        private let pointerLocation: () -> CGPoint?
+
+        init(bounds: CGRect, isTrusted: @escaping () -> Bool, postEvent: @escaping (CGEvent) -> Void,
+             inputSources: InputSources, capsLockState: @escaping () -> Bool, pointerLocation: @escaping () -> CGPoint?) {
+            self.bounds = bounds
+            self.isTrusted = isTrusted
+            self.postEvent = postEvent
+            self.inputSources = inputSources
+            self.capsLockState = capsLockState
+            self.pointerLocation = pointerLocation
+        }
+
+        func checkTrustedOrRelease() -> Bool {
+            lock.withLock {
+                guard isTrusted() else { releaseAllUnlocked(); return false }
+                return true
+            }
+        }
+
+        func prepareSwitchInputSource(_ input: RemoteInput) -> Bool {
+            lock.withLock {
+                if input.independentCapsLock == true || input.kind == .switchInputSource || input.kind == .toggleCapsLock {
+                    if remoteCapsLock == nil { remoteCapsLock = capsLockState() }
+                }
+                return !inputSources.requiresKeyboardRefocus && remoteCapsLock != true
+            }
+        }
+
+        func currentCapsLocked() -> Bool {
+            lock.withLock { remoteCapsLock == true }
+        }
+
+        func receiveImmediate(_ input: RemoteInput, validated: Bool = false) throws -> InputFeedback? {
+            try lock.withLock {
+                if !validated { try input.validate() }
+                guard isTrusted() else { releaseAllUnlocked(); return nil }
+                if input.independentCapsLock == true || input.kind == .switchInputSource || input.kind == .toggleCapsLock {
+                    if remoteCapsLock == nil { remoteCapsLock = capsLockState() }
+                }
+                if input.kind == .switchInputSource || input.kind == .toggleCapsLock {
+                    guard !inputSources.requiresKeyboardRefocus else {
+                        return InputFeedback(message: "请点击远端输入位置后继续", capsLocked: remoteCapsLock == true)
+                    }
+                    if input.kind == .toggleCapsLock || remoteCapsLock == true {
+                        remoteCapsLock = !(remoteCapsLock ?? false)
+                        let event = CGEvent(keyboardEventSource: source, virtualKey: 57, keyDown: remoteCapsLock == true)
+                        event?.type = .flagsChanged
+                        var modifiers = CGEventSource.flagsState(.combinedSessionState)
+                        modifiers.remove(.maskAlphaShift)
+                        if remoteCapsLock == true { modifiers.insert(.maskAlphaShift) }
+                        event?.flags = modifiers
+                        if let event { inputFlags = modifiers; postEvent(event) }
+                        return InputFeedback(message: remoteCapsLock == true ? "远端大写锁定已开启" : "远端大写锁定已关闭",
+                                             capsLocked: remoteCapsLock == true)
+                    }
+                    return nil
+                }
+                let point = CGPoint(x: bounds.minX + input.x * max(0, bounds.width - 1),
+                                    y: bounds.minY + input.y * max(0, bounds.height - 1))
+                let mask: CGEventFlags = [.maskAlphaShift, .maskShift, .maskControl, .maskAlternate,
+                                          .maskCommand, .maskSecondaryFn, .maskNumericPad]
+                var flags = CGEventFlags(rawValue: input.flags).intersection(mask)
+                if input.independentCapsLock == true {
+                    flags.remove(.maskAlphaShift)
+                    if remoteCapsLock == true { flags.insert(.maskAlphaShift) }
+                }
+                var event: CGEvent?
+                let button = CGMouseButton(rawValue: UInt32(input.button)) ?? .left
+                switch input.kind {
+                case .keyDown, .keyUp, .flags:
+                    guard !inputSources.requiresKeyboardRefocus else { return nil }
+                    if input.kind == .flags {
+                        // Modifier keys arrive as flagsChanged, not ordinary keyDown/keyUp.
+                        let modifier: CGEventFlags
+                        switch input.keyCode {
+                        case 54, 55: modifier = .maskCommand
+                        case 56, 60: modifier = .maskShift
+                        case 58, 61: modifier = .maskAlternate
+                        case 59, 62: modifier = .maskControl
+                        case 57: modifier = .maskAlphaShift
+                        case 63: modifier = .maskSecondaryFn
+                        default: return nil
+                        }
+                        let down: Bool
+                        if input.flags & 0x207F != 0, let bit = InputInjector.modifierDeviceBits[input.keyCode] {
+                            down = input.flags & bit != 0
+                        } else { down = flags.contains(modifier) }
+                        event = CGEvent(keyboardEventSource: source, virtualKey: input.keyCode, keyDown: down)
+                        event?.type = .flagsChanged
+                        if down { heldKeys.insert(input.keyCode) } else { heldKeys.remove(input.keyCode) }
+                    } else {
+                        let down = input.kind == .keyDown
+                        event = CGEvent(keyboardEventSource: source, virtualKey: input.keyCode, keyDown: down)
+                        event?.setIntegerValueField(.keyboardEventAutorepeat, value: input.isRepeat ? 1 : 0)
+                        if down { heldKeys.insert(input.keyCode) } else { heldKeys.remove(input.keyCode) }
+                    }
+                case .scroll:
+                    // A wheel or an older viewer sends no phases; finish any gesture an interrupted stream left open.
+                    if input.scrollPhase == nil && input.momentumPhase == nil { endScrollPhasesUnlocked() }
+                    let wheels = try scrollEventsUnlocked(input)
+                    guard let wheel = wheels.last else { return nil }
+                    // A scroll's location does not move the pointer used for window and view routing, so move it there
+                    // first. Skip the move once the pointer is already there: one per wheel event redoes hover mid-scroll.
+                    let current = pointerLocation()
+                    if current.map({ abs($0.x - point.x) >= 0.5 || abs($0.y - point.y) >= 0.5 }) ?? true {
+                        let heldButton = heldButtons.min()
+                        let moveType: CGEventType = heldButton == nil ? .mouseMoved
+                            : heldButton == 0 ? .leftMouseDragged : heldButton == 1 ? .rightMouseDragged : .otherMouseDragged
+                        let moveButton = CGMouseButton(rawValue: UInt32(heldButton ?? 0)) ?? .left
+                        guard let move = CGEvent(mouseEventSource: source, mouseType: moveType, mouseCursorPosition: point,
+                                                 mouseButton: moveButton) else {
+                            throw DeskError.invalid("无法建立远端滚动事件")
+                        }
+                        move.flags = flags
+                        postEvent(move)
+                    }
+                    for earlier in wheels.dropLast() {
+                        earlier.location = point
+                        earlier.flags = flags
+                        postEvent(earlier)
+                    }
+                    lastPoint = point
+                    event = wheel
+                    event?.location = point
+                case .move, .drag, .down, .up:
+                    let type: CGEventType
+                    switch input.kind {
+                    case .down:
+                        inputSources.requiresKeyboardRefocus = false
+                        heldButtons.insert(input.button)
+                        type = input.button == 0 ? .leftMouseDown : input.button == 1 ? .rightMouseDown : .otherMouseDown
+                    case .up:
+                        heldButtons.remove(input.button)
+                        type = input.button == 0 ? .leftMouseUp : input.button == 1 ? .rightMouseUp : .otherMouseUp
+                    case .drag:
+                        type = input.button == 0 ? .leftMouseDragged : input.button == 1 ? .rightMouseDragged : .otherMouseDragged
+                    default: type = .mouseMoved
+                    }
+                    event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button)
+                    event?.setIntegerValueField(.mouseEventClickState, value: Int64(input.clicks))
+                    lastPoint = point
+                case .switchInputSource, .toggleCapsLock: return nil
+                }
+                event?.flags = flags
+                if let event { inputFlags = flags; postEvent(event) }
+                return nil
+            }
+        }
+
+        private func scrollEventsUnlocked(_ input: RemoteInput) throws -> [CGEvent] {
+            if let lineX = input.lineDeltaX, let lineY = input.lineDeltaY {
+                guard lineX != 0 || lineY != 0 else { return [] }
+                let pixels = try scroll.accumulate(deltaX: input.deltaX, deltaY: input.deltaY)
+                let lines = try lineScroll.accumulate(deltaX: lineX, deltaY: lineY)
+                let wheel = try wheelEvent(units: .line, x: lines?.x ?? 0, y: lines?.y ?? 0)
+                wheel.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: lineY)
+                wheel.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: lineX)
+                wheel.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(pixels?.y ?? 0))
+                wheel.setIntegerValueField(.scrollWheelEventPointDeltaAxis2, value: Int64(pixels?.x ?? 0))
+                return [wheel]
+            }
+            let pixels = try scroll.accumulate(deltaX: input.deltaX, deltaY: input.deltaY)
+            guard input.scrollPhase != nil || input.momentumPhase != nil else {
+                guard let pixels else { return [] }
+                return [try wheelEvent(units: .pixel, x: pixels.x, y: pixels.y)]
+            }
+            func wheel(_ phase: RemoteInput.ScrollPhase?, _ momentum: RemoteInput.MomentumPhase?,
+                       moving: Bool = true) throws -> CGEvent {
+                let event = try wheelEvent(units: .pixel, x: moving ? pixels?.x ?? 0 : 0, y: moving ? pixels?.y ?? 0 : 0)
+                event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase?.rawValue ?? 0))
+                event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Int64(momentum?.rawValue ?? 0))
+                return event
+            }
+            var events: [CGEvent] = []
+            if let phase = input.scrollPhase {
+                if momentumOpen {
+                    momentumOpen = false
+                    events.append(try wheel(nil, .ended, moving: false))
+                }
+                switch phase {
+                case .mayBegin, .began:
+                    if let open = openScrollPhase, open != .mayBegin { events.append(try wheel(.ended, nil, moving: false)) }
+                    openScrollPhase = phase
+                    events.append(try wheel(phase, nil))
+                case .changed:
+                    if openScrollPhase == nil || openScrollPhase == .mayBegin { events.append(try wheel(.began, nil, moving: false)) }
+                    openScrollPhase = .changed
+                    if pixels != nil { events.append(try wheel(.changed, nil)) }
+                case .ended, .cancelled:
+                    guard openScrollPhase != nil else { return events }
+                    openScrollPhase = nil
+                    events.append(try wheel(phase, nil))
+                    scroll.reset()
+                }
+                return events
+            }
+            guard let momentum = input.momentumPhase else { return [] }
+            if let open = openScrollPhase {
+                openScrollPhase = nil
+                events.append(try wheel(open == .mayBegin ? .cancelled : .ended, nil, moving: false))
+            }
+            switch momentum {
+            case .began:
+                if momentumOpen { events.append(try wheel(nil, .ended, moving: false)) }
+                momentumOpen = true
+                events.append(try wheel(nil, .began))
+            case .changed:
+                if !momentumOpen { events.append(try wheel(nil, .began, moving: false)) }
+                momentumOpen = true
+                if pixels != nil { events.append(try wheel(nil, .changed)) }
+            case .ended:
+                guard momentumOpen else { return events }
+                momentumOpen = false
+                events.append(try wheel(nil, .ended))
+                scroll.reset()
+            }
+            return events
+        }
+
+        private func wheelEvent(units: CGScrollEventUnit, x: Int32, y: Int32) throws -> CGEvent {
+            guard let event = CGEvent(scrollWheelEvent2Source: source, units: units, wheelCount: 2,
+                                      wheel1: y, wheel2: x, wheel3: 0) else {
+                throw DeskError.invalid("无法建立远端滚动事件")
+            }
+            return event
+        }
+
+        private func endScrollPhasesUnlocked() {
+            var endings: [(RemoteInput.ScrollPhase?, RemoteInput.MomentumPhase?)] = []
+            if let open = openScrollPhase { endings.append((open == .mayBegin ? .cancelled : .ended, nil)) }
+            if momentumOpen { endings.append((nil, .ended)) }
+            openScrollPhase = nil
+            momentumOpen = false
+            guard !endings.isEmpty else { return }
+            scroll.reset()
+            for (phase, momentum) in endings {
+                guard let event = try? wheelEvent(units: .pixel, x: 0, y: 0) else { continue }
+                event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase?.rawValue ?? 0))
+                event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Int64(momentum?.rawValue ?? 0))
+                event.location = lastPoint
+                event.flags = inputFlags
+                postEvent(event)
+            }
+        }
+
+        func releaseAll() {
+            lock.withLock { releaseAllUnlocked() }
+        }
+
+        private func releaseAllUnlocked() {
+            endScrollPhasesUnlocked()
+            inputSources.cancel()
+            scroll.reset()
+            lineScroll.reset()
+            for key in heldKeys {
+                let event = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false)
+                if [54, 55, 56, 57, 58, 59, 60, 61, 62, 63].contains(key) { event?.type = .flagsChanged }
+                event?.flags = remoteCapsLock == true ? [.maskAlphaShift] : []
+                if let event { postEvent(event) }
+            }
+            for button in heldButtons {
+                let type: CGEventType = button == 0 ? .leftMouseUp : button == 1 ? .rightMouseUp : .otherMouseUp
+                let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: lastPoint,
+                                    mouseButton: CGMouseButton(rawValue: UInt32(button)) ?? .left)
+                event?.flags = remoteCapsLock == true ? [.maskAlphaShift] : []
+                if let event { postEvent(event) }
+            }
+            heldKeys.removeAll()
+            heldButtons.removeAll()
+            inputFlags = remoteCapsLock == true ? [.maskAlphaShift] : []
+        }
+    }
+
+    nonisolated let bounds: CGRect
+    nonisolated let supportsConcurrentQueue: Bool
+    private let engine: Engine
+
+    convenience init(displayID: CGDirectDisplayID) {
+        self.init(concurrentBounds: CGDisplayBounds(displayID))
+    }
+
+    nonisolated init(concurrentBounds bounds: CGRect,
+                     isTrusted: @escaping @Sendable () -> Bool = { AXIsProcessTrusted() },
+                     postEvent: @escaping @Sendable (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
+                     inputSources: InputSources? = nil,
+                     capsLockState: @escaping @Sendable () -> Bool = { CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift) },
+                     pointerLocation: @escaping @Sendable () -> CGPoint? = { CGEvent(source: nil)?.location }) {
+        self.bounds = bounds
+        self.supportsConcurrentQueue = true
+        self.engine = Engine(bounds: bounds, isTrusted: isTrusted, postEvent: postEvent,
+                             inputSources: inputSources ?? InputSources(),
+                             capsLockState: capsLockState, pointerLocation: pointerLocation)
+    }
 
     init(bounds: CGRect, isTrusted: @escaping () -> Bool = { AXIsProcessTrusted() },
          postEvent: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
@@ -1424,276 +1794,49 @@ final class InputInjector {
          capsLockState: @escaping () -> Bool = { CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift) },
          pointerLocation: @escaping () -> CGPoint? = { CGEvent(source: nil)?.location }) {
         self.bounds = bounds
-        self.isTrusted = isTrusted
-        self.postEvent = postEvent
-        self.inputSources = inputSources ?? InputSources()
-        self.capsLockState = capsLockState
-        self.pointerLocation = pointerLocation
+        self.supportsConcurrentQueue = false
+        self.engine = Engine(bounds: bounds, isTrusted: isTrusted, postEvent: postEvent,
+                             inputSources: inputSources ?? InputSources(),
+                             capsLockState: capsLockState, pointerLocation: pointerLocation)
     }
 
     func receive(_ input: RemoteInput) async throws -> InputFeedback? {
         try input.validate()
-        guard isTrusted() else { releaseAll(); return nil }
-        if input.independentCapsLock == true || input.kind == .switchInputSource || input.kind == .toggleCapsLock {
-            if remoteCapsLock == nil { remoteCapsLock = capsLockState() }
-        }
-        if input.kind == .switchInputSource, !inputSources.requiresKeyboardRefocus, remoteCapsLock != true {
+        guard engine.checkTrustedOrRelease() else { return nil }
+        if input.kind == .switchInputSource, engine.prepareSwitchInputSource(input) {
             do {
-                let selected = try await inputSources.toggle()
-                guard isTrusted() else { releaseAll(); return nil }
+                let selected = try await engine.inputSources.toggle()
+                guard engine.checkTrustedOrRelease() else { return nil }
                 return InputFeedback(message: "远端输入源已确认：\(selected)", capsLocked: false)
             } catch is CancellationError {
                 return nil
             } catch {
-                if inputSources.requiresKeyboardRefocus {
-                    releaseAll()
-                    return InputFeedback(message: "\(error.localizedDescription)，请点击远端输入位置后继续", capsLocked: remoteCapsLock == true)
+                if engine.inputSources.requiresKeyboardRefocus {
+                    engine.releaseAll()
+                    return InputFeedback(message: "\(error.localizedDescription)，请点击远端输入位置后继续",
+                                         capsLocked: engine.currentCapsLocked())
                 }
-                return InputFeedback(message: error.localizedDescription, capsLocked: remoteCapsLock == true)
+                return InputFeedback(message: error.localizedDescription, capsLocked: engine.currentCapsLocked())
             }
         }
-        return try receiveImmediate(input, validated: true)
+        return try engine.receiveImmediate(input, validated: true)
     }
 
     func receiveImmediate(_ input: RemoteInput, validated: Bool = false) throws -> InputFeedback? {
-        if !validated { try input.validate() }
-        guard isTrusted() else { releaseAll(); return nil }
-        if input.independentCapsLock == true || input.kind == .switchInputSource || input.kind == .toggleCapsLock {
-            if remoteCapsLock == nil { remoteCapsLock = capsLockState() }
-        }
-        if input.kind == .switchInputSource || input.kind == .toggleCapsLock {
-            guard !inputSources.requiresKeyboardRefocus else {
-                return InputFeedback(message: "请点击远端输入位置后继续", capsLocked: remoteCapsLock == true)
-            }
-            if input.kind == .toggleCapsLock || remoteCapsLock == true {
-                remoteCapsLock = !(remoteCapsLock ?? false)
-                let event = CGEvent(keyboardEventSource: source, virtualKey: 57, keyDown: remoteCapsLock == true)
-                event?.type = .flagsChanged
-                var modifiers = CGEventSource.flagsState(.combinedSessionState)
-                modifiers.remove(.maskAlphaShift)
-                if remoteCapsLock == true { modifiers.insert(.maskAlphaShift) }
-                event?.flags = modifiers
-                if let event { inputFlags = modifiers; postEvent(event) }
-                return InputFeedback(message: remoteCapsLock == true ? "远端大写锁定已开启" : "远端大写锁定已关闭",
-                                     capsLocked: remoteCapsLock == true)
-            }
-            return nil
-        }
-        let point = CGPoint(x: bounds.minX + input.x * max(0, bounds.width - 1),
-                            y: bounds.minY + input.y * max(0, bounds.height - 1))
-        let mask: CGEventFlags = [.maskAlphaShift, .maskShift, .maskControl, .maskAlternate,
-                                  .maskCommand, .maskSecondaryFn, .maskNumericPad]
-        var flags = CGEventFlags(rawValue: input.flags).intersection(mask)
-        if input.independentCapsLock == true {
-            flags.remove(.maskAlphaShift)
-            if remoteCapsLock == true { flags.insert(.maskAlphaShift) }
-        }
-        var event: CGEvent?
-        let button = CGMouseButton(rawValue: UInt32(input.button)) ?? .left
-        switch input.kind {
-        case .keyDown, .keyUp, .flags:
-            guard !inputSources.requiresKeyboardRefocus else { return nil }
-            if input.kind == .flags {
-                // Modifier keys arrive as flagsChanged, not ordinary keyDown/keyUp.
-                let modifier: CGEventFlags
-                switch input.keyCode {
-                case 54, 55: modifier = .maskCommand
-                case 56, 60: modifier = .maskShift
-                case 58, 61: modifier = .maskAlternate
-                case 59, 62: modifier = .maskControl
-                case 57: modifier = .maskAlphaShift
-                case 63: modifier = .maskSecondaryFn
-                default: return nil
-                }
-                let down: Bool
-                if input.flags & 0x207F != 0, let bit = Self.modifierDeviceBits[input.keyCode] {
-                    down = input.flags & bit != 0
-                } else { down = flags.contains(modifier) }
-                event = CGEvent(keyboardEventSource: source, virtualKey: input.keyCode, keyDown: down)
-                event?.type = .flagsChanged
-                if down { heldKeys.insert(input.keyCode) } else { heldKeys.remove(input.keyCode) }
-            } else {
-                let down = input.kind == .keyDown
-                event = CGEvent(keyboardEventSource: source, virtualKey: input.keyCode, keyDown: down)
-                event?.setIntegerValueField(.keyboardEventAutorepeat, value: input.isRepeat ? 1 : 0)
-                if down { heldKeys.insert(input.keyCode) } else { heldKeys.remove(input.keyCode) }
-            }
-        case .scroll:
-            // A wheel or an older viewer sends no phases; finish any gesture an interrupted stream left open.
-            if input.scrollPhase == nil && input.momentumPhase == nil { endScrollPhases() }
-            let wheels = try scrollEvents(input)
-            guard let wheel = wheels.last else { return nil }
-            // A scroll's location does not move the pointer used for window and view routing, so move it there
-            // first. Skip the move once the pointer is already there: one per wheel event redoes hover mid-scroll.
-            let current = pointerLocation()
-            if current.map({ abs($0.x - point.x) >= 0.5 || abs($0.y - point.y) >= 0.5 }) ?? true {
-                let heldButton = heldButtons.min()
-                let moveType: CGEventType = heldButton == nil ? .mouseMoved
-                    : heldButton == 0 ? .leftMouseDragged : heldButton == 1 ? .rightMouseDragged : .otherMouseDragged
-                let moveButton = CGMouseButton(rawValue: UInt32(heldButton ?? 0)) ?? .left
-                guard let move = CGEvent(mouseEventSource: source, mouseType: moveType, mouseCursorPosition: point,
-                                         mouseButton: moveButton) else {
-                    throw DeskError.invalid("无法建立远端滚动事件")
-                }
-                move.flags = flags
-                postEvent(move)
-            }
-            for earlier in wheels.dropLast() {
-                earlier.location = point
-                earlier.flags = flags
-                postEvent(earlier)
-            }
-            lastPoint = point
-            event = wheel
-            event?.location = point
-        case .move, .drag, .down, .up:
-            let type: CGEventType
-            switch input.kind {
-            case .down:
-                inputSources.requiresKeyboardRefocus = false
-                heldButtons.insert(input.button)
-                type = input.button == 0 ? .leftMouseDown : input.button == 1 ? .rightMouseDown : .otherMouseDown
-            case .up:
-                heldButtons.remove(input.button)
-                type = input.button == 0 ? .leftMouseUp : input.button == 1 ? .rightMouseUp : .otherMouseUp
-            case .drag:
-                type = input.button == 0 ? .leftMouseDragged : input.button == 1 ? .rightMouseDragged : .otherMouseDragged
-            default: type = .mouseMoved
-            }
-            event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button)
-            event?.setIntegerValueField(.mouseEventClickState, value: Int64(input.clicks))
-            lastPoint = point
-        case .switchInputSource, .toggleCapsLock: return nil
-        }
-        event?.flags = flags
-        if let event { inputFlags = flags; postEvent(event) }
-        return nil
+        try engine.receiveImmediate(input, validated: validated)
     }
 
-    // Wheel events for one scroll input in posting order; the last is the input's own, earlier ones end or
-    // begin a phase whose own event was lost. Empty when it moves less than a pixel and starts or ends nothing.
-    private func scrollEvents(_ input: RemoteInput) throws -> [CGEvent] {
-        if let lineX = input.lineDeltaX, let lineY = input.lineDeltaY {
-            // A wheel stays a line wheel, so apps scroll by their own line height, as with a local mouse.
-            guard lineX != 0 || lineY != 0 else { return [] }
-            let pixels = try scroll.accumulate(deltaX: input.deltaX, deltaY: input.deltaY)
-            let lines = try lineScroll.accumulate(deltaX: lineX, deltaY: lineY)
-            let wheel = try wheelEvent(units: .line, x: lines?.x ?? 0, y: lines?.y ?? 0)
-            wheel.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: lineY)
-            wheel.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: lineX)
-            wheel.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(pixels?.y ?? 0))
-            wheel.setIntegerValueField(.scrollWheelEventPointDeltaAxis2, value: Int64(pixels?.x ?? 0))
-            return [wheel]
-        }
-        let pixels = try scroll.accumulate(deltaX: input.deltaX, deltaY: input.deltaY)
-        guard input.scrollPhase != nil || input.momentumPhase != nil else {
-            // An older viewer, or a precise device outside a gesture: pixels as before.
-            guard let pixels else { return [] }
-            return [try wheelEvent(units: .pixel, x: pixels.x, y: pixels.y)]
-        }
-        func wheel(_ phase: RemoteInput.ScrollPhase?, _ momentum: RemoteInput.MomentumPhase?,
-                   moving: Bool = true) throws -> CGEvent {
-            let event = try wheelEvent(units: .pixel, x: moving ? pixels?.x ?? 0 : 0, y: moving ? pixels?.y ?? 0 : 0)
-            event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase?.rawValue ?? 0))
-            event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Int64(momentum?.rawValue ?? 0))
-            return event
-        }
-        // A gesture phase and a momentum phase do not occur together; the gesture phase wins. An ending lost
-        // on the way is supplied before the next phase, so apps always see a gesture begin and end in order.
-        var events: [CGEvent] = []
-        if let phase = input.scrollPhase {
-            if momentumOpen {
-                momentumOpen = false
-                events.append(try wheel(nil, .ended, moving: false))
-            }
-            switch phase {
-            case .mayBegin, .began:
-                if let open = openScrollPhase, open != .mayBegin { events.append(try wheel(.ended, nil, moving: false)) }
-                openScrollPhase = phase
-                events.append(try wheel(phase, nil))
-            case .changed:
-                if openScrollPhase == nil || openScrollPhase == .mayBegin { events.append(try wheel(.began, nil, moving: false)) }
-                openScrollPhase = .changed
-                if pixels != nil { events.append(try wheel(.changed, nil)) }
-            case .ended, .cancelled:
-                guard openScrollPhase != nil else { return events }
-                openScrollPhase = nil
-                events.append(try wheel(phase, nil))
-                scroll.reset()
-            }
-            return events
-        }
-        guard let momentum = input.momentumPhase else { return [] }
-        if let open = openScrollPhase {
-            openScrollPhase = nil
-            events.append(try wheel(open == .mayBegin ? .cancelled : .ended, nil, moving: false))
-        }
-        switch momentum {
-        case .began:
-            if momentumOpen { events.append(try wheel(nil, .ended, moving: false)) }
-            momentumOpen = true
-            events.append(try wheel(nil, .began))
-        case .changed:
-            if !momentumOpen { events.append(try wheel(nil, .began, moving: false)) }
-            momentumOpen = true
-            if pixels != nil { events.append(try wheel(nil, .changed)) }
-        case .ended:
-            guard momentumOpen else { return events }
-            momentumOpen = false
-            events.append(try wheel(nil, .ended))
-            scroll.reset()
-        }
-        return events
-    }
-
-    private func wheelEvent(units: CGScrollEventUnit, x: Int32, y: Int32) throws -> CGEvent {
-        guard let event = CGEvent(scrollWheelEvent2Source: source, units: units, wheelCount: 2,
-                                  wheel1: y, wheel2: x, wheel3: 0) else {
-            throw DeskError.invalid("无法建立远端滚动事件")
-        }
-        return event
-    }
-
-    // Silence can be a stationary touch. Only an explicit ending, a different scroll stream or releaseAll
-    // closes the gesture; the viewer sends an ending when its pointer leaves the remote picture.
-    private func endScrollPhases() {
-        var endings: [(RemoteInput.ScrollPhase?, RemoteInput.MomentumPhase?)] = []
-        if let open = openScrollPhase { endings.append((open == .mayBegin ? .cancelled : .ended, nil)) }
-        if momentumOpen { endings.append((nil, .ended)) }
-        openScrollPhase = nil
-        momentumOpen = false
-        guard !endings.isEmpty else { return }
-        scroll.reset()
-        for (phase, momentum) in endings {
-            guard let event = try? wheelEvent(units: .pixel, x: 0, y: 0) else { continue }
-            event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase?.rawValue ?? 0))
-            event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: Int64(momentum?.rawValue ?? 0))
-            event.location = lastPoint
-            event.flags = inputFlags
-            postEvent(event)
-        }
+    nonisolated func receiveImmediateOnInputQueue(_ input: RemoteInput, validated: Bool = false) throws -> InputFeedback? {
+        precondition(supportsConcurrentQueue)
+        return try engine.receiveImmediate(input, validated: validated)
     }
 
     func releaseAll() {
-        endScrollPhases()
-        inputSources.cancel()
-        scroll.reset()
-        lineScroll.reset()
-        for key in heldKeys {
-            let event = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false)
-            if [54, 55, 56, 57, 58, 59, 60, 61, 62, 63].contains(key) { event?.type = .flagsChanged }
-            event?.flags = remoteCapsLock == true ? [.maskAlphaShift] : []
-            if let event { postEvent(event) }
-        }
-        for button in heldButtons {
-            let type: CGEventType = button == 0 ? .leftMouseUp : button == 1 ? .rightMouseUp : .otherMouseUp
-            let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: lastPoint,
-                                mouseButton: CGMouseButton(rawValue: UInt32(button)) ?? .left)
-            event?.flags = remoteCapsLock == true ? [.maskAlphaShift] : []
-            if let event { postEvent(event) }
-        }
-        heldKeys.removeAll()
-        heldButtons.removeAll()
-        inputFlags = remoteCapsLock == true ? [.maskAlphaShift] : []
+        engine.releaseAll()
+    }
+
+    nonisolated func releaseAllOnInputQueue() {
+        precondition(supportsConcurrentQueue)
+        engine.releaseAll()
     }
 }

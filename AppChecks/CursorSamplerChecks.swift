@@ -201,6 +201,29 @@ private struct CursorSamplerChecks {
                         && samples[1].image?.png != samples[0].image?.png, "A changed bitmap reused the old shape")
         }
 
+        run("Immutable CGImage-backed cursors hit the fast path and still detect hotspot changes") {
+            let base = try image(width: 16, height: 12)
+            guard let cgImage = base.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                throw CursorSamplerCheckFailure("Could not obtain CGImage for immutable cursor test")
+            }
+            let immutable = NSImage(cgImage: cgImage, size: CGSize(width: 16, height: 12))
+            var hotSpot = CGPoint(x: 2, y: 3), point = CGPoint(x: 100, y: 100), encodes = 0, samples: [HostCursorSample] = []
+            let sampler = HostCursorSampler(display: display(), cursorProvider: { CursorProbe(image: immutable, hotSpot: hotSpot) },
+                locationProvider: { point }, screenFrameProvider: { _ in CGRect(x: 0, y: 0, width: 1440, height: 900) },
+                pngEncoder: { bitmap in encodes += 1; return bitmap.representation(using: .png, properties: [:]) })
+            sampler.onSample = { samples.append($0) }; sampler.start(); defer { sampler.stop() }
+            for step in 1...10 {
+                point = CGPoint(x: 100 + CGFloat(step), y: 100)
+                sampler.sampleNow()
+            }
+            try require(encodes == 1 && samples.count == 11 && samples.dropFirst().allSatisfy { !$0.shapeChanged },
+                        "Immutable CGImage cursor re-encoded or lost position updates")
+            hotSpot = CGPoint(x: 4, y: 5)
+            sampler.sampleNow()
+            try require(encodes == 2 && samples.count == 12 && samples.last?.shapeChanged == true && samples.last?.image?.hotSpotX == 4,
+                        "Hotspot change on immutable CGImage cursor did not invalidate fast path")
+        }
+
         run("Shape and hotspot changes update independently of cursor identity") {
             let red = try image(), blue = try image(blue: true)
             var cursor: NSCursor? = CursorProbe(image: red, hotSpot: .zero)

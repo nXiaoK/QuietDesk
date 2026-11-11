@@ -38,9 +38,26 @@ final class HostCursorSampler {
     private var previousPosition: Position?
     private var previousShape: Data?
     private var sampledShape = false
+    private struct ScratchCanvas {
+        let width: Int
+        let height: Int
+        let bitmap: NSBitmapImageRep
+        let context: NSGraphicsContext
+    }
+
+    private struct ImmutableCursorCache {
+        let cgImageID: ObjectIdentifier
+        let size: CGSize
+        let hotSpot: CGPoint
+        let fingerprint: Data
+        let image: CursorImage
+    }
+
     private var cachedImages: [Data: CursorImage] = [:]
     private var cacheOrder: [Data] = []
     private var failedRaster: (fingerprint: Data, retryAt: TimeInterval)?
+    private var scratchCanvas: ScratchCanvas?
+    private var immutableCache: ImmutableCursorCache?
 
     init(display: DisplaySnapshot, interval: TimeInterval = 1.0 / 30,
          cursorProvider: @escaping CursorProvider = { NSCursor.currentSystem },
@@ -84,6 +101,8 @@ final class HostCursorSampler {
         previousPosition = nil; previousShape = nil; sampledShape = false
         cachedImages.removeAll(); cacheOrder.removeAll()
         failedRaster = nil
+        scratchCanvas = nil
+        immutableCache = nil
     }
 
     func updateDisplay(_ value: DisplaySnapshot) {
@@ -141,6 +160,12 @@ final class HostCursorSampler {
               (0.5...256).contains(size.height), hotSpot.x.isFinite, hotSpot.y.isFinite,
               hotSpot.x >= 0, hotSpot.y >= 0, hotSpot.x <= size.width, hotSpot.y <= size.height else { return nil }
         let representations = image.representations
+        let hasMutableBitmapRep = representations.contains { $0 is NSBitmapImageRep }
+        let backingCGImage = hasMutableBitmapRep ? nil : image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        if let backingCGImage, let cached = immutableCache,
+           cached.cgImageID == ObjectIdentifier(backingCGImage), cached.size == size, cached.hotSpot == hotSpot {
+            return (cached.fingerprint, cached.image)
+        }
         let representationScale = representations.compactMap { representation -> CGFloat? in
             guard representation.pixelsWide > 0, representation.pixelsHigh > 0 else { return nil }
             return min(CGFloat(representation.pixelsWide) / size.width, CGFloat(representation.pixelsHigh) / size.height)
@@ -149,11 +174,22 @@ final class HostCursorSampler {
         let reduction = min(1, 256 / max(size.width * scale, size.height * scale))
         let width = max(1, min(256, Int((size.width * scale * reduction).rounded())))
         let height = max(1, min(256, Int((size.height * scale * reduction).rounded())))
-        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
-            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-            colorSpaceName: .deviceRGB, bytesPerRow: width * 4, bitsPerPixel: 32),
-              let pixels = bitmap.bitmapData, let context = NSGraphicsContext(bitmapImageRep: bitmap) else { return nil }
-        bitmap.size = CGSize(width: width, height: height)
+        let canvas: ScratchCanvas
+        if let existing = scratchCanvas, existing.width == width, existing.height == height {
+            canvas = existing
+        } else {
+            guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: width, pixelsHigh: height,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: width * 4, bitsPerPixel: 32),
+                  let context = NSGraphicsContext(bitmapImageRep: bitmap) else { return nil }
+            bitmap.size = CGSize(width: width, height: height)
+            let created = ScratchCanvas(width: width, height: height, bitmap: bitmap, context: context)
+            scratchCanvas = created
+            canvas = created
+        }
+        let bitmap = canvas.bitmap
+        let context = canvas.context
+        guard let pixels = bitmap.bitmapData else { return nil }
         let rect = CGRect(x: 0, y: 0, width: width, height: height)
         context.cgContext.clear(rect)
         NSGraphicsContext.saveGraphicsState()
@@ -164,13 +200,32 @@ final class HostCursorSampler {
         NSGraphicsContext.restoreGraphicsState()
         var hasher = SHA256()
         hasher.update(bufferPointer: UnsafeRawBufferPointer(start: pixels, count: width * height * 4))
-        var metadata = Data(capacity: 36)
-        for value in [Double(size.width), Double(size.height), Double(hotSpot.x), Double(hotSpot.y)] { metadata.put(value.bitPattern) }
-        metadata.put(UInt16(width)); metadata.put(UInt16(height))
-        hasher.update(data: metadata)
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 36) { buffer in
+            var offset = 0
+            for value in [Double(size.width), Double(size.height), Double(hotSpot.x), Double(hotSpot.y)] {
+                let bits = value.bitPattern.bigEndian
+                withUnsafeBytes(of: bits) { bytes in
+                    buffer.baseAddress!.advanced(by: offset).update(from: bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), count: 8)
+                }
+                offset += 8
+            }
+            let rawWidth = UInt16(width).bigEndian
+            let rawHeight = UInt16(height).bigEndian
+            for dimension in [rawWidth, rawHeight] {
+                withUnsafeBytes(of: dimension) { bytes in
+                    buffer.baseAddress!.advanced(by: offset).update(from: bytes.baseAddress!.assumingMemoryBound(to: UInt8.self), count: 2)
+                }
+                offset += 2
+            }
+            hasher.update(bufferPointer: UnsafeRawBufferPointer(buffer))
+        }
         let fingerprint = Data(hasher.finalize())
         if let cached = cachedImages[fingerprint] {
             cacheOrder.removeAll { $0 == fingerprint }; cacheOrder.append(fingerprint)
+            if let backingCGImage {
+                immutableCache = ImmutableCursorCache(cgImageID: ObjectIdentifier(backingCGImage), size: size, hotSpot: hotSpot,
+                                                      fingerprint: fingerprint, image: cached)
+            }
             return (fingerprint, cached)
         }
         let now = clock()
@@ -180,6 +235,7 @@ final class HostCursorSampler {
                   logicalWidth: Double(size.width), logicalHeight: Double(size.height),
                   hotSpotX: Double(hotSpot.x), hotSpotY: Double(hotSpot.y)) else {
             failedRaster = (fingerprint, now.isFinite ? now + 1 : 0)
+            immutableCache = nil
             return nil
         }
         failedRaster = nil
@@ -187,6 +243,12 @@ final class HostCursorSampler {
             cacheOrder.removeFirst(); cachedImages.removeValue(forKey: oldest)
         }
         cachedImages[fingerprint] = value; cacheOrder.append(fingerprint)
+        if let backingCGImage {
+            immutableCache = ImmutableCursorCache(cgImageID: ObjectIdentifier(backingCGImage), size: size, hotSpot: hotSpot,
+                                                  fingerprint: fingerprint, image: value)
+        } else {
+            immutableCache = nil
+        }
         return (fingerprint, value)
     }
 

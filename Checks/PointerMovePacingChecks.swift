@@ -144,4 +144,27 @@ func runPointerMovePacingChecks() {
         }
         try check(try same(pacer.takeDue(now: PointerMovePacer.interval), pending), "Rejected input poisoned the pending move")
     }
+
+    run("High-refresh pointer pacing scales to 120 Hz and drag pacing coalesces bursts safely") {
+        try check(abs(PointerMovePacer.interval(forFramesPerSecond: 30) - (1.0 / 60)) < 1e-12, "Sub-60 fps lowered pointer rate")
+        try check(abs(PointerMovePacer.interval(forFramesPerSecond: 90) - (1.0 / 90)) < 1e-12, "90 fps did not use 90 Hz pointer rate")
+        try check(abs(PointerMovePacer.interval(forFramesPerSecond: 240) - (1.0 / 120)) < 1e-12, "240 fps exceeded the 120 Hz pointer ceiling")
+        var pacer = PointerMovePacer()
+        _ = pacer.offer(move(0.1), now: 0)
+        _ = pacer.offer(move(0.5), now: 0.002)
+        pacer.setInterval(1.0 / 120)
+        try check(abs((pacer.nextDelay(now: 0.002) ?? -1) - ((1.0 / 120) - 0.002)) < 1e-12,
+                  "Switching to 120 Hz kept the slower 60 Hz deadline")
+        try check(pacer.takeDue(now: 1.0 / 120)?.x == 0.5, "120 Hz deadline did not emit pending move")
+
+        var dragPacer = PointerMovePacer(interval: 1.0 / 120, allowsDrag: true)
+        var d1 = RemoteInput(kind: .drag); d1.x = 0.2; d1.y = 0.3; d1.button = 0
+        var d2 = RemoteInput(kind: .drag); d2.x = 0.4; d2.y = 0.5; d2.button = 0
+        var d3 = RemoteInput(kind: .drag); d3.x = 0.8; d3.y = 0.9; d3.button = 0
+        try check(dragPacer.offer(d1, now: 0)?.x == 0.2, "First drag in a gesture was delayed")
+        try check(dragPacer.offer(d2, now: 0.001) == nil && dragPacer.offer(d3, now: 0.002) == nil,
+                  "Back-to-back drags bypassed pacing")
+        try check(dragPacer.pendingButton == 0, "Pending drag button was not exposed")
+        try check(dragPacer.takeDue(now: 1.0 / 120)?.x == 0.8, "Coalesced drag lost final position")
+    }
 }

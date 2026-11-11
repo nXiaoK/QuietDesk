@@ -687,6 +687,96 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
    run("HEVC frames cross the independent TCP media connection") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false,hevc:true) }
    run("HEVC frames cross framed shared TCP") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false,hevc:true) }
    run("HEVC packets keep their codec on the legacy video message") { try exercise(udp:false,auxiliary:false,rejectFirst:false,reconfigure:false,legacy:true,hevc:true) }
+   run("Authenticated UDP interactive fast lane delivers cursor positions and sequenced pointer moves with TCP fallback") {
+       let key = try PairingKey.generate()
+       let queue = DispatchQueue(label: "checks.interactive-fast-lane")
+       var udpReservation = socket(AF_INET, SOCK_DGRAM, 0)
+       guard udpReservation >= 0 else { throw Failure(message: "Could not reserve UDP socket") }
+       defer { if udpReservation >= 0 { close(udpReservation) } }
+       var addr = sockaddr_in()
+       addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+       addr.sin_family = sa_family_t(AF_INET)
+       addr.sin_port = 0
+       addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+       let bound = withUnsafePointer(to: &addr) {
+           $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(udpReservation, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+       }
+       guard bound == 0 else { throw Failure(message: "Could not bind UDP reservation") }
+       var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+       _ = withUnsafeMutablePointer(to: &addr) {
+           $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(udpReservation, $0, &len) }
+       }
+       let port = UInt16(bigEndian: addr.sin_port)
+       let listener = try NWListener(using: MediaSecureTransport.tlsParameters(key: key, roles: MediaChannelRole.allCases),
+                                     on: NWEndpoint.Port(rawValue: port)!)
+       let listenReady = DispatchSemaphore(value: 0)
+       let committed = DispatchSemaphore(value: 0)
+       let cursorDone = DispatchSemaphore(value: 0)
+       let inputDone = DispatchSemaphore(value: 0)
+       let hostBox = Box<MediaSession?>(nil)
+       let viewerBox = Box<MediaSession?>(nil)
+       let peers = Box<[Peer]>([])
+       let receivedCursor = Box<CursorPosition?>(nil)
+       let receivedInput = Box<RemoteInput?>(nil)
+       let cursorID = UUID()
+       listener.newConnectionHandler = { incoming in
+           let peer = Peer(connection: incoming)
+           peers.update { $0.append(peer) }
+           peer.onReady = {
+               if let role = MediaSecureTransport.negotiatedRole(on: incoming), role != .control {
+                   hostBox.get()?.acceptAuxiliary(peer, role: role)
+                   return
+               }
+               guard let host = try? MediaSession.host(control: peer, key: key, port: port, settings: StreamSettings()) else { return }
+               hostBox.update { $0 = host }
+               host.onPrepareRecovery = { $0(true) }
+               host.onProduceRecoveryFrame = { host.sendVideo(packet(1, idr: true)) }
+               host.onInteractiveInput = { input in receivedInput.update { $0 = input }; inputDone.signal() }
+               peer.onMessageHandled = { message, resume in _ = host.receive(message); resume() }
+               host.start()
+           }
+           peer.start()
+       }
+       listener.stateUpdateHandler = { if case .ready = $0 { listenReady.signal() } }
+       listener.start(queue: queue)
+       try wait(listenReady, "Interactive listener ready")
+       close(udpReservation); udpReservation = -1
+       let client = Peer(connection: NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!,
+                                                  using: try MediaSecureTransport.tlsParameters(key: key, roles: [.control])))
+       client.onReady = {
+           guard let viewer = try? MediaSession.viewer(control: client, key: key, host: "127.0.0.1", port: port,
+                                                       settings: StreamSettings(), udpEnabled: true) else { return }
+           viewerBox.update { $0 = viewer }
+           viewer.onVideo = { _, complete in complete(true) }
+           viewer.onCommitStream = { _, _ in committed.signal() }
+           viewer.onCursorPosition = { pos in receivedCursor.update { $0 = pos }; cursorDone.signal() }
+           client.onMessageHandled = { message, resume in _ = viewer.receive(message); resume() }
+           viewer.start()
+       }
+       defer {
+           viewerBox.get()?.stop(); hostBox.get()?.stop()
+           client.close("done"); peers.get().forEach { $0.close("done") }; listener.cancel()
+       }
+       client.start()
+       try wait(committed, "Interactive UDP stream did not commit", seconds: 8)
+       Thread.sleep(forTimeInterval: 0.05)
+       guard let host = hostBox.get(), let viewer = viewerBox.get() else { throw Failure(message: "Missing interactive media sessions") }
+       let pos = try CursorPosition(cursorID: cursorID, epoch: 1, sequence: 7, insideDisplay: true, x: 0.25, y: 0.75)
+       try require(host.sendCursorPosition(pos), "Committed UDP host rejected cursor datagram fast lane")
+       try wait(cursorDone, "Viewer did not receive UDP cursor position")
+       try require(receivedCursor.get()?.sequence == 7 && receivedCursor.get()?.x == 0.25, "UDP cursor position payload changed")
+
+       var move = RemoteInput(kind: .move); move.x = 0.4; move.y = 0.6; move.pointerSequence = 99
+       try require(viewer.sendInteractiveInput(move), "Committed UDP viewer rejected pointer datagram fast lane")
+       try wait(inputDone, "Host did not receive UDP interactive pointer move")
+       try require(receivedInput.get()?.pointerSequence == 99 && receivedInput.get()?.x == 0.4, "UDP pointer move payload changed")
+
+       var click = RemoteInput(kind: .down); click.x = 0.4; click.y = 0.6; click.pointerSequence = 100
+       try require(!viewer.sendInteractiveInput(click), "Button down unexpectedly used unreliable UDP fast lane")
+       viewer.setPaused(true)
+       Thread.sleep(forTimeInterval: 0.05)
+       try require(!viewer.sendInteractiveInput(move), "Paused session did not fall back from UDP fast lane")
+   }
   }
   print("Media session checks: \(passed) passed, \(failed) failed")
   if failed>0 {exit(1)}

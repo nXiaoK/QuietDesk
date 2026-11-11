@@ -53,6 +53,8 @@ public final class MediaSession: @unchecked Sendable {
     public var onBytes: ((Int) -> Void)?
     public var onFrameSent: (() -> Void)?
     public var onReliableData: ((Message) -> Void)?
+    public var onCursorPosition: ((CursorPosition) -> Void)?
+    public var onInteractiveInput: ((RemoteInput) -> Void)?
     public var onReduceLoad: ((MediaBottleneck) -> Void)?
     public var onSample: ((MediaPathSample) -> Void)?
     // Actual video route classification, delivered before its sample or direct reduction callback.
@@ -133,7 +135,12 @@ public final class MediaSession: @unchecked Sendable {
     private let initialDatagramRelayed: Bool
     private var relayRoutingNegotiated = false
     private var viewerAcceptsMarkedRepairs = false
+    private var datagramInteractiveNegotiated = false
+    private let interactiveDatagramLock = NSLock()
+    private var interactiveDatagramAvailable = false
     private static let repairedFragmentKind: UInt8 = 5
+    private static let cursorPositionDatagramKind: UInt8 = 6
+    private static let interactiveInputDatagramKind: UInt8 = 7
     private var alternateRequested = false
     private var alternateProbePending = false
     private var alternateRetryDeferred = false
@@ -274,7 +281,8 @@ public final class MediaSession: @unchecked Sendable {
             if self.side == .viewer {
                 self.onDiagnosticVideoPath?(.preparing)
                 self.sendControl(MediaControl(.request, relayRouting: self.relayRoutingEnabled ? true : nil,
-                                              receiveFrameWindow: MediaBufferLimits.receiveFrameWindow, markedRepairs: true))
+                                              receiveFrameWindow: MediaBufferLimits.receiveFrameWindow, markedRepairs: true,
+                                              datagramInteractive: true))
                 self.onState?("正在优化传输")
             }
         }
@@ -309,6 +317,56 @@ public final class MediaSession: @unchecked Sendable {
             if Self.isBulk(message.kind), self.bulkBound, let peer = self.bulkPeer { peer.send(message) }
             else { self.control.send(message) }
         }
+    }
+
+    @discardableResult
+    public func sendCursorPosition(_ position: CursorPosition) -> Bool {
+        guard side == .host, interactiveDatagramLock.withLock({ interactiveDatagramAvailable }) else { return false }
+        let encoded = position.encode()
+        var packet = Data(capacity: 1 + encoded.count)
+        packet.append(Self.cursorPositionDatagramKind)
+        packet.append(encoded)
+        queue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            if !self.paused, !self.configurationSuspended, self.datagramInteractiveNegotiated,
+               self.udpVerified, let peer = self.udpPeer, self.sendDatagram(packet, using: peer) {
+                return
+            }
+            self.control.send(Message(.cursorPosition, encoded))
+        }
+        return true
+    }
+
+    @discardableResult
+    public func sendInteractiveInput(_ input: RemoteInput) -> Bool {
+        guard side == .viewer,
+              input.kind == .move || input.kind == .drag,
+              input.pointerSequence != nil,
+              interactiveDatagramLock.withLock({ interactiveDatagramAvailable }),
+              let encoded = try? JSONEncoder().encode(input),
+              encoded.count + 1 <= MediaFragment.maximumDatagramBytes + 1 else {
+            return false
+        }
+        var packet = Data(capacity: 1 + encoded.count)
+        packet.append(Self.interactiveInputDatagramKind)
+        packet.append(encoded)
+        queue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            if !self.paused, !self.configurationSuspended, self.datagramInteractiveNegotiated,
+               self.udpVerified, let peer = self.udpPeer {
+                _ = self.sendDatagram(packet, using: peer)
+                return
+            }
+            self.control.send(Message(.input, encoded))
+        }
+        return true
+    }
+
+    private func refreshInteractiveDatagramAvailability() {
+        let ready = !stopped && negotiated && datagramInteractiveNegotiated
+            && !paused && !configurationSuspended && udpVerified && udpPeer != nil
+            && (transaction == nil ? active?.path == .udp : transaction?.path == .udp)
+        interactiveDatagramLock.withLock { interactiveDatagramAvailable = ready }
     }
 
     public func acceptAuxiliary(_ peer: Peer, role: MediaChannelRole) {
@@ -353,6 +411,7 @@ public final class MediaSession: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, !self.stopped, self.paused != value else { return }
             self.paused = value
+            self.refreshInteractiveDatagramAvailability()
             self.reliableDeliveryFailures = 0; self.reliableFailureNotified = false
             if !value { self.livenessResumedAt = SessionClock.uptime }
             else { self.udpJitter.reset() }
@@ -370,6 +429,7 @@ public final class MediaSession: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
             self.udpVerified = false
+            self.refreshInteractiveDatagramAvailability()
             self.controlRoundTrip = nil
             self.udpJitter.reset()
             self.receivedChallenge = false
@@ -388,6 +448,7 @@ public final class MediaSession: @unchecked Sendable {
             self.alternateEndpoint = nil; self.alternateProbePending = false; self.alternateRequested = false
             guard usingAlternate else { return }
             self.udpVerified = false; self.receivedChallenge = false; self.challenge = nil
+            self.refreshInteractiveDatagramAvailability()
             self.udpJitter.reset()
             self.udpPeer?.close("中继媒体路径已关闭")
             self.clearDatagrams()
@@ -399,6 +460,7 @@ public final class MediaSession: @unchecked Sendable {
             guard let self, !self.stopped else { completion(); return }
             guard self.negotiated else { completion(); return }
             self.configurationSuspended = true
+            self.refreshInteractiveDatagramAvailability()
             self.recoveryHold = true
             self.udpJitter.reset()
             self.abortTransaction(retry: false)
@@ -429,6 +491,7 @@ public final class MediaSession: @unchecked Sendable {
             guard let self, !self.stopped else { return }
             guard self.negotiated else { return }
             self.configurationSuspended = false
+            self.refreshInteractiveDatagramAvailability()
             self.livenessResumedAt = SessionClock.uptime
             self.handleActions(self.policy.setPaused(self.paused, now: SessionClock.now))
             if !self.paused {
@@ -442,6 +505,7 @@ public final class MediaSession: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
             self.stopped = true
+            self.refreshInteractiveDatagramAvailability()
             _ = self.policy.stop()
             self.timer?.cancel(); self.timer = nil
             self.pollTimer?.cancel(); self.pollTimer = nil; self.pollScheduled = false
@@ -502,10 +566,12 @@ public final class MediaSession: @unchecked Sendable {
             if sessionID != nil { if offerSent { sendOffer() }; return }
             viewerAcceptsMarkedRepairs = value.markedRepairs == true
             relayRoutingNegotiated = relayRoutingEnabled && value.relayRouting == true
+            datagramInteractiveNegotiated = value.datagramInteractive == true
             let identifier = UUID(), token = try randomBytes(32), sessionKey = try randomBytes(32)
             sessionID = identifier; bindingToken = token; datagramKey = sessionKey
             grant = try MediaBindingGrant(sessionID: identifier, token: token, now: SessionClock.now)
             negotiated = true
+            refreshInteractiveDatagramAvailability()
             onReceiveFrameWindow?(value.receiveFrameWindow)
             prepareListener(sessionKey: sessionKey, identifier: identifier)
             return
@@ -516,6 +582,8 @@ public final class MediaSession: @unchecked Sendable {
             sessionID = identifier; bindingToken = token; datagramKey = sessionKey
             negotiated = true; udpAvailable = udpEnabled && value.path != "tcp"
             relayRoutingNegotiated = relayRoutingEnabled && value.relayRouting == true
+            datagramInteractiveNegotiated = value.datagramInteractive == true
+            refreshInteractiveDatagramAvailability()
             fallbackAt = SessionClock.now + 1.5
             openAuxiliary(.video); openAuxiliary(.bulk)
             if udpAvailable { handleActions(policy.tick(now: SessionClock.now)) }
@@ -566,6 +634,7 @@ public final class MediaSession: @unchecked Sendable {
             var pending = Transaction(id: id, stream: stream, path: path, started: SessionClock.now)
             pending.diagnostic = diagnostics?.start()
             transaction = pending
+            refreshInteractiveDatagramAvailability()
             let prepare: ((@escaping (Bool) -> Void) -> Void)?
             if let onPrepareStream { prepare = { complete in onPrepareStream(stream, complete) } }
             else { prepare = onPrepareRecovery }
@@ -621,6 +690,7 @@ public final class MediaSession: @unchecked Sendable {
                   pending.path == path, pending.stage == .decoded, let packet = pending.packet else { return }
             pending.stage = .committed; transaction = pending
             active = (stream, path, pending.localNetwork)
+            refreshInteractiveDatagramAvailability()
             diagnostics?.record(.mediaSwitch, since: pending.diagnostic, kind: .mediaFrame, identifier: 1)
             recordTransport(path)
             onCommitStream?(stream, packet)
@@ -635,6 +705,7 @@ public final class MediaSession: @unchecked Sendable {
             guard side == .host, let pending = transaction, pending.id == id,
                   pending.stream == stream, pending.path == path, pending.stage == .decoded else { return }
             active = (stream, path, pending.localNetwork); transaction = nil; recoveryHold = false
+            refreshInteractiveDatagramAvailability()
             recordTransport(path)
             onState?(stateLabel(path)); onResumeFrames?()
         case .abort:
@@ -704,7 +775,8 @@ public final class MediaSession: @unchecked Sendable {
         guard let sessionID, let token = bindingToken, let datagramKey, !stopped else { return }
         offerSent = true
         sendControl(MediaControl(.offer, sessionID: sessionID, token: token, datagramKey: datagramKey,
-                                 path: udpAvailable ? "udp" : "tcp", relayRouting: relayRoutingNegotiated ? true : nil))
+                                 path: udpAvailable ? "udp" : "tcp", relayRouting: relayRoutingNegotiated ? true : nil,
+                                 datagramInteractive: datagramInteractiveNegotiated ? true : nil))
     }
 
     private func openAuxiliary(_ role: MediaChannelRole) {
@@ -801,6 +873,7 @@ public final class MediaSession: @unchecked Sendable {
     private func installDatagram(_ peer: BoundedDatagramPeer, hostBinding: ((Data) -> Void)? = nil, start: Bool = true, release: @escaping () -> Void = {}) {
         if side == .host { hostAssist = hostBinding; udpRelayed = hostBinding != nil }
         udpPeer = peer; udpVerified = false; receivedChallenge = false; challenge = nil; lastPongAt = 0
+        refreshInteractiveDatagramAvailability()
         udpJitter.reset()
         peer.onReady = { [weak self, weak peer] in
             release()
@@ -817,6 +890,7 @@ public final class MediaSession: @unchecked Sendable {
             release()
             guard let self, let peer, self.udpPeer === peer else { return }
             self.udpPeer = nil; self.udpVerified = false
+            self.refreshInteractiveDatagramAvailability()
             self.clearDatagrams()
             if self.side == .viewer, let probe = self.policy.probeID {
                 self.handleActions(self.policy.probeFailed(id: probe, now: SessionClock.now))
@@ -896,6 +970,25 @@ public final class MediaSession: @unchecked Sendable {
             case 4:
                 guard side == .host, udpVerified else { return }
                 receiveFeedback(try MediaFeedback.decode(Data(data.dropFirst())))
+            case Self.cursorPositionDatagramKind:
+                guard side == .viewer, datagramInteractiveNegotiated, udpVerified else { return }
+                do {
+                    onCursorPosition?(try CursorPosition.decode(Data(data.dropFirst())))
+                } catch {
+                    control.close("交互光标数据报无效：\(error.localizedDescription)")
+                }
+            case Self.interactiveInputDatagramKind:
+                guard side == .host, datagramInteractiveNegotiated, udpVerified else { return }
+                do {
+                    let input = try Wire.readJSON(RemoteInput.self, Data(data.dropFirst()))
+                    try input.validate()
+                    guard input.kind == .move || input.kind == .drag, input.pointerSequence != nil else {
+                        throw DeskError.invalid("交互数据报输入类型无效")
+                    }
+                    onInteractiveInput?(input)
+                } catch {
+                    control.close("交互输入数据报无效：\(error.localizedDescription)")
+                }
             default: return
             }
         } catch {
@@ -906,6 +999,7 @@ public final class MediaSession: @unchecked Sendable {
 
     private func verifiedUDP(receivedPong: Bool = true) {
         udpVerified = true
+        refreshInteractiveDatagramAvailability()
         if udpRelayed, let peer = udpPeer, assistAnnouncedPeer !== peer, let datagramKey, let sessionID {
             assistAnnouncedPeer = peer
             let secret = Self.peerAssistSecret(datagramKey: datagramKey, sessionID: sessionID)
@@ -932,6 +1026,7 @@ public final class MediaSession: @unchecked Sendable {
         pending.localNetwork = localNetworkClassification(path) ?? false
         pending.diagnostic = diagnostics?.start()
         transaction = pending
+        refreshInteractiveDatagramAvailability()
         reportLocalNetwork()
         // Same-path recoveries are counted by diagnostics; only route changes are reported with a cause.
         if active?.path != path {
@@ -949,6 +1044,7 @@ public final class MediaSession: @unchecked Sendable {
         guard let pending = transaction else { return }
         if notify { sendTransaction(.abort, pending, mediaFailure: mediaFailure ? true : nil) }
         transaction = nil; clearDatagrams()
+        refreshInteractiveDatagramAvailability()
         if side == .viewer {
             retryAt = SessionClock.now + (retry ? 0.5 : 0)
             retryPath = retry ? pending.path : nil
@@ -1337,6 +1433,7 @@ public final class MediaSession: @unchecked Sendable {
         if side == .host, udpVerified, !livenessGrace.isActive(at: uptime),
            uptime - max(lastPongAt, livenessResumedAt) >= 1 {
             udpVerified = false
+            refreshInteractiveDatagramAvailability()
             udpPeer?.close("媒体路径保活超时")
         }
         if side == .viewer {
@@ -1479,6 +1576,7 @@ public final class MediaSession: @unchecked Sendable {
     private func retireDatagramPath() {
         let previous = udpPeer
         udpPeer = nil; udpVerified = false; receivedChallenge = false; challenge = nil; lastPongAt = 0
+        refreshInteractiveDatagramAvailability()
         udpJitter.reset()
         previous?.close("媒体路径失活，需要重新握手")
         clearDatagrams()

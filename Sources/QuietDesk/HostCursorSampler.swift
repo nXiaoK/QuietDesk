@@ -59,7 +59,7 @@ final class HostCursorSampler {
     private var scratchCanvas: ScratchCanvas?
     private var immutableCache: ImmutableCursorCache?
 
-    init(display: DisplaySnapshot, interval: TimeInterval = 1.0 / 30,
+    init(display: DisplaySnapshot, interval: TimeInterval = 1.0 / 60,
          cursorProvider: @escaping CursorProvider = { NSCursor.currentSystem },
          locationProvider: @escaping LocationProvider = { NSEvent.mouseLocation },
          screenFrameProvider: @escaping ScreenFrameProvider = { id in

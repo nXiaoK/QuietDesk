@@ -88,6 +88,7 @@ final class ViewerSession {
     var media: MediaSession?
     var mediaReceiver: MediaCanvasReceiver?
     var mediaCommitted = false
+    var pointerSequence: UInt64 = 0
     var mediaQuality: MediaQualityPolicy?
     var automaticVideoSettings: StreamSettings?
     var automaticVideoAdjustment: MediaQualityPolicy.Adjustment?

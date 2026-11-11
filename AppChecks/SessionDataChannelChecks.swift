@@ -289,6 +289,24 @@ private struct SessionDataChannelChecks {
                         "Lost a partial interval, counted the offline gap or reused a previous channel")
         }
 
+        run("Out-of-order cursor datagrams do not overwrite newer queued samples") {
+            let channel = SessionDataChannel(send: { _ in }, onFreshFrame: { _ in })
+            var delivered: [CursorPosition] = []
+            channel.configureCursorPosition { delivered.append($0) }
+            let cursorID = UUID()
+            let newer = try CursorPosition(cursorID: cursorID, epoch: 2, sequence: 5, insideDisplay: true, x: 0.7, y: 0.8)
+            let olderSequence = try CursorPosition(cursorID: cursorID, epoch: 2, sequence: 4, insideDisplay: true, x: 0.1, y: 0.2)
+            let olderEpoch = try CursorPosition(cursorID: cursorID, epoch: 1, sequence: 99, insideDisplay: true, x: 0.3, y: 0.4)
+            try onBackground {
+                try require(channel.receiveCursorPosition(newer), "Newer cursor position should be accepted")
+                try require(channel.receiveCursorPosition(olderSequence), "Out-of-order cursor sequence should be coalesced safely")
+                try require(channel.receiveCursorPosition(olderEpoch), "Out-of-order cursor epoch should be coalesced safely")
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.03))
+            try require(delivered.count == 1 && delivered.first?.epoch == 2 && delivered.first?.sequence == 5,
+                        "Expected newer cursor sample (epoch 2, seq 5), got \(delivered)")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

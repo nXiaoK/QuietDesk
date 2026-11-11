@@ -439,6 +439,16 @@ final class DeskModel: ObservableObject {
                 guard self.supportsInputActions else { return }
             }
             if self.canvas.usesCapsLockActions { input.independentCapsLock = true }
+            if [.move, .drag, .down, .up, .scroll].contains(input.kind),
+               self.viewerSession.pointerSequence < UInt64.max {
+                self.viewerSession.pointerSequence += 1
+                input.pointerSequence = self.viewerSession.pointerSequence
+            }
+            if (input.kind == .move || input.kind == .drag),
+               !self.canvas.isFlushingPointerMoves,
+               self.viewerSession.media?.sendInteractiveInput(input) == true {
+                return
+            }
             do {
                 let message = try Wire.json(.input, input)
                 if input.kind == .scroll {
@@ -1152,6 +1162,51 @@ final class DeskModel: ObservableObject {
         let history = trafficHistoryStore
         let auxiliarySession = hostSession.media
         let relayRegistrations = relayHostRegistrations
+        let immediateInputs = HostImmediateInputQueue()
+        let activeInputGate = hostSession.inputGate
+        let inputQueue = hostInputQueue
+        let flushImmediateInputsOnInputQueue: @Sendable () -> Bool = { [weak self, weak candidate] in
+            let (items, resumes) = immediateInputs.drainItems()
+            defer { for resume in resumes { resume() } }
+            guard !items.isEmpty else { return true }
+            let state = activeInputGate.snapshot()
+            guard !state.closed else { return false }
+            guard state.sessionReady else {
+                DispatchQueue.main.async { [weak self, weak candidate] in
+                    guard let self, let candidate, self.generation == token, self.active, self.peer === candidate, !self.connected else { return }
+                    candidate.close("屏幕共享尚未就绪", retryable: true)
+                }
+                return false
+            }
+            do {
+                for item in items {
+                    let input = item.input
+                    let current = activeInputGate.snapshot()
+                    guard !current.closed, current.sessionReady else { return false }
+                    if current.desktopActionRunning { continue }
+                    if current.unlocker?.typing == true, [.keyDown, .keyUp, .flags].contains(input.kind) { continue }
+                    if input.kind == .scroll {
+                        DiagnosticLog.shared.count(.scrollReceived)
+                        if !current.canInject { DiagnosticLog.shared.count(.scrollSuppressed) }
+                    }
+                    if current.canInject, let injector = current.injector,
+                       let feedback = try injector.receiveImmediateOnInputQueue(input, validated: true, fromDatagram: item.fromDatagram) {
+                        let after = activeInputGate.snapshot()
+                        if !after.closed, after.sessionReady, after.canInject, let candidate {
+                            candidate.send(try Wire.json(.inputStatus, feedback))
+                        }
+                    }
+                }
+                return true
+            } catch {
+                DispatchQueue.main.async { [weak self, weak candidate] in
+                    guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
+                    self.recordDiagnosticFailure(.connectionFailed, error: error)
+                    candidate.close(error.localizedDescription)
+                }
+                return false
+            }
+        }
         pending[id] = candidate
         candidate.onReady = { [weak self, weak candidate] in
             admission.release(id)
@@ -1251,6 +1306,12 @@ final class DeskModel: ObservableObject {
                             do { _ = try channel.receive(message) }
                             catch { candidate?.close(error.localizedDescription) }
                         }
+                        media.onInteractiveInput = { input in
+                            guard activeInputGate.snapshot().sessionReady else { return }
+                            if immediateInputs.enqueueDatagram(input) {
+                                inputQueue.async { _ = flushImmediateInputsOnInputQueue() }
+                            }
+                        }
                         media.onReceiveFrameWindow = { [weak streamer] limit in streamer?.setReceiverFrameWindow(limit) }
                         media.onPrepareRecovery = { [weak streamer] completion in
                             guard let streamer else { completion(false); return }
@@ -1345,50 +1406,6 @@ final class DeskModel: ObservableObject {
                         else { candidate.close(error.localizedDescription, retryable: true) }
                     }
                 }
-            }
-        }
-        let immediateInputs = HostImmediateInputQueue()
-        let activeInputGate = hostSession.inputGate
-        let inputQueue = hostInputQueue
-        let flushImmediateInputsOnInputQueue: @Sendable () -> Bool = { [weak self, weak candidate] in
-            let (inputs, resumes) = immediateInputs.drain()
-            defer { for resume in resumes { resume() } }
-            guard !inputs.isEmpty else { return true }
-            let state = activeInputGate.snapshot()
-            guard !state.closed else { return false }
-            guard state.sessionReady else {
-                DispatchQueue.main.async { [weak self, weak candidate] in
-                    guard let self, let candidate, self.generation == token, self.active, self.peer === candidate, !self.connected else { return }
-                    candidate.close("屏幕共享尚未就绪", retryable: true)
-                }
-                return false
-            }
-            do {
-                for input in inputs {
-                    let current = activeInputGate.snapshot()
-                    guard !current.closed, current.sessionReady else { return false }
-                    if current.desktopActionRunning { continue }
-                    if current.unlocker?.typing == true, [.keyDown, .keyUp, .flags].contains(input.kind) { continue }
-                    if input.kind == .scroll {
-                        DiagnosticLog.shared.count(.scrollReceived)
-                        if !current.canInject { DiagnosticLog.shared.count(.scrollSuppressed) }
-                    }
-                    if current.canInject, let injector = current.injector,
-                       let feedback = try injector.receiveImmediateOnInputQueue(input, validated: true) {
-                        let after = activeInputGate.snapshot()
-                        if !after.closed, after.sessionReady, after.canInject, let candidate {
-                            candidate.send(try Wire.json(.inputStatus, feedback))
-                        }
-                    }
-                }
-                return true
-            } catch {
-                DispatchQueue.main.async { [weak self, weak candidate] in
-                    guard let self, let candidate, self.generation == token, self.active, self.peer === candidate else { return }
-                    self.recordDiagnosticFailure(.connectionFailed, error: error)
-                    candidate.close(error.localizedDescription)
-                }
-                return false
             }
         }
         candidate.onMessageHandled = { [weak self, weak candidate] message, resume in
@@ -1612,6 +1629,7 @@ final class DeskModel: ObservableObject {
             }
         }
         media.onBytes = { channel.recordBytes($0) }
+        media.onCursorPosition = { _ = channel.receiveCursorPosition($0) }
         media.onReliableData = { [weak peer] message in
             do { _ = try channel.receive(message) }
             catch { peer?.close(error.localizedDescription) }
@@ -1888,7 +1906,7 @@ final class DeskModel: ObservableObject {
         host.cursorSampler?.stop()
         guard host.cursorSubscribed, host.cursorEnabled, !host.paused, let display = host.capturedDisplay else { return }
         let epoch = host.cursorEpoch
-        let sampler = HostCursorSampler(display: display)
+        let sampler = HostCursorSampler(display: display, interval: 1.0 / 60)
         host.cursorSampler = sampler
         sampler.onSample = { [weak self, weak host, weak peer] sample in
             guard let self, let host, let peer, self.hostSession === host, self.peer === peer,
@@ -1906,7 +1924,9 @@ final class DeskModel: ObservableObject {
                 host.cursorPositionSequence += 1
                 let position = try CursorPosition(cursorID: host.cursorID, epoch: epoch,
                     sequence: host.cursorPositionSequence, insideDisplay: sample.insideDisplay, x: sample.x, y: sample.y)
-                peer.send(Message(.cursorPosition, position.encode()))
+                if host.media?.sendCursorPosition(position) != true {
+                    peer.send(Message(.cursorPosition, position.encode()))
+                }
             } catch { peer.close(error.localizedDescription) }
         }
         sampler.start()
@@ -2453,6 +2473,7 @@ final class DeskModel: ObservableObject {
             status = hello.canControl ? "已连接 · 点击画面开始操作" : "已连接 · 仅观看（家里 Mac 需开启辅助功能）"
             let state = VideoStreamState(settings: hello.settings, width: hello.width, height: hello.height)
             activeVideoState = state
+            canvas.setPointerFrameRate(state.settings.framesPerSecond)
             recordVideoConfiguration(state)
             supportsLiveSettings = hello.liveSettings == true
             supportsExtendedVideoSettings = supportsLiveSettings && hello.extendedVideoSettings == true
@@ -2591,6 +2612,7 @@ final class DeskModel: ObservableObject {
             viewerSession.videoRequestTimeout?.cancel()
             videoTuning = tuning
             activeVideoState = result.state
+            canvas.setPointerFrameRate(result.state.settings.framesPerSecond)
             activeVideoCodec = tuning.appliedCodec
             // An adaptive host that updated the running encoder in place keeps the current media stream.
             let inPlace = supportsAdaptiveVideo && (result.restartsStream.map { !$0 }

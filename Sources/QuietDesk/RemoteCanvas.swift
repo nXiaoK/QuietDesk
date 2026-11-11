@@ -402,8 +402,12 @@ final class RemoteCanvas: NSView {
     private var tracking: NSTrackingArea?
     private var observers: [NSObjectProtocol] = []
     private var movePacer = PointerMovePacer()
+    private var dragPacer = PointerMovePacer(allowsDrag: true)
     private var moveTimer: Timer?
+    private var dragTimer: Timer?
     private var moveGeneration = UUID()
+    private var dragGeneration = UUID()
+    private(set) var isFlushingPointerMoves = false
     private var activeScroll: RemoteInput?
     private var cursorState = CursorPresentationState()
     private var cursorImage: NSImage?
@@ -644,6 +648,14 @@ final class RemoteCanvas: NSView {
         CATransaction.commit()
     }
 
+    func setPointerFrameRate(_ framesPerSecond: Int) {
+        let interval = PointerMovePacer.interval(forFramesPerSecond: framesPerSecond)
+        movePacer.setInterval(interval)
+        dragPacer.setInterval(interval)
+        if moveTimer != nil { moveTimer?.invalidate(); moveTimer = nil; moveGeneration = UUID(); schedulePointerMove() }
+        if dragTimer != nil { dragTimer?.invalidate(); dragTimer = nil; dragGeneration = UUID(); schedulePointerDrag() }
+    }
+
     private func schedulePointerMove() {
         guard moveTimer == nil, let delay = movePacer.nextDelay(now: SessionClock.now) else { return }
         let token = moveGeneration
@@ -662,13 +674,50 @@ final class RemoteCanvas: NSView {
         RunLoop.main.add(timer, forMode: .common)
     }
 
-    private func flushPointerMoves() {
+    private func schedulePointerDrag() {
+        guard dragTimer == nil, let delay = dragPacer.nextDelay(now: SessionClock.now) else { return }
+        let token = dragGeneration
+        let timer = Timer(timeInterval: max(0.0001, delay), repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.dragGeneration == token else { return }
+                self.dragTimer = nil
+                if let input = self.dragPacer.takeDue(now: SessionClock.now), self.canControl, !self.pointerInputSuspended {
+                    self.onInput?(input)
+                }
+                self.schedulePointerDrag()
+            }
+        }
+        timer.tolerance = 0.001
+        dragTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func emitFlushedPointer(_ input: RemoteInput?) {
+        guard let input, canControl, !pointerInputSuspended else { return }
+        let previous = isFlushingPointerMoves
+        isFlushingPointerMoves = true
+        defer { isFlushingPointerMoves = previous }
+        onInput?(input)
+    }
+
+    private func flushMovePacerOnly() {
         moveTimer?.invalidate(); moveTimer = nil; moveGeneration = UUID()
-        if let input = movePacer.flush(now: SessionClock.now), canControl, !pointerInputSuspended { onInput?(input) }
+        emitFlushedPointer(movePacer.flush(now: SessionClock.now))
+    }
+
+    private func flushDragPacerOnly() {
+        dragTimer?.invalidate(); dragTimer = nil; dragGeneration = UUID()
+        emitFlushedPointer(dragPacer.flush(now: SessionClock.now))
+    }
+
+    private func flushPointerMoves() {
+        flushMovePacerOnly()
+        flushDragPacerOnly()
     }
 
     private func cancelPointerMoves() {
         moveTimer?.invalidate(); moveTimer = nil; moveGeneration = UUID(); movePacer.cancel()
+        dragTimer?.invalidate(); dragTimer = nil; dragGeneration = UUID(); dragPacer.cancel()
     }
 
     func makeVideoReceiver(diagnostics: PerformanceDiagnostics? = nil,
@@ -822,6 +871,8 @@ final class RemoteCanvas: NSView {
         displayLink = nil
         lastPresentedAt = 0
         cancelPointerMoves()
+        movePacer.setInterval(PointerMovePacer.interval)
+        dragPacer.setInterval(PointerMovePacer.interval)
         cursorState = CursorPresentationState(); cursorImage = nil; localCursor = .arrow
         cursorPublished = nil; localPointerInside = false
         refreshCursorImage()
@@ -947,7 +998,13 @@ final class RemoteCanvas: NSView {
 
     private func pointer(_ event: NSEvent, _ kind: RemoteInput.Kind) {
         guard canControl, !pointerInputSuspended else { return }
-        if kind != .move { flushPointerMoves() }
+        if kind == .move {
+            flushDragPacerOnly()
+        } else if kind == .drag {
+            flushMovePacerOnly()
+        } else {
+            flushPointerMoves()
+        }
         let point = convert(event.locationInWindow, from: nil)
         let rect = pictureRect
         localPointerInside = rect.contains(point)
@@ -990,6 +1047,12 @@ final class RemoteCanvas: NSView {
         if kind == .move {
             if let ready = movePacer.offer(input, now: SessionClock.now) { onInput?(ready) }
             schedulePointerMove()
+        } else if kind == .drag {
+            if let pendingButton = dragPacer.pendingButton, pendingButton != input.button {
+                flushDragPacerOnly()
+            }
+            if let ready = dragPacer.offer(input, now: SessionClock.now) { onInput?(ready) }
+            schedulePointerDrag()
         } else { onInput?(input) }
     }
 
@@ -1095,6 +1158,7 @@ final class RemoteCanvas: NSView {
     deinit {
         displayLink?.invalidate()
         moveTimer?.invalidate()
+        dragTimer?.invalidate()
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
     }
 }

@@ -1419,8 +1419,13 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 }
 
 final class HostImmediateInputQueue: @unchecked Sendable {
+    struct Item: Sendable {
+        let input: RemoteInput
+        let fromDatagram: Bool
+    }
+
     private let lock = NSLock()
-    private var pending: [RemoteInput] = []
+    private var pending: [Item] = []
     private var backpressureResumes: [() -> Void] = []
     private var flushScheduled = false
     let capacity: Int
@@ -1430,11 +1435,12 @@ final class HostImmediateInputQueue: @unchecked Sendable {
     }
 
     func enqueue(_ input: RemoteInput, resume: @escaping () -> Void) -> Bool {
+        let item = Item(input: input, fromDatagram: false)
         let result = lock.withLock { () -> (resumeNow: Bool, scheduleFlush: Bool) in
-            if let last = pending.last, Self.canCoalesce(previous: last, next: input) {
-                pending[pending.count - 1] = input
+            if let last = pending.last, Self.canCoalesce(previous: last, next: item) {
+                pending[pending.count - 1] = item
             } else {
-                pending.append(input)
+                pending.append(item)
             }
             let resumeNow = pending.count < capacity && backpressureResumes.isEmpty
             if !resumeNow {
@@ -1448,22 +1454,48 @@ final class HostImmediateInputQueue: @unchecked Sendable {
         return result.scheduleFlush
     }
 
-    func drain() -> (inputs: [RemoteInput], resumes: [() -> Void]) {
-        lock.withLock {
-            flushScheduled = false
-            let inputs = pending
-            let resumes = backpressureResumes
-            pending.removeAll(keepingCapacity: true)
-            backpressureResumes.removeAll()
-            return (inputs, resumes)
+    func enqueueDatagram(_ input: RemoteInput) -> Bool {
+        let item = Item(input: input, fromDatagram: true)
+        return lock.withLock { () -> Bool in
+            if let last = pending.last, Self.canCoalesce(previous: last, next: item) {
+                pending[pending.count - 1] = item
+            } else if pending.count < capacity {
+                pending.append(item)
+            } else {
+                return false
+            }
+            let scheduleFlush = !flushScheduled
+            flushScheduled = true
+            return scheduleFlush
         }
     }
 
-    private static func canCoalesce(previous: RemoteInput, next: RemoteInput) -> Bool {
-        guard previous.flags == next.flags, previous.independentCapsLock == next.independentCapsLock else { return false }
-        switch (previous.kind, next.kind) {
+    func drainItems() -> (items: [Item], resumes: [() -> Void]) {
+        lock.withLock {
+            flushScheduled = false
+            let items = pending
+            let resumes = backpressureResumes
+            pending.removeAll(keepingCapacity: true)
+            backpressureResumes.removeAll()
+            return (items, resumes)
+        }
+    }
+
+    func drain() -> (inputs: [RemoteInput], resumes: [() -> Void]) {
+        let drained = drainItems()
+        return (drained.items.map(\.input), drained.resumes)
+    }
+
+    private static func canCoalesce(previous: Item, next: Item) -> Bool {
+        guard previous.fromDatagram == next.fromDatagram,
+              previous.input.flags == next.input.flags,
+              previous.input.independentCapsLock == next.input.independentCapsLock else { return false }
+        if let prevSeq = previous.input.pointerSequence, let nextSeq = next.input.pointerSequence, nextSeq <= prevSeq {
+            return false
+        }
+        switch (previous.input.kind, next.input.kind) {
         case (.move, .move): return true
-        case (.drag, .drag): return previous.button == next.button
+        case (.drag, .drag): return previous.input.button == next.input.button
         default: return false
         }
     }
@@ -1482,6 +1514,7 @@ final class InputInjector: @unchecked Sendable {
         private let lock = NSRecursiveLock()
         private var heldKeys = Set<UInt16>()
         private var heldButtons = Set<Int>()
+        private var highestPointerSequence: UInt64 = 0
         private var lastPoint = CGPoint.zero
         private var inputFlags: CGEventFlags = []
         private var scroll = ScrollAccumulator()
@@ -1526,10 +1559,21 @@ final class InputInjector: @unchecked Sendable {
             lock.withLock { remoteCapsLock == true }
         }
 
-        func receiveImmediate(_ input: RemoteInput, validated: Bool = false) throws -> InputFeedback? {
+        func receiveImmediate(_ input: RemoteInput, validated: Bool = false, fromDatagram: Bool = false) throws -> InputFeedback? {
             try lock.withLock {
                 if !validated { try input.validate() }
                 guard isTrusted() else { releaseAllUnlocked(); return nil }
+                if fromDatagram, input.kind == .drag, !heldButtons.contains(input.button) {
+                    return nil
+                }
+                if let pointerSequence = input.pointerSequence {
+                    if input.kind == .move || input.kind == .drag {
+                        guard pointerSequence > highestPointerSequence else { return nil }
+                        highestPointerSequence = pointerSequence
+                    } else if pointerSequence > highestPointerSequence {
+                        highestPointerSequence = pointerSequence
+                    }
+                }
                 if input.independentCapsLock == true || input.kind == .switchInputSource || input.kind == .toggleCapsLock {
                     if remoteCapsLock == nil { remoteCapsLock = capsLockState() }
                 }
@@ -1822,13 +1866,13 @@ final class InputInjector: @unchecked Sendable {
         return try engine.receiveImmediate(input, validated: true)
     }
 
-    func receiveImmediate(_ input: RemoteInput, validated: Bool = false) throws -> InputFeedback? {
-        try engine.receiveImmediate(input, validated: validated)
+    func receiveImmediate(_ input: RemoteInput, validated: Bool = false, fromDatagram: Bool = false) throws -> InputFeedback? {
+        try engine.receiveImmediate(input, validated: validated, fromDatagram: fromDatagram)
     }
 
-    nonisolated func receiveImmediateOnInputQueue(_ input: RemoteInput, validated: Bool = false) throws -> InputFeedback? {
+    nonisolated func receiveImmediateOnInputQueue(_ input: RemoteInput, validated: Bool = false, fromDatagram: Bool = false) throws -> InputFeedback? {
         precondition(supportsConcurrentQueue)
-        return try engine.receiveImmediate(input, validated: validated)
+        return try engine.receiveImmediate(input, validated: validated, fromDatagram: fromDatagram)
     }
 
     func releaseAll() {

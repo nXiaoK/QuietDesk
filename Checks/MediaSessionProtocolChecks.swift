@@ -72,8 +72,22 @@ func runMediaSessionProtocolChecks() {
     }
     run("A media request can opt in to marked repairs and legacy requests omit the capability") {
         let legacy = try MediaControl.read(Data(#"{"operation":"request"}"#.utf8))
-        let modern = try MediaControl.read(MediaControl(.request, markedRepairs: true).message().payload)
-        try check(legacy.markedRepairs == nil && modern.markedRepairs == true, "Lost the viewer's repair capability")
+        let modern = try MediaControl.read(MediaControl(.request, markedRepairs: true, datagramInteractive: true).message().payload)
+        try check(legacy.markedRepairs == nil && legacy.datagramInteractive == nil
+                  && modern.markedRepairs == true && modern.datagramInteractive == true,
+                  "Lost the viewer's repair or interactive datagram capability")
+        let session = UUID(), token = Data(repeating: 0x33, count: 32)
+        let offer = try MediaControl.read(MediaControl(.offer, sessionID: session, token: token, datagramKey: token, datagramInteractive: true).message().payload)
+        try check(offer.datagramInteractive == true, "Lost offer datagramInteractive capability")
+        try rejects("Allowed datagramInteractive outside request/offer") {
+            try MediaControl(.recover, sessionID: session, transportEpoch: 1, codecEpoch: 1, datagramInteractive: true).validate()
+        }
+        var move = RemoteInput(kind: .move); move.x = 0.25; move.y = 0.75; move.pointerSequence = 42
+        try move.validate()
+        var zeroSeq = move; zeroSeq.pointerSequence = 0
+        try rejects("Accepted zero pointerSequence") { try zeroSeq.validate() }
+        var keySeq = RemoteInput(kind: .keyDown); keySeq.keyCode = 1; keySeq.pointerSequence = 1
+        try rejects("Accepted pointerSequence on keyboard event") { try keySeq.validate() }
     }
     run("Auxiliary bindings are session-bound, expiring and consumed once per role") {
         let session = UUID(), token = Data(repeating: 0xA6, count: 32)

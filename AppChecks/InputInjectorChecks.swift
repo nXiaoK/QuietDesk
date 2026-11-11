@@ -451,6 +451,41 @@ private struct InputInjectorChecks {
             try require(recorded.allSatisfy { !$0.2 }, "Off-main input queue unexpectedly executed on the main thread")
         }
 
+        await run("Sequenced UDP pointer moves and drags never regress cursor state after newer clicks or releases") {
+            final class SequencedEventBox: @unchecked Sendable {
+                private let lock = NSLock()
+                private var items: [(CGEventType, CGPoint)] = []
+                func append(_ event: CGEvent) { lock.withLock { items.append((event.type, event.location)) } }
+                func snapshot() -> [(CGEventType, CGPoint)] { lock.withLock { items } }
+            }
+            let box = SequencedEventBox()
+            let injector = InputInjector(concurrentBounds: CGRect(x: 0, y: 0, width: 101, height: 101),
+                                         isTrusted: { true },
+                                         postEvent: { box.append($0) },
+                                         capsLockState: { false },
+                                         pointerLocation: { CGPoint(x: 0, y: 0) })
+            var unheldDrag = RemoteInput(kind: .drag); unheldDrag.x = 0.2; unheldDrag.y = 0.2; unheldDrag.pointerSequence = 1
+            _ = try injector.receiveImmediateOnInputQueue(unheldDrag, validated: true, fromDatagram: true)
+            try require(box.snapshot().isEmpty, "UDP drag before button-down injected a phantom drag")
+
+            var down = RemoteInput(kind: .down); down.x = 0.5; down.y = 0.5; down.pointerSequence = 10
+            _ = try injector.receiveImmediateOnInputQueue(down, validated: true)
+            var staleMove = RemoteInput(kind: .move); staleMove.x = 0.1; staleMove.y = 0.1; staleMove.pointerSequence = 9
+            _ = try injector.receiveImmediateOnInputQueue(staleMove, validated: true, fromDatagram: true)
+            var validDrag = RemoteInput(kind: .drag); validDrag.x = 0.6; validDrag.y = 0.6; validDrag.pointerSequence = 11
+            _ = try injector.receiveImmediateOnInputQueue(validDrag, validated: true, fromDatagram: true)
+            var up = RemoteInput(kind: .up); up.x = 0.6; up.y = 0.6; up.pointerSequence = 12
+            _ = try injector.receiveImmediateOnInputQueue(up, validated: true)
+            var lateDrag = RemoteInput(kind: .drag); lateDrag.x = 0.9; lateDrag.y = 0.9; lateDrag.pointerSequence = 11
+            _ = try injector.receiveImmediateOnInputQueue(lateDrag, validated: true, fromDatagram: true)
+
+            let events = box.snapshot()
+            try require(events.map(\.0) == [.leftMouseDown, .leftMouseDragged, .leftMouseUp],
+                        "Out-of-order UDP pointer packets crossed click/release boundaries: \(events.map(\.0))")
+            try require(events[0].1 == CGPoint(x: 50, y: 50) && events[1].1 == CGPoint(x: 60, y: 60) && events[2].1 == CGPoint(x: 60, y: 60),
+                        "Stale UDP move altered injected coordinates")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

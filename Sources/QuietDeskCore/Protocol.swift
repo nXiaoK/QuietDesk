@@ -294,6 +294,8 @@ public struct RemoteInput: Codable, Sendable {
     public var lineDeltaY: Double?
     public var scrollPhase: ScrollPhase?
     public var momentumPhase: MomentumPhase?
+    // Monotonic per-session sequence for pointer events, guarding causal order across UDP and TCP paths.
+    public var pointerSequence: UInt64?
 
     public init(kind: Kind) { self.kind = kind }
 
@@ -302,6 +304,11 @@ public struct RemoteInput: Codable, Sendable {
               (0...2).contains(button), keyCode <= 127, (0...3).contains(clicks),
               deltaX.isFinite, deltaY.isFinite, abs(deltaX) <= 3000, abs(deltaY) <= 3000 else {
             throw DeskError.invalid("远端输入参数无效")
+        }
+        if let pointerSequence {
+            guard pointerSequence > 0, [.move, .drag, .down, .up, .scroll].contains(kind) else {
+                throw DeskError.invalid("远端指针序号无效")
+            }
         }
         let lines = [lineDeltaX, lineDeltaY].compactMap { $0 }
         guard kind == .scroll || (lines.isEmpty && scrollPhase == nil && momentumPhase == nil),

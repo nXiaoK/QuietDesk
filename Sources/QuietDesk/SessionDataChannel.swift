@@ -53,6 +53,26 @@ final class SessionDataChannel: @unchecked Sendable {
         }
         if let (position, handler) = next { handler(position) }
     }
+    @discardableResult
+    func receiveCursorPosition(_ position: CursorPosition) -> Bool {
+        let state = lock.withLock { () -> (accepted: Bool, shouldSchedule: Bool) in
+            guard valid, cursorPosition != nil else { return (false, false) }
+            if let existing = latestCursorPosition,
+               existing.cursorID == position.cursorID,
+               (position.epoch < existing.epoch || (position.epoch == existing.epoch && position.sequence <= existing.sequence)) {
+                return (true, false)
+            }
+            latestCursorPosition = position
+            guard !cursorFlushScheduled else { return (true, false) }
+            cursorFlushScheduled = true
+            return (true, true)
+        }
+        if state.shouldSchedule {
+            DispatchQueue.main.async { [weak self] in self?.flushCursorPosition() }
+        }
+        return state.accepted
+    }
+
     func sendReliableData(_ message: Message) {
         let handler = lock.withLock { valid ? (reliableData ?? send) : nil }
         handler?(message)
@@ -92,17 +112,7 @@ final class SessionDataChannel: @unchecked Sendable {
             let configured = lock.withLock { valid && cursorPosition != nil }
             guard configured else { return false }
             let position = try CursorPosition.decode(message.payload)
-            let shouldSchedule = lock.withLock { () -> Bool in
-                guard valid, cursorPosition != nil else { return false }
-                latestCursorPosition = position
-                guard !cursorFlushScheduled else { return false }
-                cursorFlushScheduled = true
-                return true
-            }
-            if shouldSchedule {
-                DispatchQueue.main.async { [weak self] in self?.flushCursorPosition() }
-            }
-            return true
+            return receiveCursorPosition(position)
         case .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel:
             guard let clipboard = handlers.3 else { return false }
             clipboard(message)

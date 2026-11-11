@@ -64,6 +64,10 @@ func run(address, certificate, privateKey, accessFile, state, health string, max
 		return err
 	}
 	defer udp.Close()
+	if udpConn, ok := udp.(*net.UDPConn); ok {
+		_ = udpConn.SetReadBuffer(4 << 20)
+		_ = udpConn.SetWriteBuffer(4 << 20)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	var healthServer *http.Server

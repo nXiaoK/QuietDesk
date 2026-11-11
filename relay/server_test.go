@@ -214,14 +214,14 @@ func TestFramingAndReplayBounds(t *testing.T) {
 		}
 	}
 	window := ReplayWindow{}
-	for _, value := range []uint64{1, 3, 2, 64, 65} {
+	for _, value := range []uint64{1, 3, 2, 64, 65, 320, 200, 512, 70, 513} {
 		if !window.Accept(value) {
-			t.Fatal("valid reordered sequence rejected")
+			t.Fatalf("valid reordered sequence %d rejected", value)
 		}
 	}
-	for _, value := range []uint64{0, 1, 2, 3, 65} {
+	for _, value := range []uint64{0, 1, 2, 3, 64, 65, 70, 200, 320, 512, 513} {
 		if window.Accept(value) {
-			t.Fatal("replay accepted")
+			t.Fatalf("replay %d accepted", value)
 		}
 	}
 }
@@ -273,6 +273,67 @@ func TestOwnerPersistenceAndDuplicateRegistration(t *testing.T) {
 		t.Fatal("device identity was taken over after restart")
 	}
 	restarted.register(t, deviceA, owner)
+}
+
+func TestConcurrentPersistenceAndUDPForwarding(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private", "state.json")
+	access := randomKey(t)
+	f := newFixture(t, Config{AccessKey: access, StatePath: path})
+	registration, _ := f.register(t, deviceA, randomKey(t))
+	lease := f.dial(t)
+	write(t, lease, Message{Op: "datagram", DeviceID: deviceA, AccessKey: access})
+	host := read(t, registration, "incomingDatagram")
+	var id [16]byte
+	copy(id[:], host.DatagramID)
+	hostSocket, err := net.DialUDP("udp", nil, f.udpAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hostSocket.Close()
+	viewerSocket, err := net.DialUDP("udp", nil, f.udpAddress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer viewerSocket.Close()
+	initPacket, _ := EncodeDatagram(Datagram{Side: 1, Sequence: 1, ID: id}, host.DatagramKey)
+	hostSocket.Write(initPacket)
+	viewer := read(t, lease, "datagramReady")
+	viewerInit, _ := EncodeDatagram(Datagram{Side: 0, Sequence: 1, ID: id}, viewer.DatagramKey)
+	viewerSocket.Write(viewerInit)
+	until(t, func() bool {
+		f.server.mu.Lock()
+		defer f.server.mu.Unlock()
+		entry := f.server.datagrams[id]
+		return entry != nil && entry.addresses[0] != nil && entry.addresses[1] != nil
+	})
+	regDone := make(chan struct{}, 6)
+	for index := byte(1); index <= 6; index++ {
+		deviceID := "00000000-0000-4000-8000-0000000000" + hex.EncodeToString([]byte{index})
+		go func(idText string) {
+			conn, _ := f.register(t, idText, randomKey(t))
+			_ = f.server.Snapshot()
+			conn.Close()
+			regDone <- struct{}{}
+		}(deviceID)
+	}
+	hostSocket.SetDeadline(time.Now().Add(3 * time.Second))
+	buffer := make([]byte, 2048)
+	for seq := uint64(2); seq <= 25; seq++ {
+		packet, _ := EncodeDatagram(Datagram{Side: 0, Sequence: seq, ID: id, Payload: []byte{byte(seq), 0xaa}}, viewer.DatagramKey)
+		if _, err := viewerSocket.Write(packet); err != nil {
+			t.Fatal(err)
+		}
+		n, err := hostSocket.Read(buffer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decoded, err := DecodeDatagram(buffer[:n], host.DatagramKey); err != nil || decoded.Payload[0] != byte(seq) {
+			t.Fatal("concurrent persistence corrupted UDP forwarding")
+		}
+	}
+	for range 6 {
+		<-regDone
+	}
 }
 
 func TestOpaqueDuplexAndRegistrationShutdown(t *testing.T) {

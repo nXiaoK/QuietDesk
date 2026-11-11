@@ -50,10 +50,14 @@ func runRelayProtocolChecks() {
             _ = try RelayDatagram(side: 0, sequence: 1, id: id, payload: Data(count: RelayDatagram.maximumPayloadBytes + 1))
         }
     }
-    run("Relay replay windows allow bounded reordering but never duplicate, zero or wrapped counters") {
+    run("Relay replay windows allow bounded reordering across 512 packets but never duplicate, zero or wrapped counters") {
         var window = RelayReplayWindow()
-        for value: UInt64 in [1, 3, 2, 64, 65] { try check(window.accept(value), "Fresh reordered datagram rejected") }
-        for value: UInt64 in [0, 1, 2, 3, 65] { try check(!window.accept(value), "Replay revived an old relay packet") }
+        for value: UInt64 in [1, 3, 2, 64, 65, 320, 200, 512, 70, 513] {
+            try check(window.accept(value), "Fresh reordered datagram rejected")
+        }
+        for value: UInt64 in [0, 1, 2, 3, 64, 65, 70, 200, 320, 512, 513] {
+            try check(!window.accept(value), "Replay revived an old relay packet")
+        }
         try check(window.accept(.max) && !window.accept(1) && !window.accept(.max), "Counter exhaustion silently wrapped")
     }
     run("Relay connection metadata remains optional and contains no service or desktop credentials") {

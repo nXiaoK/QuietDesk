@@ -130,9 +130,11 @@ func WriteMessage(w io.Writer, message Message) error {
 	return nil
 }
 
+const ReplayWindowSize = 512
+
 type ReplayWindow struct {
 	highest uint64
-	bits    uint64
+	words   [ReplayWindowSize / 64]uint64
 }
 
 func (w *ReplayWindow) Accept(sequence uint64) bool {
@@ -141,19 +143,37 @@ func (w *ReplayWindow) Accept(sequence uint64) bool {
 	}
 	if sequence > w.highest {
 		distance := sequence - w.highest
-		if distance >= 64 {
-			w.bits = 1
+		if distance >= ReplayWindowSize {
+			w.words = [ReplayWindowSize / 64]uint64{1}
 		} else {
-			w.bits = (w.bits << distance) | 1
+			wordShift := int(distance / 64)
+			bitShift := uint(distance % 64)
+			for i := len(w.words) - 1; i >= 0; i-- {
+				if i < wordShift {
+					w.words[i] = 0
+					continue
+				}
+				value := w.words[i-wordShift] << bitShift
+				if bitShift > 0 && i > wordShift {
+					value |= w.words[i-wordShift-1] >> (64 - bitShift)
+				}
+				w.words[i] = value
+			}
+			w.words[0] |= 1
 		}
 		w.highest = sequence
 		return true
 	}
 	distance := w.highest - sequence
-	if distance >= 64 || w.bits&(uint64(1)<<distance) != 0 {
+	if distance >= ReplayWindowSize {
 		return false
 	}
-	w.bits |= uint64(1) << distance
+	wordIndex := int(distance / 64)
+	mask := uint64(1) << uint(distance%64)
+	if w.words[wordIndex]&mask != 0 {
+		return false
+	}
+	w.words[wordIndex] |= mask
 	return true
 }
 

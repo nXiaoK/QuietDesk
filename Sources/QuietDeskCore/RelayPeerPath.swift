@@ -853,6 +853,7 @@ final class RelayAssistedPipe: RelayDatagramPipe {
     private var started = false
     private var ready = false
     private var closed = false
+    private var relayRegistered = false
     private var delivering = 0
     private var keepalive: DispatchSourceTimer?
     private var ticker: DispatchSourceTimer?
@@ -882,6 +883,14 @@ final class RelayAssistedPipe: RelayDatagramPipe {
         guard !relays.isEmpty else { finish(RelayTransportError.network); return }
         relayChoices = relays; ready = true
         guard sendRelay(Data()) else { return }
+        if relays.count == 1 {
+            for delay in [0.15, 0.4, 0.8] {
+                queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self, self.ready, !self.closed, !self.relayRegistered else { return }
+                    self.sendRelay(Data())
+                }
+            }
+        }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         let probingUntil = SessionClock.uptime + 5
         let interval = relays.count > 1 ? 0.2 : 15
@@ -993,6 +1002,7 @@ final class RelayAssistedPipe: RelayDatagramPipe {
         if data.starts(with: Self.relayMagic) {
             guard let packet = try? RelayDatagram.decode(data, key: key), packet.id == id, packet.side == side, packet.downstream,
                   replay.accept(packet.sequence), !packet.payload.isEmpty else { return }
+            relayRegistered = true
             if relayChoices.count > 1 {
                 // The node learned this socket's port from our registration at relayAddress.
                 // Its reply may use a different source IP behind a load balancer.

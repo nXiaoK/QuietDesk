@@ -87,6 +87,7 @@ final class RelayUDPPipe {
     private var ready = false
     private var closed = false
     private var receiving = false
+    private var peerSeen = false
     private var delivering = 0
     private var pendingBytes = 0
     private var sends: [UUID: (Int, (Bool) -> Void)] = [:]
@@ -106,8 +107,18 @@ final class RelayUDPPipe {
                 self.ready = true
                 self.send(Data()) { [weak self] success in
                     guard let self, !self.closed else { return }
-                    if success { self.onReady?(); self.receive() }
-                    else { self.finish(RelayTransportError.network) }
+                    if success {
+                        self.onReady?()
+                        self.receive()
+                        for delay in [0.15, 0.4, 0.8] {
+                            self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                                guard let self, self.ready, !self.closed, !self.peerSeen else { return }
+                                self.send(Data()) { _ in }
+                            }
+                        }
+                    } else {
+                        self.finish(RelayTransportError.network)
+                    }
                 }
                 let timer = DispatchSource.makeTimerSource(queue: self.queue)
                 timer.schedule(deadline: .now() + 15, repeating: 15)
@@ -122,10 +133,12 @@ final class RelayUDPPipe {
 
     func send(_ payload: Data, completion: @escaping (Bool) -> Void) {
         guard ready, !closed, sequence < .max, payload.count <= RelayDatagram.maximumPayloadBytes else { completion(false); return }
+        let wireBytes = RelayDatagram.overhead + payload.count
+        guard wireBytes <= connection.maximumDatagramSize else { completion(false); return }
+        guard wireBytes <= 256 * 1024 - pendingBytes else { completion(!payload.isEmpty); return }
         do {
             sequence += 1
             let data = try RelayDatagram(side: side, sequence: sequence, id: id, payload: payload).encode(key: key)
-            guard data.count <= connection.maximumDatagramSize, data.count <= 256 * 1024 - pendingBytes else { completion(false); return }
             pendingBytes += data.count
             let token = UUID(); sends[token] = (data.count, completion)
             connection.send(content: data, completion: .contentProcessed { [weak self] error in
@@ -146,6 +159,7 @@ final class RelayUDPPipe {
             guard complete, let data, let packet = try? RelayDatagram.decode(data, key: self.key),
                   packet.id == self.id, packet.side == self.side, packet.downstream,
                   self.replay.accept(packet.sequence), !packet.payload.isEmpty else { self.receive(); return }
+            self.peerSeen = true
             guard let callback = self.onPayload else { self.receive(); return }
             self.delivering += 1
             let once = NSLock(); var finished = false

@@ -182,19 +182,60 @@ public struct RelayMessage: Codable, Sendable {
 }
 
 public struct RelayReplayWindow: Sendable {
+    public static let size: UInt64 = 512
     private var highest: UInt64 = 0
-    private var bits: UInt64 = 0
+    private var w0: UInt64 = 0, w1: UInt64 = 0, w2: UInt64 = 0, w3: UInt64 = 0
+    private var w4: UInt64 = 0, w5: UInt64 = 0, w6: UInt64 = 0, w7: UInt64 = 0
+
     public init() {}
+
+    private subscript(word index: Int) -> UInt64 {
+        get {
+            switch index {
+            case 0: return w0; case 1: return w1; case 2: return w2; case 3: return w3
+            case 4: return w4; case 5: return w5; case 6: return w6; default: return w7
+            }
+        }
+        set {
+            switch index {
+            case 0: w0 = newValue; case 1: w1 = newValue; case 2: w2 = newValue; case 3: w3 = newValue
+            case 4: w4 = newValue; case 5: w5 = newValue; case 6: w6 = newValue; default: w7 = newValue
+            }
+        }
+    }
+
     public mutating func accept(_ sequence: UInt64) -> Bool {
         guard sequence > 0 else { return false }
         if sequence > highest {
             let distance = sequence - highest
-            bits = distance >= 64 ? 1 : (bits << distance) | 1
-            highest = sequence; return true
+            if distance >= Self.size {
+                w0 = 1; w1 = 0; w2 = 0; w3 = 0; w4 = 0; w5 = 0; w6 = 0; w7 = 0
+            } else {
+                let wordShift = Int(distance / 64)
+                let bitShift = distance % 64
+                for i in stride(from: 7, through: 0, by: -1) {
+                    if i < wordShift {
+                        self[word: i] = 0
+                        continue
+                    }
+                    var value = self[word: i - wordShift] << bitShift
+                    if bitShift > 0, i > wordShift {
+                        value |= self[word: i - wordShift - 1] >> (64 - bitShift)
+                    }
+                    self[word: i] = value
+                }
+                w0 |= 1
+            }
+            highest = sequence
+            return true
         }
         let distance = highest - sequence
-        guard distance < 64, bits & (UInt64(1) << distance) == 0 else { return false }
-        bits |= UInt64(1) << distance; return true
+        guard distance < Self.size else { return false }
+        let wordIndex = Int(distance / 64)
+        let mask = UInt64(1) << (distance % 64)
+        guard self[word: wordIndex] & mask == 0 else { return false }
+        self[word: wordIndex] |= mask
+        return true
     }
 }
 

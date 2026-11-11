@@ -45,9 +45,11 @@ type Snapshot struct {
 
 type Server struct {
 	cfg           Config
-	mu            sync.Mutex
+	mu            sync.RWMutex
+	persistMu     sync.Mutex
 	hosts         map[string]*host
 	owners        map[string]string
+	pendingOwners map[string]bool
 	circuits      map[string]*circuit
 	datagrams     map[[16]byte]*datagramLease
 	connections   map[net.Conn]struct{}
@@ -80,6 +82,7 @@ type circuit struct {
 }
 
 type datagramLease struct {
+	mu        sync.Mutex
 	host      *host
 	keys      [2][32]byte
 	addresses [2]net.Addr
@@ -137,8 +140,9 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, errors.New("invalid relay resource configuration")
 	}
 	cfg.AccessKey = append([]byte(nil), cfg.AccessKey...)
-	s := &Server{cfg: cfg, hosts: make(map[string]*host), owners: make(map[string]string), circuits: make(map[string]*circuit),
-		datagrams: make(map[[16]byte]*datagramLease), connections: make(map[net.Conn]struct{}), slots: make(chan struct{}, cfg.MaxConnections)}
+	s := &Server{cfg: cfg, hosts: make(map[string]*host), owners: make(map[string]string), pendingOwners: make(map[string]bool),
+		circuits: make(map[string]*circuit), datagrams: make(map[[16]byte]*datagramLease), connections: make(map[net.Conn]struct{}),
+		slots: make(chan struct{}, cfg.MaxConnections)}
 	if cfg.StatePath != "" {
 		info, err := os.Lstat(cfg.StatePath)
 		if err == nil {
@@ -248,8 +252,8 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) Snapshot() Snapshot {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	pending, assisted := 0, 0
 	for _, circuit := range s.circuits {
 		if !circuit.active {
@@ -309,28 +313,19 @@ func (s *Server) handle(conn net.Conn) {
 	}
 }
 
-func (s *Server) saveOwner(id, digest string) error {
-	if s.cfg.StatePath == "" {
-		s.owners[id] = digest
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(s.cfg.StatePath), 0700); err != nil {
+func writeOwnersState(statePath string, owners map[string]string) error {
+	if err := os.MkdirAll(filepath.Dir(statePath), 0700); err != nil {
 		return err
 	}
-	parent, err := os.Lstat(filepath.Dir(s.cfg.StatePath))
+	parent, err := os.Lstat(filepath.Dir(statePath))
 	if err != nil || !parent.IsDir() || parent.Mode().Perm()&0077 != 0 {
 		return errors.New("relay state directory must be private and must not be a symlink")
 	}
-	if info, err := os.Lstat(s.cfg.StatePath); err == nil && (!info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0) {
+	if info, err := os.Lstat(statePath); err == nil && (!info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0) {
 		return errors.New("unsafe relay state file")
 	} else if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	owners := make(map[string]string, len(s.owners)+1)
-	for key, value := range s.owners {
-		owners[key] = value
-	}
-	owners[id] = digest
 	data, err := json.Marshal(struct {
 		Version int               `json:"version"`
 		Owners  map[string]string `json:"owners"`
@@ -338,7 +333,7 @@ func (s *Server) saveOwner(id, digest string) error {
 	if err != nil {
 		return err
 	}
-	file, err := os.CreateTemp(filepath.Dir(s.cfg.StatePath), ".relay-state-*")
+	file, err := os.CreateTemp(filepath.Dir(statePath), ".relay-state-*")
 	if err != nil {
 		return err
 	}
@@ -354,22 +349,18 @@ func (s *Server) saveOwner(id, digest string) error {
 		err = closeErr
 	}
 	if err == nil {
-		err = os.Rename(file.Name(), s.cfg.StatePath)
+		err = os.Rename(file.Name(), statePath)
 	}
 	if err != nil {
 		return err
 	}
-	directory, err := os.Open(filepath.Dir(s.cfg.StatePath))
+	directory, err := os.Open(filepath.Dir(statePath))
 	if err != nil {
 		return err
 	}
 	err = directory.Sync()
 	directory.Close()
-	if err != nil {
-		return err
-	}
-	s.owners = owners
-	return nil
+	return err
 }
 
 func (s *Server) register(conn net.Conn, message Message) {
@@ -386,21 +377,49 @@ func (s *Server) register(conn net.Conn, message Message) {
 	h := &host{id: message.DeviceID, registration: registration, conn: conn, done: make(chan struct{}), assist: message.Assist}
 	s.mu.Lock()
 	code := ""
+	needPersist := false
 	if stored, exists := s.owners[h.id]; exists && subtle.ConstantTimeCompare([]byte(stored), []byte(digest)) != 1 {
 		code = "owner_mismatch"
-	} else if s.hosts[h.id] != nil {
+	} else if s.hosts[h.id] != nil || s.pendingOwners[h.id] {
 		code = "busy"
-	} else if !exists && len(s.owners) >= s.cfg.MaxDevices {
+	} else if !exists && len(s.owners)+len(s.pendingOwners) >= s.cfg.MaxDevices {
 		code = "capacity"
-	} else if !exists {
-		if s.saveOwner(h.id, digest) != nil {
-			code = "storage"
+	} else if exists || s.cfg.StatePath == "" {
+		if !exists {
+			s.owners[h.id] = digest
 		}
-	}
-	if code == "" {
 		s.hosts[h.id] = h
+	} else {
+		s.pendingOwners[h.id] = true
+		needPersist = true
 	}
 	s.mu.Unlock()
+	if needPersist {
+		s.persistMu.Lock()
+		s.mu.RLock()
+		owners := make(map[string]string, len(s.owners)+1)
+		for key, value := range s.owners {
+			owners[key] = value
+		}
+		s.mu.RUnlock()
+		owners[h.id] = digest
+		persistErr := writeOwnersState(s.cfg.StatePath, owners)
+		s.mu.Lock()
+		delete(s.pendingOwners, h.id)
+		if persistErr != nil {
+			code = "storage"
+		} else {
+			s.owners[h.id] = digest
+			if s.closed {
+				s.mu.Unlock()
+				s.persistMu.Unlock()
+				return
+			}
+			s.hosts[h.id] = h
+		}
+		s.mu.Unlock()
+		s.persistMu.Unlock()
+	}
 	if code != "" {
 		WriteMessage(conn, Message{Op: "error", Error: code})
 		return
@@ -459,16 +478,18 @@ func (s *Server) acceptAssist(h *host, datagramID []byte, side byte, candidates 
 	}
 	var id [16]byte
 	copy(id[:], datagramID)
-	s.mu.Lock()
+	s.mu.RLock()
 	lease := s.datagrams[id]
 	if lease == nil || !lease.assist || lease.host != h {
-		s.mu.Unlock()
+		s.mu.RUnlock()
 		return false
 	}
+	lease.mu.Lock()
 	lease.consent[side] = true
 	lease.local[side] = local
 	ready := lease.consent[0] && lease.consent[1]
-	s.mu.Unlock()
+	lease.mu.Unlock()
+	s.mu.RUnlock()
 	if ready {
 		lease.wake()
 	}
@@ -485,9 +506,15 @@ func candidateKey(candidates []Candidate) string {
 
 // announce sends each side the other's node-observed address and self-reported candidates when they changed.
 func (s *Server) announce(id [16]byte, lease *datagramLease) bool {
-	s.mu.Lock()
-	if s.datagrams[id] != lease || !lease.consent[0] || !lease.consent[1] {
-		s.mu.Unlock()
+	s.mu.RLock()
+	if s.datagrams[id] != lease {
+		s.mu.RUnlock()
+		return false
+	}
+	lease.mu.Lock()
+	if !lease.consent[0] || !lease.consent[1] {
+		lease.mu.Unlock()
+		s.mu.RUnlock()
 		return false
 	}
 	var lists [2][]Candidate
@@ -507,7 +534,8 @@ func (s *Server) announce(id [16]byte, lease *datagramLease) bool {
 		}
 	}
 	h := lease.host
-	s.mu.Unlock()
+	lease.mu.Unlock()
+	s.mu.RUnlock()
 	if changed[0] {
 		lease.writeViewer(Message{Op: "peerCandidates", DatagramID: id[:], Candidates: lists[0]})
 	}
@@ -645,7 +673,7 @@ func (s *Server) openDatagram(conn net.Conn, message Message) {
 	case <-lease.hostReady:
 	case <-h.done:
 		return
-	case <-time.After(time.Second):
+	case <-time.After(2500 * time.Millisecond):
 		WriteMessage(conn, Message{Op: "error", Error: "timeout"})
 		return
 	}
@@ -707,38 +735,63 @@ func (s *Server) serveUDP(conn net.PacketConn) {
 		var id [16]byte
 		copy(id[:], buffer[14:30])
 		side := buffer[4]
-		s.mu.Lock()
+		s.mu.RLock()
 		lease := s.datagrams[id]
 		if lease == nil {
-			s.mu.Unlock()
+			s.mu.RUnlock()
 			s.rejected.Add(1)
 			continue
 		}
-		packet, err := DecodeDatagram(buffer[:n], lease.keys[side][:])
-		if err != nil || !lease.replay[side].Accept(packet.Sequence) {
-			s.mu.Unlock()
+		sideKey := lease.keys[side]
+		s.mu.RUnlock()
+		packet, err := DecodeDatagram(buffer[:n], sideKey[:])
+		if err != nil {
+			s.rejected.Add(1)
+			continue
+		}
+		s.mu.RLock()
+		if s.datagrams[id] != lease {
+			s.mu.RUnlock()
+			s.rejected.Add(1)
+			continue
+		}
+		lease.mu.Lock()
+		if !lease.replay[side].Accept(packet.Sequence) {
+			lease.mu.Unlock()
+			s.mu.RUnlock()
 			s.rejected.Add(1)
 			continue
 		}
 		if side == 1 && lease.addresses[side] == nil {
 			close(lease.hostReady)
 		}
+		shouldWake := false
 		if previous := lease.addresses[side]; lease.assist && lease.consent[0] && lease.consent[1] && (previous == nil || previous.String() != address.String()) {
-			lease.wake()
+			shouldWake = true
 		}
 		lease.addresses[side] = address
 		other := byte(1) - side
 		destination := lease.addresses[other]
 		if destination == nil || len(packet.Payload) == 0 || lease.sequences[other] == ^uint64(0) {
-			s.mu.Unlock()
+			lease.mu.Unlock()
+			s.mu.RUnlock()
+			if shouldWake {
+				lease.wake()
+			}
 			continue
 		}
 		lease.sequences[other]++
+		outSeq := lease.sequences[other]
+		otherKey := lease.keys[other]
+		lease.mu.Unlock()
+		s.mu.RUnlock()
+		if shouldWake {
+			lease.wake()
+		}
 		packet.Side = other
 		packet.Downstream = true
-		packet.Sequence = lease.sequences[other]
-		outgoing, err := EncodeDatagram(packet, lease.keys[other][:])
-		s.mu.Unlock()
+		packet.Sequence = outSeq
+		outgoing, err := EncodeDatagram(packet, otherKey[:])
 		if err == nil {
 			if _, err = conn.WriteTo(outgoing, destination); err == nil {
 				s.forwarded.Add(uint64(len(packet.Payload)))

@@ -90,8 +90,9 @@ final class InputSources: @unchecked Sendable {
         try access.select(target)
         try await confirm(target, token: token)
         if let contextRefresh {
-            requiresKeyboardRefocus = true
-            try await contextRefresh.refresh { self.lock.withLock { self.generation != token } }
+            try await contextRefresh.refresh(onFocusExcursionBegan: {
+                self.requiresKeyboardRefocus = true
+            }) { self.lock.withLock { self.generation != token } }
             try await confirm(target, token: token)
         }
         requiresKeyboardRefocus = false

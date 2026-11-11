@@ -1441,7 +1441,7 @@ final class HostImmediateInputQueue: @unchecked Sendable {
         let item = Item(input: input, fromDatagram: false)
         let result = lock.withLock { () -> (resumeNow: Bool, scheduleFlush: Bool) in
             if let last = pending.last, Self.canCoalesce(previous: last, next: item) {
-                pending[pending.count - 1] = item
+                pending[pending.count - 1] = Item(input: item.input.accumulatingPointerDelta(from: last.input), fromDatagram: false)
             } else {
                 pending.append(item)
             }
@@ -1461,7 +1461,7 @@ final class HostImmediateInputQueue: @unchecked Sendable {
         let item = Item(input: input, fromDatagram: true)
         return lock.withLock { () -> Bool in
             if let last = pending.last, Self.canCoalesce(previous: last, next: item) {
-                pending[pending.count - 1] = item
+                pending[pending.count - 1] = Item(input: item.input.accumulatingPointerDelta(from: last.input), fromDatagram: true)
             } else if pending.count < capacity {
                 pending.append(item)
             } else {
@@ -1519,6 +1519,9 @@ final class InputInjector: @unchecked Sendable {
         private var heldButtons = Set<Int>()
         private var highestPointerSequence: UInt64 = 0
         private var lastPoint = CGPoint.zero
+        private var hasKnownPoint = false
+        private var pointerRemainderX: Double = 0
+        private var pointerRemainderY: Double = 0
         private var inputFlags: CGEventFlags = []
         private var scroll = ScrollAccumulator()
         private var lineScroll = ScrollAccumulator()
@@ -1654,6 +1657,9 @@ final class InputInjector: @unchecked Sendable {
                                                  mouseButton: moveButton) else {
                             throw DeskError.invalid("无法建立远端滚动事件")
                         }
+                        if let heldButton {
+                            move.setIntegerValueField(.mouseEventButtonNumber, value: Int64(heldButton))
+                        }
                         move.flags = flags
                         postEvent(move)
                     }
@@ -1663,6 +1669,9 @@ final class InputInjector: @unchecked Sendable {
                         postEvent(earlier)
                     }
                     lastPoint = point
+                    hasKnownPoint = true
+                    pointerRemainderX = 0
+                    pointerRemainderY = 0
                     event = wheel
                     event?.location = point
                 case .move, .drag, .down, .up:
@@ -1671,17 +1680,37 @@ final class InputInjector: @unchecked Sendable {
                     case .down:
                         inputSources.requiresKeyboardRefocus = false
                         heldButtons.insert(input.button)
+                        pointerRemainderX = 0
+                        pointerRemainderY = 0
                         type = input.button == 0 ? .leftMouseDown : input.button == 1 ? .rightMouseDown : .otherMouseDown
                     case .up:
                         heldButtons.remove(input.button)
+                        pointerRemainderX = 0
+                        pointerRemainderY = 0
                         type = input.button == 0 ? .leftMouseUp : input.button == 1 ? .rightMouseUp : .otherMouseUp
                     case .drag:
                         type = input.button == 0 ? .leftMouseDragged : input.button == 1 ? .rightMouseDragged : .otherMouseDragged
                     default: type = .mouseMoved
                     }
                     event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button)
+                    if input.kind != .move {
+                        event?.setIntegerValueField(.mouseEventButtonNumber, value: Int64(input.button))
+                    }
+                    if input.kind == .move || input.kind == .drag {
+                        let rawDX = input.pointerDeltaX ?? (hasKnownPoint ? Double(point.x - lastPoint.x) : 0)
+                        let rawDY = input.pointerDeltaY ?? (hasKnownPoint ? Double(point.y - lastPoint.y) : 0)
+                        let totalDX = pointerRemainderX + rawDX
+                        let totalDY = pointerRemainderY + rawDY
+                        let intDX = totalDX.rounded(.towardZero)
+                        let intDY = totalDY.rounded(.towardZero)
+                        pointerRemainderX = totalDX - intDX
+                        pointerRemainderY = totalDY - intDY
+                        event?.setIntegerValueField(.mouseEventDeltaX, value: Int64(intDX))
+                        event?.setIntegerValueField(.mouseEventDeltaY, value: Int64(intDY))
+                    }
                     event?.setIntegerValueField(.mouseEventClickState, value: Int64(input.clicks))
                     lastPoint = point
+                    hasKnownPoint = true
                 case .switchInputSource, .toggleCapsLock: return nil
                 }
                 event?.flags = flags
@@ -1805,11 +1834,15 @@ final class InputInjector: @unchecked Sendable {
                 let type: CGEventType = button == 0 ? .leftMouseUp : button == 1 ? .rightMouseUp : .otherMouseUp
                 let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: lastPoint,
                                     mouseButton: CGMouseButton(rawValue: UInt32(button)) ?? .left)
+                event?.setIntegerValueField(.mouseEventButtonNumber, value: Int64(button))
                 event?.flags = remoteCapsLock == true ? [.maskAlphaShift] : []
                 if let event { postEvent(event) }
             }
             heldKeys.removeAll()
             heldButtons.removeAll()
+            pointerRemainderX = 0
+            pointerRemainderY = 0
+            hasKnownPoint = false
             inputFlags = remoteCapsLock == true ? [.maskAlphaShift] : []
         }
     }

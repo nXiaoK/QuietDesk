@@ -167,4 +167,37 @@ func runPointerMovePacingChecks() {
         try check(dragPacer.pendingButton == 0, "Pending drag button was not exposed")
         try check(dragPacer.takeDue(now: 1.0 / 120)?.x == 0.8, "Coalesced drag lost final position")
     }
+
+    run("Extended mouse buttons and coalesced pointer relative deltas validate and accumulate accurately") {
+        for validButton in [0, 1, 2, 3, 4, 31] {
+            var down = RemoteInput(kind: .down); down.x = 0.5; down.y = 0.5; down.button = validButton
+            try down.validate()
+        }
+        for invalidButton in [-1, 32] {
+            var down = RemoteInput(kind: .down); down.x = 0.5; down.y = 0.5; down.button = invalidButton
+            try check((try? down.validate()) == nil, "Accepted out-of-range button \(invalidButton)")
+        }
+
+        var partialDelta = move(0.5); partialDelta.pointerDeltaX = 4
+        try check((try? partialDelta.validate()) == nil, "Accepted single-axis pointerDelta without matching axis")
+        var clickWithDelta = RemoteInput(kind: .down); clickWithDelta.pointerDeltaX = 1; clickWithDelta.pointerDeltaY = 1
+        try check((try? clickWithDelta.validate()) == nil, "Accepted pointerDelta on a button-down event")
+        var hugeDelta = move(0.5); hugeDelta.pointerDeltaX = RemoteInput.maximumPointerDelta + 1; hugeDelta.pointerDeltaY = 0
+        try check((try? hugeDelta.validate()) == nil, "Accepted out-of-bounds pointerDelta")
+
+        var pacer = PointerMovePacer(interval: 1.0 / 120, allowsDrag: true)
+        var m0 = move(0.1); m0.pointerDeltaX = 3; m0.pointerDeltaY = -2
+        try check(pacer.offer(m0, now: 0)?.pointerDeltaX == 3, "Initial move delta was delayed")
+
+        var m1 = move(0.2); m1.pointerDeltaX = 4.5; m1.pointerDeltaY = -1.5
+        var m2 = move(0.3); m2.pointerDeltaX = 6.25; m2.pointerDeltaY = 3.5
+        let m3 = move(0.4) // Synthetic zero-delta follow-up preserves accumulated hardware delta
+        try check(pacer.offer(m1, now: 0.001) == nil && pacer.offer(m2, now: 0.002) == nil && pacer.offer(m3, now: 0.003) == nil,
+                  "Coalesced moves emitted before pacing slot")
+        guard let coalesced = pacer.takeDue(now: 1.0 / 120) else {
+            throw CheckFailure("Coalesced move was not emitted on slot")
+        }
+        try check(coalesced.x == 0.4 && coalesced.pointerDeltaX == 10.75 && coalesced.pointerDeltaY == 2.0,
+                  "Coalesced move lost accumulated relative deltas: (\(String(describing: coalesced.pointerDeltaX)), \(String(describing: coalesced.pointerDeltaY)))")
+    }
 }

@@ -486,6 +486,51 @@ private struct InputInjectorChecks {
                         "Stale UDP move altered injected coordinates")
         }
 
+        await run("Side buttons, relative pointer deltas, subpixel remainders and queue coalescing preserve exact metadata") {
+            let recorder = EventRecorder()
+            let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 101, height: 101),
+                                         isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
+            var down4 = RemoteInput(kind: .down); down4.x = 0.2; down4.y = 0.3; down4.button = 3
+            var drag4a = RemoteInput(kind: .drag); drag4a.x = 1.0; drag4a.y = 0.3; drag4a.button = 3
+            drag4a.pointerDeltaX = 14.6; drag4a.pointerDeltaY = -2.4
+            var drag4b = RemoteInput(kind: .drag); drag4b.x = 1.0; drag4b.y = 0.3; drag4b.button = 3
+            drag4b.pointerDeltaX = 5.6; drag4b.pointerDeltaY = -0.8
+            _ = try await injector.receive(down4)
+            _ = try await injector.receive(drag4a)
+            _ = try await injector.receive(drag4b)
+            injector.releaseAll()
+            try require(recorder.events.map(\.type) == [.otherMouseDown, .otherMouseDragged, .otherMouseDragged, .otherMouseUp],
+                        "Side button sequence changed event types")
+            try require(recorder.events.allSatisfy { $0.getIntegerValueField(.mouseEventButtonNumber) == 3 && NSEvent(cgEvent: $0)?.buttonNumber == 3 },
+                        "Mouse4 lost buttonNumber=3 on press, drag or release")
+            try require(recorder.events[1].getIntegerValueField(.mouseEventDeltaX) == 14
+                        && recorder.events[1].getIntegerValueField(.mouseEventDeltaY) == -2
+                        && recorder.events[2].getIntegerValueField(.mouseEventDeltaX) == 6
+                        && recorder.events[2].getIntegerValueField(.mouseEventDeltaY) == -1,
+                        "Edge-clamped drag deltas or subpixel remainders were lost")
+
+            recorder.events.removeAll()
+            var legacyFirst = RemoteInput(kind: .move); legacyFirst.x = 0.1; legacyFirst.y = 0.2
+            var legacySecond = RemoteInput(kind: .move); legacySecond.x = 0.35; legacySecond.y = 0.5
+            _ = try await injector.receive(legacyFirst)
+            _ = try await injector.receive(legacySecond)
+            try require(recorder.events.count == 2
+                        && recorder.events[0].getIntegerValueField(.mouseEventDeltaX) == 0
+                        && recorder.events[0].getIntegerValueField(.mouseEventDeltaY) == 0
+                        && recorder.events[1].getIntegerValueField(.mouseEventDeltaX) == 25
+                        && recorder.events[1].getIntegerValueField(.mouseEventDeltaY) == 30,
+                        "Legacy moves after release did not synthesize clean relative deltas")
+
+            let queue = HostImmediateInputQueue(capacity: 8)
+            var d1 = RemoteInput(kind: .move); d1.x = 0.2; d1.y = 0.2; d1.pointerSequence = 1; d1.pointerDeltaX = 4.5; d1.pointerDeltaY = -1.5
+            var d2 = RemoteInput(kind: .move); d2.x = 0.4; d2.y = 0.2; d2.pointerSequence = 2; d2.pointerDeltaX = 7.5; d2.pointerDeltaY = -2.5
+            _ = queue.enqueueDatagram(d1)
+            _ = queue.enqueueDatagram(d2)
+            let drained = queue.drain().inputs
+            try require(drained.count == 1 && drained[0].x == 0.4 && drained[0].pointerDeltaX == 12 && drained[0].pointerDeltaY == -4,
+                        "Host immediate queue dropped accumulated pointer deltas when coalescing datagrams")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

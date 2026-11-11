@@ -280,6 +280,8 @@ public struct RemoteInput: Codable, Sendable {
         case began = 1, changed = 2, ended = 3
     }
     public static let maximumLineDelta = 250.0
+    public static let maximumPointerDelta = 10_000.0
+    public static let maximumButtonNumber = 31
     public var kind: Kind
     public var x: Double = 0
     public var y: Double = 0
@@ -297,14 +299,34 @@ public struct RemoteInput: Codable, Sendable {
     public var lineDeltaY: Double?
     public var scrollPhase: ScrollPhase?
     public var momentumPhase: MomentumPhase?
+    // Relative pointer motion in remote display points for move/drag events; older hosts ignore it.
+    public var pointerDeltaX: Double?
+    public var pointerDeltaY: Double?
     // Monotonic per-session sequence for pointer events, guarding causal order across UDP and TCP paths.
     public var pointerSequence: UInt64?
 
     public init(kind: Kind) { self.kind = kind }
 
+    public func accumulatingPointerDelta(from earlier: RemoteInput?) -> RemoteInput {
+        guard let earlier,
+              earlier.pointerDeltaX != nil || earlier.pointerDeltaY != nil
+              || pointerDeltaX != nil || pointerDeltaY != nil else {
+            return self
+        }
+        var merged = self
+        let limit = Self.maximumPointerDelta
+        let dx = (earlier.pointerDeltaX ?? 0) + (pointerDeltaX ?? 0)
+        let dy = (earlier.pointerDeltaY ?? 0) + (pointerDeltaY ?? 0)
+        if dx.isFinite, dy.isFinite {
+            merged.pointerDeltaX = min(limit, max(-limit, dx))
+            merged.pointerDeltaY = min(limit, max(-limit, dy))
+        }
+        return merged
+    }
+
     public func validate() throws {
         guard x.isFinite, y.isFinite, (0...1).contains(x), (0...1).contains(y),
-              (0...2).contains(button), keyCode <= 127, (0...3).contains(clicks),
+              (0...Self.maximumButtonNumber).contains(button), keyCode <= 127, (0...3).contains(clicks),
               deltaX.isFinite, deltaY.isFinite, abs(deltaX) <= 3000, abs(deltaY) <= 3000 else {
             throw DeskError.invalid("远端输入参数无效")
         }
@@ -312,6 +334,11 @@ public struct RemoteInput: Codable, Sendable {
             guard pointerSequence > 0, [.move, .drag, .down, .up, .scroll].contains(kind) else {
                 throw DeskError.invalid("远端指针序号无效")
             }
+        }
+        let pointerDeltas = [pointerDeltaX, pointerDeltaY].compactMap { $0 }
+        guard pointerDeltas.isEmpty || ([.move, .drag].contains(kind) && pointerDeltas.count == 2
+                                        && pointerDeltas.allSatisfy { $0.isFinite && abs($0) <= Self.maximumPointerDelta }) else {
+            throw DeskError.invalid("远端指针增量参数无效")
         }
         let lines = [lineDeltaX, lineDeltaY].compactMap { $0 }
         guard kind == .scroll || (lines.isEmpty && scrollPhase == nil && momentumPhase == nil),

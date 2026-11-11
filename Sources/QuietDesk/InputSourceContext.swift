@@ -72,10 +72,13 @@ final class InputSourceContextRefresh {
         self.waitForChange = waitForChange
     }
 
-    func refresh(isCancelled: () -> Bool) async throws {
+    func refresh(onFocusExcursionBegan: () -> Void = {}, isCancelled: () -> Bool) async throws {
         guard !isCancelled(), !Task.isCancelled else { throw CancellationError() }
         guard let original = access.originalProcessID else { throw DeskError.invalid("无法读取远端输入应用，请重试") }
-        guard access.frontmostProcessID == original else { throw DeskError.invalid("远端输入焦点已改变") }
+        guard access.frontmostProcessID == original else {
+            onFocusExcursionBegan()
+            throw DeskError.invalid("远端输入焦点已改变")
+        }
         // TIS already activates the input context when the target belongs to this process.
         guard original != access.currentProcessID else { return }
         defer {
@@ -83,7 +86,11 @@ final class InputSourceContextRefresh {
             if access.frontmostProcessID == access.currentProcessID { _ = access.restoreOriginalApplication() }
             access.closeRefreshWindow()
         }
-        guard access.activateRefreshWindow() else { throw DeskError.invalid("无法刷新远端输入焦点") }
+        guard access.activateRefreshWindow() else {
+            if access.frontmostProcessID != original { onFocusExcursionBegan() }
+            throw DeskError.invalid("无法刷新远端输入焦点")
+        }
+        onFocusExcursionBegan()
         var activated = false
         for _ in 0..<25 {
             try await waitForChange()

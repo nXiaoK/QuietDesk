@@ -1191,6 +1191,44 @@ private struct RemoteCanvasChecks {
                         "Oversized remote picture in 1:1 mode overflowed the window bounds")
         }
 
+        run("Side mouse buttons and hardware relative pointer deltas map to scaled remote desktop coordinates") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            canvas.remoteSize = CGSize(width: 800, height: 400) // pictureRect is 400x200 -> 2x scale on X and Y
+            canvas.canControl = true
+            defer { canvas.reset() }
+            var inputs: [RemoteInput] = []
+            canvas.onInput = { inputs.append($0) }
+
+            @MainActor
+            func sideMouse(_ type: CGEventType, buttonNumber: UInt32, dx: Int64 = 0, dy: Int64 = 0) throws -> NSEvent {
+                guard let cg = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: .zero,
+                                       mouseButton: CGMouseButton(rawValue: buttonNumber)!) else {
+                    throw CanvasCheckFailure("Could not construct side-button mouse event")
+                }
+                cg.setIntegerValueField(.mouseEventButtonNumber, value: Int64(buttonNumber))
+                cg.setIntegerValueField(.mouseEventClickState, value: 1)
+                cg.setIntegerValueField(.mouseEventDeltaX, value: dx)
+                cg.setIntegerValueField(.mouseEventDeltaY, value: dy)
+                return try nativeEvent(cg, point: CGPoint(x: 200, y: 150))
+            }
+
+            canvas.otherMouseDown(with: try sideMouse(.otherMouseDown, buttonNumber: 3))
+            canvas.otherMouseDragged(with: try sideMouse(.otherMouseDragged, buttonNumber: 3, dx: 7, dy: -5))
+            canvas.otherMouseUp(with: try sideMouse(.otherMouseUp, buttonNumber: 3))
+            canvas.otherMouseDown(with: try sideMouse(.otherMouseDown, buttonNumber: 4))
+            canvas.otherMouseUp(with: try sideMouse(.otherMouseUp, buttonNumber: 4))
+
+            try require(inputs.map(\.kind) == [.down, .drag, .up, .down, .up],
+                        "Side-button event sequence was dropped or reordered")
+            try require(inputs.map(\.button) == [3, 3, 3, 4, 4],
+                        "Mouse4/Mouse5 button numbers were clamped to middle button: \(inputs.map(\.button))")
+            try require(inputs[1].pointerDeltaX == 14 && inputs[1].pointerDeltaY == -10,
+                        "Hardware drag delta did not scale to remoteSize/pictureRect: (\(String(describing: inputs[1].pointerDeltaX)), \(String(describing: inputs[1].pointerDeltaY)))")
+            try require(inputs[0].pointerDeltaX == nil && inputs[2].pointerDeltaX == nil,
+                        "Button down/up acquired pointer deltas")
+            try inputs.forEach { try $0.validate() }
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

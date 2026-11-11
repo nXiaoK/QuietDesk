@@ -3247,7 +3247,7 @@ final class DeskModel: ObservableObject {
         let keyboard = kind == .keyDown || kind == .keyUp || kind == .flags
         if keyboard { input.keyCode = event.keyCode }
         else if kind == .down || kind == .up || kind == .drag {
-            input.button = min(2, max(0, event.buttonNumber))
+            input.button = min(RemoteInput.maximumButtonNumber, max(0, event.buttonNumber))
         }
         input.flags = UInt64(event.modifierFlags.rawValue)
         let allowed = wakeInputGate.allows(input, suspended: wasSuspended || sessionInputSuspended || desktopActionWorking || !connected)

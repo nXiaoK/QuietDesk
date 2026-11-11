@@ -44,7 +44,12 @@ public struct PointerMovePacer: Sendable {
     public mutating func offer(_ input: RemoteInput, now: TimeInterval) -> RemoteInput? {
         let supported = input.kind == .move || (allowsDrag && input.kind == .drag)
         guard supported, (try? input.validate()) != nil, validTime(now) else { return nil }
-        pending = input
+        if let existing = pending, existing.kind == input.kind,
+           (input.kind != .drag || existing.button == input.button) {
+            pending = input.accumulatingPointerDelta(from: existing)
+        } else {
+            pending = input
+        }
         return takeDue(now: now)
     }
 

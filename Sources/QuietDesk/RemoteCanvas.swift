@@ -1022,8 +1022,19 @@ final class RemoteCanvas: NSView {
             activeScroll?.x = input.x; activeScroll?.y = input.y; activeScroll?.flags = input.flags
         }
         if kind == .down || kind == .up || kind == .drag {
-            input.button = min(2, max(0, event.buttonNumber))
+            input.button = min(RemoteInput.maximumButtonNumber, max(0, event.buttonNumber))
             input.clicks = min(3, max(1, event.clickCount))
+        }
+        if kind == .move || kind == .drag {
+            let rawDX = Double(event.deltaX)
+            let rawDY = Double(event.deltaY)
+            if rawDX.isFinite, rawDY.isFinite, rawDX != 0 || rawDY != 0 {
+                let scaleX = Double(max(1, remoteSize.width) / rect.width)
+                let scaleY = Double(max(1, remoteSize.height) / rect.height)
+                let limit = RemoteInput.maximumPointerDelta
+                input.pointerDeltaX = min(limit, max(-limit, rawDX * scaleX))
+                input.pointerDeltaY = min(limit, max(-limit, rawDY * scaleY))
+            }
         }
         if kind == .scroll {
             let multiplier: Double = event.hasPreciseScrollingDeltas ? 1 : 12

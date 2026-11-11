@@ -196,6 +196,35 @@ private struct InputContextRefreshChecks {
             try require(result == nil && keyCount == 0 && focus.closes == 1 && focus.frontmostProcessID == focus.originalProcessID,
                         "Released control returned a stale success or injected a key before refocus")
         }
+        await run("Aborted refresh before focus leaves the target app does not lock out keyboard input") {
+            let unactivated = FocusProbe(); unactivated.acceptsActivation = false
+            let unactivatedRefresh = InputSourceContextRefresh(access: unactivated) { await Task.yield() }
+            let unactivatedProbe = ContextSourceProbe(refresh: unactivatedRefresh)
+            let unactivatedSources = InputSources(access: unactivatedProbe) { await Task.yield() }
+            var postedKeys = 0
+            let injector = InputInjector(bounds: .zero, isTrusted: { true }, postEvent: { if $0.type == .keyDown { postedKeys += 1 } },
+                                         inputSources: unactivatedSources, capsLockState: { false })
+            let failedSwitch = try await injector.receive(RemoteInput(kind: .switchInputSource))
+            _ = try await injector.receive(RemoteInput(kind: .keyDown))
+            try require(failedSwitch?.message.contains("请点击") == false && !unactivatedSources.requiresKeyboardRefocus && postedKeys == 1,
+                        "Headless or rejected refresh window locked out keyboard input even though focus never left the target app")
+
+            let missingApp = FocusProbe(); missingApp.originalProcessID = nil
+            let missingRefresh = InputSourceContextRefresh(access: missingApp) { await Task.yield() }
+            let missingProbe = ContextSourceProbe(refresh: missingRefresh)
+            let missingSources = InputSources(access: missingProbe) { await Task.yield() }
+            do { _ = try await missingSources.toggle(); throw ContextCheckFailure(message: "Missing app succeeded") }
+            catch is DeskError { }
+            try require(!missingSources.requiresKeyboardRefocus, "Missing original app locked out keyboard input without touching focus")
+
+            let changedBeforeRefresh = FocusProbe(); changedBeforeRefresh.frontmostProcessID = 30
+            let changedRefresh = InputSourceContextRefresh(access: changedBeforeRefresh) { await Task.yield() }
+            let changedProbe = ContextSourceProbe(refresh: changedRefresh)
+            let changedSources = InputSources(access: changedProbe) { await Task.yield() }
+            do { _ = try await changedSources.toggle(); throw ContextCheckFailure(message: "Changed focus succeeded") }
+            catch is DeskError { }
+            try require(changedSources.requiresKeyboardRefocus, "External focus change before refresh failed to require refocus")
+        }
         print("Input context checks: \(passed) passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

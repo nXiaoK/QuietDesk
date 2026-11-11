@@ -1229,6 +1229,93 @@ private struct RemoteCanvasChecks {
             try inputs.forEach { try $0.validate() }
         }
 
+        run("Canvas drag-and-drop highlights valid local files using an isolated drag pasteboard and forwards URLs") {
+            @MainActor
+            final class SyntheticDraggingInfo: NSObject, NSDraggingInfo {
+                let draggingPasteboard: NSPasteboard
+                let draggingDestinationWindow: NSWindow?
+                init(pasteboard: NSPasteboard, window: NSWindow? = nil) {
+                    self.draggingPasteboard = pasteboard
+                    self.draggingDestinationWindow = window
+                }
+                var draggingSourceOperationMask: NSDragOperation { .copy }
+                var draggingLocation: NSPoint { NSPoint(x: 120, y: 90) }
+                var draggedImageLocation: NSPoint { .zero }
+                var draggedImage: NSImage? { nil }
+                var draggingSource: Any? { nil }
+                var draggingSequenceNumber: Int { 1 }
+                func slideDraggedImage(to screenPoint: NSPoint) {}
+                var animatesToDestination: Bool = false
+                var draggingFormation: NSDraggingFormation = .default
+                var numberOfValidItemsForDrop: Int = 1
+                func enumerateDraggingItems(options enumOpts: NSDraggingItemEnumerationOptions = [],
+                                            for view: NSView?, classes classArray: [AnyClass],
+                                            searchOptions: [NSPasteboard.ReadingOptionKey: Any] = [:],
+                                            using block: @escaping (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
+                var springLoadingHighlight: NSSpringLoadingHighlight { .none }
+                func resetSpringLoading() {}
+            }
+
+            let dragPasteboard = NSPasteboard.withUniqueName()
+            defer { dragPasteboard.releaseGlobally() }
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("quietdesk-drop-" + UUID().uuidString)
+            try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: tempDir) }
+            let fileA = tempDir.appendingPathComponent("report.pdf")
+            let fileB = tempDir.appendingPathComponent("slides.key")
+            try Data([1, 2, 3]).write(to: fileA)
+            try Data([4, 5, 6]).write(to: fileB)
+
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            defer { canvas.reset() }
+            try require(canvas.registeredDraggedTypes.contains(.fileURL),
+                        "Canvas did not register for .fileURL drag-and-drop")
+
+            var acceptedCheckCount = 0
+            var droppedBatches: [[URL]] = []
+            var activityCount = 0
+            canvas.canAcceptFileDrop = { urls in
+                acceptedCheckCount += 1
+                return !urls.isEmpty
+            }
+            canvas.onDropFiles = { urls in
+                droppedBatches.append(urls)
+                return true
+            }
+            canvas.onUserActivity = { activityCount += 1 }
+
+            // Plain text on drag pasteboard should be rejected without targeting highlight
+            dragPasteboard.clearContents()
+            dragPasteboard.setString("not-a-file", forType: .string)
+            let textDrag = SyntheticDraggingInfo(pasteboard: dragPasteboard)
+            try require(canvas.draggingEntered(textDrag) == [] && !canvas.isFileDropTargeted,
+                        "Non-file drag targeted canvas")
+
+            // Duplicate file URLs on isolated drag pasteboard are deduplicated and accepted
+            dragPasteboard.clearContents()
+            dragPasteboard.writeObjects([fileA as NSURL, fileB as NSURL, fileA as NSURL])
+            let fileDrag = SyntheticDraggingInfo(pasteboard: dragPasteboard)
+            try require(canvas.draggingEntered(fileDrag) == .copy && canvas.isFileDropTargeted,
+                        "Valid file drag did not enter targeted copy state")
+            canvas.draggingExited(fileDrag)
+            try require(!canvas.isFileDropTargeted, "draggingExited did not clear drop highlight")
+
+            try require(canvas.draggingEntered(fileDrag) == .copy && canvas.isFileDropTargeted,
+                        "Re-entering file drag did not restore highlight")
+            try require(canvas.performDragOperation(fileDrag), "performDragOperation failed for valid files")
+            try require(!canvas.isFileDropTargeted && activityCount == 1 && acceptedCheckCount >= 2,
+                        "performDragOperation left highlight active or skipped user activity")
+            try require(droppedBatches.count == 1 && droppedBatches[0] == [fileA.standardizedFileURL, fileB.standardizedFileURL],
+                        "Dropped URLs were not standardized and deduplicated: \(droppedBatches)")
+
+            // Suspended input rejects drag operations and clears highlight
+            _ = canvas.draggingEntered(fileDrag)
+            canvas.pointerInputSuspended = true
+            try require(!canvas.isFileDropTargeted && canvas.draggingEntered(fileDrag) == []
+                        && !canvas.performDragOperation(fileDrag),
+                        "Suspended canvas accepted file drop")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

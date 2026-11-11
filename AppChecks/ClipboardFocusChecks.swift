@@ -101,10 +101,12 @@ private final class ClipboardPair {
     var routeRemote: ((Message) -> Bool)?
 
     init(storage: URL, localAllowed: Bool = false, remoteAllowed: Bool = false, controllingLocal: Bool = false,
+         allowsChunkWindow: Bool = false, allowsDecoupledFileTransfer: Bool = false,
          convertLocalTIFF: @escaping (Data) -> Data? = { data in NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) },
          validateRemotePNG: ((Data) -> Bool)? = nil) {
         let session = UUID()
         localSync = ClipboardSync(session: session, allowsFileSending: true, allowsAutomaticSending: localAllowed,
+            allowsChunkWindow: allowsChunkWindow, allowsDecoupledFileTransfer: allowsDecoupledFileTransfer,
             controllingRemote: controllingLocal, pasteboard: local, storage: storage.appendingPathComponent("local"),
             convertTIFF: convertLocalTIFF) { [weak self] message in
                 DispatchQueue.main.async {
@@ -114,6 +116,7 @@ private final class ClipboardPair {
                 }
             }
         remoteSync = ClipboardSync(session: session, allowsFileSending: true, allowsAutomaticSending: remoteAllowed,
+            allowsChunkWindow: allowsChunkWindow, allowsDecoupledFileTransfer: allowsDecoupledFileTransfer,
             pasteboard: remote, storage: storage.appendingPathComponent("remote"), validatePNG: validateRemotePNG) { [weak self] message in
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -1502,6 +1505,108 @@ private struct ClipboardFocusChecks {
             }
             try require(MessageKind.clipboardSettings.rawValue == 11 && MessageKind.controlStatus.rawValue == 20 && Wire.version == 1,
                         "Existing protocol numbering changed")
+        }
+
+        run("Explicit dropped file transfer saves to received folder without reading or modifying either pasteboard") { folder in
+            let pair = ClipboardPair(storage: folder, localAllowed: true, remoteAllowed: true,
+                                     allowsChunkWindow: true, allowsDecoupledFileTransfer: true)
+            defer { pair.stop() }
+            let source = folder.appendingPathComponent("dropped-archive.zip")
+            let expected = Data(repeating: 0x3C, count: 600_000)
+            try expected.write(to: source)
+            var receivedResult: (result: ClipboardFileResult, keptLocalCopy: Bool)?
+            var senderCompleted = false
+            pair.remoteSync.onFileOffer = { [weak remoteSync = pair.remoteSync] offer in
+                if let offer { remoteSync?.respondToFileOffer(id: offer.id, accept: true) }
+            }
+            pair.remoteSync.onFileResult = { result, keptLocalCopy in
+                receivedResult = (result, keptLocalCopy)
+            }
+            pair.localSync.onFileResult = { result, _ in
+                if result.direction == .sending && result.outcome == .completed { senderCompleted = true }
+            }
+            let started = pair.localSync.sendDroppedFiles([source, source])
+            try require(started, "sendDroppedFiles rejected valid local file")
+            try eventually("Dropped file did not complete on both peers") {
+                senderCompleted && receivedResult?.result.outcome == .completed
+            }
+            try require(pair.local.reads == 0 && pair.local.writes == 0
+                        && pair.remote.reads == 0 && pair.remote.writes == 0,
+                        "Explicit dropped file read or wrote system pasteboard (local \(pair.local.reads)/\(pair.local.writes), remote \(pair.remote.reads)/\(pair.remote.writes))")
+            guard let files = receivedResult?.result.files, files.count == 1 else {
+                throw FocusCheckFailure("Expected exactly one deduplicated received file")
+            }
+            try require((try? Data(contentsOf: files[0])) == expected, "Dropped file content mismatch")
+        }
+
+        run("Decoupled file transfer allows bidirectional text sync while a clipboard file transfer is mid-flight") { folder in
+            let pair = ClipboardPair(storage: folder, localAllowed: true, remoteAllowed: true,
+                                     allowsChunkWindow: true, allowsDecoupledFileTransfer: true)
+            defer { pair.stop() }
+            let source = folder.appendingPathComponent("large-video.mov")
+            let expected = Data(repeating: 0x7E, count: 900_000)
+            try expected.write(to: source)
+
+            var fileCounter: UInt64?
+            var holdFileChunks = true
+            var heldChunks: [Message] = []
+            var fileResult: (ClipboardFileResult, Bool)?
+            pair.routeLocal = { message in
+                if message.kind == .clipboardBegin,
+                   let obj = try? JSONSerialization.jsonObject(with: message.payload) as? [String: Any],
+                   obj["type"] as? String == "files",
+                   let rev = obj["revision"] as? [String: Any],
+                   let counter = (rev["counter"] as? NSNumber)?.uint64Value {
+                    fileCounter = counter
+                }
+                if holdFileChunks {
+                    if message.kind == .clipboardChunk {
+                        var reader = ByteReader(message.payload)
+                        if let counter: UInt64 = try? reader.take(), counter == fileCounter {
+                            heldChunks.append(message)
+                            return false
+                        }
+                    } else if message.kind == .clipboardEnd,
+                              let obj = try? JSONSerialization.jsonObject(with: message.payload) as? [String: Any],
+                              let rev = obj["revision"] as? [String: Any],
+                              (rev["counter"] as? NSNumber)?.uint64Value == fileCounter {
+                        heldChunks.append(message)
+                        return false
+                    }
+                }
+                return true
+            }
+            pair.remoteSync.onFileOffer = { [weak remoteSync = pair.remoteSync] offer in
+                if let offer { remoteSync?.respondToFileOffer(id: offer.id, accept: true) }
+            }
+            pair.remoteSync.onFileResult = { result, kept in fileResult = (result, kept) }
+
+            pair.local.copy(.files([source]))
+            pair.localSync.sendLocalCopy()
+            try eventually("File transfer did not enter mid-flight chunk streaming") { !heldChunks.isEmpty }
+
+            pair.local.copy(.text(Data("text while sending file".utf8)))
+            pair.localSync.sendLocalCopy()
+            try eventually("Local-to-remote text blocked behind active file send") {
+                pair.remote.copiedText == "text while sending file"
+            }
+
+            pair.remote.copy(.text(Data("text while receiving file".utf8)))
+            pair.remoteSync.sendLocalCopy()
+            try eventually("Remote-to-local text blocked behind active file receive") {
+                pair.local.copiedText == "text while receiving file"
+            }
+
+            holdFileChunks = false
+            for chunk in heldChunks { pair.remoteSync.receive(chunk) }
+            heldChunks.removeAll()
+            try eventually("Held file transfer did not finish after releasing chunks") {
+                fileResult?.0.outcome == .completed
+            }
+            try require(fileResult?.1 == true && pair.remote.copiedText == "text while receiving file"
+                        && fileResult?.0.files.count == 1
+                        && (try? Data(contentsOf: fileResult!.0.files[0])) == expected,
+                        "Completed background file overwrote newer text pasteboard or lost file bytes")
         }
 
         print("\(passed) passed, \(failed) failed")

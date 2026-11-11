@@ -135,4 +135,157 @@ func runClipboardWindowChecks() {
             try check(!success.read(), "Future acknowledgement completed an unsent transfer")
         }
     }
+
+    run("Decoupled file lane uses a 64-chunk window and runs concurrently with bidirectional text clipboard transfers") {
+        try withCheckFolder { folder in
+            let file = folder.appendingPathComponent("bundle.bin")
+            let expectedFile = Data(repeating: 0x5A, count: 18 * 1_024 * 1_024 + 19)
+            try expectedFile.write(to: file)
+            let a = ClipboardTransfer(storage: folder.appendingPathComponent("a"), requireFileApproval: true,
+                                      allowsChunkWindow: true, allowsDecoupledFileTransfer: true)
+            let b = ClipboardTransfer(storage: folder.appendingPathComponent("b"), requireFileApproval: true,
+                                      allowsChunkWindow: true, allowsDecoupledFileTransfer: true)
+            defer { stopTransfers(a, b) }
+
+            let fileOrigin = Box<String?>(nil), fileCounter = Box<UInt64?>(nil)
+            let fileWindowCount = Box(0), heldFileReceipts = Box<[Message]>([])
+            let holdFileReceipts = Box(true)
+            let windowFull = DispatchSemaphore(value: 0)
+            let textAToBDone = DispatchSemaphore(value: 0), textBToADone = DispatchSemaphore(value: 0)
+            let fileSendDone = DispatchSemaphore(value: 0), fileReceiveDone = DispatchSemaphore(value: 0)
+            let textOnB = Box<Data?>(nil), textOnA = Box<Data?>(nil)
+            let explicitFiles = Box<[URL]>([]), pasteboardCallbackCalled = Box(false), fileSucceeded = Box(false)
+
+            func revisionTuple(_ payload: Data) -> (UInt64, String)? {
+                guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+                      let rev = obj["revision"] as? [String: Any],
+                      let counter = (rev["counter"] as? NSNumber)?.uint64Value,
+                      let origin = rev["origin"] as? String else { return nil }
+                return (counter, origin)
+            }
+
+            a.onSend = { message in
+                if message.kind == .clipboardBegin,
+                   let obj = try? JSONSerialization.jsonObject(with: message.payload) as? [String: Any],
+                   obj["type"] as? String == "files",
+                   let (counter, origin) = revisionTuple(message.payload) {
+                    fileCounter.set(counter)
+                    fileOrigin.set(origin)
+                }
+                if [.clipboardEntry, .clipboardChunk, .clipboardEnd].contains(message.kind) {
+                    let isFileMessage: Bool
+                    if message.kind == .clipboardChunk {
+                        var reader = ByteReader(message.payload)
+                        let counter: UInt64? = try? reader.take()
+                        let uuidBytes = try? reader.bytes(16)
+                        let origin = uuidBytes.map { bytes -> String in
+                            let raw = bytes.withUnsafeBytes { $0.loadUnaligned(as: uuid_t.self) }
+                            return UUID(uuid: raw).uuidString
+                        }
+                        isFileMessage = (counter == fileCounter.read() && origin == fileOrigin.read())
+                    } else if let (counter, origin) = revisionTuple(message.payload) {
+                        isFileMessage = (counter == fileCounter.read() && origin == fileOrigin.read())
+                    } else {
+                        isFileMessage = false
+                    }
+                    if isFileMessage {
+                        fileWindowCount.update {
+                            $0 += 1
+                            if $0 == 64 { windowFull.signal() }
+                        }
+                    }
+                }
+                b.receive(message)
+            }
+            b.onSend = { message in
+                if message.kind == .clipboardReceipt,
+                   let (counter, origin) = revisionTuple(message.payload),
+                   counter == fileCounter.read(), origin == fileOrigin.read(),
+                   (try? receiptSequence(message)) != 0,
+                   holdFileReceipts.read() {
+                    heldFileReceipts.update { $0.append(message) }
+                    return
+                }
+                a.receive(message)
+            }
+            b.onFileOffer = { [weak b] offer in
+                if let offer, offer.isExplicitDrop {
+                    b?.respondToFileOffer(id: offer.id, accept: true)
+                }
+            }
+            b.onReceive = { payload in
+                switch payload {
+                case .text(let data):
+                    textOnB.set(data)
+                    textAToBDone.signal()
+                case .files:
+                    pasteboardCallbackCalled.set(true)
+                case .png:
+                    break
+                }
+            }
+            b.onExplicitFilesReceived = { urls in
+                explicitFiles.set(urls)
+                fileReceiveDone.signal()
+            }
+            a.onReceive = { payload in
+                if case .text(let data) = payload {
+                    textOnA.set(data)
+                    textBToADone.signal()
+                }
+            }
+
+            a.sendExplicitFiles([file]) { ok in
+                fileSucceeded.set(ok)
+                fileSendDone.signal()
+            }
+            try wait(windowFull, "Decoupled file lane never filled 64-message window")
+            Thread.sleep(forTimeInterval: 0.08)
+            try check(fileWindowCount.read() == 64,
+                      "Decoupled file lane exceeded or fell short of 64-message window: \(fileWindowCount.read())")
+
+            let msgAToB = Data("concurrent-local-to-remote".utf8)
+            let msgBToA = Data("concurrent-remote-to-local".utf8)
+            a.send(.text(msgAToB))
+            try wait(textAToBDone, "Text A->B blocked behind paused file transfer")
+            b.send(.text(msgBToA))
+            try wait(textBToADone, "Text B->A blocked behind paused file transfer")
+            try check(textOnB.read() == msgAToB && textOnA.read() == msgBToA,
+                      "Concurrent text transfers corrupted payload")
+
+            let until = Date().addingTimeInterval(3)
+            while heldFileReceipts.read().count < 64, Date() < until { Thread.sleep(forTimeInterval: 0.01) }
+            guard let latestFileReceipt = heldFileReceipts.read().last else {
+                throw CheckFailure("Missing cumulative file receipt")
+            }
+            holdFileReceipts.set(false)
+            a.receive(latestFileReceipt)
+            try wait(fileSendDone, "Resumed file transfer did not finish sending")
+            try wait(fileReceiveDone, "Resumed file transfer did not deliver explicit files")
+            let urls = explicitFiles.read()
+            try check(fileSucceeded.read() && !pasteboardCallbackCalled.read() && urls.count == 1
+                      && (try? Data(contentsOf: urls[0])) == expectedFile,
+                      "Explicit dropped file modified pasteboard callback or lost bytes")
+
+            let legacyPeer = ClipboardTransfer(storage: folder.appendingPathComponent("legacy"), requireFileApproval: true)
+            defer { legacyPeer.stop() }
+            let legacyRejected = DispatchSemaphore(value: 0)
+            let legacyOffered = Box(false), legacyReceipts = Box(0), legacyError = Box("")
+            legacyPeer.onFileOffer = { if $0 != nil { legacyOffered.set(true) } }
+            legacyPeer.onSend = { msg in if msg.kind == .clipboardReceipt { legacyReceipts.update { $0 += 1 } } }
+            legacyPeer.onStatus = { status in
+                if status.contains("对端未协商独立文件传输通道") {
+                    legacyError.set(status)
+                    legacyRejected.signal()
+                }
+            }
+            let unnegotiatedBegin = """
+            {"revision":{"counter":1,"origin":"\(UUID().uuidString)"},"sequence":0,"type":"files","count":1,"bytes":4,"independentFileLane":true}
+            """
+            legacyPeer.receive(Message(.clipboardBegin, Data(unnegotiatedBegin.utf8)))
+            try wait(legacyRejected, "Legacy peer accepted unnegotiated independentFileLane")
+            try check(!legacyOffered.read() && legacyReceipts.read() == 0 && !legacyError.read().isEmpty,
+                      "Legacy peer offered or acknowledged unnegotiated independentFileLane")
+        }
+    }
 }

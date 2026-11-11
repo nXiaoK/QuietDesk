@@ -105,6 +105,7 @@ final class ClipboardSync {
     var onReceivedFilesKept: (() -> Void)?
     var onDiagnostic: ((DiagnosticEvent) -> Void)?
     var allowsFileSending: Bool
+    private let allowsDecoupledFileTransfer: Bool
     private var allowsAutomaticSending: Bool
     private var controllingRemote: Bool
     private let pasteboard: ClipboardPasteboard
@@ -114,7 +115,7 @@ final class ClipboardSync {
     private var observedChange: Int
     // A copy made before taking control may still be waiting for activation or session resume.
     private var pendingLocalChange: Int?
-    private var pendingFileOffer: (id: UUID, change: Int)?
+    private var pendingFileOffer: (id: UUID, change: Int, explicitDrop: Bool)?
     private var receivingFileID: UUID?
     private var receivingFileChange: Int?
     private var receivedFilesKeptLocally = false
@@ -135,6 +136,7 @@ final class ClipboardSync {
     private let session: UUID
 
     init(session: UUID, allowsFileSending: Bool, allowsAutomaticSending: Bool = true, allowsChunkWindow: Bool = false,
+         allowsDecoupledFileTransfer: Bool = false,
          controllingRemote: Bool = false, handledChange: Int? = nil, pasteboard: ClipboardPasteboard? = nil, storage: URL? = nil,
          convertTIFF: @escaping (Data) -> Data? = { data in
              autoreleasepool { NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) }
@@ -143,6 +145,7 @@ final class ClipboardSync {
          send: @escaping (Message) -> Void) {
         self.session = session
         self.allowsFileSending = allowsFileSending
+        self.allowsDecoupledFileTransfer = allowsDecoupledFileTransfer
         self.allowsAutomaticSending = allowsAutomaticSending
         self.controllingRemote = controllingRemote
         self.convertTIFF = convertTIFF
@@ -151,10 +154,17 @@ final class ClipboardSync {
         self.pasteboard = pasteboard
         observedChange = handledChange ?? pasteboard.changeCount
         let transfer = ClipboardTransfer(storage: storage ?? Self.storageURL, requireFileApproval: true,
-                                         allowsChunkWindow: allowsChunkWindow)
+                                         allowsChunkWindow: allowsChunkWindow,
+                                         allowsDecoupledFileTransfer: allowsDecoupledFileTransfer)
         self.transfer = transfer
         receiveMessage = { [weak transfer] message in transfer?.receive(message) }
         transfer.onSend = send
+        transfer.onExplicitFilesReceived = { [weak self] files in
+            DispatchQueue.main.async {
+                guard let self, self.running else { return }
+                self.onDiagnostic?(.applied(.files, fileCount: files.count))
+            }
+        }
         transfer.onApplyWithPermit = { [weak self] payload, permit, completion in
             DispatchQueue.main.async {
                 guard let self else { completion(false); return }
@@ -179,7 +189,9 @@ final class ClipboardSync {
                 guard let self, self.running else { return }
                 self.receivingFileID = id
                 if id != nil {
-                    self.receivingFileChange = self.receivingFileChange ?? self.pendingFileOffer?.change ?? self.pasteboard.changeCount
+                    if self.receivingFileChange == nil, self.pendingFileOffer?.explicitDrop != true {
+                        self.receivingFileChange = self.pendingFileOffer?.change ?? self.pasteboard.changeCount
+                    }
                 } else {
                     self.receivingFileChange = nil
                     if self.receivedFilesKeptLocally {
@@ -195,6 +207,16 @@ final class ClipboardSync {
         transfer.onFileOffer = { [weak self] offer in
             DispatchQueue.main.async {
                 guard let self, self.running, let offer else { return }
+                if self.allowsDecoupledFileTransfer {
+                    let change = self.pasteboard.changeCount
+                    self.pendingFileOffer = (offer.id, change, offer.isExplicitDrop)
+                    if !offer.isExplicitDrop {
+                        self.staleFileChange = change
+                    }
+                    self.onDiagnostic?(.fileOfferReceived(count: offer.count, totalBytes: offer.bytes))
+                    self.onFileOffer?(offer)
+                    return
+                }
                 self.lastSharedMarker = nil
                 self.cancelImageApplication()
                 if self.imagePreparation != nil {
@@ -203,7 +225,7 @@ final class ClipboardSync {
                     self.settleWaiters(false)
                 }
                 let change = self.pasteboard.changeCount
-                self.pendingFileOffer = (offer.id, change)
+                self.pendingFileOffer = (offer.id, change, offer.isExplicitDrop)
                 self.pendingLocalChange = nil
                 self.deferredLocalChange = change
                 self.staleFileChange = change
@@ -217,7 +239,11 @@ final class ClipboardSync {
                 self.pendingFileOffer = nil
                 switch reason {
                 case .accepted:
-                    self.observedChange = pending.change
+                    if !self.allowsDecoupledFileTransfer {
+                        self.observedChange = pending.change
+                    } else if !pending.explicitDrop, self.pasteboard.changeCount == pending.change, self.pendingLocalChange == nil {
+                        self.observedChange = pending.change
+                    }
                     self.onDiagnostic?(.fileOfferAccepted)
                 case .declined:
                     self.deferredLocalChange = nil
@@ -271,11 +297,56 @@ final class ClipboardSync {
         controllingRemote = controlling
     }
 
+    private var hasActivePasteboardFileSend: Bool {
+        guard let fileSendingChange else { return false }
+        return !allowsDecoupledFileTransfer || fileSendingChange == observedChange
+    }
+
     /// 操作远端时按 ⌘V 是否要等剪贴板：只有本机复制等待发送或仍在发送时才等，否则按普通按键直接送达。
-    var holdsPaste: Bool { running && (!controllingRemote || pendingLocalChange != nil || sendingChange != nil) }
+    var holdsPaste: Bool {
+        running && (!controllingRemote || pendingLocalChange != nil || sendingChange != nil || hasActivePasteboardFileSend)
+    }
 
     /// 本机剪贴板已处理到的版本。自动重连时交给新会话，断线期间在本机的复制仍在切回时发送。
     var handledChange: Int { observedChange }
+
+    /// 显式发送拖拽的文件（不读取也不改写系统剪贴板）。
+    @discardableResult
+    func sendDroppedFiles(_ urls: [URL]) -> Bool {
+        guard running else { return false }
+        let normalized = Self.normalizeDroppedFileURLs(urls)
+        guard !normalized.isEmpty else {
+            onStatus?("没有可发送的本地文件")
+            return false
+        }
+        guard allowsFileSending else {
+            onStatus?("对端需更新到 0.5.0 才能确认接收文件，未发送文件内容")
+            return false
+        }
+        onDiagnostic?(.sending(.files, fileCount: normalized.count))
+        transfer.sendExplicitFiles(normalized) { [weak self] success in
+            DispatchQueue.main.async {
+                guard let self, self.running else { return }
+                self.onDiagnostic?(success
+                    ? .sent(.files, fileCount: normalized.count)
+                    : .sendFailed(.files, fileCount: normalized.count))
+            }
+        }
+        return true
+    }
+
+    nonisolated static func normalizeDroppedFileURLs(_ urls: [URL]) -> [URL] {
+        var seen = Set<String>()
+        var result: [URL] = []
+        for url in urls where url.isFileURL && !url.path.isEmpty {
+            let standardized = url.standardizedFileURL
+            let key = standardized.path.precomposedStringWithCanonicalMapping
+            if seen.insert(key).inserted {
+                result.append(standardized)
+            }
+        }
+        return result
+    }
 
     /// 本机明确发起的复制（截取远端画面）在操作远端期间也照常发送。
     func sendLocalCopy() {
@@ -289,12 +360,12 @@ final class ClipboardSync {
 
     func respondToFileOffer(id: UUID, accept: Bool) {
         guard running, let pendingFileOffer, pendingFileOffer.id == id else { return }
-        if accept, pasteboard.changeCount != pendingFileOffer.change {
+        if !allowsDecoupledFileTransfer, accept, pasteboard.changeCount != pendingFileOffer.change {
             transfer.respondToFileOffer(id: id, accept: false)
             sendCurrent()
             return
         }
-        if accept { receivingFileChange = pendingFileOffer.change }
+        if accept, !pendingFileOffer.explicitDrop { receivingFileChange = pendingFileOffer.change }
         transfer.respondToFileOffer(id: id, accept: accept)
     }
 
@@ -303,16 +374,24 @@ final class ClipboardSync {
         if controllingRemote { skipChangesWhileControlling() }
         if controllingRemote, pendingLocalChange == nil {
             // 远端自己的复制粘贴不补发本机剪贴板，也不重新发起文件确认；本机正在接收的文件与之无关。
-            guard let sending = sendingChange else { completion(true); return }
-            if sending == fileSendingChange {
+            if let sending = sendingChange {
+                if !allowsDecoupledFileTransfer, sending == fileSendingChange {
+                    completion(false)
+                    onStatus?("文件需在接收端确认；传输完成后请再次按 ⌘V 粘贴")
+                    return
+                }
+                waiters.append(completion)
+                return
+            }
+            if hasActivePasteboardFileSend {
                 completion(false)
                 onStatus?("文件需在接收端确认；传输完成后请再次按 ⌘V 粘贴")
                 return
             }
-            waiters.append(completion)
+            completion(true)
             return
         }
-        guard receivingFileChange == nil else {
+        if !allowsDecoupledFileTransfer, receivingFileChange != nil {
             completion(false)
             onStatus?("文件仍在接收，完成后请再次粘贴；新的本机复制会随后同步")
             return
@@ -326,6 +405,11 @@ final class ClipboardSync {
         let change = pasteboard.changeCount
         if change == sharedChange { completion(true); return }
         if let files = pasteboard.fileURLs, !files.isEmpty {
+            if receivingFileChange != nil {
+                completion(false)
+                onStatus?("文件仍在接收，完成后请再次粘贴；新的本机复制会随后同步")
+                return
+            }
             if pasteboard.isRelayedFromOtherDevice {
                 completion(false)
                 onStatus?("剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传")
@@ -337,7 +421,8 @@ final class ClipboardSync {
                 onStatus?("此文件复制早于远端请求，请在本机重新复制后再粘贴")
                 return
             }
-            if sendingChange != change { sendCurrent() }
+            let activeFileSend = allowsDecoupledFileTransfer ? fileSendingChange : sendingChange
+            if activeFileSend != change { sendCurrent() }
             if change == sharedChange { completion(true); return }
             completion(false)
             onStatus?(allowsFileSending ? "文件需在接收端确认；传输完成后请再次按 ⌘V 粘贴" : "对端需更新到 0.5.0 才能确认接收文件，未发送文件内容")
@@ -385,7 +470,7 @@ final class ClipboardSync {
     private func sendCurrent() {
         guard running, allowsAutomaticSending else { return }
         let change = pasteboard.changeCount
-        guard receivingFileChange == nil else {
+        if !allowsDecoupledFileTransfer, receivingFileChange != nil {
             if change != deferredLocalChange { pendingLocalChange = change }
             settleWaiters(false)
             return
@@ -402,6 +487,12 @@ final class ClipboardSync {
         }
         let payload: ClipboardPayload
         if let files = pasteboard.fileURLs, !files.isEmpty {
+            if receivingFileChange != nil {
+                if change != deferredLocalChange { pendingLocalChange = change }
+                observedChange = Int.min
+                settleWaiters(false)
+                return
+            }
             payload = .files(files)
         } else if let png = pasteboard.pngData { payload = .png(png) }
         else if let tiff = pasteboard.tiffData {
@@ -482,11 +573,16 @@ final class ClipboardSync {
         if isFile {
             settleWaiters(false)
         }
-        if (!isFile && lastSharedMarker == contentMarker) || ((hasSharedState || sendingChange != nil) && pasteboard.contentMarker == contentMarker) {
+        let activeSend = (allowsDecoupledFileTransfer && isFile) ? fileSendingChange : sendingChange
+        if (!isFile && lastSharedMarker == contentMarker) || ((hasSharedState || activeSend != nil) && pasteboard.contentMarker == contentMarker) {
             hasSharedState = true
             lastSharedMarker = contentMarker
             sharedChange = change
-            sendingChange = nil
+            if allowsDecoupledFileTransfer && isFile {
+                fileSendingChange = nil
+            } else {
+                sendingChange = nil
+            }
             settleWaiters(true)
             return
         }
@@ -495,29 +591,56 @@ final class ClipboardSync {
             settleWaiters(false)
             return
         }
-        sendingChange = change
-        fileSendingChange = isFile ? change : nil
+        if allowsDecoupledFileTransfer && isFile {
+            fileSendingChange = change
+        } else {
+            sendingChange = change
+            if !allowsDecoupledFileTransfer {
+                fileSendingChange = isFile ? change : nil
+            }
+        }
         let summary = diagnosticSummary(for: payload)
         onDiagnostic?(.sending(summary.kind, fileCount: summary.fileCount))
         transfer.send(payload, preparation: preparation, deferred: { [weak self] in
-            DispatchQueue.main.async { self?.deferLocalCopy(change: change) }
+            DispatchQueue.main.async { self?.deferLocalCopy(change: change, isFile: isFile) }
         }) { [weak self] success in
             DispatchQueue.main.async {
                 guard let self, self.running else { return }
                 self.onDiagnostic?(success ? .sent(summary.kind, fileCount: summary.fileCount) : .sendFailed(summary.kind, fileCount: summary.fileCount))
+                if self.allowsDecoupledFileTransfer && isFile {
+                    guard self.fileSendingChange == change else { return }
+                    self.fileSendingChange = nil
+                    if success, self.observedChange == change {
+                        self.sharedChange = change
+                        self.hasSharedState = true
+                        self.lastSharedMarker = contentMarker
+                    }
+                    return
+                }
                 guard self.sendingChange == change else { return }
                 self.sendingChange = nil
+                if !self.allowsDecoupledFileTransfer, self.fileSendingChange == change {
+                    self.fileSendingChange = nil
+                }
                 if success { self.sharedChange = change; self.hasSharedState = true; self.lastSharedMarker = contentMarker }
                 self.settleWaiters(success)
             }
         }
     }
 
-    private func deferLocalCopy(change: Int) {
+    private func deferLocalCopy(change: Int, isFile: Bool = false) {
+        if allowsDecoupledFileTransfer && isFile {
+            guard running, fileSendingChange == change else { return }
+            fileSendingChange = nil
+            pendingLocalChange = change
+            observedChange = Int.min
+            settleWaiters(false)
+            return
+        }
         guard running, sendingChange == change else { return }
         imagePreparation = nil
         sendingChange = nil
-        fileSendingChange = nil
+        if !allowsDecoupledFileTransfer { fileSendingChange = nil }
         pendingLocalChange = change
         observedChange = Int.min
         settleWaiters(false)
@@ -533,12 +656,21 @@ final class ClipboardSync {
     private func prepareApplication(_ payload: ClipboardPayload, permit: ClipboardApplyPermit,
                                     completion: @escaping (Bool) -> Void) {
         guard running, permit.isValid else { completion(false); return }
-        if imagePreparation != nil {
-            imagePreparation = nil
-            sendingChange = nil
-            settleWaiters(false)
+        let isKeptBackgroundFile: Bool
+        if allowsDecoupledFileTransfer, case .files = payload,
+           let receivingFileChange, pasteboard.changeCount != receivingFileChange {
+            isKeptBackgroundFile = true
+        } else {
+            isKeptBackgroundFile = false
         }
-        cancelImageApplication()
+        if !isKeptBackgroundFile {
+            if imagePreparation != nil {
+                imagePreparation = nil
+                sendingChange = nil
+                settleWaiters(false)
+            }
+            cancelImageApplication()
+        }
         guard case .png(let bytes) = payload else {
             completion(permit.performIfValid { apply(payload) })
             return
@@ -590,7 +722,9 @@ final class ClipboardSync {
                 deferredLocalChange = nil
                 staleFileChange = nil
                 onDiagnostic?(.applied(summary.kind, fileCount: summary.fileCount))
-                settleWaiters(false)
+                if !allowsDecoupledFileTransfer {
+                    settleWaiters(false)
+                }
                 return true
             }
         }

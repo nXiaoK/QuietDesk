@@ -337,6 +337,7 @@ final class DeskModel: ObservableObject {
     private var remoteClipboardEnabled = false
     private var remoteFileApproval = false
     private var remoteClipboardChunkWindow = false
+    private var remoteDecoupledFileTransfer = false
     private var remoteReceivesAutomaticClipboard = true
     private var remoteClipboardFocusAware = false
     private var lastClipboardReceivePreference: Bool?
@@ -524,6 +525,8 @@ final class DeskModel: ObservableObject {
         }
         canvas.onToggleFullScreen = { [weak self] in self?.toggleFullScreen() }
         canvas.onCaptureFrame = { [weak self] in self?.copyRemoteFrame() }
+        canvas.canAcceptFileDrop = { [weak self] urls in self?.canSendDroppedFiles(urls) == true }
+        canvas.onDropFiles = { [weak self] urls in self?.sendDroppedFiles(urls) == true }
         canvas.onFullScreen = { [weak self] enabled in
             guard let self, self.isFullScreen != enabled else { return }
             self.isFullScreen = enabled
@@ -4114,8 +4117,34 @@ final class DeskModel: ObservableObject {
         remoteClipboardEnabled = preference.enabled
         remoteFileApproval = preference.fileApproval == true
         remoteClipboardChunkWindow = preference.chunkWindow == true
+        remoteDecoupledFileTransfer = preference.decoupledFileTransfer == true
         remoteReceivesAutomaticClipboard = preference.receivesAutomaticUpdates ?? true
         remoteClipboardFocusAware = preference.receivesAutomaticUpdates != nil
+    }
+
+    func canSendDroppedFiles(_ urls: [URL]) -> Bool {
+        guard mode == .viewer, connected, !sessionInputSuspended,
+              supportsClipboard, clipboardEnabled, remoteClipboardEnabled, remoteFileApproval,
+              clipboardSync != nil else { return false }
+        return !ClipboardSync.normalizeDroppedFileURLs(urls).isEmpty
+    }
+
+    @discardableResult
+    func sendDroppedFiles(_ urls: [URL]) -> Bool {
+        guard canSendDroppedFiles(urls), let clipboardSync else {
+            if connected, supportsClipboard {
+                if !clipboardEnabled {
+                    clipboardStatus = "请先开启双向剪贴板，再拖拽发送文件"
+                } else if !remoteClipboardEnabled {
+                    clipboardStatus = "对端已关闭双向剪贴板，无法拖拽发送文件"
+                } else if !remoteFileApproval {
+                    clipboardStatus = "对端需更新到 0.5.0 才能确认接收文件，未发送文件内容"
+                }
+            }
+            return false
+        }
+        recordSessionActivity()
+        return clipboardSync.sendDroppedFiles(urls)
     }
 
     private func updateClipboardSync() {
@@ -4125,6 +4154,7 @@ final class DeskModel: ObservableObject {
             let channel = dataChannel
             let sync = ClipboardSync(session: clipboardSession, allowsFileSending: remoteFileApproval,
                 allowsAutomaticSending: automaticClipboardSendingAllowed, allowsChunkWindow: remoteClipboardChunkWindow,
+                allowsDecoupledFileTransfer: remoteDecoupledFileTransfer,
                 controllingRemote: clipboardControlsRemote, handledChange: clipboardHandledChange) { [weak peer, weak channel] message in
                     if let channel { channel.sendReliableData(message) }
                     else { peer?.send(message) }
@@ -4563,6 +4593,7 @@ final class DeskModel: ObservableObject {
         remoteClipboardEnabled = false
         remoteFileApproval = false
         remoteClipboardChunkWindow = false
+        remoteDecoupledFileTransfer = false
         remoteReceivesAutomaticClipboard = true
         remoteClipboardFocusAware = false
         lastClipboardReceivePreference = nil

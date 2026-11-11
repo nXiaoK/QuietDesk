@@ -419,7 +419,11 @@ final class RemoteCanvas: NSView {
     var onCursorPresentation: ((Bool, Bool) -> Void)?
     var pointerInputSuspended = false {
         didSet {
-            if pointerInputSuspended { cancelPointerMoves(); activeScroll = nil }
+            if pointerInputSuspended {
+                cancelPointerMoves()
+                activeScroll = nil
+                setFileDropTargeted(false)
+            }
             window?.invalidateCursorRects(for: self)
             updateCursorPresentation()
         }
@@ -448,6 +452,10 @@ final class RemoteCanvas: NSView {
     var onFullScreen: ((Bool) -> Void)?
     var onToggleFullScreen: (() -> Void)?
     var onCaptureFrame: (() -> Void)?
+    var canAcceptFileDrop: (([URL]) -> Bool)?
+    var onDropFiles: (([URL]) -> Bool)?
+    private(set) var isFileDropTargeted = false
+    private let dropHighlightLayer = CALayer()
     var remoteSize = CGSize(width: 16, height: 10) {
         didSet {
             guard oldValue != remoteSize else { return }
@@ -494,6 +502,14 @@ final class RemoteCanvas: NSView {
         remoteCursorView.wantsLayer = true
         remoteCursorView.layer?.zPosition = 1
         addSubview(remoteCursorView)
+        dropHighlightLayer.borderWidth = 3
+        dropHighlightLayer.cornerRadius = 8
+        dropHighlightLayer.borderColor = NSColor.controlAccentColor.cgColor
+        dropHighlightLayer.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.08).cgColor
+        dropHighlightLayer.isHidden = true
+        dropHighlightLayer.zPosition = 2
+        layer?.addSublayer(dropHighlightLayer)
+        registerForDraggedTypes([.fileURL])
         capsLockMonitor.isActive = { [weak self] in
             guard let self else { return false }
             return self.usesCapsLockActions && self.canControl && self.window?.isKeyWindow == true
@@ -549,7 +565,70 @@ final class RemoteCanvas: NSView {
         CATransaction.setDisableActions(true)
         videoLayer.frame = scalingMode == .fitWindow ? bounds : pictureRect
         videoLayer.contentsScale = window?.backingScaleFactor ?? 1
+        dropHighlightLayer.frame = bounds.insetBy(dx: 4, dy: 4)
         CATransaction.commit()
+    }
+
+    nonisolated static func extractDroppedFileURLs(from pasteboard: NSPasteboard) -> [URL] {
+        guard let objects = pasteboard.readObjects(forClasses: [NSURL.self],
+                                                   options: [.urlReadingFileURLsOnly: true]) as? [URL] else {
+            return []
+        }
+        var seen = Set<String>()
+        var urls: [URL] = []
+        for url in objects where url.isFileURL && !url.path.isEmpty {
+            let standardized = url.standardizedFileURL
+            let key = standardized.path.precomposedStringWithCanonicalMapping
+            if seen.insert(key).inserted {
+                urls.append(standardized)
+            }
+        }
+        return urls
+    }
+
+    private func setFileDropTargeted(_ targeted: Bool) {
+        guard isFileDropTargeted != targeted else { return }
+        isFileDropTargeted = targeted
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        dropHighlightLayer.borderColor = NSColor.controlAccentColor.cgColor
+        dropHighlightLayer.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.08).cgColor
+        dropHighlightLayer.isHidden = !targeted
+        CATransaction.commit()
+    }
+
+    private func validateFileDrop(_ sender: any NSDraggingInfo) -> [URL]? {
+        guard !pointerInputSuspended, let canAcceptFileDrop else { return nil }
+        let urls = Self.extractDroppedFileURLs(from: sender.draggingPasteboard)
+        guard !urls.isEmpty, canAcceptFileDrop(urls) else { return nil }
+        return urls
+    }
+
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        let accepted = validateFileDrop(sender) != nil
+        setFileDropTargeted(accepted)
+        return accepted ? .copy : []
+    }
+
+    override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        let accepted = validateFileDrop(sender) != nil
+        setFileDropTargeted(accepted)
+        return accepted ? .copy : []
+    }
+
+    override func draggingExited(_ sender: (any NSDraggingInfo)?) {
+        setFileDropTargeted(false)
+    }
+
+    override func concludeDragOperation(_ sender: (any NSDraggingInfo)?) {
+        setFileDropTargeted(false)
+    }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        setFileDropTargeted(false)
+        guard let urls = validateFileDrop(sender), let onDropFiles else { return false }
+        onUserActivity?()
+        return onDropFiles(urls)
     }
 
     override func viewDidChangeBackingProperties() {
@@ -563,6 +642,7 @@ final class RemoteCanvas: NSView {
         displayLink = nil
         cancelScrollGesture()
         cancelPointerMoves()
+        setFileDropTargeted(false)
         needsLayout = true
         if systemShortcutMonitor.isRunning { releaseControl() }
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
@@ -871,6 +951,7 @@ final class RemoteCanvas: NSView {
         displayLink = nil
         lastPresentedAt = 0
         cancelPointerMoves()
+        setFileDropTargeted(false)
         movePacer.setInterval(PointerMovePacer.interval)
         dragPacer.setInterval(PointerMovePacer.interval)
         cursorState = CursorPresentationState(); cursorImage = nil; localCursor = .arrow

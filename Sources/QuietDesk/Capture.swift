@@ -1840,7 +1840,8 @@ final class HostImmediateInputQueue: @unchecked Sendable {
     private static func canCoalesce(previous: Item, next: Item) -> Bool {
         guard previous.fromDatagram == next.fromDatagram,
               previous.input.flags == next.input.flags,
-              previous.input.independentCapsLock == next.input.independentCapsLock else { return false }
+              previous.input.independentCapsLock == next.input.independentCapsLock,
+              previous.input.relativeMouse == next.input.relativeMouse else { return false }
         if let prevSeq = previous.input.pointerSequence, let nextSeq = next.input.pointerSequence, nextSeq <= prevSeq {
             return false
         }
@@ -1876,6 +1877,15 @@ final class InputInjector: @unchecked Sendable {
         // Gesture and momentum phases already given to apps and not yet ended.
         private var openScrollPhase: RemoteInput.ScrollPhase?
         private var momentumOpen = false
+        private var openMagnifyPhase: RemoteInput.ScrollPhase?
+        private var openRotatePhase: RemoteInput.ScrollPhase?
+        private static let gestureEventType = CGEventType(rawValue: 29)!
+        private static let gestureHIDTypeField = CGEventField(rawValue: 110)!
+        private static let gestureValueField = CGEventField(rawValue: 113)!
+        private static let gesturePhaseField = CGEventField(rawValue: 132)!
+        private static let hidTypeRotate: Int64 = 5
+        private static let hidTypeMagnify: Int64 = 8
+        private static let hidTypeSmartMagnify: Int64 = 22
         private let source = CGEventSource(stateID: .hidSystemState)
         private var remoteCapsLock: Bool?
         private let isTrusted: () -> Bool
@@ -1964,8 +1974,27 @@ final class InputInjector: @unchecked Sendable {
                     }
                     return nil
                 }
-                let point = CGPoint(x: bounds.minX + input.x * max(0, bounds.width - 1),
-                                    y: bounds.minY + input.y * max(0, bounds.height - 1))
+                let absolutePoint = CGPoint(x: bounds.minX + input.x * max(0, bounds.width - 1),
+                                            y: bounds.minY + input.y * max(0, bounds.height - 1))
+                let point: CGPoint
+                if input.relativeMouse == true {
+                    let basePoint: CGPoint
+                    if hasKnownPoint {
+                        basePoint = clampToBounds(lastPoint)
+                    } else if let current = pointerLocation() {
+                        basePoint = clampToBounds(current)
+                    } else {
+                        basePoint = absolutePoint
+                    }
+                    if input.kind == .move || input.kind == .drag {
+                        point = clampToBounds(CGPoint(x: basePoint.x + (input.pointerDeltaX ?? 0),
+                                                      y: basePoint.y + (input.pointerDeltaY ?? 0)))
+                    } else {
+                        point = basePoint
+                    }
+                } else {
+                    point = absolutePoint
+                }
                 let mask: CGEventFlags = [.maskAlphaShift, .maskShift, .maskControl, .maskAlternate,
                                           .maskCommand, .maskSecondaryFn, .maskNumericPad]
                 var flags = CGEventFlags(rawValue: input.flags).intersection(mask)
@@ -2008,24 +2037,7 @@ final class InputInjector: @unchecked Sendable {
                     if input.scrollPhase == nil && input.momentumPhase == nil { endScrollPhasesUnlocked() }
                     let wheels = try scrollEventsUnlocked(input)
                     guard let wheel = wheels.last else { return nil }
-                    // A scroll's location does not move the pointer used for window and view routing, so move it there
-                    // first. Skip the move once the pointer is already there: one per wheel event redoes hover mid-scroll.
-                    let current = pointerLocation()
-                    if current.map({ abs($0.x - point.x) >= 0.5 || abs($0.y - point.y) >= 0.5 }) ?? true {
-                        let heldButton = heldButtons.min()
-                        let moveType: CGEventType = heldButton == nil ? .mouseMoved
-                            : heldButton == 0 ? .leftMouseDragged : heldButton == 1 ? .rightMouseDragged : .otherMouseDragged
-                        let moveButton = CGMouseButton(rawValue: UInt32(heldButton ?? 0)) ?? .left
-                        guard let move = CGEvent(mouseEventSource: source, mouseType: moveType, mouseCursorPosition: point,
-                                                 mouseButton: moveButton) else {
-                            throw DeskError.invalid("无法建立远端滚动事件")
-                        }
-                        if let heldButton {
-                            move.setIntegerValueField(.mouseEventButtonNumber, value: Int64(heldButton))
-                        }
-                        move.flags = flags
-                        postEvent(move)
-                    }
+                    try movePointerForTargetEventUnlocked(point: point, flags: flags, errorMessage: "无法建立远端滚动事件")
                     for earlier in wheels.dropLast() {
                         earlier.location = point
                         earlier.flags = flags
@@ -2036,6 +2048,21 @@ final class InputInjector: @unchecked Sendable {
                     pointerRemainderX = 0
                     pointerRemainderY = 0
                     event = wheel
+                    event?.location = point
+                case .magnify, .rotate, .smartMagnify:
+                    let gestures = try trackpadGestureEventsUnlocked(input)
+                    guard let lastGesture = gestures.last else { return nil }
+                    try movePointerForTargetEventUnlocked(point: point, flags: flags, errorMessage: "无法建立远端触控板手势事件")
+                    for earlier in gestures.dropLast() {
+                        earlier.location = point
+                        earlier.flags = flags
+                        postEvent(earlier)
+                    }
+                    lastPoint = point
+                    hasKnownPoint = true
+                    pointerRemainderX = 0
+                    pointerRemainderY = 0
+                    event = lastGesture
                     event?.location = point
                 case .move, .drag, .down, .up:
                     let type: CGEventType
@@ -2160,6 +2187,120 @@ final class InputInjector: @unchecked Sendable {
             return event
         }
 
+        private func clampToBounds(_ point: CGPoint) -> CGPoint {
+            let maxX = bounds.minX + max(0, bounds.width - 1)
+            let maxY = bounds.minY + max(0, bounds.height - 1)
+            return CGPoint(x: min(maxX, max(bounds.minX, point.x)),
+                           y: min(maxY, max(bounds.minY, point.y)))
+        }
+
+        private func movePointerForTargetEventUnlocked(point: CGPoint, flags: CGEventFlags, errorMessage: String) throws {
+            let current = pointerLocation()
+            if current.map({ abs($0.x - point.x) >= 0.5 || abs($0.y - point.y) >= 0.5 }) ?? true {
+                let heldButton = heldButtons.min()
+                let moveType: CGEventType = heldButton == nil ? .mouseMoved
+                    : heldButton == 0 ? .leftMouseDragged : heldButton == 1 ? .rightMouseDragged : .otherMouseDragged
+                let moveButton = CGMouseButton(rawValue: UInt32(heldButton ?? 0)) ?? .left
+                guard let move = CGEvent(mouseEventSource: source, mouseType: moveType, mouseCursorPosition: point,
+                                         mouseButton: moveButton) else {
+                    throw DeskError.invalid(errorMessage)
+                }
+                if let heldButton {
+                    move.setIntegerValueField(.mouseEventButtonNumber, value: Int64(heldButton))
+                }
+                move.flags = flags
+                postEvent(move)
+            }
+        }
+
+        private func makeGestureEvent(hidType: Int64, value: Double?, phase: RemoteInput.ScrollPhase?) throws -> CGEvent {
+            guard let event = CGEvent(source: source) else {
+                throw DeskError.invalid("无法建立远端触控板手势事件")
+            }
+            event.type = Self.gestureEventType
+            event.setIntegerValueField(Self.gestureHIDTypeField, value: hidType)
+            if let value {
+                event.setDoubleValueField(Self.gestureValueField, value: value)
+            }
+            event.setIntegerValueField(Self.gesturePhaseField, value: Int64(phase?.rawValue ?? 0))
+            return event
+        }
+
+        private func trackpadGestureEventsUnlocked(_ input: RemoteInput) throws -> [CGEvent] {
+            switch input.kind {
+            case .smartMagnify:
+                return [try makeGestureEvent(hidType: Self.hidTypeSmartMagnify, value: nil, phase: input.gesturePhase)]
+            case .magnify:
+                let mag = input.magnification ?? 0
+                return try phasedGestureEventsUnlocked(
+                    hidType: Self.hidTypeMagnify,
+                    value: mag,
+                    phase: input.gesturePhase,
+                    openState: &openMagnifyPhase
+                )
+            case .rotate:
+                let rot = input.rotation ?? 0
+                return try phasedGestureEventsUnlocked(
+                    hidType: Self.hidTypeRotate,
+                    value: rot,
+                    phase: input.gesturePhase,
+                    openState: &openRotatePhase
+                )
+            default:
+                return []
+            }
+        }
+
+        private func phasedGestureEventsUnlocked(
+            hidType: Int64,
+            value: Double,
+            phase: RemoteInput.ScrollPhase?,
+            openState: inout RemoteInput.ScrollPhase?
+        ) throws -> [CGEvent] {
+            guard let phase else {
+                guard value != 0 else { return [] }
+                return [try makeGestureEvent(hidType: hidType, value: value, phase: nil)]
+            }
+            var events: [CGEvent] = []
+            switch phase {
+            case .mayBegin, .began:
+                if let open = openState, open != .mayBegin {
+                    events.append(try makeGestureEvent(hidType: hidType, value: 0, phase: .ended))
+                }
+                openState = phase
+                events.append(try makeGestureEvent(hidType: hidType, value: value, phase: phase))
+            case .changed:
+                if openState == nil || openState == .mayBegin {
+                    events.append(try makeGestureEvent(hidType: hidType, value: 0, phase: .began))
+                }
+                openState = .changed
+                events.append(try makeGestureEvent(hidType: hidType, value: value, phase: .changed))
+            case .ended, .cancelled:
+                guard openState != nil else { return events }
+                openState = nil
+                events.append(try makeGestureEvent(hidType: hidType, value: value, phase: phase))
+            }
+            return events
+        }
+
+        private func endTrackpadGesturesUnlocked() {
+            var endings: [(Int64, RemoteInput.ScrollPhase)] = []
+            if let open = openMagnifyPhase {
+                endings.append((Self.hidTypeMagnify, open == .mayBegin ? .cancelled : .ended))
+            }
+            if let open = openRotatePhase {
+                endings.append((Self.hidTypeRotate, open == .mayBegin ? .cancelled : .ended))
+            }
+            openMagnifyPhase = nil
+            openRotatePhase = nil
+            for (hidType, phase) in endings {
+                guard let event = try? makeGestureEvent(hidType: hidType, value: 0, phase: phase) else { continue }
+                event.location = lastPoint
+                event.flags = inputFlags
+                postEvent(event)
+            }
+        }
+
         private func endScrollPhasesUnlocked() {
             var endings: [(RemoteInput.ScrollPhase?, RemoteInput.MomentumPhase?)] = []
             if let open = openScrollPhase { endings.append((open == .mayBegin ? .cancelled : .ended, nil)) }
@@ -2184,6 +2325,7 @@ final class InputInjector: @unchecked Sendable {
 
         private func releaseAllUnlocked() {
             endScrollPhasesUnlocked()
+            endTrackpadGesturesUnlocked()
             inputSources.cancel()
             scroll.reset()
             lineScroll.reset()

@@ -384,6 +384,45 @@ enum RemoteCanvasScalingMode: String, CaseIterable, Equatable {
 }
 
 @MainActor
+protocol MouseCursorAssociating: AnyObject {
+    func setCursorAssociated(_ associated: Bool)
+    func warpCursor(to quartzScreenPoint: CGPoint)
+    func setCursorHidden(_ hidden: Bool)
+}
+
+@MainActor
+final class SystemMouseCursorAssociator: MouseCursorAssociating {
+    private var cursorDisassociated = false
+    private var cursorHidden = false
+
+    func setCursorAssociated(_ associated: Bool) {
+        guard cursorDisassociated == associated else { return }
+        cursorDisassociated = !associated
+        _ = CGAssociateMouseAndMouseCursorPosition(associated ? 1 : 0)
+    }
+
+    func warpCursor(to quartzScreenPoint: CGPoint) {
+        _ = CGWarpMouseCursorPosition(quartzScreenPoint)
+    }
+
+    func setCursorHidden(_ hidden: Bool) {
+        guard cursorHidden != hidden else { return }
+        cursorHidden = hidden
+        if hidden { NSCursor.hide() } else { NSCursor.unhide() }
+    }
+
+    deinit {
+        if cursorDisassociated {
+            _ = CGAssociateMouseAndMouseCursorPosition(1)
+        }
+        if cursorHidden {
+            if Thread.isMainThread { NSCursor.unhide() }
+            else { DispatchQueue.main.async { NSCursor.unhide() } }
+        }
+    }
+}
+
+@MainActor
 final class RemoteCanvas: NSView {
     private let videoLayer: AVSampleBufferDisplayLayer
     private let renderQueue = DispatchQueue(label: "quietdesk.canvas-render", qos: .userInteractive)
@@ -409,6 +448,34 @@ final class RemoteCanvas: NSView {
     private var dragGeneration = UUID()
     private(set) var isFlushingPointerMoves = false
     private var activeScroll: RemoteInput?
+    private var activeMagnify: RemoteInput?
+    private var activeRotate: RemoteInput?
+    private let mouseAssociator: MouseCursorAssociating
+    private let isApplicationActive: @MainActor () -> Bool
+    private(set) var isRelativeMouseCaptured = false
+    var onRelativeMouseCaptureChanged: ((Bool) -> Void)?
+    var supportsRelativeMouse = false {
+        didSet {
+            guard oldValue != supportsRelativeMouse else { return }
+            flushPointerMoves()
+            reconcileRelativeMouseCapture()
+        }
+    }
+    var relativeMouseEnabled = false {
+        didSet {
+            guard oldValue != relativeMouseEnabled else { return }
+            flushPointerMoves()
+            reconcileRelativeMouseCapture()
+        }
+    }
+    var forwardsTrackpadGestures = false {
+        didSet {
+            if !forwardsTrackpadGestures {
+                activeMagnify = nil
+                activeRotate = nil
+            }
+        }
+    }
     private var cursorState = CursorPresentationState()
     private var cursorImage: NSImage?
     private var localCursor = NSCursor.arrow
@@ -420,9 +487,14 @@ final class RemoteCanvas: NSView {
     var pointerInputSuspended = false {
         didSet {
             if pointerInputSuspended {
+                disengageRelativeMouseCapture()
                 cancelPointerMoves()
                 activeScroll = nil
+                activeMagnify = nil
+                activeRotate = nil
                 setFileDropTargeted(false)
+            } else {
+                reconcileRelativeMouseCapture()
             }
             window?.invalidateCursorRects(for: self)
             updateCursorPresentation()
@@ -476,7 +548,15 @@ final class RemoteCanvas: NSView {
     }
     var canControl = false {
         didSet {
-            if !canControl { cancelPointerMoves(); activeScroll = nil }
+            if !canControl {
+                disengageRelativeMouseCapture()
+                cancelPointerMoves()
+                activeScroll = nil
+                activeMagnify = nil
+                activeRotate = nil
+            } else {
+                reconcileRelativeMouseCapture()
+            }
             reconcileSystemShortcutCapture()
             window?.invalidateCursorRects(for: self)
             updateCursorPresentation()
@@ -491,8 +571,24 @@ final class RemoteCanvas: NSView {
         self.init(frame: frameRect, videoLayer: AVSampleBufferDisplayLayer())
     }
 
-    init(frame frameRect: NSRect, videoLayer: AVSampleBufferDisplayLayer) {
+    convenience init(frame frameRect: NSRect, videoLayer: AVSampleBufferDisplayLayer) {
+        self.init(
+            frame: frameRect,
+            videoLayer: videoLayer,
+            mouseAssociator: SystemMouseCursorAssociator(),
+            isApplicationActive: { NSApp?.isActive == true }
+        )
+    }
+
+    init(
+        frame frameRect: NSRect,
+        videoLayer: AVSampleBufferDisplayLayer,
+        mouseAssociator: MouseCursorAssociating,
+        isApplicationActive: @escaping @MainActor () -> Bool = { MainActor.assumeIsolated { NSApp?.isActive == true } }
+    ) {
         self.videoLayer = videoLayer
+        self.mouseAssociator = mouseAssociator
+        self.isApplicationActive = isApplicationActive
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.backgroundColor = NSColor.black.cgColor
@@ -640,7 +736,9 @@ final class RemoteCanvas: NSView {
         super.viewDidMoveToWindow()
         displayLink?.invalidate()
         displayLink = nil
+        disengageRelativeMouseCapture()
         cancelScrollGesture()
+        cancelTrackpadGestures()
         cancelPointerMoves()
         setFileDropTargeted(false)
         needsLayout = true
@@ -653,11 +751,35 @@ final class RemoteCanvas: NSView {
         window.acceptsMouseMovedEvents = true
         observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification,
             object: window, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.releaseControl(); self?.updateCursorPresentation() }
+                MainActor.assumeIsolated {
+                    self?.disengageRelativeMouseCapture()
+                    self?.releaseControl()
+                    self?.updateCursorPresentation()
+                }
             })
         observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification,
             object: window, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.reconcileSystemShortcutCapture(); self?.updateCursorPresentation() }
+                MainActor.assumeIsolated {
+                    self?.reconcileSystemShortcutCapture()
+                    self?.reconcileRelativeMouseCapture()
+                    self?.updateCursorPresentation()
+                }
+            })
+        observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.disengageRelativeMouseCapture()
+                    self?.releaseControl()
+                    self?.updateCursorPresentation()
+                }
+            })
+        observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.reconcileSystemShortcutCapture()
+                    self?.reconcileRelativeMouseCapture()
+                    self?.updateCursorPresentation()
+                }
             })
         for name in [NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
@@ -665,11 +787,13 @@ final class RemoteCanvas: NSView {
                     guard let self else { return }
                     self.onFullScreen?(self.window?.styleMask.contains(.fullScreen) == true)
                     self.reconcileSystemShortcutCapture()
+                    self.reconcileRelativeMouseCapture()
                 }
             })
         }
         onFullScreen?(window.styleMask.contains(.fullScreen))
         reconcileSystemShortcutCapture()
+        reconcileRelativeMouseCapture()
     }
 
     override func updateTrackingAreas() {
@@ -683,7 +807,7 @@ final class RemoteCanvas: NSView {
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        if cursorState.enabled, canControl, !pointerInputSuspended {
+        if cursorState.enabled, !isRelativeMouseCaptured, canControl, !pointerInputSuspended {
             addCursorRect(pictureRect, cursor: localCursor)
         }
     }
@@ -710,7 +834,8 @@ final class RemoteCanvas: NSView {
     }
 
     private func updateCursorPresentation() {
-        let localOwnsPointer = localPointerInside && window?.isKeyWindow == true && canControl && !pointerInputSuspended
+        let localOwnsPointer = !isRelativeMouseCaptured && localPointerInside
+            && window?.isKeyWindow == true && canControl && !pointerInputSuspended
         guard cursorState.enabled, !localOwnsPointer, let position = cursorState.position, position.insideDisplay else {
             if !remoteCursorView.isHidden { remoteCursorView.isHidden = true }
             return
@@ -950,7 +1075,14 @@ final class RemoteCanvas: NSView {
         displayLink?.invalidate()
         displayLink = nil
         lastPresentedAt = 0
+        disengageRelativeMouseCapture()
         cancelPointerMoves()
+        activeScroll = nil
+        activeMagnify = nil
+        activeRotate = nil
+        supportsRelativeMouse = false
+        relativeMouseEnabled = false
+        forwardsTrackpadGestures = false
         setFileDropTargeted(false)
         movePacer.setInterval(PointerMovePacer.interval)
         dragPacer.setInterval(PointerMovePacer.interval)
@@ -977,8 +1109,11 @@ final class RemoteCanvas: NSView {
     }
 
     func releaseControl() {
+        disengageRelativeMouseCapture()
         cancelPointerMoves()
         activeScroll = nil
+        activeMagnify = nil
+        activeRotate = nil
         interactionRevision &+= 1
         if window?.firstResponder === self, window?.makeFirstResponder(nil) == true { return }
         systemShortcutMonitor.stop()
@@ -993,17 +1128,79 @@ final class RemoteCanvas: NSView {
     override func becomeFirstResponder() -> Bool {
         capsLockMonitor.reset(); localShortcutKeys.removeAll(); onFocus?(true)
         // NSWindow assigns firstResponder after this callback returns.
-        DispatchQueue.main.async { [weak self] in self?.reconcileSystemShortcutCapture() }
+        DispatchQueue.main.async { [weak self] in
+            self?.reconcileSystemShortcutCapture()
+            self?.reconcileRelativeMouseCapture()
+        }
         return true
     }
     override func resignFirstResponder() -> Bool {
+        disengageRelativeMouseCapture()
         cancelPointerMoves()
         activeScroll = nil
+        activeMagnify = nil
+        activeRotate = nil
         systemShortcutMonitor.stop()
         shortcutStartAttempted = false
         publishShortcutStatus("全屏控制画面获得焦点后自动转发系统快捷键", running: false)
         capsLockMonitor.reset(); localShortcutKeys.removeAll(); onRelease?(); onFocus?(false)
         return true
+    }
+
+    private var shouldCaptureRelativeMouse: Bool {
+        let rect = pictureRect
+        return relativeMouseEnabled
+            && supportsRelativeMouse
+            && canControl
+            && !pointerInputSuspended
+            && window != nil
+            && window?.isKeyWindow == true
+            && window?.firstResponder === self
+            && isApplicationActive()
+            && rect.width > 0
+            && rect.height > 0
+    }
+
+    func reconcileRelativeMouseCapture() {
+        if shouldCaptureRelativeMouse {
+            guard !isRelativeMouseCaptured else { return }
+            flushPointerMoves()
+            isRelativeMouseCaptured = true
+            warpCursorToPictureCenter()
+            mouseAssociator.setCursorHidden(true)
+            mouseAssociator.setCursorAssociated(false)
+            window?.invalidateCursorRects(for: self)
+            updateCursorPresentation()
+            onRelativeMouseCaptureChanged?(true)
+        } else {
+            disengageRelativeMouseCapture()
+        }
+    }
+
+    private func disengageRelativeMouseCapture() {
+        guard isRelativeMouseCaptured else {
+            mouseAssociator.setCursorAssociated(true)
+            mouseAssociator.setCursorHidden(false)
+            return
+        }
+        flushPointerMoves()
+        isRelativeMouseCaptured = false
+        mouseAssociator.setCursorAssociated(true)
+        mouseAssociator.setCursorHidden(false)
+        window?.invalidateCursorRects(for: self)
+        updateCursorPresentation()
+        onRelativeMouseCaptureChanged?(false)
+    }
+
+    private func warpCursorToPictureCenter() {
+        guard let window else { return }
+        let rect = pictureRect
+        guard rect.width > 0, rect.height > 0 else { return }
+        let windowPoint = convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
+        let appKitScreenPoint = window.convertPoint(toScreen: windowPoint)
+        let mainHeight = NSScreen.screens.first?.frame.height ?? CGDisplayBounds(CGMainDisplayID()).height
+        let quartzPoint = CGPoint(x: appKitScreenPoint.x, y: mainHeight - appKitScreenPoint.y)
+        mouseAssociator.warpCursor(to: quartzPoint)
     }
 
     func updateSystemShortcutCapture(sessionActive: Bool, accessibility: Bool, inputMonitoring: Bool, retry: Bool = false) {
@@ -1088,23 +1285,22 @@ final class RemoteCanvas: NSView {
         }
         let point = convert(event.locationInWindow, from: nil)
         let rect = pictureRect
-        localPointerInside = rect.contains(point)
+        let relativeLocked = isRelativeMouseCaptured
+        localPointerInside = relativeLocked || rect.contains(point)
         updateCursorPresentation()
-        if !localPointerInside { cancelScrollGesture(flags: UInt64(event.modifierFlags.rawValue)) }
-        guard rect.width > 0, rect.height > 0 else { return }
-        if kind != .up && kind != .drag && !rect.contains(point) { return }
-        onUserActivity?()
-        if kind == .down || kind == .scroll { interactionRevision &+= 1 }
-        var input = RemoteInput(kind: kind)
-        input.x = min(1, max(0, (point.x - rect.minX) / rect.width))
-        input.y = min(1, max(0, (point.y - rect.minY) / rect.height))
-        input.flags = UInt64(event.modifierFlags.rawValue)
-        if localPointerInside, activeScroll != nil {
-            activeScroll?.x = input.x; activeScroll?.y = input.y; activeScroll?.flags = input.flags
+        if !localPointerInside {
+            let modifierBits = UInt64(event.modifierFlags.rawValue)
+            cancelScrollGesture(flags: modifierBits)
+            cancelTrackpadGestures(flags: modifierBits)
         }
-        if kind == .down || kind == .up || kind == .drag {
-            input.button = min(RemoteInput.maximumButtonNumber, max(0, event.buttonNumber))
-            input.clicks = min(3, max(1, event.clickCount))
+        guard rect.width > 0, rect.height > 0 else { return }
+        if !relativeLocked && kind != .up && kind != .drag && !rect.contains(point) { return }
+        var input = RemoteInput(kind: kind)
+        input.x = relativeLocked ? 0.5 : min(1, max(0, (point.x - rect.minX) / rect.width))
+        input.y = relativeLocked ? 0.5 : min(1, max(0, (point.y - rect.minY) / rect.height))
+        input.flags = UInt64(event.modifierFlags.rawValue)
+        if relativeLocked {
+            input.relativeMouse = true
         }
         if kind == .move || kind == .drag {
             let rawDX = Double(event.deltaX)
@@ -1115,7 +1311,29 @@ final class RemoteCanvas: NSView {
                 let limit = RemoteInput.maximumPointerDelta
                 input.pointerDeltaX = min(limit, max(-limit, rawDX * scaleX))
                 input.pointerDeltaY = min(limit, max(-limit, rawDY * scaleY))
+            } else if relativeLocked {
+                return
             }
+        }
+        onUserActivity?()
+        if kind == .down || kind == .scroll { interactionRevision &+= 1 }
+        if localPointerInside {
+            if activeScroll != nil {
+                activeScroll?.x = input.x; activeScroll?.y = input.y; activeScroll?.flags = input.flags
+                activeScroll?.relativeMouse = input.relativeMouse
+            }
+            if activeMagnify != nil {
+                activeMagnify?.x = input.x; activeMagnify?.y = input.y; activeMagnify?.flags = input.flags
+                activeMagnify?.relativeMouse = input.relativeMouse
+            }
+            if activeRotate != nil {
+                activeRotate?.x = input.x; activeRotate?.y = input.y; activeRotate?.flags = input.flags
+                activeRotate?.relativeMouse = input.relativeMouse
+            }
+        }
+        if kind == .down || kind == .up || kind == .drag {
+            input.button = min(RemoteInput.maximumButtonNumber, max(0, event.buttonNumber))
+            input.clicks = min(3, max(1, event.clickCount))
         }
         if kind == .scroll {
             let multiplier: Double = event.hasPreciseScrollingDeltas ? 1 : 12
@@ -1148,29 +1366,102 @@ final class RemoteCanvas: NSView {
         } else { onInput?(input) }
     }
 
+    private func trackpadGesture(_ event: NSEvent, _ kind: RemoteInput.Kind) {
+        guard forwardsTrackpadGestures, canControl, !pointerInputSuspended else { return }
+        flushPointerMoves()
+        let point = convert(event.locationInWindow, from: nil)
+        let rect = pictureRect
+        let relativeLocked = isRelativeMouseCaptured
+        localPointerInside = relativeLocked || rect.contains(point)
+        updateCursorPresentation()
+        if !localPointerInside {
+            let modifierBits = UInt64(event.modifierFlags.rawValue)
+            cancelScrollGesture(flags: modifierBits)
+            cancelTrackpadGestures(flags: modifierBits)
+            return
+        }
+        guard rect.width > 0, rect.height > 0 else { return }
+        onUserActivity?()
+        interactionRevision &+= 1
+        var input = RemoteInput(kind: kind)
+        input.x = relativeLocked ? 0.5 : min(1, max(0, (point.x - rect.minX) / rect.width))
+        input.y = relativeLocked ? 0.5 : min(1, max(0, (point.y - rect.minY) / rect.height))
+        input.flags = UInt64(event.modifierFlags.rawValue)
+        if relativeLocked {
+            input.relativeMouse = true
+        }
+        input.gesturePhase = RemoteInput.ScrollPhase(event.phase)
+        switch kind {
+        case .magnify:
+            let raw = Double(event.magnification)
+            guard raw.isFinite else { return }
+            let limit = RemoteInput.maximumMagnification
+            input.magnification = min(limit, max(-limit, raw))
+            if let phase = input.gesturePhase {
+                activeMagnify = (phase == .ended || phase == .cancelled) ? nil : input
+            } else {
+                activeMagnify = nil
+            }
+        case .rotate:
+            let raw = Double(event.rotation)
+            guard raw.isFinite else { return }
+            let limit = RemoteInput.maximumRotation
+            input.rotation = min(limit, max(-limit, raw))
+            if let phase = input.gesturePhase {
+                activeRotate = (phase == .ended || phase == .cancelled) ? nil : input
+            } else {
+                activeRotate = nil
+            }
+        case .smartMagnify:
+            break
+        default:
+            return
+        }
+        onInput?(input)
+    }
+
     override func mouseDown(with event: NSEvent) {
-        guard canControl, pictureRect.contains(convert(event.locationInWindow, from: nil)) else { return }
-        window?.makeFirstResponder(self)
+        guard canControl, isRelativeMouseCaptured || pictureRect.contains(convert(event.locationInWindow, from: nil)) else { return }
+        let wasFocused = window?.firstResponder === self
+        if !wasFocused { window?.makeFirstResponder(self) }
         pointer(event, .down)
+        if !wasFocused { reconcileRelativeMouseCapture() }
     }
     override func mouseUp(with event: NSEvent) { pointer(event, .up) }
-    override func rightMouseDown(with event: NSEvent) { window?.makeFirstResponder(self); pointer(event, .down) }
+    override func rightMouseDown(with event: NSEvent) {
+        let wasFocused = window?.firstResponder === self
+        if !wasFocused { window?.makeFirstResponder(self) }
+        pointer(event, .down)
+        if !wasFocused { reconcileRelativeMouseCapture() }
+    }
     override func rightMouseUp(with event: NSEvent) { pointer(event, .up) }
-    override func otherMouseDown(with event: NSEvent) { window?.makeFirstResponder(self); pointer(event, .down) }
+    override func otherMouseDown(with event: NSEvent) {
+        let wasFocused = window?.firstResponder === self
+        if !wasFocused { window?.makeFirstResponder(self) }
+        pointer(event, .down)
+        if !wasFocused { reconcileRelativeMouseCapture() }
+    }
     override func otherMouseUp(with event: NSEvent) { pointer(event, .up) }
     override func mouseDragged(with event: NSEvent) { pointer(event, .drag) }
     override func rightMouseDragged(with event: NSEvent) { pointer(event, .drag) }
     override func otherMouseDragged(with event: NSEvent) { pointer(event, .drag) }
     override func scrollWheel(with event: NSEvent) { pointer(event, .scroll) }
+    override func magnify(with event: NSEvent) { trackpadGesture(event, .magnify) }
+    override func rotate(with event: NSEvent) { trackpadGesture(event, .rotate) }
+    override func smartMagnify(with event: NSEvent) { trackpadGesture(event, .smartMagnify) }
     override func mouseMoved(with event: NSEvent) {
         pointer(event, .move)
     }
     override func mouseEntered(with event: NSEvent) {
-        localPointerInside = pictureRect.contains(convert(event.locationInWindow, from: nil)); updateCursorPresentation()
+        localPointerInside = isRelativeMouseCaptured || pictureRect.contains(convert(event.locationInWindow, from: nil))
+        updateCursorPresentation()
     }
     override func mouseExited(with event: NSEvent) {
+        guard !isRelativeMouseCaptured else { return }
         localPointerInside = false; flushPointerMoves(); updateCursorPresentation()
-        cancelScrollGesture(flags: UInt64(event.modifierFlags.rawValue))
+        let modifierBits = UInt64(event.modifierFlags.rawValue)
+        cancelScrollGesture(flags: modifierBits)
+        cancelTrackpadGestures(flags: modifierBits)
     }
 
     // A quiet trackpad can still be touched. End its remote gesture only when its input target is lost;
@@ -1184,6 +1475,27 @@ final class RemoteCanvas: NSView {
         else { input.momentumPhase = .ended }
         if let flags { input.flags = flags }
         onInput?(input)
+    }
+
+    private func cancelTrackpadGestures(flags: UInt64? = nil) {
+        let magnifyToCancel = activeMagnify
+        let rotateToCancel = activeRotate
+        activeMagnify = nil
+        activeRotate = nil
+        guard magnifyToCancel != nil || rotateToCancel != nil else { return }
+        flushPointerMoves()
+        if var mag = magnifyToCancel {
+            mag.magnification = 0
+            mag.gesturePhase = .cancelled
+            if let flags { mag.flags = flags }
+            onInput?(mag)
+        }
+        if var rot = rotateToCancel {
+            rot.rotation = 0
+            rot.gesturePhase = .cancelled
+            if let flags { rot.flags = flags }
+            onInput?(rot)
+        }
     }
 
     private func keyboard(_ event: NSEvent, _ kind: RemoteInput.Kind) {

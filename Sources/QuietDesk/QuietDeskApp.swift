@@ -278,6 +278,19 @@ struct DeskView: View {
                         .help(model.remoteAudioStatus.isEmpty ? "切换远端系统声音回传" : model.remoteAudioStatus)
                         .disabled(!model.connected)
                     }
+                    if model.supportsRelativeMouse {
+                        Button {
+                            model.canvas.releaseControl()
+                            model.setRelativeMouseEnabled(!model.relativeMouseEnabled)
+                        } label: {
+                            Label(model.relativeMouseEnabled ? "关闭相对鼠标" : "开启相对鼠标",
+                                  systemImage: model.relativeMouseCaptured ? "scope" : "cursorarrow.motionlines")
+                        }
+                        .help(model.relativeMouseEnabled
+                              ? "已开启相对鼠标（点击画面锁定视角，按 ⌃⌥Esc 释放光标）；点击关闭"
+                              : "开启相对鼠标（3D 视角锁定模式，按 ⌃⌥Esc 释放光标）")
+                        .disabled(!model.connected || !model.canControl)
+                    }
                     desktopActionButton(.missionControl)
                     desktopActionButton(.previousSpace)
                     desktopActionButton(.nextSpace)
@@ -473,7 +486,8 @@ struct DeskView: View {
                 Text(model.frameRate)
                 Text(model.traffic)
             } else if sessionLayout {
-                Label(controlStatus, systemImage: model.controlling ? "cursorarrow.rays" : "cursorarrow")
+                Label(model.relativeMouseCaptured ? "相对鼠标锁定（⌃⌥Esc 释放）" : controlStatus,
+                      systemImage: model.relativeMouseCaptured ? "scope" : (model.controlling ? "cursorarrow.rays" : "cursorarrow"))
                     .foregroundStyle(model.controlling ? Color.accentColor : Color.secondary).lineLimit(1)
                     .help(model.status)
                 Spacer(minLength: 8)

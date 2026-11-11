@@ -1316,6 +1316,175 @@ private struct RemoteCanvasChecks {
                         "Suspended canvas accepted file drop")
         }
 
+        run("Relative mouse cursor lock engages on click, scales unbounded deltas and immediately unlocks on every escape hatch") {
+            @MainActor
+            final class MockMouseAssociator: MouseCursorAssociating {
+                var associated = true
+                var hidden = false
+                var warpedPoints: [CGPoint] = []
+                func setCursorAssociated(_ associated: Bool) { self.associated = associated }
+                func warpCursor(to quartzScreenPoint: CGPoint) { warpedPoints.append(quartzScreenPoint) }
+                func setCursorHidden(_ hidden: Bool) { self.hidden = hidden }
+            }
+
+            final class SyntheticKeyWindow: NSWindow {
+                var syntheticKey = true
+                override var isKeyWindow: Bool { syntheticKey }
+                override var canBecomeKey: Bool { true }
+            }
+
+            let associator = MockMouseAssociator()
+            var appActive = true
+            let window = SyntheticKeyWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+                                            styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            defer { window.close() }
+
+            let canvas = RemoteCanvas(
+                frame: NSRect(x: 0, y: 0, width: 400, height: 300),
+                videoLayer: AVSampleBufferDisplayLayer(),
+                mouseAssociator: associator,
+                isApplicationActive: { appActive }
+            )
+            defer { canvas.reset() }
+            canvas.remoteSize = CGSize(width: 800, height: 600) // 2x scale vs 400x300 canvas
+            canvas.canControl = true
+            canvas.supportsRelativeMouse = true
+            canvas.relativeMouseEnabled = true
+            window.contentView = canvas
+
+            var inputs: [RemoteInput] = []
+            var captureStates: [Bool] = []
+            canvas.onInput = { inputs.append($0) }
+            canvas.onRelativeMouseCaptureChanged = { captureStates.append($0) }
+
+            // Before focusing the canvas, cursor must remain associated and visible.
+            try require(!canvas.isRelativeMouseCaptured && associator.associated && !associator.hidden,
+                        "Cursor locked before user clicked into canvas")
+
+            // Clicking at window (300, 225) -> flipped canvas (300, 75) sends initial absolute click (0.75, 0.25) and locks cursor.
+            let initialClick = try mouse(.leftMouseDown, point: CGPoint(x: 300, y: 225), clicks: 1)
+            canvas.mouseDown(with: initialClick)
+            try require(inputs.count == 1 && inputs[0].kind == .down && inputs[0].relativeMouse == nil
+                        && abs(inputs[0].x - 0.75) < 0.001 && abs(inputs[0].y - 0.25) < 0.001,
+                        "Initial click before lock lost exact target coordinates: \(inputs)")
+            try require(canvas.isRelativeMouseCaptured && !associator.associated && associator.hidden
+                        && !associator.warpedPoints.isEmpty && captureStates.last == true,
+                        "Canvas click did not engage relative mouse capture")
+            canvas.mouseUp(with: try mouse(.leftMouseUp, point: CGPoint(x: 200, y: 150), clicks: 1))
+
+            // While locked, a mouseMoved with hardware delta (+40, -15) scales 2x to (+80, -30) with relativeMouse=true.
+            inputs.removeAll()
+            guard let cgMove = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: .zero, mouseButton: .left) else {
+                throw CanvasCheckFailure("Could not construct relative mouse CGEvent")
+            }
+            cgMove.setIntegerValueField(.mouseEventDeltaX, value: 40)
+            cgMove.setIntegerValueField(.mouseEventDeltaY, value: -15)
+            let relMove = try nativeEvent(cgMove, point: CGPoint(x: 200, y: 150))
+            canvas.mouseMoved(with: relMove)
+            try require(inputs.count == 1 && inputs[0].kind == .move && inputs[0].relativeMouse == true
+                        && inputs[0].pointerDeltaX == 80 && inputs[0].pointerDeltaY == -30,
+                        "Locked relative move did not emit scaled relativeMouse deltas: \(inputs)")
+
+            // Escape hatch 1: ⌃⌥Esc (keyCode 53) immediately unlocks cursor.
+            guard let escCG = CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: true) else {
+                throw CanvasCheckFailure("Could not construct Escape CGEvent")
+            }
+            escCG.flags = [.maskControl, .maskAlternate]
+            guard let escEvent = NSEvent(cgEvent: escCG) else { throw CanvasCheckFailure("Could not bridge Escape NSEvent") }
+            canvas.keyDown(with: escEvent)
+            try require(!canvas.isRelativeMouseCaptured && associator.associated && !associator.hidden,
+                        "⌃⌥Esc did not immediately unlock relative mouse")
+
+            // Re-lock and verify Escape hatch 2: pointerInputSuspended = true
+            canvas.mouseDown(with: initialClick)
+            try require(canvas.isRelativeMouseCaptured && !associator.associated, "Failed to re-lock for suspend test")
+            canvas.pointerInputSuspended = true
+            try require(!canvas.isRelativeMouseCaptured && associator.associated && !associator.hidden,
+                        "pointerInputSuspended=true did not unlock relative mouse")
+            canvas.pointerInputSuspended = false
+            try require(canvas.isRelativeMouseCaptured && !associator.associated,
+                        "Resuming pointer input while still focused did not re-engage lock")
+
+            // Escape hatch 3: NSWindow.didResignKeyNotification
+            window.syntheticKey = false
+            NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: window)
+            try require(!canvas.isRelativeMouseCaptured && associator.associated && !associator.hidden,
+                        "Window resigning key did not unlock relative mouse")
+
+            // Re-lock and verify Escape hatch 4: NSApplication.didResignActiveNotification
+            window.syntheticKey = true
+            canvas.mouseDown(with: initialClick)
+            try require(canvas.isRelativeMouseCaptured, "Failed to re-lock for app deactivation test")
+            appActive = false
+            NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: NSApp)
+            try require(!canvas.isRelativeMouseCaptured && associator.associated && !associator.hidden,
+                        "Application deactivation did not unlock relative mouse")
+
+            // Re-lock and verify Escape hatch 5 & 6: relativeMouseEnabled=false and canControl=false
+            appActive = true
+            canvas.mouseDown(with: initialClick)
+            try require(canvas.isRelativeMouseCaptured, "Failed to re-lock for toggle test")
+            canvas.relativeMouseEnabled = false
+            try require(!canvas.isRelativeMouseCaptured && associator.associated && !associator.hidden,
+                        "Disabling relativeMouseEnabled did not unlock cursor")
+            canvas.relativeMouseEnabled = true
+            try require(canvas.isRelativeMouseCaptured, "Re-enabling relativeMouseEnabled while focused did not lock")
+            canvas.canControl = false
+            try require(!canvas.isRelativeMouseCaptured && associator.associated && !associator.hidden,
+                        "canControl=false did not unlock cursor")
+        }
+
+        run("Trackpad magnify, rotate and smartMagnify gestures gate on capability and cancel cleanly on exit") {
+            @MainActor
+            func gestureEvent(hidType: Int64, value: Double?, phase: Int64, point: CGPoint = CGPoint(x: 100, y: 150)) throws -> NSEvent {
+                guard let cg = CGEvent(source: nil) else { throw CanvasCheckFailure("Could not create gesture CGEvent") }
+                cg.type = CGEventType(rawValue: 29)!
+                cg.flags = .maskCommand
+                cg.setIntegerValueField(CGEventField(rawValue: 110)!, value: hidType)
+                if let value { cg.setDoubleValueField(CGEventField(rawValue: 113)!, value: value) }
+                cg.setIntegerValueField(CGEventField(rawValue: 132)!, value: phase)
+                return try nativeEvent(cg, point: point)
+            }
+
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+            defer { canvas.reset() }
+            canvas.remoteSize = CGSize(width: 400, height: 200)
+            canvas.canControl = true
+            var inputs: [RemoteInput] = []
+            canvas.onInput = { inputs.append($0) }
+
+            // Legacy host (forwardsTrackpadGestures == false): zero gesture inputs may be sent!
+            canvas.magnify(with: try gestureEvent(hidType: 8, value: 0.25, phase: 2))
+            canvas.rotate(with: try gestureEvent(hidType: 5, value: 15.0, phase: 2))
+            canvas.smartMagnify(with: try gestureEvent(hidType: 22, value: nil, phase: 4))
+            try require(inputs.isEmpty, "Legacy host received unnegotiated trackpad gestures: \(inputs)")
+
+            // Negotiated host (forwardsTrackpadGestures == true): gestures carry exact coordinates, values & phases
+            canvas.forwardsTrackpadGestures = true
+            canvas.magnify(with: try gestureEvent(hidType: 8, value: 0.5, phase: 1))
+            canvas.magnify(with: try gestureEvent(hidType: 8, value: 0.25, phase: 2))
+            canvas.rotate(with: try gestureEvent(hidType: 5, value: -30.0, phase: 1))
+            canvas.smartMagnify(with: try gestureEvent(hidType: 22, value: nil, phase: 4))
+            try require(inputs.map(\.kind) == [.magnify, .magnify, .rotate, .smartMagnify],
+                        "Unexpected gesture kinds: \(inputs.map(\.kind))")
+            try require(inputs[0].x == 0.25 && inputs[0].y == 0.5 && inputs[0].gesturePhase == .began && inputs[0].magnification == 0.5
+                        && inputs[1].gesturePhase == .changed && inputs[1].magnification == 0.25
+                        && inputs[2].gesturePhase == .began && inputs[2].rotation == -30.0,
+                        "Gesture metadata or letterboxing mapping was altered: \(inputs)")
+            try inputs.forEach { try $0.validate() }
+
+            // Leaving the picture cancels both active magnify and rotate gestures explicitly
+            inputs.removeAll()
+            let outside = try mouse(.mouseMoved, point: CGPoint(x: 350, y: 10)) // inside letterboxing (pictureRect y is 50..250)
+            canvas.mouseMoved(with: outside)
+            try require(inputs.count == 2
+                        && inputs[0].kind == .magnify && inputs[0].magnification == 0 && inputs[0].gesturePhase == .cancelled
+                        && inputs[1].kind == .rotate && inputs[1].rotation == 0 && inputs[1].gesturePhase == .cancelled,
+                        "Entering letterboxing did not cancel open magnify and rotate gestures: \(inputs)")
+            try inputs.forEach { try $0.validate() }
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

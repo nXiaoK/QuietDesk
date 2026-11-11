@@ -222,7 +222,11 @@ public struct Hello: Codable, Sendable {
     public let selectedDisplayID: UInt32?
     // The host supports ScreenCaptureKit native system audio capture encoded as low-latency 48 kHz Opus.
     public let remoteAudioV1: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil, displaySwitchingV1: Bool? = nil, displays: [RemoteDisplayInfo]? = nil, selectedDisplayID: UInt32? = nil, remoteAudioV1: Bool? = nil) {
+    // The host supports relative mouse cursor-lock mode, advancing its virtual cursor by pointerDeltaX/pointerDeltaY.
+    public let relativeMouseV1: Bool?
+    // The host supports trackpad pinch-to-zoom, two-finger rotation, and smart-magnify gesture replay.
+    public let trackpadGesturesV1: Bool?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil, displaySwitchingV1: Bool? = nil, displays: [RemoteDisplayInfo]? = nil, selectedDisplayID: UInt32? = nil, remoteAudioV1: Bool? = nil, relativeMouseV1: Bool? = nil, trackpadGesturesV1: Bool? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -261,6 +265,8 @@ public struct Hello: Codable, Sendable {
         self.displays = displays
         self.selectedDisplayID = selectedDisplayID
         self.remoteAudioV1 = remoteAudioV1
+        self.relativeMouseV1 = relativeMouseV1
+        self.trackpadGesturesV1 = trackpadGesturesV1
     }
 
     public func validate() throws {
@@ -291,9 +297,9 @@ public struct ControlStatus: Codable, Sendable {
 
 public struct RemoteInput: Codable, Sendable {
     public enum Kind: String, Codable, Sendable {
-        case move, drag, down, up, scroll, keyDown, keyUp, flags, switchInputSource, toggleCapsLock
+        case move, drag, down, up, scroll, magnify, rotate, smartMagnify, keyDown, keyUp, flags, switchInputSource, toggleCapsLock
     }
-    /// A trackpad-style gesture phase, numbered as CGScrollPhase.
+    /// A trackpad-style gesture phase, numbered as CGScrollPhase / CGGesturePhase.
     public enum ScrollPhase: Int, Codable, Sendable {
         case began = 1, changed = 2, ended = 4, cancelled = 8, mayBegin = 128
     }
@@ -304,6 +310,8 @@ public struct RemoteInput: Codable, Sendable {
     public static let maximumLineDelta = 250.0
     public static let maximumPointerDelta = 10_000.0
     public static let maximumButtonNumber = 31
+    public static let maximumMagnification = 10.0
+    public static let maximumRotation = 3_600.0
     public var kind: Kind
     public var x: Double = 0
     public var y: Double = 0
@@ -326,6 +334,12 @@ public struct RemoteInput: Codable, Sendable {
     public var pointerDeltaY: Double?
     // Monotonic per-session sequence for pointer events, guarding causal order across UDP and TCP paths.
     public var pointerSequence: UInt64?
+    // True when the viewer locked cursor association and the host should advance/anchor its virtual cursor.
+    public var relativeMouse: Bool?
+    // Trackpad pinch magnification, rotation degrees, and gesture phase (sent only when trackpadGesturesV1 is negotiated).
+    public var magnification: Double?
+    public var rotation: Double?
+    public var gesturePhase: ScrollPhase?
 
     public init(kind: Kind) { self.kind = kind }
 
@@ -352,8 +366,9 @@ public struct RemoteInput: Codable, Sendable {
               deltaX.isFinite, deltaY.isFinite, abs(deltaX) <= 3000, abs(deltaY) <= 3000 else {
             throw DeskError.invalid("远端输入参数无效")
         }
+        let isPointerOrGestureKind = [.move, .drag, .down, .up, .scroll, .magnify, .rotate, .smartMagnify].contains(kind)
         if let pointerSequence {
-            guard pointerSequence > 0, [.move, .drag, .down, .up, .scroll].contains(kind) else {
+            guard pointerSequence > 0, isPointerOrGestureKind else {
                 throw DeskError.invalid("远端指针序号无效")
             }
         }
@@ -362,11 +377,41 @@ public struct RemoteInput: Codable, Sendable {
                                         && pointerDeltas.allSatisfy { $0.isFinite && abs($0) <= Self.maximumPointerDelta }) else {
             throw DeskError.invalid("远端指针增量参数无效")
         }
+        if let relativeMouse {
+            guard isPointerOrGestureKind else {
+                throw DeskError.invalid("相对鼠标参数无效")
+            }
+            if relativeMouse, kind == .move || kind == .drag {
+                guard pointerDeltas.count == 2 else {
+                    throw DeskError.invalid("相对鼠标移动缺少增量参数")
+                }
+            }
+        }
         let lines = [lineDeltaX, lineDeltaY].compactMap { $0 }
         guard kind == .scroll || (lines.isEmpty && scrollPhase == nil && momentumPhase == nil),
               lines.isEmpty || (lines.count == 2 && scrollPhase == nil && momentumPhase == nil
                                 && lines.allSatisfy { $0.isFinite && abs($0) <= Self.maximumLineDelta }) else {
             throw DeskError.invalid("远端滚动参数无效")
+        }
+        switch kind {
+        case .magnify:
+            guard rotation == nil,
+                  let magnification, magnification.isFinite, abs(magnification) <= Self.maximumMagnification else {
+                throw DeskError.invalid("远端缩放手势参数无效")
+            }
+        case .rotate:
+            guard magnification == nil,
+                  let rotation, rotation.isFinite, abs(rotation) <= Self.maximumRotation else {
+                throw DeskError.invalid("远端旋转手势参数无效")
+            }
+        case .smartMagnify:
+            guard magnification == nil, rotation == nil else {
+                throw DeskError.invalid("远端智能缩放手势参数无效")
+            }
+        default:
+            guard magnification == nil, rotation == nil, gesturePhase == nil else {
+                throw DeskError.invalid("非手势事件不能携带触控板手势参数")
+            }
         }
     }
 }

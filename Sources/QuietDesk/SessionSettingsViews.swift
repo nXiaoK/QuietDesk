@@ -146,6 +146,20 @@ private struct ConnectionOptionsSections: View {
                     Text(model.supportsIndependentCursor ? model.cursorStatus : "对端版本不支持独立光标")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                Toggle(isOn: Binding(get: { model.relativeMouseEnabled }, set: { model.setRelativeMouseEnabled($0) })) {
+                    Text("相对鼠标（3D 视角锁定）").frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .disabled(!model.connected || !model.supportsRelativeMouse || !model.canControl)
+                .help("开启后点击远程画面会隐藏并锁定本地光标，按无边界相对位移驱动远端视角或鼠标；按 ⌃⌥Esc 立即释放光标。")
+                if model.connected {
+                    Text(!model.supportsRelativeMouse ? "对端版本不支持相对鼠标视角锁定"
+                         : model.relativeMouseCaptured ? "相对鼠标已锁定 · 按 ⌃⌥Esc 立即释放光标"
+                         : model.relativeMouseEnabled ? "相对鼠标待激活 · 点击远程画面锁定光标（按 ⌃⌥Esc 释放）"
+                         : "相对鼠标未开启（适合 3D 建模/第一人称视角；会话结束自动重置）")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    Text(model.supportsTrackpadGestures ? "触控板双指缩放/旋转手势透传已就绪" : "对端版本不支持触控板缩放/旋转手势")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
                 Toggle(isOn: Binding(get: { model.remoteAudioEnabled }, set: { model.setRemoteAudioEnabled($0) })) {
                     Text("远端声音回传").frame(maxWidth: .infinity, alignment: .leading)
                 }

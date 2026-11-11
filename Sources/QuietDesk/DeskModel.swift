@@ -240,6 +240,10 @@ final class DeskModel: ObservableObject {
     @Published private(set) var remoteAudioStreaming = false
     @Published private(set) var remoteAudioWorking = false
     @Published private(set) var remoteAudioStatus = ""
+    @Published private(set) var supportsRelativeMouse = false
+    @Published private(set) var supportsTrackpadGestures = false
+    @Published private(set) var relativeMouseEnabled = false
+    @Published private(set) var relativeMouseCaptured = false
     var desktopActionUnavailableReason: String? {
         if !connected { return "连接后可选择远端桌面" }
         if !supportsDesktopActions { return "被控端需更新后才能使用桌面操作" }
@@ -466,8 +470,14 @@ final class DeskModel: ObservableObject {
             if input.kind == .switchInputSource || input.kind == .toggleCapsLock {
                 guard self.supportsInputActions else { return }
             }
+            if [.magnify, .rotate, .smartMagnify].contains(input.kind) {
+                guard self.supportsTrackpadGestures else { return }
+            }
+            if input.relativeMouse == true {
+                guard self.supportsRelativeMouse else { return }
+            }
             if self.canvas.usesCapsLockActions { input.independentCapsLock = true }
-            if [.move, .drag, .down, .up, .scroll].contains(input.kind),
+            if [.move, .drag, .down, .up, .scroll, .magnify, .rotate, .smartMagnify].contains(input.kind),
                self.viewerSession.pointerSequence < UInt64.max {
                 self.viewerSession.pointerSequence += 1
                 input.pointerSequence = self.viewerSession.pointerSequence
@@ -497,6 +507,9 @@ final class DeskModel: ObservableObject {
             guard let self else { return }
             self.controlling = focused
             self.refreshClipboardFocus()
+        }
+        canvas.onRelativeMouseCaptureChanged = { [weak self] captured in
+            self?.relativeMouseCaptured = captured
         }
         canvas.onFailure = { [weak self] message in
             DiagnosticLog.shared.record(.captureFailed, role: .viewer, state: .failed)
@@ -1507,7 +1520,9 @@ final class DeskModel: ObservableObject {
                             displaySwitchingV1: true,
                             displays: initialDisplays.isEmpty ? nil : initialDisplays,
                             selectedDisplayID: initialDisplays.isEmpty ? nil : snapshot.id,
-                            remoteAudioV1: true)))
+                            remoteAudioV1: true,
+                            relativeMouseV1: true,
+                            trackpadGesturesV1: true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -2092,6 +2107,14 @@ final class DeskModel: ObservableObject {
             streamer.resumeAfterReconfiguration()
             if !host.paused { host.media?.resumeAfterConfiguration() }
         }
+    }
+
+    func setRelativeMouseEnabled(_ enabled: Bool) {
+        let targetValue = enabled && (!connected || supportsRelativeMouse)
+        guard relativeMouseEnabled != targetValue else { return }
+        relativeMouseEnabled = targetValue
+        canvas.relativeMouseEnabled = targetValue
+        if !targetValue { relativeMouseCaptured = false }
     }
 
     func setRemoteAudioEnabled(_ enabled: Bool) {
@@ -2956,6 +2979,17 @@ final class DeskModel: ObservableObject {
                 remoteAudioWorking = false
                 remoteAudioStatus = ""
             }
+            supportsRelativeMouse = hello.relativeMouseV1 == true
+            supportsTrackpadGestures = hello.trackpadGesturesV1 == true
+            canvas.supportsRelativeMouse = supportsRelativeMouse
+            canvas.forwardsTrackpadGestures = supportsTrackpadGestures
+            if !supportsRelativeMouse {
+                relativeMouseEnabled = false
+                relativeMouseCaptured = false
+                canvas.relativeMouseEnabled = false
+            } else {
+                canvas.relativeMouseEnabled = relativeMouseEnabled
+            }
             publishSessionPause()
             sendNextSessionPause()
             if let token = pauseTransmission.freshFrameToken { scheduleFreshFrameTimeout(token, peer: peer) }
@@ -3778,6 +3812,9 @@ final class DeskModel: ObservableObject {
         case .leftMouseUp, .rightMouseUp, .otherMouseUp: kind = .up
         case .leftMouseDragged, .rightMouseDragged, .otherMouseDragged: kind = .drag
         case .scrollWheel: kind = .scroll
+        case .magnify: kind = .magnify
+        case .rotate: kind = .rotate
+        case .smartMagnify: kind = .smartMagnify
         default: kind = .move
         }
         var input = RemoteInput(kind: kind)
@@ -4510,7 +4547,8 @@ final class DeskModel: ObservableObject {
             if windowActivityMonitor == nil {
                 windowActivityMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged,
                     .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp,
-                    .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel]) { [weak self] event in
+                    .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel,
+                    .magnify, .rotate, .smartMagnify]) { [weak self] event in
                         var result: NSEvent? = event
                         MainActor.assumeIsolated {
                             if let self { result = self.observeSessionEvent(event) }
@@ -4740,6 +4778,13 @@ final class DeskModel: ObservableObject {
         remoteAudioStreaming = false
         remoteAudioWorking = false
         remoteAudioStatus = ""
+        supportsRelativeMouse = false
+        supportsTrackpadGestures = false
+        relativeMouseEnabled = false
+        relativeMouseCaptured = false
+        canvas.supportsRelativeMouse = false
+        canvas.relativeMouseEnabled = false
+        canvas.forwardsTrackpadGestures = false
         supportsSessionUnlock = false
         unlockWorking = false
         unlockNoticeTask?.cancel()

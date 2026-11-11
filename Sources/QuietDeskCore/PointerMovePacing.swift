@@ -45,6 +45,7 @@ public struct PointerMovePacer: Sendable {
         let supported = input.kind == .move || (allowsDrag && input.kind == .drag)
         guard supported, (try? input.validate()) != nil, validTime(now) else { return nil }
         if let existing = pending, existing.kind == input.kind,
+           existing.relativeMouse == input.relativeMouse,
            (input.kind != .drag || existing.button == input.button) {
             pending = input.accumulatingPointerDelta(from: existing)
         } else {

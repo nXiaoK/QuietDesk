@@ -555,6 +555,125 @@ private struct InputInjectorChecks {
                         "Pointer coordinates did not remap to the switched display bounds")
         }
 
+        await run("Relative mouse mode advances virtual cursor, clamps to display bounds while keeping raw 3D deltas, and clicks at virtual anchor") {
+            let recorder = EventRecorder()
+            recorder.pointer = CGPoint(x: 50, y: 50)
+            let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 101, height: 101),
+                                         isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
+
+            // Move +30, -20 from current host pointer (50, 50) -> (80, 30)
+            var rel1 = RemoteInput(kind: .move)
+            rel1.x = 0.5; rel1.y = 0.5; rel1.relativeMouse = true
+            rel1.pointerDeltaX = 30.4; rel1.pointerDeltaY = -20.0
+            _ = try await injector.receive(rel1)
+            try require(recorder.events.count == 1
+                        && abs(recorder.events[0].location.x - 80.4) < 0.01
+                        && abs(recorder.events[0].location.y - 30.0) < 0.01
+                        && recorder.events[0].getIntegerValueField(.mouseEventDeltaX) == 30
+                        && recorder.events[0].getIntegerValueField(.mouseEventDeltaY) == -20,
+                        "First relative move did not advance from host pointer location")
+
+            // Move +60, -50 -> location clamps to (100, 0), while mouseEventDeltaX/Y preserves full (+60, -50) for 3D cameras!
+            var rel2 = RemoteInput(kind: .move)
+            rel2.x = 0.5; rel2.y = 0.5; rel2.relativeMouse = true
+            rel2.pointerDeltaX = 59.6; rel2.pointerDeltaY = -50.0
+            _ = try await injector.receive(rel2)
+            try require(recorder.events.count == 2
+                        && recorder.events[1].location == CGPoint(x: 100, y: 0)
+                        && recorder.events[1].getIntegerValueField(.mouseEventDeltaX) == 60
+                        && recorder.events[1].getIntegerValueField(.mouseEventDeltaY) == -50,
+                        "Edge-clamped relative move lost unbounded 3D camera delta or subpixel remainder")
+
+            // Clicking while relativeMouse=true clicks at virtual cursor (100, 0), NOT canvas center (50, 50)!
+            var relDown = RemoteInput(kind: .down)
+            relDown.x = 0.5; relDown.y = 0.5; relDown.relativeMouse = true
+            var relUp = RemoteInput(kind: .up)
+            relUp.x = 0.5; relUp.y = 0.5; relUp.relativeMouse = true
+            _ = try await injector.receive(relDown)
+            _ = try await injector.receive(relUp)
+            try require(recorder.events[2].location == CGPoint(x: 100, y: 0)
+                        && recorder.events[3].location == CGPoint(x: 100, y: 0),
+                        "Relative mouse click jumped away from virtual cursor position")
+
+            // HostImmediateInputQueue keeps absolute and relative moves separate while coalescing consecutive relative moves
+            let queue = HostImmediateInputQueue(capacity: 8)
+            var absMove = RemoteInput(kind: .move); absMove.x = 0.2; absMove.y = 0.2; absMove.pointerSequence = 1
+            var rMove1 = RemoteInput(kind: .move); rMove1.x = 0.5; rMove1.y = 0.5; rMove1.relativeMouse = true
+            rMove1.pointerSequence = 2; rMove1.pointerDeltaX = 12; rMove1.pointerDeltaY = -5
+            var rMove2 = RemoteInput(kind: .move); rMove2.x = 0.5; rMove2.y = 0.5; rMove2.relativeMouse = true
+            rMove2.pointerSequence = 3; rMove2.pointerDeltaX = 8; rMove2.pointerDeltaY = 15
+            _ = queue.enqueueDatagram(absMove)
+            _ = queue.enqueueDatagram(rMove1)
+            _ = queue.enqueueDatagram(rMove2)
+            let drained = queue.drain().inputs
+            try require(drained.count == 2
+                        && drained[0].relativeMouse == nil
+                        && drained[1].relativeMouse == true
+                        && drained[1].pointerDeltaX == 20 && drained[1].pointerDeltaY == 10,
+                        "HostImmediateInputQueue merged across relativeMouse boundary or dropped coalesced deltas: \(drained)")
+        }
+
+        await run("Trackpad magnify, rotate and smartMagnify replay as native AppKit gesture events and close on release") {
+            let recorder = EventRecorder()
+            let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 201, height: 201),
+                                         isTrusted: { true }, postEvent: recorder.post, pointerLocation: { recorder.pointer })
+
+            // Orphan .changed magnify auto-opens .began at (80, 120) after moving pointer there first
+            var magChanged = RemoteInput(kind: .magnify)
+            magChanged.x = 0.4; magChanged.y = 0.6
+            magChanged.magnification = 0.375
+            magChanged.gesturePhase = .changed
+            magChanged.flags = CGEventFlags.maskCommand.rawValue
+            _ = try await injector.receive(magChanged)
+
+            try require(recorder.events.count == 3 && recorder.events[0].type == .mouseMoved
+                        && recorder.events[0].location == CGPoint(x: 80, y: 120),
+                        "Gesture did not synchronize pointer target or open missing .began phase")
+            guard let magBeganNS = NSEvent(cgEvent: recorder.events[1]),
+                  let magChangedNS = NSEvent(cgEvent: recorder.events[2]) else {
+                throw InputCheckFailure("Could not bridge synthesized magnify CGEvents to NSEvent")
+            }
+            try require(magBeganNS.type == .magnify && magBeganNS.phase == .began && magBeganNS.magnification == 0
+                        && magChangedNS.type == .magnify && magChangedNS.phase == .changed
+                        && abs(magChangedNS.magnification - 0.375) < 0.001
+                        && recorder.events[2].flags == .maskCommand,
+                        "Synthesized magnify NSEvent lost type, phase, magnification or modifiers")
+
+            // Rotate gesture at the same location skips redundant pointer move and delivers exact degrees
+            recorder.events.removeAll()
+            var rotBegan = RemoteInput(kind: .rotate)
+            rotBegan.x = 0.4; rotBegan.y = 0.6; rotBegan.rotation = -18.5; rotBegan.gesturePhase = .began
+            _ = try await injector.receive(rotBegan)
+            try require(recorder.events.count == 1, "Gesture at unchanged pointer emitted redundant move")
+            guard let rotNS = NSEvent(cgEvent: recorder.events[0]) else {
+                throw InputCheckFailure("Could not bridge synthesized rotate CGEvent to NSEvent")
+            }
+            try require(rotNS.type == .rotate && rotNS.phase == .began && abs(Double(rotNS.rotation) + 18.5) < 0.01,
+                        "Synthesized rotate NSEvent lost type, phase or rotation degrees")
+
+            // Smart magnify discrete gesture
+            recorder.events.removeAll()
+            var smart = RemoteInput(kind: .smartMagnify)
+            smart.x = 0.4; smart.y = 0.6; smart.gesturePhase = .ended
+            _ = try await injector.receive(smart)
+            guard let smartNS = NSEvent(cgEvent: recorder.events[0]) else {
+                throw InputCheckFailure("Could not bridge synthesized smartMagnify CGEvent to NSEvent")
+            }
+            try require(smartNS.type == .smartMagnify, "Synthesized smartMagnify NSEvent had wrong type")
+
+            // releaseAll() closes both unfinished magnify and rotate gestures so apps never stay stuck mid-gesture
+            recorder.events.removeAll()
+            injector.releaseAll()
+            try require(recorder.events.count == 2, "releaseAll() did not close open magnify and rotate phases")
+            guard let endMag = NSEvent(cgEvent: recorder.events[0]),
+                  let endRot = NSEvent(cgEvent: recorder.events[1]) else {
+                throw InputCheckFailure("Could not bridge gesture ending CGEvents")
+            }
+            try require(endMag.type == .magnify && endMag.phase == .ended
+                        && endRot.type == .rotate && endRot.phase == .ended,
+                        "releaseAll() did not emit .ended for open magnify and rotate gestures")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

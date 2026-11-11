@@ -29,14 +29,18 @@ MESSAGE_KINDS = dict(enumerate((
     "clipboardEnd", "clipboardReceipt", "clipboardCancel", "streamSettingsRequest", "streamSettingsResult",
     "controlStatus", "deviceIdentity", "sessionEffectsRequest", "sessionEffectsResult", "sessionPauseRequest",
     "sessionPauseResult", "mediaControl", "mediaFrame", "mediaFeedback", "cursorControl", "cursorShape", "cursorPosition",
-    "sessionUnlockRequest", "sessionUnlockResult"), start=1))
+    "sessionUnlockRequest", "sessionUnlockResult", "sessionTermination",
+    "desktopActionRequest", "desktopActionResult"), start=1))
 OTHER_EVENTS = set((
     "applicationStarted applicationStopped connectionStarted connectionReady connectionClosed connectionFailed "
     "connectionMetrics reconnectScheduled inputFailed hostStarted hostStopped captureStarted captureStopped "
-    "captureFailed streamConfigured displayChanged sessionPaused sessionResumed sessionEffectsChanged "
+    "captureFailed startupTimedOut streamConfigured displayChanged sessionPaused sessionResumed sessionEffectsChanged "
+    "screenLock privacyCurtain sessionUnlock displayDim "
     "clipboardOffered clipboardOfferReceived clipboardAccepted clipboardRejected clipboardCompleted "
     "clipboardFailed clipboardEchoSuppressed permissionChanged exportRequested "
-    "exportCompleted exportFailed counters performanceDiagnosticsChanged"
+    "exportCompleted exportFailed counters performanceDiagnosticsChanged "
+    "relayRegistration mediaRouteChanged mediaPathSwitch peerPathChanged "
+    "updateCheck updatePreferenceChanged updateDownload updateInstall updateCancelled"
 ).split())
 SUMMARY_FIELDS = {"metric", "messageKind", "unit", "count", "minimum", "maximum", "mean",
                   "p95UpperBound", "worstIdentifier", "windowMilliseconds"}

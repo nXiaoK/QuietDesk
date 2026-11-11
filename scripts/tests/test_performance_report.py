@@ -181,6 +181,35 @@ class PerformanceReportTests(unittest.TestCase):
                    for name in declaration.split(",")}
         self.assertEqual(set(report_module.METRIC_UNITS), metrics)
 
+    def test_message_kinds_and_diagnostic_events_match_core_contracts(self):
+        protocol_source = (SCRIPT.parents[1] / "Sources/QuietDeskCore/Protocol.swift").read_text()
+        kind_block = protocol_source.split("public enum MessageKind: UInt8", 1)[1].split("}", 1)[0]
+        expected_kinds = {}
+        next_value = 1
+        for declaration in re.findall(r"case ([^\n]+)", kind_block):
+            for item in declaration.split(","):
+                part = item.strip()
+                if "=" in part:
+                    name, raw = [piece.strip() for piece in part.split("=", 1)]
+                    next_value = int(raw)
+                else:
+                    name = part
+                expected_kinds[next_value] = name
+                next_value += 1
+        self.assertEqual(report_module.MESSAGE_KINDS, expected_kinds)
+
+        log_source = (SCRIPT.parents[1] / "Sources/QuietDesk/DiagnosticLog.swift").read_text()
+        event_block = log_source.split("enum Event: String, Codable {", 1)[1].split("}", 1)[0]
+        events = {name.strip() for declaration in re.findall(r"case ([^\n]+)", event_block)
+                  for name in declaration.split(",")}
+        self.assertEqual(report_module.OTHER_EVENTS | {"performanceWindow"}, events)
+
+        report = report_module.read_report(self.write([window(messageKind=kind) for kind in (34, 35, 36)]))
+        self.assertEqual((report.valid_windows, report.skipped_lines), (3, 0))
+        text = report_module.render_report([report])
+        for label in ("sessionTermination (34)", "desktopActionRequest (35)", "desktopActionResult (36)"):
+            self.assertIn(label, text)
+
     def test_tcp_report_values_use_transport_units_and_have_no_application_identifier(self):
         records = [window(metric=metric, unit=unit, count=1, minimum=value, maximum=value,
                           mean=value, p95UpperBound=value, messageKind=None, worstIdentifier=None)

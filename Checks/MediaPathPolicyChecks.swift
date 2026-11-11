@@ -1161,4 +1161,42 @@ func runMediaPathPolicyChecks() {
         estimator.add(.nan, at: 44); estimator.add(-1, at: 44); estimator.add(100, at: 44)
         try check(estimator.takeWindow(at: 44) == nil, "Invalid delivery times were accepted")
     }
+
+    run("UDP pacing scales with weak WAN bitrates and jitter estimator filters single spikes while detecting sustained jitter") {
+        let rate1 = MediaSession.udpPacingBytesPerSecond(megabits: 1) * 8 / 1_000_000
+        let rate3 = MediaSession.udpPacingBytesPerSecond(megabits: 3) * 8 / 1_000_000
+        let rate6 = MediaSession.udpPacingBytesPerSecond(megabits: 6) * 8 / 1_000_000
+        let rate12 = MediaSession.udpPacingBytesPerSecond(megabits: 12) * 8 / 1_000_000
+        try check(abs(rate1 - 2.0) < 1e-6 && abs(rate3 - 4.8) < 1e-6 && abs(rate6 - 9.6) < 1e-6 && abs(rate12 - 19.2) < 1e-6,
+                  "Weak WAN UDP pacing remained floored at 12 Mbps: \(rate1), \(rate3), \(rate6), \(rate12)")
+        let burst1 = MediaSession.udpPacingBurstBytes(megabits: 1)
+        try check(burst1 >= Double(MediaFragment.maximumDatagramBytes + 1) * 4 && burst1 <= 8_192,
+                  "Weak WAN UDP burst exceeded bounds: \(burst1)")
+        let span = MediaSession.udpPacingSpan(payloadBytes: 4 * MediaFragment.maximumPayloadBytes, megabits: 3)
+        let expectedWireBytes = Double(4 * MediaFragment.maximumPayloadBytes + 4 * (1 + MediaFragment.encodedHeaderBytes))
+        try check(abs(span - expectedWireBytes / MediaSession.udpPacingBytesPerSecond(megabits: 3)) < 1e-9,
+                  "UDP pacing span omitted wire header overhead")
+
+        var jitter = MediaJitterEstimator()
+        jitter.observeRoundTrip(0.010)
+        try check(jitter.takeWindowMilliseconds() == nil, "Single RTT sample produced jitter")
+        jitter.observeRoundTrip(0.010)
+        try check(jitter.takeWindowMilliseconds() == 0, "Steady RTT reported jitter")
+        try check(jitter.takeWindowMilliseconds() == nil, "Idle window replayed stale jitter")
+        // One isolated 50 ms spike must stay below the 30 ms congestion threshold.
+        jitter.observeRoundTrip(0.060)
+        jitter.observeRoundTrip(0.010)
+        guard let spikeJitter = jitter.takeWindowMilliseconds(), spikeJitter < 30 else {
+            throw CheckFailure("Isolated RTT spike exceeded the 30 ms congestion threshold")
+        }
+        // Sustained 60 ms variation reaches >= 30 ms within a one-second probe cadence.
+        for rtt in [0.075, 0.015, 0.080, 0.015] { jitter.observeRoundTrip(rtt) }
+        guard let sustained = jitter.takeWindowMilliseconds(), sustained >= 30 else {
+            throw CheckFailure("Sustained RTT variation did not cross the 30 ms congestion threshold")
+        }
+        try check(sample(jitter: sustained).networkCondition == .congested && sample(jitter: spikeJitter).networkCondition == .healthy,
+                  "Measured UDP jitter did not drive MediaPathSample network condition")
+        jitter.reset()
+        try check(jitter.takeWindowMilliseconds() == nil, "Reset jitter estimator retained old samples")
+    }
 }

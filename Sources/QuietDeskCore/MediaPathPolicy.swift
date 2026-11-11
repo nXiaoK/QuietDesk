@@ -184,6 +184,40 @@ public struct MediaDeliveryEstimator: Sendable {
     public mutating func reset() { recent.removeAll(); window.removeAll() }
 }
 
+// Viewer side: smoothed variation of consecutive authenticated UDP round-trip measurements.
+public struct MediaJitterEstimator: Sendable {
+    private var previousSeconds: TimeInterval?
+    private var smoothedSeconds: Double = 0
+    private var hasEstimate = false
+    private var windowSamples = 0
+
+    public init() {}
+
+    public mutating func observeRoundTrip(_ seconds: TimeInterval) {
+        guard seconds.isFinite, seconds >= 0, seconds < 10 else { return }
+        if let previous = previousSeconds {
+            let delta = abs(seconds - previous)
+            smoothedSeconds = hasEstimate ? smoothedSeconds + (delta - smoothedSeconds) / 4 : delta * 0.5
+            hasEstimate = true
+            windowSamples += 1
+        }
+        previousSeconds = seconds
+    }
+
+    public mutating func takeWindowMilliseconds() -> Double? {
+        defer { windowSamples = 0 }
+        guard hasEstimate, windowSamples > 0 else { return nil }
+        return smoothedSeconds * 1_000
+    }
+
+    public mutating func reset() {
+        previousSeconds = nil
+        smoothedSeconds = 0
+        hasEstimate = false
+        windowSamples = 0
+    }
+}
+
 // One coordinator owns this value and executes its actions. A selection is only a request;
 // the coordinator confirms a new epoch after its first complete keyframe has decoded.
 public struct MediaPathPolicy: Sendable {

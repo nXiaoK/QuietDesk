@@ -218,6 +218,7 @@ public final class MediaSession: @unchecked Sendable {
     private var sampleSettledFragments = 0
     private var sampleLostFragments = 0
     private var sampleDeliveryMilliseconds: Double?
+    private var udpJitter = MediaJitterEstimator()
     private var deliveryEstimator = MediaDeliveryEstimator()
     private var deliveryPath: Path?
     // Hand-off time and the frame's own pacing time, which is not queueing.
@@ -354,6 +355,7 @@ public final class MediaSession: @unchecked Sendable {
             self.paused = value
             self.reliableDeliveryFailures = 0; self.reliableFailureNotified = false
             if !value { self.livenessResumedAt = SessionClock.uptime }
+            else { self.udpJitter.reset() }
             self.handleActions(self.policy.setPaused(value, now: SessionClock.now))
             self.clearDatagrams()
             if value { self.abortTransaction(retry: false) }
@@ -369,6 +371,7 @@ public final class MediaSession: @unchecked Sendable {
             guard let self, !self.stopped else { return }
             self.udpVerified = false
             self.controlRoundTrip = nil
+            self.udpJitter.reset()
             self.receivedChallenge = false
             self.challenge = nil
             self.udpPeer?.close("媒体网络路径变化，需要重新验证")
@@ -385,6 +388,7 @@ public final class MediaSession: @unchecked Sendable {
             self.alternateEndpoint = nil; self.alternateProbePending = false; self.alternateRequested = false
             guard usingAlternate else { return }
             self.udpVerified = false; self.receivedChallenge = false; self.challenge = nil
+            self.udpJitter.reset()
             self.udpPeer?.close("中继媒体路径已关闭")
             self.clearDatagrams()
         }
@@ -396,6 +400,7 @@ public final class MediaSession: @unchecked Sendable {
             guard self.negotiated else { completion(); return }
             self.configurationSuspended = true
             self.recoveryHold = true
+            self.udpJitter.reset()
             self.abortTransaction(retry: false)
             self.clearDatagrams()
             if let cache = self.cache {
@@ -520,7 +525,7 @@ public final class MediaSession: @unchecked Sendable {
         if value.operation == .stats {
             guard side == .viewer, let milliseconds = value.encodeMilliseconds else { return }
             // Newer hosts report their window mean; an older host's per-second maximum is treated the same way.
-            sampleEncode.add(milliseconds)
+            if value.encodeIdle != true { sampleEncode.add(milliseconds) }
             if let delivery = value.deliveryMilliseconds { sampleDeliveryMilliseconds = max(sampleDeliveryMilliseconds ?? 0, delivery) }
             return
         }
@@ -796,6 +801,7 @@ public final class MediaSession: @unchecked Sendable {
     private func installDatagram(_ peer: BoundedDatagramPeer, hostBinding: ((Data) -> Void)? = nil, start: Bool = true, release: @escaping () -> Void = {}) {
         if side == .host { hostAssist = hostBinding; udpRelayed = hostBinding != nil }
         udpPeer = peer; udpVerified = false; receivedChallenge = false; challenge = nil; lastPongAt = 0
+        udpJitter.reset()
         peer.onReady = { [weak self, weak peer] in
             release()
             guard let self, let peer, !self.stopped, self.udpPeer === peer else { return }
@@ -872,6 +878,7 @@ public final class MediaSession: @unchecked Sendable {
                 self.challenge = nil
                 lastPongAt = now
                 roundTrip = max(0.001, min(2, measured))
+                udpJitter.observeRoundTrip(measured)
                 if side == .viewer { receiver?.updateLimits(bufferLimits) }
                 recordDuration(.mediaRoundTrip, seconds: measured)
                 if let onDiagnosticUDPRoundTrip, let active, active.path == .udp, receiver?.stream == active.stream,
@@ -931,6 +938,7 @@ public final class MediaSession: @unchecked Sendable {
             sampleStartedAt = SessionClock.now; samplePackets = 0; sampleFrames = 0; sampleWaitMilliseconds = 0
             sampleBytes = 0; sampleSettledFragments = 0; sampleLostFragments = 0; sampleDeliveryMilliseconds = nil
             sampleEncode = MediaComputeTiming(); sampleDecode = MediaComputeTiming(); sampleDirectReduction = false
+            _ = udpJitter.takeWindowMilliseconds()
             onPathSwitch?(stateLabel(path), cause)
         }
         onState?(active == nil ? "正在准备视频" : "正在恢复画面")
@@ -983,15 +991,15 @@ public final class MediaSession: @unchecked Sendable {
             let header = MediaFrameHeader(stream: target.0, frameID: nextFrameID, isIDR: isIDR)
             let frame = try MediaFrame(header: header, packet: packet)
             let bytes = frame.packetBytes.count
-            let paced = Double(bytes) / bytesPerSecond
+            let paced = Self.udpPacingSpan(payloadBytes: bytes, megabits: settings.megabits)
             let budget = target.1 != .udp ? 5
                 : isIDR ? max(1, paced + roundTrip * 2 + 0.2) : max(0.25, paced + roundTrip * 3 + 0.08)
             let fragments = try cache!.insert(frame, deadline: SessionClock.now + min(5, budget))
             sentHeaders.insert(header)
             if deliveryPath != target.1 { deliveryPath = target.1; deliveryEstimator.reset(); deliverySentAt.removeAll() }
             if !isIDR, deliverySentAt.count < 16 {
-                let rate = target.1 == .udp ? bytesPerSecond : VideoSendPacing(megabits: settings.megabits).bytesPerSecond
-                deliverySentAt[header] = (SessionClock.now, Double(bytes) / rate)
+                let pacedSpan = target.1 == .udp ? paced : Double(bytes) / VideoSendPacing(megabits: settings.megabits).bytesPerSecond
+                deliverySentAt[header] = (SessionClock.now, pacedSpan)
             }
             if transaction != nil { transaction?.frameSubmitted = true }
             nextFrameID += 1
@@ -1042,7 +1050,8 @@ public final class MediaSession: @unchecked Sendable {
                 if feedback.kind == .reassembled, let waited = receiver?.collectionDuration(of: feedback.header) {
                     // The sender paces each frame at about the target rate; only time beyond that is queueing.
                     if !feedback.header.isIDR {
-                        let paced = Double(receiver?.fragmentedBytes(of: feedback.header) ?? 0) / bytesPerSecond
+                        let paced = Self.udpPacingSpan(payloadBytes: receiver?.fragmentedBytes(of: feedback.header) ?? 0,
+                                                       megabits: settings.megabits)
                         sampleWaitMilliseconds = max(sampleWaitMilliseconds, max(0, waited - paced) * 1000)
                     }
                     recordDuration(.mediaReassembly, seconds: waited, identifier: feedback.header.frameID)
@@ -1187,11 +1196,29 @@ public final class MediaSession: @unchecked Sendable {
         pumpDatagrams()
     }
 
-    private var bytesPerSecond: Double { max(1_500_000, Double(settings.megabits) * 1_000_000 / 8 * 1.6) }
+    // 1.6x target bitrate with a 2 Mbps floor prevents weak WAN tiers (1-6 Mbps) from pacing bursts at 12 Mbps,
+    // while keeping candidate keyframes inside the UDP trial window.
+    public static func udpPacingBytesPerSecond(megabits: Int) -> Double {
+        max(250_000, Double(max(1, megabits)) * 1_000_000 / 8 * 1.6)
+    }
+
+    public static func udpPacingBurstBytes(megabits: Int) -> Double {
+        let rate = udpPacingBytesPerSecond(megabits: megabits)
+        return min(32_768.0, max(Double(MediaFragment.maximumDatagramBytes + 1) * 4, rate * 0.008))
+    }
+
+    public static func udpPacingSpan(payloadBytes: Int, megabits: Int) -> TimeInterval {
+        guard payloadBytes > 0 else { return 0 }
+        let fragments = max(1, (payloadBytes + MediaFragment.maximumPayloadBytes - 1) / MediaFragment.maximumPayloadBytes)
+        let wireBytes = payloadBytes + fragments * (1 + MediaFragment.encodedHeaderBytes)
+        return Double(wireBytes) / udpPacingBytesPerSecond(megabits: megabits)
+    }
+
+    private var bytesPerSecond: Double { Self.udpPacingBytesPerSecond(megabits: settings.megabits) }
 
     private func pumpDatagrams() {
         guard !stopped, !paused, let peer = udpPeer, udpVerified else { return }
-        let now = SessionClock.now, burst = min(32_768.0, max(1101, bytesPerSecond * 0.006))
+        let now = SessionClock.now, burst = Self.udpPacingBurstBytes(megabits: settings.megabits)
         pacingCredit = min(burst, pacingCredit + max(0, now - pacingUpdatedAt) * bytesPerSecond)
         pacingUpdatedAt = now
         while datagramOffset < pendingDatagrams.count {
@@ -1288,6 +1315,7 @@ public final class MediaSession: @unchecked Sendable {
             // A queued packet may run before the timer after a stall. Neither can prove delivery failure
             // from an old deadline, or accept a pre-stall nonce as a fresh RTT sample.
             challenge = nil
+            udpJitter.reset()
             sendPing()
             policy.allowLivenessRecovery(now: SessionClock.now)
         }
@@ -1344,13 +1372,16 @@ public final class MediaSession: @unchecked Sendable {
                 // one delayed heartbeat cannot stand for several windows of local delay. Never reuse an old route's
                 // UDP RTT, or the initial 10 ms estimate, as evidence that the current video path is healthy.
                 var measuredRoundTrip = controlRoundTrip.flatMap { $0.at >= sampleStartedAt ? $0.milliseconds : nil }
-                if (transaction?.path ?? active?.path) == .udp, udpVerified, lastPongAt > 0, SessionClock.uptime - lastPongAt < 1 {
+                let isActiveUDP = (transaction?.path ?? active?.path) == .udp && udpVerified
+                if isActiveUDP, lastPongAt > 0, SessionClock.uptime - lastPongAt < 1 {
                     measuredRoundTrip = max(measuredRoundTrip ?? 0, roundTrip * 1_000)
                 }
+                let windowJitter = udpJitter.takeWindowMilliseconds()
                 let sample = MediaPathSample(duration: duration,
                     mediaActive: now - lastVideoAt < 1, networkSamples: samplePackets, decodedFrames: sampleFrames,
                     lossFraction: sampleSettledFragments >= MediaLossWindow.minimumFragments
                         ? Double(sampleLostFragments) / Double(sampleSettledFragments) : nil,
+                    jitterMilliseconds: isActiveUDP && samplePackets > 0 ? windowJitter : nil,
                     queueMilliseconds: samplePackets > 0 ? sampleWaitMilliseconds : nil,
                     encodeMilliseconds: sampleEncode.mean, decodeMilliseconds: sampleDecode.mean,
                     frameBudgetMilliseconds: 1000 / Double(settings.framesPerSecond),
@@ -1372,8 +1403,13 @@ public final class MediaSession: @unchecked Sendable {
             handleSendEvents(cache?.expire() ?? [])
             if now - sampleStartedAt >= 1 {
                 let delivery = deliveryEstimator.takeWindow(at: now).map { min(60_000, $0) }
-                if let identifier = sessionID, let encode = sampleEncode.mean, encode <= 10_000 {
-                    sendControl(MediaControl(.stats, sessionID: identifier, encodeMilliseconds: encode, deliveryMilliseconds: delivery))
+                if let identifier = sessionID {
+                    if let encode = sampleEncode.mean, encode <= 10_000 {
+                        sendControl(MediaControl(.stats, sessionID: identifier, encodeMilliseconds: encode, deliveryMilliseconds: delivery))
+                    } else if let delivery {
+                        sendControl(MediaControl(.stats, sessionID: identifier, encodeMilliseconds: 0,
+                                                 deliveryMilliseconds: delivery, encodeIdle: true))
+                    }
                 }
                 sampleStartedAt = now; sampleEncode = MediaComputeTiming(); sampleDecode = MediaComputeTiming()
             }
@@ -1443,6 +1479,7 @@ public final class MediaSession: @unchecked Sendable {
     private func retireDatagramPath() {
         let previous = udpPeer
         udpPeer = nil; udpVerified = false; receivedChallenge = false; challenge = nil; lastPongAt = 0
+        udpJitter.reset()
         previous?.close("媒体路径失活，需要重新握手")
         clearDatagrams()
         onDatagramPathRetired?(); alternateEndpoint?.retire?()

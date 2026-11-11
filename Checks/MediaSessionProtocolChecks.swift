@@ -43,6 +43,14 @@ func runMediaSessionProtocolChecks() {
         // An older viewer decodes stats with the new field and still sees a valid encode figure.
         let encoded = try JSONEncoder().encode(MediaControl(.stats, sessionID: session, encodeMilliseconds: 4.2, deliveryMilliseconds: 180))
         try check(String(decoding: encoded, as: UTF8.self).contains("encodeMilliseconds"), "Stats lost the field older viewers require")
+        let idleStats = MediaControl(.stats, sessionID: session, encodeMilliseconds: 0, deliveryMilliseconds: 195, encodeIdle: true)
+        try idleStats.validate()
+        let decodedIdle = try MediaControl.read(idleStats.message().payload)
+        try check(decodedIdle.encodeIdle == true && decodedIdle.deliveryMilliseconds == 195 && decodedIdle.encodeMilliseconds == 0,
+                  "Idle encode delivery stats changed in transit")
+        try rejects("Accepted encodeIdle outside stats") {
+            try MediaControl(.recover, sessionID: session, transportEpoch: 1, codecEpoch: 1, encodeIdle: true).validate()
+        }
         try rejects("Accepted non-finite encoder data") {
             try MediaControl(.stats, sessionID: session, encodeMilliseconds: .infinity).validate()
         }

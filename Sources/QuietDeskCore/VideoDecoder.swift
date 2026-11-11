@@ -1,3 +1,4 @@
+import CoreMedia
 import Foundation
 import VideoToolbox
 
@@ -42,10 +43,13 @@ public final class VideoDecoder {
                 if format == nil || !CMFormatDescriptionEqual(format!, otherFormatDescription: description) {
                     if let session { VTDecompressionSessionWaitForAsynchronousFrames(session); VTDecompressionSessionInvalidate(session) }
                     session = nil
+                    let specification = [kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: kCFBooleanTrue] as CFDictionary
                     let result = VTDecompressionSessionCreate(allocator: nil, formatDescription: description,
-                        decoderSpecification: nil, imageBufferAttributes: [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
+                        decoderSpecification: specification,
+                        imageBufferAttributes: [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
                         outputCallback: nil, decompressionSessionOut: &session)
-                    guard result == noErr else { throw DeskError.system("创建视频解码器失败", result) }
+                    guard result == noErr, let created = session else { throw DeskError.system("创建视频解码器失败", result) }
+                    _ = VTSessionSetProperty(created, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
                     format = description
                     hardwareChecked = false
                     hardware = nil
@@ -90,6 +94,16 @@ public final class VideoDecoder {
         }
     }
 
+    var realTimeMode: Bool? {
+        queue.sync {
+            guard let session else { return nil }
+            var value: Unmanaged<CFTypeRef>?
+            guard VTSessionCopyProperty(session, key: kVTDecompressionPropertyKey_RealTime,
+                                        allocator: nil, valueOut: &value) == noErr else { return nil }
+            return (value?.takeRetainedValue() as? NSNumber)?.boolValue
+        }
+    }
+
     public func stop() {
         timingLock.withLock { timingStopped = true; timings.removeAll() }
         queue.async { [self] in
@@ -105,6 +119,7 @@ public final class VideoDecoder {
 public final class LatestFrameMailbox {
     private let lock = NSLock()
     private var frame: CVPixelBuffer?
+    private var sampleBuffer: CMSampleBuffer?
     private var scheduled = false
     private var latestSequence: UInt32?
     private var frameSequence: UInt32?
@@ -112,7 +127,11 @@ public final class LatestFrameMailbox {
     private var decodedAt: PerformanceDiagnostics.Token?
     private var timingStopped = false
     public init(diagnostics: PerformanceDiagnostics? = nil) { self.diagnostics = diagnostics }
+    public var hasPendingFrame: Bool { lock.withLock { scheduled } }
     public func offer(_ frame: CVPixelBuffer, sequence: UInt32? = nil) -> Bool {
+        offer(frame, sampleBuffer: nil, sequence: sequence)
+    }
+    public func offer(_ frame: CVPixelBuffer, sampleBuffer: CMSampleBuffer?, sequence: UInt32? = nil) -> Bool {
         lock.withLock {
             if let sequence {
                 if let latestSequence {
@@ -124,6 +143,7 @@ public final class LatestFrameMailbox {
             }
             if scheduled, !timingStopped { diagnostics?.recordValue(.displayReplaced, 1) }
             self.frame = frame
+            self.sampleBuffer = sampleBuffer
             frameSequence = sequence
             decodedAt = timingStopped ? nil : diagnostics?.start()
             if scheduled { return false }
@@ -135,10 +155,14 @@ public final class LatestFrameMailbox {
         takeWithTiming()?.frame
     }
     public func takeWithTiming() -> (frame: CVPixelBuffer, decodedAt: PerformanceDiagnostics.Token?, sequence: UInt32?)? {
+        guard let taken = takeSampleWithTiming() else { return nil }
+        return (taken.frame, taken.decodedAt, taken.sequence)
+    }
+    public func takeSampleWithTiming() -> (frame: CVPixelBuffer, sampleBuffer: CMSampleBuffer?, decodedAt: PerformanceDiagnostics.Token?, sequence: UInt32?)? {
         lock.withLock {
             defer { scheduled = false; decodedAt = nil }
             guard let frame else { return nil }
-            return (frame, decodedAt, frameSequence)
+            return (frame, sampleBuffer, decodedAt, frameSequence)
         }
     }
     public func stopDiagnostics() {

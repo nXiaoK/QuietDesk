@@ -88,6 +88,7 @@ private struct VideoSampleChecks {
                     try require(ready.wait(timeout: .now() + 10) == .success && decoded.get(),
                                 "Synthetic encode/decode failed at \(rate) fps")
                 }
+                try require(decoder.realTimeMode == true, "VideoDecoder did not enable VideoToolbox RealTime decompression")
             }
         }
 

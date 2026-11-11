@@ -77,11 +77,31 @@ enum CursorBitmap {
 
 @MainActor
 private final class CursorOverlayView: NSView {
-    var image: NSImage? { didSet { needsDisplay = true } }
+    private var cachedCGImage: CGImage?
+    var image: NSImage? {
+        didSet {
+            guard image !== oldValue else { return }
+            cachedCGImage = image?.cgImage(forProposedRect: nil, context: nil, hints: nil)
+            needsDisplay = true
+        }
+    }
     override var isFlipped: Bool { true }
+    override var wantsUpdateLayer: Bool { true }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
-    override func draw(_ dirtyRect: NSRect) {
-        image?.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+    override func updateLayer() {
+        layer?.contentsGravity = .resize
+        layer?.contents = cachedCGImage
+    }
+}
+
+private final class DisplayLinkTarget: NSObject {
+    weak var canvas: RemoteCanvas?
+    init(_ canvas: RemoteCanvas) { self.canvas = canvas }
+    @objc func step(_ link: CADisplayLink) {
+        MainActor.assumeIsolated {
+            guard let canvas else { link.invalidate(); return }
+            canvas.displayLinkFired(link)
+        }
     }
 }
 
@@ -92,6 +112,8 @@ final class MediaCanvasReceiver: @unchecked Sendable {
         let id: MediaStreamID
         let decoder: MediaCanvasDecoding
         let mailbox: LatestFrameMailbox
+        private let sampleLock = NSLock()
+        private var sampleCache = VideoDisplayFormatCache()
         var pending: [UUID: (Bool) -> Void] = [:]
         var submittedAt: [UUID: TimeInterval] = [:]
         var lastCompletedAt: TimeInterval?
@@ -104,8 +126,15 @@ final class MediaCanvasReceiver: @unchecked Sendable {
             self.id = id; self.decoder = decoder
             mailbox = LatestFrameMailbox(diagnostics: diagnostics)
         }
+
+        func prepareSample(_ image: CVPixelBuffer) -> CMSampleBuffer? {
+            sampleLock.withLock { sampleCache.sampleBuffer(for: image) }
+        }
     }
 
+    // Outer fence acquired only by commit, stop and main-actor presentation so 60-240 fps
+    // receive/decode callbacks never contend with UI display work.
+    private let displayFence = NSLock()
     private let lock = NSLock()
     private let diagnostics: PerformanceDiagnostics?
     private let makeDecoder: (PerformanceDiagnostics?) -> MediaCanvasDecoding
@@ -162,12 +191,14 @@ final class MediaCanvasReceiver: @unchecked Sendable {
     func commit(stream id: MediaStreamID) -> Bool {
         var retired: Stream?
         var alreadyActive = false
-        let committed: Stream? = lock.withLock {
-            guard !stopped else { return nil }
-            if let active, active.id == id { alreadyActive = true; return nil }
-            guard let candidate, candidate.id == id, candidate.hasDecodedIDR else { return nil }
-            retired = active; active = candidate; self.candidate = nil
-            return candidate
+        let committed: Stream? = displayFence.withLock {
+            lock.withLock {
+                guard !stopped else { return nil }
+                if let active, active.id == id { alreadyActive = true; return nil }
+                guard let candidate, candidate.id == id, candidate.hasDecodedIDR else { return nil }
+                retired = active; active = candidate; self.candidate = nil
+                return candidate
+            }
         }
         if let retired { retire(retired) }
         guard let committed else { return alreadyActive }
@@ -176,12 +207,14 @@ final class MediaCanvasReceiver: @unchecked Sendable {
     }
 
     func stop() {
-        let retired: [Stream] = lock.withLock {
-            guard !stopped else { return [] }
-            stopped = true
-            let streams = [active, candidate].compactMap { $0 }
-            active = nil; candidate = nil; newestStream = nil
-            return streams
+        let retired: [Stream] = displayFence.withLock {
+            lock.withLock {
+                guard !stopped else { return [] }
+                stopped = true
+                let streams = [active, candidate].compactMap { $0 }
+                active = nil; candidate = nil; newestStream = nil
+                return streams
+            }
         }
         for stream in retired { retire(stream) }
     }
@@ -192,6 +225,10 @@ final class MediaCanvasReceiver: @unchecked Sendable {
     func reportDecodeTime(_ handler: ((Double) -> Void)?) { lock.withLock { decodeTime = handler } }
 
     private func decoded(_ result: Result<CVPixelBuffer, Error>, frame: MediaFrame, stream: Stream, token: UUID) {
+        let completedAt = SessionClock.now
+        let preparedSample: CMSampleBuffer?
+        if case .success(let image) = result { preparedSample = stream.prepareSample(image) }
+        else { preparedSample = nil }
         var success = false
         var shouldDisplay = false
         var serviceTime: (Double, (Double) -> Void)?
@@ -200,18 +237,17 @@ final class MediaCanvasReceiver: @unchecked Sendable {
             let submittedAt = stream.submittedAt.removeValue(forKey: token)
             guard !stopped, active === stream || candidate === stream else { return completion }
             if case .success(let image) = result {
-                let now = SessionClock.now
                 if let submittedAt, let decodeTime {
-                    serviceTime = (max(0, now - max(submittedAt, stream.lastCompletedAt ?? submittedAt)) * 1_000, decodeTime)
+                    serviceTime = (max(0, completedAt - max(submittedAt, stream.lastCompletedAt ?? submittedAt)) * 1_000, decodeTime)
                 }
-                stream.lastCompletedAt = now
+                stream.lastCompletedAt = completedAt
                 success = true
                 if frame.header.isIDR { stream.hasDecodedIDR = true }
                 if stream.lastDecoded.map({ frame.header.frameID > $0 }) ?? true {
                     stream.lastDecoded = frame.header.frameID
                     // The media envelope has a 64-bit frame ID. Its watermark above owns
                     // ordering; the legacy packet's independent 32-bit sequence is not reused.
-                    let offered = stream.mailbox.offer(image)
+                    let offered = stream.mailbox.offer(image, sampleBuffer: preparedSample)
                     shouldDisplay = active === stream && offered
                 }
             }
@@ -233,13 +269,16 @@ final class MediaCanvasReceiver: @unchecked Sendable {
         DispatchQueue.main.async { [weak self, stream] in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                // Keep commit/stop behind this short enqueue boundary. An old callback
-                // cannot enqueue after a newer commit has returned to the coordinator.
-                self.lock.withLock {
-                    stream.displayScheduled = false
-                    guard !self.stopped, self.active === stream else { return }
-                    self.willDisplay(stream.id)
-                    self.display(stream.mailbox)
+                // Keep commit/stop serialized against presentation without blocking decode/receive callbacks.
+                self.displayFence.withLock {
+                    let ready: (MediaStreamID, LatestFrameMailbox)? = self.lock.withLock {
+                        stream.displayScheduled = false
+                        guard !self.stopped, self.active === stream else { return nil }
+                        return (stream.id, stream.mailbox)
+                    }
+                    guard let (id, mailbox) = ready else { return }
+                    self.willDisplay(id)
+                    self.display(mailbox)
                 }
             }
         }
@@ -286,6 +325,21 @@ struct VideoDisplayFormatCache {
         return format
     }
 
+    mutating func sampleBuffer(for image: CVPixelBuffer) -> CMSampleBuffer? {
+        var sample: CMSampleBuffer?
+        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
+        guard let format = formatDescription(for: image),
+              CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: image,
+                formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample) == noErr,
+              let sample else { return nil }
+        if let array = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) {
+            let dictionary = unsafeBitCast(CFArrayGetValueAtIndex(array, 0), to: CFMutableDictionary.self)
+            CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        }
+        return sample
+    }
+
     mutating func reset() {
         cached = nil
     }
@@ -306,6 +360,9 @@ enum RemoteCanvasScalingMode: String, CaseIterable, Equatable {
 @MainActor
 final class RemoteCanvas: NSView {
     private let videoLayer: AVSampleBufferDisplayLayer
+    private let renderQueue = DispatchQueue(label: "quietdesk.canvas-render", qos: .userInteractive)
+    private var displayLink: CADisplayLink?
+    private var lastPresentedAt: TimeInterval = 0
     private var decoder: MediaCanvasDecoding = VideoDecoder()
     private var mailbox = LatestFrameMailbox()
     private var formatCache = VideoDisplayFormatCache()
@@ -451,7 +508,9 @@ final class RemoteCanvas: NSView {
     override func layout() {
         super.layout()
         updateLayerFrame()
-        showLatestFrame()
+        if videoLayer.status == .failed || displayedFrame == nil || mailbox.hasPendingFrame {
+            showLatestFrame()
+        }
         updateCursorPresentation()
     }
 
@@ -470,6 +529,8 @@ final class RemoteCanvas: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        displayLink?.invalidate()
+        displayLink = nil
         cancelScrollGesture()
         cancelPointerMoves()
         needsLayout = true
@@ -541,17 +602,20 @@ final class RemoteCanvas: NSView {
     private func updateCursorPresentation() {
         let localOwnsPointer = localPointerInside && window?.isKeyWindow == true && canControl && !pointerInputSuspended
         guard cursorState.enabled, !localOwnsPointer, let position = cursorState.position, position.insideDisplay else {
-            remoteCursorView.isHidden = true
+            if !remoteCursorView.isHidden { remoteCursorView.isHidden = true }
             return
         }
         let image = cursorImage ?? NSCursor.arrow.image
         let hotSpot = cursorHotSpot
         let rect = pictureRect
         remoteCursorView.image = image
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         remoteCursorView.frame = NSRect(x: rect.minX + position.x * rect.width - hotSpot.x,
                                        y: rect.minY + position.y * rect.height - hotSpot.y,
                                        width: image.size.width, height: image.size.height)
         remoteCursorView.isHidden = false
+        CATransaction.commit()
     }
 
     private func schedulePointerMove() {
@@ -594,14 +658,17 @@ final class RemoteCanvas: NSView {
         self.diagnostics = diagnostics
         let inbox = mailbox
         let decoder = decoder
+        let sampleLock = NSLock()
+        var sampleCache = VideoDisplayFormatCache()
         return { [weak self] packet, acknowledged in
             decoder.decode(packet) { [weak self] result in
                 switch result {
                 case .success(let image):
-                    if inbox.offer(image, sequence: packet.sequence) {
+                    let prepared = sampleLock.withLock { sampleCache.sampleBuffer(for: image) }
+                    if inbox.offer(image, sampleBuffer: prepared, sequence: packet.sequence) {
                         DispatchQueue.main.async {
                             guard let self, self.mailbox === inbox else { return }
-                            self.showLatestFrame()
+                            self.requestFramePresentation()
                         }
                     }
                     // Decode completion is independent of window visibility and display readiness.
@@ -636,11 +703,50 @@ final class RemoteCanvas: NSView {
                 self.displayedFrame = nil
                 self.formatCache.reset()
                 self.mailbox = inbox
+                self.showLatestFrame()
+                return
             }
-            self.showLatestFrame()
+            self.requestFramePresentation()
         }
         mediaReceiver = receiver
         return receiver
+    }
+
+    private func ensureDisplayLink() -> CADisplayLink? {
+        if let displayLink { return displayLink }
+        guard window != nil else { return nil }
+        let target = DisplayLinkTarget(self)
+        let link = self.displayLink(target: target, selector: #selector(DisplayLinkTarget.step(_:)))
+        link.isPaused = true
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+        return link
+    }
+
+    fileprivate func displayLinkFired(_ link: CADisplayLink) {
+        guard mailbox.hasPendingFrame else {
+            link.isPaused = true
+            return
+        }
+        showLatestFrame()
+    }
+
+    private func requestFramePresentation() {
+        guard let window, window.isVisible, window.occlusionState.contains(.visible), displayedFrame != nil else {
+            showLatestFrame()
+            return
+        }
+        let maxFPS = max(60, window.screen?.maximumFramesPerSecond ?? 60)
+        let vsyncInterval = 1.0 / Double(maxFPS)
+        if SessionClock.uptime - lastPresentedAt >= vsyncInterval * 0.75 {
+            showLatestFrame()
+            return
+        }
+        if let link = ensureDisplayLink() {
+            link.isPaused = false
+        } else {
+            showLatestFrame()
+        }
     }
 
     private func showLatestFrame() {
@@ -648,31 +754,27 @@ final class RemoteCanvas: NSView {
         guard videoLayer.isReadyForMoreMediaData else {
             if !awaitingDisplay {
                 awaitingDisplay = true
-                videoLayer.requestMediaDataWhenReady(on: .main) { [weak self] in
-                    MainActor.assumeIsolated {
-                        guard let self else { return }
-                        self.videoLayer.stopRequestingMediaData()
-                        self.awaitingDisplay = false
-                        self.showLatestFrame()
+                videoLayer.requestMediaDataWhenReady(on: renderQueue) { [weak self] in
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated {
+                            guard let self else { return }
+                            self.videoLayer.stopRequestingMediaData()
+                            self.awaitingDisplay = false
+                            self.showLatestFrame()
+                        }
                     }
                 }
             }
             return
         }
-        guard let received = mailbox.takeWithTiming() else { return }
+        guard let received = mailbox.takeSampleWithTiming() else {
+            displayLink?.isPaused = true
+            return
+        }
+        if !mailbox.hasPendingFrame { displayLink?.isPaused = true }
         let image = received.frame
         let enqueueStarted = diagnostics?.start()
-        var sample: CMSampleBuffer?
-        var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
-        guard let format = formatCache.formatDescription(for: image),
-              CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: image,
-                formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample) == noErr,
-              let sample else { return }
-        if let array = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) {
-            let dictionary = unsafeBitCast(CFArrayGetValueAtIndex(array, 0), to: CFMutableDictionary.self)
-            CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                                 Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
-        }
+        guard let sample = received.sampleBuffer ?? formatCache.sampleBuffer(for: image) else { return }
         // Keep the old cursor mode while the layer is busy or sample creation fails.
         // Clear its retained image before changing modes so a burned-in old cursor
         // cannot remain visible underneath the immediate local cursor.
@@ -683,12 +785,16 @@ final class RemoteCanvas: NSView {
         }
         videoLayer.enqueue(sample)
         displayedFrame = image
+        lastPresentedAt = SessionClock.uptime
         // Enqueue completion does not confirm that the frame has reached the screen.
         diagnostics?.record(.decodeToDisplay, since: received.decodedAt, kind: .video, identifier: received.sequence.map(UInt64.init))
         diagnostics?.record(.displayEnqueue, since: enqueueStarted, kind: .video, identifier: received.sequence.map(UInt64.init))
     }
 
     func reset() {
+        displayLink?.invalidate()
+        displayLink = nil
+        lastPresentedAt = 0
         cancelPointerMoves()
         cursorState = CursorPresentationState(); cursorImage = nil; localCursor = .arrow
         cursorPublished = nil; localPointerInside = false
@@ -960,7 +1066,11 @@ final class RemoteCanvas: NSView {
         return true
     }
 
-    deinit { moveTimer?.invalidate(); for observer in observers { NotificationCenter.default.removeObserver(observer) } }
+    deinit {
+        displayLink?.invalidate()
+        moveTimer?.invalidate()
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+    }
 }
 
 private extension RemoteInput.ScrollPhase {

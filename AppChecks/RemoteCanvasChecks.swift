@@ -1152,6 +1152,11 @@ private struct RemoteCanvasChecks {
             let resizedDimensions = CMVideoFormatDescriptionGetDimensions(display.displayedFormats[2])
             try require(resizedDimensions.width == 96 && resizedDimensions.height == 64,
                         "Resized format description had wrong dimensions: \(resizedDimensions)")
+            // Ensure routine layout passes do not create and re-enqueue duplicate sample buffers when no new frame arrived.
+            canvas.layout()
+            canvas.layout()
+            try require(display.displayedFormats.count == 3,
+                        "Layout passes redundantly re-enqueued an already displayed frame: \(display.displayedFormats.count)")
         }
 
         run("Original 1:1 scaling centers smaller remote pictures without upscaling and maps pointer coordinates accurately") {

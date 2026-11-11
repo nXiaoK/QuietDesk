@@ -521,6 +521,51 @@ public struct MediaQualityPolicy: Sendable {
     public static let initialBitrateHold: TimeInterval = 4
     public static let maximumBitrateHold: TimeInterval = 120
     public static let upgradeProbation: TimeInterval = 30
+    /// Sustained zero-loss healthy decoded duration after which degraded resolution/FPS may step back up
+    /// even when normal office/coding screen activity stays below half of the current bitrate target.
+    public static let degradedPixelRecoveryHold: TimeInterval = 45
+    /// Initial bitrate cap for non-LAN direct WAN targets before path capacity is proven.
+    public static let wanDirectStartingMegabits = 20
+    /// Initial bitrate cap for relayed targets, leaving headroom above Retina 60 fps readable floor.
+    public static let relayStartingMegabits = 15
+
+    /// True only for loopback, RFC1918/link-local/ULA LAN addresses, or local mDNS names.
+    /// Public IPv4/IPv6, WAN domains, and CGNAT/overlay 100.64.0.0/10 start cautiously until RTT proves LAN.
+    public static func isLikelyLocalHost(_ address: String) -> Bool {
+        var host = address.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if host.hasPrefix("[") && host.hasSuffix("]") {
+            host = String(host.dropFirst().dropLast())
+        }
+        if let zone = host.firstIndex(of: "%") {
+            host = String(host[..<zone])
+        }
+        guard !host.isEmpty else { return false }
+        if host == "localhost" || host == "::1"
+            || host.hasSuffix(".local") || host.hasSuffix(".lan") || host.hasSuffix(".home.arpa")
+            || (!host.contains(".") && !host.contains(":")) {
+            return true
+        }
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        if parts.count == 4, let a = Int(parts[0]), let b = Int(parts[1]),
+           let c = Int(parts[2]), let d = Int(parts[3]),
+           [a, b, c, d].allSatisfy({ (0...255).contains($0) }) {
+            if a == 127 || a == 10 { return true }
+            if a == 192 && b == 168 { return true }
+            if a == 172 && (16...31).contains(b) { return true }
+            if a == 169 && b == 254 { return true }
+            return false
+        }
+        if host.contains(":") {
+            if host.hasPrefix("fe80:") || host.hasPrefix("fe8") || host.hasPrefix("fe9")
+                || host.hasPrefix("fea") || host.hasPrefix("feb") {
+                return true
+            }
+            if (host.hasPrefix("fc") || host.hasPrefix("fd")), host.count >= 4 {
+                return true
+            }
+        }
+        return false
+    }
     // Below this many bits per pixel and frame, screen text smears; lower the frame rate or size instead.
     public static let minimumBitsPerPixel = 0.02
     // Raising the frame rate or size needs room for twice that floor at the new level.
@@ -897,27 +942,45 @@ public struct MediaQualityPolicy: Sendable {
         guard now - lastChangeAt + mediaPolicyTimeTolerance >= 3 else { return nil }
         var next = effective
         let pixelsDuration = localLatencyLimited ? filledDuration : (next.megabits < upperBound.megabits ? activeDuration : healthyDuration)
-        if pixelsDuration + mediaPolicyTimeTolerance >= upgradeHold {
-            if let higher = StreamSettings.frameRates.first(where: { $0 > next.framesPerSecond && $0 <= upperBound.framesPerSecond }) {
+        let pixelsBelowCeiling = next.framesPerSecond < upperBound.framesPerSecond || shownEdge(next) < shownEdge(upperBound)
+        let sustainedDegradedHealth = !isLocalNetwork && !localLatencyLimited && pixelsBelowCeiling
+            && healthyDuration + mediaPolicyTimeTolerance >= max(Self.degradedPixelRecoveryHold, max(upgradeHold, bitrateHold) * 2)
+        if pixelsDuration + mediaPolicyTimeTolerance >= upgradeHold || sustainedDegradedHealth {
+            var blockedByBitrate = false
+            if let higher = StreamSettings.frameRates.first(where: { $0 > next.framesPerSecond && $0 <= upperBound.framesPerSecond }),
+               computeFits(higher) {
                 var candidate = next; candidate.framesPerSecond = higher
-                if Double(next.megabits) >= megabits(Self.comfortableBitsPerPixel, for: candidate), computeFits(higher) {
+                if Double(next.megabits) >= megabits(Self.comfortableBitsPerPixel, for: candidate) {
                     return recommendUpgrade(candidate, kind: .pixels, now: now)
                 }
+                blockedByBitrate = true
             }
             if shownEdge(next) < shownEdge(upperBound),
                let higher = StreamSettings.longestEdges.first(where: { $0 > next.longestEdge && $0 <= upperBound.longestEdge }) {
                 var candidate = next; candidate.longestEdge = higher
-                if Double(next.megabits) >= megabits(Self.comfortableBitsPerPixel, for: candidate), !recentlySlow(candidate, now: now) {
-                    return recommendUpgrade(candidate, kind: .pixels, now: now)
+                if !recentlySlow(candidate, now: now) {
+                    if Double(next.megabits) >= megabits(Self.comfortableBitsPerPixel, for: candidate) {
+                        return recommendUpgrade(candidate, kind: .pixels, now: now)
+                    }
+                    blockedByBitrate = true
                 }
             }
+            if blockedByBitrate, next.megabits < upperBound.megabits,
+               let higher = nextBitrateStep(from: next.megabits) {
+                next.megabits = higher
+                return recommendUpgrade(next, kind: .bitrate, now: now)
+            }
         }
-        guard next.megabits < upperBound.megabits, filledDuration + mediaPolicyTimeTolerance >= bitrateHold else { return nil }
-        let target = Double(next.megabits) * 1.25
-        guard let higher = bitRates.first(where: { Double($0) >= target && $0 <= upperBound.megabits })
-                ?? bitRates.last(where: { $0 > next.megabits && $0 <= upperBound.megabits }) else { return nil }
+        guard next.megabits < upperBound.megabits, filledDuration + mediaPolicyTimeTolerance >= bitrateHold,
+              let higher = nextBitrateStep(from: next.megabits) else { return nil }
         next.megabits = higher
         return recommendUpgrade(next, kind: .bitrate, now: now)
+    }
+
+    private func nextBitrateStep(from current: Int) -> Int? {
+        let target = Double(current) * 1.25
+        return bitRates.first(where: { Double($0) >= target && $0 <= upperBound.megabits })
+            ?? bitRates.last(where: { $0 > current && $0 <= upperBound.megabits })
     }
 
     private mutating func recommendUpgrade(_ settings: StreamSettings, kind: UpgradeKind, now: TimeInterval) -> StreamSettings {

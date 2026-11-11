@@ -1198,12 +1198,13 @@ private struct VideoPipelineChecks {
                         "4:4:4 Display P3 configuration did not use BGRA + displayP3 + default capturesAudio=false")
 
             let cfgAudio = ScreenStreamer.configuration(width: 1920, height: 1080, settings: .init(framesPerSecond: 60, megabits: 8),
-                                                        capturesAudio: true)
+                                                        includesCursor: false, capturesAudio: true)
             try require(cfgAudio.capturesAudio
+                        && !cfgAudio.showsCursor
                         && cfgAudio.excludesCurrentProcessAudio
                         && cfgAudio.sampleRate == RemoteAudioControl.sampleRate
                         && cfgAudio.channelCount == RemoteAudioControl.channels,
-                        "Audio-enabled SCStreamConfiguration did not set 48 kHz 2ch with excludesCurrentProcessAudio")
+                        "Audio-enabled cursor-excluded SCStreamConfiguration did not set showsCursor=false and 48 kHz 2ch")
 
             var refine = StaticFrameRefinement()
             try require(refine.nextPassNumber == nil, "Idle StaticFrameRefinement reported a pass number")

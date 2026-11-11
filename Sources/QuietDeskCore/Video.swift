@@ -209,9 +209,15 @@ public final class VideoEncoder {
         return (boostedMegabits, expectedFPS, quality)
     }
 
+    public static func dataRateLimitBytes(megabits: Int) -> Int {
+        // 1.5x one-second burst headroom prevents sharp text from smearing during sudden scrolling/window motion
+        // while remaining inside MediaSession's 1.6x UDP datagram pacer.
+        max(187_500, Int((Double(max(1, megabits)) * 1_000_000 / 8 * 1.5).rounded()))
+    }
+
     private static func setBitrate(_ megabits: Int, using set: SetProperty) throws {
         try set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: megabits * 1_000_000))
-        try set(kVTCompressionPropertyKey_DataRateLimits, [NSNumber(value: megabits * 1_000_000 / 8), NSNumber(value: 1)] as CFArray)
+        try set(kVTCompressionPropertyKey_DataRateLimits, [NSNumber(value: dataRateLimitBytes(megabits: megabits)), NSNumber(value: 1)] as CFArray)
     }
 
     private static func setKeyFrameInterval(framesPerSecond: Int, using set: SetProperty) throws {
@@ -232,14 +238,14 @@ public final class VideoEncoder {
             _ = writeProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: boost.expectedFPS))
             _ = writeProperty(session, kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: boost.megabits * 1_000_000))
             _ = writeProperty(session, kVTCompressionPropertyKey_DataRateLimits,
-                              [NSNumber(value: boost.megabits * 1_000_000 / 8), NSNumber(value: 1)] as CFArray)
+                              [NSNumber(value: Self.dataRateLimitBytes(megabits: boost.megabits)), NSNumber(value: 1)] as CFArray)
             _ = writeProperty(session, kVTCompressionPropertyKey_Quality, NSNumber(value: boost.quality))
             refinementBoostActive = true
         } else if refinementBoostActive {
             _ = writeProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: configuredSettings.framesPerSecond))
             _ = writeProperty(session, kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: configuredSettings.megabits * 1_000_000))
             _ = writeProperty(session, kVTCompressionPropertyKey_DataRateLimits,
-                              [NSNumber(value: configuredSettings.megabits * 1_000_000 / 8), NSNumber(value: 1)] as CFArray)
+                              [NSNumber(value: Self.dataRateLimitBytes(megabits: configuredSettings.megabits)), NSNumber(value: 1)] as CFArray)
             _ = writeProperty(session, kVTCompressionPropertyKey_Quality, nil)
             refinementBoostActive = false
         }

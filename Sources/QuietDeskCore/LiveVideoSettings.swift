@@ -21,12 +21,24 @@ public struct StreamSettingsRequest: Codable, Sendable {
     public let codec: VideoCodec?
     // Sent only to a host that advertised hevc444VideoV1. Missing means 4:2:0.
     public let chromaSubsampling: VideoChromaSubsampling?
+    // Sent only during initial startup negotiation when the host advertised initialCursorNegotiationV1.
+    public let cursorRequestID: UUID?
+    public let independentCursor: Bool?
     public init(id: UUID = UUID(), settings: StreamSettings, codec: VideoCodec? = nil,
-                chromaSubsampling: VideoChromaSubsampling? = nil) {
+                chromaSubsampling: VideoChromaSubsampling? = nil,
+                cursorRequestID: UUID? = nil, independentCursor: Bool? = nil) {
         self.id = id
         self.settings = settings
         self.codec = codec
         self.chromaSubsampling = chromaSubsampling
+        self.cursorRequestID = cursorRequestID
+        self.independentCursor = independentCursor
+    }
+    public func validate() throws {
+        try settings.validateControlValues()
+        guard (cursorRequestID == nil) == (independentCursor == nil) else {
+            throw DeskError.invalid("初始光标协商字段不完整")
+        }
     }
 }
 
@@ -60,6 +72,7 @@ public struct VideoTuningSession {
     public private(set) var desiredCodec: VideoCodec = .h264
     public private(set) var appliedChroma: VideoChromaSubsampling = .yuv420
     public private(set) var desiredChroma: VideoChromaSubsampling = .yuv420
+    private var pendingInitialCursor: (requestID: UUID, enabled: Bool)?
     public init(applied: VideoStreamState, preferred: StreamSettings? = nil) throws {
         try applied.validate()
         if let preferred { try preferred.validateControlValues() }
@@ -80,6 +93,10 @@ public struct VideoTuningSession {
         desiredChroma = chroma
         if chroma == .yuv444 { desiredCodec = .hevc }
     }
+    /// Attaches one-shot initial independent cursor negotiation onto the first startup StreamSettingsRequest.
+    public mutating func chooseInitialCursor(requestID: UUID, enabled: Bool) {
+        pendingInitialCursor = (requestID, enabled)
+    }
     public mutating func nextRequest() -> StreamSettingsRequest? {
         guard pending == nil,
               desired != applied.settings || desiredCodec != appliedCodec || desiredChroma != appliedChroma else {
@@ -96,10 +113,14 @@ public struct VideoTuningSession {
     private mutating func makeRequest() -> StreamSettingsRequest {
         // H.264 / 4:2:0 on both sides keeps the request exactly as older hosts know it.
         let effectiveChroma: VideoChromaSubsampling = desiredCodec == .hevc ? desiredChroma : .yuv420
+        let initialCursor = pendingInitialCursor
+        pendingInitialCursor = nil
         let request = StreamSettingsRequest(
             settings: desired,
             codec: desiredCodec == .h264 && appliedCodec == .h264 ? nil : desiredCodec,
-            chromaSubsampling: effectiveChroma == .yuv420 && appliedChroma == .yuv420 ? nil : effectiveChroma
+            chromaSubsampling: effectiveChroma == .yuv420 && appliedChroma == .yuv420 ? nil : effectiveChroma,
+            cursorRequestID: initialCursor?.requestID,
+            independentCursor: initialCursor?.enabled
         )
         pending = request
         return request

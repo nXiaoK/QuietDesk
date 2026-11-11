@@ -557,4 +557,53 @@ func runLiveSettingsChecks() {
         try check(recovered.id == saved444.id && recovered.chromaSubsampling == nil && recovered.videoSettings == medium,
                   "Malformed chromaSubsampling hid saved ConnectionRecord")
     }
+
+    run("Single-start cursor negotiation attaches once to initial StreamSettingsRequest and validates field pairing") {
+        let hello = Hello(name: "Studio", width: 2560, height: 1440, settings: .init(), canControl: true,
+                          independentCursorV1: true, initialStreamNegotiationV1: true, initialCursorNegotiationV1: true)
+        let decodedHello = try Wire.readJSON(Hello.self, Wire.json(.hello, hello).payload)
+        try check(decodedHello.initialCursorNegotiationV1 == true, "Hello lost initialCursorNegotiationV1")
+        let legacyHello = try Wire.readJSON(Hello.self, Wire.json(.hello, Hello(name: "Old", width: 1920, height: 1080,
+                                                                               settings: .init(), canControl: true)).payload)
+        try check(legacyHello.initialCursorNegotiationV1 == nil, "Legacy Hello unexpectedly set initialCursorNegotiationV1")
+
+        let initial = VideoStreamState(settings: .init(longestEdge: 1920, framesPerSecond: 30, megabits: 10), width: 1920, height: 1080)
+        var unchanged = try VideoTuningSession(applied: initial, preferred: initial.settings)
+        let cursorID = UUID()
+        unchanged.chooseInitialCursor(requestID: cursorID, enabled: true)
+        // Video settings themselves did not change, so nextRequest stays nil while initialConfirmationRequest carries the cursor fields once.
+        try check(unchanged.nextRequest() == nil, "Initial cursor alone triggered a manual-style video settings request")
+        guard let confirmReq = unchanged.initialConfirmationRequest() else {
+            throw CheckFailure("initialConfirmationRequest returned nil")
+        }
+        try confirmReq.validate()
+        try check(confirmReq.cursorRequestID == cursorID && confirmReq.independentCursor == true,
+                  "initialConfirmationRequest lost initial cursor negotiation")
+        try check( try unchanged.receive(StreamSettingsResult(id: confirmReq.id, state: initial, restartsStream: false)),
+                  "Initial confirmation reply rejected")
+        try unchanged.choose(.init(longestEdge: 2560, framesPerSecond: 60, megabits: 20))
+        guard let followUp = unchanged.nextRequest() else { throw CheckFailure("Follow-up request missing") }
+        let encodedFollowUp = String(decoding: try JSONEncoder().encode(followUp), as: UTF8.self)
+        try check(followUp.cursorRequestID == nil && followUp.independentCursor == nil
+                  && !encodedFollowUp.contains("cursorRequestID") && !encodedFollowUp.contains("independentCursor"),
+                  "Subsequent StreamSettingsRequest re-sent one-shot initial cursor fields")
+
+        // Also attaches when initial video settings/codec differ from Hello (nextRequest path).
+        var changed = try VideoTuningSession(applied: initial, preferred: .init(longestEdge: 2560, framesPerSecond: 60, megabits: 20))
+        let secondCursorID = UUID()
+        changed.chooseCodec(.hevc)
+        changed.chooseInitialCursor(requestID: secondCursorID, enabled: false)
+        guard let firstChanged = changed.nextRequest() else { throw CheckFailure("Changed startup sent no nextRequest") }
+        try firstChanged.validate()
+        try check(firstChanged.codec == .hevc && firstChanged.cursorRequestID == secondCursorID && firstChanged.independentCursor == false,
+                  "Changed startup request missed HEVC or initial cursor fields")
+
+        // Mismatched cursorRequestID / independentCursor is rejected on validation.
+        try rejects("Mismatched cursorRequestID without independentCursor was accepted") {
+            try StreamSettingsRequest(settings: .init(), cursorRequestID: UUID(), independentCursor: nil).validate()
+        }
+        try rejects("Mismatched independentCursor without cursorRequestID was accepted") {
+            try StreamSettingsRequest(settings: .init(), cursorRequestID: nil, independentCursor: true).validate()
+        }
+    }
 }

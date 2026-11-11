@@ -696,7 +696,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 
     func start(_ capture: CapturePlan, codec: VideoCodec = .h264,
                chromaSubsampling: VideoChromaSubsampling = .yuv420,
-               capturesAudio: Bool = false) async throws {
+               capturesAudio: Bool = false,
+               includesCursor: Bool = true) async throws {
         try Task.checkCancellation()
         let width = capture.width, height = capture.height, settings = capture.settings
         let id = UUID()
@@ -704,6 +705,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                                       chromaSubsampling: chromaSubsampling, colorSpace: capture.colorSpace, id: id)
         let stream = SCStream(filter: capture.filter,
             configuration: Self.configuration(width: width, height: height, settings: settings,
+                                              includesCursor: includesCursor,
                                               chromaSubsampling: encoder.chromaSubsampling,
                                               colorSpace: capture.colorSpace,
                                               capturesAudio: capturesAudio), delegate: self)
@@ -736,8 +738,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             self.capturesAudio = capturesAudio
             self.audioOutputAttached = capturesAudio
             cursorGate = CursorCaptureGate()
-            appliedCursorIncluded = true
-            lastConfirmedCursorIncluded = true
+            appliedCursorIncluded = includesCursor
+            lastConfirmedCursorIncluded = includesCursor
             running = true
             syncAudioDeliveryState()
             let watchdog = DispatchSource.makeTimerSource(queue: queue)

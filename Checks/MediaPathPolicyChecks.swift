@@ -1199,4 +1199,59 @@ func runMediaPathPolicyChecks() {
         jitter.reset()
         try check(jitter.takeWindowMilliseconds() == nil, "Reset jitter estimator retained old samples")
     }
+
+    run("Degraded desktop sessions escape low-resolution bitrate deadlocks, classify non-LAN hosts and give encoder burst headroom") {
+        // 1. Encoder DataRateLimits gives 1.5x 1-second burst headroom while staying strictly under MediaSession's 1.6x UDP pacer.
+        for megabits in [1, 6, 15, 20, 60] {
+            let limitBytes = Double(VideoEncoder.dataRateLimitBytes(megabits: megabits))
+            let averageBytes = Double(megabits) * 125_000
+            let udpPacerBytes = MediaSession.udpPacingBytesPerSecond(megabits: megabits)
+            try check(abs(limitBytes - averageBytes * 1.5) < 1 && limitBytes < udpPacerBytes,
+                      "Encoder DataRateLimits (\(limitBytes)) misaligned with average (\(averageBytes)) or UDP pacer (\(udpPacerBytes))")
+        }
+
+        // 2. Host classification distinguishes LAN/Bonjour/loopback from WAN, CGNAT/Overlay (100.64.0.0/10) and public IPv6.
+        for local in ["127.0.0.1", "::1", "localhost", "mac-studio.local", "macbook", "192.168.1.20", "10.0.0.8", "172.16.5.4", "172.31.255.1", "fd12:3456::1", "fe80::1%en0"] {
+            try check(MediaQualityPolicy.isLikelyLocalHost(local), "Expected local classification for \(local)")
+        }
+        for remote in ["100.64.0.1", "100.101.202.3", "172.32.0.1", "203.0.113.10", "remote.example.com", "240e:3b0:1234::8"] {
+            try check(!MediaQualityPolicy.isLikelyLocalHost(remote), "Expected WAN/overlay classification for \(remote)")
+        }
+
+        // 3. Catch-22 recovery during active desktop scrolling: degraded to 1920@30 / 6 Mbps with ceiling 8192@60 / 60 Mbps (3456×2234 Retina).
+        // Desktop scrolling produces ~2.2 Mbps (< 50% of 6 Mbps, so filledDuration stays 0), yet exceeds minimumBitsPerPixel so activeDuration advances.
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 60)
+        let degraded = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 6)
+        var desktop = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, applied: degraded,
+                                             bitRates: StreamSettings.adaptiveBitRates, appliedSize: (1920, 1240), now: 0)
+        var now = 0.0
+        var trajectory: [StreamSettings] = []
+        while now < 150, desktop.effective.dimensions(width: 3456, height: 2234) != (3456, 2234) || desktop.effective.framesPerSecond < 60 {
+            now += 1
+            // Simulate realistic desktop scrolling bitrate (~35% of current cap, always >= minimumBPP but < 50% filledShare).
+            let desktopMbps = max(2.2, Double(desktop.effective.megabits) * 0.35)
+            if let next = desktop.observe(sample(received: desktopMbps), now: now) {
+                trajectory.append(next)
+                _ = desktop.confirmApplied(next, now: now)
+                let size = next.dimensions(width: 3456, height: 2234)
+                try desktop.synchronizeApplied(next, size: size, now: now)
+            }
+        }
+        try check(desktop.effective.dimensions(width: 3456, height: 2234) == (3456, 2234) && desktop.effective.framesPerSecond == 60,
+                  "Active desktop session remained trapped below native Retina quality: \(trajectory), final=\(desktop.effective)")
+
+        // 4. Quiet coding desktop degraded to 1280@30 / 2 Mbps recovers gently once sustained healthy time reaches degradedPixelRecoveryHold (45s).
+        let severeDegraded = StreamSettings(longestEdge: 1280, framesPerSecond: 30, megabits: 2)
+        var quietCoding = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, applied: severeDegraded,
+                                                 bitRates: StreamSettings.adaptiveBitRates, appliedSize: (1280, 828), now: 0)
+        for t in 1...44 {
+            try check(quietCoding.observe(sample(received: 0.3), now: Double(t)) == nil,
+                      "Quiet degraded screen recovered prematurely at t=\(t)s")
+        }
+        guard let step1 = quietCoding.observe(sample(received: 0.3), now: 45) else {
+            throw CheckFailure("Sustained 45s healthy degraded session made zero recovery progress")
+        }
+        try check(step1.megabits > severeDegraded.megabits || step1.framesPerSecond > severeDegraded.framesPerSecond,
+                  "Expected bitrate or FPS step toward sharpest desktop quality, got \(step1)")
+    }
 }

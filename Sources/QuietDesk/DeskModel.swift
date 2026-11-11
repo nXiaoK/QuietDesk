@@ -1522,7 +1522,8 @@ final class DeskModel: ObservableObject {
                             selectedDisplayID: initialDisplays.isEmpty ? nil : snapshot.id,
                             remoteAudioV1: true,
                             relativeMouseV1: true,
-                            trackpadGesturesV1: true)))
+                            trackpadGesturesV1: true,
+                            initialCursorNegotiationV1: true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -1549,9 +1550,15 @@ final class DeskModel: ObservableObject {
                                 self.stop()
                             }
                         }
-                        let negotiatedInitial = await host.awaitInitialSettings(
-                            grace: host.usesRelayControl ? .milliseconds(160) : .milliseconds(60)
-                        )
+                        let remoteTrafficAddress = (try? TrafficEndpoint(remoteEndpoint: connection.endpoint, listeningPort: listeningPort))?.address
+                        let initialSettingsGrace: Duration = if host.usesRelayControl {
+                            .milliseconds(600)
+                        } else if let remoteTrafficAddress, !MediaQualityPolicy.isLikelyLocalHost(remoteTrafficAddress) {
+                            .milliseconds(350)
+                        } else {
+                            .milliseconds(100)
+                        }
+                        let negotiatedInitial = await host.awaitInitialSettings(grace: initialSettingsGrace)
                         defer {
                             if let request = negotiatedInitial, host.settingsRequestID == request.id {
                                 host.settingsRequestID = nil
@@ -1562,6 +1569,7 @@ final class DeskModel: ObservableObject {
                         var activeCapture = capture
                         var activeCodec: VideoCodec = .h264
                         var activeChroma: VideoChromaSubsampling = .yuv420
+                        var initialIncludesCursor = true
                         if let request = negotiatedInitial {
                             activeCodec = request.codec == .hevc && VideoEncoder.hardwareHEVCAvailable ? .hevc : .h264
                             activeChroma = activeCodec == .hevc
@@ -1570,13 +1578,39 @@ final class DeskModel: ObservableObject {
                             if request.settings != settings {
                                 activeCapture = ScreenStreamer.prepareCapture(display: display, settings: request.settings)
                             }
+                            if let wantIndependent = request.independentCursor {
+                                if !wantIndependent, let error = host.effects?.setIndependentCursor(false) {
+                                    candidate.close("本机光标恢复失败，正在结束共享：\(error)", retryable: true)
+                                    return
+                                }
+                                initialIncludesCursor = !wantIndependent
+                            }
                         }
-                        try await streamer.start(activeCapture, codec: activeCodec, chromaSubsampling: activeChroma)
+                        try await streamer.start(activeCapture, codec: activeCodec,
+                                                 chromaSubsampling: activeChroma,
+                                                 includesCursor: initialIncludesCursor)
                         guard self.generation == token, self.active, self.peer === candidate, self.hostSession === host, !Task.isCancelled else {
                             await streamer.stop()
                             return
                         }
                         if let request = negotiatedInitial {
+                            if let cursorReqID = request.cursorRequestID, request.independentCursor != nil {
+                                let actualIncluded = streamer.currentCursorIncluded ?? initialIncludesCursor
+                                host.cursorEnabled = !actualIncluded
+                                if let error = host.effects?.setIndependentCursor(host.cursorEnabled), !host.cursorEnabled {
+                                    await streamer.stop()
+                                    candidate.close("本机光标恢复失败，正在结束共享：\(error)", retryable: true)
+                                    return
+                                }
+                                let cursorReason: CursorControl.Reason? = host.paused ? .waitingForResume : nil
+                                host.cursorEpoch = 1
+                                host.cursorSubscribed = true
+                                host.cursorShapeRevision = 0
+                                host.cursorPositionSequence = 0
+                                candidate.send(try CursorControl(.status, requestID: cursorReqID, cursorID: host.cursorID,
+                                    epoch: host.cursorEpoch, enabled: host.cursorEnabled, reason: cursorReason).message())
+                                self.startHostCursorSampler(host, peer: candidate)
+                            }
                             let updatedState = VideoStreamState(settings: request.settings,
                                                                 width: activeCapture.width,
                                                                 height: activeCapture.height)
@@ -1831,7 +1865,9 @@ final class DeskModel: ObservableObject {
             DispatchQueue.main.async {
                 guard let self, let viewer, self.viewerSession === viewer, !viewer.mediaCommitted else { return }
                 viewer.mediaCommitted = true
-                self.sendCursorRequest()
+                if !viewer.cursorConfigured || (viewer.cursorRequestID == nil && viewer.cursorRequestedEnabled != self.lowLatencyCursorEnabled) {
+                    self.sendCursorRequest()
+                }
             }
         }
         media.onBytes = { channel.recordBytes($0) }
@@ -2048,6 +2084,10 @@ final class DeskModel: ObservableObject {
         cursorStatus = "正在切换光标…"
         do { peer.send(try CursorControl(.request, requestID: id, enabled: lowLatencyCursorEnabled).message()) }
         catch { peer.close(error.localizedDescription); return }
+        armViewerCursorTimeout(id: id, viewer: viewer, peer: peer)
+    }
+
+    private func armViewerCursorTimeout(id: UUID, viewer: ViewerSession, peer: Peer) {
         viewer.cursorTimeout?.cancel()
         viewer.cursorTimeout = Task { [weak self, weak viewer, weak peer] in
             do { try await Task.sleep(for: .seconds(25)) } catch { return }
@@ -2929,30 +2969,58 @@ final class DeskModel: ObservableObject {
                     viewerQualityPolicy.chooseManually(savePreference: viewerQualityPolicy.maySaveCurrentChoice)
                     try configureViewerMedia(peer: peer, settings: state.settings, preferred: preferred,
                                              relayRouting: hello.relayTransportV1 == true && target?.relay != nil)
-                    // A relayed session starts from a modest bitrate and climbs only as the path proves it.
-                    if supportsAdaptiveVideo, viewerSession.usesRelayControl, var tuning = videoTuning,
-                       let start = viewerSession.mediaQuality?.startingSettings(maximumMegabits: 10), start != tuning.desired {
+                    // Start non-LAN and relayed sessions from a conservative bitrate so the initial keyframe
+                    // and refinement burst cannot overflow unknown WAN uplinks; healthy paths climb quickly.
+                    let initialMaxMegabits: Int? = if viewerSession.usesRelayControl {
+                        MediaQualityPolicy.relayStartingMegabits
+                    } else if let address = target?.address, !MediaQualityPolicy.isLikelyLocalHost(address) {
+                        MediaQualityPolicy.wanDirectStartingMegabits
+                    } else {
+                        nil
+                    }
+                    if supportsAdaptiveVideo, let maximumMegabits = initialMaxMegabits, var tuning = videoTuning,
+                       let start = viewerSession.mediaQuality?.startingSettings(maximumMegabits: maximumMegabits), start != tuning.desired {
                         try tuning.choose(start)
                         videoTuning = tuning
                         viewerSession.automaticVideoSettings = start
                         viewerSession.automaticVideoAdjustment = nil
                     }
                 }
+                supportsIndependentCursor = viewerSession.media != nil && hello.independentCursorV1 == true
+                if supportsIndependentCursor {
+                    let canvas = self.canvas
+                    dataChannel?.configureCursorPosition { [weak canvas] position in
+                        MainActor.assumeIsolated { canvas?.receiveCursorPosition(position) }
+                    }
+                    if hello.initialStreamNegotiationV1 == true, hello.initialCursorNegotiationV1 == true {
+                        let cursorID = UUID()
+                        viewerSession.cursorConfigured = true
+                        viewerSession.cursorRequestID = cursorID
+                        viewerSession.cursorRequestedEnabled = lowLatencyCursorEnabled
+                        cursorStatus = "正在切换光标…"
+                        armViewerCursorTimeout(id: cursorID, viewer: viewerSession, peer: peer)
+                        videoTuning?.chooseInitialCursor(requestID: cursorID, enabled: lowLatencyCursorEnabled)
+                    }
+                }
                 applyInitialVideoQualityIfReady()
                 sendNextVideoSettings()
                 if hello.initialStreamNegotiationV1 == true { sendInitialVideoConfirmationIfNeeded() }
-            } else { videoSettingsStatus = "主机需更新到 0.4.0 才能动态调整画质" }
+            } else {
+                videoSettingsStatus = "主机需更新到 0.4.0 才能动态调整画质"
+                supportsIndependentCursor = viewerSession.media != nil && hello.independentCursorV1 == true
+                if supportsIndependentCursor {
+                    let canvas = self.canvas
+                    dataChannel?.configureCursorPosition { [weak canvas] position in
+                        MainActor.assumeIsolated { canvas?.receiveCursorPosition(position) }
+                    }
+                }
+            }
             if viewer.media == nil, let channel = dataChannel {
                 connectionDiagnostics?.setVideoPath(.committed(.shared, relayedUDP: false), on: channel)
             }
-            supportsIndependentCursor = viewerSession.media != nil && hello.independentCursorV1 == true
-            if supportsIndependentCursor {
-                let canvas = self.canvas
-                dataChannel?.configureCursorPosition { [weak canvas] position in
-                    MainActor.assumeIsolated { canvas?.receiveCursorPosition(position) }
-                }
+            if !viewerSession.cursorConfigured {
+                sendCursorRequest()
             }
-            sendCursorRequest()
             supportsRemoteAudio = hello.remoteAudioV1 == true
             if supportsRemoteAudio {
                 let viewer = viewerSession
@@ -4023,7 +4091,7 @@ final class DeskModel: ObservableObject {
             if let result = try? Wire.json(.streamSettingsResult, reply(state, "正在处理上一项画质调整", false)) { peer.send(result) }
             return
         }
-        do { try request.settings.validateControlValues() }
+        do { try request.validate() }
         catch {
             if let result = try? Wire.json(.streamSettingsResult, reply(state, error.localizedDescription, false)) { peer.send(result) }
             return
@@ -4032,6 +4100,9 @@ final class DeskModel: ObservableObject {
             host.settingsRequestID = request.id
             host.resolveInitialSettings(request)
             return
+        }
+        if let cursorReqID = request.cursorRequestID, let wantIndependent = request.independentCursor, !host.cursorSubscribed {
+            applyHostCursorRequest(CursorControl(.request, requestID: cursorReqID, enabled: wantIndependent), peer: peer)
         }
         if request.settings == state.settings, codec == activeVideoCodec, chroma == activeVideoChroma {
             if let result = try? Wire.json(.streamSettingsResult, reply(state, nil, false)) { peer.send(result) }

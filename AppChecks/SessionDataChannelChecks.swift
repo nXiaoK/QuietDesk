@@ -307,6 +307,29 @@ private struct SessionDataChannelChecks {
                         "Expected newer cursor sample (epoch 2, seq 5), got \(delivered)")
         }
 
+        run("Audio packets require negotiated handler and stop immediately on channel invalidation") {
+            let unconfigured = SessionDataChannel(send: { _ in }, onFreshFrame: { _ in })
+            let samplePacket = try RemoteAudioPacket(epoch: 1, sequence: 1, opusPayload: Data([0xFC, 0x01, 0x02]))
+            try require(!(try unconfigured.receive(Message(.audioFrame, samplePacket.encode()))),
+                        "Unconfigured channel must reject unsolicited .audioFrame so caller can enforce negotiation")
+            try require(!unconfigured.receiveAudioPacket(samplePacket),
+                        "Unconfigured channel must ignore direct datagram audio packet")
+
+            let channel = SessionDataChannel(send: { _ in }, onFreshFrame: { _ in })
+            let received = ChannelBox<[RemoteAudioPacket]>([])
+            channel.configureAudioPacket { pkt in received.update { $0.append(pkt) } }
+            try onBackground {
+                try require(try channel.receive(Message(.audioFrame, samplePacket.encode())),
+                            "Configured channel should accept .audioFrame")
+                let second = try RemoteAudioPacket(epoch: 1, sequence: 2, opusPayload: Data([0xFC, 0x03, 0x04]))
+                try require(channel.receiveAudioPacket(second),
+                            "Configured channel should accept datagram audio packet")
+            }
+            try require(received.read().map(\.sequence) == [1, 2], "Audio packets were not delivered in order")
+            channel.invalidate()
+            try require(!channel.receiveAudioPacket(samplePacket), "Invalidated channel delivered late audio packet")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

@@ -38,6 +38,7 @@ public final class MediaSession: @unchecked Sendable {
             self.host = host; self.port = port; self.retire = retire
         }
     }
+    public static let maximumTCPAudioFallbackPendingBytes = 512 * 1024
     public var diagnostics: PerformanceDiagnostics?
     public var onVideo: ((MediaFrame, @escaping (Bool) -> Void) -> Void)?
     public var onCommitStream: ((MediaStreamID, VideoPacket) -> Void)?
@@ -55,6 +56,7 @@ public final class MediaSession: @unchecked Sendable {
     public var onReliableData: ((Message) -> Void)?
     public var onCursorPosition: ((CursorPosition) -> Void)?
     public var onInteractiveInput: ((RemoteInput) -> Void)?
+    public var onAudioPacket: ((RemoteAudioPacket) -> Void)?
     public var onReduceLoad: ((MediaBottleneck) -> Void)?
     public var onSample: ((MediaPathSample) -> Void)?
     // Actual video route classification, delivered before its sample or direct reduction callback.
@@ -138,6 +140,7 @@ public final class MediaSession: @unchecked Sendable {
     private var datagramInteractiveNegotiated = false
     private var dynamicFrameWindowNegotiated = false
     private var parityFECNegotiated = false
+    private var datagramAudioNegotiated = false
     private var advertisedReceiveFrameWindow: Int?
     private var lastReportedReceiveWindow: Int?
     private var hasMeasuredRoundTrip = false
@@ -148,6 +151,7 @@ public final class MediaSession: @unchecked Sendable {
     private static let cursorPositionDatagramKind: UInt8 = 6
     private static let interactiveInputDatagramKind: UInt8 = 7
     private static let parityDatagramKind: UInt8 = 8
+    private static let audioPacketDatagramKind: UInt8 = 9
     private var alternateRequested = false
     private var alternateProbePending = false
     private var alternateRetryDeferred = false
@@ -289,7 +293,8 @@ public final class MediaSession: @unchecked Sendable {
                 self.onDiagnosticVideoPath?(.preparing)
                 self.sendControl(MediaControl(.request, relayRouting: self.relayRoutingEnabled ? true : nil,
                                               receiveFrameWindow: MediaBufferLimits.receiveFrameWindow, markedRepairs: true,
-                                              datagramInteractive: true, dynamicFrameWindow: true, parityFEC: true))
+                                              datagramInteractive: true, dynamicFrameWindow: true, parityFEC: true,
+                                              datagramAudio: true))
                 self.onState?("正在优化传输")
             }
         }
@@ -365,6 +370,28 @@ public final class MediaSession: @unchecked Sendable {
                 return
             }
             self.control.send(Message(.input, encoded))
+        }
+        return true
+    }
+
+    @discardableResult
+    public func sendAudioPacket(_ packet: RemoteAudioPacket) -> Bool {
+        guard side == .host else { return false }
+        let encoded = packet.encode()
+        guard encoded.count + 1 <= MediaFragment.maximumDatagramBytes + 1 else { return false }
+        var datagram = Data(capacity: 1 + encoded.count)
+        datagram.append(Self.audioPacketDatagramKind)
+        datagram.append(encoded)
+        queue.async { [weak self] in
+            guard let self, !self.stopped, !self.paused, !self.configurationSuspended else { return }
+            if self.datagramAudioNegotiated, self.udpVerified, let peer = self.udpPeer {
+                _ = self.sendDatagram(datagram, using: peer)
+                return
+            }
+            // Over TCP fallback, drop live audio packets if the control socket is congested (> 512 KiB).
+            if self.control.queuedSendBytes <= Self.maximumTCPAudioFallbackPendingBytes {
+                self.control.send(Message(.audioFrame, encoded))
+            }
         }
         return true
     }
@@ -580,6 +607,7 @@ public final class MediaSession: @unchecked Sendable {
             datagramInteractiveNegotiated = value.datagramInteractive == true
             dynamicFrameWindowNegotiated = value.dynamicFrameWindow == true
             parityFECNegotiated = value.parityFEC == true
+            datagramAudioNegotiated = value.datagramAudio == true
             advertisedReceiveFrameWindow = value.receiveFrameWindow
             let identifier = UUID(), token = try randomBytes(32), sessionKey = try randomBytes(32)
             sessionID = identifier; bindingToken = token; datagramKey = sessionKey
@@ -599,6 +627,7 @@ public final class MediaSession: @unchecked Sendable {
             datagramInteractiveNegotiated = value.datagramInteractive == true
             dynamicFrameWindowNegotiated = value.dynamicFrameWindow == true
             parityFECNegotiated = value.parityFEC == true
+            datagramAudioNegotiated = value.datagramAudio == true
             refreshInteractiveDatagramAvailability()
             fallbackAt = SessionClock.now + 1.5
             openAuxiliary(.video); openAuxiliary(.bulk)
@@ -794,7 +823,8 @@ public final class MediaSession: @unchecked Sendable {
                                  path: udpAvailable ? "udp" : "tcp", relayRouting: relayRoutingNegotiated ? true : nil,
                                  datagramInteractive: datagramInteractiveNegotiated ? true : nil,
                                  dynamicFrameWindow: dynamicFrameWindowNegotiated ? true : nil,
-                                 parityFEC: parityFECNegotiated ? true : nil))
+                                 parityFEC: parityFECNegotiated ? true : nil,
+                                 datagramAudio: datagramAudioNegotiated ? true : nil))
     }
 
     private func openAuxiliary(_ role: MediaChannelRole) {
@@ -1015,6 +1045,13 @@ public final class MediaSession: @unchecked Sendable {
                     onInteractiveInput?(input)
                 } catch {
                     control.close("交互输入数据报无效：\(error.localizedDescription)")
+                }
+            case Self.audioPacketDatagramKind:
+                guard side == .viewer, datagramAudioNegotiated, udpVerified else { return }
+                do {
+                    onAudioPacket?(try RemoteAudioPacket.decode(Data(data.dropFirst())))
+                } catch {
+                    control.close("远端音频数据报无效：\(error.localizedDescription)")
                 }
             default: return
             }

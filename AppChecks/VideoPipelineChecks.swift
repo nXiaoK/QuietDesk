@@ -1193,8 +1193,17 @@ private struct VideoPipelineChecks {
             let cfg444 = ScreenStreamer.configuration(width: 2560, height: 1440, settings: .init(framesPerSecond: 60, megabits: 12),
                                                       chromaSubsampling: .yuv444, colorSpace: .displayP3)
             try require(cfg444.pixelFormat == kCVPixelFormatType_32BGRA
-                        && cfg444.colorSpaceName == CGColorSpace.displayP3,
-                        "4:4:4 Display P3 configuration did not use BGRA + displayP3")
+                        && cfg444.colorSpaceName == CGColorSpace.displayP3
+                        && !cfg444.capturesAudio,
+                        "4:4:4 Display P3 configuration did not use BGRA + displayP3 + default capturesAudio=false")
+
+            let cfgAudio = ScreenStreamer.configuration(width: 1920, height: 1080, settings: .init(framesPerSecond: 60, megabits: 8),
+                                                        capturesAudio: true)
+            try require(cfgAudio.capturesAudio
+                        && cfgAudio.excludesCurrentProcessAudio
+                        && cfgAudio.sampleRate == RemoteAudioControl.sampleRate
+                        && cfgAudio.channelCount == RemoteAudioControl.channels,
+                        "Audio-enabled SCStreamConfiguration did not set 48 kHz 2ch with excludesCurrentProcessAudio")
 
             var refine = StaticFrameRefinement()
             try require(refine.nextPassNumber == nil, "Idle StaticFrameRefinement reported a pass number")

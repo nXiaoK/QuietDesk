@@ -63,6 +63,9 @@ public final class Peer {
     public private(set) var closeIsRetryable = false
     public private(set) var closeAllowsAlternateRoute = false
     public var isLocalNetwork: Bool { localNetworkClassification == true }
+    public var queuedSendBytes: Int { pendingBytesLock.withLock { max(0, trackedPendingBytes) } }
+    private let pendingBytesLock = NSLock()
+    private var trackedPendingBytes = 0
     private let localNetworkStatus = LocalNetworkStatus()
     var localNetworkClassification: Bool? { localNetworkStatus.read(connection.currentPath) }
     private let connection: NWConnection
@@ -72,7 +75,9 @@ public final class Peer {
     private var lastReceived = SessionClock.uptime
     private var livenessGrace = LocalSchedulingGrace()
     private var timer: DispatchSourceTimer?
-    private var pendingBytes = 0
+    private var pendingBytes = 0 {
+        didSet { pendingBytesLock.withLock { trackedPendingBytes = pendingBytes } }
+    }
     private var deliverySequence: UInt64 = 0
     private var waitingForMessage = false
     private let idleTimeout: TimeInterval
@@ -350,6 +355,7 @@ public final class Peer {
         videoPacer = nil
         let unsent = outgoing
         outgoing.removeAll()
+        pendingBytes = 0
         roundTripDiagnostic = nil
         transportReport = nil
         collectingTransportReport = nil

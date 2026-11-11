@@ -266,6 +266,18 @@ struct DeskView: View {
                         .help("在远端多台显示器之间无缝切换")
                         .disabled(!model.connected || model.displaySwitchWorking)
                     }
+                    if model.supportsRemoteAudio {
+                        Button {
+                            model.canvas.releaseControl()
+                            model.setRemoteAudioEnabled(!model.remoteAudioEnabled)
+                        } label: {
+                            Label(model.remoteAudioEnabled ? "关闭远端声音" : "开启远端声音",
+                                  systemImage: model.remoteAudioStreaming ? "speaker.wave.2.fill"
+                                      : (model.remoteAudioEnabled ? "speaker.wave.1" : "speaker.slash"))
+                        }
+                        .help(model.remoteAudioStatus.isEmpty ? "切换远端系统声音回传" : model.remoteAudioStatus)
+                        .disabled(!model.connected)
+                    }
                     desktopActionButton(.missionControl)
                     desktopActionButton(.previousSpace)
                     desktopActionButton(.nextSpace)

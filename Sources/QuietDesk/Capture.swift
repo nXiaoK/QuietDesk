@@ -394,6 +394,14 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     let queue = DispatchQueue(label: "quietdesk.capture", qos: .userInteractive)
+    private let audioQueue = DispatchQueue(label: "quietdesk.audio-capture", qos: .userInteractive)
+    private let audioCallbackLock = NSLock()
+    private var _onAudioSample: ((CMSampleBuffer) -> Void)?
+    private var audioDeliveryActive = false
+    var onAudioSample: ((CMSampleBuffer) -> Void)? {
+        get { audioCallbackLock.withLock { _onAudioSample } }
+        set { audioCallbackLock.withLock { _onAudioSample = newValue } }
+    }
     var onFrame: ((VideoPacket) -> Void)?
     var onEncodeDuration: ((TimeInterval) -> Void)?
     var onError: ((String) -> Void)?
@@ -437,6 +445,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var excludedWindowIDs = Set<CGWindowID>()
     private var reconfiguring = false
     private var sessionPaused = false
+    private var capturesAudio = false
+    private var audioOutputAttached = false
     private var cursorGate = CursorCaptureGate()
     private var appliedCursorIncluded: Bool? = true
     private var lastConfirmedCursorIncluded = true
@@ -486,6 +496,16 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         return DispatchQueue.getSpecific(key: queueIdentity) == true ? read() : queue.sync(execute: read)
     }
 
+    var isAudioCaptureEnabled: Bool {
+        let read = { [self] in capturesAudio && audioOutputAttached }
+        return DispatchQueue.getSpecific(key: queueIdentity) == true ? read() : queue.sync(execute: read)
+    }
+
+    private func syncAudioDeliveryState() {
+        let active = running && captureStarted && !sessionPaused && capturesAudio && audioOutputAttached
+        audioCallbackLock.withLock { audioDeliveryActive = active }
+    }
+
     private func cursorState() -> (actual: Bool?, target: Bool?) {
         let read = { [self] in
             (actual: running && captureStarted ? appliedCursorIncluded : nil, target: running ? cursorGate.included : nil)
@@ -526,7 +546,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 
     static func configuration(width: Int, height: Int, settings: StreamSettings, includesCursor: Bool = true,
                               chromaSubsampling: VideoChromaSubsampling = .yuv420,
-                              colorSpace: VideoColorSpace = .sRGB) -> SCStreamConfiguration {
+                              colorSpace: VideoColorSpace = .sRGB,
+                              capturesAudio: Bool = false) -> SCStreamConfiguration {
         let configuration = SCStreamConfiguration()
         configuration.width = width
         configuration.height = height
@@ -536,7 +557,12 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         // Two retained encoder inputs plus the newest capture still leave producer buffers available.
         configuration.queueDepth = settings.framesPerSecond >= 60 ? 5 : 3
         configuration.showsCursor = includesCursor
-        configuration.capturesAudio = false
+        configuration.capturesAudio = capturesAudio
+        if capturesAudio {
+            configuration.excludesCurrentProcessAudio = true
+            configuration.sampleRate = RemoteAudioControl.sampleRate
+            configuration.channelCount = RemoteAudioControl.channels
+        }
         configuration.colorSpaceName = colorSpace == .displayP3 ? CGColorSpace.displayP3 : CGColorSpace.sRGB
         if chromaSubsampling == .yuv444 {
             configuration.pixelFormat = kCVPixelFormatType_32BGRA
@@ -669,7 +695,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     func start(_ capture: CapturePlan, codec: VideoCodec = .h264,
-               chromaSubsampling: VideoChromaSubsampling = .yuv420) async throws {
+               chromaSubsampling: VideoChromaSubsampling = .yuv420,
+               capturesAudio: Bool = false) async throws {
         try Task.checkCancellation()
         let width = capture.width, height = capture.height, settings = capture.settings
         let id = UUID()
@@ -678,8 +705,12 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         let stream = SCStream(filter: capture.filter,
             configuration: Self.configuration(width: width, height: height, settings: settings,
                                               chromaSubsampling: encoder.chromaSubsampling,
-                                              colorSpace: capture.colorSpace), delegate: self)
+                                              colorSpace: capture.colorSpace,
+                                              capturesAudio: capturesAudio), delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        if capturesAudio {
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+        }
         let lifecycle = CaptureLifecycle(stream: stream)
         queue.sync {
             self.encoder = encoder
@@ -702,10 +733,13 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             sourceWidth = capture.sourceWidth
             sourceHeight = capture.sourceHeight
             currentSettings = settings
+            self.capturesAudio = capturesAudio
+            self.audioOutputAttached = capturesAudio
             cursorGate = CursorCaptureGate()
             appliedCursorIncluded = true
             lastConfirmedCursorIncluded = true
             running = true
+            syncAudioDeliveryState()
             let watchdog = DispatchSource.makeTimerSource(queue: queue)
             watchdog.schedule(deadline: .now() + 2, repeating: 2)
             watchdog.setEventHandler { [weak self] in
@@ -722,10 +756,12 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             let current = queue.sync { () -> Bool in
                 guard self.stream === stream, running else { return false }
                 captureStarted = true
+                syncAudioDeliveryState()
                 return true
             }
             guard current else {
                 try? stream.removeStreamOutput(self, type: .screen)
+                if capturesAudio { try? stream.removeStreamOutput(self, type: .audio) }
                 await lifecycle.stop()
                 throw CancellationError()
             }
@@ -820,10 +856,18 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                     cursorFrameTimeout = timer
                     timer.resume()
                     let width = outputWidth, height = outputHeight
+                    let currentChroma = encoder?.chromaSubsampling ?? .yuv420
+                    let currentColorSpace = captureColorSpace
                     let updatedConfiguration = Self.configuration(width: width, height: height,
                                                                   settings: currentSettings, includesCursor: included,
-                                                                  chromaSubsampling: encoder?.chromaSubsampling ?? .yuv420,
-                                                                  colorSpace: captureColorSpace)
+                                                                  chromaSubsampling: currentChroma,
+                                                                  colorSpace: currentColorSpace,
+                                                                  capturesAudio: capturesAudio)
+                    let screenshotConfiguration = Self.configuration(width: width, height: height,
+                                                                     settings: currentSettings, includesCursor: included,
+                                                                     chromaSubsampling: currentChroma,
+                                                                     colorSpace: currentColorSpace,
+                                                                     capturesAudio: false)
                     activeStream.updateConfiguration(updatedConfiguration, completionHandler: { [weak self] error in
                             self?.queue.async { [weak self] in
                                 guard let self, self.running, self.stream.map(ObjectIdentifier.init) == expectedStreamID,
@@ -839,7 +883,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                                     return
                                 }
                                 self.scheduleStaticCursorFrameFallback(request: request, expectedStreamID: expectedStreamID,
-                                                                       configuration: updatedConfiguration)
+                                                                       configuration: screenshotConfiguration)
                             }
                         })
                 }
@@ -976,7 +1020,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             if frameRateChanged {
                 stream.updateConfiguration(Self.configuration(width: outputWidth, height: outputHeight,
                     settings: settings, includesCursor: cursorGate.included,
-                    chromaSubsampling: encoder.chromaSubsampling, colorSpace: captureColorSpace), completionHandler: nil)
+                    chromaSubsampling: encoder.chromaSubsampling, colorSpace: captureColorSpace,
+                    capturesAudio: capturesAudio), completionHandler: nil)
                 pump()
             }
             return VideoStreamState(settings: settings, width: outputWidth, height: outputHeight)
@@ -987,7 +1032,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     func reconfigure(_ settings: StreamSettings, codec: VideoCodec? = nil,
                      chromaSubsampling: VideoChromaSubsampling? = nil) async throws -> VideoStreamState {
         try settings.validateControlValues()
-        let snapshot = try queue.sync { () throws -> (SCStream, Int, Int, Int, Int, StreamSettings, Bool, VideoCodec, VideoChromaSubsampling, VideoColorSpace, SCContentFilter?, Bool) in
+        let snapshot = try queue.sync { () throws -> (SCStream, Int, Int, Int, Int, StreamSettings, Bool, VideoCodec, VideoChromaSubsampling, VideoColorSpace, SCContentFilter?, Bool, Bool) in
             guard running, captureStarted, let stream, displayID != nil else { throw DeskError.invalid("屏幕采集尚未就绪，请稍后调整") }
             if let operation = cursorOperationID { cancelCursorOperation(operation); throw DeskError.invalid("光标采集正在更新，请稍后调整画质") }
             if let waiter = cursorFrameWaiter {
@@ -996,7 +1041,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             }
             return (stream, sourceWidth, sourceHeight, outputWidth, outputHeight, currentSettings, cursorGate.included,
                     encoder?.codec ?? .h264, encoder?.chromaSubsampling ?? .yuv420, captureColorSpace, activeFilter,
-                    encoder != nil && !frameFlow.encodingFailed)
+                    encoder != nil && !frameFlow.encodingFailed, capturesAudio)
         }
         let (width, height) = settings.dimensions(width: snapshot.1, height: snapshot.2)
         let targetCodec = codec ?? snapshot.7
@@ -1010,7 +1055,10 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         let effectiveChroma = replacement?.chromaSubsampling ?? snapshot.8
         let nextConfiguration = Self.configuration(width: width, height: height, settings: settings,
                                                    includesCursor: snapshot.6, chromaSubsampling: effectiveChroma,
-                                                   colorSpace: snapshot.9)
+                                                   colorSpace: snapshot.9, capturesAudio: snapshot.12)
+        let screenshotConfiguration = Self.configuration(width: width, height: height, settings: settings,
+                                                         includesCursor: snapshot.6, chromaSubsampling: effectiveChroma,
+                                                         colorSpace: snapshot.9, capturesAudio: false)
         do { try await pauseAtFrameBoundary() }
         catch { replacement?.stop(); throw error }
         do {
@@ -1020,7 +1068,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             var freshStaticSample: (CVPixelBuffer, CMTime)?
             if effectiveChroma != snapshot.8 || width != snapshot.3 || height != snapshot.4,
                let filter = snapshot.10, !queue.sync(execute: { cursorGate.needsFreshFrame }),
-               let sample = try? await SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: nextConfiguration),
+               let sample = try? await SCScreenshotManager.captureSampleBuffer(contentFilter: filter, configuration: screenshotConfiguration),
                CMSampleBufferIsValid(sample), let image = CMSampleBufferGetImageBuffer(sample) {
                 freshStaticSample = (image, CMSampleBufferGetPresentationTimeStamp(sample))
             }
@@ -1077,7 +1125,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                 do {
                     try await snapshot.0.updateConfiguration(Self.configuration(width: snapshot.3, height: snapshot.4,
                         settings: snapshot.5, includesCursor: snapshot.6,
-                        chromaSubsampling: snapshot.8, colorSpace: snapshot.9))
+                        chromaSubsampling: snapshot.8, colorSpace: snapshot.9, capturesAudio: snapshot.12))
                     queue.sync {
                         guard running, stream === snapshot.0 else { return }
                         frameFlow.requestKeyFrame()
@@ -1097,7 +1145,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 
     /// Hot-switches the active `SCStream` to another display or updated display mode/resolution in place.
     func switchCapture(_ capture: CapturePlan, excludedWindows: Set<CGWindowID>? = nil) async throws -> VideoStreamState {
-        let snapshot = try queue.sync { () throws -> (SCStream, StreamSettings, Bool, VideoCodec, VideoChromaSubsampling, CGDirectDisplayID?, SCContentFilter?, Int, Int, Int, Int, VideoColorSpace, Set<CGWindowID>, Bool) in
+        let snapshot = try queue.sync { () throws -> (SCStream, StreamSettings, Bool, VideoCodec, VideoChromaSubsampling, CGDirectDisplayID?, SCContentFilter?, Int, Int, Int, Int, VideoColorSpace, Set<CGWindowID>, Bool, Bool) in
             guard running, captureStarted, let stream else {
                 throw DeskError.invalid("屏幕采集尚未就绪，请稍后切换显示器")
             }
@@ -1112,7 +1160,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             return (stream, currentSettings, cursorGate.included, encoder?.codec ?? .h264,
                     encoder?.chromaSubsampling ?? .yuv420, displayID, activeFilter,
                     sourceWidth, sourceHeight, outputWidth, outputHeight, captureColorSpace,
-                    excludedWindowIDs, encoder != nil && !frameFlow.encodingFailed)
+                    excludedWindowIDs, encoder != nil && !frameFlow.encodingFailed, capturesAudio)
         }
         let settings = snapshot.1
         let (width, height) = settings.dimensions(width: capture.sourceWidth, height: capture.sourceHeight)
@@ -1126,7 +1174,10 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         let effectiveChroma = replacement?.chromaSubsampling ?? snapshot.4
         let nextConfiguration = Self.configuration(width: width, height: height, settings: settings,
                                                    includesCursor: snapshot.2, chromaSubsampling: effectiveChroma,
-                                                   colorSpace: capture.colorSpace)
+                                                   colorSpace: capture.colorSpace, capturesAudio: snapshot.14)
+        let screenshotConfiguration = Self.configuration(width: width, height: height, settings: settings,
+                                                         includesCursor: snapshot.2, chromaSubsampling: effectiveChroma,
+                                                         colorSpace: capture.colorSpace, capturesAudio: false)
         do { try await pauseAtFrameBoundary() }
         catch { replacement?.stop(); throw error }
         do {
@@ -1137,7 +1188,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             var freshStaticSample: (CVPixelBuffer, CMTime)?
             if !queue.sync(execute: { cursorGate.needsFreshFrame }),
                let sample = try? await SCScreenshotManager.captureSampleBuffer(contentFilter: capture.filter,
-                                                                               configuration: nextConfiguration),
+                                                                               configuration: screenshotConfiguration),
                CMSampleBufferIsValid(sample), let image = CMSampleBufferGetImageBuffer(sample) {
                 freshStaticSample = (image, CMSampleBufferGetPresentationTimeStamp(sample))
             }
@@ -1193,7 +1244,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                     if let oldFilter = snapshot.6 { try await snapshot.0.updateContentFilter(oldFilter) }
                     try await snapshot.0.updateConfiguration(Self.configuration(width: snapshot.9, height: snapshot.10,
                         settings: snapshot.1, includesCursor: snapshot.2,
-                        chromaSubsampling: snapshot.4, colorSpace: snapshot.11))
+                        chromaSubsampling: snapshot.4, colorSpace: snapshot.11, capturesAudio: snapshot.14))
                     queue.sync {
                         guard running, stream === snapshot.0 else { return }
                         frameFlow.requestKeyFrame()
@@ -1228,6 +1279,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             let pendingCursor = try queue.sync { () throws -> Bool? in
                 guard running, stream === current else { throw CancellationError() }
                 sessionPaused = paused
+                syncAudioDeliveryState()
                 if paused { reconfiguring = false; cancelRefinement() }
                 else {
                     frameFlow.requestKeyFrame()
@@ -1252,8 +1304,70 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             queue.sync {
                 guard running, stream === current else { return }
                 sessionPaused = snapshot.1
+                syncAudioDeliveryState()
                 reconfiguring = false
                 pump()
+            }
+            throw error
+        }
+    }
+
+    func setAudioCaptureEnabled(_ enabled: Bool) async throws {
+        try Task.checkCancellation()
+        let prepared = try queue.sync { () throws -> (stream: SCStream, config: SCStreamConfiguration, newlyAttached: Bool)? in
+            guard running, captureStarted, let stream else {
+                throw DeskError.invalid("屏幕采集尚未就绪")
+            }
+            guard !reconfiguring, cursorOperationID == nil, cursorFrameWaiter == nil else {
+                throw DeskError.invalid("正在调整画面采集配置，请稍后重试远端声音")
+            }
+            if capturesAudio == enabled && audioOutputAttached == enabled {
+                return nil
+            }
+            var newlyAttached = false
+            if enabled && !audioOutputAttached {
+                try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+                audioOutputAttached = true
+                newlyAttached = true
+            }
+            if !enabled {
+                capturesAudio = false
+                syncAudioDeliveryState()
+            }
+            let nextConfig = Self.configuration(
+                width: outputWidth,
+                height: outputHeight,
+                settings: currentSettings,
+                includesCursor: cursorGate.included,
+                chromaSubsampling: encoder?.chromaSubsampling ?? .yuv420,
+                colorSpace: captureColorSpace,
+                capturesAudio: enabled
+            )
+            return (stream, nextConfig, newlyAttached)
+        }
+        guard let prepared else { return }
+        do {
+            try await prepared.stream.updateConfiguration(prepared.config)
+            try queue.sync {
+                guard running, stream === prepared.stream else { throw CancellationError() }
+                capturesAudio = enabled
+                if !enabled, audioOutputAttached {
+                    try? prepared.stream.removeStreamOutput(self, type: .audio)
+                    audioOutputAttached = false
+                }
+                syncAudioDeliveryState()
+            }
+        } catch {
+            queue.sync {
+                guard running, stream === prepared.stream else { return }
+                if enabled {
+                    capturesAudio = false
+                    if prepared.newlyAttached, audioOutputAttached {
+                        try? prepared.stream.removeStreamOutput(self, type: .audio)
+                        audioOutputAttached = false
+                    }
+                }
+                syncAudioDeliveryState()
             }
             throw error
         }
@@ -1466,7 +1580,13 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             encoder?.stop()
             encoder = nil
             let old = lifecycle
-            if let stream { try? stream.removeStreamOutput(self, type: .screen) }
+            if let stream {
+                try? stream.removeStreamOutput(self, type: .screen)
+                if audioOutputAttached { try? stream.removeStreamOutput(self, type: .audio) }
+            }
+            capturesAudio = false
+            audioOutputAttached = false
+            syncAudioDeliveryState()
             activeFilter = nil
             stream = nil
             lifecycle = nil
@@ -1489,7 +1609,14 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard running, self.stream === stream, type == .screen, CMSampleBufferIsValid(sampleBuffer),
+        if type == .audio {
+            guard CMSampleBufferIsValid(sampleBuffer), CMSampleBufferDataIsReady(sampleBuffer) else { return }
+            let handler = audioCallbackLock.withLock { audioDeliveryActive ? _onAudioSample : nil }
+            handler?(sampleBuffer)
+            return
+        }
+        guard type == .screen else { return }
+        guard running, self.stream === stream, CMSampleBufferIsValid(sampleBuffer),
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let status = attachments.first?[.status] as? Int,
               status == SCFrameStatus.complete.rawValue,

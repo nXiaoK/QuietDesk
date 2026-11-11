@@ -31,6 +31,8 @@ public enum MessageKind: UInt8, Sendable {
     case desktopActionRequest = 35, desktopActionResult
     // Sent only after the host advertises displaySwitchingV1 and the viewer subscribes or selects a display.
     case displayControl = 37
+    // Sent only after the host advertises remoteAudioV1 and the viewer requests remote audio.
+    case audioControl = 38, audioFrame = 39
 }
 
 public struct Message: Sendable {
@@ -218,7 +220,9 @@ public struct Hello: Codable, Sendable {
     public let displaySwitchingV1: Bool?
     public let displays: [RemoteDisplayInfo]?
     public let selectedDisplayID: UInt32?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil, displaySwitchingV1: Bool? = nil, displays: [RemoteDisplayInfo]? = nil, selectedDisplayID: UInt32? = nil) {
+    // The host supports ScreenCaptureKit native system audio capture encoded as low-latency 48 kHz Opus.
+    public let remoteAudioV1: Bool?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil, displaySwitchingV1: Bool? = nil, displays: [RemoteDisplayInfo]? = nil, selectedDisplayID: UInt32? = nil, remoteAudioV1: Bool? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -256,6 +260,7 @@ public struct Hello: Codable, Sendable {
         self.displaySwitchingV1 = displaySwitchingV1
         self.displays = displays
         self.selectedDisplayID = selectedDisplayID
+        self.remoteAudioV1 = remoteAudioV1
     }
 
     public func validate() throws {

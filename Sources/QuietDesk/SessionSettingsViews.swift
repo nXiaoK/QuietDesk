@@ -146,6 +146,15 @@ private struct ConnectionOptionsSections: View {
                     Text(model.supportsIndependentCursor ? model.cursorStatus : "对端版本不支持独立光标")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                Toggle(isOn: Binding(get: { model.remoteAudioEnabled }, set: { model.setRemoteAudioEnabled($0) })) {
+                    Text("远端声音回传").frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .disabled(model.connected && !model.supportsRemoteAudio)
+                .help("通过 ScreenCaptureKit 原生采集远端系统声音并以低延迟 Opus 回传；可与“被控端本机静音”同时开启。")
+                if model.connected {
+                    Text(model.supportsRemoteAudio ? model.remoteAudioStatus : "对端版本不支持远端声音回传")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
                 Toggle("仅使用 TCP（下次连接生效）", isOn: $model.mediaTCPOnly)
                 Text(model.connected ? model.mediaRouteSummary : (model.mediaTCPOnly ? "视频使用 TCP" : "视频优先 UDP，不可用时自动使用 TCP"))
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)

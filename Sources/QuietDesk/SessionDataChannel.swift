@@ -13,6 +13,7 @@ final class SessionDataChannel: @unchecked Sendable {
     private var media: ((Message) -> Bool)?
     private var reliableData: ((Message) -> Void)?
     private var cursorPosition: ((CursorPosition) -> Void)?
+    private var audioPacket: ((RemoteAudioPacket) -> Void)?
     private var latestCursorPosition: CursorPosition?
     private var cursorFlushScheduled = false
     private var freshFrameToken: UUID?
@@ -40,6 +41,19 @@ final class SessionDataChannel: @unchecked Sendable {
             cursorPosition = handler
             if handler == nil { latestCursorPosition = nil; cursorFlushScheduled = false }
         }
+    }
+    func configureAudioPacket(_ handler: ((RemoteAudioPacket) -> Void)?) {
+        lock.withLock {
+            guard valid else { return }
+            audioPacket = handler
+        }
+    }
+    @discardableResult
+    func receiveAudioPacket(_ packet: RemoteAudioPacket) -> Bool {
+        let handler = lock.withLock { valid ? audioPacket : nil }
+        guard let handler else { return false }
+        handler(packet)
+        return true
     }
     func flushCursorPosition() {
         let next = lock.withLock { () -> (CursorPosition, (CursorPosition) -> Void)? in
@@ -113,6 +127,12 @@ final class SessionDataChannel: @unchecked Sendable {
             guard configured else { return false }
             let position = try CursorPosition.decode(message.payload)
             return receiveCursorPosition(position)
+        case .audioFrame:
+            let handler = lock.withLock { valid ? audioPacket : nil }
+            guard let handler else { return false }
+            let packet = try RemoteAudioPacket.decode(message.payload)
+            handler(packet)
+            return true
         case .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel:
             guard let clipboard = handlers.3 else { return false }
             clipboard(message)
@@ -162,6 +182,7 @@ final class SessionDataChannel: @unchecked Sendable {
             media = nil
             reliableData = nil
             cursorPosition = nil
+            audioPacket = nil
             latestCursorPosition = nil
             cursorFlushScheduled = false
             mediaFreshFrame = nil

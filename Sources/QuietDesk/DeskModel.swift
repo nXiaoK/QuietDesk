@@ -235,6 +235,11 @@ final class DeskModel: ObservableObject {
     @Published private(set) var remoteSelectedDisplayID: UInt32 = 0
     @Published private(set) var displaySwitchWorking = false
     @Published private(set) var displaySwitchStatus = ""
+    @Published private(set) var supportsRemoteAudio = false
+    @Published private(set) var remoteAudioEnabled = UserDefaults.standard.bool(forKey: "remoteAudioEnabled")
+    @Published private(set) var remoteAudioStreaming = false
+    @Published private(set) var remoteAudioWorking = false
+    @Published private(set) var remoteAudioStatus = ""
     var desktopActionUnavailableReason: String? {
         if !connected { return "连接后可选择远端桌面" }
         if !supportsDesktopActions { return "被控端需更新后才能使用桌面操作" }
@@ -1501,7 +1506,8 @@ final class DeskModel: ObservableObject {
                             hevc444VideoV1: VideoEncoder.hardwareHEVC444Available ? true : nil,
                             displaySwitchingV1: true,
                             displays: initialDisplays.isEmpty ? nil : initialDisplays,
-                            selectedDisplayID: initialDisplays.isEmpty ? nil : snapshot.id)))
+                            selectedDisplayID: initialDisplays.isEmpty ? nil : snapshot.id,
+                            remoteAudioV1: true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -2040,12 +2046,12 @@ final class DeskModel: ObservableObject {
         let host = hostSession
         guard let id = request.requestID, host.cursorTask == nil, let streamer = host.streamer else { return }
         let capture = host.captureTask, settings = host.settingsTask, pause = host.pauseTask,
-            effects = host.effectsTask, display = host.displayTask
+            effects = host.effectsTask, display = host.displayTask, audio = host.audioTask
         let token = generation
         host.cursorTask = Task { [weak self, weak host, weak peer] in
             guard let self, let host, let peer else { return }
             defer { if self.hostSession === host { host.cursorTask = nil } }
-            await capture?.value; await settings?.value; await pause?.value; await effects?.value; await display?.value
+            await capture?.value; await settings?.value; await pause?.value; await effects?.value; await display?.value; await audio?.value
             guard self.hostSession === host, self.peer === peer, self.generation == token, !Task.isCancelled else { return }
             guard host.cursorEpoch < UInt32.max else { peer.close("光标模式代次已耗尽，请重新连接", retryable: true); return }
             await self.suspendMediaForConfiguration(host.media)
@@ -2085,6 +2091,157 @@ final class DeskModel: ObservableObject {
             self.startHostCursorSampler(host, peer: peer)
             streamer.resumeAfterReconfiguration()
             if !host.paused { host.media?.resumeAfterConfiguration() }
+        }
+    }
+
+    func setRemoteAudioEnabled(_ enabled: Bool) {
+        guard remoteAudioEnabled != enabled else { return }
+        remoteAudioEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "remoteAudioEnabled")
+        sibling?.setRemoteAudioEnabled(enabled)
+        guard mode == .viewer, connected else { return }
+        guard supportsRemoteAudio else {
+            remoteAudioStatus = "对端版本不支持远端声音回传"
+            return
+        }
+        if !enabled {
+            viewerSession.audioPlayer?.stop()
+            remoteAudioStreaming = false
+            remoteAudioStatus = "正在关闭远端声音…"
+        } else {
+            remoteAudioStatus = "正在开启远端声音…"
+        }
+        sendRemoteAudioRequest()
+    }
+
+    private func sendRemoteAudioRequest() {
+        guard mode == .viewer, connected, supportsRemoteAudio, let peer,
+              viewerSession.audioRequestID == nil else { return }
+        let viewer = viewerSession
+        let id = UUID()
+        let desired = remoteAudioEnabled
+        viewer.audioRequestID = id
+        viewer.audioRequestedEnabled = desired
+        remoteAudioWorking = true
+        do {
+            peer.send(try RemoteAudioControl.request(id: id, enabled: desired).message())
+        } catch {
+            viewer.audioRequestID = nil
+            remoteAudioWorking = false
+            remoteAudioStatus = error.localizedDescription
+            return
+        }
+        viewer.audioTimeout?.cancel()
+        viewer.audioTimeout = Task { [weak self, weak viewer, weak peer] in
+            do { try await Task.sleep(for: .seconds(15)) } catch { return }
+            guard let self, let viewer, let peer, self.viewerSession === viewer,
+                  viewer.audioRequestID == id, self.peer === peer else { return }
+            viewer.audioRequestID = nil
+            viewer.audioTimeout = nil
+            self.remoteAudioWorking = false
+            self.remoteAudioStatus = "远端声音切换超时，请稍后重试"
+        }
+    }
+
+    private func applyHostAudioRequest(_ request: RemoteAudioControl, peer: Peer) {
+        let host = hostSession
+        guard let requestID = request.requestID, let streamer = host.streamer else { return }
+        let capture = host.captureTask, settings = host.settingsTask, pause = host.pauseTask,
+            cursor = host.cursorTask, effects = host.effectsTask, display = host.displayTask,
+            previousAudio = host.audioTask
+        let token = generation
+        let taskID = UUID()
+        host.audioTaskID = taskID
+        host.audioTask = Task { [weak self, weak host, weak peer] in
+            guard let self, let host, let peer else { return }
+            defer {
+                if self.generation == token, self.hostSession === host, host.audioTaskID == taskID {
+                    host.audioTaskID = nil
+                    host.audioTask = nil
+                }
+            }
+            await previousAudio?.value
+            await capture?.value
+            await settings?.value
+            await pause?.value
+            await cursor?.value
+            await effects?.value
+            await display?.value
+            guard self.generation == token, self.hostSession === host, self.peer === peer,
+                  host.streamer === streamer, !Task.isCancelled else { return }
+            if request.enabled {
+                guard host.audioEpoch < UInt32.max else {
+                    if let reply = try? RemoteAudioControl.status(
+                        requestID: requestID,
+                        enabled: false,
+                        error: "音频会话代次已耗尽，请重新连接"
+                    ).message() {
+                        peer.send(reply)
+                    }
+                    return
+                }
+                let nextEpoch = host.audioEpoch + 1
+                do {
+                    let media = host.media
+                    let sender = try HostAudioSender(epoch: nextEpoch) { [weak media, weak peer] packet in
+                        if let media {
+                            _ = media.sendAudioPacket(packet)
+                        } else if let peer, peer.queuedSendBytes <= MediaSession.maximumTCPAudioFallbackPendingBytes {
+                            peer.send(Message(.audioFrame, packet.encode()))
+                        }
+                    }
+                    sender.setPaused(host.paused)
+                    streamer.onAudioSample = { [weak sender] sample in
+                        sender?.enqueue(sample)
+                    }
+                    do {
+                        try await streamer.setAudioCaptureEnabled(true)
+                    } catch {
+                        streamer.onAudioSample = nil
+                        sender.stop()
+                        throw error
+                    }
+                    guard self.generation == token, self.hostSession === host, self.peer === peer,
+                          host.streamer === streamer, !Task.isCancelled else {
+                        streamer.onAudioSample = nil
+                        sender.stop()
+                        return
+                    }
+                    host.audioSender?.stop()
+                    host.audioEpoch = nextEpoch
+                    host.audioEnabled = true
+                    host.audioSender = sender
+                    sender.setPaused(host.paused)
+                    peer.send(try RemoteAudioControl.status(
+                        requestID: requestID,
+                        enabled: true,
+                        epoch: nextEpoch,
+                        magicCookie: sender.magicCookie
+                    ).message())
+                } catch {
+                    guard self.generation == token, self.hostSession === host, self.peer === peer, !Task.isCancelled else { return }
+                    host.audioSender?.stop()
+                    host.audioSender = nil
+                    host.audioEnabled = false
+                    if let reply = try? RemoteAudioControl.status(
+                        requestID: requestID,
+                        enabled: false,
+                        error: error.localizedDescription
+                    ).message() {
+                        peer.send(reply)
+                    }
+                }
+            } else {
+                streamer.onAudioSample = nil
+                host.audioSender?.stop()
+                host.audioSender = nil
+                host.audioEnabled = false
+                try? await streamer.setAudioCaptureEnabled(false)
+                guard self.generation == token, self.hostSession === host, self.peer === peer, !Task.isCancelled else { return }
+                if let reply = try? RemoteAudioControl.status(requestID: requestID, enabled: false).message() {
+                    peer.send(reply)
+                }
+            }
         }
     }
 
@@ -2493,6 +2650,10 @@ final class DeskModel: ObservableObject {
             let request = try CursorControl.read(message.payload)
             guard request.operation == .request, hostSession.mediaPrepared else { throw DeskError.invalid("光标功能未协商") }
             applyHostCursorRequest(request, peer: peer)
+        case .audioControl:
+            let request = try RemoteAudioControl.read(message.payload)
+            guard request.operation == .request else { throw DeskError.invalid("远端音频控制方向无效") }
+            applyHostAudioRequest(request, peer: peer)
         case .sessionPauseRequest:
             applyHostSessionPause(try Wire.readJSON(SessionPauseRequest.self, message.payload), peer: peer)
         case .sessionEffectsRequest:
@@ -2769,6 +2930,32 @@ final class DeskModel: ObservableObject {
                 }
             }
             sendCursorRequest()
+            supportsRemoteAudio = hello.remoteAudioV1 == true
+            if supportsRemoteAudio {
+                let viewer = viewerSession
+                let player = ViewerAudioPlayer(onError: { [weak self, weak viewer] message in
+                    DispatchQueue.main.async {
+                        guard let self, let viewer, self.viewerSession === viewer else { return }
+                        self.remoteAudioStatus = "本机音频播放受限：\(message)"
+                    }
+                })
+                viewer.audioPlayer = player
+                let channel = dataChannel
+                channel?.configureAudioPacket { [weak player] packet in
+                    player?.receive(packet)
+                }
+                viewer.media?.onAudioPacket = { [weak channel] packet in
+                    _ = channel?.receiveAudioPacket(packet)
+                }
+                remoteAudioStatus = remoteAudioEnabled ? "正在开启远端声音…" : "远端声音回传已关闭"
+                if remoteAudioEnabled {
+                    sendRemoteAudioRequest()
+                }
+            } else {
+                remoteAudioStreaming = false
+                remoteAudioWorking = false
+                remoteAudioStatus = ""
+            }
             publishSessionPause()
             sendNextSessionPause()
             if let token = pauseTransmission.freshFrameToken { scheduleFreshFrameTimeout(token, peer: peer) }
@@ -2923,6 +3110,32 @@ final class DeskModel: ObservableObject {
                 }
             case .subscribe, .select:
                 throw DeskError.invalid("显示器控制消息方向无效")
+            }
+        case .audioControl:
+            guard viewerSession.helloReceived, supportsRemoteAudio else {
+                throw DeskError.invalid("当前连接未启用远端声音回传")
+            }
+            let control = try RemoteAudioControl.read(message.payload)
+            guard control.operation == .status else {
+                throw DeskError.invalid("远端音频状态方向无效")
+            }
+            guard control.requestID == nil || control.requestID == viewerSession.audioRequestID else { return }
+            let wasRequested = viewerSession.audioRequestID != nil ? viewerSession.audioRequestedEnabled : nil
+            viewerSession.audioTimeout?.cancel()
+            viewerSession.audioTimeout = nil
+            viewerSession.audioRequestID = nil
+            remoteAudioWorking = false
+            if control.enabled, let epoch = control.epoch {
+                viewerSession.audioPlayer?.start(epoch: epoch, magicCookie: control.magicCookie, paused: sessionInputSuspended)
+                remoteAudioStreaming = true
+                remoteAudioStatus = "正在播放远端系统声音（Opus 48 kHz 立体声）"
+            } else {
+                viewerSession.audioPlayer?.stop()
+                remoteAudioStreaming = false
+                remoteAudioStatus = control.error.map { "远端声音未开启：\($0)" } ?? "远端声音回传已关闭"
+            }
+            if let wasRequested, wasRequested != remoteAudioEnabled, control.error == nil {
+                sendRemoteAudioRequest()
             }
         default: throw DeskError.invalid("收到当前角色不支持的消息")
         }
@@ -3440,7 +3653,7 @@ final class DeskModel: ObservableObject {
         let token = generation
         // Capture changes run in the order they were requested; the curtain never interrupts one.
         let capture = host.captureTask, cursor = host.cursorTask, pause = host.pauseTask,
-            video = host.settingsTask, display = host.displayTask
+            video = host.settingsTask, display = host.displayTask, audio = host.audioTask
         host.effectsTask = Task { [weak self, weak peer, weak host] in
             guard let self, let peer, let host, self.hostSession === host else { return }
             defer { if self.generation == token, self.peer === peer, self.hostSession === host { host.effectsTask = nil } }
@@ -3452,6 +3665,7 @@ final class DeskModel: ObservableObject {
                 await pause?.value
                 await video?.value
                 await display?.value
+                await audio?.value
                 try Task.checkCancellation()
                 _ = try await effects.apply(request.state) { try await streamer.setExcludedWindows($0) }
             } catch { failure = error.localizedDescription }
@@ -3633,6 +3847,7 @@ final class DeskModel: ObservableObject {
             accessibility: localAccessibility, inputMonitoring: localInputMonitoring)
         canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && canControl && !sessionInputSuspended && !desktopActionWorking
         canvas.pointerInputSuspended = sessionInputSuspended || desktopActionWorking
+        if mode == .viewer { viewerSession.audioPlayer?.setPaused(sessionInputSuspended) }
         refreshClipboardFocus()
     }
 
@@ -3677,7 +3892,7 @@ final class DeskModel: ObservableObject {
         host.injector?.releaseAll()
         let token = generation
         let capture = host.captureTask, video = host.settingsTask, cursor = host.cursorTask,
-            effects = host.effectsTask, display = host.displayTask
+            effects = host.effectsTask, display = host.displayTask, audio = host.audioTask
         host.pauseTask = Task { [weak self, weak peer, weak host] in
             guard let self, let peer, let host, self.hostSession === host else { return }
             defer {
@@ -3692,6 +3907,7 @@ final class DeskModel: ObservableObject {
             await cursor?.value
             await effects?.value
             await display?.value
+            await audio?.value
             guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer, !Task.isCancelled else { return }
             await self.suspendMediaForConfiguration(host.media)
             guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
@@ -3721,6 +3937,7 @@ final class DeskModel: ObservableObject {
                 peer.send(reply)
             }
             host.media?.setPaused(host.paused)
+            host.audioSender?.setPaused(host.paused)
             if host.paused { host.cursorSampler?.stop() }
             else { self.startHostCursorSampler(host, peer: peer) }
             if !host.paused {
@@ -3790,6 +4007,7 @@ final class DeskModel: ObservableObject {
         let cursor = host.cursorTask
         let effects = host.effectsTask
         let display = host.displayTask
+        let audio = host.audioTask
         host.settingsTask = Task { [weak self, weak peer, weak host] in
             guard let self, let peer, let host, self.hostSession === host else { return }
             defer {
@@ -3803,6 +4021,7 @@ final class DeskModel: ObservableObject {
                 await cursor?.value
                 await effects?.value
                 await display?.value
+                await audio?.value
                 guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
                       host.settingsRequestID == request.id, !Task.isCancelled else { return }
                 // Same-size, same-codec, same-chroma changes (bitrate and/or frame rate) update the running encoder in place.
@@ -3884,6 +4103,7 @@ final class DeskModel: ObservableObject {
         let pause = host.pauseTask
         let cursor = host.cursorTask
         let effects = host.effectsTask
+        let audio = host.audioTask
         host.displayTask = Task { [weak self, weak peer, weak host] in
             guard let self, let peer, let host, self.hostSession === host else { return }
             defer {
@@ -3902,6 +4122,7 @@ final class DeskModel: ObservableObject {
             await pause?.value
             await cursor?.value
             await effects?.value
+            await audio?.value
             guard self.generation == token, self.peer === peer, self.hostSession === host,
                   host.streamer === streamer, !Task.isCancelled else { return }
             var mediaSuspended = false
@@ -4501,6 +4722,10 @@ final class DeskModel: ObservableObject {
         oldViewer.desktopActionTimeout?.cancel()
         oldHost.displayTask?.cancel()
         oldViewer.displaySwitchTimeout?.cancel()
+        oldHost.audioTask?.cancel()
+        oldHost.audioSender?.stop()
+        oldViewer.audioTimeout?.cancel()
+        oldViewer.audioPlayer?.stop()
         supportsDesktopActions = false
         desktopActionWorking = false
         desktopActionStatus = ""
@@ -4511,6 +4736,10 @@ final class DeskModel: ObservableObject {
         remoteSelectedDisplayID = 0
         displaySwitchWorking = false
         displaySwitchStatus = ""
+        supportsRemoteAudio = false
+        remoteAudioStreaming = false
+        remoteAudioWorking = false
+        remoteAudioStatus = ""
         supportsSessionUnlock = false
         unlockWorking = false
         unlockNoticeTask?.cancel()

@@ -52,6 +52,11 @@ final class HostSession {
     var cursorSampler: HostCursorSampler?
     var cursorShapeRevision: UInt64 = 0
     var cursorPositionSequence: UInt64 = 0
+    var audioEpoch: UInt32 = 0
+    var audioEnabled = false
+    var audioTask: Task<Void, Never>?
+    var audioTaskID: UUID?
+    var audioSender: HostAudioSender?
     var streamer: ScreenStreamer?
     var injector: InputInjector?
     var captureTask: Task<Void, Never>?
@@ -120,6 +125,10 @@ final class ViewerSession {
     var cursorRequestedEnabled = false
     var cursorConfigured = false
     var cursorTimeout: Task<Void, Never>?
+    var audioRequestID: UUID?
+    var audioRequestedEnabled = false
+    var audioTimeout: Task<Void, Never>?
+    var audioPlayer: ViewerAudioPlayer?
     var media: MediaSession?
     var mediaReceiver: MediaCanvasReceiver?
     var mediaCommitted = false

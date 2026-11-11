@@ -108,6 +108,26 @@ private struct ConnectionOptionsSections: View {
             Divider()
             VStack(alignment: .leading, spacing: 8) {
                 Text("连接").font(.headline)
+                if model.connected, model.supportsDisplaySwitching, !model.remoteDisplays.isEmpty {
+                    HStack(spacing: 8) {
+                        Text("远端屏幕").foregroundStyle(.secondary)
+                        Picker("远端屏幕", selection: Binding(
+                            get: { model.remoteSelectedDisplayID },
+                            set: { model.selectRemoteDisplay($0) }
+                        )) {
+                            ForEach(model.remoteDisplays) { display in
+                                Text(display.summary).tag(display.id)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .disabled(model.remoteDisplays.count < 2 || model.displaySwitchWorking)
+                    }
+                    if !model.displaySwitchStatus.isEmpty {
+                        Text(model.displaySwitchStatus).font(.caption).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
                 HStack(spacing: 8) {
                     Text("画面显示").foregroundStyle(.secondary)
                     Picker("画面显示", selection: $model.canvasScalingMode) {

@@ -29,6 +29,8 @@ public enum MessageKind: UInt8, Sendable {
     case sessionTermination = 34
     // Sent only after the host advertises desktopActionsV1.
     case desktopActionRequest = 35, desktopActionResult
+    // Sent only after the host advertises displaySwitchingV1 and the viewer subscribes or selects a display.
+    case displayControl = 37
 }
 
 public struct Message: Sendable {
@@ -212,7 +214,11 @@ public struct Hello: Codable, Sendable {
     public let initialStreamNegotiationV1: Bool?
     // The host has a hardware HEVC Main 4:4:4 encoder and accepts chromaSubsampling == .yuv444.
     public let hevc444VideoV1: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil) {
+    // The host supports in-session multi-display switching and seamless screen-parameter hot updates.
+    public let displaySwitchingV1: Bool?
+    public let displays: [RemoteDisplayInfo]?
+    public let selectedDisplayID: UInt32?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil, displaySwitchingV1: Bool? = nil, displays: [RemoteDisplayInfo]? = nil, selectedDisplayID: UInt32? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -247,6 +253,9 @@ public struct Hello: Codable, Sendable {
         self.hevcVideoV1 = hevcVideoV1
         self.initialStreamNegotiationV1 = initialStreamNegotiationV1
         self.hevc444VideoV1 = hevc444VideoV1
+        self.displaySwitchingV1 = displaySwitchingV1
+        self.displays = displays
+        self.selectedDisplayID = selectedDisplayID
     }
 
     public func validate() throws {
@@ -262,6 +271,11 @@ public struct Hello: Codable, Sendable {
             throw DeskError.invalid("兼容画质字段的帧率不能超过 60 fps")
         }
         if higherFrameRateVideoV1 == true, let preferredHigherFrameRateSettings { try preferredHigherFrameRateSettings.validateControlValues() }
+        if let displays {
+            try RemoteDisplayInfo.validateList(displays, selectedDisplayID: selectedDisplayID)
+        } else if let selectedDisplayID, selectedDisplayID == 0 {
+            throw DeskError.invalid("远端当前共享显示器标识无效")
+        }
     }
 }
 

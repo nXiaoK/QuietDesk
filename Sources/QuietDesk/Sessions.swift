@@ -56,6 +56,12 @@ final class HostSession {
     var injector: InputInjector?
     var captureTask: Task<Void, Never>?
     var capturedDisplay: DisplaySnapshot?
+    var displayUpdatesSubscribed = false
+    var preferredDisplayIDOverride: UInt32?
+    var displayTask: Task<Void, Never>?
+    var displaySwitchRequestID: UUID?
+    var pendingAutomaticDisplayRefresh = false
+    var lastSentDisplays: [RemoteDisplayInfo] = []
     var settingsTask: Task<Void, Never>?
     var settingsRequestID: UUID?
     var effects: HostSessionEffects?
@@ -136,6 +142,9 @@ final class ViewerSession {
     var restoreCanvasFocusAfterIdle = false
     var desktopActionRequest: DesktopActionRequest?
     var desktopActionTimeout: Task<Void, Never>?
+    var displayUpdatesSubscribed = false
+    var displaySwitchRequestID: UUID?
+    var displaySwitchTimeout: Task<Void, Never>?
     var unlockRequestID: UUID?
     var unlockAutomatic = false
     var unlockTask: Task<Void, Never>?

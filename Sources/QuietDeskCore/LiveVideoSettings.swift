@@ -119,4 +119,10 @@ public struct VideoTuningSession {
         self.pending = nil
         return true
     }
+
+    /// Updates the confirmed host stream state when a display switch or screen mode hot-update changes dimensions.
+    public mutating func synchronizeHostState(_ state: VideoStreamState) throws {
+        try state.validate()
+        applied = state
+    }
 }

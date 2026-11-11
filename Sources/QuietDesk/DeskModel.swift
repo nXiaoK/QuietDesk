@@ -230,6 +230,11 @@ final class DeskModel: ObservableObject {
     /// Briefly shown over the picture when the window toolbar's action is refused or unconfirmed.
     @Published private(set) var desktopActionNotice: String?
     private var desktopActionNoticeTask: Task<Void, Never>?
+    @Published private(set) var supportsDisplaySwitching = false
+    @Published private(set) var remoteDisplays: [RemoteDisplayInfo] = []
+    @Published private(set) var remoteSelectedDisplayID: UInt32 = 0
+    @Published private(set) var displaySwitchWorking = false
+    @Published private(set) var displaySwitchStatus = ""
     var desktopActionUnavailableReason: String? {
         if !connected { return "连接后可选择远端桌面" }
         if !supportsDesktopActions { return "被控端需更新后才能使用桌面操作" }
@@ -816,14 +821,64 @@ final class DeskModel: ObservableObject {
         ScreenStreamer.displaySnapshot(id)
     }
 
+    private var effectiveHostPreferredDisplayID: CGDirectDisplayID {
+        hostSession.preferredDisplayIDOverride ?? preferredDisplayID
+    }
+
+    private func hostRemoteDisplays(selectedID: UInt32, fallbackSnapshot: DisplaySnapshot? = nil) -> [RemoteDisplayInfo] {
+        let mainID = CGMainDisplayID()
+        var seen = Set<UInt32>()
+        var result: [RemoteDisplayInfo] = []
+        for (index, screen) in screens.enumerated() {
+            guard screen.id != 0, seen.insert(screen.id).inserted else { continue }
+            let snapshot = screen.id == fallbackSnapshot?.id ? fallbackSnapshot! : displaySnapshot(screen.id)
+            let width = min(16_384, max(2, snapshot.pixelWidth))
+            let height = min(16_384, max(2, snapshot.pixelHeight))
+            let trimmed = screen.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = trimmed.isEmpty ? "显示器 \(index + 1)" : trimmed
+            result.append(RemoteDisplayInfo(id: screen.id, name: name, width: width, height: height,
+                                            isMain: screen.id == mainID))
+        }
+        if selectedID != 0, !seen.contains(selectedID) {
+            let snapshot = fallbackSnapshot ?? displaySnapshot(selectedID)
+            let width = min(16_384, max(2, snapshot.pixelWidth))
+            let height = min(16_384, max(2, snapshot.pixelHeight))
+            result.insert(RemoteDisplayInfo(id: selectedID, name: "当前显示器", width: width, height: height,
+                                            isMain: selectedID == mainID), at: 0)
+        }
+        if result.count > DisplayControl.maximumDisplays {
+            var trimmed = Array(result.prefix(DisplayControl.maximumDisplays))
+            if selectedID != 0, !trimmed.contains(where: { $0.id == selectedID }),
+               let selected = result.first(where: { $0.id == selectedID }) {
+                trimmed[trimmed.count - 1] = selected
+            }
+            result = trimmed
+        }
+        return result
+    }
+
     func chooseDisplay(_ id: CGDirectDisplayID) {
+        hostSession.preferredDisplayIDOverride = nil
         preferredDisplayID = id
         UserDefaults.standard.set(Int(id), forKey: "sharedDisplay")
         displayID = id
         displayFallbackNotice = nil
+        if mode == .host, hostingRequested, active, let peer, hostSession.streamer != nil,
+           hostSession.capturedDisplay?.id != id {
+            if hostSession.displayUpdatesSubscribed {
+                scheduleHostDisplayHotUpdate(targetDisplayID: id, requestID: nil, peer: peer)
+            } else {
+                DiagnosticLog.shared.record(.displayChanged, role: .host, state: .requested)
+                restartHostAfterFailure("已切换共享显示器，正在重新准备共享")
+            }
+        }
     }
 
     private func updateDisplayFallbackNotice() {
+        if hostSession.preferredDisplayIDOverride != nil {
+            displayFallbackNotice = nil
+            return
+        }
         guard displayID != preferredDisplayID else { displayFallbackNotice = nil; return }
         let name = screens.first(where: { $0.id == displayID }).map { "「\($0.name)」" } ?? "备用显示器"
         displayFallbackNotice = "首选显示器当前不可用，正在使用\(name)；恢复后下次开启共享时自动使用首选显示器"
@@ -837,9 +892,53 @@ final class DeskModel: ObservableObject {
         screens = current
         let available = current.map { displaySnapshot($0.id) }
         if mode == .host, hostingRequested, active, let capturedDisplay = hostSession.capturedDisplay,
+           let peer, hostSession.streamer != nil {
+            if !DisplaySelection.requiresRestart(captured: capturedDisplay, available: available) {
+                displayID = capturedDisplay.id
+                updateDisplayFallbackNotice()
+                if hostSession.displayUpdatesSubscribed {
+                    let displays = hostRemoteDisplays(selectedID: capturedDisplay.id, fallbackSnapshot: capturedDisplay)
+                    if !displays.isEmpty, displays != hostSession.lastSentDisplays {
+                        hostSession.lastSentDisplays = displays
+                        if let message = try? DisplayControl.state(displays: displays, selectedDisplayID: capturedDisplay.id,
+                                                                   videoState: nil).message() {
+                            peer.send(message)
+                        }
+                    }
+                }
+                return
+            }
+            guard let nextSelection = DisplaySelection.select(preferred: effectiveHostPreferredDisplayID,
+                                                              main: CGMainDisplayID(), available: available) else {
+                DiagnosticLog.shared.record(.displayChanged, role: .host, state: .requested)
+                restartHostAfterFailure("当前没有可共享的显示器，等待显示器恢复")
+                return
+            }
+            displayID = nextSelection.id
+            if hostSession.preferredDisplayIDOverride != nil,
+               nextSelection.id != hostSession.preferredDisplayIDOverride {
+                hostSession.preferredDisplayIDOverride = nil
+            }
+            updateDisplayFallbackNotice()
+            let currentSettings = activeVideoState?.settings ?? settings.legacyCompatible
+            let (newOutWidth, newOutHeight) = currentSettings.dimensions(width: nextSelection.pixelWidth,
+                                                                         height: nextSelection.pixelHeight)
+            let sameOutputDimensions = activeVideoState.map {
+                $0.width == newOutWidth && $0.height == newOutHeight
+            } ?? false
+            if hostSession.displayUpdatesSubscribed || sameOutputDimensions {
+                scheduleHostDisplayHotUpdate(targetDisplayID: nextSelection.id, requestID: nil, peer: peer)
+            } else {
+                DiagnosticLog.shared.record(.displayChanged, role: .host, state: .requested)
+                restartHostAfterFailure("共享显示器已变化，正在重新准备共享")
+            }
+            return
+        }
+        if mode == .host, hostingRequested, active, let capturedDisplay = hostSession.capturedDisplay,
            !DisplaySelection.requiresRestart(captured: capturedDisplay, available: available) {
             displayID = capturedDisplay.id
-        } else if let selection = DisplaySelection.select(preferred: preferredDisplayID, main: CGMainDisplayID(), available: available) {
+        } else if let selection = DisplaySelection.select(preferred: effectiveHostPreferredDisplayID,
+                                                          main: CGMainDisplayID(), available: available) {
             displayID = selection.id
         }
         updateDisplayFallbackNotice()
@@ -850,8 +949,10 @@ final class DeskModel: ObservableObject {
         }
     }
 
-    private func selectShareableDisplay(_ displays: [SCDisplay]) throws -> (display: SCDisplay, snapshot: DisplaySnapshot) {
-        guard let selection = DisplaySelection.select(preferred: preferredDisplayID, main: CGMainDisplayID(),
+    private func selectShareableDisplay(_ displays: [SCDisplay],
+                                        preferredOverride: CGDirectDisplayID? = nil) throws -> (display: SCDisplay, snapshot: DisplaySnapshot) {
+        let preferred = preferredOverride ?? effectiveHostPreferredDisplayID
+        guard let selection = DisplaySelection.select(preferred: preferred, main: CGMainDisplayID(),
             available: displays.filter { CGDisplayIsActive($0.displayID) != 0 }.map { displaySnapshot($0.displayID) }),
               let display = displays.first(where: { $0.displayID == selection.id }) else {
             throw DeskError.invalid("当前没有可共享的显示器，等待显示器恢复")
@@ -1379,6 +1480,8 @@ final class DeskModel: ObservableObject {
                             }
                         }
                         media.start()
+                        let initialDisplays = self.hostRemoteDisplays(selectedID: snapshot.id, fallbackSnapshot: snapshot)
+                        host.lastSentDisplays = initialDisplays
                         candidate.send(try Wire.json(.hello, Hello(name: Host.current().localizedName ?? "家里 Mac",
                             width: width, height: height, settings: settings, canControl: self.canControl,
                             preferredSettings: preferredSettings.extendedCompatible, deviceID: self.trafficHistoryStore.localDeviceID,
@@ -1392,7 +1495,10 @@ final class DeskModel: ObservableObject {
                             sessionTerminationV1: true, desktopActionsV1: true,
                             hevcVideoV1: VideoEncoder.hardwareHEVCAvailable ? true : nil,
                             initialStreamNegotiationV1: true,
-                            hevc444VideoV1: VideoEncoder.hardwareHEVC444Available ? true : nil)))
+                            hevc444VideoV1: VideoEncoder.hardwareHEVC444Available ? true : nil,
+                            displaySwitchingV1: true,
+                            displays: initialDisplays.isEmpty ? nil : initialDisplays,
+                            selectedDisplayID: initialDisplays.isEmpty ? nil : snapshot.id)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -1930,12 +2036,13 @@ final class DeskModel: ObservableObject {
     private func applyHostCursorRequest(_ request: CursorControl, peer: Peer) {
         let host = hostSession
         guard let id = request.requestID, host.cursorTask == nil, let streamer = host.streamer else { return }
-        let capture = host.captureTask, settings = host.settingsTask, pause = host.pauseTask, effects = host.effectsTask
+        let capture = host.captureTask, settings = host.settingsTask, pause = host.pauseTask,
+            effects = host.effectsTask, display = host.displayTask
         let token = generation
         host.cursorTask = Task { [weak self, weak host, weak peer] in
             guard let self, let host, let peer else { return }
             defer { if self.hostSession === host { host.cursorTask = nil } }
-            await capture?.value; await settings?.value; await pause?.value; await effects?.value
+            await capture?.value; await settings?.value; await pause?.value; await effects?.value; await display?.value
             guard self.hostSession === host, self.peer === peer, self.generation == token, !Task.isCancelled else { return }
             guard host.cursorEpoch < UInt32.max else { peer.close("光标模式代次已耗尽，请重新连接", retryable: true); return }
             await self.suspendMediaForConfiguration(host.media)
@@ -2353,6 +2460,28 @@ final class DeskModel: ObservableObject {
         switch message.kind {
         case .desktopActionRequest:
             applyHostDesktopAction(try Wire.readJSON(DesktopActionRequest.self, message.payload), peer: peer)
+        case .displayControl:
+            let control = try DisplayControl.read(message.payload)
+            switch control.operation {
+            case .subscribe:
+                hostSession.displayUpdatesSubscribed = true
+                if let captured = hostSession.capturedDisplay {
+                    let displays = hostRemoteDisplays(selectedID: captured.id, fallbackSnapshot: captured)
+                    if !displays.isEmpty {
+                        hostSession.lastSentDisplays = displays
+                        peer.send(try DisplayControl.state(displays: displays, selectedDisplayID: captured.id,
+                                                           videoState: nil).message())
+                    }
+                }
+            case .select:
+                hostSession.displayUpdatesSubscribed = true
+                guard let requestID = control.id, let targetID = control.displayID else {
+                    throw DeskError.invalid("显示器切换请求字段无效")
+                }
+                scheduleHostDisplayHotUpdate(targetDisplayID: targetID, requestID: requestID, peer: peer)
+            case .state, .result:
+                throw DeskError.invalid("显示器控制消息方向无效")
+            }
         case .sessionTermination:
             let notification = try SessionTermination.read(message.payload)
             guard notification.operation == .subscribe else { throw DeskError.invalid("结束连接消息方向无效") }
@@ -2564,6 +2693,18 @@ final class DeskModel: ObservableObject {
             supportsAdaptiveVideo = supportsHighRefreshVideoSettings && hello.adaptiveVideoV1 == true
             supportsSessionUnlock = hello.sessionUnlockV1 == true
             supportsDesktopActions = hello.desktopActionsV1 == true
+            supportsDisplaySwitching = hello.displaySwitchingV1 == true
+            if supportsDisplaySwitching {
+                remoteDisplays = hello.displays ?? []
+                remoteSelectedDisplayID = hello.selectedDisplayID ?? remoteDisplays.first?.id ?? 0
+                displaySwitchStatus = currentRemoteDisplaySummary
+                viewerSession.displayUpdatesSubscribed = true
+                peer.send(try DisplayControl.subscribe().message())
+            } else {
+                remoteDisplays = []
+                remoteSelectedDisplayID = 0
+                displaySwitchStatus = ""
+            }
             refreshUnlockState()
             if supportsLiveSettings {
                 let hostDefault = supportsHigherFrameRateVideo ? (hello.preferredHigherFrameRateSettings ?? hello.preferredHighRefreshSettings ?? hello.preferredSettings ?? hello.settings)
@@ -2748,7 +2889,96 @@ final class DeskModel: ObservableObject {
             }
             sendNextVideoSettings()
             if !viewerSession.cursorConfigured { sendCursorRequest() }
+        case .displayControl:
+            guard viewerSession.helloReceived, supportsDisplaySwitching, viewerSession.displayUpdatesSubscribed else {
+                throw DeskError.invalid("当前连接未启用多显示器切换")
+            }
+            let control = try DisplayControl.read(message.payload)
+            switch control.operation {
+            case .state:
+                remoteDisplays = control.displays ?? []
+                if let selected = control.selectedDisplayID { remoteSelectedDisplayID = selected }
+                if let videoState = control.videoState {
+                    try applyViewerDisplayVideoState(videoState)
+                }
+                if !displaySwitchWorking { displaySwitchStatus = currentRemoteDisplaySummary }
+            case .result:
+                guard let id = control.id, id == viewerSession.displaySwitchRequestID else { return }
+                viewerSession.displaySwitchTimeout?.cancel()
+                viewerSession.displaySwitchTimeout = nil
+                viewerSession.displaySwitchRequestID = nil
+                displaySwitchWorking = false
+                remoteDisplays = control.displays ?? remoteDisplays
+                if let selected = control.selectedDisplayID { remoteSelectedDisplayID = selected }
+                if control.error == nil, let videoState = control.videoState {
+                    try applyViewerDisplayVideoState(videoState)
+                }
+                if let error = control.error {
+                    displaySwitchStatus = "切换失败：\(error)"
+                } else {
+                    displaySwitchStatus = "已切换到\(currentRemoteDisplayLabel)"
+                }
+            case .subscribe, .select:
+                throw DeskError.invalid("显示器控制消息方向无效")
+            }
         default: throw DeskError.invalid("收到当前角色不支持的消息")
+        }
+    }
+
+    private var currentRemoteDisplayLabel: String {
+        if let match = remoteDisplays.first(where: { $0.id == remoteSelectedDisplayID }) {
+            return "「\(match.name)」"
+        }
+        return "远端显示器"
+    }
+
+    private var currentRemoteDisplaySummary: String {
+        if let match = remoteDisplays.first(where: { $0.id == remoteSelectedDisplayID }) {
+            return "当前屏幕：\(match.summary)"
+        }
+        return remoteDisplays.count > 1 ? "可切换 \(remoteDisplays.count) 台远端显示器" : ""
+    }
+
+    private func applyViewerDisplayVideoState(_ videoState: VideoStreamState) throws {
+        activeVideoState = videoState
+        canvas.setPointerFrameRate(videoState.settings.framesPerSecond)
+        if var tuning = videoTuning {
+            try tuning.synchronizeHostState(videoState)
+            videoTuning = tuning
+        }
+        viewerSession.media?.updateSettings(videoState.settings, restartsStream: true)
+        try viewerSession.mediaQuality?.synchronizeApplied(videoState.settings,
+                                                           size: (videoState.width, videoState.height),
+                                                           now: SessionClock.now)
+        recordVideoConfiguration(videoState)
+        canvas.remoteSize = CGSize(width: videoState.width, height: videoState.height)
+        resolution = "\(videoState.width) × \(videoState.height)"
+        videoSettingsStatus = "已生效：\(videoState.settings.summary)" + activeVideoFormatSuffix
+        if !viewerSession.cursorConfigured { sendCursorRequest() }
+    }
+
+    func selectRemoteDisplay(_ id: UInt32) {
+        guard connected, supportsDisplaySwitching, let peer else { return }
+        guard !displaySwitchWorking else { return }
+        guard remoteDisplays.contains(where: { $0.id == id }) else { return }
+        guard id != remoteSelectedDisplayID else { return }
+        let request = DisplayControl.select(displayID: id)
+        guard let requestID = request.id, let message = try? request.message() else { return }
+        viewerSession.displaySwitchTimeout?.cancel()
+        viewerSession.displaySwitchRequestID = requestID
+        displaySwitchWorking = true
+        let targetName = remoteDisplays.first(where: { $0.id == id })?.name ?? "显示器"
+        displaySwitchStatus = "正在切换到「\(targetName)」…"
+        peer.send(message)
+        let viewer = viewerSession
+        viewer.displaySwitchTimeout = Task { [weak self, weak peer, weak viewer] in
+            do { try await Task.sleep(for: .seconds(15)) } catch { return }
+            guard let self, let peer, let viewer, self.peer === peer, self.viewerSession === viewer,
+                  viewer.displaySwitchRequestID == requestID else { return }
+            viewer.displaySwitchRequestID = nil
+            viewer.displaySwitchTimeout = nil
+            self.displaySwitchWorking = false
+            self.displaySwitchStatus = "切换显示器超时，请稍后重试"
         }
     }
 
@@ -3160,12 +3390,13 @@ final class DeskModel: ObservableObject {
             if let result = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(state: state, error: message)) { peer.send(result) }
             if !state.privacy, host.effectsTask == nil, let streamer = host.streamer {
                 let token = self.generation
-                let cursor = host.cursorTask
+                let cursor = host.cursorTask, display = host.displayTask
                 host.effectsTask = Task { [weak self, weak peer, weak host] in
                     guard let self, let peer, let host, self.hostSession === host else { return }
                     defer { if self.generation == token, self.peer === peer, self.hostSession === host { host.effectsTask = nil } }
                     do {
                         await cursor?.value
+                        await display?.value
                         guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
                         try await streamer.setExcludedWindows([])
                     }
@@ -3205,7 +3436,8 @@ final class DeskModel: ObservableObject {
         }
         let token = generation
         // Capture changes run in the order they were requested; the curtain never interrupts one.
-        let capture = host.captureTask, cursor = host.cursorTask, pause = host.pauseTask, video = host.settingsTask
+        let capture = host.captureTask, cursor = host.cursorTask, pause = host.pauseTask,
+            video = host.settingsTask, display = host.displayTask
         host.effectsTask = Task { [weak self, weak peer, weak host] in
             guard let self, let peer, let host, self.hostSession === host else { return }
             defer { if self.generation == token, self.peer === peer, self.hostSession === host { host.effectsTask = nil } }
@@ -3216,6 +3448,7 @@ final class DeskModel: ObservableObject {
                 await cursor?.value
                 await pause?.value
                 await video?.value
+                await display?.value
                 try Task.checkCancellation()
                 _ = try await effects.apply(request.state) { try await streamer.setExcludedWindows($0) }
             } catch { failure = error.localizedDescription }
@@ -3440,7 +3673,8 @@ final class DeskModel: ObservableObject {
         host.desktopActions?.cancel()
         host.injector?.releaseAll()
         let token = generation
-        let capture = host.captureTask, video = host.settingsTask, cursor = host.cursorTask, effects = host.effectsTask
+        let capture = host.captureTask, video = host.settingsTask, cursor = host.cursorTask,
+            effects = host.effectsTask, display = host.displayTask
         host.pauseTask = Task { [weak self, weak peer, weak host] in
             guard let self, let peer, let host, self.hostSession === host else { return }
             defer {
@@ -3454,6 +3688,7 @@ final class DeskModel: ObservableObject {
             await video?.value
             await cursor?.value
             await effects?.value
+            await display?.value
             guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer, !Task.isCancelled else { return }
             await self.suspendMediaForConfiguration(host.media)
             guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
@@ -3551,6 +3786,7 @@ final class DeskModel: ObservableObject {
         let pause = host.pauseTask
         let cursor = host.cursorTask
         let effects = host.effectsTask
+        let display = host.displayTask
         host.settingsTask = Task { [weak self, weak peer, weak host] in
             guard let self, let peer, let host, self.hostSession === host else { return }
             defer {
@@ -3563,6 +3799,7 @@ final class DeskModel: ObservableObject {
                 await pause?.value
                 await cursor?.value
                 await effects?.value
+                await display?.value
                 guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
                       host.settingsRequestID == request.id, !Task.isCancelled else { return }
                 // Same-size, same-codec, same-chroma changes (bitrate and/or frame rate) update the running encoder in place.
@@ -3598,6 +3835,167 @@ final class DeskModel: ObservableObject {
                 self.recordDiagnosticFailure(.streamConfigured, error: error)
                 if !host.paused { host.media?.resumeAfterConfiguration() }
                 if let result = try? Wire.json(.streamSettingsResult, reply(actual, error.localizedDescription, nil)) { peer.send(result) }
+            }
+        }
+    }
+
+    private func scheduleHostDisplayHotUpdate(targetDisplayID: UInt32?, requestID: UUID?, peer: Peer) {
+        let host = hostSession
+        guard let streamer = host.streamer, let currentState = activeVideoState else { return }
+        if let requestID, host.displaySwitchRequestID == requestID { return }
+        if host.displayTask != nil {
+            if let requestID {
+                let currentID = host.capturedDisplay?.id ?? displayID
+                let displays = hostRemoteDisplays(selectedID: currentID, fallbackSnapshot: host.capturedDisplay)
+                if !displays.isEmpty,
+                   let message = try? DisplayControl.result(id: requestID, selectedDisplayID: currentID,
+                                                            displays: displays, videoState: currentState,
+                                                            error: "正在切换显示器，请稍后重试").message() {
+                    peer.send(message)
+                }
+            } else {
+                host.pendingAutomaticDisplayRefresh = true
+            }
+            return
+        }
+        if let requestID, let targetDisplayID,
+           let captured = host.capturedDisplay, captured.id == targetDisplayID,
+           !DisplaySelection.requiresRestart(captured: captured, available: screens.map { displaySnapshot($0.id) }) {
+            host.preferredDisplayIDOverride = targetDisplayID
+            updateDisplayFallbackNotice()
+            let displays = hostRemoteDisplays(selectedID: targetDisplayID, fallbackSnapshot: captured)
+            if !displays.isEmpty {
+                host.lastSentDisplays = displays
+                if let message = try? DisplayControl.result(id: requestID, selectedDisplayID: targetDisplayID,
+                                                            displays: displays, videoState: currentState, error: nil).message() {
+                    peer.send(message)
+                }
+            }
+            return
+        }
+        host.displaySwitchRequestID = requestID
+        displaySwitchWorking = true
+        let token = generation
+        let capture = host.captureTask
+        let settings = host.settingsTask
+        let pause = host.pauseTask
+        let cursor = host.cursorTask
+        let effects = host.effectsTask
+        host.displayTask = Task { [weak self, weak peer, weak host] in
+            guard let self, let peer, let host, self.hostSession === host else { return }
+            defer {
+                if self.generation == token, self.peer === peer, self.hostSession === host {
+                    host.displaySwitchRequestID = nil
+                    host.displayTask = nil
+                    self.displaySwitchWorking = false
+                    if host.pendingAutomaticDisplayRefresh {
+                        host.pendingAutomaticDisplayRefresh = false
+                        self.refreshDisplays()
+                    }
+                }
+            }
+            await capture?.value
+            await settings?.value
+            await pause?.value
+            await cursor?.value
+            await effects?.value
+            guard self.generation == token, self.peer === peer, self.hostSession === host,
+                  host.streamer === streamer, !Task.isCancelled else { return }
+            var mediaSuspended = false
+            do {
+                let excludedIDs = streamer.currentExcludedWindowIDs
+                var content: SCShareableContent?
+                var excludedWindows: [SCWindow] = []
+                if excludedIDs.isEmpty {
+                    content = try await Self.loadShareableContent()
+                } else {
+                    for attempt in 0..<20 {
+                        let loaded = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+                        let matched = loaded.windows.filter { excludedIDs.contains($0.windowID) }
+                        if matched.count == excludedIDs.count {
+                            content = loaded
+                            excludedWindows = matched
+                            break
+                        }
+                        guard attempt < 19 else {
+                            throw DeskError.invalid("无法在新显示器上保持防窥遮罩排除")
+                        }
+                        try await Task.sleep(for: .milliseconds(50))
+                    }
+                }
+                guard let content else { throw DeskError.invalid("系统未返回可共享的屏幕信息") }
+                let resolved: (display: SCDisplay, snapshot: DisplaySnapshot)
+                if requestID != nil, let targetDisplayID {
+                    guard CGDisplayIsActive(targetDisplayID) != 0,
+                          let targetDisplay = content.displays.first(where: { $0.displayID == targetDisplayID }) else {
+                        throw DeskError.invalid("所选显示器当前不可用")
+                    }
+                    let snapshot = self.displaySnapshot(targetDisplayID)
+                    guard DisplaySelection.select(preferred: targetDisplayID, main: targetDisplayID, available: [snapshot]) != nil else {
+                        throw DeskError.invalid("所选显示器分辨率无效")
+                    }
+                    resolved = (targetDisplay, snapshot)
+                } else {
+                    resolved = try self.selectShareableDisplay(content.displays, preferredOverride: targetDisplayID)
+                }
+                let streamSettings = self.activeVideoState?.settings ?? self.settings.legacyCompatible
+                let plan = ScreenStreamer.prepareCapture(display: resolved.display, settings: streamSettings,
+                                                         excludingWindows: excludedWindows)
+                await self.suspendMediaForConfiguration(host.media)
+                mediaSuspended = true
+                guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
+                let updated = try await streamer.switchCapture(plan, excludedWindows: excludedIDs)
+                guard self.generation == token, self.peer === peer, self.hostSession === host,
+                      host.streamer === streamer, !Task.isCancelled else { return }
+                if requestID != nil {
+                    host.preferredDisplayIDOverride = resolved.snapshot.id
+                }
+                host.capturedDisplay = resolved.snapshot
+                self.displayID = resolved.snapshot.id
+                self.updateDisplayFallbackNotice()
+                host.injector?.updateBounds(resolved.snapshot.bounds)
+                host.cursorSampler?.updateDisplay(resolved.snapshot)
+                self.activeVideoState = updated
+                self.activeVideoCodec = streamer.videoCodec
+                self.activeVideoChroma = streamer.videoChromaSubsampling
+                self.resolution = "\(updated.width) × \(updated.height)"
+                self.recordVideoConfiguration(updated)
+                DiagnosticLog.shared.record(.displayChanged, role: .host, state: .succeeded)
+                peer.setVideoPacing(VideoSendPacing(megabits: updated.settings.megabits))
+                host.media?.updateSettings(updated.settings)
+                let currentScreens = NSScreen.screens.compactMap { screen -> (id: CGDirectDisplayID, name: String)? in
+                    guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { return nil }
+                    return (number.uint32Value, screen.localizedName)
+                }
+                if !currentScreens.isEmpty { self.screens = currentScreens }
+                let displays = self.hostRemoteDisplays(selectedID: resolved.snapshot.id, fallbackSnapshot: resolved.snapshot)
+                if !displays.isEmpty { host.lastSentDisplays = displays }
+                if let requestID, !displays.isEmpty {
+                    peer.send(try DisplayControl.result(id: requestID, selectedDisplayID: resolved.snapshot.id,
+                                                        displays: displays, videoState: updated, error: nil).message())
+                } else if host.displayUpdatesSubscribed, !displays.isEmpty {
+                    peer.send(try DisplayControl.state(displays: displays, selectedDisplayID: resolved.snapshot.id,
+                                                       videoState: updated).message())
+                }
+                streamer.resumeAfterReconfiguration()
+                if !host.paused { host.media?.resumeAfterConfiguration() }
+            } catch {
+                guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
+                self.recordDiagnosticFailure(.streamConfigured, error: error)
+                if mediaSuspended, !host.paused { host.media?.resumeAfterConfiguration() }
+                if let requestID, let actual = self.activeVideoState {
+                    let currentID = host.capturedDisplay?.id ?? self.displayID
+                    let displays = self.hostRemoteDisplays(selectedID: currentID, fallbackSnapshot: host.capturedDisplay)
+                    if !displays.isEmpty,
+                       let message = try? DisplayControl.result(id: requestID, selectedDisplayID: currentID,
+                                                                displays: displays, videoState: actual,
+                                                                error: error.localizedDescription).message() {
+                        peer.send(message)
+                    }
+                } else if requestID == nil {
+                    DiagnosticLog.shared.record(.displayChanged, role: .host, state: .failed)
+                    self.restartHostAfterFailure("共享显示器已变化，正在重新准备共享")
+                }
             }
         }
     }
@@ -4071,11 +4469,18 @@ final class DeskModel: ObservableObject {
         oldHost.desktopActionTask?.cancel()
         oldHost.desktopActions?.cancel()
         oldViewer.desktopActionTimeout?.cancel()
+        oldHost.displayTask?.cancel()
+        oldViewer.displaySwitchTimeout?.cancel()
         supportsDesktopActions = false
         desktopActionWorking = false
         desktopActionStatus = ""
         desktopActionNoticeTask?.cancel()
         desktopActionNotice = nil
+        supportsDisplaySwitching = false
+        remoteDisplays = []
+        remoteSelectedDisplayID = 0
+        displaySwitchWorking = false
+        displaySwitchStatus = ""
         supportsSessionUnlock = false
         unlockWorking = false
         unlockNoticeTask?.cancel()

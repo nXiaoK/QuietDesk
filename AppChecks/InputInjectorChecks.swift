@@ -531,6 +531,30 @@ private struct InputInjectorChecks {
                         "Host immediate queue dropped accumulated pointer deltas when coalescing datagrams")
         }
 
+        await run("Display hot-switch updateBounds releases held inputs and remaps coordinates to the new screen") {
+            let recorder = EventRecorder()
+            let injector = InputInjector(bounds: CGRect(x: 0, y: 0, width: 1280, height: 800),
+                                         isTrusted: { true }, postEvent: recorder.post)
+            var down = RemoteInput(kind: .down)
+            down.x = 0.5; down.y = 0.5; down.button = 0
+            var key = RemoteInput(kind: .keyDown)
+            key.keyCode = 2
+            _ = try await injector.receive(down)
+            _ = try await injector.receive(key)
+            // Switch to an external display placed to the left of the main screen in Quartz space.
+            injector.updateBounds(CGRect(x: -1920, y: 100, width: 1921, height: 1081))
+            try require(recorder.events.contains(where: { $0.type == .leftMouseUp })
+                        && recorder.events.contains(where: { $0.type == .keyUp }),
+                        "Switching displays left mouse buttons or keys stuck on the previous screen")
+            recorder.events.removeAll()
+            var move = RemoteInput(kind: .move)
+            move.x = 0.5; move.y = 0.5
+            _ = try await injector.receive(move)
+            try require(recorder.events.count == 1
+                        && recorder.events[0].location == CGPoint(x: -960, y: 640),
+                        "Pointer coordinates did not remap to the switched display bounds")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

@@ -245,6 +245,27 @@ struct DeskView: View {
                     Button { model.canvas.releaseControl(); model.copyRemoteFrame() } label: {
                         Label(SessionToolAction.captureFrame.title(), systemImage: SessionToolAction.captureFrame.symbol())
                     }.help(SessionToolAction.captureFrame.help).disabled(!model.connected)
+                    if model.supportsDisplaySwitching, model.remoteDisplays.count > 1 {
+                        Menu {
+                            ForEach(model.remoteDisplays) { display in
+                                Button {
+                                    model.canvas.releaseControl()
+                                    model.selectRemoteDisplay(display.id)
+                                } label: {
+                                    if display.id == model.remoteSelectedDisplayID {
+                                        Label(display.summary, systemImage: "checkmark")
+                                    } else {
+                                        Text(display.summary)
+                                    }
+                                }
+                                .disabled(display.id == model.remoteSelectedDisplayID || model.displaySwitchWorking)
+                            }
+                        } label: {
+                            Label("切换屏幕", systemImage: "display.2")
+                        }
+                        .help("在远端多台显示器之间无缝切换")
+                        .disabled(!model.connected || model.displaySwitchWorking)
+                    }
                     desktopActionButton(.missionControl)
                     desktopActionButton(.previousSpace)
                     desktopActionButton(.nextSpace)

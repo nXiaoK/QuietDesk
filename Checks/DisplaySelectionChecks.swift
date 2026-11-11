@@ -100,4 +100,92 @@ func runDisplaySelectionChecks() {
         try check(!DisplaySelection.requiresRestart(captured: changedMain, available: [changedMain, external]),
                   "The recovered snapshot caused another reconnect")
     }
+
+    run("Remote display metadata and DisplayControl messages validate and round-trip cleanly") {
+        let builtIn = RemoteDisplayInfo(id: 1, name: "Built-in Retina Display", width: 3024, height: 1964, isMain: true)
+        let studio = RemoteDisplayInfo(id: 2, name: "Studio Display", width: 5120, height: 2880, isMain: false)
+        try builtIn.validate()
+        try studio.validate()
+        try RemoteDisplayInfo.validateList([builtIn, studio], selectedDisplayID: 2)
+        try check(builtIn.summary.contains("（主屏）") && !studio.summary.contains("（主屏）"),
+                  "Primary display summary label did not distinguish main display")
+
+        // Reject invalid IDs, empty names, duplicate IDs, and missing selectedDisplayID.
+        for bad in [
+            RemoteDisplayInfo(id: 0, name: "Bad", width: 1920, height: 1080, isMain: false),
+            RemoteDisplayInfo(id: 3, name: "   ", width: 1920, height: 1080, isMain: false),
+            RemoteDisplayInfo(id: 4, name: "Tiny", width: 1, height: 1080, isMain: false)
+        ] {
+            do { try bad.validate(); throw CheckFailure("Invalid RemoteDisplayInfo passed validation") }
+            catch is DeskError { }
+        }
+        do {
+            try RemoteDisplayInfo.validateList([builtIn, RemoteDisplayInfo(id: 1, name: "Dup", width: 1920, height: 1080, isMain: false)],
+                                               selectedDisplayID: 1)
+            throw CheckFailure("Duplicate display IDs passed list validation")
+        } catch is DeskError { }
+        do {
+            try RemoteDisplayInfo.validateList([builtIn, studio], selectedDisplayID: 99)
+            throw CheckFailure("Unmatched selectedDisplayID passed list validation")
+        } catch is DeskError { }
+
+        // Subscribe, state, select, and result round-trip over Wire.
+        let subMsg = try DisplayControl.subscribe().message()
+        try check(subMsg.kind == .displayControl, "DisplayControl used unexpected MessageKind")
+        try check(try DisplayControl.read(subMsg.payload) == .subscribe(), "Subscribe message changed on decode")
+
+        let videoState = VideoStreamState(settings: StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 12),
+                                          width: 2560, height: 1440)
+        let stateMsg = try DisplayControl.state(displays: [builtIn, studio], selectedDisplayID: 2, videoState: videoState).message()
+        let decodedState = try DisplayControl.read(stateMsg.payload)
+        try check(decodedState.operation == .state && decodedState.selectedDisplayID == 2
+                  && decodedState.displays == [builtIn, studio] && decodedState.videoState == videoState,
+                  "Display state update lost display list or videoState")
+
+        let reqID = UUID()
+        let selectMsg = try DisplayControl.select(id: reqID, displayID: 2).message()
+        let decodedSelect = try DisplayControl.read(selectMsg.payload)
+        try check(decodedSelect.operation == .select && decodedSelect.id == reqID && decodedSelect.displayID == 2,
+                  "Display select request lost id or displayID")
+
+        let resultMsg = try DisplayControl.result(id: reqID, selectedDisplayID: 2, displays: [builtIn, studio],
+                                                  videoState: videoState).message()
+        let decodedResult = try DisplayControl.read(resultMsg.payload)
+        try check(decodedResult.operation == .result && decodedResult.id == reqID
+                  && decodedResult.selectedDisplayID == 2 && decodedResult.videoState == videoState,
+                  "Display switch result did not round-trip")
+    }
+
+    run("Hello multi-display fields remain backward-compatible and synchronize VideoTuningSession dimensions") {
+        let legacyHello = Hello(name: "Mac", width: 1920, height: 1080, settings: StreamSettings(), canControl: true)
+        try legacyHello.validate()
+        try check(legacyHello.displaySwitchingV1 == nil && legacyHello.displays == nil && legacyHello.selectedDisplayID == nil,
+                  "Legacy Hello synthesized multi-display fields")
+
+        let displays = [
+            RemoteDisplayInfo(id: 10, name: "Built-in", width: 3024, height: 1964, isMain: true),
+            RemoteDisplayInfo(id: 20, name: "External 4K", width: 3840, height: 2160, isMain: false)
+        ]
+        let modernHello = Hello(name: "Mac", width: 1920, height: 1246, settings: StreamSettings(), canControl: true,
+                                displaySwitchingV1: true, displays: displays, selectedDisplayID: 10)
+        try modernHello.validate()
+        let wire = try Wire.json(.hello, modernHello)
+        let decoded = try Wire.readJSON(Hello.self, wire.payload)
+        try decoded.validate()
+        try check(decoded.displaySwitchingV1 == true && decoded.displays == displays && decoded.selectedDisplayID == 10,
+                  "Hello multi-display capability or display list was lost")
+
+        var tuning = try VideoTuningSession(
+            applied: VideoStreamState(settings: StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 12),
+                                      width: 2560, height: 1664),
+            preferred: StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 12)
+        )
+        let switchedState = VideoStreamState(
+            settings: StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 12),
+            width: 2560, height: 1440
+        )
+        try tuning.synchronizeHostState(switchedState)
+        try check(tuning.applied == switchedState && tuning.nextRequest() == nil,
+                  "VideoTuningSession did not adopt switched display dimensions cleanly")
+    }
 }

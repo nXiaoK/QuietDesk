@@ -476,6 +476,16 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         return DispatchQueue.getSpecific(key: queueIdentity) == true ? read() : queue.sync(execute: read)
     }
 
+    var currentDisplayID: CGDirectDisplayID? {
+        let read = { [self] in displayID }
+        return DispatchQueue.getSpecific(key: queueIdentity) == true ? read() : queue.sync(execute: read)
+    }
+
+    var currentExcludedWindowIDs: Set<CGWindowID> {
+        let read = { [self] in excludedWindowIDs }
+        return DispatchQueue.getSpecific(key: queueIdentity) == true ? read() : queue.sync(execute: read)
+    }
+
     private func cursorState() -> (actual: Bool?, target: Bool?) {
         let read = { [self] in
             (actual: running && captureStarted ? appliedCursorIncluded : nil, target: running ? cursorGate.included : nil)
@@ -496,8 +506,9 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         CGDisplayCopyColorSpace(id).isWideGamutRGB ? .displayP3 : .sRGB
     }
 
-    static func prepareCapture(display: SCDisplay, settings: StreamSettings) -> CapturePlan {
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+    static func prepareCapture(display: SCDisplay, settings: StreamSettings,
+                               excludingWindows: [SCWindow] = []) -> CapturePlan {
+        let filter = SCContentFilter(display: display, excludingWindows: excludingWindows)
         let source = sourceDimensions(filter: filter, displayID: display.displayID)
         let (width, height) = settings.dimensions(width: source.width, height: source.height)
         return CapturePlan(filter: filter, displayID: display.displayID, sourceWidth: source.width,
@@ -1084,6 +1095,122 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
+    /// Hot-switches the active `SCStream` to another display or updated display mode/resolution in place.
+    func switchCapture(_ capture: CapturePlan, excludedWindows: Set<CGWindowID>? = nil) async throws -> VideoStreamState {
+        let snapshot = try queue.sync { () throws -> (SCStream, StreamSettings, Bool, VideoCodec, VideoChromaSubsampling, CGDirectDisplayID?, SCContentFilter?, Int, Int, Int, Int, VideoColorSpace, Set<CGWindowID>, Bool) in
+            guard running, captureStarted, let stream else {
+                throw DeskError.invalid("屏幕采集尚未就绪，请稍后切换显示器")
+            }
+            if let operation = cursorOperationID {
+                cancelCursorOperation(operation)
+                throw DeskError.invalid("光标采集正在更新，请稍后切换显示器")
+            }
+            if let waiter = cursorFrameWaiter {
+                cancelCursorRequest(waiter.id)
+                throw DeskError.invalid("正在等待光标采集的新画面")
+            }
+            return (stream, currentSettings, cursorGate.included, encoder?.codec ?? .h264,
+                    encoder?.chromaSubsampling ?? .yuv420, displayID, activeFilter,
+                    sourceWidth, sourceHeight, outputWidth, outputHeight, captureColorSpace,
+                    excludedWindowIDs, encoder != nil && !frameFlow.encodingFailed)
+        }
+        let settings = snapshot.1
+        let (width, height) = settings.dimensions(width: capture.sourceWidth, height: capture.sourceHeight)
+        let targetCodec = snapshot.3
+        let requestedChroma: VideoChromaSubsampling = targetCodec == .hevc ? snapshot.4 : .yuv420
+        let canReuseEncoder = snapshot.13 && width == snapshot.9 && height == snapshot.10 && capture.colorSpace == snapshot.11
+        let id = UUID()
+        let replacement = canReuseEncoder ? nil : try makeEncoder(width: width, height: height, settings: settings,
+                                                                  codec: targetCodec, chromaSubsampling: requestedChroma,
+                                                                  colorSpace: capture.colorSpace, id: id)
+        let effectiveChroma = replacement?.chromaSubsampling ?? snapshot.4
+        let nextConfiguration = Self.configuration(width: width, height: height, settings: settings,
+                                                   includesCursor: snapshot.2, chromaSubsampling: effectiveChroma,
+                                                   colorSpace: capture.colorSpace)
+        do { try await pauseAtFrameBoundary() }
+        catch { replacement?.stop(); throw error }
+        do {
+            try Task.checkCancellation()
+            try await snapshot.0.updateContentFilter(capture.filter)
+            try await snapshot.0.updateConfiguration(nextConfiguration)
+            try Task.checkCancellation()
+            var freshStaticSample: (CVPixelBuffer, CMTime)?
+            if !queue.sync(execute: { cursorGate.needsFreshFrame }),
+               let sample = try? await SCScreenshotManager.captureSampleBuffer(contentFilter: capture.filter,
+                                                                               configuration: nextConfiguration),
+               CMSampleBufferIsValid(sample), let image = CMSampleBufferGetImageBuffer(sample) {
+                freshStaticSample = (image, CMSampleBufferGetPresentationTimeStamp(sample))
+            }
+            try Task.checkCancellation()
+            try queue.sync {
+                guard running, stream === snapshot.0 else { throw CancellationError() }
+                if !canReuseEncoder || encoder == nil || frameFlow.encodingFailed {
+                    let nextEncoder = try replacement ?? makeEncoder(width: width, height: height, settings: settings,
+                                                                     codec: targetCodec, chromaSubsampling: requestedChroma,
+                                                                     colorSpace: capture.colorSpace, id: id)
+                    let old = encoder
+                    encoderID = id
+                    encoder = nextEncoder
+                    encoderHardwareChecked = false
+                    encoderHardware = nil
+                    presentationTimeline = VideoPresentationTimeline()
+                    old?.stop()
+                }
+                encodingTimingLock.withLock { encodingStarted.removeAll(); encodeTiming.cancel() }
+                lastCaptureDiagnostics = nil
+                displayID = capture.displayID
+                activeFilter = capture.filter
+                if let excludedWindows { excludedWindowIDs = excludedWindows }
+                sourceWidth = capture.sourceWidth
+                sourceHeight = capture.sourceHeight
+                captureColorSpace = capture.colorSpace
+                outputWidth = width
+                outputHeight = height
+                let wasMediaHeld = frameFlow.mediaHold
+                frameFlow = VideoFrameFlow(sequence: frameFlow.sequence)
+                if wasMediaHeld { frameFlow.prepareMediaRecovery() }
+                frameDropper.reset()
+                cancelRefinement()
+                if cursorGate.needsFreshFrame {
+                    latest = nil
+                    lastCapture = nil
+                    appliedCursorIncluded = nil
+                } else if let freshStaticSample {
+                    latest = (freshStaticSample.0, freshStaticSample.1, nil)
+                    lastCapture = latest
+                    lastCaptureAt = SessionClock.now
+                } else {
+                    latest = nil
+                    lastCapture = nil
+                }
+                discardMismatchedFrame()
+            }
+            return VideoStreamState(settings: settings, width: width, height: height)
+        } catch {
+            replacement?.stop()
+            if queue.sync(execute: { running && stream === snapshot.0 }) {
+                do {
+                    if let oldFilter = snapshot.6 { try await snapshot.0.updateContentFilter(oldFilter) }
+                    try await snapshot.0.updateConfiguration(Self.configuration(width: snapshot.9, height: snapshot.10,
+                        settings: snapshot.1, includesCursor: snapshot.2,
+                        chromaSubsampling: snapshot.4, colorSpace: snapshot.11))
+                    queue.sync {
+                        guard running, stream === snapshot.0 else { return }
+                        frameFlow.requestKeyFrame()
+                        discardMismatchedFrame()
+                        reconfiguring = false
+                        pump()
+                    }
+                } catch let rollbackError {
+                    queue.async { [weak self] in
+                        self?.reportError(rollbackError, message: "显示器切换失败且无法恢复原配置：\(rollbackError.localizedDescription)")
+                    }
+                }
+            }
+            throw error
+        }
+    }
+
     func setSessionPaused(_ paused: Bool) async throws -> Bool {
         let snapshot = try queue.sync { () throws -> (SCStream, Bool, Bool) in
             guard running, captureStarted, let stream else { throw DeskError.invalid("屏幕采集尚未就绪") }
@@ -1606,7 +1733,7 @@ final class InputInjector: @unchecked Sendable {
     ]
 
     private final class Engine: @unchecked Sendable {
-        let bounds: CGRect
+        private var bounds: CGRect
         let inputSources: InputSources
         private let lock = NSRecursiveLock()
         private var heldKeys = Set<UInt16>()
@@ -1637,6 +1764,21 @@ final class InputInjector: @unchecked Sendable {
             self.inputSources = inputSources
             self.capsLockState = capsLockState
             self.pointerLocation = pointerLocation
+        }
+
+        func currentBounds() -> CGRect {
+            lock.withLock { bounds }
+        }
+
+        func updateBounds(_ next: CGRect) {
+            lock.withLock {
+                guard bounds != next else { return }
+                releaseAllUnlocked()
+                bounds = next
+                hasKnownPoint = false
+                pointerRemainderX = 0
+                pointerRemainderY = 0
+            }
         }
 
         func checkTrustedOrRelease() -> Bool {
@@ -1941,7 +2083,7 @@ final class InputInjector: @unchecked Sendable {
         }
     }
 
-    nonisolated let bounds: CGRect
+    nonisolated var bounds: CGRect { engine.currentBounds() }
     nonisolated let supportsConcurrentQueue: Bool
     private let engine: Engine
 
@@ -1955,7 +2097,6 @@ final class InputInjector: @unchecked Sendable {
                      inputSources: InputSources? = nil,
                      capsLockState: @escaping @Sendable () -> Bool = { CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift) },
                      pointerLocation: @escaping @Sendable () -> CGPoint? = { CGEvent(source: nil)?.location }) {
-        self.bounds = bounds
         self.supportsConcurrentQueue = true
         self.engine = Engine(bounds: bounds, isTrusted: isTrusted, postEvent: postEvent,
                              inputSources: inputSources ?? InputSources(),
@@ -1967,11 +2108,14 @@ final class InputInjector: @unchecked Sendable {
          inputSources: InputSources? = nil,
          capsLockState: @escaping () -> Bool = { CGEventSource.flagsState(.combinedSessionState).contains(.maskAlphaShift) },
          pointerLocation: @escaping () -> CGPoint? = { CGEvent(source: nil)?.location }) {
-        self.bounds = bounds
         self.supportsConcurrentQueue = false
         self.engine = Engine(bounds: bounds, isTrusted: isTrusted, postEvent: postEvent,
                              inputSources: inputSources ?? InputSources(),
                              capsLockState: capsLockState, pointerLocation: pointerLocation)
+    }
+
+    nonisolated func updateBounds(_ next: CGRect) {
+        engine.updateBounds(next)
     }
 
     func receive(_ input: RemoteInput) async throws -> InputFeedback? {

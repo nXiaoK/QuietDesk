@@ -271,7 +271,7 @@ struct SharingView: View {
                 Spacer(minLength: 0)
             }
             if locked {
-                Label("共享中不可修改，停止共享后可编辑", systemImage: "lock")
+                Label("共享中可直接切换显示器；端口与默认画质需停止共享后编辑", systemImage: "lock")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -285,6 +285,7 @@ struct SharingView: View {
                             }
                             .labelsHidden()
                             .frame(maxWidth: .infinity)
+                            .disabled(model.working || model.displaySwitchWorking)
                         }
                         HStack(spacing: 8) {
                             Text("监听端口")
@@ -293,6 +294,7 @@ struct SharingView: View {
                                 .frame(width: 72)
                                 .accessibilityLabel("监听端口")
                         }
+                        .disabled(locked)
                     }
                     if let notice = model.displayFallbackNotice {
                         Text(notice)
@@ -331,6 +333,7 @@ struct SharingView: View {
                         }
                         .frame(maxWidth: .infinity)
                     }
+                    .disabled(locked)
                     Divider()
                     VStack(alignment: .leading, spacing: 5) {
                         Text("建议先用 1920 / 15 fps / 3 Mbps。静止画面最多细化 4 次后停止重复编码；码率是目标值，关键帧和网络开销可能产生短时峰值。")
@@ -341,7 +344,6 @@ struct SharingView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 }
-                .disabled(locked)
             }
         }
     }

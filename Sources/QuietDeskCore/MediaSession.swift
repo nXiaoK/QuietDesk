@@ -203,6 +203,8 @@ public final class MediaSession: @unchecked Sendable {
     private var pacingScheduled = false
     private var pacingTimer: DispatchSourceTimer?
     private var pacingGeneration: UInt64 = 0
+    private var pollScheduled = false
+    private var pollTimer: DispatchSourceTimer?
     private var decoding: Set<MediaFrameHeader> = []
     private var reassembledLocally: Set<MediaFrameHeader> = []
     private var reassembledAtPeer: Set<MediaFrameHeader> = []
@@ -437,6 +439,7 @@ public final class MediaSession: @unchecked Sendable {
             self.stopped = true
             _ = self.policy.stop()
             self.timer?.cancel(); self.timer = nil
+            self.pollTimer?.cancel(); self.pollTimer = nil; self.pollScheduled = false
             self.pathMonitor?.cancel(); self.pathMonitor = nil
             self.udpListener?.cancel(); self.udpListener = nil
             self.udpPeer?.close(); self.udpPeer = nil
@@ -882,6 +885,7 @@ public final class MediaSession: @unchecked Sendable {
                 guard fragment.header.stream == expectedStream else { return }
                 samplePackets += 1; sampleBytes += data.count; lastVideoAt = SessionClock.now
                 handleReceiveEvents(try receiver?.receive(fragment, isRepair: kind == Self.repairedFragmentKind) ?? [])
+                scheduleReceiverPoll()
             case 4:
                 guard side == .host, udpVerified else { return }
                 receiveFeedback(try MediaFeedback.decode(Data(data.dropFirst())))
@@ -1079,15 +1083,18 @@ public final class MediaSession: @unchecked Sendable {
 
     private func receiveFeedback(_ feedback: MediaFeedback) {
         guard feedback.header.stream == cache?.stream else { return }
+        let targetHeader = (feedback.kind == .nack || feedback.kind == .expired)
+            ? (cache?.frameHeader(for: feedback.header.frameID) ?? feedback.header)
+            : feedback.header
         var accepted = feedback
         if feedback.kind == .nack {
-            let submitted = originalSubmittedCounts[feedback.header] ?? 0
+            let submitted = originalSubmittedCounts[targetHeader] ?? 0
             let ranges = feedback.missingRanges.compactMap { range -> MediaFragmentRange? in
                 let first = Int(range.first), end = min(submitted, Int(range.first) + Int(range.count))
                 guard end > first else { return nil }
                 return MediaFragmentRange(first: range.first, count: UInt16(end - first))
             }
-            guard !ranges.isEmpty, let filtered = try? MediaFeedback(kind: .nack, header: feedback.header, missingRanges: ranges) else { return }
+            guard !ranges.isEmpty, let filtered = try? MediaFeedback(kind: .nack, header: targetHeader, missingRanges: ranges) else { return }
             accepted = filtered
         }
         if feedback.kind == .reassembled || feedback.kind == .decoded, let sent = deliverySentAt.removeValue(forKey: feedback.header) {
@@ -1153,13 +1160,29 @@ public final class MediaSession: @unchecked Sendable {
     }
 
     private func enqueue(_ fragments: [MediaFragment], repair: Bool = false) {
-        let bytes = fragments.reduce(0) { $0 + $1.encode().count + 1 }
+        guard !fragments.isEmpty else { return }
+        let kindByte: UInt8 = repair && viewerAcceptsMarkedRepairs ? Self.repairedFragmentKind : 3
+        let bytes = fragments.reduce(0) { $0 + 1 + MediaFragment.encodedHeaderBytes + $1.payload.count }
         guard bytes <= 32 * 1024 * 1024 - pendingDatagramBytes else { requestRecovery(); return }
+        var encoded: [Datagram] = []
+        encoded.reserveCapacity(fragments.count)
         for fragment in fragments {
-            var data = Data([repair && viewerAcceptsMarkedRepairs ? Self.repairedFragmentKind : 3])
+            var data = Data(capacity: 1 + MediaFragment.encodedHeaderBytes + fragment.payload.count)
+            data.append(kindByte)
             data.append(fragment.encode())
-            pendingDatagrams.append(Datagram(header: fragment.header, fragmentIndex: fragment.fragmentIndex,
-                                             data: data, repair: repair)); pendingDatagramBytes += data.count
+            encoded.append(Datagram(header: fragment.header, fragmentIndex: fragment.fragmentIndex,
+                                    data: data, repair: repair))
+        }
+        pendingDatagramBytes += bytes
+        if repair, datagramOffset < pendingDatagrams.count {
+            if datagramOffset > 0 {
+                pendingDatagrams.removeFirst(datagramOffset)
+                datagramOffset = 0
+            }
+            let insertAt = pendingDatagrams.firstIndex(where: { !$0.repair }) ?? pendingDatagrams.count
+            pendingDatagrams.insert(contentsOf: encoded, at: insertAt)
+        } else {
+            pendingDatagrams.append(contentsOf: encoded)
         }
         pumpDatagrams()
     }
@@ -1210,9 +1233,32 @@ public final class MediaSession: @unchecked Sendable {
         pacingTimer = timer; timer.resume()
     }
 
+    private func scheduleReceiverPoll() {
+        guard side == .viewer, !stopped, !paused, !configurationSuspended,
+              let delay = receiver?.nextPollDelay, delay < 0.009 else { return }
+        let wait = max(0.0005, delay)
+        guard !pollScheduled else { return }
+        pollScheduled = true
+        if let pollTimer {
+            pollTimer.schedule(deadline: .now() + wait, leeway: .microseconds(300))
+            return
+        }
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
+        timer.setEventHandler { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.pollScheduled = false
+            guard self.side == .viewer, !self.paused, !self.configurationSuspended else { return }
+            self.handleReceiveEvents(self.receiver?.poll() ?? [])
+            self.scheduleReceiverPoll()
+        }
+        timer.schedule(deadline: .now() + wait, leeway: .microseconds(300))
+        pollTimer = timer; timer.resume()
+    }
+
     private func clearDatagrams() {
         pacingGeneration &+= 1
         pacingTimer?.cancel(); pacingTimer = nil; pacingScheduled = false
+        pollTimer?.cancel(); pollTimer = nil; pollScheduled = false
         pendingDatagrams.removeAll(); datagramOffset = 0; pendingDatagramBytes = 0
         pacingCredit = 0; pacingUpdatedAt = SessionClock.now
         originalSubmittedCounts.removeAll()

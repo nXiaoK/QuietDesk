@@ -93,6 +93,12 @@ public final class MediaFrameReassembler {
     private var waitingForFirstIDR = true
     private var awaitingDecode: MediaFrameHeader?
     private var gapStartedAt: TimeInterval?
+    private struct MissingFrame {
+        let firstSeenAt: TimeInterval
+        var lastNackAt: TimeInterval?
+        var requested = false
+    }
+    private var missingFrames: [UInt64: MissingFrame] = [:]
     private var assemblies: [UInt64: Assembly] = [:]
     private var lastDecoded: MediaFrameHeader?
     private var lastAcknowledgementAt: TimeInterval?
@@ -197,6 +203,7 @@ public final class MediaFrameReassembler {
             settleFragments(end, lost: (0..<end).lazy.filter { !assembly.received[$0] || assembly.late[$0] }.count)
         }
         assemblies.removeAll()
+        missingFrames.removeAll()
         bufferedBytes = 0
         awaitingDecode = nil
         gapStartedAt = nil
@@ -212,6 +219,7 @@ public final class MediaFrameReassembler {
         self.stream = stream
         expectedFrameID = firstFrameID
         assemblies.removeAll()
+        missingFrames.removeAll()
         bufferedBytes = 0
         awaitingDecode = nil
         gapStartedAt = nil
@@ -236,6 +244,7 @@ public final class MediaFrameReassembler {
             return events + invalidate(at: fragment.header)
         }
         let assembly: Assembly
+        var missingGap: MissingFrame?
         if let existing = assemblies[fragment.header.frameID] {
             guard existing.header == fragment.header, existing.totalBytes == fragment.frameBytes,
                   existing.fragmentCount == Int(fragment.fragmentCount) else {
@@ -248,7 +257,11 @@ public final class MediaFrameReassembler {
                   fragment.frameBytes <= limits.maximumBufferedBytes - bufferedBytes else {
                 return events + invalidate(at: fragment.header)
             }
+            missingGap = missingFrames.removeValue(forKey: fragment.header.frameID)
             assembly = Assembly(fragment, now: now)
+            if missingGap?.requested == true, assembly.fragmentCount == 1 {
+                assembly.requestedThroughTail = true
+            }
             assemblies[fragment.header.frameID] = assembly
             bufferedBytes += fragment.frameBytes
         }
@@ -265,7 +278,8 @@ public final class MediaFrameReassembler {
             assembly.received[index] = true
             assembly.receivedCount += 1
             let reorderedLate = index < assembly.highestReceivedIndex && now - assembly.highestReceivedAt >= limits.reorderDelay
-            if reorderedLate || (isRepair && assembly.requestedThroughTail) { assembly.late[index] = true }
+            let missingHoleLate = missingGap.map { $0.requested || now - $0.firstSeenAt >= limits.reorderDelay } ?? false
+            if reorderedLate || missingHoleLate || (isRepair && assembly.requestedThroughTail) { assembly.late[index] = true }
             if index > assembly.highestReceivedIndex {
                 assembly.highestReceivedIndex = index
                 assembly.highestReceivedAt = now
@@ -313,6 +327,7 @@ public final class MediaFrameReassembler {
             guard assemblies.count < limits.maximumFrames, bytes.count <= limits.maximumBufferedBytes - bufferedBytes else {
                 return events + invalidate(at: frame.header)
             }
+            missingFrames.removeValue(forKey: frame.header.frameID)
             assemblies[frame.header.frameID] = Assembly(frame, bytes: bytes, now: now)
             bufferedBytes += bytes.count
             events.append(.feedback(try MediaFeedback(kind: .reassembled, header: frame.header)))
@@ -335,11 +350,50 @@ public final class MediaFrameReassembler {
         return completedAt - assembly.firstReceivedAt
     }
 
+    /// Delay until the earliest pending NACK check for a missing frame or fragment hole, if any.
+    public var nextPollDelay: TimeInterval? {
+        guard !requiresRecovery else { return nil }
+        let now = currentTime()
+        var earliest: TimeInterval?
+        func consider(_ due: TimeInterval) {
+            let delay = max(0, due - now)
+            earliest = earliest.map { min($0, delay) } ?? delay
+        }
+        for missing in missingFrames.values {
+            let due = max(missing.firstSeenAt + limits.reorderDelay,
+                          missing.lastNackAt.map { $0 + limits.nackInterval } ?? 0)
+            consider(due)
+        }
+        for assembly in assemblies.values where assembly.frame == nil {
+            let hasEarlyHole = assembly.receivedCount < assembly.highestReceivedIndex + 1
+            let baseDue = hasEarlyHole
+                ? assembly.firstReceivedAt + limits.reorderDelay
+                : assembly.lastProgressAt + max(limits.reorderDelay, limits.nackInterval)
+            let due = max(baseDue, assembly.lastNackAt.map { $0 + limits.nackInterval } ?? 0)
+            consider(due)
+        }
+        return earliest
+    }
+
     public func poll() -> [MediaReceiveEvent] {
         let now = currentTime()
         var events = expire(at: now)
         guard !requiresRecovery else { return events }
-        for id in assemblies.keys.sorted() {
+        let candidateIDs = Set(assemblies.keys).union(missingFrames.keys).sorted()
+        for id in candidateIDs {
+            if var missing = missingFrames[id], assemblies[id] == nil {
+                guard now - missing.firstSeenAt >= limits.reorderDelay,
+                      missing.lastNackAt.map({ now - $0 >= limits.nackInterval }) ?? true else { continue }
+                let header = MediaFrameHeader(stream: stream, frameID: id, isIDR: waitingForFirstIDR && id == expectedFrameID)
+                if let feedback = try? MediaFeedback(kind: .nack, header: header,
+                                                     missingRanges: [.init(first: 0, count: 1)]) {
+                    missing.lastNackAt = now
+                    missing.requested = true
+                    missingFrames[id] = missing
+                    events.append(.feedback(feedback))
+                }
+                continue
+            }
             guard let assembly = assemblies[id], assembly.frame == nil,
                   now - assembly.firstReceivedAt >= limits.reorderDelay,
                   assembly.lastNackAt.map({ now - $0 >= limits.nackInterval }) ?? true else { continue }
@@ -398,9 +452,15 @@ public final class MediaFrameReassembler {
     }
 
     private func updateGap(at now: TimeInterval) {
+        missingFrames = missingFrames.filter { $0.key >= expectedFrameID && assemblies[$0.key] == nil }
         if assemblies[expectedFrameID] == nil, !assemblies.isEmpty {
             if gapStartedAt == nil { gapStartedAt = now }
         } else { gapStartedAt = nil }
+        if let highest = assemblies.keys.max(), highest > expectedFrameID {
+            for id in expectedFrameID..<highest where assemblies[id] == nil && missingFrames[id] == nil {
+                missingFrames[id] = MissingFrame(firstSeenAt: now)
+            }
+        }
     }
 
     private func readyFrame() -> [MediaReceiveEvent] {
@@ -441,6 +501,7 @@ public final class MediaFrameReassembler {
             settleFragments(assembly.fragmentCount, lost: zip(assembly.received, assembly.late).lazy.filter { !$0.0 || $0.1 }.count)
         }
         assemblies.removeAll()
+        missingFrames.removeAll()
         bufferedBytes = 0
         awaitingDecode = nil
         gapStartedAt = nil
@@ -522,6 +583,10 @@ public final class MediaRetransmissionCache {
         return fragments
     }
 
+    public func frameHeader(for frameID: UInt64) -> MediaFrameHeader? {
+        frames[frameID]?.header
+    }
+
     public func handle(_ feedback: MediaFeedback, estimatedRoundTrip: TimeInterval) -> [MediaSendEvent] {
         guard feedback.header.stream == stream, !requiresRecovery else { return [] }
         let now = currentTime()
@@ -529,7 +594,8 @@ public final class MediaRetransmissionCache {
         guard !requiresRecovery else { return events }
         guard let inserted = highestInserted, feedback.header.frameID <= inserted else { return events }
         // A receiver detecting a wholly missing frame cannot know whether it happened to be an IDR.
-        if feedback.kind != .expired, let cached = frames[feedback.header.frameID], cached.header != feedback.header { return events }
+        if feedback.kind != .expired && feedback.kind != .nack,
+           let cached = frames[feedback.header.frameID], cached.header != feedback.header { return events }
         switch feedback.kind {
         case .decoded:
             // Repeated cumulative decode status recovers a lost earlier ACK without retransmitting video.

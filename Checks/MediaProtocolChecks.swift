@@ -577,4 +577,63 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         try require(feedback(receiver.poll(), .expired).count == 1 && receiver.requiresRecovery,
                     "Stalled P-frame did not expire after updated frameTimeToLive")
     }
+
+    run("Wholly missing single-fragment P-frame and unknown-flag IDR repair via NACK without epoch stall") {
+        let time = MediaCheckClock()
+        let receiver = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        let sender = try MediaRetransmissionCache(stream: stream, clock: { time.now })
+        let first = try frame(1, idr: true)
+        let firstParts = try sender.insert(first, deadline: 1)
+        _ = try receiver.receive(firstParts[0])
+        let firstDecoded = receiver.decoded(first.header, success: true)
+        _ = sender.handle(feedback(firstDecoded, .decoded)[0], estimatedRoundTrip: 0.005)
+
+        // Frame 2 (1 fragment) is dropped in transit; frame 3 arrives at t = 0.010.
+        time.now = 0.010
+        let second = try frame(2, sequence: 102)
+        let third = try frame(3, sequence: 103)
+        let secondParts = try sender.insert(second, deadline: 1)
+        let thirdParts = try sender.insert(third, deadline: 1)
+        try require(secondParts.count == 1 && thirdParts.count == 1, "Desktop P-frame fixture exceeded 1 fragment")
+        try require(ready(try receiver.receive(thirdParts[0])).isEmpty, "Frame 3 crossed missing frame 2")
+        try require(receiver.nextPollDelay.map { abs($0 - 0.003) < 1e-6 } == true, "Missing frame did not arm reorder poll delay")
+        time.now = 0.012
+        try require(feedback(receiver.poll(), .nack).isEmpty, "Missing frame NACK fired before reorderDelay")
+        time.now = 0.0135
+        let nacks = feedback(receiver.poll(), .nack)
+        try require(nacks.count == 1 && nacks[0].header.frameID == 2
+                    && nacks[0].missingRanges == [.init(first: 0, count: 1)],
+                    "Wholly missing 1-fragment P-frame was not NACKed")
+        guard case .retransmit(let repairs)? = sender.handle(nacks[0], estimatedRoundTrip: 0.005).first,
+              repairs == secondParts else {
+            throw MediaCheckFailure(message: "Sender did not retransmit wholly missing 1-fragment P-frame")
+        }
+        time.now = 0.019
+        let recoveredSecond = ready(try receiver.receive(repairs[0], isRepair: true))
+        try require(recoveredSecond.map(\.header.frameID) == [2] && !receiver.requiresRecovery,
+                    "Repaired 1-fragment P-frame did not immediately unblock decoding")
+        let afterSecond = receiver.decoded(second.header, success: true)
+        try require(ready(afterSecond).map(\.header.frameID) == [3], "Buffered frame 3 did not release after frame 2 repair")
+        _ = receiver.decoded(third.header, success: true)
+        try require(receiver.takeFragmentCounts() == (3, 1), "Repaired 1-fragment gap did not count 1 lost of 3 settled fragments")
+        _ = sender.handle(try MediaFeedback(kind: .decoded, header: third.header), estimatedRoundTrip: 0.005)
+
+        // Frame 4 is a mid-stream native IDR whose single packet is lost before frame 5 arrives.
+        time.now = 0.030
+        let fourthIDR = try frame(4, idr: true, sequence: 104)
+        let fifth = try frame(5, sequence: 105)
+        let fourthParts = try sender.insert(fourthIDR, deadline: 1)
+        let fifthParts = try sender.insert(fifth, deadline: 1)
+        _ = try receiver.receive(fifthParts[0])
+        time.now = 0.034
+        let idrNacks = feedback(receiver.poll(), .nack)
+        try require(idrNacks.count == 1 && idrNacks[0].header.frameID == 4 && !idrNacks[0].header.isIDR,
+                    "Receiver did not probe unknown missing frame 4")
+        guard case .retransmit(let idrRepairs)? = sender.handle(idrNacks[0], estimatedRoundTrip: 0.005).first,
+              idrRepairs == fourthParts else {
+            throw MediaCheckFailure(message: "Sender rejected NACK for missing native IDR with unknown flag")
+        }
+        try require(ready(try receiver.receive(idrRepairs[0], isRepair: true)).map(\.header.frameID) == [4],
+                    "Repaired mid-stream IDR did not enter decode")
+    }
 }

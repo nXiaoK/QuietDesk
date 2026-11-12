@@ -1754,7 +1754,8 @@ public final class MediaSession: @unchecked Sendable {
     }
 
     private static func isBulk(_ kind: MessageKind) -> Bool {
-        [.clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel].contains(kind)
+        [.clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd,
+         .clipboardReceipt, .clipboardCancel, .clipboardManifest, .clipboardPull].contains(kind)
     }
 
     deinit {

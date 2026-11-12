@@ -15,11 +15,43 @@ public enum ClipboardAutomaticLimits {
     }
 }
 
-public struct ClipboardRevision: Codable, Equatable, Comparable {
+public struct ClipboardRevision: Codable, Equatable, Comparable, Sendable {
     public let counter: UInt64
     public let origin: UUID
+    public init(counter: UInt64, origin: UUID) {
+        self.counter = counter
+        self.origin = origin
+    }
     public static func < (lhs: Self, rhs: Self) -> Bool {
         lhs.counter == rhs.counter ? lhs.origin.uuidString < rhs.origin.uuidString : lhs.counter < rhs.counter
+    }
+}
+
+public enum ClipboardManifestKind: String, Codable, Equatable, Sendable {
+    case text
+    case png
+    case files
+}
+
+public struct ClipboardManifest: Codable, Equatable, Sendable {
+    public let revision: ClipboardRevision
+    public let kind: ClipboardManifestKind
+
+    public init(revision: ClipboardRevision, kind: ClipboardManifestKind) {
+        self.revision = revision
+        self.kind = kind
+    }
+}
+
+public struct ClipboardPullRequest: Codable, Equatable, Sendable {
+    public let requestID: UUID
+    public let revision: ClipboardRevision
+    public let kind: ClipboardManifestKind
+
+    public init(requestID: UUID = UUID(), revision: ClipboardRevision, kind: ClipboardManifestKind) {
+        self.requestID = requestID
+        self.revision = revision
+        self.kind = kind
     }
 }
 
@@ -30,12 +62,14 @@ public struct ClipboardPreference: Codable {
     public let receivesAutomaticUpdates: Bool?
     public let chunkWindow: Bool?
     public let decoupledFileTransfer: Bool?
+    public let onDemandClipboard: Bool?
     public init(enabled: Bool, session: UUID? = nil, fileApproval: Bool? = true, receivesAutomaticUpdates: Bool? = nil,
-                chunkWindow: Bool? = true, decoupledFileTransfer: Bool? = true) {
+                chunkWindow: Bool? = true, decoupledFileTransfer: Bool? = true, onDemandClipboard: Bool? = true) {
         self.enabled = enabled; self.session = session; self.fileApproval = fileApproval
         self.receivesAutomaticUpdates = receivesAutomaticUpdates
         self.chunkWindow = chunkWindow
         self.decoupledFileTransfer = decoupledFileTransfer
+        self.onDemandClipboard = onDemandClipboard
     }
 }
 
@@ -88,10 +122,11 @@ private struct ClipboardBegin: Codable {
     let chunkWindow: Bool?
     let independentFileLane: Bool?
     let explicitDrop: Bool?
+    let pullRequestID: UUID?
 
     init(revision: ClipboardRevision, sequence: UInt64, type: String, count: Int, bytes: UInt64,
          names: [String]?, rootCount: Int?, chunkWindow: Bool?,
-         independentFileLane: Bool? = nil, explicitDrop: Bool? = nil) {
+         independentFileLane: Bool? = nil, explicitDrop: Bool? = nil, pullRequestID: UUID? = nil) {
         self.revision = revision
         self.sequence = sequence
         self.type = type
@@ -102,6 +137,7 @@ private struct ClipboardBegin: Codable {
         self.chunkWindow = chunkWindow
         self.independentFileLane = independentFileLane
         self.explicitDrop = explicitDrop
+        self.pullRequestID = pullRequestID
     }
 }
 
@@ -147,6 +183,10 @@ public final class ClipboardTransfer {
     public var onExplicitFilesReceived: (([URL]) -> Void)?
     public var onApply: ((ClipboardPayload, @escaping (Bool) -> Void) -> Void)?
     public var onApplyWithPermit: ((ClipboardPayload, ClipboardApplyPermit, @escaping (Bool) -> Void) -> Void)?
+    public var onManifest: ((ClipboardManifest) -> Void)?
+    public var onManifestInvalidated: ((ClipboardRevision) -> Void)?
+    public var onPullRequested: ((ClipboardPullRequest) -> Void)?
+    public var validatePulledPNG: (@Sendable (Data) -> Bool)?
     public var onStatus: ((String) -> Void)?
     public var onFileOffer: ((ClipboardFileOffer?) -> Void)?
     public var onFileOfferEnded: ((UUID, ClipboardFileOfferEndReason) -> Void)?
@@ -154,16 +194,20 @@ public final class ClipboardTransfer {
     public var onFileTransferStarted: (() -> Void)?
     public var onFileResult: ((ClipboardFileResult) -> Void)?
     private let queue = DispatchQueue(label: "quietdesk.clipboard.files", qos: .utility)
+    private let pullValidationQueue = DispatchQueue(label: "quietdesk.clipboard.pull-validate", qos: .userInitiated)
     private let storage: URL
     private let requireFileApproval: Bool
     private let allowsChunkWindow: Bool
     private let allowsDecoupledFileTransfer: Bool
+    private let allowsOnDemandClipboard: Bool
     private let availableCapacity: (URL) throws -> UInt64
     private var partialStorage: ClipboardPartialStorage?
     private let origin = UUID()
     private var clock: UInt64 = 0
     private var newest: ClipboardRevision?
     private var newestFile: ClipboardRevision?
+    private var announcedManifestRevision: ClipboardRevision?
+    private var activePull: ActivePull?
     private var outgoing: Outgoing?
     private var fileOutgoing: Outgoing?
     private var incoming: Incoming?
@@ -180,6 +224,53 @@ public final class ClipboardTransfer {
     private static let windowChunkSize = 262_144
     private static let maximumInFlightMessages: UInt64 = 16
     private static let decoupledFileWindowMessages: UInt64 = 64
+
+    private final class PullResultBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: ClipboardPayload?
+        func set(_ next: ClipboardPayload?) { lock.withLock { value = next } }
+        func read() -> ClipboardPayload? { lock.withLock { value } }
+    }
+
+    private final class ActivePull: @unchecked Sendable {
+        let requestID: UUID
+        let revision: ClipboardRevision
+        let kind: ClipboardManifestKind
+        private let lock = NSLock()
+        private var progressAt: TimeInterval
+        private var finished = false
+        private var streamRev: ClipboardRevision?
+        private let completion: (ClipboardPayload?) -> Void
+
+        init(requestID: UUID, revision: ClipboardRevision, kind: ClipboardManifestKind,
+             now: TimeInterval = SessionClock.now, completion: @escaping (ClipboardPayload?) -> Void) {
+            self.requestID = requestID
+            self.revision = revision
+            self.kind = kind
+            self.progressAt = now
+            self.completion = completion
+        }
+
+        var lastProgressAt: TimeInterval { lock.withLock { progressAt } }
+        var isFinished: Bool { lock.withLock { finished } }
+        var streamRevision: ClipboardRevision? {
+            get { lock.withLock { streamRev } }
+            set { lock.withLock { streamRev = newValue } }
+        }
+
+        func touch(now: TimeInterval = SessionClock.now) {
+            lock.withLock { if !finished { progressAt = now } }
+        }
+
+        func settle(_ payload: ClipboardPayload?) {
+            let callback: ((ClipboardPayload?) -> Void)? = lock.withLock {
+                guard !finished else { return nil }
+                finished = true
+                return completion
+            }
+            callback?(payload)
+        }
+    }
 
     private struct Part {
         let path: String
@@ -243,13 +334,166 @@ public final class ClipboardTransfer {
     }
 
     public init(storage: URL, requireFileApproval: Bool = false, allowsChunkWindow: Bool = false,
-                allowsDecoupledFileTransfer: Bool = false,
+                allowsDecoupledFileTransfer: Bool = false, allowsOnDemandClipboard: Bool = false,
                 availableCapacity: ((URL) throws -> UInt64)? = nil) {
         self.storage = storage; self.requireFileApproval = requireFileApproval
         self.allowsChunkWindow = allowsChunkWindow
         self.allowsDecoupledFileTransfer = allowsDecoupledFileTransfer
+        self.allowsOnDemandClipboard = allowsOnDemandClipboard
         self.availableCapacity = availableCapacity ?? ClipboardPartialStorage.availableCapacity
         queue.async { try? ClipboardPartialStorage.removeAbandoned(storage: storage) }
+    }
+
+    public func announceManifest(kind: ClipboardManifestKind, completion: @escaping (ClipboardRevision?) -> Void = { _ in }) {
+        queue.async { [self] in
+            guard !stopped, allowsOnDemandClipboard else {
+                completion(nil)
+                return
+            }
+            let reason = "剪贴板已被新的复制内容替换"
+            cancelOutgoing(reason)
+            if allowsDecoupledFileTransfer {
+                if let incoming {
+                    sendJSON(.clipboardCancel, ClipboardReceipt(revision: incoming.begin.revision, sequence: incoming.sequence, reason: reason))
+                } else if let applying {
+                    sendJSON(.clipboardCancel, ClipboardReceipt(revision: applying.revision, sequence: 0, reason: reason))
+                }
+                discardClipboardIncoming()
+            } else if receivingFileID == nil {
+                if let incoming {
+                    sendJSON(.clipboardCancel, ClipboardReceipt(revision: incoming.begin.revision, sequence: incoming.sequence, reason: reason))
+                } else if let pendingFileOffer {
+                    sendJSON(.clipboardCancel, ClipboardReceipt(revision: pendingFileOffer.begin.revision, sequence: 0, reason: reason))
+                } else if let applying {
+                    sendJSON(.clipboardCancel, ClipboardReceipt(revision: applying.revision, sequence: 0, reason: reason))
+                }
+                discardIncoming(reason: .superseded)
+            }
+            clock &+= 1
+            let revision = ClipboardRevision(counter: clock, origin: origin)
+            newest = revision
+            announcedManifestRevision = revision
+            sendJSON(.clipboardManifest, ClipboardManifest(revision: revision, kind: kind))
+            switch kind {
+            case .text:
+                onStatus?("文字已就绪，粘贴时按需同步")
+            case .png:
+                onStatus?("图片已就绪，粘贴时按需同步")
+            case .files:
+                onStatus?("文件已复制，在远端按 ⌘V 时发起传输确认")
+            }
+            completion(revision)
+        }
+    }
+
+    public func invalidateRemoteManifest(_ revision: ClipboardRevision) {
+        queue.async { [self] in
+            guard !stopped, allowsOnDemandClipboard else { return }
+            if let pull = activePull, pull.revision == revision {
+                activePull = nil
+                if let incoming, incoming.begin.pullRequestID == pull.requestID {
+                    sendJSON(.clipboardCancel, ClipboardReceipt(revision: incoming.begin.revision, sequence: incoming.sequence, reason: "对端剪贴板已更新"))
+                    if allowsDecoupledFileTransfer {
+                        discardClipboardIncoming()
+                    } else if receivingFileID == nil {
+                        discardIncoming(reason: .superseded)
+                    }
+                } else {
+                    sendJSON(.clipboardCancel, ClipboardReceipt(revision: revision, sequence: 0, reason: "对端剪贴板已更新"))
+                }
+                pull.settle(nil)
+                return
+            }
+            sendJSON(.clipboardCancel, ClipboardReceipt(revision: revision, sequence: 0, reason: "对端剪贴板已更新"))
+        }
+    }
+
+    public func rejectPull(_ request: ClipboardPullRequest, reason: String) {
+        queue.async { [self] in
+            guard !stopped else { return }
+            sendJSON(.clipboardCancel, ClipboardReceipt(revision: request.revision, sequence: 0, reason: reason))
+            onStatus?(reason)
+        }
+    }
+
+    public func sendPulled(_ payload: ClipboardPayload, requestID: UUID, completion: @escaping (Bool) -> Void = { _ in }) {
+        performSend(payload, preparation: nil, explicitDrop: false, pullRequestID: requestID,
+                    deferred: nil, completion: completion)
+    }
+
+    public func pullPayload(revision: ClipboardRevision, kind: ClipboardManifestKind,
+                            completion: @escaping (ClipboardPayload?) -> Void) {
+        _ = startPull(revision: revision, kind: kind, completion: completion)
+    }
+
+    public func pullPayloadSynchronously(
+        revision: ClipboardRevision,
+        kind: ClipboardManifestKind,
+        stallTimeout: TimeInterval = 4.0,
+        maxTimeout: TimeInterval = 12.0
+    ) -> ClipboardPayload? {
+        dispatchPrecondition(condition: .notOnQueue(queue))
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = PullResultBox()
+        let pull = startPull(revision: revision, kind: kind) { payload in
+            box.set(payload)
+            semaphore.signal()
+        }
+        let startedAt = SessionClock.now
+        let pollSlice: TimeInterval = min(0.1, max(0.01, stallTimeout / 4))
+        while true {
+            if semaphore.wait(timeout: .now() + pollSlice) == .success {
+                return box.read()
+            }
+            let now = SessionClock.now
+            if now - pull.lastProgressAt >= stallTimeout || now - startedAt >= maxTimeout {
+                pull.settle(nil)
+                queue.async { [self] in
+                    guard activePull === pull else { return }
+                    activePull = nil
+                    if let incoming, incoming.begin.pullRequestID == pull.requestID {
+                        sendJSON(.clipboardCancel, ClipboardReceipt(revision: incoming.begin.revision, sequence: incoming.sequence, reason: "按需粘贴等待超时"))
+                        if allowsDecoupledFileTransfer {
+                            discardClipboardIncoming()
+                        } else if receivingFileID == nil {
+                            discardIncoming(reason: .timedOut)
+                        }
+                    } else {
+                        sendJSON(.clipboardCancel, ClipboardReceipt(revision: revision, sequence: 0, reason: "按需粘贴等待超时"))
+                    }
+                    onStatus?("剪贴板按需拉取超时，请重试粘贴")
+                }
+                return box.read()
+            }
+        }
+    }
+
+    private func startPull(revision: ClipboardRevision, kind: ClipboardManifestKind,
+                           completion: @escaping (ClipboardPayload?) -> Void) -> ActivePull {
+        let request = ClipboardPullRequest(revision: revision, kind: kind)
+        let pull = ActivePull(requestID: request.requestID, revision: revision, kind: kind, completion: completion)
+        queue.async { [self] in
+            guard !stopped, allowsOnDemandClipboard, kind == .text || kind == .png else {
+                pull.settle(nil)
+                return
+            }
+            if let previous = activePull {
+                activePull = nil
+                if let incoming, incoming.begin.pullRequestID == previous.requestID {
+                    sendJSON(.clipboardCancel, ClipboardReceipt(revision: incoming.begin.revision, sequence: incoming.sequence, reason: "已被新的按需粘贴请求替换"))
+                    if allowsDecoupledFileTransfer {
+                        discardClipboardIncoming()
+                    } else if receivingFileID == nil {
+                        discardIncoming(reason: .superseded)
+                    }
+                }
+                previous.settle(nil)
+            }
+            activePull = pull
+            onStatus?(kind == .png ? "正在按需拉取剪贴板图片…" : "正在按需拉取剪贴板文字…")
+            sendJSON(.clipboardPull, request)
+        }
+        return pull
     }
 
     public func respondToFileOffer(id: UUID, accept: Bool) {
@@ -342,15 +586,21 @@ public final class ClipboardTransfer {
     // As with prepareSend, deferral replaces completion and neither retains the payload nor schedules a retry.
     public func send(_ payload: ClipboardPayload, preparation: UUID? = nil, deferred: (() -> Void)? = nil,
                      completion: @escaping (Bool) -> Void = { _ in }) {
-        performSend(payload, preparation: preparation, explicitDrop: false, deferred: deferred, completion: completion)
+        performSend(payload, preparation: preparation, explicitDrop: false, pullRequestID: nil,
+                    deferred: deferred, completion: completion)
     }
 
     private func performSend(_ payload: ClipboardPayload, preparation: UUID?, explicitDrop: Bool,
+                             pullRequestID: UUID? = nil,
                              deferred: (() -> Void)?, completion: @escaping (Bool) -> Void) {
         queue.async { [self] in
             guard !stopped else { completion(false); return }
             let isFile: Bool
             if case .files = payload { isFile = true } else { isFile = false }
+            if pullRequestID != nil, (isFile || !allowsOnDemandClipboard) {
+                completion(false)
+                return
+            }
             let useFileLane = isFile && allowsDecoupledFileTransfer
             if !allowsDecoupledFileTransfer {
                 if receivingFileID != nil, let deferred { deferred(); return }
@@ -361,7 +611,7 @@ public final class ClipboardTransfer {
             guard preparation == nil || preparation == sendPreparation else { completion(false); return }
             var installed = false
             do {
-                onStatus?(explicitDrop ? "正在准备拖拽文件…" : "正在准备剪贴板…")
+                onStatus?(explicitDrop ? "正在准备拖拽文件…" : (pullRequestID != nil ? "正在响应按需粘贴…" : "正在准备剪贴板…"))
                 let (type, parts) = try plan(payload)
                 if type == "files", !explicitDrop, matchesAppliedFiles(parts) {
                     completion(true)
@@ -398,7 +648,12 @@ public final class ClipboardTransfer {
                 if isFile { onFileTransferStarted?() }
                 clock &+= 1
                 let revision = ClipboardRevision(counter: clock, origin: origin)
-                if useFileLane { newestFile = revision } else { newest = revision }
+                if useFileLane {
+                    newestFile = revision
+                } else {
+                    newest = revision
+                    if pullRequestID == nil { announcedManifestRevision = nil }
+                }
                 let transfer = Outgoing(revision: revision, parts: parts, windowed: allowsChunkWindow, isFile: isFile,
                                         independentFileLane: useFileLane, explicitDrop: useFileLane && explicitDrop,
                                         completion: completion)
@@ -420,7 +675,8 @@ public final class ClipboardTransfer {
                 sendJSON(.clipboardBegin, ClipboardBegin(revision: revision, sequence: 0, type: type, count: parts.count,
                     bytes: total, names: names, rootCount: rootCount, chunkWindow: transfer.windowed ? true : nil,
                     independentFileLane: useFileLane ? true : nil,
-                    explicitDrop: (useFileLane && explicitDrop) ? true : nil))
+                    explicitDrop: (useFileLane && explicitDrop) ? true : nil,
+                    pullRequestID: pullRequestID))
                 ensureTimer()
                 onStatus?(type == "files"
                     ? "已发送文件信息，等待对端确认接收（90 秒内）"
@@ -445,6 +701,54 @@ public final class ClipboardTransfer {
             guard !stopped else { return }
             do {
                 switch message.kind {
+                case .clipboardManifest:
+                    let manifest = try Wire.readJSON(ClipboardManifest.self, message.payload)
+                    guard allowsOnDemandClipboard else { throw DeskError.invalid("对端未协商按需剪贴板") }
+                    clock = max(clock, manifest.revision.counter)
+                    guard newest == nil || manifest.revision > newest! else { return }
+                    newest = manifest.revision
+                    if let prev = announcedManifestRevision {
+                        announcedManifestRevision = nil
+                        onManifestInvalidated?(prev)
+                    }
+                    cancelOutgoing("对端有更新的剪贴板内容")
+                    if allowsDecoupledFileTransfer {
+                        if let incoming {
+                            sendJSON(.clipboardCancel, ClipboardReceipt(revision: incoming.begin.revision, sequence: incoming.sequence, reason: "对端有更新的剪贴板内容"))
+                        } else if let applying {
+                            sendJSON(.clipboardCancel, ClipboardReceipt(revision: applying.revision, sequence: 0, reason: "对端有更新的剪贴板内容"))
+                        }
+                        discardClipboardIncoming()
+                    } else if receivingFileID == nil {
+                        if let incoming {
+                            sendJSON(.clipboardCancel, ClipboardReceipt(revision: incoming.begin.revision, sequence: incoming.sequence, reason: "对端有更新的剪贴板内容"))
+                        } else if let pendingFileOffer {
+                            sendJSON(.clipboardCancel, ClipboardReceipt(revision: pendingFileOffer.begin.revision, sequence: 0, reason: "对端有更新的剪贴板内容"))
+                        } else if let applying {
+                            sendJSON(.clipboardCancel, ClipboardReceipt(revision: applying.revision, sequence: 0, reason: "对端有更新的剪贴板内容"))
+                        }
+                        discardIncoming(reason: .superseded)
+                    }
+                    switch manifest.kind {
+                    case .text:
+                        onStatus?("对端已复制文字，粘贴时按需拉取")
+                    case .png:
+                        onStatus?("对端已复制图片，粘贴时按需拉取")
+                    case .files:
+                        break
+                    }
+                    onManifest?(manifest)
+                case .clipboardPull:
+                    let request = try Wire.readJSON(ClipboardPullRequest.self, message.payload)
+                    guard allowsOnDemandClipboard else { throw DeskError.invalid("对端未协商按需剪贴板") }
+                    guard request.kind == .text || request.kind == .png else {
+                        throw DeskError.invalid("按需剪贴板拉取类型无效")
+                    }
+                    guard announcedManifestRevision == request.revision, let onPullRequested else {
+                        sendJSON(.clipboardCancel, ClipboardReceipt(revision: request.revision, sequence: 0, reason: "剪贴板内容已更新或不可用"))
+                        return
+                    }
+                    onPullRequested(request)
                 case .clipboardBegin: try begin(Wire.readJSON(ClipboardBegin.self, message.payload))
                 case .clipboardEntry: try entry(Wire.readJSON(ClipboardEntry.self, message.payload))
                 case .clipboardChunk: try chunk(message.payload)
@@ -473,15 +777,24 @@ public final class ClipboardTransfer {
                     } else { try fillWindow(activeOutgoing) }
                 case .clipboardCancel:
                     let receipt = try Wire.readJSON(ClipboardReceipt.self, message.payload)
+                    if announcedManifestRevision == receipt.revision {
+                        announcedManifestRevision = nil
+                        onManifestInvalidated?(receipt.revision)
+                    }
+                    if let pull = activePull, pull.revision == receipt.revision || pull.streamRevision == receipt.revision {
+                        activePull = nil
+                        pull.settle(nil)
+                    }
+                    let preservedPullID = activePull?.requestID
                     if applyingFile?.revision == receipt.revision {
                         discardFileIncoming(reason: .cancelled, message: receipt.reason ?? "文件接收已取消")
                         onStatus?(receipt.reason ?? "文件接收已取消")
                     }
                     if applying?.revision == receipt.revision {
                         if allowsDecoupledFileTransfer {
-                            discardClipboardIncoming()
+                            discardClipboardIncoming(preservePullID: preservedPullID)
                         } else {
-                            discardIncoming(reason: .cancelled, message: receipt.reason ?? "剪贴板接收已取消")
+                            discardIncoming(reason: .cancelled, message: receipt.reason ?? "剪贴板接收已取消", preservePullID: preservedPullID)
                         }
                         onStatus?(receipt.reason ?? "剪贴板接收已取消")
                     }
@@ -500,14 +813,14 @@ public final class ClipboardTransfer {
                         if pendingFileOffer?.begin.independentFileLane == true {
                             discardFileIncoming(reason: .cancelled, message: receipt.reason ?? "文件接收已取消")
                         } else {
-                            discardIncoming(reason: .cancelled, message: receipt.reason ?? "剪贴板接收已取消")
+                            discardIncoming(reason: .cancelled, message: receipt.reason ?? "剪贴板接收已取消", preservePullID: preservedPullID)
                         }
                         onStatus?(receipt.reason ?? "剪贴板接收已取消")
                     } else if incoming?.begin.revision == receipt.revision {
                         if allowsDecoupledFileTransfer, incoming?.begin.type != "files" {
-                            discardClipboardIncoming()
+                            discardClipboardIncoming(preservePullID: preservedPullID)
                         } else {
-                            discardIncoming(reason: .cancelled, message: receipt.reason ?? "剪贴板接收已取消")
+                            discardIncoming(reason: .cancelled, message: receipt.reason ?? "剪贴板接收已取消", preservePullID: preservedPullID)
                         }
                         onStatus?(receipt.reason ?? "剪贴板接收已取消")
                     }
@@ -530,10 +843,15 @@ public final class ClipboardTransfer {
         queue.async { [self] in
             stopped = true
             timer?.cancel(); timer = nil
+            announcedManifestRevision = nil
             cancelFileOutgoing("连接结束", notify: false, outcome: nil)
             cancelOutgoing("连接结束", notify: false, outcome: nil)
             discardFileIncoming(reason: .stopped)
             discardIncoming(reason: .stopped)
+            if let pull = activePull {
+                activePull = nil
+                pull.settle(nil)
+            }
             partialStorage = nil
             completion?()
         }
@@ -673,6 +991,19 @@ public final class ClipboardTransfer {
         guard value.explicitDrop != true || value.independentFileLane == true else {
             throw DeskError.invalid("拖拽文件传输标记无效")
         }
+        if let pullID = value.pullRequestID {
+            guard allowsOnDemandClipboard else {
+                throw DeskError.invalid("对端未协商按需剪贴板")
+            }
+            guard (value.type == "text" || value.type == "png"),
+                  value.independentFileLane != true, value.explicitDrop != true else {
+                throw DeskError.invalid("按需拉取仅支持文字或图片")
+            }
+            guard let pull = activePull, !pull.isFinished, pull.requestID == pullID, pull.kind.rawValue == value.type else {
+                sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: 0, reason: "按需粘贴请求已失效"))
+                return
+            }
+        }
         if pendingFileOffer?.begin.revision == value.revision { return }
         let useFileLane = value.independentFileLane == true || (allowsDecoupledFileTransfer && value.type == "files")
         if useFileLane {
@@ -682,6 +1013,11 @@ public final class ClipboardTransfer {
             }
         } else {
             guard newest == nil || value.revision > newest! else {
+                if let pullID = value.pullRequestID, activePull?.requestID == pullID {
+                    let stalePull = activePull
+                    activePull = nil
+                    stalePull?.settle(nil)
+                }
                 sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: 0, reason: "已有更新的剪贴板内容"))
                 return
             }
@@ -700,6 +1036,11 @@ public final class ClipboardTransfer {
             try ClipboardAutomaticLimits.validate(type: value.type, bytes: value.bytes)
         }
         catch {
+            if let pullID = value.pullRequestID, activePull?.requestID == pullID {
+                let failedPull = activePull
+                activePull = nil
+                failedPull?.settle(nil)
+            }
             sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: 0, reason: error.localizedDescription))
             if value.type == "files" {
                 onFileResult?(ClipboardFileResult(direction: .receiving, outcome: .failed, message: error.localizedDescription))
@@ -708,6 +1049,10 @@ public final class ClipboardTransfer {
             return
         }
         guard value.chunkWindow != true || allowsChunkWindow else { throw DeskError.invalid("对端未协商剪贴板传输窗口") }
+        if !useFileLane, value.pullRequestID == nil, let prev = announcedManifestRevision {
+            announcedManifestRevision = nil
+            onManifestInvalidated?(prev)
+        }
         if useFileLane {
             newestFile = value.revision
             cancelFileOutgoing("对端有更新的文件传输")
@@ -715,11 +1060,15 @@ public final class ClipboardTransfer {
         } else if allowsDecoupledFileTransfer {
             newest = value.revision
             cancelOutgoing("对端有更新的剪贴板内容")
-            discardClipboardIncoming()
+            discardClipboardIncoming(preservePullID: value.pullRequestID)
         } else {
             newest = value.revision
             cancelOutgoing("对端有更新的剪贴板内容")
-            discardIncoming(reason: .superseded)
+            discardIncoming(reason: .superseded, preservePullID: value.pullRequestID)
+        }
+        if let pullID = value.pullRequestID, let pull = activePull, pull.requestID == pullID {
+            pull.streamRevision = value.revision
+            pull.touch()
         }
         if value.type == "files" { onFileTransferStarted?() }
         if value.type == "files", requireFileApproval {
@@ -735,6 +1084,11 @@ public final class ClipboardTransfer {
         }
         do { try startReceiving(value) }
         catch {
+            if let pullID = value.pullRequestID, activePull?.requestID == pullID {
+                let failedPull = activePull
+                activePull = nil
+                failedPull?.settle(nil)
+            }
             sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: 0, reason: error.localizedDescription))
             if value.type == "files" {
                 onFileResult?(ClipboardFileResult(direction: .receiving, outcome: .failed,
@@ -804,6 +1158,9 @@ public final class ClipboardTransfer {
         activeIncoming.remaining = value.bytes
         activeIncoming.sequence = value.sequence
         activeIncoming.updated = SessionClock.now
+        if activePull?.streamRevision == value.revision {
+            activePull?.touch(now: activeIncoming.updated)
+        }
         acknowledge(value.revision, value.sequence)
     }
 
@@ -827,6 +1184,9 @@ public final class ClipboardTransfer {
         activeIncoming.received += UInt64(bytes.count)
         activeIncoming.sequence = sequence
         activeIncoming.updated = SessionClock.now
+        if activePull?.streamRevision == revision {
+            activePull?.touch(now: activeIncoming.updated)
+        }
         if activeIncoming.updated - activeIncoming.progressAt > 0.5 {
             activeIncoming.progressAt = activeIncoming.updated
             onStatus?("正在接收：\(ByteCountFormatter.string(fromByteCount: Int64(clamping: activeIncoming.received), countStyle: .file)) / \(ByteCountFormatter.string(fromByteCount: Int64(clamping: activeIncoming.begin.bytes), countStyle: .file))")
@@ -867,6 +1227,53 @@ public final class ClipboardTransfer {
             try? FileManager.default.removeItem(at: activeIncoming.directory)
         }
         if matchedFileLane { self.fileIncoming = nil } else { self.incoming = nil }
+        if let pullID = activeIncoming.begin.pullRequestID {
+            guard let pull = activePull, !pull.isFinished, pull.requestID == pullID else {
+                sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: value.sequence, reason: "按需粘贴请求已结束"))
+                return
+            }
+            activePull = nil
+            switch payload {
+            case .text:
+                acknowledge(value.revision, value.sequence)
+                onStatus?("剪贴板按需同步完成")
+                pull.settle(payload)
+            case .png(let pngData):
+                if let validatePulledPNG {
+                    pull.touch()
+                    pullValidationQueue.async { [weak self] in
+                        let valid = validatePulledPNG(pngData)
+                        guard let self else {
+                            pull.settle(nil)
+                            return
+                        }
+                        self.queue.async {
+                            guard !self.stopped, !pull.isFinished else {
+                                pull.settle(nil)
+                                return
+                            }
+                            if valid {
+                                self.acknowledge(value.revision, value.sequence)
+                                self.onStatus?("剪贴板按需同步完成")
+                                pull.settle(.png(pngData))
+                            } else {
+                                self.sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: value.sequence, reason: "接收的图片无法识别"))
+                                self.onStatus?("接收的图片无法识别")
+                                pull.settle(nil)
+                            }
+                        }
+                    }
+                } else {
+                    acknowledge(value.revision, value.sequence)
+                    onStatus?("剪贴板按需同步完成")
+                    pull.settle(payload)
+                }
+            case .files:
+                sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: value.sequence, reason: "按需拉取不支持文件"))
+                pull.settle(nil)
+            }
+            return
+        }
         let files: [URL]
         if case .files(let urls) = payload { files = urls } else { files = [] }
         if activeIncoming.begin.type == "files", activeIncoming.begin.explicitDrop == true {
@@ -967,9 +1374,13 @@ public final class ClipboardTransfer {
         onFileOffer?(nil)
     }
 
-    private func discardClipboardIncoming() {
+    private func discardClipboardIncoming(preservePullID: UUID? = nil) {
         sendPreparation = nil
         applying?.permit.invalidate(); applying = nil
+        if let pull = activePull, pull.requestID != preservePullID {
+            activePull = nil
+            pull.settle(nil)
+        }
         if let incoming {
             try? incoming.handle?.close(); incoming.handle = nil
             try? FileManager.default.removeItem(at: incoming.directory)
@@ -994,11 +1405,15 @@ public final class ClipboardTransfer {
             message: message ?? (reason == .superseded ? "文件接收已被新的文件替换" : "文件接收已取消"), files: files))
     }
 
-    private func discardIncoming(reason: ClipboardFileOfferEndReason, message: String? = nil) {
+    private func discardIncoming(reason: ClipboardFileOfferEndReason, message: String? = nil, preservePullID: UUID? = nil) {
         let wasFile = incoming?.begin.type == "files" || pendingFileOffer != nil || receivingFileID != nil
         let files = applying?.files ?? []
         sendPreparation = nil
         applying?.permit.invalidate(); applying = nil
+        if let pull = activePull, pull.requestID != preservePullID {
+            activePull = nil
+            pull.settle(nil)
+        }
         finishFileOffer(reason)
         finishFileReception()
         if let incoming {

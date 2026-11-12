@@ -378,6 +378,7 @@ final class DeskModel: ObservableObject {
     private var remoteFileApproval = false
     private var remoteClipboardChunkWindow = false
     private var remoteDecoupledFileTransfer = false
+    private var remoteOnDemandClipboard = false
     private var remoteReceivesAutomaticClipboard = true
     private var remoteClipboardFocusAware = false
     private var lastClipboardReceivePreference: Bool?
@@ -2813,7 +2814,7 @@ final class DeskModel: ObservableObject {
             applyRemoteClipboardPreference(preference)
             if first { try sendClipboardPreference(to: peer) }
             updateClipboardSync()
-        case .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel:
+        case .clipboardManifest, .clipboardPull, .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel:
             clipboardSync?.receive(message)
         case .streamSettingsRequest:
             let request = try Wire.readJSON(StreamSettingsRequest.self, message.payload)
@@ -3200,7 +3201,7 @@ final class DeskModel: ObservableObject {
             guard preference.session == clipboardSession else { throw DeskError.invalid("剪贴板会话不匹配") }
             applyRemoteClipboardPreference(preference)
             updateClipboardSync()
-        case .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel:
+        case .clipboardManifest, .clipboardPull, .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel:
             clipboardSync?.receive(message)
         case .inputStatus:
             guard viewerSession.helloReceived, supportsInputActions else { throw DeskError.invalid("不支持的键盘状态消息") }
@@ -4518,6 +4519,7 @@ final class DeskModel: ObservableObject {
         remoteFileApproval = preference.fileApproval == true
         remoteClipboardChunkWindow = preference.chunkWindow == true
         remoteDecoupledFileTransfer = preference.decoupledFileTransfer == true
+        remoteOnDemandClipboard = preference.onDemandClipboard == true
         remoteReceivesAutomaticClipboard = preference.receivesAutomaticUpdates ?? true
         remoteClipboardFocusAware = preference.receivesAutomaticUpdates != nil
     }
@@ -4555,6 +4557,8 @@ final class DeskModel: ObservableObject {
             let sync = ClipboardSync(session: clipboardSession, allowsFileSending: remoteFileApproval,
                 allowsAutomaticSending: automaticClipboardSendingAllowed, allowsChunkWindow: remoteClipboardChunkWindow,
                 allowsDecoupledFileTransfer: remoteDecoupledFileTransfer,
+                allowsOnDemandClipboard: remoteOnDemandClipboard,
+                deferFileOfferUntilPaste: remoteOnDemandClipboard && mode == .viewer,
                 controllingRemote: clipboardControlsRemote, handledChange: clipboardHandledChange) { [weak peer, weak channel] message in
                     if let channel { channel.sendReliableData(message) }
                     else { peer?.send(message) }
@@ -4603,9 +4607,13 @@ final class DeskModel: ObservableObject {
                 self.clipboardFilePrompt = prompt
                 prompt.present()
             }
-            clipboardStatus = remoteClipboardFocusAware
-                ? "双向剪贴板已开启：控制端复制后切回 QuietDesk 时发送，操作远端期间的复制粘贴留在远端；远端在释放控制后发送；文件确认后接收"
-                : "双向剪贴板已开启：控制端复制后切回 QuietDesk 时发送，操作远端期间的复制粘贴留在远端；两端升级后可按控制焦点限制远端发送，文件确认后接收"
+            if remoteOnDemandClipboard {
+                clipboardStatus = "按需剪贴板已开启：文字和图片仅在按 ⌘V 或右键粘贴时拉取，复制不占流量；文件确认后接收"
+            } else {
+                clipboardStatus = remoteClipboardFocusAware
+                    ? "双向剪贴板已开启：控制端复制后切回 QuietDesk 时发送，操作远端期间的复制粘贴留在远端；远端在释放控制后发送；文件确认后接收"
+                    : "双向剪贴板已开启：控制端复制后切回 QuietDesk 时发送，操作远端期间的复制粘贴留在远端；两端升级后可按控制焦点限制远端发送，文件确认后接收"
+            }
         } else if enabled {
             clipboardSync?.allowsFileSending = remoteFileApproval
             clipboardSync?.setAutomaticSendingAllowed(automaticClipboardSendingAllowed)
@@ -5022,6 +5030,7 @@ final class DeskModel: ObservableObject {
         remoteFileApproval = false
         remoteClipboardChunkWindow = false
         remoteDecoupledFileTransfer = false
+        remoteOnDemandClipboard = false
         remoteReceivesAutomaticClipboard = true
         remoteClipboardFocusAware = false
         lastClipboardReceivePreference = nil

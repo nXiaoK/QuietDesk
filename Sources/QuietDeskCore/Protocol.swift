@@ -35,6 +35,8 @@ public enum MessageKind: UInt8, Sendable {
     case audioControl = 38, audioFrame = 39
     // Sent only after the host advertises qualityProbeV1 during a bounded manual route quality benchmark.
     case qualityProbeControl = 40
+    // Sent only after both peers advertise ClipboardPreference.onDemandClipboard == true.
+    case clipboardManifest = 41, clipboardPull = 42
 }
 
 public struct Message: Sendable {

@@ -13,19 +13,98 @@ protocol ClipboardPasteboard: AnyObject {
     /// 内容由 macOS 通用剪贴板（接力/Handoff）等跨设备机制写入，而不是本机用户复制。
     var isRelayedFromOtherDevice: Bool { get }
     var isSensitive: Bool { get }
+    func inspectCurrentKind() -> ClipboardManifestKind?
     func write(_ payload: ClipboardPayload, marker: String) -> Bool
+    func writeLazy(
+        _ kind: ClipboardManifestKind,
+        marker: String,
+        fetch: @escaping @MainActor () -> ClipboardPayload?,
+        asyncFetch: @escaping @MainActor (@escaping (ClipboardPayload?) -> Void) -> Void
+    ) -> Bool
 }
 
 extension ClipboardPasteboard {
     var isRelayedFromOtherDevice: Bool { false }
     var tiffData: Data? { nil }
     var isSensitive: Bool { false }
+    func inspectCurrentKind() -> ClipboardManifestKind? {
+        if let files = fileURLs, !files.isEmpty { return .files }
+        if pngData != nil || tiffData != nil { return .png }
+        if text != nil { return .text }
+        return nil
+    }
+    func writeLazy(
+        _ kind: ClipboardManifestKind,
+        marker: String,
+        fetch: @escaping @MainActor () -> ClipboardPayload?,
+        asyncFetch: @escaping @MainActor (@escaping (ClipboardPayload?) -> Void) -> Void
+    ) -> Bool {
+        false
+    }
+}
+
+private final class LazyClipboardItemProvider: NSObject, NSPasteboardItemDataProvider {
+    private var fetch: (@MainActor () -> ClipboardPayload?)?
+    private var cachedPayload: ClipboardPayload?
+    private var didFetch = false
+    var onFinished: (() -> Void)?
+
+    init(fetch: @escaping @MainActor () -> ClipboardPayload?) {
+        self.fetch = fetch
+    }
+
+    func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem, provideDataForType type: NSPasteboard.PasteboardType) {
+        let resolve: @MainActor () -> ClipboardPayload? = {
+            if !self.didFetch {
+                self.didFetch = true
+                self.cachedPayload = self.fetch?()
+            }
+            return self.cachedPayload
+        }
+        let payload: ClipboardPayload?
+        if Thread.isMainThread {
+            payload = MainActor.assumeIsolated { resolve() }
+        } else {
+            payload = DispatchQueue.main.sync { MainActor.assumeIsolated { resolve() } }
+        }
+        guard let payload else { return }
+        switch (type, payload) {
+        case (.string, .text(let bytes)):
+            if let string = String(data: bytes, encoding: .utf8) {
+                item.setString(string, forType: .string)
+            }
+        case (.png, .png(let bytes)):
+            item.setData(bytes, forType: .png)
+        default:
+            break
+        }
+    }
+
+    func pasteboardFinishedWithDataProvider(_ pasteboard: NSPasteboard) {
+        let cleanup = {
+            self.fetch = nil
+            self.cachedPayload = nil
+            self.onFinished?()
+            self.onFinished = nil
+        }
+        if Thread.isMainThread {
+            cleanup()
+        } else {
+            DispatchQueue.main.async(execute: cleanup)
+        }
+    }
 }
 
 @MainActor
-private final class SystemClipboardPasteboard: ClipboardPasteboard {
-    private let pasteboard = NSPasteboard.general
+final class SystemClipboardPasteboard: ClipboardPasteboard {
+    private let pasteboard: NSPasteboard
+    private var activeLazyProvider: LazyClipboardItemProvider?
     private static let marker = NSPasteboard.PasteboardType("local.quietdesk.clipboard-session")
+
+    init(pasteboard: NSPasteboard = .general) {
+        self.pasteboard = pasteboard
+    }
+
     var changeCount: Int { pasteboard.changeCount }
     var fileURLs: [URL]? { pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] }
     var pngData: Data? { pasteboard.data(forType: .png) }
@@ -40,6 +119,21 @@ private final class SystemClipboardPasteboard: ClipboardPasteboard {
     var isRelayedFromOtherDevice: Bool {
         guard let types = pasteboard.types else { return false }
         return !Self.relayedTypes.isDisjoint(with: types)
+    }
+
+    func inspectCurrentKind() -> ClipboardManifestKind? {
+        guard let types = pasteboard.types, !types.isEmpty else { return nil }
+        let typeSet = Set(types)
+        if typeSet.contains(.fileURL) {
+            return .files
+        }
+        if typeSet.contains(.png) || typeSet.contains(.tiff) {
+            return .png
+        }
+        if typeSet.contains(.string) {
+            return .text
+        }
+        return nil
     }
 
     func write(_ payload: ClipboardPayload, marker: String) -> Bool {
@@ -69,8 +163,88 @@ private final class SystemClipboardPasteboard: ClipboardPasteboard {
         for item in items {
             guard item.setString(marker, forType: Self.marker) else { return false }
         }
+        activeLazyProvider = nil
         pasteboard.clearContents()
         return pasteboard.writeObjects(items)
+    }
+
+    func writeLazy(
+        _ kind: ClipboardManifestKind,
+        marker: String,
+        fetch: @escaping @MainActor () -> ClipboardPayload?,
+        asyncFetch: @escaping @MainActor (@escaping (ClipboardPayload?) -> Void) -> Void
+    ) -> Bool {
+        guard kind == .text || kind == .png else { return false }
+        let item = NSPasteboardItem()
+        guard item.setString(marker, forType: Self.marker) else { return false }
+        let promisedType: NSPasteboard.PasteboardType = (kind == .png) ? .png : .string
+        let provider = LazyClipboardItemProvider(fetch: fetch)
+        provider.onFinished = { [weak self, weak provider] in
+            MainActor.assumeIsolated {
+                if self?.activeLazyProvider === provider {
+                    self?.activeLazyProvider = nil
+                }
+            }
+        }
+        guard item.setDataProvider(provider, forTypes: [promisedType]) else { return false }
+        activeLazyProvider = provider
+        pasteboard.clearContents()
+        let wrote = pasteboard.writeObjects([item])
+        if !wrote { activeLazyProvider = nil }
+        return wrote
+    }
+}
+
+private final class OnDemandSourceGate: @unchecked Sendable {
+    enum Decision {
+        case accept
+        case rejectBusy
+        case rejectStale
+    }
+
+    private let lock = NSLock()
+    private var expectedRevision: ClipboardRevision?
+    private var expectedKind: ClipboardManifestKind?
+    private var pullingRemotely = false
+
+    func setExpected(revision: ClipboardRevision?, kind: ClipboardManifestKind?) {
+        lock.withLock {
+            expectedRevision = revision
+            expectedKind = revision == nil ? nil : kind
+        }
+    }
+
+    func clear(matching revision: ClipboardRevision? = nil) {
+        lock.withLock {
+            if let revision, expectedRevision != revision { return }
+            expectedRevision = nil
+            expectedKind = nil
+        }
+    }
+
+    func matches(revision: ClipboardRevision) -> Bool {
+        lock.withLock { expectedRevision == revision }
+    }
+
+    func setPullingRemotely(_ active: Bool) {
+        lock.withLock { pullingRemotely = active }
+    }
+
+    func evaluate(_ request: ClipboardPullRequest) -> Decision {
+        lock.withLock {
+            if pullingRemotely { return .rejectBusy }
+            guard expectedRevision == request.revision, expectedKind == request.kind else {
+                return .rejectStale
+            }
+            return .accept
+        }
+    }
+}
+
+private final class PNGValidatorBox: @unchecked Sendable {
+    let validate: (Data) -> Bool
+    init(_ validate: @escaping (Data) -> Bool) {
+        self.validate = validate
     }
 }
 
@@ -104,8 +278,29 @@ final class ClipboardSync {
     /// 接收完成时本机已有更新的复制，文件只留在接收目录；之后的同步状态会覆盖状态行，提示需单独保留。
     var onReceivedFilesKept: (() -> Void)?
     var onDiagnostic: ((DiagnosticEvent) -> Void)?
+    private struct LocalOnDemandCopy {
+        let token: UUID
+        let change: Int
+        let kind: ClipboardManifestKind
+        var revision: ClipboardRevision?
+        var materializedOnPeer: Bool
+        var cachedPNG: Data?
+    }
+
+    private struct TrackedRemoteManifest {
+        let revision: ClipboardRevision
+        let kind: ClipboardManifestKind
+        let change: Int
+        let installedOnPasteboard: Bool
+    }
+
     var allowsFileSending: Bool
     private let allowsDecoupledFileTransfer: Bool
+    private let allowsOnDemandClipboard: Bool
+    private let deferFileOfferUntilPaste: Bool
+    private let sourceGate = OnDemandSourceGate()
+    private var localOnDemandCopy: LocalOnDemandCopy?
+    private var trackedRemoteManifest: TrackedRemoteManifest?
     private var allowsAutomaticSending: Bool
     private var controllingRemote: Bool
     private let pasteboard: ClipboardPasteboard
@@ -136,7 +331,8 @@ final class ClipboardSync {
     private let session: UUID
 
     init(session: UUID, allowsFileSending: Bool, allowsAutomaticSending: Bool = true, allowsChunkWindow: Bool = false,
-         allowsDecoupledFileTransfer: Bool = false,
+         allowsDecoupledFileTransfer: Bool = false, allowsOnDemandClipboard: Bool = false,
+         deferFileOfferUntilPaste: Bool = false,
          controllingRemote: Bool = false, handledChange: Int? = nil, pasteboard: ClipboardPasteboard? = nil, storage: URL? = nil,
          convertTIFF: @escaping (Data) -> Data? = { data in
              autoreleasepool { NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) }
@@ -146,19 +342,60 @@ final class ClipboardSync {
         self.session = session
         self.allowsFileSending = allowsFileSending
         self.allowsDecoupledFileTransfer = allowsDecoupledFileTransfer
+        self.allowsOnDemandClipboard = allowsOnDemandClipboard
+        self.deferFileOfferUntilPaste = deferFileOfferUntilPaste && allowsOnDemandClipboard
         self.allowsAutomaticSending = allowsAutomaticSending
         self.controllingRemote = controllingRemote
         self.convertTIFF = convertTIFF
-        self.validatePNG = validatePNG ?? { data in autoreleasepool { NSBitmapImageRep(data: data) != nil } }
+        let resolvedValidatePNG = validatePNG ?? { data in autoreleasepool { NSBitmapImageRep(data: data) != nil } }
+        self.validatePNG = resolvedValidatePNG
         let pasteboard = pasteboard ?? SystemClipboardPasteboard()
         self.pasteboard = pasteboard
         observedChange = handledChange ?? pasteboard.changeCount
         let transfer = ClipboardTransfer(storage: storage ?? Self.storageURL, requireFileApproval: true,
                                          allowsChunkWindow: allowsChunkWindow,
-                                         allowsDecoupledFileTransfer: allowsDecoupledFileTransfer)
+                                         allowsDecoupledFileTransfer: allowsDecoupledFileTransfer,
+                                         allowsOnDemandClipboard: allowsOnDemandClipboard)
         self.transfer = transfer
         receiveMessage = { [weak transfer] message in transfer?.receive(message) }
         transfer.onSend = send
+        let validatorBox = PNGValidatorBox(resolvedValidatePNG)
+        transfer.validatePulledPNG = { data in validatorBox.validate(data) }
+        transfer.onManifest = { [weak self] manifest in
+            DispatchQueue.main.async {
+                guard let self, self.running else { return }
+                self.handleRemoteManifest(manifest)
+            }
+        }
+        transfer.onManifestInvalidated = { [weak self, gate = sourceGate] revision in
+            gate.clear(matching: revision)
+            DispatchQueue.main.async {
+                guard let self, self.running else { return }
+                if self.localOnDemandCopy?.revision == revision {
+                    self.localOnDemandCopy = nil
+                    self.sharedChange = nil
+                    self.lastSharedMarker = nil
+                }
+            }
+        }
+        transfer.onPullRequested = { [weak self, weak transfer, gate = sourceGate] request in
+            switch gate.evaluate(request) {
+            case .rejectBusy:
+                transfer?.rejectPull(request, reason: "对端正在处理另一项粘贴请求")
+                return
+            case .rejectStale:
+                transfer?.rejectPull(request, reason: "剪贴板内容已更新或不可用")
+                return
+            case .accept:
+                DispatchQueue.main.async {
+                    guard let self, self.running else {
+                        transfer?.rejectPull(request, reason: "对端剪贴板会话已关闭")
+                        return
+                    }
+                    self.fulfillPullRequest(request)
+                }
+            }
+        }
         transfer.onExplicitFilesReceived = { [weak self] files in
             DispatchQueue.main.async {
                 guard let self, self.running else { return }
@@ -302,13 +539,23 @@ final class ClipboardSync {
         return !allowsDecoupledFileTransfer || fileSendingChange == observedChange
     }
 
-    /// 操作远端时按 ⌘V 是否要等剪贴板：只有本机复制等待发送或仍在发送时才等，否则按普通按键直接送达。
-    var holdsPaste: Bool {
-        running && (!controllingRemote || pendingLocalChange != nil || sendingChange != nil || hasActivePasteboardFileSend)
+    private var hasUnmaterializedOnDemandCopy: Bool {
+        guard allowsOnDemandClipboard, let copy = localOnDemandCopy, !copy.materializedOnPeer else { return false }
+        return pasteboard.changeCount == copy.change
     }
 
-    /// 本机剪贴板已处理到的版本。自动重连时交给新会话，断线期间在本机的复制仍在切回时发送。
-    var handledChange: Int { observedChange }
+    /// 操作远端时按 ⌘V 是否要等剪贴板：只有本机复制等待发送、仍在发送或尚未按需物化到远端时才等，否则按普通按键直接送达。
+    var holdsPaste: Bool {
+        running && (!controllingRemote || pendingLocalChange != nil || sendingChange != nil || hasActivePasteboardFileSend || hasUnmaterializedOnDemandCopy)
+    }
+
+    /// 本机剪贴板已处理到的版本。自动重连时交给新会话；若按需清单尚未物化到对端，重连后重新通告该版本。
+    var handledChange: Int {
+        if hasUnmaterializedOnDemandCopy, let copy = localOnDemandCopy {
+            return copy.change &- 1
+        }
+        return observedChange
+    }
 
     /// 显式发送拖拽的文件（不读取也不改写系统剪贴板）。
     @discardableResult
@@ -372,7 +619,7 @@ final class ClipboardSync {
     func prepareForPaste(_ completion: @escaping (Bool) -> Void) {
         guard running, allowsAutomaticSending else { completion(false); return }
         if controllingRemote { skipChangesWhileControlling() }
-        if controllingRemote, pendingLocalChange == nil {
+        if controllingRemote, pendingLocalChange == nil, !hasUnmaterializedOnDemandCopy {
             // 远端自己的复制粘贴不补发本机剪贴板，也不重新发起文件确认；本机正在接收的文件与之无关。
             if let sending = sendingChange {
                 if !allowsDecoupledFileTransfer, sending == fileSendingChange {
@@ -422,14 +669,14 @@ final class ClipboardSync {
                 return
             }
             let activeFileSend = allowsDecoupledFileTransfer ? fileSendingChange : sendingChange
-            if activeFileSend != change { sendCurrent() }
+            if activeFileSend != change { sendCurrentEager() }
             if change == sharedChange { completion(true); return }
             completion(false)
             onStatus?(allowsFileSending ? "文件需在接收端确认；传输完成后请再次按 ⌘V 粘贴" : "对端需更新到 0.5.0 才能确认接收文件，未发送文件内容")
             return
         }
         waiters.append(completion)
-        if sendingChange != change { sendCurrent() }
+        if sendingChange != change { sendCurrentEager() }
     }
 
     func stop() {
@@ -439,6 +686,9 @@ final class ClipboardSync {
         receivedFilesKeptLocally = false
         onFileReceptionChanged?(nil)
         pendingLocalChange = nil
+        localOnDemandCopy = nil
+        trackedRemoteManifest = nil
+        sourceGate.clear()
         cancelImageApplication()
         imagePreparation = nil
         timer?.invalidate(); timer = nil
@@ -454,6 +704,7 @@ final class ClipboardSync {
 
     private func poll() {
         guard running else { return }
+        checkTrackedRemoteManifestInvalidation()
         if controllingRemote {
             skipChangesWhileControlling()
             guard pendingLocalChange != nil else { return }
@@ -464,10 +715,125 @@ final class ClipboardSync {
     private func skipChangesWhileControlling() {
         let change = pasteboard.changeCount
         if pendingLocalChange != change { pendingLocalChange = nil }
+        if localOnDemandCopy != nil, localOnDemandCopy?.change != change {
+            localOnDemandCopy = nil
+            sourceGate.clear()
+        }
         if change != deferredLocalChange, change != pendingLocalChange { observedChange = change }
     }
 
+    private func checkTrackedRemoteManifestInvalidation() {
+        guard allowsOnDemandClipboard, let tracked = trackedRemoteManifest,
+              pasteboard.changeCount != tracked.change else { return }
+        trackedRemoteManifest = nil
+        transfer.invalidateRemoteManifest(tracked.revision)
+    }
+
     private func sendCurrent() {
+        if allowsOnDemandClipboard, waiters.isEmpty {
+            announceOnDemandCurrent()
+            return
+        }
+        sendCurrentEager()
+    }
+
+    private func announceOnDemandCurrent() {
+        guard running, allowsAutomaticSending else { return }
+        let change = pasteboard.changeCount
+        if !allowsDecoupledFileTransfer, receivingFileChange != nil {
+            if change != deferredLocalChange { pendingLocalChange = change }
+            return
+        }
+        let replacedRemoteRevision: ClipboardRevision?
+        if let tracked = trackedRemoteManifest, tracked.change != change {
+            trackedRemoteManifest = nil
+            replacedRemoteRevision = tracked.revision
+        } else {
+            replacedRemoteRevision = nil
+        }
+        pendingLocalChange = nil
+        observedChange = change
+        imagePreparation = nil
+        cancelImageApplication()
+        guard !pasteboard.isSensitive else {
+            sendingChange = nil
+            localOnDemandCopy = nil
+            sourceGate.clear()
+            if let replacedRemoteRevision { transfer.invalidateRemoteManifest(replacedRemoteRevision) }
+            onStatus?("剪贴板内容已标记为敏感，未同步到对端")
+            return
+        }
+        if hasSharedState, let marker = pasteboard.contentMarker, marker.hasPrefix(session.uuidString + ":") {
+            sharedChange = change
+            lastSharedMarker = marker
+            return
+        }
+        guard let kind = pasteboard.inspectCurrentKind() else {
+            localOnDemandCopy = nil
+            sourceGate.clear()
+            if let replacedRemoteRevision { transfer.invalidateRemoteManifest(replacedRemoteRevision) }
+            onStatus?("此剪贴板类型暂不能同步")
+            return
+        }
+        if kind == .files {
+            if pasteboard.isRelayedFromOtherDevice {
+                localOnDemandCopy = nil
+                sourceGate.clear()
+                if let replacedRemoteRevision { transfer.invalidateRemoteManifest(replacedRemoteRevision) }
+                onDiagnostic?(.staleFilesSuppressed)
+                onStatus?("剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传")
+                return
+            }
+            if staleFileChange == change {
+                localOnDemandCopy = nil
+                sourceGate.clear()
+                if let replacedRemoteRevision { transfer.invalidateRemoteManifest(replacedRemoteRevision) }
+                onDiagnostic?(.staleFilesSuppressed)
+                return
+            }
+            if !deferFileOfferUntilPaste {
+                localOnDemandCopy = nil
+                sourceGate.clear()
+                sendCurrentEager()
+                return
+            }
+        }
+        staleFileChange = nil
+        let token = UUID()
+        localOnDemandCopy = LocalOnDemandCopy(
+            token: token,
+            change: change,
+            kind: kind,
+            revision: nil,
+            materializedOnPeer: false,
+            cachedPNG: nil
+        )
+        sharedChange = nil
+        lastSharedMarker = nil
+        sourceGate.clear()
+        let gate = sourceGate
+        transfer.announceManifest(kind: kind) { [weak self] revision in
+            if kind == .text || kind == .png {
+                gate.setExpected(revision: revision, kind: kind)
+            } else {
+                gate.clear()
+            }
+            DispatchQueue.main.async {
+                guard let self, self.running, self.localOnDemandCopy?.token == token else { return }
+                if let revision {
+                    if (kind == .text || kind == .png) && !gate.matches(revision: revision) {
+                        self.localOnDemandCopy = nil
+                    } else {
+                        self.localOnDemandCopy?.revision = revision
+                    }
+                } else {
+                    self.localOnDemandCopy = nil
+                }
+            }
+        }
+    }
+
+    private func sendCurrentEager() {
         guard running, allowsAutomaticSending else { return }
         let change = pasteboard.changeCount
         if !allowsDecoupledFileTransfer, receivingFileChange != nil {
@@ -481,6 +847,8 @@ final class ClipboardSync {
         cancelImageApplication()
         guard !pasteboard.isSensitive else {
             sendingChange = nil
+            localOnDemandCopy = nil
+            sourceGate.clear()
             onStatus?("剪贴板内容已标记为敏感，未同步到对端")
             settleWaiters(false)
             return
@@ -494,8 +862,12 @@ final class ClipboardSync {
                 return
             }
             payload = .files(files)
-        } else if let png = pasteboard.pngData { payload = .png(png) }
-        else if let tiff = pasteboard.tiffData {
+        } else if let copy = localOnDemandCopy, copy.change == change, let cachedPNG = copy.cachedPNG {
+            payload = .png(cachedPNG)
+        } else if let png = pasteboard.pngData {
+            if localOnDemandCopy?.change == change { localOnDemandCopy?.cachedPNG = png }
+            payload = .png(png)
+        } else if let tiff = pasteboard.tiffData {
             guard UInt64(tiff.count) <= ClipboardAutomaticLimits.imageBytes else {
                 onStatus?("图片超过 64 MiB，未自动同步，请保存为文件后复制")
                 settleWaiters(false)
@@ -525,6 +897,9 @@ final class ClipboardSync {
                             self.onStatus?("剪贴板图片无法转换为 PNG")
                             self.settleWaiters(false)
                             return
+                        }
+                        if self.localOnDemandCopy?.change == change {
+                            self.localOnDemandCopy?.cachedPNG = png
                         }
                         self.sendPrepared(.png(png), change: change, preparation: preparation)
                     }
@@ -591,6 +966,10 @@ final class ClipboardSync {
             settleWaiters(false)
             return
         }
+        if isFile, localOnDemandCopy?.change == change {
+            localOnDemandCopy?.materializedOnPeer = true
+            sourceGate.clear()
+        }
         if allowsDecoupledFileTransfer && isFile {
             fileSendingChange = change
         } else {
@@ -622,8 +1001,211 @@ final class ClipboardSync {
                 if !self.allowsDecoupledFileTransfer, self.fileSendingChange == change {
                     self.fileSendingChange = nil
                 }
-                if success { self.sharedChange = change; self.hasSharedState = true; self.lastSharedMarker = contentMarker }
+                if success {
+                    if self.localOnDemandCopy?.change == change {
+                        self.localOnDemandCopy?.materializedOnPeer = true
+                        self.sourceGate.clear()
+                    }
+                    self.sharedChange = change
+                    self.hasSharedState = true
+                    self.lastSharedMarker = contentMarker
+                }
                 self.settleWaiters(success)
+            }
+        }
+    }
+
+    private func handleRemoteManifest(_ manifest: ClipboardManifest) {
+        guard running, allowsOnDemandClipboard else { return }
+        if !allowsDecoupledFileTransfer, receivingFileChange != nil {
+            return
+        }
+        if imagePreparation != nil {
+            imagePreparation = nil
+            sendingChange = nil
+            settleWaiters(false)
+        }
+        cancelImageApplication()
+        localOnDemandCopy = nil
+        sourceGate.clear()
+
+        if manifest.kind == .files {
+            trackedRemoteManifest = TrackedRemoteManifest(
+                revision: manifest.revision,
+                kind: .files,
+                change: pasteboard.changeCount,
+                installedOnPasteboard: false
+            )
+            return
+        }
+
+        let marker = Self.lazyMarker(for: manifest.revision, kind: manifest.kind, session: session)
+        let revision = manifest.revision
+        let kind = manifest.kind
+        let wrote = pasteboard.writeLazy(
+            kind,
+            marker: marker,
+            fetch: { [weak self] in
+                guard let self, self.running else { return nil }
+                return self.pullRemotePayloadSynchronously(revision: revision, kind: kind)
+            },
+            asyncFetch: { [weak self] completion in
+                guard let self, self.running else {
+                    completion(nil)
+                    return
+                }
+                self.pullRemotePayloadAsynchronously(revision: revision, kind: kind, completion: completion)
+            }
+        )
+        guard wrote else {
+            onDiagnostic?(.applyFailed(kind == .png ? .png : .text, fileCount: 0))
+            onStatus?("系统剪贴板写入失败")
+            transfer.invalidateRemoteManifest(revision)
+            return
+        }
+        let newChange = pasteboard.changeCount
+        trackedRemoteManifest = TrackedRemoteManifest(
+            revision: revision,
+            kind: kind,
+            change: newChange,
+            installedOnPasteboard: true
+        )
+        observedChange = newChange
+        pendingLocalChange = nil
+        deferredLocalChange = nil
+        staleFileChange = nil
+        sharedChange = newChange
+        hasSharedState = true
+        lastSharedMarker = marker
+        sendingChange = nil
+    }
+
+    private func pullRemotePayloadSynchronously(revision: ClipboardRevision, kind: ClipboardManifestKind) -> ClipboardPayload? {
+        sourceGate.setPullingRemotely(true)
+        defer { sourceGate.setPullingRemotely(false) }
+        let payload = transfer.pullPayloadSynchronously(revision: revision, kind: kind)
+        if let payload {
+            let summary = diagnosticSummary(for: payload)
+            onDiagnostic?(.applied(summary.kind, fileCount: summary.fileCount))
+        } else {
+            onDiagnostic?(.applyFailed(kind == .png ? .png : .text, fileCount: 0))
+        }
+        return payload
+    }
+
+    private func pullRemotePayloadAsynchronously(revision: ClipboardRevision, kind: ClipboardManifestKind,
+                                                 completion: @escaping (ClipboardPayload?) -> Void) {
+        transfer.pullPayload(revision: revision, kind: kind) { [weak self] payload in
+            DispatchQueue.main.async {
+                if let self, self.running {
+                    if let payload {
+                        let summary = self.diagnosticSummary(for: payload)
+                        self.onDiagnostic?(.applied(summary.kind, fileCount: summary.fileCount))
+                    } else {
+                        self.onDiagnostic?(.applyFailed(kind == .png ? .png : .text, fileCount: 0))
+                    }
+                }
+                completion(payload)
+            }
+        }
+    }
+
+    private func fulfillPullRequest(_ request: ClipboardPullRequest) {
+        guard running, allowsOnDemandClipboard,
+              let copy = localOnDemandCopy,
+              copy.kind == request.kind,
+              (copy.revision == nil || copy.revision == request.revision),
+              pasteboard.changeCount == copy.change,
+              !pasteboard.isSensitive else {
+            localOnDemandCopy = nil
+            sourceGate.clear()
+            transfer.rejectPull(request, reason: "对端剪贴板已变化，请重新复制")
+            poll()
+            return
+        }
+
+        switch request.kind {
+        case .text:
+            guard let text = pasteboard.text else {
+                transfer.rejectPull(request, reason: "剪贴板文字已不可用")
+                return
+            }
+            let bytes = Data(text.utf8)
+            do {
+                try ClipboardAutomaticLimits.validate(type: "text", bytes: UInt64(bytes.count))
+            } catch {
+                transfer.rejectPull(request, reason: error.localizedDescription)
+                return
+            }
+            sendPulledPayload(.text(bytes), request: request, change: copy.change)
+        case .png:
+            if let cachedPNG = copy.cachedPNG {
+                sendPulledPayload(.png(cachedPNG), request: request, change: copy.change)
+                return
+            }
+            if let png = pasteboard.pngData {
+                do {
+                    try ClipboardAutomaticLimits.validate(type: "png", bytes: UInt64(png.count))
+                } catch {
+                    transfer.rejectPull(request, reason: error.localizedDescription)
+                    return
+                }
+                if localOnDemandCopy?.change == copy.change {
+                    localOnDemandCopy?.cachedPNG = png
+                }
+                sendPulledPayload(.png(png), request: request, change: copy.change)
+                return
+            }
+            guard let tiff = pasteboard.tiffData else {
+                transfer.rejectPull(request, reason: "剪贴板图片已不可用")
+                return
+            }
+            guard UInt64(tiff.count) <= ClipboardAutomaticLimits.imageBytes else {
+                transfer.rejectPull(request, reason: "图片超过 64 MiB，未自动同步，请保存为文件后复制")
+                return
+            }
+            let convert = convertTIFF
+            let change = copy.change
+            imageQueue.async { [weak self] in
+                let png = convert(tiff)
+                DispatchQueue.main.async {
+                    guard let self, self.running else { return }
+                    guard self.pasteboard.changeCount == change, !self.pasteboard.isSensitive else {
+                        self.transfer.rejectPull(request, reason: "对端剪贴板已变化，请重新复制")
+                        return
+                    }
+                    guard let png else {
+                        self.transfer.rejectPull(request, reason: "剪贴板图片无法转换为 PNG")
+                        return
+                    }
+                    do {
+                        try ClipboardAutomaticLimits.validate(type: "png", bytes: UInt64(png.count))
+                    } catch {
+                        self.transfer.rejectPull(request, reason: error.localizedDescription)
+                        return
+                    }
+                    if self.localOnDemandCopy?.change == change {
+                        self.localOnDemandCopy?.cachedPNG = png
+                    }
+                    self.sendPulledPayload(.png(png), request: request, change: change)
+                }
+            }
+        case .files:
+            transfer.rejectPull(request, reason: "按需拉取不支持文件")
+        }
+    }
+
+    private func sendPulledPayload(_ payload: ClipboardPayload, request: ClipboardPullRequest, change: Int) {
+        let summary = diagnosticSummary(for: payload)
+        onDiagnostic?(.sending(summary.kind, fileCount: 0))
+        transfer.sendPulled(payload, requestID: request.requestID) { [weak self] success in
+            DispatchQueue.main.async {
+                guard let self, self.running else { return }
+                self.onDiagnostic?(success ? .sent(summary.kind, fileCount: 0) : .sendFailed(summary.kind, fileCount: 0))
+                if success, self.localOnDemandCopy?.change == change {
+                    self.localOnDemandCopy?.materializedOnPeer = true
+                    self.sharedChange = change
+                }
             }
         }
     }
@@ -662,6 +1244,14 @@ final class ClipboardSync {
             isKeptBackgroundFile = true
         } else {
             isKeptBackgroundFile = false
+        }
+        if allowsOnDemandClipboard, !isKeptBackgroundFile, !allowsAutomaticSending,
+           let tracked = trackedRemoteManifest, pasteboard.changeCount != tracked.change {
+            trackedRemoteManifest = nil
+            localOnDemandCopy = nil
+            sourceGate.clear()
+            completion(permit.performIfValid { true })
+            return
         }
         if !isKeptBackgroundFile {
             if imagePreparation != nil {
@@ -728,6 +1318,9 @@ final class ClipboardSync {
                 return true
             }
         }
+        trackedRemoteManifest = nil
+        localOnDemandCopy = nil
+        sourceGate.clear()
         let contentMarker = contentMarker ?? Self.marker(for: payload, session: session)
         guard pasteboard.write(payload, marker: contentMarker) else {
             onDiagnostic?(.applyFailed(summary.kind, fileCount: summary.fileCount))
@@ -754,6 +1347,10 @@ final class ClipboardSync {
         case .png: return (.png, 0)
         case .files(let urls): return (.files, urls.count)
         }
+    }
+
+    nonisolated private static func lazyMarker(for revision: ClipboardRevision, kind: ClipboardManifestKind, session: UUID) -> String {
+        "\(session.uuidString):lazy:\(kind.rawValue):\(revision.origin.uuidString):\(revision.counter)"
     }
 
     nonisolated private static func marker(for payload: ClipboardPayload, session: UUID) -> String {

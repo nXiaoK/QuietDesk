@@ -24,6 +24,19 @@ private func eventually(_ message: String, _ condition: () -> Bool) throws {
     try require(condition(), message)
 }
 
+private final class ChannelSafeBox<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: T
+    init(_ value: T) { self.value = value }
+    func read() -> T { lock.withLock { value } }
+    func set(_ next: T) { lock.withLock { value = next } }
+}
+
+private extension ChannelSafeBox where T == [MessageKind] {
+    func append(_ kind: MessageKind) { lock.withLock { value.append(kind) } }
+    func snapshot() -> [MessageKind] { lock.withLock { value } }
+}
+
 private final class ImageConversionProbe: @unchecked Sendable {
     private let lock = NSLock()
     private var background = false
@@ -51,6 +64,9 @@ private final class MemoryPasteboard: ClipboardPasteboard {
     var isRelayedFromOtherDevice = false
     var isSensitive = false
     var rawTIFF: Data?
+    private(set) var hasLazyItem = false
+    private(set) var lazyKind: ClipboardManifestKind?
+    private var lazyAsyncFetch: (@MainActor (@escaping (ClipboardPayload?) -> Void) -> Void)?
     var tiffData: Data? { reads += 1; return rawTIFF }
 
     var fileURLs: [URL]? {
@@ -70,20 +86,79 @@ private final class MemoryPasteboard: ClipboardPasteboard {
     }
     var contentMarker: String? { reads += 1; return marker }
 
-    func copy(_ payload: ClipboardPayload) {
-        self.payload = payload; rawTIFF = nil; marker = nil; changeCount += 1
+    func inspectCurrentKind() -> ClipboardManifestKind? {
+        if hasLazyItem { return lazyKind }
+        if rawTIFF != nil { return .png }
+        switch payload {
+        case .files(let urls): return urls.isEmpty ? nil : .files
+        case .png: return .png
+        case .text: return .text
+        }
     }
 
-    func republish() { marker = nil; changeCount += 1 }
+    func copy(_ payload: ClipboardPayload) {
+        self.payload = payload; rawTIFF = nil; marker = nil
+        hasLazyItem = false; lazyKind = nil; lazyAsyncFetch = nil
+        changeCount += 1
+    }
+
+    func republish() {
+        marker = nil
+        hasLazyItem = false; lazyKind = nil; lazyAsyncFetch = nil
+        changeCount += 1
+    }
 
     func write(_ payload: ClipboardPayload, marker: String) -> Bool {
         guard !rejectsWrites else { return false }
-        self.payload = payload; self.marker = marker
+        self.payload = payload; rawTIFF = nil; self.marker = marker
+        hasLazyItem = false; lazyKind = nil; lazyAsyncFetch = nil
         changeCount += 1; writes += 1
         return true
     }
 
+    func writeLazy(
+        _ kind: ClipboardManifestKind,
+        marker: String,
+        fetch: @escaping @MainActor () -> ClipboardPayload?,
+        asyncFetch: @escaping @MainActor (@escaping (ClipboardPayload?) -> Void) -> Void
+    ) -> Bool {
+        guard !rejectsWrites, kind == .text || kind == .png else { return false }
+        self.payload = .text(Data())
+        self.rawTIFF = nil
+        self.marker = marker
+        self.hasLazyItem = true
+        self.lazyKind = kind
+        self.lazyAsyncFetch = asyncFetch
+        changeCount += 1
+        writes += 1
+        return true
+    }
+
+    @discardableResult
+    func simulatePaste() -> ClipboardPayload? {
+        if hasLazyItem, let fetch = lazyAsyncFetch {
+            var resolved: ClipboardPayload?
+            var finished = false
+            fetch { result in
+                resolved = result
+                finished = true
+            }
+            let deadline = Date().addingTimeInterval(5)
+            while !finished, Date() < deadline {
+                pump(for: 0.01)
+            }
+            if let resolved {
+                self.payload = resolved
+                self.hasLazyItem = false
+                self.lazyAsyncFetch = nil
+            }
+            return resolved
+        }
+        return payload
+    }
+
     var copiedText: String? {
+        guard !hasLazyItem else { return nil }
         if case .text(let data) = payload { return String(data: data, encoding: .utf8) }
         return nil
     }
@@ -102,11 +177,13 @@ private final class ClipboardPair {
 
     init(storage: URL, localAllowed: Bool = false, remoteAllowed: Bool = false, controllingLocal: Bool = false,
          allowsChunkWindow: Bool = false, allowsDecoupledFileTransfer: Bool = false,
+         allowsOnDemandClipboard: Bool = false, deferLocalFileOffer: Bool = false,
          convertLocalTIFF: @escaping (Data) -> Data? = { data in NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) },
          validateRemotePNG: ((Data) -> Bool)? = nil) {
         let session = UUID()
         localSync = ClipboardSync(session: session, allowsFileSending: true, allowsAutomaticSending: localAllowed,
             allowsChunkWindow: allowsChunkWindow, allowsDecoupledFileTransfer: allowsDecoupledFileTransfer,
+            allowsOnDemandClipboard: allowsOnDemandClipboard, deferFileOfferUntilPaste: deferLocalFileOffer,
             controllingRemote: controllingLocal, pasteboard: local, storage: storage.appendingPathComponent("local"),
             convertTIFF: convertLocalTIFF) { [weak self] message in
                 DispatchQueue.main.async {
@@ -117,6 +194,7 @@ private final class ClipboardPair {
             }
         remoteSync = ClipboardSync(session: session, allowsFileSending: true, allowsAutomaticSending: remoteAllowed,
             allowsChunkWindow: allowsChunkWindow, allowsDecoupledFileTransfer: allowsDecoupledFileTransfer,
+            allowsOnDemandClipboard: allowsOnDemandClipboard, deferFileOfferUntilPaste: false,
             pasteboard: remote, storage: storage.appendingPathComponent("remote"), validatePNG: validateRemotePNG) { [weak self] message in
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -1607,6 +1685,329 @@ private struct ClipboardFocusChecks {
                         && fileResult?.0.files.count == 1
                         && (try? Data(contentsOf: fileResult!.0.files[0])) == expected,
                         "Completed background file overwrote newer text pasteboard or lost file bytes")
+        }
+
+        run("On-demand clipboard sends zero payload bytes or file offers on copy and materializes text, TIFF, and files only on paste") { folder in
+            var tiffConversions = 0
+            let validPNG: Data = {
+                let rep = NSBitmapImageRep(
+                    bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2,
+                    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                    colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+                )!
+                return rep.representation(using: .png, properties: [:])!
+            }()
+            let pair = ClipboardPair(
+                storage: folder,
+                localAllowed: true,
+                remoteAllowed: false,
+                allowsChunkWindow: true,
+                allowsDecoupledFileTransfer: true,
+                allowsOnDemandClipboard: true,
+                deferLocalFileOffer: true,
+                convertLocalTIFF: { _ in
+                    tiffConversions += 1
+                    return validPNG
+                }
+            )
+            defer { pair.stop() }
+
+            var remoteOffer: ClipboardFileOffer?
+            pair.remoteSync.onFileOffer = { remoteOffer = $0 }
+
+            // 1. Copy text on viewer: only manifest sent, 0 payload reads, 0 chunks.
+            pair.local.copy(.text(Data("paste-triggered-text".utf8)))
+            try eventually("Text manifest was not installed lazily on remote") {
+                pair.remote.hasLazyItem && pair.remote.lazyKind == .text
+            }
+            try require(pair.local.reads == 0
+                        && pair.localMessages == [.clipboardManifest]
+                        && pair.remote.copiedText == nil,
+                        "On-demand text copy read payload or sent chunks before paste")
+
+            // Enter remote control and press Cmd+V (prepareForPaste): materializes once, then holdsPaste becomes false.
+            pair.localSync.setControllingRemote(true)
+            try require(pair.localSync.holdsPaste, "Unmaterialized on-demand text copy did not hold first Cmd+V")
+            var pasteReady: Bool?
+            pair.localSync.prepareForPaste { pasteReady = $0 }
+            try eventually("Cmd+V did not materialize on-demand text") { pasteReady == true }
+            try require(pair.remote.copiedText == "paste-triggered-text" && !pair.localSync.holdsPaste,
+                        "Materialized text did not arrive or continued holding subsequent Cmd+V")
+            let beginsAfterFirstPaste = pair.localMessages.filter { $0 == .clipboardBegin }.count
+            var secondPaste: Bool?
+            pair.localSync.prepareForPaste { secondPaste = $0 }
+            try require(secondPaste == true && pair.localMessages.filter { $0 == .clipboardBegin }.count == beginsAfterFirstPaste,
+                        "Second Cmd+V re-transferred already materialized text")
+
+            // 2. Copy TIFF image on viewer: 0 TIFF->PNG conversions on copy; converts only when pasted.
+            pair.localSync.setControllingRemote(false)
+            pair.local.copy(.text(Data()))
+            pair.local.rawTIFF = Data([0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00])
+            pair.localSync.sendLocalCopy()
+            try eventually("PNG manifest for TIFF was not installed lazily on remote") {
+                pair.remote.hasLazyItem && pair.remote.lazyKind == .png
+            }
+            try require(tiffConversions == 0, "TIFF image was converted on copy before any paste")
+            pair.localSync.setControllingRemote(true)
+            var imagePasteReady: Bool?
+            pair.localSync.prepareForPaste { imagePasteReady = $0 }
+            try eventually("Cmd+V did not materialize TIFF image") { imagePasteReady == true }
+            try require(tiffConversions == 1, "TIFF conversion count was \(tiffConversions), expected 1")
+            if case .png(let appliedPNG) = pair.remote.payload {
+                try require(appliedPNG == validPNG, "Applied PNG bytes mismatched")
+            } else {
+                throw FocusCheckFailure("Remote did not receive materialized PNG")
+            }
+
+            // 3. Copy file on viewer (deferLocalFileOffer == true): 0 file prompts on copy; prompt appears only on Cmd+V.
+            pair.localSync.setControllingRemote(false)
+            let fileURL = folder.appendingPathComponent("deferred.txt")
+            try Data("deferred-file".utf8).write(to: fileURL)
+            pair.local.copy(.files([fileURL]))
+            pump(for: 0.35)
+            try require(remoteOffer == nil && !pair.localMessages.suffix(1).contains(.clipboardBegin),
+                        "Viewer file copy triggered remote file prompt before Cmd+V")
+            pair.localSync.setControllingRemote(true)
+            try require(pair.localSync.holdsPaste, "Deferred file copy did not intercept first Cmd+V")
+            var filePasteReady: Bool?
+            pair.localSync.prepareForPaste { filePasteReady = $0 }
+            try eventually("Cmd+V did not trigger deferred file offer on remote") { remoteOffer != nil }
+            try require(filePasteReady == false && remoteOffer?.names == ["deferred.txt"],
+                        "Deferred file offer did not require recipient confirmation")
+        }
+
+        run("On-demand clipboard supports right-click lazy paste in both directions without echo on focus switches") { folder in
+            let validPNG: Data = {
+                let rep = NSBitmapImageRep(
+                    bitmapDataPlanes: nil, pixelsWide: 2, pixelsHigh: 2,
+                    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                    colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+                )!
+                return rep.representation(using: .png, properties: [:])!
+            }()
+            let pair = ClipboardPair(
+                storage: folder,
+                localAllowed: true,
+                remoteAllowed: false,
+                allowsChunkWindow: true,
+                allowsDecoupledFileTransfer: true,
+                allowsOnDemandClipboard: true,
+                deferLocalFileOffer: true
+            )
+            defer { pair.stop() }
+
+            // A -> B right-click paste: pulls on demand and marks A's copy materialized so subsequent Cmd+V doesn't re-push.
+            pair.local.copy(.text(Data("right-click-from-viewer".utf8)))
+            try eventually("Viewer manifest did not reach host") { pair.remote.hasLazyItem }
+            pair.localSync.setControllingRemote(true)
+            try require(pair.localSync.holdsPaste, "Viewer should hold paste before right-click pull completes")
+            let pulledOnHost = pair.remote.simulatePaste()
+            guard case .text(let hostBytes)? = pulledOnHost,
+                  String(data: hostBytes, encoding: .utf8) == "right-click-from-viewer" else {
+                throw FocusCheckFailure("Right-click paste on host did not pull viewer text")
+            }
+            try eventually("Viewer did not mark pulled copy as materialized") { !pair.localSync.holdsPaste }
+            try require(pair.remoteMessages.contains(.clipboardPull), "Host did not use clipboardPull")
+
+            // B -> A copy while controlled, then release control: 0 chunks sent on focus release, pulled only on paste on A.
+            pair.remote.copy(.png(validPNG))
+            pump(for: 0.35)
+            let remoteChunksBeforeRelease = pair.remoteMessages.filter { $0 == .clipboardChunk }.count
+            pair.localSync.setControllingRemote(false)
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            try eventually("Host PNG manifest did not reach viewer after releasing control") {
+                pair.local.hasLazyItem && pair.local.lazyKind == .png
+            }
+            try require(pair.remoteMessages.filter { $0 == .clipboardChunk }.count == remoteChunksBeforeRelease,
+                        "Releasing control eagerly streamed host PNG before viewer pasted")
+
+            let pulledOnViewer = pair.local.simulatePaste()
+            guard case .png(let viewerPNG)? = pulledOnViewer, viewerPNG == validPNG else {
+                throw FocusCheckFailure("Local paste on viewer did not pull host PNG")
+            }
+
+            let localManifestsBeforeFocusBounce = pair.localMessages.filter { $0 == .clipboardManifest }.count
+            let localBeginsBeforeFocusBounce = pair.localMessages.filter { $0 == .clipboardBegin }.count
+            pair.localSync.setAutomaticSendingAllowed(false)
+            pair.localSync.setAutomaticSendingAllowed(true)
+            pump(for: 0.35)
+            try require(pair.localMessages.filter { $0 == .clipboardManifest }.count == localManifestsBeforeFocusBounce
+                        && pair.localMessages.filter { $0 == .clipboardBegin }.count == localBeginsBeforeFocusBounce,
+                        "Focus bounce echoed pulled remote clipboard back to host")
+        }
+
+        run("Remote local copy while controlled invalidates viewer unmaterialized copy and reconnect re-announces unmaterialized copy") { folder in
+            let pair = ClipboardPair(
+                storage: folder,
+                localAllowed: true,
+                remoteAllowed: false,
+                allowsChunkWindow: true,
+                allowsDecoupledFileTransfer: true,
+                allowsOnDemandClipboard: true,
+                deferLocalFileOffer: true
+            )
+            defer { pair.stop() }
+
+            pair.local.copy(.text(Data("viewer-stale-copy".utf8)))
+            try eventually("Manifest did not reach remote") { pair.remote.hasLazyItem }
+            let reconnectChangeWhileUnmaterialized = pair.localSync.handledChange
+            try require(reconnectChangeWhileUnmaterialized != pair.local.changeCount,
+                        "Unmaterialized copy handledChange would suppress re-announcement after reconnect")
+
+            // Enter remote control; user copies something directly on remote host without pasting viewer's copy.
+            pair.localSync.setControllingRemote(true)
+            pair.remote.copy(.text(Data("host-own-copy".utf8)))
+            try eventually("Remote copy while controlled did not invalidate viewer unmaterialized copy") {
+                !pair.localSync.holdsPaste
+            }
+            var pasteReady: Bool?
+            pair.localSync.prepareForPaste { pasteReady = $0 }
+            try require(pasteReady == true && pair.remote.copiedText == "host-own-copy",
+                        "Cmd+V on remote overwrote remote's newer copy with viewer's stale copy")
+
+            // Verify reconnect handover re-announces an unmaterialized copy on the new session.
+            pair.localSync.setControllingRemote(false)
+            pair.local.copy(.text(Data("survives-reconnect".utf8)))
+            try eventually("New manifest was not created") { pair.localSync.holdsPaste || pair.remote.hasLazyItem }
+            let savedHandledChange = pair.localSync.handledChange
+            let reconnectedRemote = MemoryPasteboard()
+            let reconnectedSession = UUID()
+            var reconnectedHostSync: ClipboardSync!
+            let reconnectedViewerSync = ClipboardSync(
+                session: reconnectedSession,
+                allowsFileSending: true,
+                allowsAutomaticSending: true,
+                allowsChunkWindow: true,
+                allowsDecoupledFileTransfer: true,
+                allowsOnDemandClipboard: true,
+                deferFileOfferUntilPaste: true,
+                handledChange: savedHandledChange,
+                pasteboard: pair.local,
+                storage: folder.appendingPathComponent("reconnected-local")
+            ) { message in
+                DispatchQueue.main.async { reconnectedHostSync?.receive(message) }
+            }
+            reconnectedHostSync = ClipboardSync(
+                session: reconnectedSession,
+                allowsFileSending: true,
+                allowsAutomaticSending: false,
+                allowsChunkWindow: true,
+                allowsDecoupledFileTransfer: true,
+                allowsOnDemandClipboard: true,
+                pasteboard: reconnectedRemote,
+                storage: folder.appendingPathComponent("reconnected-remote")
+            ) { message in
+                DispatchQueue.main.async { reconnectedViewerSync.receive(message) }
+            }
+            defer {
+                reconnectedViewerSync.stop()
+                reconnectedHostSync.stop()
+            }
+            try eventually("Reconnected session did not re-announce unmaterialized viewer copy") {
+                reconnectedRemote.hasLazyItem && reconnectedRemote.lazyKind == .text
+            }
+            let pulledAfterReconnect = reconnectedRemote.simulatePaste()
+            guard case .text(let bytes)? = pulledAfterReconnect,
+                  String(data: bytes, encoding: .utf8) == "survives-reconnect" else {
+                throw FocusCheckFailure("Reconnected session failed to pull re-announced copy")
+            }
+        }
+
+        run("SystemClipboardPasteboard NSPasteboardItemDataProvider pulls multi-chunk text and PNG synchronously on demand") { folder in
+            let isolatedSourcePB = NSPasteboard.withUniqueName()
+            let isolatedSinkPB = NSPasteboard.withUniqueName()
+            defer {
+                isolatedSourcePB.releaseGlobally()
+                isolatedSinkPB.releaseGlobally()
+            }
+            let sourcePasteboard = SystemClipboardPasteboard(pasteboard: isolatedSourcePB)
+            let sinkPasteboard = SystemClipboardPasteboard(pasteboard: isolatedSinkPB)
+            let wireQueue = DispatchQueue(label: "checks.appkit.lazy-pasteboard.wire")
+
+            let sourceTransfer = ClipboardTransfer(
+                storage: folder.appendingPathComponent("sys-src"),
+                requireFileApproval: true,
+                allowsChunkWindow: true,
+                allowsDecoupledFileTransfer: true,
+                allowsOnDemandClipboard: true
+            )
+            var sinkSync: ClipboardSync!
+            let sourcePayloadBox = ChannelSafeBox<ClipboardPayload>(.text(Data()))
+            let sentBySource = ChannelSafeBox<[MessageKind]>([])
+
+            sourceTransfer.onSend = { msg in
+                sentBySource.append(msg.kind)
+                wireQueue.async { sinkSync?.receive(msg) }
+            }
+            sourceTransfer.onPullRequested = { [weak sourceTransfer] req in
+                sourceTransfer?.sendPulled(sourcePayloadBox.read(), requestID: req.requestID)
+            }
+
+            sinkSync = ClipboardSync(
+                session: UUID(),
+                allowsFileSending: true,
+                allowsAutomaticSending: false,
+                allowsChunkWindow: true,
+                allowsDecoupledFileTransfer: true,
+                allowsOnDemandClipboard: true,
+                pasteboard: sinkPasteboard,
+                storage: folder.appendingPathComponent("sys-sink")
+            ) { msg in
+                wireQueue.async { sourceTransfer.receive(msg) }
+            }
+            defer {
+                sinkSync.stop()
+                sourceTransfer.stop()
+            }
+
+            // Verify inspectCurrentKind() inspects NSPasteboard.types metadata correctly.
+            isolatedSourcePB.clearContents()
+            isolatedSourcePB.setString("meta-check", forType: .string)
+            try require(sourcePasteboard.inspectCurrentKind() == .text, "SystemClipboardPasteboard failed to detect .text")
+
+            // 1. Multi-chunk text lazy NSPasteboardItemDataProvider synchronous pull on @MainActor.
+            let expectedString = String(repeating: "QuietDesk按需粘贴测试-", count: 8_000)
+            sourcePayloadBox.set(.text(Data(expectedString.utf8)))
+            let baselineChange = isolatedSinkPB.changeCount
+            sourceTransfer.announceManifest(kind: .text)
+            try eventually("Lazy text item was not installed on isolated NSPasteboard") {
+                isolatedSinkPB.changeCount != baselineChange
+            }
+            try require(isolatedSinkPB.types?.contains(.string) == true,
+                        "Lazy NSPasteboardItem did not advertise .string for right-click Paste menu")
+            try require(sentBySource.snapshot() == [.clipboardManifest],
+                        "Text chunks were sent before NSPasteboard requested data")
+
+            let materializedString = isolatedSinkPB.string(forType: .string)
+            try require(materializedString == expectedString,
+                        "NSPasteboardItemDataProvider synchronous text pull failed or corrupted string")
+            try require(sentBySource.snapshot().contains(.clipboardChunk),
+                        "Expected multi-chunk pull transfer over background wire")
+
+            // 2. Real PNG lazy NSPasteboardItemDataProvider synchronous pull on @MainActor.
+            let validPNG: Data = {
+                let rep = NSBitmapImageRep(
+                    bitmapDataPlanes: nil, pixelsWide: 4, pixelsHigh: 4,
+                    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                    colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+                )!
+                return rep.representation(using: .png, properties: [:])!
+            }()
+            sourcePayloadBox.set(.png(validPNG))
+            let beforePNGChange = isolatedSinkPB.changeCount
+            let countBeforePNGAnnounce = sentBySource.snapshot().count
+            sourceTransfer.announceManifest(kind: .png)
+            try eventually("Lazy PNG item was not installed on isolated NSPasteboard") {
+                isolatedSinkPB.changeCount != beforePNGChange
+            }
+            try require(isolatedSinkPB.types?.contains(.png) == true,
+                        "Lazy NSPasteboardItem did not advertise .png for right-click Paste menu")
+            try require(sentBySource.snapshot().dropFirst(countBeforePNGAnnounce) == [.clipboardManifest],
+                        "PNG chunks were sent before NSPasteboard requested data")
+
+            let materializedPNG = isolatedSinkPB.data(forType: .png)
+            try require(materializedPNG == validPNG,
+                        "NSPasteboardItemDataProvider synchronous PNG pull failed or corrupted bytes")
         }
 
         print("\(passed) passed, \(failed) failed")

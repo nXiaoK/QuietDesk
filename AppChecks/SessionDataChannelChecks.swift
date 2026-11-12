@@ -118,7 +118,10 @@ private struct SessionDataChannelChecks {
                 received.update { $0.append(message.kind) }
                 if Thread.isMainThread { touchedMain.update { $0 = true } }
             }
-            let kinds: [MessageKind] = [.clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel]
+            let kinds: [MessageKind] = [
+                .clipboardManifest, .clipboardPull,
+                .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel
+            ]
             try onBackground {
                 for kind in kinds { try require(channel.receive(Message(kind, Data([1, 2, 3]))), "Clipboard message missed its endpoint") }
                 for kind: MessageKind in [.hello, .clipboardSettings, .requestClipboard, .input] {

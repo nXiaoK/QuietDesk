@@ -133,7 +133,8 @@ final class SessionDataChannel: @unchecked Sendable {
             let packet = try RemoteAudioPacket.decode(message.payload)
             handler(packet)
             return true
-        case .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel:
+        case .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd,
+             .clipboardReceipt, .clipboardCancel, .clipboardManifest, .clipboardPull:
             guard let clipboard = handlers.3 else { return false }
             clipboard(message)
             return true

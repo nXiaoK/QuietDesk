@@ -288,4 +288,158 @@ func runClipboardWindowChecks() {
                       "Legacy peer offered or acknowledged unnegotiated independentFileLane")
         }
     }
+
+    run("On-demand clipboard negotiates backward-compatibly and pulls multi-chunk text and validated PNG off main thread") {
+        try withCheckFolder { folder in
+            let legacyPref = try JSONDecoder().decode(ClipboardPreference.self, from: Data(#"{"enabled":true}"#.utf8))
+            try check(legacyPref.onDemandClipboard == nil, "Legacy preference unexpectedly set onDemandClipboard")
+            let modernData = try JSONEncoder().encode(ClipboardPreference(enabled: true))
+            let modernPref = try JSONDecoder().decode(ClipboardPreference.self, from: modernData)
+            try check(modernPref.onDemandClipboard == true, "Modern preference did not advertise onDemandClipboard")
+
+            let wireQueue = DispatchQueue(label: "checks.clipboard.ondemand.wire")
+            let source = ClipboardTransfer(
+                storage: folder.appendingPathComponent("source"),
+                requireFileApproval: true,
+                allowsChunkWindow: true,
+                allowsDecoupledFileTransfer: true,
+                allowsOnDemandClipboard: true
+            )
+            let sink = ClipboardTransfer(
+                storage: folder.appendingPathComponent("sink"),
+                requireFileApproval: true,
+                allowsChunkWindow: true,
+                allowsDecoupledFileTransfer: true,
+                allowsOnDemandClipboard: true
+            )
+            defer { stopTransfers(source, sink) }
+
+            let sourceSentKinds = Box<[MessageKind]>([])
+            let sinkApplyCalled = Box(false)
+            let latestManifest = Box<ClipboardManifest?>(nil)
+            let manifestArrived = DispatchSemaphore(value: 0)
+            let invalidatedRev = Box<ClipboardRevision?>(nil)
+            let invalidatedDone = DispatchSemaphore(value: 0)
+            let sourcePayload = Box<ClipboardPayload>(.text(Data()))
+            let validPNGMagic = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+
+            source.onSend = { msg in
+                sourceSentKinds.update { $0.append(msg.kind) }
+                wireQueue.async { sink.receive(msg) }
+            }
+            sink.onSend = { msg in
+                wireQueue.async { source.receive(msg) }
+            }
+            sink.onApply = { _, completion in
+                sinkApplyCalled.set(true)
+                completion(true)
+            }
+            sink.onReceive = { _ in
+                sinkApplyCalled.set(true)
+            }
+            sink.validatePulledPNG = { data in
+                data.starts(with: validPNGMagic)
+            }
+            sink.onManifest = { manifest in
+                latestManifest.set(manifest)
+                manifestArrived.signal()
+            }
+            source.onManifestInvalidated = { rev in
+                invalidatedRev.set(rev)
+                invalidatedDone.signal()
+            }
+            source.onPullRequested = { [weak source] req in
+                source?.sendPulled(sourcePayload.read(), requestID: req.requestID)
+            }
+
+            let expectedText = Data(repeating: 0x41, count: 600_000)
+            sourcePayload.set(.text(expectedText))
+            source.announceManifest(kind: .text)
+            try wait(manifestArrived, "Text manifest did not arrive")
+            try check(sourceSentKinds.read() == [.clipboardManifest], "Copy announcement sent payload chunks eagerly")
+            guard let textManifest = latestManifest.read(), textManifest.kind == .text else {
+                throw CheckFailure("Expected text manifest")
+            }
+
+            let pulledText = sink.pullPayloadSynchronously(revision: textManifest.revision, kind: .text)
+            guard case .text(let pulledTextBytes)? = pulledText else {
+                throw CheckFailure("Synchronous text pull returned nil or wrong kind")
+            }
+            try check(pulledTextBytes == expectedText && !sinkApplyCalled.read(),
+                      "Pulled text mismatched or routed through eager apply callback")
+
+            let expectedPNG = validPNGMagic + Data(repeating: 0x2B, count: 300_000)
+            sourcePayload.set(.png(expectedPNG))
+            source.announceManifest(kind: .png)
+            try wait(manifestArrived, "PNG manifest did not arrive")
+            guard let pngManifest = latestManifest.read(), pngManifest.kind == .png else {
+                throw CheckFailure("Expected PNG manifest")
+            }
+            let pulledPNG = sink.pullPayloadSynchronously(revision: pngManifest.revision, kind: .png)
+            guard case .png(let pulledPNGBytes)? = pulledPNG else {
+                throw CheckFailure("Validated synchronous PNG pull returned nil")
+            }
+            try check(pulledPNGBytes == expectedPNG, "Pulled PNG bytes mismatched")
+
+            sourcePayload.set(.png(Data([0x00, 0x01, 0x02, 0x03])))
+            source.announceManifest(kind: .png)
+            try wait(manifestArrived, "Invalid PNG manifest did not arrive")
+            guard let badManifest = latestManifest.read() else { throw CheckFailure("Missing manifest") }
+            let rejectedPNG = sink.pullPayloadSynchronously(revision: badManifest.revision, kind: .png)
+            try check(rejectedPNG == nil, "Corrupt pulled PNG passed validation")
+
+            sink.invalidateRemoteManifest(badManifest.revision)
+            try wait(invalidatedDone, "Source was not notified when remote manifest was invalidated")
+            try check(invalidatedRev.read() == badManifest.revision, "Invalidated revision mismatched")
+        }
+    }
+
+    run("On-demand clipboard rejects unnegotiated messages and blocks pullRequestID on files") {
+        try withCheckFolder { folder in
+            let legacy = ClipboardTransfer(storage: folder.appendingPathComponent("legacy"), requireFileApproval: true)
+            defer { legacy.stop() }
+            let legacyStatus = Box<[String]>([])
+            let legacyFailed = DispatchSemaphore(value: 0)
+            legacy.onStatus = { status in
+                legacyStatus.update { $0.append(status) }
+                if status.contains("对端未协商按需剪贴板") {
+                    legacyFailed.signal()
+                }
+            }
+            let manifestMsg = try Wire.json(.clipboardManifest, ClipboardManifest(
+                revision: ClipboardRevision(counter: 1, origin: UUID()),
+                kind: .text
+            ))
+            legacy.receive(manifestMsg)
+            try wait(legacyFailed, "Legacy peer accepted unnegotiated clipboardManifest")
+
+            let negotiated = ClipboardTransfer(
+                storage: folder.appendingPathComponent("negotiated"),
+                requireFileApproval: true,
+                allowsChunkWindow: true,
+                allowsDecoupledFileTransfer: true,
+                allowsOnDemandClipboard: true
+            )
+            defer { negotiated.stop() }
+            let fileOfferSeen = Box(false)
+            let receiptsSent = Box(0)
+            let rejectedDone = DispatchSemaphore(value: 0)
+            negotiated.onFileOffer = { if $0 != nil { fileOfferSeen.set(true) } }
+            negotiated.onSend = { msg in
+                if msg.kind == .clipboardReceipt { receiptsSent.update { $0 += 1 } }
+            }
+            negotiated.onStatus = { status in
+                if status.contains("按需拉取仅支持文字或图片") {
+                    rejectedDone.signal()
+                }
+            }
+            let spoofedFilesPull = """
+            {"revision":{"counter":5,"origin":"\(UUID().uuidString)"},"sequence":0,"type":"files","count":1,"bytes":16,"pullRequestID":"\(UUID().uuidString)"}
+            """
+            negotiated.receive(Message(.clipboardBegin, Data(spoofedFilesPull.utf8)))
+            try wait(rejectedDone, "Negotiated peer accepted pullRequestID on files")
+            try check(!fileOfferSeen.read() && receiptsSent.read() == 0,
+                      "Spoofed file pull triggered offer or receipt")
+        }
+    }
 }

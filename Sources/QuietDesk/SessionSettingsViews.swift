@@ -194,7 +194,7 @@ private struct ConnectionOptionsSections: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("剪贴板与文件").font(.headline)
                 Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) { Text("双向同步文字、图片和文件").frame(maxWidth: .infinity, alignment: .leading) }
-                Text("文字和图片按控制端焦点同步；文件需逐次确认后下载，完成后再粘贴。")
+                Text("文字和图片仅在按 ⌘V 或右键粘贴时按需同步，复制不占流量；文件需接收端确认后下载，完成后再粘贴。")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Button { model.canvas.releaseControl(); model.openReceivedFiles() } label: {
                     Label("打开接收文件目录", systemImage: "folder")

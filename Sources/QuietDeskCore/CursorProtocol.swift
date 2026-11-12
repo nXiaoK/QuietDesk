@@ -163,6 +163,12 @@ public struct CursorPosition: Sendable {
 }
 
 public struct CursorPresentationState {
+    private struct PendingBinding {
+        let cursorID: UUID
+        let epoch: UInt32
+        let stream: MediaStreamID
+        let enabled: Bool
+    }
     public private(set) var cursorID: UUID?
     public private(set) var epoch: UInt32 = 0
     public private(set) var enabled = false
@@ -171,19 +177,39 @@ public struct CursorPresentationState {
     private var revision: UInt64 = 0
     private var committedStream: MediaStreamID?
     private var bindings: [MediaStreamID: (epoch: UInt32, enabled: Bool)] = [:]
+    private var pendingBindings: [PendingBinding] = []
     public init() {}
     public mutating func status(_ control: CursorControl) -> Bool {
         guard control.operation == .status, let id = control.cursorID, let incoming = control.epoch,
               cursorID == nil || cursorID == id, incoming > epoch else { return false }
         cursorID = id; epoch = incoming; revision = 0; image = nil; position = nil
+        var remainingPending: [PendingBinding] = []
+        for candidate in pendingBindings where candidate.cursorID == id {
+            if candidate.epoch == incoming {
+                if let committedStream, !Self.isNewer(candidate.stream, than: committedStream) { continue }
+                if bindings.count >= 3, bindings[candidate.stream] == nil { bindings.removeAll() }
+                bindings[candidate.stream] = (incoming, candidate.enabled)
+            } else if candidate.epoch > incoming {
+                remainingPending.append(candidate)
+            }
+        }
+        pendingBindings = remainingPending
         return true
     }
     public mutating func bind(_ control: CursorControl) -> Bool {
-        guard control.operation == .binding, control.cursorID == cursorID, control.epoch == epoch,
+        guard control.operation == .binding, let id = control.cursorID, let incomingEpoch = control.epoch,
               let stream = control.stream?.stream else { return false }
+        if let cursorID, id != cursorID { return false }
         if let committedStream, !Self.isNewer(stream, than: committedStream) { return false }
-        if bindings.count >= 3, bindings[stream] == nil { bindings.removeAll() }
-        bindings[stream] = (epoch, control.enabled)
+        if cursorID == id, incomingEpoch == epoch {
+            if bindings.count >= 3, bindings[stream] == nil { bindings.removeAll() }
+            bindings[stream] = (epoch, control.enabled)
+            return true
+        }
+        guard incomingEpoch > epoch else { return false }
+        pendingBindings.removeAll { $0.stream == stream }
+        if pendingBindings.count >= 3 { pendingBindings.removeAll() }
+        pendingBindings.append(PendingBinding(cursorID: id, epoch: incomingEpoch, stream: stream, enabled: control.enabled))
         return true
     }
     @discardableResult
@@ -193,6 +219,7 @@ public struct CursorPresentationState {
         committedStream = stream
         enabled = binding.enabled
         bindings = bindings.filter { Self.isNewer($0.key, than: stream) }
+        pendingBindings.removeAll { !Self.isNewer($0.stream, than: stream) }
         return true
     }
     @discardableResult

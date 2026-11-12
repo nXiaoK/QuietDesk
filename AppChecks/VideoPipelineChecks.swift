@@ -843,6 +843,21 @@ private struct VideoPipelineChecks {
                         "Static cursor fallback completed the same request twice")
         }
 
+        run("Single-pass independent cursor startup initializes CursorCaptureGate with includesCursor=false") {
+            var gate = CursorCaptureGate(included: false)
+            let initial = try cursorSample(CMTime(value: 1, timescale: 60))
+            try require(!gate.included && !gate.needsFreshFrame && gate.observe(initial, displayTime: 100).retain,
+                        "Initial independent-cursor gate reverted to included=true or blocked initial frames")
+            let disableIndependent = gate.request(included: true)
+            try require(gate.included && gate.needsFreshFrame && gate.requestID == disableIndependent,
+                        "Turning off independent cursor after single-pass startup was ignored")
+            try require(gate.arm(id: disableIndependent, afterDisplayTime: 110, width: 64, height: 64),
+                        "Follow-up cursor toggle could not arm")
+            let restored = try cursorSample(CMTime(value: 2, timescale: 60))
+            try require(gate.observe(restored, displayTime: 111).completed == disableIndependent && gate.included,
+                        "Follow-up cursor toggle did not complete cleanly")
+        }
+
         run("Fresh encoders produce real IDR frames when replaying the same retained pixel buffer") {
             var pixelBuffer: CVPixelBuffer?
             let status = CVPixelBufferCreate(nil, 64, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nil, &pixelBuffer)

@@ -1586,11 +1586,11 @@ final class DeskModel: ObservableObject {
                         }
                         let remoteTrafficAddress = (try? TrafficEndpoint(remoteEndpoint: connection.endpoint, listeningPort: listeningPort))?.address
                         let initialSettingsGrace: Duration = if host.usesRelayControl {
-                            .milliseconds(600)
+                            .milliseconds(750)
                         } else if let remoteTrafficAddress, !MediaQualityPolicy.isLikelyLocalHost(remoteTrafficAddress) {
-                            .milliseconds(350)
+                            .milliseconds(450)
                         } else {
-                            .milliseconds(100)
+                            .milliseconds(250)
                         }
                         let negotiatedInitial = await host.awaitInitialSettings(grace: initialSettingsGrace)
                         defer {
@@ -2874,9 +2874,11 @@ final class DeskModel: ObservableObject {
                 let requested = viewerSession.cursorRequestedEnabled
                 viewerSession.cursorRequestID = nil
                 viewerSession.cursorTimeout?.cancel()
-                canvas.receiveCursorStatus(control)
-                cursorStatus = control.reason == .unavailable ? "切换失败，保持原光标模式"
-                    : control.reason == .waitingForResume ? "恢复画面后启用光标模式" : "正在切换光标…"
+                let committedImmediately = canvas.receiveCursorStatus(control)
+                if !committedImmediately || control.reason != nil {
+                    cursorStatus = control.reason == .unavailable ? "切换失败，保持原光标模式"
+                        : control.reason == .waitingForResume ? "恢复画面后启用光标模式" : "正在切换光标…"
+                }
                 if requested != lowLatencyCursorEnabled { sendCursorRequest() }
             } else if control.operation == .binding { canvas.receiveCursorBinding(control) }
             else { throw DeskError.invalid("光标控制方向无效") }

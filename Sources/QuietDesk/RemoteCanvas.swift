@@ -483,6 +483,7 @@ final class RemoteCanvas: NSView {
     private let remoteCursorView = CursorOverlayView()
     private var localPointerInside = false
     private var cursorPublished: (Bool, Bool)?
+    private var lastInvalidatedCursorRect: NSRect = .null
     var onCursorPresentation: ((Bool, Bool) -> Void)?
     var pointerInputSuspended = false {
         didSet {
@@ -653,6 +654,11 @@ final class RemoteCanvas: NSView {
         if videoLayer.status == .failed || displayedFrame == nil || mailbox.hasPendingFrame {
             showLatestFrame()
         }
+        let currentPictureRect = pictureRect
+        if currentPictureRect != lastInvalidatedCursorRect {
+            lastInvalidatedCursorRect = currentPictureRect
+            window?.invalidateCursorRects(for: self)
+        }
         updateCursorPresentation()
     }
 
@@ -794,6 +800,9 @@ final class RemoteCanvas: NSView {
         onFullScreen?(window.styleMask.contains(.fullScreen))
         reconcileSystemShortcutCapture()
         reconcileRelativeMouseCapture()
+        lastInvalidatedCursorRect = pictureRect
+        window.invalidateCursorRects(for: self)
+        updateCursorPresentation()
     }
 
     override func updateTrackingAreas() {
@@ -812,10 +821,26 @@ final class RemoteCanvas: NSView {
         }
     }
 
-    func receiveCursorStatus(_ control: CursorControl) { if cursorState.status(control) { refreshCursorImage() } }
-    func receiveCursorBinding(_ control: CursorControl) { _ = cursorState.bind(control) }
+    @discardableResult
+    func receiveCursorStatus(_ control: CursorControl) -> Bool {
+        guard cursorState.status(control) else { return false }
+        if commitDisplayedStreamCursorIfReady() { return true }
+        refreshCursorImage()
+        return false
+    }
+    func receiveCursorBinding(_ control: CursorControl) {
+        guard cursorState.bind(control) else { return }
+        _ = commitDisplayedStreamCursorIfReady()
+    }
     func receiveCursorShape(_ shape: CursorShape) { if cursorState.update(shape) { refreshCursorImage() } }
     func receiveCursorPosition(_ position: CursorPosition) { if cursorState.update(position) { updateCursorPresentation() } }
+
+    private func commitDisplayedStreamCursorIfReady() -> Bool {
+        guard displayedFrame != nil, !awaitingDisplay, let displayStream,
+              cursorState.commit(displayStream) else { return false }
+        refreshCursorImage(forcePublish: true)
+        return true
+    }
 
     private func refreshCursorImage(forcePublish: Bool = false) {
         let decoded = cursorState.image.flatMap(CursorBitmap.image)
@@ -1087,7 +1112,7 @@ final class RemoteCanvas: NSView {
         movePacer.setInterval(PointerMovePacer.interval)
         dragPacer.setInterval(PointerMovePacer.interval)
         cursorState = CursorPresentationState(); cursorImage = nil; localCursor = .arrow
-        cursorPublished = nil; localPointerInside = false
+        cursorPublished = nil; localPointerInside = false; lastInvalidatedCursorRect = .null
         refreshCursorImage()
         shortcutSessionActive = false
         releaseControl()

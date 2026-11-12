@@ -273,4 +273,23 @@ func runCursorProtocolChecks() {
         for stream in streams { if state.commit(stream) { retained += 1 } }
         try check((1...3).contains(retained), "Uncommitted cursor bindings were retained without a fixed bound")
     }
+
+    run("Cursor binding arriving ahead of status for initial or newer epoch promotes cleanly on status") {
+        var state = CursorPresentationState()
+        try check(state.bind(binding(first, epoch: 1, enabled: true)) && !state.enabled,
+                  "Pre-status initial binding was dropped or activated prematurely")
+        try check(!state.commit(first), "Pre-status binding committed before status confirmed epoch")
+        try check(state.status(status(epoch: 1, enabled: true)) && !state.enabled,
+                  "Initial status failed after pre-status binding")
+        try check(state.commit(first) && state.enabled,
+                  "Promoted initial binding did not activate independent cursor on commit")
+        try check(state.bind(binding(second, epoch: 2, enabled: false)) && state.enabled,
+                  "Next-epoch binding ahead of status was rejected or changed current mode")
+        try check(!state.bind(binding(second, epoch: 2, enabled: false, id: UUID())),
+                  "Mismatched cursor identity was accepted while buffering next epoch")
+        try check(state.status(status(epoch: 2, enabled: false)) && state.enabled,
+                  "Epoch 2 status failed or changed mode before stream commit")
+        try check(state.commit(second) && !state.enabled,
+                  "Promoted epoch 2 binding did not disable cursor mode on commit")
+    }
 }

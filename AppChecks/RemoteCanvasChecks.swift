@@ -961,6 +961,65 @@ private struct RemoteCanvasChecks {
             try require(CursorBitmap.image(brokenCursor) == nil, "Corrupted cursor PNG unexpectedly decoded")
         }
 
+        run("Initial independent cursor activates when binding arrives after static first frame or before window layout") {
+            final class CursorRectSpyWindow: NSWindow {
+                var invalidatedViews: [ObjectIdentifier] = []
+                override func invalidateCursorRects(for aView: NSView) {
+                    invalidatedViews.append(ObjectIdentifier(aView))
+                    super.invalidateCursorRects(for: aView)
+                }
+            }
+            for statusFirst in [true, false] {
+                let canvas = RemoteCanvas(frame: .zero)
+                canvas.remoteSize = CGSize(width: 400, height: 200)
+                canvas.canControl = true
+                let decoder = CanvasDecoderProbe()
+                let receiver = canvas.makeMediaReceiver(makeDecoder: { _ in decoder })
+                defer { receiver.stop(); canvas.reset() }
+                let stream = MediaStreamID(sessionID: UUID(), transportEpoch: 1, codecEpoch: 1), cursorID = UUID()
+                var flags: (Bool, Bool)?
+                canvas.onCursorPresentation = { flags = ($0, $1) }
+                receiver.receive(try mediaFrame(stream: stream, id: 1, keyFrame: true)) { _ in }
+                decoder.finish(1, .success(try canvasPixel()))
+                try require(receiver.commit(stream: stream), "Initial static stream did not commit")
+                drainCanvasDisplay()
+                try require(canvas.displayedFrame != nil && flags == nil,
+                            "Displayed stream without cursor metadata unexpectedly changed cursor mode")
+                if statusFirst {
+                    let committedOnStatus = canvas.receiveCursorStatus(CursorControl(.status, requestID: UUID(), cursorID: cursorID, epoch: 1, enabled: true))
+                    try require(!committedOnStatus && flags?.0 == false, "Status alone committed without stream binding")
+                    canvas.receiveCursorBinding(CursorControl(.binding, cursorID: cursorID, epoch: 1, enabled: true, stream: stream))
+                } else {
+                    canvas.receiveCursorBinding(CursorControl(.binding, cursorID: cursorID, epoch: 1, enabled: true, stream: stream))
+                    try require(flags == nil, "Binding before status activated cursor mode prematurely")
+                    let committedOnStatus = canvas.receiveCursorStatus(CursorControl(.status, requestID: UUID(), cursorID: cursorID, epoch: 1, enabled: true))
+                    try require(committedOnStatus, "Status after binding on already-displayed stream did not report immediate commit")
+                }
+                canvas.receiveCursorShape(try CursorShape(cursorID: cursorID, epoch: 1, revision: 1, image: canvasCursorImage(canvasCursorPNG())))
+                canvas.receiveCursorPosition(try CursorPosition(cursorID: cursorID, epoch: 1, sequence: 1, insideDisplay: true, x: 0.25, y: 0.25))
+                try require(flags?.0 == true && flags?.1 == true,
+                            "Static first frame did not activate immediate cursor once status+binding arrived: \(String(describing: flags))")
+                let window = CursorRectSpyWindow(contentRect: .zero,
+                                                 styleMask: .borderless, backing: .buffered, defer: false)
+                window.isReleasedWhenClosed = false
+                defer { window.close() }
+                window.contentView = canvas
+                let invalidationsOnAttach = window.invalidatedViews.filter { $0 == ObjectIdentifier(canvas) }.count
+                try require(invalidationsOnAttach >= 1, "Attaching RemoteCanvas to window did not invalidate cursor rects")
+                window.setContentSize(NSSize(width: 400, height: 300))
+                canvas.frame = NSRect(x: 0, y: 0, width: 400, height: 300)
+                canvas.layoutSubtreeIfNeeded()
+                let invalidationsAfterLayout = window.invalidatedViews.filter { $0 == ObjectIdentifier(canvas) }.count
+                try require(invalidationsAfterLayout > invalidationsOnAttach,
+                            "Non-zero layout after 0x0 initial commit did not re-invalidate cursor rects")
+                guard let overlay = canvas.subviews.first(where: { !$0.isHidden }) else {
+                    throw CanvasCheckFailure("Remote cursor overlay did not become visible after delayed window layout")
+                }
+                try require(overlay.frame == NSRect(x: 99, y: 98, width: 8, height: 6),
+                            "Delayed layout did not place cursor overlay in pictureRect: \(overlay.frame)")
+            }
+        }
+
         run("Native mouse moves use a monotonic pacing timer and retain the final position with identical event timestamps") {
             let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
             canvas.remoteSize = CGSize(width: 400, height: 300); canvas.canControl = true

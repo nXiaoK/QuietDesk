@@ -287,7 +287,7 @@ struct VideoPresentationTimeline {
 
 // displayTime is in mach absolute ticks; PTS is compared only with other SCK sample timestamps.
 struct CursorCaptureGate {
-    private(set) var included = true
+    private(set) var included: Bool
     private(set) var needsFreshFrame = false
     private(set) var requestID: UUID?
     private(set) var configurationApplied = false
@@ -295,6 +295,10 @@ struct CursorCaptureGate {
     private var minimumPresentationTime: CMTime?
     private var minimumDisplayTime: UInt64?
     private var expectedDimensions: (Int, Int)?
+
+    init(included: Bool = true) {
+        self.included = included
+    }
 
     @discardableResult
     mutating func request(included: Bool, id: UUID = UUID()) -> UUID {
@@ -740,7 +744,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             currentSettings = settings
             self.capturesAudio = capturesAudio
             self.audioOutputAttached = capturesAudio
-            cursorGate = CursorCaptureGate()
+            cursorGate = CursorCaptureGate(included: includesCursor)
             appliedCursorIncluded = includesCursor
             lastConfirmedCursorIncluded = includesCursor
             running = true

@@ -35,7 +35,7 @@ struct SessionControlPresentation: Equatable {
 }
 
 enum SessionToolAction: CaseIterable {
-    case releaseControl, fullScreen, sendText, receiveText, captureFrame, desktop, keyboard, privacy, traffic, endSession
+    case releaseControl, fullScreen, sendText, receiveText, captureFrame, keyboard, privacy, traffic, endSession
 
     func title(fullScreen: Bool = false, hasSession: Bool = true) -> String {
         switch self {
@@ -44,7 +44,6 @@ enum SessionToolAction: CaseIterable {
         case .sendText: return "发送文字"
         case .receiveText: return "获取文字"
         case .captureFrame: return "截取远端画面"
-        case .desktop: return "远端桌面"
         case .keyboard: return "键盘与快捷键"
         case .privacy: return "被控端隐私与安全"
         case .traffic: return "设备历史流量"
@@ -59,7 +58,6 @@ enum SessionToolAction: CaseIterable {
         case .sendText: return "doc.badge.arrow.up"
         case .receiveText: return "arrow.down.doc"
         case .captureFrame: return "camera.viewfinder"
-        case .desktop: return "rectangle.3.group"
         case .keyboard: return "keyboard"
         case .privacy: return "lock.shield"
         case .traffic: return "chart.bar.xaxis"
@@ -83,7 +81,6 @@ enum SessionToolAction: CaseIterable {
         case .sendText: return "发送本机剪贴板文字"
         case .receiveText: return "获取远端剪贴板文字"
         case .captureFrame: return "把当前远端画面复制到剪贴板（⌃⌘S），防窥遮罩不会出现在截图里"
-        case .desktop: return "调度中心与上一／下一空间；不可用原因和发送结果在面板内显示"
         case .keyboard: return "系统快捷键、Caps Lock 转发与本机权限的实际生效状态"
         case .privacy: return "被控端防窥、静音、亮度与断开锁屏设置"
         case .traffic: return "查看本机保存的设备历史流量"
@@ -131,12 +128,11 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
     let close: () -> Void
     @State private var page = Page.main
 
-    private enum Page { case main, keyboard, desktop }
+    private enum Page { case main, keyboard }
     private var title: String {
         switch page {
         case .main: return presentation.remoteName.isEmpty ? "控制与设置" : presentation.remoteName
         case .keyboard: return SessionToolAction.keyboard.title()
-        case .desktop: return SessionToolAction.desktop.title()
         }
     }
 
@@ -166,7 +162,6 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
                 VStack(alignment: .leading, spacing: 12) {
                     switch page {
                     case .keyboard: keyboard
-                    case .desktop: desktop
                     case .main:
                         HStack(spacing: 8) {
                             shortcutButton(.releaseControl)
@@ -177,8 +172,8 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
                             compactButton(.receiveText)
                             compactButton(.captureFrame)
                         }
+                        desktop
                         VStack(spacing: 0) {
-                            navigationButton(.desktop)
                             navigationButton(.keyboard, detail: presentation.keyboardSummary)
                         }
                         Divider()
@@ -210,7 +205,6 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
     private func activate(_ action: SessionToolAction) {
         guard presentation.isEnabled(action) else { return }
         perform(action)
-        if action == .desktop { page = .desktop }
         if action == .keyboard { page = .keyboard }
     }
 

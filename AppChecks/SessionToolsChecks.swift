@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import SwiftUI
 
 private struct ToolsCheckFailure: Error, CustomStringConvertible {
     let description: String
@@ -70,7 +72,7 @@ private struct SessionToolsChecks {
                         "Wake reconnect was mislabeled as disconnected when input waits for a fresh frame")
         }
         run("Both surfaces use the same action set, labels and existing shortcuts") {
-            try require(SessionToolAction.allCases.count == 10, "Action inventory changed")
+            try require(SessionToolAction.allCases.count == 9, "Action inventory changed")
             for action in SessionToolAction.allCases where action != .fullScreen {
                 try require(action.title(fullScreen: false) == action.title(fullScreen: true), "Window and full-screen names differ")
                 try require(!action.symbol().isEmpty && !action.help.isEmpty, "Missing accessible action description")
@@ -107,11 +109,45 @@ private struct SessionToolsChecks {
                 try require(viewing.isEnabled(action), "Viewing permission incorrectly disabled existing non-input tools")
             }
         }
-        run("Local release, keyboard, desktop explanation and settings stay reachable during reconnect") {
+        run("Local release, keyboard and settings stay reachable during reconnect") {
             let reconnecting = tools(connected: false, reconnecting: true, control: control(reconnecting: true))
-            for action in [SessionToolAction.releaseControl, .keyboard, .desktop, .privacy, .traffic, .fullScreen, .endSession] {
+            for action in [SessionToolAction.releaseControl, .keyboard, .privacy, .traffic, .fullScreen, .endSession] {
                 try require(reconnecting.isEnabled(action), "Local recovery tool unavailable")
             }
+        }
+        run("Remote desktop actions render inline on the main page without requiring subpage navigation") {
+            final class DesktopMountProbe: NSView {
+                var mountedInWindow = false
+                override func viewDidMoveToWindow() {
+                    super.viewDidMoveToWindow()
+                    if window != nil { mountedInWindow = true }
+                }
+            }
+            struct InlineDesktopFixture: NSViewRepresentable {
+                let probe: DesktopMountProbe
+                func makeNSView(context: Context) -> DesktopMountProbe { probe }
+                func updateNSView(_ nsView: DesktopMountProbe, context: Context) {}
+            }
+            let mounted = MainActor.assumeIsolated {
+                let probe = DesktopMountProbe(frame: NSRect(x: 0, y: 0, width: 120, height: 32))
+                let view = SessionToolsView(
+                    presentation: tools(fullScreen: true),
+                    settings: Text("Synthetic settings"),
+                    keyboard: Text("Synthetic keyboard"),
+                    desktop: InlineDesktopFixture(probe: probe),
+                    perform: { _ in },
+                    close: {}
+                )
+                let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 340, height: 560),
+                                      styleMask: .borderless, backing: .buffered, defer: false)
+                window.isReleasedWhenClosed = false
+                defer { window.close() }
+                let hosting = NSHostingView(rootView: view)
+                window.contentView = hosting
+                hosting.layoutSubtreeIfNeeded()
+                return probe.mountedInWindow
+            }
+            try require(mounted, "Desktop actions were hidden behind a subpage instead of inline on main")
         }
         run("Return is unavailable in an idle window and remains available in disconnected full screen") {
             try require(!tools(connected: false, hasSession: false).isEnabled(.endSession), "Idle window disconnect is active")

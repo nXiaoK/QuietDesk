@@ -440,8 +440,8 @@ struct DeskView: View {
                         .padding(.horizontal, 14).padding(.vertical, 8)
                         .background(.black.opacity(0.72), in: Capsule())
                 }
-                // Full screen shows this in the 桌面 panel; the window toolbar icons have nowhere else to show it.
-                if !immersive, let notice = model.desktopActionNotice {
+                // While 控制与设置 is open, its inline desktop row shows the status; otherwise show a top notice.
+                if !(immersive ? showFullScreenMenu : showOptions), let notice = model.desktopActionNotice {
                     Label(notice, systemImage: "exclamationmark.triangle")
                         .font(.callout).foregroundStyle(.white)
                         .padding(.horizontal, 14).padding(.vertical, 8)
@@ -515,9 +515,8 @@ struct DeskView: View {
     /// One click sends the action; the reason it is unavailable replaces the tooltip.
     private func desktopActionButton(_ action: RemoteDesktopAction) -> some View {
         let reason = model.desktopActionUnavailableReason
-        let help = model.sessionEffects.privacy ? action.toolbarHelp + "\n黑屏遮罩不保证覆盖调度中心和空间切换动画。" : action.toolbarHelp
         return Button { model.sendDesktopAction(action) } label: { Label(action.title, systemImage: action.toolbarSymbol) }
-            .help(reason ?? help)
+            .help(action.helpText(unavailableReason: reason, privacyEnabled: model.sessionEffects.privacy))
             .disabled(reason != nil)
     }
 

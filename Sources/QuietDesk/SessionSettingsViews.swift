@@ -283,7 +283,10 @@ struct SessionControlsView: View {
             keyboard: CapsLockDetails(model: model, compact: true),
             desktop: RemoteDesktopActionsView(unavailableReason: model.desktopActionUnavailableReason,
                 status: model.desktopActionStatus, privacyEnabled: model.sessionEffects.privacy,
-                perform: model.sendDesktopAction),
+                perform: { action in
+                    model.canvas.releaseControl()
+                    model.sendDesktopAction(action)
+                }),
             perform: perform, close: close)
         .onChange(of: model.active) { _, active in if !active { close() } }
     }
@@ -291,7 +294,7 @@ struct SessionControlsView: View {
     private func perform(_ action: SessionToolAction) {
         presentation.perform(action, releaseControl: { model.canvas.releaseControl() }) {
             switch action {
-            case .releaseControl, .desktop: break
+            case .releaseControl: break
             case .fullScreen: close(); model.toggleFullScreen()
             case .sendText: model.pushClipboard()
             case .receiveText: model.pullClipboard()

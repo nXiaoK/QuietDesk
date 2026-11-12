@@ -2,6 +2,8 @@ import SwiftUI
 import QuietDeskCore
 
 extension RemoteDesktopAction {
+    static let inlineOrder: [RemoteDesktopAction] = [.previousSpace, .missionControl, .nextSpace]
+
     var title: String {
         switch self {
         case .previousSpace: return "上一空间"
@@ -10,7 +12,15 @@ extension RemoteDesktopAction {
         }
     }
 
-    /// The window toolbar shows each action as its own icon; Mission Control keeps the panel's icon.
+    var compactTitle: String {
+        switch self {
+        case .previousSpace: return "上一空间"
+        case .missionControl: return "调度中心"
+        case .nextSpace: return "下一空间"
+        }
+    }
+
+    /// Shown in the window toolbar and the inline session tools row.
     var toolbarSymbol: String {
         switch self {
         case .previousSpace: return "arrow.left.square"
@@ -26,6 +36,11 @@ extension RemoteDesktopAction {
         case .missionControl: return "在远端打开调度中心，再点按画面选择桌面（远端默认 ⌃↑）"
         }
     }
+
+    func helpText(unavailableReason: String?, privacyEnabled: Bool) -> String {
+        if let unavailableReason { return unavailableReason }
+        return privacyEnabled ? toolbarHelp + "\n黑屏遮罩不保证覆盖调度中心和空间切换动画。" : toolbarHelp
+    }
 }
 
 struct RemoteDesktopActionsView: View {
@@ -34,31 +49,42 @@ struct RemoteDesktopActionsView: View {
     let privacyEnabled: Bool
     let perform: (RemoteDesktopAction) -> Void
 
+    static func detailText(unavailableReason: String?, status: String, privacyEnabled: Bool) -> String? {
+        var lines: [String] = []
+        if let unavailableReason {
+            lines.append(unavailableReason)
+        } else if !status.isEmpty {
+            lines.append(status)
+        }
+        if privacyEnabled {
+            lines.append("黑屏遮罩不保证覆盖调度中心和空间切换动画。")
+        }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Label("远端桌面", systemImage: "rectangle.3.group").font(.headline)
-            HStack(spacing: 8) {
-                Button { perform(.previousSpace) } label: {
-                    Label("上一空间", systemImage: "chevron.left").frame(maxWidth: .infinity)
-                }
-                Button { perform(.nextSpace) } label: {
-                    Label("下一空间", systemImage: "chevron.right").frame(maxWidth: .infinity)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                ForEach(RemoteDesktopAction.inlineOrder, id: \.self) { action in
+                    Button { perform(action) } label: {
+                        VStack(spacing: 4) {
+                            Image(systemName: action.toolbarSymbol)
+                            Text(action.compactTitle).font(.system(size: 10))
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 32)
+                    }
+                    .help(action.helpText(unavailableReason: unavailableReason, privacyEnabled: privacyEnabled))
                 }
             }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
             .disabled(unavailableReason != nil)
-            Button { perform(.missionControl) } label: {
-                Label("调度中心，选择桌面…", systemImage: "rectangle.3.group").frame(maxWidth: .infinity)
-            }
-            .disabled(unavailableReason != nil)
-            Text(unavailableReason ?? (status.isEmpty ? "在远端调度中心点击要使用的桌面；上一／下一空间也会经过全屏应用。" : status))
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            Text("使用远端默认快捷键 ⌃←、⌃→、⌃↑；若被修改或关闭，请在被控 Mac 的系统设置中核对。多屏时作用于远端当前活动屏幕。")
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            if privacyEnabled {
-                Text("黑屏遮罩不保证覆盖调度中心和空间切换动画。")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let detail = Self.detailText(unavailableReason: unavailableReason, status: status, privacyEnabled: privacyEnabled) {
+                Text(detail)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .buttonStyle(.bordered).controlSize(.small)
     }
 }

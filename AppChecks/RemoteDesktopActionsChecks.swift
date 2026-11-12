@@ -232,6 +232,26 @@ private struct RemoteDesktopActionsChecks {
                         "Cancellation during Control press sent an arrow or left Control held")
         }
 
+        await run("Inline desktop actions expose one-click spatial order, compact labels and concise status") {
+            try require(RemoteDesktopAction.inlineOrder == [.previousSpace, .missionControl, .nextSpace],
+                        "Inline desktop button order changed")
+            try require(RemoteDesktopAction.previousSpace.compactTitle == "上一空间"
+                        && RemoteDesktopAction.missionControl.compactTitle == "调度中心"
+                        && RemoteDesktopAction.nextSpace.compactTitle == "下一空间",
+                        "Inline desktop compact labels changed")
+            try require(RemoteDesktopActionsView.detailText(unavailableReason: nil, status: "", privacyEnabled: false) == nil,
+                        "Ready inline desktop row added unnecessary static text")
+            try require(RemoteDesktopActionsView.detailText(unavailableReason: "当前仅观看，需被控端辅助功能权限生效",
+                                                            status: "旧状态", privacyEnabled: false) == "当前仅观看，需被控端辅助功能权限生效",
+                        "Unavailable reason did not take precedence over stale status")
+            try require(RemoteDesktopActionsView.detailText(unavailableReason: nil, status: "已发送", privacyEnabled: true)
+                        == "已发送\n黑屏遮罩不保证覆盖调度中心和空间切换动画。",
+                        "Privacy curtain warning or action status was omitted")
+            try require(RemoteDesktopAction.missionControl.helpText(unavailableReason: "画面暂停或恢复中，请稍候", privacyEnabled: true)
+                        == "画面暂停或恢复中，请稍候",
+                        "Disabled tooltip did not surface exact unavailable reason")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

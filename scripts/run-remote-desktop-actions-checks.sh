@@ -14,5 +14,6 @@ core_objects=("$build_directory"/QuietDeskCore.build/*.swift.o)
 swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     -module-cache-path "$build_directory/ModuleCache" -I "$build_directory/Modules" \
     "${core_objects[@]}" Sources/QuietDesk/HostScreenUnlocker.swift Sources/QuietDesk/RemoteDesktopActions.swift \
+    Sources/QuietDesk/RemoteDesktopActionsView.swift \
     AppChecks/RemoteDesktopActionsChecks.swift -o "$build_directory/RemoteDesktopActionsChecks"
 "$build_directory/RemoteDesktopActionsChecks"

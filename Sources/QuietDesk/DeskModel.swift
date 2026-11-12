@@ -293,7 +293,8 @@ final class DeskModel: ObservableObject {
     @Published private(set) var unlockPasswordSaved = false
     @Published private(set) var autoUnlockEnabled = false
     private var unlockNoticeTask: Task<Void, Never>?
-    private var supportsSessionPause = false
+    @Published private(set) var supportsSessionPause = false
+    @Published private(set) var disableIdleAutoPause = UserDefaults.standard.bool(forKey: "disableIdleAutoPause")
     @Published private(set) var sessionPaused = false
     @Published private(set) var sessionPauseWorking = false
     @Published private(set) var sessionPauseStatus = ""
@@ -452,6 +453,7 @@ final class DeskModel: ObservableObject {
         trafficHistory = services.trafficHistory
         trafficHistoryStore = services.trafficHistoryStore
         routeBenchmarkStore = services.routeBenchmarkStore
+        idlePolicy = SessionIdlePolicy(now: SessionClock.now, enabled: !disableIdleAutoPause)
         if let data = UserDefaults.standard.data(forKey: "streamSettings"),
            let saved = try? JSONDecoder().decode(StreamSettings.self, from: data),
            (try? saved.validateControlValues()) != nil {
@@ -1803,7 +1805,7 @@ final class DeskModel: ObservableObject {
             relaySelectedForTarget = relay?.strategy == .relay || (relay != nil && address.isEmpty)
             relayFallbackAttempted = false
             relayFallbackCooldown.reset()
-            idlePolicy = SessionIdlePolicy(now: SessionClock.now)
+            idlePolicy = SessionIdlePolicy(now: SessionClock.now, enabled: !disableIdleAutoPause)
             _ = idlePolicy.attentionChanged(now: SessionClock.now, attended: sessionWindowAttended, suppressWake: true)
             pauseTransmission = SessionPauseTransmission()
             wakeInputGate = SessionWakeInputGate()
@@ -4651,6 +4653,18 @@ final class DeskModel: ObservableObject {
         if !enabled, reconnecting { stop(reason: "已关闭自动重连") }
     }
 
+    func setDisableIdleAutoPause(_ disabled: Bool) {
+        guard disableIdleAutoPause != disabled else { return }
+        disableIdleAutoPause = disabled
+        UserDefaults.standard.set(disabled, forKey: "disableIdleAutoPause")
+        sibling?.setDisableIdleAutoPause(disabled)
+        let resumed = idlePolicy.setEnabled(activeRouteBenchmarkOverride == nil && !disabled, now: SessionClock.now)
+        if mode == .viewer, disabled,
+           resumed || pauseTransmission.desiredPaused || reconnectDeferredForIdle {
+            resumeIdleTransmission()
+        }
+    }
+
     func setLoginEnabled(_ enabled: Bool) {
         do { try LaunchSettings.setEnabled(enabled) }
         catch { self.error = error.localizedDescription }
@@ -5082,7 +5096,7 @@ final class DeskModel: ObservableObject {
         } else { report = nil }
         if peer != nil { DiagnosticLog.shared.record(.connectionClosed, role: diagnosticRole, state: .cancelled) }
         if mode == .host, active || working { DiagnosticLog.shared.record(.hostStopped, role: .host, state: .cancelled) }
-        idlePolicy = SessionIdlePolicy(now: SessionClock.now)
+        idlePolicy = SessionIdlePolicy(now: SessionClock.now, enabled: !disableIdleAutoPause)
         pauseTransmission = SessionPauseTransmission()
         wakeInputGate = SessionWakeInputGate()
         reconnectDeferredForIdle = false
@@ -5391,7 +5405,7 @@ final class DeskModel: ObservableObject {
         target = attemptTarget
         relayFallbackAttempted = false
         relayFallbackCooldown.reset()
-        idlePolicy = SessionIdlePolicy(now: SessionClock.now)
+        idlePolicy = SessionIdlePolicy(now: SessionClock.now, enabled: false)
         _ = idlePolicy.attentionChanged(now: SessionClock.now, attended: true, suppressWake: true)
         pauseTransmission = SessionPauseTransmission()
         wakeInputGate = SessionWakeInputGate()

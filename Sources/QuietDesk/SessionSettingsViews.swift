@@ -181,6 +181,19 @@ private struct ConnectionOptionsSections: View {
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 if model.relayEnabled { RelayPeerAssistPicker(model: model) }
                 Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
+                Toggle(isOn: Binding(get: { model.disableIdleAutoPause }, set: { model.setDisableIdleAutoPause($0) })) {
+                    Text(IdleAutoPausePresentation.toggleTitle).frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .help(IdleAutoPausePresentation.toggleHelp)
+                Text(IdleAutoPausePresentation(
+                    disableAutoPause: model.disableIdleAutoPause,
+                    connected: model.connected,
+                    reconnecting: model.reconnecting,
+                    supportsSessionPause: model.supportsSessionPause,
+                    sessionPaused: model.sessionPaused,
+                    sessionPauseStatus: model.sessionPauseStatus
+                ).summary)
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 Toggle("连接诊断", isOn: $model.connectionDiagnosticsEnabled)
                     .disabled(model.isControllingAnotherMac)
                 Text("连接前开启，结束后自动显示整段会话的线路、延迟、UDP 丢包、帧率和吞吐量。报告仅在本机内存中保留。")

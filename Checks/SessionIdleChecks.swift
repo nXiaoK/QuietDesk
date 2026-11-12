@@ -156,4 +156,72 @@ func runSessionIdleChecks() {
             _ = try Wire.readJSON(SessionPauseResult.self, Data("{\"id\":\"00000000-0000-0000-0000-000000000000\",\"paused\":1}".utf8))
         }
     }
+    run("Disabling automatic idle pause is off by default and prevents unattended pauses while enabled") {
+        let defaultPolicy = SessionIdlePolicy(now: 0)
+        try check(defaultPolicy.isEnabled && !defaultPolicy.isPaused, "Default idle auto-pause state changed")
+
+        var disabledPolicy = SessionIdlePolicy(now: 0, enabled: false)
+        try check(!disabledPolicy.isEnabled && !disabledPolicy.isPaused, "Initial disabled state was ignored")
+        var now = 0.0
+        while now < 8 * 3_600 {
+            now += 60
+            try check(!disabledPolicy.tick(now: now, attended: false) && !disabledPolicy.isPaused,
+                      "Session paused at \(now) s despite automatic pause being disabled")
+        }
+        try check(!disabledPolicy.attentionChanged(now: now + 1, attended: false) && !disabledPolicy.isPaused,
+                  "Background attention update paused while disabled")
+        try check(!disabledPolicy.attentionChanged(now: now + 2, attended: true) && !disabledPolicy.isPaused,
+                  "Returning while never paused reported a resume")
+    }
+    run("Toggling automatic pause off wakes a paused session once, and turning it back on starts a fresh away window") {
+        var policy = SessionIdlePolicy(now: 0)
+        try check(policy.tick(now: 600, attended: false) && policy.isPaused, "Ten minutes away did not pause")
+        try check(policy.setEnabled(false, now: 605) && !policy.isPaused && !policy.isEnabled,
+                  "Disabling automatic pause failed to wake a paused session")
+        try check(!policy.setEnabled(false, now: 606), "Repeated disable produced a duplicate wake")
+        try check(!policy.tick(now: 3_600, attended: false) && !policy.isPaused,
+                  "Background tick paused while automatic pause was disabled")
+
+        // Re-enabling automatic pause while still away must count ten minutes from now, not prior background time.
+        try check(!policy.setEnabled(true, now: 3_600) && policy.isEnabled && !policy.isPaused,
+                  "Re-enabling automatic pause caused an immediate transition")
+        try check(!policy.tick(now: 4_199.9, attended: false) && !policy.isPaused,
+                  "Session paused before ten minutes after re-enabling automatic pause")
+        try check(policy.tick(now: 4_200, attended: false) && policy.isPaused,
+                  "Session did not pause ten minutes after re-enabling automatic pause")
+    }
+    run("Failed host wake synchronized while auto-pause is disabled can still be retried by user return or activity") {
+        var policy = SessionIdlePolicy(now: 0, enabled: false)
+        policy.synchronize(paused: true, now: 100)
+        try check(policy.isPaused, "Actual host pause state was lost")
+        try check(policy.activity(now: 101, attended: true) && !policy.isPaused,
+                  "Attended activity could not retry resuming while auto-pause was disabled")
+    }
+    run("Idle auto-pause presentation reflects default off switch, active pause, legacy host and disabled mode") {
+        let defaultIdle = IdleAutoPausePresentation(disableAutoPause: false)
+        try check(IdleAutoPausePresentation.toggleTitle == "关闭自动暂停省流模式", "Toggle title changed")
+        try check(defaultIdle.summary.contains("默认开启省流") && defaultIdle.summary.contains("10 分钟"),
+                  "Default summary did not explain active data-saving pause")
+
+        let legacyConnected = IdleAutoPausePresentation(disableAutoPause: false, connected: true, supportsSessionPause: false)
+        try check(legacyConnected.summary.contains("对端版本不支持"), "Legacy host limitation was hidden")
+
+        let pausedConnected = IdleAutoPausePresentation(
+            disableAutoPause: false,
+            connected: true,
+            supportsSessionPause: true,
+            sessionPaused: true,
+            sessionPauseStatus: "空闲暂停 · 加密会话仍保持"
+        )
+        try check(pausedConnected.summary == "空闲暂停 · 加密会话仍保持", "Live pause status was not surfaced")
+
+        let disabledMode = IdleAutoPausePresentation(
+            disableAutoPause: true,
+            connected: true,
+            supportsSessionPause: false,
+            sessionPaused: false
+        )
+        try check(disabledMode.summary.contains("已关闭自动暂停省流"),
+                  "Disabled auto-pause summary did not confirm continuous background streaming")
+    }
 }

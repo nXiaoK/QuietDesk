@@ -429,6 +429,7 @@ final class DeskModel: ObservableObject {
     private let hostStartupDeadline = ConnectionStartupDeadline()
     private var hostStartupPhase = DiagnosticLog.StartupPhase.shareableContent
     private let trafficHistoryStore: TrafficHistoryStore
+    let routeBenchmarkStore: RouteQualityBenchmarkStore
     private var trafficSession: TrafficSession?
     private var effectsCleanupTask: Task<Void, Never>?
     private var effectsCleanupsRunning = 0
@@ -449,6 +450,7 @@ final class DeskModel: ObservableObject {
         self.mode = mode
         trafficHistory = services.trafficHistory
         trafficHistoryStore = services.trafficHistoryStore
+        routeBenchmarkStore = services.routeBenchmarkStore
         if let data = UserDefaults.standard.data(forKey: "streamSettings"),
            let saved = try? JSONDecoder().decode(StreamSettings.self, from: data),
            (try? saved.validateControlValues()) != nil {
@@ -5188,6 +5190,93 @@ final class DeskModel: ObservableObject {
         )
     }
 
+    func buildRouteBenchmarkTargetDescriptor(for record: ConnectionRecord? = nil) -> RouteBenchmarkTargetDescriptor {
+        if let record {
+            let direct = RouteBenchmarkTargetDescriptor.normalizedDirectEndpoint(address: record.address, port: record.port)
+            let fallbackRelay = (selectedConnectionID == record.id)
+                ? UUID(uuidString: targetRelayDeviceID.trimmingCharacters(in: .whitespacesAndNewlines))
+                : nil
+            let relayID = record.relay?.deviceID ?? fallbackRelay
+            let endpoint = ConnectionEntryPresentation.endpoint(record)
+            let trimmedName = record.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let label = trimmedName.isEmpty ? endpoint : "\(trimmedName)（\(endpoint)）"
+            return RouteBenchmarkTargetDescriptor(
+                displayName: label,
+                recordID: record.id,
+                directEndpoint: direct,
+                relayDeviceID: relayID
+            )
+        }
+
+        let cleanAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsedPort = UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 5908
+        let formDirect = RouteBenchmarkTargetDescriptor.normalizedDirectEndpoint(address: cleanAddress, port: parsedPort)
+        let cleanDevice = targetRelayDeviceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let formRelay = UUID(uuidString: cleanDevice)
+
+        let matchedRecord: ConnectionRecord? = {
+            if !cleanAddress.isEmpty,
+               let directMatch = ConnectionStore.matching(connections, address: cleanAddress, port: parsedPort, preferredID: selectedConnectionID) {
+                return directMatch
+            }
+            if let formRelay,
+               let relayMatch = connections.first(where: { $0.relay?.deviceID == formRelay }) {
+                return relayMatch
+            }
+            return nil
+        }()
+
+        let direct = formDirect ?? matchedRecord.flatMap {
+            RouteBenchmarkTargetDescriptor.normalizedDirectEndpoint(address: $0.address, port: $0.port)
+        }
+        let relayID = formRelay ?? matchedRecord?.relay?.deviceID
+
+        let label: String
+        if let matchedRecord {
+            let endpoint = ConnectionEntryPresentation.endpoint(matchedRecord)
+            let trimmedName = matchedRecord.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            label = trimmedName.isEmpty ? endpoint : "\(trimmedName)（\(endpoint)）"
+        } else if !cleanAddress.isEmpty && relayEnabled && !cleanDevice.isEmpty {
+            label = "\(cleanAddress):\(port) ＋ 中继设备 \(cleanDevice.prefix(8))…"
+        } else if !cleanAddress.isEmpty {
+            label = "\(cleanAddress):\(port)"
+        } else if !cleanDevice.isEmpty {
+            label = "中继设备 \(cleanDevice)"
+        } else {
+            label = "当前未填写连接目标"
+        }
+
+        return RouteBenchmarkTargetDescriptor(
+            displayName: label,
+            recordID: matchedRecord?.id,
+            directEndpoint: direct,
+            relayDeviceID: relayID
+        )
+    }
+
+    func resolveConnectionRecordForBenchmarkCandidate(
+        _ candidate: RouteBenchmarkCandidate,
+        preferredRecord: ConnectionRecord? = nil,
+        preferredRecordID: UUID? = nil
+    ) -> ConnectionRecord? {
+        if let preferredRecord {
+            return preferredRecord
+        }
+        if let preferredRecordID,
+           let matched = connections.first(where: { $0.id == preferredRecordID }) {
+            return matched
+        }
+        if let deviceID = candidate.relayDeviceID,
+           let matched = connections.first(where: { $0.relay?.deviceID == deviceID }) {
+            return matched
+        }
+        if !candidate.address.isEmpty,
+           let matched = ConnectionStore.matching(connections, address: candidate.address, port: candidate.port, preferredID: selectedConnectionID) {
+            return matched
+        }
+        return nil
+    }
+
     func resolveRouteBenchmarkPairingKey(for record: ConnectionRecord? = nil) throws -> PairingKey {
         if sibling?.hasIncomingControlConnection == true {
             throw DeskError.invalid("这台 Mac 正在被另一台 Mac 控制；对方断开后才能测试其他 Mac 的线路质量")
@@ -5357,19 +5446,20 @@ final class DeskModel: ObservableObject {
     func connectUsingBenchmarkCandidate(_ candidate: RouteBenchmarkCandidate, record: ConnectionRecord?) {
         setRouteBenchmarkMode(false)
         guard !active, !working else { return }
+        let resolvedRecord = resolveConnectionRecordForBenchmarkCandidate(candidate, preferredRecord: record)
         do {
-            let key = try resolveRouteBenchmarkPairingKey(for: record)
+            let key = try resolveRouteBenchmarkPairingKey(for: resolvedRecord)
             viewerCode = key.code
         } catch {
             connectionError = error.localizedDescription
             return
         }
 
-        if let record {
-            selectedConnectionID = record.id
-            if !record.address.isEmpty {
-                address = record.address
-                port = String(record.port)
+        if let resolvedRecord {
+            selectedConnectionID = resolvedRecord.id
+            if !resolvedRecord.address.isEmpty {
+                address = resolvedRecord.address
+                port = String(resolvedRecord.port)
             }
         }
 

@@ -41,7 +41,7 @@ public struct QualityProbeControl: Codable, Equatable, Sendable {
 }
 
 /// Selectable per-route measurement durations for manual connection & relay route testing.
-public enum RouteBenchmarkDuration: Int, CaseIterable, Identifiable, Sendable {
+public enum RouteBenchmarkDuration: Int, Codable, CaseIterable, Identifiable, Sendable {
     case seconds15 = 15
     case seconds30 = 30
     case seconds60 = 60
@@ -119,7 +119,7 @@ public enum RouteBenchmarkKind: String, Codable, CaseIterable, Hashable, Sendabl
     }
 }
 
-public struct RouteBenchmarkCandidate: Identifiable, Hashable, Sendable {
+public struct RouteBenchmarkCandidate: Codable, Identifiable, Hashable, Sendable {
     public let id: String
     public let kind: RouteBenchmarkKind
     public let address: String
@@ -127,6 +127,10 @@ public struct RouteBenchmarkCandidate: Identifiable, Hashable, Sendable {
     public let relayEndpoint: RelayEndpoint?
     public let relayDeviceID: UUID?
     public let nodeCount: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case kind, address, port, relayEndpoint, relayDeviceID, nodeCount
+    }
 
     public init(kind: RouteBenchmarkKind, address: String = "", port: UInt16 = 5908,
                 relayEndpoint: RelayEndpoint? = nil, relayDeviceID: UUID? = nil, nodeCount: Int = 1) {
@@ -141,6 +145,28 @@ public struct RouteBenchmarkCandidate: Identifiable, Hashable, Sendable {
         } else {
             self.id = "\(kind.rawValue):\(address):\(port)"
         }
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try values.decode(RouteBenchmarkKind.self, forKey: .kind)
+        let address = try values.decodeIfPresent(String.self, forKey: .address) ?? ""
+        let port = try values.decodeIfPresent(UInt16.self, forKey: .port) ?? 5908
+        let relayEndpoint = try values.decodeIfPresent(RelayEndpoint.self, forKey: .relayEndpoint)
+        let relayDeviceID = try values.decodeIfPresent(UUID.self, forKey: .relayDeviceID)
+        let nodeCount = try values.decodeIfPresent(Int.self, forKey: .nodeCount) ?? 1
+        self.init(kind: kind, address: address, port: port,
+                  relayEndpoint: relayEndpoint, relayDeviceID: relayDeviceID, nodeCount: nodeCount)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(kind, forKey: .kind)
+        try values.encode(address, forKey: .address)
+        try values.encode(port, forKey: .port)
+        try values.encodeIfPresent(relayEndpoint, forKey: .relayEndpoint)
+        try values.encodeIfPresent(relayDeviceID, forKey: .relayDeviceID)
+        try values.encode(nodeCount, forKey: .nodeCount)
     }
 
     public var title: String {
@@ -263,7 +289,7 @@ public enum RouteBenchmarkStatus: Equatable, Sendable {
     }
 }
 
-public struct RouteBenchmarkMetrics: Equatable, Sendable {
+public struct RouteBenchmarkMetrics: Codable, Equatable, Sendable {
     public var connectMilliseconds: Double?
     public var firstFrameMilliseconds: Double?
     public var measuredSeconds: Double
@@ -386,8 +412,8 @@ public struct RouteBenchmarkMetrics: Equatable, Sendable {
     }
 }
 
-public struct RouteBenchmarkEvaluation: Equatable, Sendable {
-    public enum Grade: String, Equatable, Sendable {
+public struct RouteBenchmarkEvaluation: Codable, Equatable, Sendable {
+    public enum Grade: String, Codable, Equatable, Sendable {
         case excellent
         case good
         case fair

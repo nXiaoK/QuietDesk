@@ -6,6 +6,7 @@ import Combine
 final class DeskServices {
     let trafficHistoryStore = TrafficHistoryStore()
     let trafficHistory = TrafficHistoryFeed()
+    let routeBenchmarkStore = RouteQualityBenchmarkStore()
 
     init() {
         let feed = trafficHistory

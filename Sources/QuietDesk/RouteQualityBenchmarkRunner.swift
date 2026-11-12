@@ -1,12 +1,36 @@
+import Combine
 import Foundation
 import QuietDeskCore
 
 @MainActor
 final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
+    enum ViewTab: String, CaseIterable, Identifiable {
+        case currentRun
+        case history
+
+        var id: String { rawValue }
+    }
+
+    enum HistoryScope: Hashable {
+        case currentTarget
+        case historicalTarget(RouteBenchmarkTargetDescriptor)
+        case allRecords
+    }
+
+    private struct ActiveRunContext {
+        let id: UUID
+        let startedAt: Date
+        let durationSeconds: Int
+        let target: RouteBenchmarkTargetDescriptor
+    }
+
     let id = UUID()
     let model: DeskModel
+    let store: RouteQualityBenchmarkStore
     let sourceRecord: ConnectionRecord?
 
+    @Published var selectedTab: ViewTab
+    @Published var historyScope: HistoryScope
     @Published var duration: RouteBenchmarkDuration = .seconds30
     @Published var results: [RouteBenchmarkResult]
     @Published private(set) var notes: [String]
@@ -14,40 +38,51 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
     @Published private(set) var activeCandidateID: String?
     @Published private(set) var liveTelemetrySummary = ""
     @Published private(set) var errorMessage: String?
+    @Published private(set) var lastSavedRunID: UUID?
 
     private var runTask: Task<Void, Never>?
+    private var activeRunContext: ActiveRunContext?
     private var skipCurrentRequested = false
     private var stopAllRequested = false
+    private var storeCancellable: AnyCancellable?
 
     init(model: DeskModel, record: ConnectionRecord? = nil) {
         self.model = model
+        self.store = model.routeBenchmarkStore
         self.sourceRecord = record
         let plan = model.buildRouteBenchmarkPlan(for: record)
-        self.results = plan.candidates.map { RouteBenchmarkResult(candidate: $0) }
+        let candidateResults = plan.candidates.map { RouteBenchmarkResult(candidate: $0) }
+        self.results = candidateResults
         self.notes = plan.notes
+
+        let descriptor = model.buildRouteBenchmarkTargetDescriptor(for: record)
+        let archive = model.routeBenchmarkStore.archive
+        if descriptor.hasIdentity {
+            self.historyScope = .currentTarget
+        } else if let latest = archive.distinctTargets().first {
+            self.historyScope = .historicalTarget(latest)
+        } else {
+            self.historyScope = .allRecords
+        }
+
+        if candidateResults.isEmpty && !archive.runs.isEmpty {
+            self.selectedTab = .history
+        } else {
+            self.selectedTab = .currentRun
+        }
+
+        self.storeCancellable = model.routeBenchmarkStore.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+    }
+
+    var currentTargetDescriptor: RouteBenchmarkTargetDescriptor {
+        model.buildRouteBenchmarkTargetDescriptor(for: sourceRecord)
     }
 
     var targetSummary: String {
-        if let record = sourceRecord {
-            let endpoint = ConnectionEntryPresentation.endpoint(record)
-            let trimmed = record.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                return "\(trimmed)（\(endpoint)）"
-            }
-            return endpoint
-        }
-        let cleanAddress = model.address.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanDevice = model.targetRelayDeviceID.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !cleanAddress.isEmpty && model.relayEnabled && !cleanDevice.isEmpty {
-            return "\(cleanAddress):\(model.port) ＋ 中继设备 \(cleanDevice.prefix(8))…"
-        }
-        if !cleanAddress.isEmpty {
-            return "\(cleanAddress):\(model.port)"
-        }
-        if !cleanDevice.isEmpty {
-            return "中继设备 \(cleanDevice)"
-        }
-        return "当前未填写连接目标"
+        currentTargetDescriptor.displayName
     }
 
     var selectedCount: Int {
@@ -74,6 +109,141 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
             }
         }.count
     }
+
+    // MARK: - Historical Records & Cumulative Assessment
+
+    var storageWarningMessage: String? {
+        store.warningMessage
+    }
+
+    var allHistoryRuns: [RouteBenchmarkRunRecord] {
+        store.archive.runs
+    }
+
+    var currentTargetHistoryRuns: [RouteBenchmarkRunRecord] {
+        let descriptor = currentTargetDescriptor
+        guard descriptor.hasIdentity else { return [] }
+        return store.archive.runs(matching: descriptor)
+    }
+
+    var currentTargetAssessment: RouteBenchmarkOverallAssessment? {
+        let descriptor = currentTargetDescriptor
+        guard descriptor.hasIdentity else { return nil }
+        let matching = store.archive.runs(matching: descriptor)
+        return RouteBenchmarkHistoryEvaluator.assess(runs: matching, targetOverride: descriptor)
+    }
+
+    var distinctHistoricalTargets: [RouteBenchmarkTargetDescriptor] {
+        store.archive.distinctTargets()
+    }
+
+    var otherHistoricalTargets: [RouteBenchmarkTargetDescriptor] {
+        let current = store.archive.unifiedTarget(for: currentTargetDescriptor)
+        return distinctHistoricalTargets.filter { target in
+            guard current.hasIdentity else { return true }
+            return !current.matches(target)
+        }
+    }
+
+    var badgeHistoryCount: Int {
+        if currentTargetDescriptor.hasIdentity {
+            let count = currentTargetHistoryRuns.count
+            return count > 0 ? count : allHistoryRuns.count
+        }
+        return allHistoryRuns.count
+    }
+
+    var displayedHistoryRuns: [RouteBenchmarkRunRecord] {
+        switch historyScope {
+        case .currentTarget:
+            if currentTargetDescriptor.hasIdentity {
+                return currentTargetHistoryRuns
+            }
+            return allHistoryRuns
+        case let .historicalTarget(target):
+            return store.archive.runs(matching: target)
+        case .allRecords:
+            return allHistoryRuns
+        }
+    }
+
+    var displayedAssessment: RouteBenchmarkOverallAssessment? {
+        switch historyScope {
+        case .currentTarget:
+            if currentTargetDescriptor.hasIdentity {
+                return currentTargetAssessment
+            }
+            if distinctHistoricalTargets.count <= 1 {
+                return RouteBenchmarkHistoryEvaluator.assess(runs: allHistoryRuns)
+            }
+            return nil
+        case let .historicalTarget(target):
+            let runs = store.archive.runs(matching: target)
+            return RouteBenchmarkHistoryEvaluator.assess(runs: runs, targetOverride: target)
+        case .allRecords:
+            if distinctHistoricalTargets.count <= 1 {
+                return RouteBenchmarkHistoryEvaluator.assess(runs: allHistoryRuns)
+            }
+            return nil
+        }
+    }
+
+    func deleteHistoryRun(_ id: UUID) {
+        store.removeRun(id: id)
+        if lastSavedRunID == id {
+            lastSavedRunID = nil
+        }
+        reconcileHistoryScopeAfterDeletion()
+    }
+
+    func clearDisplayedHistory() {
+        switch historyScope {
+        case .currentTarget:
+            if currentTargetDescriptor.hasIdentity {
+                store.removeRuns(matching: currentTargetDescriptor)
+            } else {
+                store.removeAll()
+            }
+        case let .historicalTarget(target):
+            store.removeRuns(matching: target)
+        case .allRecords:
+            store.removeAll()
+        }
+        lastSavedRunID = nil
+        reconcileHistoryScopeAfterDeletion()
+    }
+
+    func clearAllHistory() {
+        store.removeAll()
+        lastSavedRunID = nil
+        reconcileHistoryScopeAfterDeletion()
+    }
+
+    private func reconcileHistoryScopeAfterDeletion() {
+        if case let .historicalTarget(selected) = historyScope,
+           store.archive.runs(matching: selected).isEmpty {
+            if currentTargetDescriptor.hasIdentity {
+                historyScope = .currentTarget
+            } else if let next = distinctHistoricalTargets.first {
+                historyScope = .historicalTarget(next)
+            } else {
+                historyScope = .allRecords
+            }
+        }
+    }
+
+    func resolveConnectionRecord(
+        for candidate: RouteBenchmarkCandidate,
+        preferredTargetRecordID: UUID? = nil
+    ) -> ConnectionRecord? {
+        model.resolveConnectionRecordForBenchmarkCandidate(
+            candidate,
+            preferredRecord: sourceRecord,
+            preferredRecordID: preferredTargetRecordID
+        )
+    }
+
+    // MARK: - Benchmark Execution
 
     func reloadPlan() {
         guard !isRunning else { return }
@@ -116,6 +286,7 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
     func start() {
         guard !isRunning else { return }
         errorMessage = nil
+        selectedTab = .currentRun
         let selectedIndices = results.indices.filter { results[$0].isSelected }
         guard !selectedIndices.isEmpty else {
             errorMessage = "请至少勾选一条要测试的直连或中继线路"
@@ -140,12 +311,23 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
         }
 
         isRunning = true
+        lastSavedRunID = nil
         skipCurrentRequested = false
         stopAllRequested = false
         liveTelemetrySummary = ""
         let targetDuration = Double(duration.rawValue)
         let probeSeconds = min(QualityProbeControl.maximumDurationSeconds, duration.rawValue + 12)
         let preference = resolvedRecordPreference()
+        let snapshotTarget = currentTargetDescriptor
+        activeRunContext = ActiveRunContext(
+            id: UUID(),
+            startedAt: Date(),
+            durationSeconds: duration.rawValue,
+            target: snapshotTarget
+        )
+        if snapshotTarget.hasIdentity {
+            historyScope = .currentTarget
+        }
 
         runTask = Task { [weak self] in
             guard let self else { return }
@@ -154,7 +336,7 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
 
             for index in selectedIndices {
                 if Task.isCancelled || self.stopAllRequested {
-                    if case .pending = self.results[index].status {
+                    if !self.results[index].status.isTerminal {
                         self.results[index].status = .skipped
                     }
                     continue
@@ -181,6 +363,8 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
                 }
             }
 
+            let stoppedEarly = self.stopAllRequested || Task.isCancelled
+            self.persistActiveRunIfNeeded(stoppedEarly: stoppedEarly)
             self.activeCandidateID = nil
             self.liveTelemetrySummary = ""
             self.isRunning = false
@@ -203,10 +387,35 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
         stopAllRequested = true
         runTask?.cancel()
         runTask = nil
+        persistActiveRunIfNeeded(stoppedEarly: true)
         activeCandidateID = nil
         liveTelemetrySummary = ""
         isRunning = false
         model.setRouteBenchmarkMode(false)
+    }
+
+    private func persistActiveRunIfNeeded(stoppedEarly: Bool) {
+        guard let context = activeRunContext else { return }
+        activeRunContext = nil
+
+        for index in results.indices where !results[index].status.isTerminal {
+            results[index].status = .skipped
+        }
+
+        guard let runRecord = RouteBenchmarkRunRecord.from(
+            id: context.id,
+            startedAt: context.startedAt,
+            finishedAt: Date(),
+            perRouteDurationSeconds: context.durationSeconds,
+            stoppedEarly: stoppedEarly,
+            target: context.target,
+            results: results
+        ) else {
+            return
+        }
+
+        store.record(runRecord)
+        lastSavedRunID = runRecord.id
     }
 
     private func resolvedRecordPreference() -> ConnectionRecord? {

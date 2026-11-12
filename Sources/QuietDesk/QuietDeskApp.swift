@@ -317,7 +317,7 @@ struct DeskView: View {
                         Label("线路测速", systemImage: "speedometer")
                     }
                     .disabled(locked || routeBenchmarkRunner != nil)
-                    .help("手动测试直连与各中继方式的实际帧率、延迟及 UDP 丢包情况")
+                    .help("手动测试直连与各中继方式的实际帧率、延迟及 UDP 丢包情况，并保留历次记录生成历史总质量评估")
                     SharingBadge(host: models.host) { models.selected = .host }.disabled(roleLocked)
                 }
             }

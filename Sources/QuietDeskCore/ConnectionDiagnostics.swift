@@ -4,9 +4,15 @@ import Foundation
 public struct DiagnosticRoute: Hashable, Sendable {
     public enum Control: Hashable, Sendable { case unavailable, direct, relay }
 
-    public enum Media: Hashable, Sendable {
+    public enum Media: String, Codable, Hashable, Sendable {
         case negotiating, reconnecting, paused, udpTrial
         case directCompatibleTCP, relayCompatibleTCP, directTCP, relayTCP, directUDP, relayUDP, punchedUDP
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            let raw = try container.decode(String.self)
+            self = Self(rawValue: raw) ?? .negotiating
+        }
 
         public var isUDP: Bool { self == .directUDP || self == .relayUDP || self == .punchedUDP }
     }

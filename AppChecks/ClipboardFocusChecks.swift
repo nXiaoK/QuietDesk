@@ -2197,6 +2197,230 @@ private struct ClipboardFocusChecks {
             try require(sent.snapshot().isEmpty, "ClipboardSync announced or sent a com.apple.is-remote-clipboard item")
         }
 
+        run("Pre-connection viewer copy pastes immediately on controlled Mac via Cmd+V or right-click without re-copying") { folder in
+            @MainActor
+            func makePreConnectPair(
+                name: String,
+                viewerPB: MemoryPasteboard,
+                hostPB: MemoryPasteboard,
+                viewerAllowed: Bool = true,
+                hostAllowed: Bool = true,
+                controllingAtInit: Bool = false,
+                onDemand: Bool = true
+            ) -> (viewer: ClipboardSync, host: ClipboardSync, viewerMsgs: ChannelSafeBox<[MessageKind]>, hostMsgs: ChannelSafeBox<[MessageKind]>) {
+                let session = UUID()
+                let viewerMsgs = ChannelSafeBox<[MessageKind]>([])
+                let hostMsgs = ChannelSafeBox<[MessageKind]>([])
+                var viewerSync: ClipboardSync!
+                var hostSync: ClipboardSync!
+                viewerSync = ClipboardSync(
+                    session: session,
+                    allowsFileSending: true,
+                    allowsAutomaticSending: viewerAllowed,
+                    allowsChunkWindow: true,
+                    allowsDecoupledFileTransfer: true,
+                    allowsOnDemandClipboard: onDemand,
+                    deferFileOfferUntilPaste: onDemand,
+                    controllingRemote: controllingAtInit,
+                    syncInitialLocalClipboard: true,
+                    pasteboard: viewerPB,
+                    storage: folder.appendingPathComponent("\(name)-viewer"),
+                    convertTIFF: { $0 },
+                    validatePNG: { !$0.isEmpty }
+                ) { msg in
+                    viewerMsgs.append(msg.kind)
+                    DispatchQueue.main.async { hostSync?.receive(msg) }
+                }
+                hostSync = ClipboardSync(
+                    session: session,
+                    allowsFileSending: true,
+                    allowsAutomaticSending: hostAllowed,
+                    allowsChunkWindow: true,
+                    allowsDecoupledFileTransfer: true,
+                    allowsOnDemandClipboard: onDemand,
+                    deferFileOfferUntilPaste: false,
+                    syncInitialLocalClipboard: false,
+                    pasteboard: hostPB,
+                    storage: folder.appendingPathComponent("\(name)-host"),
+                    validatePNG: { !$0.isEmpty }
+                ) { msg in
+                    hostMsgs.append(msg.kind)
+                    DispatchQueue.main.async { viewerSync?.receive(msg) }
+                }
+                return (viewerSync, hostSync, viewerMsgs, hostMsgs)
+            }
+
+            // 1. Text copied before connecting -> right-click Paste on Host works on first try; Host's own old clipboard does not echo.
+            do {
+                let viewerPB = MemoryPasteboard()
+                let hostPB = MemoryPasteboard()
+                viewerPB.copy(.text(Data("pre-connect-right-click".utf8)))
+                hostPB.copy(.text(Data("host-preexisting".utf8)))
+                let p = makePreConnectPair(name: "rc", viewerPB: viewerPB, hostPB: hostPB)
+                defer { p.viewer.stop(); p.host.stop() }
+
+                try eventually("Pre-connection manifest did not reach host") {
+                    hostPB.hasLazyItem && hostPB.lazyKind == .text
+                }
+                try require(p.viewerMsgs.snapshot() == [.clipboardManifest] && p.hostMsgs.snapshot().isEmpty,
+                            "Pre-connection sync sent eager bytes or host echoed its pre-session clipboard")
+                let pasted = hostPB.simulatePaste()
+                guard case .text(let bytes)? = pasted,
+                      String(data: bytes, encoding: .utf8) == "pre-connect-right-click" else {
+                    throw FocusCheckFailure("Right-click paste on host failed to pull viewer's pre-connection text")
+                }
+            }
+
+            // 2. Text copied before connecting -> user already clicked remote canvas at init (controllingAtInit: true) and presses Cmd+V at 0ms.
+            do {
+                let viewerPB = MemoryPasteboard()
+                let hostPB = MemoryPasteboard()
+                viewerPB.copy(.text(Data("pre-connect-cmd-v-immediate".utf8)))
+                let p = makePreConnectPair(
+                    name: "cmdv0",
+                    viewerPB: viewerPB,
+                    hostPB: hostPB,
+                    hostAllowed: false,
+                    controllingAtInit: true
+                )
+                defer { p.viewer.stop(); p.host.stop() }
+
+                try require(p.viewer.holdsPaste, "Viewer did not hold Cmd+V at 0ms for pre-connection copy while controlling")
+                var pasteReady: Bool?
+                p.viewer.prepareForPaste { pasteReady = $0 }
+                try eventually("First Cmd+V did not materialize pre-connection text") { pasteReady == true }
+                try require(hostPB.copiedText == "pre-connect-cmd-v-immediate" && !p.viewer.holdsPaste,
+                            "Host did not receive pre-connection text on first Cmd+V")
+            }
+
+            // 3. Raw TIFF screenshot and Finder file copied before connecting; also verify remote copy invalidation.
+            do {
+                let viewerPB = MemoryPasteboard()
+                let hostPB = MemoryPasteboard()
+                viewerPB.copy(.text(Data()))
+                viewerPB.rawTIFF = Data([0x89, 0x50, 0x4E, 0x47])
+                let p = makePreConnectPair(name: "tiff", viewerPB: viewerPB, hostPB: hostPB)
+                defer { p.viewer.stop(); p.host.stop() }
+
+                try eventually("Pre-connection TIFF manifest did not reach host") {
+                    hostPB.hasLazyItem && hostPB.lazyKind == .png
+                }
+                try require(viewerPB.reads == 0, "Pre-connection TIFF was read/converted before paste")
+                p.host.setAutomaticSendingAllowed(false)
+                p.viewer.setControllingRemote(true)
+                var pngPasteReady: Bool?
+                p.viewer.prepareForPaste { pngPasteReady = $0 }
+                try eventually("First Cmd+V did not convert and send pre-connection TIFF") { pngPasteReady == true }
+                if case .png(let bytes) = hostPB.payload {
+                    try require(bytes == Data([0x89, 0x50, 0x4E, 0x47]), "Pre-connection TIFF bytes mismatched")
+                } else {
+                    throw FocusCheckFailure("Host did not apply pre-connection PNG")
+                }
+            }
+
+            do {
+                let file = folder.appendingPathComponent("pre-connect-file.txt")
+                try Data("hello-file".utf8).write(to: file)
+                let viewerPB = MemoryPasteboard()
+                let hostPB = MemoryPasteboard()
+                viewerPB.copy(.files([file]))
+                let p = makePreConnectPair(name: "file", viewerPB: viewerPB, hostPB: hostPB, hostAllowed: false)
+                defer { p.viewer.stop(); p.host.stop() }
+
+                var offer: ClipboardFileOffer?
+                p.host.onFileOffer = { offer = $0 }
+                try eventually("Pre-connection deferred file manifest was not announced") {
+                    p.viewerMsgs.snapshot() == [.clipboardManifest]
+                }
+                pump(for: 0.2)
+                try require(offer == nil, "Pre-connection file popped an unsolicited confirmation before Cmd+V")
+                p.viewer.setControllingRemote(true)
+                try require(p.viewer.holdsPaste, "Pre-connection file did not hold Cmd+V")
+                var filePaste: Bool?
+                p.viewer.prepareForPaste { filePaste = $0 }
+                try eventually("Cmd+V did not send pre-connection file offer") { offer != nil }
+                try require(filePaste == false, "File paste should await remote approval")
+                p.host.respondToFileOffer(id: offer!.id, accept: true)
+                try eventually("Accepted pre-connection file was not applied") {
+                    if case .files(let urls) = hostPB.payload { return urls.count == 1 }
+                    return false
+                }
+            }
+
+            // 4. Connection finishes while viewer automatic sending is temporarily suspended (inactive / auto-unlock), then resumes; also legacy eager mode.
+            do {
+                let viewerPB = MemoryPasteboard()
+                let hostPB = MemoryPasteboard()
+                viewerPB.copy(.text(Data("pre-connect-suspended".utf8)))
+                let p = makePreConnectPair(
+                    name: "suspended",
+                    viewerPB: viewerPB,
+                    hostPB: hostPB,
+                    viewerAllowed: false,
+                    hostAllowed: false,
+                    controllingAtInit: true
+                )
+                defer { p.viewer.stop(); p.host.stop() }
+                pump(for: 0.35)
+                try require(viewerPB.reads == 0 && p.viewerMsgs.snapshot().isEmpty,
+                            "Suspended viewer read or sent pre-connection clipboard prematurely")
+                p.viewer.setAutomaticSendingAllowed(true)
+                try eventually("Resumed viewer did not announce pre-connection copy") {
+                    hostPB.hasLazyItem && hostPB.lazyKind == .text
+                }
+                var pasteReady: Bool?
+                p.viewer.prepareForPaste { pasteReady = $0 }
+                try eventually("Cmd+V after resume did not paste pre-connection copy") {
+                    pasteReady == true && hostPB.copiedText == "pre-connect-suspended"
+                }
+            }
+
+            do {
+                let viewerPB = MemoryPasteboard()
+                let hostPB = MemoryPasteboard()
+                viewerPB.copy(.text(Data("pre-connect-legacy-peer".utf8)))
+                let p = makePreConnectPair(name: "legacy", viewerPB: viewerPB, hostPB: hostPB, hostAllowed: false, onDemand: false)
+                defer { p.viewer.stop(); p.host.stop() }
+                try eventually("Legacy peer did not receive pre-connection text") {
+                    hostPB.copiedText == "pre-connect-legacy-peer"
+                }
+            }
+
+            // 5. Sensitive pairing code, empty/unsupported pasteboard, or Handoff-relayed item before connecting are silently ignored without error status or blocking remote Cmd+V.
+            for mode in ["sensitive", "empty", "relayed"] {
+                let viewerPB = MemoryPasteboard()
+                let hostPB = MemoryPasteboard()
+                hostPB.copy(.text(Data("remote-native".utf8)))
+                switch mode {
+                case "sensitive":
+                    viewerPB.copy(.text(Data("secret-pairing-code".utf8)))
+                    viewerPB.isSensitive = true
+                case "empty":
+                    viewerPB.copy(.files([]))
+                default:
+                    viewerPB.copy(.text(Data("handoff-before-connect".utf8)))
+                    viewerPB.isRelayedFromOtherDevice = true
+                }
+                var statuses: [String] = []
+                let p = makePreConnectPair(
+                    name: "skip-\(mode)",
+                    viewerPB: viewerPB,
+                    hostPB: hostPB,
+                    hostAllowed: false,
+                    controllingAtInit: true
+                )
+                p.viewer.onStatus = { statuses.append($0) }
+                defer { p.viewer.stop(); p.host.stop() }
+
+                var pastePassThrough: Bool?
+                p.viewer.prepareForPaste { pastePassThrough = $0 }
+                pump(for: 0.35)
+                try require(pastePassThrough == true && !p.viewer.holdsPaste
+                            && viewerPB.reads == 0 && p.viewerMsgs.snapshot().isEmpty && statuses.isEmpty,
+                            "Pre-connection \(mode) clipboard emitted error status, read payload, or blocked remote Cmd+V")
+            }
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

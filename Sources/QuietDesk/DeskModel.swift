@@ -1811,6 +1811,7 @@ final class DeskModel: ObservableObject {
             wakeInputGate = SessionWakeInputGate()
             reconnectDeferredForIdle = false
             freshFrameRequiredOnReconnect = false
+            clipboardHandledChange = nil
             let saved = preference?.videoSettings
             viewerQualityPolicy = ViewerQualityPolicy(preferred: saved.flatMap { (try? $0.validateControlValues()) != nil ? $0 : nil })
             savedChromaPreference = preference?.chromaSubsampling
@@ -4561,7 +4562,8 @@ final class DeskModel: ObservableObject {
                 allowsDecoupledFileTransfer: remoteDecoupledFileTransfer,
                 allowsOnDemandClipboard: remoteOnDemandClipboard,
                 deferFileOfferUntilPaste: remoteOnDemandClipboard && mode == .viewer,
-                controllingRemote: clipboardControlsRemote, handledChange: clipboardHandledChange) { [weak peer, weak channel] message in
+                controllingRemote: clipboardControlsRemote, handledChange: clipboardHandledChange,
+                syncInitialLocalClipboard: mode == .viewer && clipboardHandledChange == nil) { [weak peer, weak channel] message in
                     if let channel { channel.sendReliableData(message) }
                     else { peer?.send(message) }
                 }

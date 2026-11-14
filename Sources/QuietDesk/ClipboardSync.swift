@@ -308,6 +308,7 @@ final class ClipboardSync {
     nonisolated let receiveMessage: @Sendable (Message) -> Void
     private var timer: Timer?
     private var observedChange: Int
+    private var initialSeedChange: Int?
     // A copy made before taking control may still be waiting for activation or session resume.
     private var pendingLocalChange: Int?
     private var pendingFileOffer: (id: UUID, change: Int, explicitDrop: Bool)?
@@ -333,7 +334,8 @@ final class ClipboardSync {
     init(session: UUID, allowsFileSending: Bool, allowsAutomaticSending: Bool = true, allowsChunkWindow: Bool = false,
          allowsDecoupledFileTransfer: Bool = false, allowsOnDemandClipboard: Bool = false,
          deferFileOfferUntilPaste: Bool = false,
-         controllingRemote: Bool = false, handledChange: Int? = nil, pasteboard: ClipboardPasteboard? = nil, storage: URL? = nil,
+         controllingRemote: Bool = false, handledChange: Int? = nil, syncInitialLocalClipboard: Bool = false,
+         pasteboard: ClipboardPasteboard? = nil, storage: URL? = nil,
          convertTIFF: @escaping (Data) -> Data? = { data in
              autoreleasepool { NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) }
          },
@@ -351,7 +353,20 @@ final class ClipboardSync {
         self.validatePNG = resolvedValidatePNG
         let pasteboard = pasteboard ?? SystemClipboardPasteboard()
         self.pasteboard = pasteboard
-        observedChange = handledChange ?? pasteboard.changeCount
+        let currentChange = pasteboard.changeCount
+        if let handledChange {
+            observedChange = handledChange
+            initialSeedChange = nil
+        } else if syncInitialLocalClipboard, !pasteboard.isRelayedFromOtherDevice {
+            observedChange = currentChange &- 1
+            initialSeedChange = currentChange
+        } else {
+            observedChange = currentChange
+            initialSeedChange = nil
+        }
+        if controllingRemote, observedChange != currentChange, !pasteboard.isRelayedFromOtherDevice {
+            pendingLocalChange = currentChange
+        }
         let transfer = ClipboardTransfer(storage: storage ?? Self.storageURL, requireFileApproval: true,
                                          allowsChunkWindow: allowsChunkWindow,
                                          allowsDecoupledFileTransfer: allowsDecoupledFileTransfer,
@@ -503,6 +518,11 @@ final class ClipboardSync {
             MainActor.assumeIsolated { self?.poll() }
         }
         if let timer { RunLoop.main.add(timer, forMode: .common) }
+        if observedChange != currentChange {
+            DispatchQueue.main.async { [weak self] in
+                self?.poll()
+            }
+        }
     }
 
     func receive(_ message: Message) { receiveMessage(message) }
@@ -629,6 +649,15 @@ final class ClipboardSync {
 
     func prepareForPaste(_ completion: @escaping (Bool) -> Void) {
         guard running, allowsAutomaticSending else { completion(false); return }
+        let currentChange = pasteboard.changeCount
+        if initialSeedChange == currentChange,
+           (pasteboard.isRelayedFromOtherDevice || pasteboard.isSensitive || pasteboard.inspectCurrentKind() == nil) {
+            initialSeedChange = nil
+            pendingLocalChange = nil
+            if currentChange != deferredLocalChange { observedChange = currentChange }
+            completion(controllingRemote)
+            return
+        }
         if controllingRemote {
             skipChangesWhileControlling()
             if pendingLocalChange != nil, pasteboard.isRelayedFromOtherDevice {
@@ -703,6 +732,7 @@ final class ClipboardSync {
         receivingFileChange = nil
         receivedFilesKeptLocally = false
         onFileReceptionChanged?(nil)
+        initialSeedChange = nil
         pendingLocalChange = nil
         localOnDemandCopy = nil
         trackedRemoteManifest = nil
@@ -732,6 +762,7 @@ final class ClipboardSync {
 
     private func skipChangesWhileControlling() {
         let change = pasteboard.changeCount
+        if initialSeedChange != nil, initialSeedChange != change { initialSeedChange = nil }
         if pendingLocalChange != change { pendingLocalChange = nil }
         if localOnDemandCopy != nil, localOnDemandCopy?.change != change {
             localOnDemandCopy = nil
@@ -766,6 +797,8 @@ final class ClipboardSync {
             if change != deferredLocalChange { pendingLocalChange = change }
             return
         }
+        let isInitialSeed = (initialSeedChange == change)
+        initialSeedChange = nil
         if pasteboard.isRelayedFromOtherDevice {
             if trackedRemoteManifest != nil {
                 trackedRemoteManifest?.change = change
@@ -780,7 +813,7 @@ final class ClipboardSync {
             cancelImageApplication()
             localOnDemandCopy = nil
             sourceGate.clear()
-            if pasteboard.inspectCurrentKind() == .files {
+            if !isInitialSeed, pasteboard.inspectCurrentKind() == .files {
                 onDiagnostic?(.staleFilesSuppressed)
                 onStatus?("剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传")
             }
@@ -802,7 +835,7 @@ final class ClipboardSync {
             localOnDemandCopy = nil
             sourceGate.clear()
             if let replacedRemoteRevision { transfer.invalidateRemoteManifest(replacedRemoteRevision) }
-            onStatus?("剪贴板内容已标记为敏感，未同步到对端")
+            if !isInitialSeed { onStatus?("剪贴板内容已标记为敏感，未同步到对端") }
             return
         }
         if hasSharedState, let marker = pasteboard.contentMarker, marker.hasPrefix(session.uuidString + ":") {
@@ -814,7 +847,7 @@ final class ClipboardSync {
             localOnDemandCopy = nil
             sourceGate.clear()
             if let replacedRemoteRevision { transfer.invalidateRemoteManifest(replacedRemoteRevision) }
-            onStatus?("此剪贴板类型暂不能同步")
+            if !isInitialSeed { onStatus?("此剪贴板类型暂不能同步") }
             return
         }
         if kind == .files {
@@ -883,6 +916,8 @@ final class ClipboardSync {
             settleWaiters(false)
             return
         }
+        let isInitialSeed = (initialSeedChange == change)
+        initialSeedChange = nil
         let previousObserved = observedChange
         pendingLocalChange = nil
         observedChange = change
@@ -898,11 +933,13 @@ final class ClipboardSync {
             sendingChange = nil
             localOnDemandCopy = nil
             sourceGate.clear()
-            if pasteboard.inspectCurrentKind() == .files {
-                onDiagnostic?(.staleFilesSuppressed)
-                onStatus?("剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传")
-            } else if !waiters.isEmpty {
-                onStatus?("剪贴板内容来自系统通用剪贴板（接力），已跳过 QuietDesk 回传")
+            if !isInitialSeed {
+                if pasteboard.inspectCurrentKind() == .files {
+                    onDiagnostic?(.staleFilesSuppressed)
+                    onStatus?("剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传")
+                } else if !waiters.isEmpty {
+                    onStatus?("剪贴板内容来自系统通用剪贴板（接力），已跳过 QuietDesk 回传")
+                }
             }
             settleWaiters(false)
             return
@@ -911,7 +948,7 @@ final class ClipboardSync {
             sendingChange = nil
             localOnDemandCopy = nil
             sourceGate.clear()
-            onStatus?("剪贴板内容已标记为敏感，未同步到对端")
+            if !isInitialSeed { onStatus?("剪贴板内容已标记为敏感，未同步到对端") }
             settleWaiters(false)
             return
         }
@@ -971,7 +1008,7 @@ final class ClipboardSync {
         }
         else if let text = pasteboard.text { payload = .text(Data(text.utf8)) }
         else {
-            onStatus?("此剪贴板类型暂不能同步")
+            if !isInitialSeed { onStatus?("此剪贴板类型暂不能同步") }
             settleWaiters(false)
             return
         }
@@ -1137,6 +1174,7 @@ final class ClipboardSync {
             installedOnPasteboard: true
         )
         observedChange = newChange
+        initialSeedChange = nil
         pendingLocalChange = nil
         deferredLocalChange = nil
         staleFileChange = nil
@@ -1397,6 +1435,7 @@ final class ClipboardSync {
             return false
         }
         observedChange = pasteboard.changeCount
+        initialSeedChange = nil
         pendingLocalChange = nil
         imagePreparation = nil
         deferredLocalChange = nil

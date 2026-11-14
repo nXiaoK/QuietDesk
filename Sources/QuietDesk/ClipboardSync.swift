@@ -164,7 +164,7 @@ final class SystemClipboardPasteboard: ClipboardPasteboard {
             guard item.setString(marker, forType: Self.marker) else { return false }
         }
         activeLazyProvider = nil
-        pasteboard.clearContents()
+        _ = pasteboard.prepareForNewContents(with: .currentHostOnly)
         return pasteboard.writeObjects(items)
     }
 
@@ -188,7 +188,7 @@ final class SystemClipboardPasteboard: ClipboardPasteboard {
         }
         guard item.setDataProvider(provider, forTypes: [promisedType]) else { return false }
         activeLazyProvider = provider
-        pasteboard.clearContents()
+        _ = pasteboard.prepareForNewContents(with: .currentHostOnly)
         let wrote = pasteboard.writeObjects([item])
         if !wrote { activeLazyProvider = nil }
         return wrote
@@ -290,7 +290,7 @@ final class ClipboardSync {
     private struct TrackedRemoteManifest {
         let revision: ClipboardRevision
         let kind: ClipboardManifestKind
-        let change: Int
+        var change: Int
         let installedOnPasteboard: Bool
     }
 
@@ -478,8 +478,10 @@ final class ClipboardSync {
                 case .accepted:
                     if !self.allowsDecoupledFileTransfer {
                         self.observedChange = pending.change
-                    } else if !pending.explicitDrop, self.pasteboard.changeCount == pending.change, self.pendingLocalChange == nil {
-                        self.observedChange = pending.change
+                    } else if !pending.explicitDrop,
+                              (self.pasteboard.changeCount == pending.change || self.pasteboard.isRelayedFromOtherDevice),
+                              self.pendingLocalChange == nil {
+                        self.observedChange = self.pasteboard.changeCount
                     }
                     self.onDiagnostic?(.fileOfferAccepted)
                 case .declined:
@@ -528,7 +530,12 @@ final class ClipboardSync {
         guard controllingRemote != controlling else { return }
         if controlling {
             let change = pasteboard.changeCount
-            pendingLocalChange = change != observedChange && change != deferredLocalChange ? change : nil
+            if pasteboard.isRelayedFromOtherDevice {
+                pendingLocalChange = nil
+                if change != deferredLocalChange { observedChange = change }
+            } else {
+                pendingLocalChange = change != observedChange && change != deferredLocalChange ? change : nil
+            }
             poll()
         } else { skipChangesWhileControlling() }
         controllingRemote = controlling
@@ -606,19 +613,30 @@ final class ClipboardSync {
     }
 
     func respondToFileOffer(id: UUID, accept: Bool) {
-        guard running, let pendingFileOffer, pendingFileOffer.id == id else { return }
-        if !allowsDecoupledFileTransfer, accept, pasteboard.changeCount != pendingFileOffer.change {
+        guard running, var pending = pendingFileOffer, pending.id == id else { return }
+        if pasteboard.changeCount != pending.change, pasteboard.isRelayedFromOtherDevice {
+            pending.change = pasteboard.changeCount
+            pendingFileOffer = pending
+        }
+        if !allowsDecoupledFileTransfer, accept, pasteboard.changeCount != pending.change {
             transfer.respondToFileOffer(id: id, accept: false)
             sendCurrent()
             return
         }
-        if accept, !pendingFileOffer.explicitDrop { receivingFileChange = pendingFileOffer.change }
+        if accept, !pending.explicitDrop { receivingFileChange = pending.change }
         transfer.respondToFileOffer(id: id, accept: accept)
     }
 
     func prepareForPaste(_ completion: @escaping (Bool) -> Void) {
         guard running, allowsAutomaticSending else { completion(false); return }
-        if controllingRemote { skipChangesWhileControlling() }
+        if controllingRemote {
+            skipChangesWhileControlling()
+            if pendingLocalChange != nil, pasteboard.isRelayedFromOtherDevice {
+                let relayedChange = pasteboard.changeCount
+                pendingLocalChange = nil
+                if relayedChange != deferredLocalChange { observedChange = relayedChange }
+            }
+        }
         if controllingRemote, pendingLocalChange == nil, !hasUnmaterializedOnDemandCopy {
             // 远端自己的复制粘贴不补发本机剪贴板，也不重新发起文件确认；本机正在接收的文件与之无关。
             if let sending = sendingChange {
@@ -725,6 +743,10 @@ final class ClipboardSync {
     private func checkTrackedRemoteManifestInvalidation() {
         guard allowsOnDemandClipboard, let tracked = trackedRemoteManifest,
               pasteboard.changeCount != tracked.change else { return }
+        if pasteboard.isRelayedFromOtherDevice {
+            trackedRemoteManifest?.change = pasteboard.changeCount
+            return
+        }
         trackedRemoteManifest = nil
         transfer.invalidateRemoteManifest(tracked.revision)
     }
@@ -742,6 +764,26 @@ final class ClipboardSync {
         let change = pasteboard.changeCount
         if !allowsDecoupledFileTransfer, receivingFileChange != nil {
             if change != deferredLocalChange { pendingLocalChange = change }
+            return
+        }
+        if pasteboard.isRelayedFromOtherDevice {
+            if trackedRemoteManifest != nil {
+                trackedRemoteManifest?.change = change
+            }
+            if receivingFileChange != nil, receivingFileChange == observedChange {
+                receivingFileChange = change
+            }
+            pendingLocalChange = nil
+            observedChange = change
+            imagePreparation = nil
+            sendingChange = nil
+            cancelImageApplication()
+            localOnDemandCopy = nil
+            sourceGate.clear()
+            if pasteboard.inspectCurrentKind() == .files {
+                onDiagnostic?(.staleFilesSuppressed)
+                onStatus?("剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传")
+            }
             return
         }
         let replacedRemoteRevision: ClipboardRevision?
@@ -841,10 +883,30 @@ final class ClipboardSync {
             settleWaiters(false)
             return
         }
+        let previousObserved = observedChange
         pendingLocalChange = nil
         observedChange = change
         imagePreparation = nil
         cancelImageApplication()
+        if pasteboard.isRelayedFromOtherDevice {
+            if trackedRemoteManifest != nil {
+                trackedRemoteManifest?.change = change
+            }
+            if receivingFileChange != nil, receivingFileChange == previousObserved {
+                receivingFileChange = change
+            }
+            sendingChange = nil
+            localOnDemandCopy = nil
+            sourceGate.clear()
+            if pasteboard.inspectCurrentKind() == .files {
+                onDiagnostic?(.staleFilesSuppressed)
+                onStatus?("剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传")
+            } else if !waiters.isEmpty {
+                onStatus?("剪贴板内容来自系统通用剪贴板（接力），已跳过 QuietDesk 回传")
+            }
+            settleWaiters(false)
+            return
+        }
         guard !pasteboard.isSensitive else {
             sendingChange = nil
             localOnDemandCopy = nil
@@ -928,10 +990,14 @@ final class ClipboardSync {
             settleWaiters(false)
             return
         }
-        // 文件来自通用剪贴板（另一台 Mac 复制后由系统同步过来），对端本身就是来源，转发只会形成回环。
-        if case .files = payload, pasteboard.isRelayedFromOtherDevice {
-            onDiagnostic?(.staleFilesSuppressed)
-            onStatus?("剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传")
+        // 通用剪贴板（另一台设备复制后由系统接力同步过来）的内容不应再转发给对端，否则会形成回环。
+        if pasteboard.isRelayedFromOtherDevice {
+            if case .files = payload {
+                onDiagnostic?(.staleFilesSuppressed)
+                onStatus?("剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传")
+            } else if !waiters.isEmpty {
+                onStatus?("剪贴板内容来自系统通用剪贴板（接力），已跳过 QuietDesk 回传")
+            }
             settleWaiters(false)
             return
         }
@@ -1240,13 +1306,15 @@ final class ClipboardSync {
         guard running, permit.isValid else { completion(false); return }
         let isKeptBackgroundFile: Bool
         if allowsDecoupledFileTransfer, case .files = payload,
-           let receivingFileChange, pasteboard.changeCount != receivingFileChange {
+           let receivingFileChange, pasteboard.changeCount != receivingFileChange,
+           !pasteboard.isRelayedFromOtherDevice {
             isKeptBackgroundFile = true
         } else {
             isKeptBackgroundFile = false
         }
         if allowsOnDemandClipboard, !isKeptBackgroundFile, !allowsAutomaticSending,
-           let tracked = trackedRemoteManifest, pasteboard.changeCount != tracked.change {
+           let tracked = trackedRemoteManifest, pasteboard.changeCount != tracked.change,
+           !pasteboard.isRelayedFromOtherDevice {
             trackedRemoteManifest = nil
             localOnDemandCopy = nil
             sourceGate.clear()
@@ -1274,7 +1342,7 @@ final class ClipboardSync {
             DispatchQueue.main.async {
                 guard let self, self.imageApplication?.token == token else { return }
                 self.imageApplication = nil
-                guard self.running, self.pasteboard.changeCount == change else {
+                guard self.running, self.pasteboard.changeCount == change || self.pasteboard.isRelayedFromOtherDevice else {
                     completion(false)
                     self.settleWaiters(false)
                     return
@@ -1306,7 +1374,8 @@ final class ClipboardSync {
             }
         case .png: break
         case .files:
-            if let receivingFileChange, pasteboard.changeCount != receivingFileChange {
+            if let receivingFileChange, pasteboard.changeCount != receivingFileChange,
+               !pasteboard.isRelayedFromOtherDevice {
                 // The transfer is complete on disk; a later local copy still owns the pasteboard.
                 receivedFilesKeptLocally = true
                 deferredLocalChange = nil

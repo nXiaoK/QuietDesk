@@ -4416,7 +4416,7 @@ final class DeskModel: ObservableObject {
         guard data.count <= Wire.maximumClipboardBytes, let text = String(data: data, encoding: .utf8) else {
             throw DeskError.invalid("剪贴板文字过大或编码无效")
         }
-        NSPasteboard.general.clearContents()
+        _ = NSPasteboard.general.prepareForNewContents(with: .currentHostOnly)
         NSPasteboard.general.setString(text, forType: .string)
         clipboardStatus = "已接收远端剪贴板文字"
     }

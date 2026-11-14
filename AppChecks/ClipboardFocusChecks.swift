@@ -2010,6 +2010,193 @@ private struct ClipboardFocusChecks {
                         "NSPasteboardItemDataProvider synchronous PNG pull failed or corrupted bytes")
         }
 
+        run("Universal Clipboard Handoff relay never triggers LAN ping-pong loop in on-demand or eager mode") { folder in
+            // 1. On-demand mode: both Macs active on LAN with Handoff enabled.
+            let pair = ClipboardPair(
+                storage: folder.appendingPathComponent("ondemand"),
+                localAllowed: true,
+                remoteAllowed: true,
+                allowsChunkWindow: true,
+                allowsDecoupledFileTransfer: true,
+                allowsOnDemandClipboard: true,
+                deferLocalFileOffer: true
+            )
+            defer { pair.stop() }
+
+            pair.local.copy(.text(Data("lan-handoff-text".utf8)))
+            try eventually("Initial text manifest did not reach peer") {
+                pair.remote.hasLazyItem && pair.remote.lazyKind == .text
+            }
+            try require(pair.localMessages == [.clipboardManifest] && pair.remoteMessages.isEmpty,
+                        "Unexpected messages on initial text manifest")
+
+            // Handoff delivers the copied text to remote Mac ~300ms later with com.apple.is-remote-clipboard.
+            let remoteReadsBeforeRelay = pair.remote.reads
+            pair.remote.isRelayedFromOtherDevice = true
+            pair.remote.copy(.text(Data("lan-handoff-text".utf8)))
+            pump(for: 0.7)
+            try require(pair.remoteMessages.isEmpty && pair.localMessages == [.clipboardManifest],
+                        "Handoff-relayed text caused remote Mac to echo manifest or invalidate sender")
+            try require(pair.remote.reads == remoteReadsBeforeRelay && pair.local.writes == 0,
+                        "Handoff-relayed text was read or overwrote sender clipboard")
+            try require(pair.localSync.holdsPaste,
+                        "Handoff arrival on remote prematurely cancelled sender unmaterialized copy")
+
+            // Clicking into remote canvas and pressing Cmd+V still materializes sender's copy cleanly.
+            pair.remoteSync.setAutomaticSendingAllowed(false)
+            pair.localSync.setControllingRemote(true)
+            var pasteReady: Bool?
+            pair.localSync.prepareForPaste { pasteReady = $0 }
+            try eventually("Cmd+V after Handoff relay did not materialize text") { pasteReady == true }
+            try require(pair.remote.copiedText == "lan-handoff-text",
+                        "Materialized text was dropped due to Handoff changeCount bump")
+            pair.remote.isRelayedFromOtherDevice = false
+
+            // PNG / raw TIFF relayed via Handoff while remote can send must neither convert TIFF nor echo.
+            pair.localSync.setControllingRemote(false)
+            pair.remoteSync.setAutomaticSendingAllowed(true)
+            let localMsgCountBeforeTIFF = pair.localMessages.count
+            let remoteMsgCountBeforeTIFF = pair.remoteMessages.count
+            pair.remote.isRelayedFromOtherDevice = true
+            pair.remote.copy(.png(Data([1, 2, 3, 4])))
+            pair.remote.rawTIFF = Data([9, 9, 9, 9])
+            pump(for: 0.65)
+            try require(pair.remoteMessages.count == remoteMsgCountBeforeTIFF
+                        && pair.localMessages.count == localMsgCountBeforeTIFF,
+                        "Handoff-relayed image triggered on-demand manifest loop")
+            pair.remote.rawTIFF = nil
+            pair.remote.isRelayedFromOtherDevice = false
+
+            // Deferred file copy + Handoff arriving both before Cmd+V and during file reception keeps pasteboard ownership.
+            let sourceFile = folder.appendingPathComponent("handoff-doc.txt")
+            try Data("file-over-lan".utf8).write(to: sourceFile)
+            var pendingOffer: ClipboardFileOffer?
+            var keptLocally = false
+            pair.remoteSync.onFileOffer = { pendingOffer = $0 }
+            pair.remoteSync.onReceivedFilesKept = { keptLocally = true }
+            pair.local.copy(.files([sourceFile]))
+            try eventually("Deferred file manifest was not recorded") {
+                pair.localMessages.suffix(1) == [.clipboardManifest]
+            }
+            // Handoff bumps remote pasteboard before Cmd+V.
+            let remoteMsgsBeforeFileHandoff = pair.remoteMessages.count
+            pair.remote.isRelayedFromOtherDevice = true
+            pair.remote.copy(.text(Data("handoff-placeholder".utf8)))
+            pump(for: 0.35)
+            try require(pair.remoteMessages.count == remoteMsgsBeforeFileHandoff && pair.localSync.holdsPaste,
+                        "Handoff arrival invalidated deferred file manifest")
+
+            pair.remoteSync.setAutomaticSendingAllowed(false)
+            pair.localSync.setControllingRemote(true)
+            var filePasteReady: Bool?
+            pair.localSync.prepareForPaste { filePasteReady = $0 }
+            try eventually("Deferred file offer did not reach remote on Cmd+V") { pendingOffer != nil }
+            try require(filePasteReady == false, "File paste should wait for remote approval")
+            // Handoff bumps remote pasteboard again while approval prompt is open.
+            pair.remote.copy(.text(Data("handoff-during-prompt".utf8)))
+            pair.remoteSync.respondToFileOffer(id: pendingOffer!.id, accept: true)
+            try eventually("Accepted file was not written to remote pasteboard") {
+                if case .files(let urls) = pair.remote.payload { return urls.count == 1 }
+                return false
+            }
+            try require(!keptLocally, "Handoff bump during file prompt falsely suppressed pasteboard write")
+            pair.remote.isRelayedFromOtherDevice = false
+
+            // Genuine local copy on remote Mac still invalidates sender's unmaterialized manifest.
+            pair.localSync.setControllingRemote(false)
+            pair.local.copy(.text(Data("viewer-next-copy".utf8)))
+            try eventually("Viewer next copy manifest did not arrive") { pair.remote.hasLazyItem }
+            pair.localSync.setControllingRemote(true)
+            pair.remote.copy(.text(Data("genuine-remote-copy".utf8)))
+            try eventually("Genuine remote copy did not invalidate viewer manifest") { !pair.localSync.holdsPaste }
+
+            // 2. Legacy eager mode + mixed-version echo resilience + inactive Handoff before taking control.
+            let eagerPair = ClipboardPair(
+                storage: folder.appendingPathComponent("eager"),
+                localAllowed: true,
+                remoteAllowed: true
+            )
+            defer { eagerPair.stop() }
+
+            eagerPair.local.copy(.text(Data("eager-lan".utf8)))
+            try eventually("Eager copy did not reach remote") { eagerPair.remote.copiedText == "eager-lan" }
+            let initialLocalBegins = eagerPair.localMessages.filter { $0 == .clipboardBegin }.count
+            try require(initialLocalBegins == 1 && eagerPair.remoteMessages.filter { $0 == .clipboardBegin }.isEmpty,
+                        "Unexpected eager transfer counts before Handoff simulation")
+
+            // Simulate Handoff echoing back on both Macs (e.g., if peer was an older version without .currentHostOnly).
+            eagerPair.remote.isRelayedFromOtherDevice = true
+            eagerPair.remote.republish()
+            eagerPair.local.isRelayedFromOtherDevice = true
+            eagerPair.local.republish()
+            pump(for: 0.7)
+            try require(eagerPair.localMessages.filter { $0 == .clipboardBegin }.count == 1
+                        && eagerPair.remoteMessages.filter { $0 == .clipboardBegin }.isEmpty,
+                        "Handoff echo caused infinite ping-pong loop in eager mode")
+
+            // Handoff arrives while QuietDesk is inactive, then user clicks directly into remote canvas and presses Cmd+V.
+            eagerPair.localSync.setAutomaticSendingAllowed(false)
+            eagerPair.local.isRelayedFromOtherDevice = true
+            eagerPair.local.copy(.text(Data("relayed-while-inactive".utf8)))
+            eagerPair.localSync.setControllingRemote(true)
+            eagerPair.localSync.setAutomaticSendingAllowed(true)
+            try require(!eagerPair.localSync.holdsPaste, "Relayed item while inactive should not hold remote Cmd+V")
+            var remotePastePassThrough: Bool?
+            eagerPair.localSync.prepareForPaste { remotePastePassThrough = $0 }
+            try require(remotePastePassThrough == true
+                        && eagerPair.localMessages.filter { $0 == .clipboardBegin }.count == 1,
+                        "Cmd+V on remote canvas attempted to echo Handoff item")
+        }
+
+        run("SystemClipboardPasteboard marks writes current-host-only and suppresses relayed pasteboard items") { folder in
+            let isolatedPB = NSPasteboard.withUniqueName()
+            defer { isolatedPB.releaseGlobally() }
+            let sysPB = SystemClipboardPasteboard(pasteboard: isolatedPB)
+
+            let marker = "\(UUID().uuidString):text:check"
+            try require(sysPB.write(.text(Data("host-only-write".utf8)), marker: marker),
+                        "SystemClipboardPasteboard.write failed on isolated pasteboard")
+            try require(sysPB.text == "host-only-write" && sysPB.contentMarker == marker && !sysPB.isRelayedFromOtherDevice,
+                        "Written pasteboard item lost text, marker, or falsely flagged relay")
+
+            let lazyMarker = "\(UUID().uuidString):lazy:text:\(UUID().uuidString):1"
+            try require(sysPB.writeLazy(
+                .text,
+                marker: lazyMarker,
+                fetch: { .text(Data("lazy-host-only".utf8)) },
+                asyncFetch: { $0(.text(Data("lazy-host-only".utf8))) }
+            ), "SystemClipboardPasteboard.writeLazy failed on isolated pasteboard")
+            try require(sysPB.contentMarker == lazyMarker && !sysPB.isRelayedFromOtherDevice,
+                        "Lazy pasteboard item lost marker or falsely flagged relay")
+            try require(sysPB.text == "lazy-host-only", "Lazy pasteboard item did not materialize")
+
+            let sent = ChannelSafeBox<[MessageKind]>([])
+            let sync = ClipboardSync(
+                session: UUID(),
+                allowsFileSending: true,
+                allowsAutomaticSending: true,
+                allowsChunkWindow: true,
+                allowsDecoupledFileTransfer: true,
+                allowsOnDemandClipboard: true,
+                pasteboard: sysPB,
+                storage: folder.appendingPathComponent("sys-relay")
+            ) { msg in
+                sent.append(msg.kind)
+            }
+            defer { sync.stop() }
+
+            // Simulate macOS Continuity / Universal Clipboard writing an item with com.apple.is-remote-clipboard.
+            let relayedItem = NSPasteboardItem()
+            relayedItem.setString("from-nearby-mac", forType: .string)
+            relayedItem.setData(Data(), forType: NSPasteboard.PasteboardType("com.apple.is-remote-clipboard"))
+            _ = isolatedPB.prepareForNewContents(with: .currentHostOnly)
+            try require(isolatedPB.writeObjects([relayedItem]), "Failed to write simulated Handoff item")
+            try require(sysPB.isRelayedFromOtherDevice, "SystemClipboardPasteboard did not detect com.apple.is-remote-clipboard")
+
+            pump(for: 0.65)
+            try require(sent.snapshot().isEmpty, "ClipboardSync announced or sent a com.apple.is-remote-clipboard item")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

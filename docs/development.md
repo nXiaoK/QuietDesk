@@ -54,7 +54,32 @@ SIGNING_IDENTITY='Developer ID Application: …' ./build-app.sh
 
 请将示例替换为实际身份。证书、私钥、密码、描述文件及私人签名配置保存在仓库外，不提交或加入源码包。指定身份只改变签名方式，不会自动完成 Apple 公证；开发签名或本地自签证书也不等于 Developer ID 分发签名。
 
-仓库默认发布继续使用临时签名，每次更新后需要在本机重新授予屏幕录制、辅助功能和输入监控权限。在本机使用同一张已信任的自签代码签名证书签名、保持 `CFBundleIdentifier`（`local.quietdesk.app`）和安装路径稳定时，指定要求（Designated Requirement）锚定在该证书指纹上而非每次变化的二进制 CDHash，有助于本机重装或覆盖更新后由 macOS 继续识别已有授权，但仍受系统版本及 TCC 策略约束，不能保证所有场景下永久免于重新授权。构建脚本会执行严格签名校验。
+仓库默认发布在未配置代码签名 Secret 时使用临时签名，每次更新后需要在本机重新授予屏幕录制、辅助功能和输入监控权限。在本机或 GitHub Actions 中使用同一张已信任的自签代码签名证书签名、保持 `CFBundleIdentifier`（`local.quietdesk.app`）和安装路径稳定时，指定要求（Designated Requirement）锚定在该证书指纹上而非每次变化的二进制 CDHash，有助于重装或覆盖更新后由 macOS 继续识别已有授权，但仍受系统版本及 TCC 策略约束，不能保证所有场景下永久免于重新授权。构建脚本会执行严格签名校验。
+
+### GitHub Actions 固定证书签名（保持线上 DMG 与本机一致的签名锚点）
+
+`Build and release macOS` 工作流支持可选的代码签名 Secrets：
+
+- `QUIETDESK_CODESIGN_P12_BASE64`：仅包含目标代码签名证书与配对私钥的 PKCS#12（Base64 编码）
+- `QUIETDESK_CODESIGN_P12_PASSWORD`：该 PKCS#12 的导出保护密码
+- `QUIETDESK_SIGNING_LEAF_SHA1`（可选）：期望的证书 SHA-1 指纹，构建后自动强校验 Designated Requirement
+- `QUIETDESK_SIGNING_IDENTITY`（可选）：显式签名身份名或 SHA-1
+
+工作流在全项目检查前先通过 `./scripts/import-ci-cert.sh --preflight` 预检密码、有效期与指纹，仅在 `Build Universal application` 前创建临时钥匙串导入证书，并在打包完成后通过 `if: always()` 执行 `./scripts/cleanup-ci-cert.sh` 立即销毁临时钥匙串；未设置上述 Secret 时自动回退为原有的 ad-hoc 签名。
+
+维护者可在本机终端执行以下命令，将本机钥匙串中的固定代码签名证书（自动剔除钥匙串内其他无关证书）直接写入自身仓库的 GitHub Actions Secrets（私钥与密码不落盘到仓库、不打印到终端）：
+
+```sh
+./scripts/export-ci-cert.sh --upload
+```
+
+脚本同时会在 `~/.config/QuietDesk/quietdesk-codesign.crt` 导出一份**不含私钥的公开证书**。若另一台需要安装该 GitHub Release DMG 的 Mac 尚未信任此证书，只需将该 `.crt` 拷过去执行一次：
+
+```sh
+./scripts/trust-cert.sh quietdesk-codesign.crt
+```
+
+对于通过浏览器直接下载的未公证自签 DMG，请先将 `QuietDesk.app` 拖入 `/Applications`（避免直接在挂载镜像内双击触发 App Translocation 随机路径），若浏览器附加了 `com.apple.quarantine` 隔离属性导致首次拦截，可执行 `./scripts/trust-cert.sh --unquarantine /Applications/QuietDesk.app`；若同时启用下方“应用内更新”，更新器通过内置公钥校验归档后会自动清理隔离属性并原地替换重启。
 
 ## 打包
 

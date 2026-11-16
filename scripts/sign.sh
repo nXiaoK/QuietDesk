@@ -37,6 +37,19 @@ resolve_identity() {
     printf '%s\n' "-"
 }
 
+is_developer_id() {
+    local id="$1"
+    if [[ "$id" == Developer\ ID* ]]; then
+        return 0
+    fi
+    local identities
+    identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+    if printf '%s\n' "$identities" | grep -Fi "$id" | grep -Fq '"Developer ID '; then
+        return 0
+    fi
+    return 1
+}
+
 IDENTITY="$(resolve_identity)"
 
 if [[ "$IDENTITY" == "-" ]]; then
@@ -45,7 +58,7 @@ if [[ "$IDENTITY" == "-" ]]; then
         exit 1
     fi
     codesign --force --sign - "$APP"
-elif [[ "$IDENTITY" == Developer\ ID* ]]; then
+elif is_developer_id "$IDENTITY"; then
     codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
 else
     codesign --force --timestamp=none --sign "$IDENTITY" "$APP"

@@ -87,6 +87,100 @@ class UpdateReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("QUIETDESK_UPDATE_PUBLIC_KEYS:", value)
         self.assertNotIn("QUIETDESK_BUNDLE_IDENTIFIER:", value)
 
+    def test_code_signing_keychain_lifecycle_and_secret_scoping(self):
+        value = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertLess(value.index("name: Preflight code signing"), value.index("name: Run project checks"))
+        self.assertLess(value.index("name: Run project checks"), value.index("name: Import code signing certificate"))
+        self.assertLess(value.index("name: Import code signing certificate"), value.index("name: Build Universal application"))
+        self.assertLess(value.index("name: Package DMG, ZIP and source"), value.index("name: Remove temporary code signing keychain"))
+        self.assertLess(value.index("name: Remove temporary code signing keychain"), value.index("name: Create draft release and upload packages"))
+        cleanup_section = value[value.index("name: Remove temporary code signing keychain"):value.index("name: Build Linux relay packages")]
+        self.assertIn("if: always()", cleanup_section)
+        after_cleanup = value[value.index("name: Create draft release and upload packages"):]
+        self.assertNotIn("QUIETDESK_CODESIGN_P12_BASE64", after_cleanup)
+        self.assertNotIn("QUIETDESK_CODESIGN_P12_PASSWORD", after_cleanup)
+
+
+class CICodeSigningScriptTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def make_p12(self, password="synthetic-pass-secret", include_key=True):
+        conf = self.root / "cert.conf"
+        conf.write_text(
+            "[req]\ndefault_bits=2048\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n"
+            "[dn]\nCN=QuietDesk Test Code Signing\n"
+            "[ext]\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\nbasicConstraints=critical,CA:FALSE\n"
+        )
+        key = self.root / "test.key"
+        crt = self.root / "test.crt"
+        p12 = self.root / "test.p12"
+        subprocess.run(
+            ["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", str(key), "-out", str(crt), "-days", "2", "-config", str(conf)],
+            check=True, capture_output=True
+        )
+        fp = subprocess.check_output(
+            ["/usr/bin/openssl", "x509", "-in", str(crt), "-noout", "-fingerprint", "-sha1"],
+            text=True
+        ).split("=", 1)[1].replace(":", "").strip()
+        cmd = ["/usr/bin/openssl", "pkcs12", "-export", "-out", str(p12), "-in", str(crt), "-passout", f"pass:{password}"]
+        if include_key:
+            cmd.extend(["-inkey", str(key)])
+        else:
+            cmd.append("-nokeys")
+        subprocess.run(cmd, check=True, capture_output=True)
+        return base64.b64encode(p12.read_bytes()).decode(), crt, key, fp
+
+    def test_preflight_allows_missing_secret_and_validates_configured_p12(self):
+        script = ROOT / "scripts/import-ci-cert.sh"
+        empty_env = {**os.environ, "QUIETDESK_CODESIGN_P12_BASE64": "", "RUNNER_TEMP": str(self.root)}
+        empty_res = subprocess.run(["bash", str(script), "--preflight"], env=empty_env, capture_output=True, text=True)
+        self.assertEqual(empty_res.returncode, 0)
+        self.assertIn("ad-hoc", empty_res.stdout)
+
+        b64, _, _, sha1 = self.make_p12(password="s3cr3t-pass-99")
+        valid_env = {
+            **os.environ,
+            "QUIETDESK_CODESIGN_P12_BASE64": b64,
+            "QUIETDESK_CODESIGN_P12_PASSWORD": "s3cr3t-pass-99",
+            "QUIETDESK_SIGNING_LEAF_SHA1": sha1.lower(),
+            "RUNNER_TEMP": str(self.root),
+        }
+        valid_res = subprocess.run(["bash", str(script), "--preflight"], env=valid_env, capture_output=True, text=True)
+        self.assertEqual(valid_res.returncode, 0, valid_res.stderr)
+        self.assertIn(sha1.upper(), valid_res.stdout)
+        self.assertNotIn("s3cr3t-pass-99", valid_res.stdout + valid_res.stderr)
+
+        wrong_pass_env = {**valid_env, "QUIETDESK_CODESIGN_P12_PASSWORD": "wrong-password-value"}
+        wrong_res = subprocess.run(["bash", str(script), "--preflight"], env=wrong_pass_env, capture_output=True, text=True)
+        self.assertNotEqual(wrong_res.returncode, 0)
+        self.assertNotIn("wrong-password-value", wrong_res.stdout + wrong_res.stderr)
+        self.assertNotIn(b64[:32], wrong_res.stdout + wrong_res.stderr)
+
+        wrong_pin_env = {**valid_env, "QUIETDESK_SIGNING_LEAF_SHA1": "0" * 40}
+        pin_res = subprocess.run(["bash", str(script), "--preflight"], env=wrong_pin_env, capture_output=True, text=True)
+        self.assertNotEqual(pin_res.returncode, 0)
+
+    def test_export_and_trust_scripts_enforce_repo_and_private_key_guards(self):
+        export_script = ROOT / "scripts/export-ci-cert.sh"
+        inside_repo = ROOT / "dist/forbidden-secrets"
+        res = subprocess.run(["bash", str(export_script), "--out-dir", str(inside_repo)], capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Git 仓库", res.stderr)
+
+        _, crt, key, _ = self.make_p12()
+        combined = self.root / "combined-with-key.pem"
+        combined.write_text(crt.read_text() + "\n" + key.read_text())
+        trust_script = ROOT / "scripts/trust-cert.sh"
+        trust_res = subprocess.run(["bash", str(trust_script), str(combined)], capture_output=True, text=True)
+        self.assertNotEqual(trust_res.returncode, 0)
+        self.assertIn("私钥", trust_res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

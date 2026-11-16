@@ -79,10 +79,23 @@ jobs:
             echo '::error::请设置匹配的 QUIETDESK_UPDATE_SIGNING_KEY 后重跑。'
             exit 1
           fi
+      - name: Preflight code signing
+        env:
+          QUIETDESK_CODESIGN_P12_BASE64: ${{ secrets.QUIETDESK_CODESIGN_P12_BASE64 }}
+          QUIETDESK_CODESIGN_P12_PASSWORD: ${{ secrets.QUIETDESK_CODESIGN_P12_PASSWORD }}
+          QUIETDESK_SIGNING_LEAF_SHA1: ${{ secrets.QUIETDESK_SIGNING_LEAF_SHA1 }}
+        run: ./scripts/import-ci-cert.sh --preflight
       - name: Verify relay build toolchain
         run: go version
       - name: Run project checks
         run: ./scripts/run-all-checks.sh
+      - name: Import code signing certificate
+        env:
+          QUIETDESK_CODESIGN_P12_BASE64: ${{ secrets.QUIETDESK_CODESIGN_P12_BASE64 }}
+          QUIETDESK_CODESIGN_P12_PASSWORD: ${{ secrets.QUIETDESK_CODESIGN_P12_PASSWORD }}
+          QUIETDESK_SIGNING_IDENTITY: ${{ secrets.QUIETDESK_SIGNING_IDENTITY }}
+          QUIETDESK_SIGNING_LEAF_SHA1: ${{ secrets.QUIETDESK_SIGNING_LEAF_SHA1 }}
+        run: ./scripts/import-ci-cert.sh
       - name: Build Universal application
         env:
           QUIETDESK_VERSION: ${{ steps.version.outputs.version }}
@@ -92,6 +105,9 @@ jobs:
           xcrun vtool -show-build dist/QuietDesk.app/Contents/MacOS/QuietDesk
       - name: Package DMG, ZIP and source
         run: python3 scripts/package-app.py
+      - name: Remove temporary code signing keychain
+        if: always()
+        run: ./scripts/cleanup-ci-cert.sh
       - name: Build Linux relay packages
         env:
           QUIETDESK_VERSION: ${{ steps.version.outputs.version }}

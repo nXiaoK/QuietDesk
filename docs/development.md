@@ -73,13 +73,11 @@ SIGNING_IDENTITY='Developer ID Application: …' ./build-app.sh
 ./scripts/export-ci-cert.sh --upload
 ```
 
-脚本同时会在 `~/.config/QuietDesk/quietdesk-codesign.crt` 导出一份**不含私钥的公开证书**。若另一台需要安装该 GitHub Release DMG 的 Mac 尚未信任此证书，只需将该 `.crt` 拷过去执行一次：
+使用自签证书构建时，`package-app.py` 会从主程序 Mach-O 签名段提取公开证书并在 DMG 镜像内自动放入可执行脚本 `首次安装信任证书.command`（应用更新用的 `.zip` 与源码包保持不变，Ad-hoc 或 Apple `Developer ID` 签名不会放入该脚本）：
 
-```sh
-./scripts/trust-cert.sh quietdesk-codesign.crt
-```
-
-对于通过浏览器直接下载的未公证自签 DMG，请先将 `QuietDesk.app` 拖入 `/Applications`（避免直接在挂载镜像内双击触发 App Translocation 随机路径），若浏览器附加了 `com.apple.quarantine` 隔离属性导致首次拦截，可执行 `./scripts/trust-cert.sh --unquarantine /Applications/QuietDesk.app`；若同时启用下方“应用内更新”，更新器通过内置公钥校验归档后会自动清理隔离属性并原地替换重启。
+- **在另一台新 Mac 首次安装该 DMG 时**：挂载 DMG 后右键点按 `首次安装信任证书.command` 选择“打开”（或在终端执行该脚本），输入一次本机管理员密码即可自动完成应用安装、系统钥匙串证书信任与清除浏览器下载隔离属性；随后打开应用授予一次录屏与辅助功能权限。
+- **后续升级新版本时**：无需再运行该脚本，直接将新版 `QuietDesk.app` 拖入 `Applications` 覆盖安装（或通过已配置的“应用内更新”自动去隔离替换重启），即可沿用同一指定要求。
+- 也可在仓库内直接使用 `./scripts/trust-cert.sh quietdesk-codesign.crt` 或 `./scripts/trust-cert.sh --unquarantine /Applications/QuietDesk.app`。
 
 ## 打包
 

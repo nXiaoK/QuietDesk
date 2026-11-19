@@ -147,17 +147,17 @@ public final class PortMappingTraffic: @unchecked Sendable {
     }
 }
 
-enum PortMappingControl: Codable {
-    case authorize(PortMappingTarget)
+public enum PortMappingControl: Codable, Equatable, Sendable {
+    case authorize(PortMappingTarget, deviceID: UUID? = nil)
     case granted(UUID)
     case attach(UUID)
     case connected
     case receivedEOF
     case rejected(Rejection)
 
-    enum Rejection: String, Codable {
+    public enum Rejection: String, Codable, Equatable, Sendable {
         case denied, busy, target, timeout
-        var explanation: String {
+        public var explanation: String {
             switch self {
             case .denied: return "被控端未允许此目标"
             case .busy: return "映射连接数量已达上限"
@@ -167,7 +167,7 @@ enum PortMappingControl: Codable {
         }
     }
 
-    static func read(_ message: Message) throws -> Self {
+    public static func read(_ message: Message) throws -> Self {
         guard message.kind == .mappingControl else { throw DeskError.invalid("端口映射消息顺序无效") }
         return try Wire.readJSON(Self.self, message.payload)
     }

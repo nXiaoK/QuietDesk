@@ -10,6 +10,7 @@ public final class PortMappingViewer: @unchecked Sendable {
     private let target: PortMappingTarget
     private let requestedPort: UInt16
     private let traffic: PortMappingTraffic
+    private let deviceID: UUID?
     private let queue = DispatchQueue(label: "quietdesk.mapping.viewer", qos: .utility)
     private let statusLock = NSLock()
     private var alternateAllowed = false
@@ -32,13 +33,13 @@ public final class PortMappingViewer: @unchecked Sendable {
     private var openingFlow: UUID?
 
     public init(host: String, port: UInt16, key: PairingKey, target: PortMappingTarget,
-                localPort: UInt16, traffic: PortMappingTraffic) throws {
+                localPort: UInt16, traffic: PortMappingTraffic, deviceID: UUID? = nil) throws {
         guard !host.isEmpty, let port = NWEndpoint.Port(rawValue: port), port != .any else {
             throw DeskError.invalid("被控端地址或服务端口无效")
         }
         endpoint = .hostPort(host: NWEndpoint.Host(host), port: port)
         params = try MediaSecureTransport.tlsParameters(key: key, roles: [.portMapping])
-        self.target = target; requestedPort = localPort; self.traffic = traffic
+        self.target = target; requestedPort = localPort; self.traffic = traffic; self.deviceID = deviceID
     }
 
     public func start() {
@@ -46,7 +47,7 @@ public final class PortMappingViewer: @unchecked Sendable {
             guard let self, !self.started, !self.stopped else { return }
             self.started = true
             self.onState?(.authorizing)
-            let peer = self.newPeer(open: .authorize(self.target))
+            let peer = self.newPeer(open: .authorize(self.target, deviceID: self.deviceID))
             self.lease = peer
             peer.onClose = { [weak self, weak peer] reason in
                 let canRetry = peer?.allowsUnauthenticatedRouteRetry == true

@@ -21,6 +21,12 @@ struct PortMappingRule: Identifiable, Codable, Equatable {
     var scope: PortMappingScope
 }
 
+struct TrustedRemoteMappingDevice: Identifiable, Codable, Equatable {
+    let id: UUID
+    var name: String
+    var lastConnected: Date
+}
+
 @MainActor
 final class PortMappingManager: ObservableObject {
     typealias Route = (_ ready: @escaping @MainActor (String, UInt16, PairingKey) -> Void,
@@ -36,32 +42,45 @@ final class PortMappingManager: ObservableObject {
     private struct Grants: Codable {
         var pairingIdentity: Data
         var targets: Set<PortMappingTarget>
+        var remoteDevices: [TrustedRemoteMappingDevice]?
+    }
+
+    private struct PendingDecision {
+        let deviceID: UUID?
+        let reply: (Bool) -> Void
     }
 
     @Published private(set) var rules: [PortMappingRule] = []
     @Published private(set) var states: [UUID: PortMappingState] = [:]
     @Published private(set) var pendingTargets: [PortMappingTarget] = []
     @Published private(set) var allowedTargets: Set<PortMappingTarget> = []
+    @Published private(set) var trustedRemoteDevices: [TrustedRemoteMappingDevice] = []
     @Published private(set) var storageError: String?
     var onApprovalVisibilityChanged: ((Bool) -> Void)?
     var hostApprovalPending: Bool { !pendingTargets.isEmpty }
     var hasRunningMappings: Bool { !running.isEmpty }
 
     private let defaults: UserDefaults
+    private let localDeviceID: UUID?
+    private let showsApprovalPanel: Bool
     private static let rulesKey = "tcpMappingRules.v1"
     private static let grantsKey = "tcpMappingGrants.v1"
+    static let maximumTrustedRemoteDevices = 64
     private var running: [UUID: RunningRule] = [:]
     private var loadFailed = false
     private let traffic = PortMappingTraffic()
     private var host: PortMappingHost?
     private var hostGeneration: UUID?
     private var grants: Grants?
-    private var decisions: [PortMappingTarget: [(Bool) -> Void]] = [:]
+    private var decisions: [PortMappingTarget: [PendingDecision]] = [:]
     private var requestedAt: [PortMappingTarget: TimeInterval] = [:]
     private var prompt: PortMappingApprovalPanel?
+    private var approvalVisible = false
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, localDeviceID: UUID? = nil, showsApprovalPanel: Bool = true) {
         self.defaults = defaults
+        self.localDeviceID = localDeviceID
+        self.showsApprovalPanel = showsApprovalPanel
         do {
             if let data = defaults.data(forKey: Self.rulesKey) { rules = try JSONDecoder().decode([PortMappingRule].self, from: data) }
             if let data = defaults.data(forKey: Self.grantsKey) { grants = try JSONDecoder().decode(Grants.self, from: data) }
@@ -122,7 +141,7 @@ final class PortMappingManager: ObservableObject {
                 guard let self, let run, self.running[rule.id] === run else { return }
                 do {
                     let viewer = try PortMappingViewer(host: address, port: port, key: key, target: rule.target,
-                                                       localPort: rule.localPort, traffic: self.traffic)
+                                                       localPort: rule.localPort, traffic: self.traffic, deviceID: self.localDeviceID)
                     run.viewer = viewer
                     viewer.onState = { [weak self, weak run, weak viewer] state in
                         DispatchQueue.main.async {
@@ -184,9 +203,10 @@ final class PortMappingManager: ObservableObject {
         let identity = Data(SHA256.hash(data: key.data))
         if grants?.pairingIdentity != identity {
             if grants != nil, !loadFailed { defaults.removeObject(forKey: Self.grantsKey) }
-            grants = Grants(pairingIdentity: identity, targets: [])
+            grants = Grants(pairingIdentity: identity, targets: [], remoteDevices: [])
         }
         allowedTargets = grants?.targets ?? []
+        trustedRemoteDevices = Self.normalizedRemoteDevices(grants?.remoteDevices ?? [])
     }
 
     func makeHost(pairingKey: PairingKey) -> PortMappingHost {
@@ -194,16 +214,9 @@ final class PortMappingManager: ObservableObject {
         let generation = UUID()
         hostGeneration = generation
         selectHostPairingKey(pairingKey)
-        let server = PortMappingHost(traffic: traffic) { [weak self] target, reply in
+        let server = PortMappingHost(traffic: traffic) { [weak self] target, deviceID, reply in
             DispatchQueue.main.async {
-                guard let self, self.hostGeneration == generation, !self.loadFailed else { reply(false); return }
-                if self.allowedTargets.contains(target) { reply(true); return }
-                self.decisions[target, default: []].append(reply)
-                if !self.pendingTargets.contains(target) {
-                    self.requestedAt[target] = ProcessInfo.processInfo.systemUptime
-                    self.pendingTargets.append(target)
-                    self.syncApprovalPanel()
-                }
+                self?.handleHostAuthorization(target: target, deviceID: deviceID, generation: generation, reply: reply)
             }
         }
         server.onAuthorizationWithdrawn = { [weak self] target in
@@ -216,10 +229,51 @@ final class PortMappingManager: ObservableObject {
         return server
     }
 
+    func handleHostAuthorization(target: PortMappingTarget, deviceID: UUID?, generation: UUID, reply: @escaping (Bool) -> Void) {
+        guard hostGeneration == generation, !loadFailed else { reply(false); return }
+        if let deviceID, trustedRemoteDevices.contains(where: { $0.id == deviceID }) { reply(true); return }
+        if allowedTargets.contains(target) { reply(true); return }
+        decisions[target, default: []].append(PendingDecision(deviceID: deviceID, reply: reply))
+        if !pendingTargets.contains(target) {
+            requestedAt[target] = ProcessInfo.processInfo.systemUptime
+            pendingTargets.append(target)
+            syncApprovalPanel()
+        }
+    }
+
+    func authorizeHostRequest(target: PortMappingTarget, deviceID: UUID?, reply: @escaping (Bool) -> Void) {
+        guard let generation = hostGeneration else { reply(false); return }
+        handleHostAuthorization(target: target, deviceID: deviceID, generation: generation, reply: reply)
+    }
+
+    /// Record a viewer device that completed an authenticated desktop session under the current pairing key.
+    func recordRemoteDevice(_ identity: DeviceIdentity, at date: Date = Date()) {
+        do {
+            var next = trustedRemoteDevices
+            let name = Self.sanitizedDeviceName(identity)
+            if let index = next.firstIndex(where: { $0.id == identity.id }) {
+                next[index].name = name
+                next[index].lastConnected = max(next[index].lastConnected, date)
+            } else {
+                next.append(TrustedRemoteMappingDevice(id: identity.id, name: name, lastConnected: date))
+            }
+            try setTrustedRemoteDevices(Self.normalizedRemoteDevices(next))
+            approvePendingRequests(for: identity.id)
+        } catch { storageError = error.localizedDescription }
+    }
+
+    func revokeRemoteDevice(_ deviceID: UUID) {
+        do {
+            let next = trustedRemoteDevices.filter { $0.id != deviceID }
+            try setTrustedRemoteDevices(next)
+            host?.revokeDevice(deviceID)
+        } catch { storageError = error.localizedDescription }
+    }
+
     func presentPendingRequest() { prompt?.present() }
 
     func decide(_ target: PortMappingTarget, allow: Bool) {
-        guard let replies = decisions[target] else { return }
+        guard let pending = decisions[target] else { return }
         if allow {
             // A synthetic click already posted before remote input was suspended may still be in AppKit's queue.
             guard let since = requestedAt[target], let event = NSApp.currentEvent, let source = event.cgEvent,
@@ -232,7 +286,7 @@ final class PortMappingManager: ObservableObject {
             } catch { storageError = error.localizedDescription; return }
         }
         removeRequest(target)
-        replies.forEach { $0(allow) }
+        pending.forEach { $0.reply(allow) }
     }
 
     static func acceptsApproval(type: NSEvent.EventType, sourcePID: Int64, timestamp: TimeInterval, requestedAt: TimeInterval) -> Bool {
@@ -248,6 +302,53 @@ final class PortMappingManager: ObservableObject {
         allowedTargets = targets
     }
 
+    private func setTrustedRemoteDevices(_ devices: [TrustedRemoteMappingDevice]) throws {
+        guard var next = grants else { throw DeskError.invalid("当前配对身份未就绪") }
+        next.remoteDevices = devices
+        try save(next, key: Self.grantsKey)
+        grants = next
+        trustedRemoteDevices = devices
+    }
+
+    private func approvePendingRequests(for deviceID: UUID) {
+        var granted: [(Bool) -> Void] = []
+        for target in pendingTargets {
+            guard let entries = decisions[target] else { continue }
+            var remaining: [PendingDecision] = []
+            for entry in entries {
+                if entry.deviceID == deviceID { granted.append(entry.reply) }
+                else { remaining.append(entry) }
+            }
+            if remaining.isEmpty { removeRequest(target) }
+            else { decisions[target] = remaining }
+        }
+        granted.forEach { $0(true) }
+    }
+
+    private static func sanitizedDeviceName(_ identity: DeviceIdentity) -> String {
+        String(identity.displayName.prefix(80))
+    }
+
+    private static func normalizedRemoteDevices(_ devices: [TrustedRemoteMappingDevice]) -> [TrustedRemoteMappingDevice] {
+        var unique: [UUID: TrustedRemoteMappingDevice] = [:]
+        for device in devices {
+            let name = sanitizedDeviceName(DeviceIdentity(id: device.id, name: device.name))
+            if let existing = unique[device.id] {
+                if device.lastConnected >= existing.lastConnected {
+                    unique[device.id] = TrustedRemoteMappingDevice(id: device.id, name: name, lastConnected: device.lastConnected)
+                }
+            } else {
+                unique[device.id] = TrustedRemoteMappingDevice(id: device.id, name: name, lastConnected: device.lastConnected)
+            }
+        }
+        let sorted = unique.values.sorted {
+            if $0.lastConnected != $1.lastConnected { return $0.lastConnected > $1.lastConnected }
+            if $0.name != $1.name { return $0.name < $1.name }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+        return Array(sorted.prefix(maximumTrustedRemoteDevices))
+    }
+
     func revoke(_ target: PortMappingTarget) {
         do {
             var next = allowedTargets
@@ -261,12 +362,12 @@ final class PortMappingManager: ObservableObject {
         hostGeneration = nil
         host?.stop()
         host = nil
-        let replies = decisions.values.flatMap { $0 }
+        let pending = decisions.values.flatMap { $0 }
         decisions.removeAll()
         requestedAt.removeAll()
         pendingTargets.removeAll()
         syncApprovalPanel()
-        replies.forEach { $0(false) }
+        pending.forEach { $0.reply(false) }
     }
 
     private func removeRequest(_ target: PortMappingTarget) {
@@ -278,15 +379,22 @@ final class PortMappingManager: ObservableObject {
 
     private func syncApprovalPanel() {
         if hostApprovalPending {
-            guard prompt == nil else { return }
+            guard !approvalVisible else { return }
+            approvalVisible = true
             onApprovalVisibilityChanged?(true)
+            guard showsApprovalPanel else { return }
             let panel = PortMappingApprovalPanel(manager: self)
             prompt = panel
             panel.present()
-        } else if let panel = prompt {
-            prompt = nil
-            panel.close()
-            onApprovalVisibilityChanged?(false)
+        } else {
+            if let panel = prompt {
+                prompt = nil
+                panel.close()
+            }
+            if approvalVisible {
+                approvalVisible = false
+                onApprovalVisibilityChanged?(false)
+            }
         }
     }
 }

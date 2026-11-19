@@ -63,7 +63,7 @@ struct PortMappingView: View {
                     Label(selected == nil ? "先添加设备" : "尚无映射规则", systemImage: "network")
                 } description: {
                     Text(selected == nil ? "在连接页填写目标 Mac 的地址与配对码，然后选择「使用连接页配置」。" :
-                        "添加规则后，可通过本机端口访问目标服务。首次启用需要被控 Mac 上的用户确认。")
+                        "添加规则后，可通过本机端口访问目标服务。曾远控过该 Mac 时可直接启用；未曾远控的设备首次启用仍需被控端确认。")
                 }
                 .frame(maxHeight: .infinity)
             } else {
@@ -140,7 +140,7 @@ struct PortMappingView: View {
 
     @ViewBuilder private func status(_ state: PortMappingState?) -> some View {
         switch state {
-        case .authorizing: Label("正在连接或等待被控端批准…", systemImage: "clock").foregroundStyle(.secondary)
+        case .authorizing: Label("正在连接或等待被控端确认…", systemImage: "clock").foregroundStyle(.secondary)
         case let .listening(_, connections):
             Label(connections > 0 ? "正在转发 · \(connections) 个连接" : "正在监听 · 等待本地连接",
                   systemImage: "checkmark.circle").foregroundStyle(.green)

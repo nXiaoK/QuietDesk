@@ -190,7 +190,13 @@ final class MappingTestHost {
     var onDesktop: ((Peer, MediaChannelRole) -> Void)?
     let otherRoles = FixtureValue(0)
 
-    init(key: PairingKey, roles: [MediaChannelRole] = MediaChannelRole.allCases, authorize: @escaping (PortMappingTarget, @escaping (Bool) -> Void) -> Void) throws {
+    convenience init(key: PairingKey, roles: [MediaChannelRole] = MediaChannelRole.allCases,
+                     authorize: @escaping (PortMappingTarget, @escaping (Bool) -> Void) -> Void) throws {
+        try self.init(key: key, roles: roles) { target, _, reply in authorize(target, reply) }
+    }
+
+    init(key: PairingKey, roles: [MediaChannelRole] = MediaChannelRole.allCases,
+         authorize: @escaping (PortMappingTarget, UUID?, @escaping (Bool) -> Void) -> Void) throws {
         host = PortMappingHost(authorize: authorize)
         listener = try loopbackListener(MediaSecureTransport.tlsParameters(key: key, roles: roles))
     }
@@ -217,8 +223,10 @@ final class MappingTestHost {
 final class MappingTestClient {
     let viewer: PortMappingViewer
     let events = FixtureValue<[PortMappingState]>([])
-    init(port: UInt16, key: PairingKey, target: PortMappingTarget, traffic: PortMappingTraffic, localPort: UInt16 = 0) throws {
-        viewer = try PortMappingViewer(host: "127.0.0.1", port: port, key: key, target: target, localPort: localPort, traffic: traffic)
+    init(port: UInt16, key: PairingKey, target: PortMappingTarget, traffic: PortMappingTraffic,
+         localPort: UInt16 = 0, deviceID: UUID? = nil) throws {
+        viewer = try PortMappingViewer(host: "127.0.0.1", port: port, key: key, target: target,
+                                       localPort: localPort, traffic: traffic, deviceID: deviceID)
         viewer.onState = { [events] event in events.change { $0.append(event) } }
     }
     var hasFailed: Bool { events.get().contains { if case .failed = $0 { return true }; return false } }
@@ -385,6 +393,60 @@ private func checkSlowMappingConsumer() throws {
     print("PASS mapped TCP backpressure survives three idle intervals, preserves 16 MiB and allows revocation")
 }
 
+private func checkTrustedDeviceMapping(_ directory: URL) throws {
+    let key = try PairingKey.generate()
+    let file = try FixtureFileServer(directory: directory, mebibytes: 1)
+    let filePort = try file.start()
+    defer { file.stop() }
+    let target = try PortMappingTarget(host: "127.0.0.1", port: filePort)
+    let trustedFirst = UUID(), trustedSecond = UUID(), untrusted = UUID()
+    let trusted = FixtureValue<Set<UUID>>([trustedFirst, trustedSecond])
+    let host = try MappingTestHost(key: key) { _, deviceID, reply in
+        reply(deviceID.map { trusted.get().contains($0) } ?? false)
+    }
+    let hostPort = try host.start()
+    defer { host.stop() }
+
+    let traffic = PortMappingTraffic()
+    for candidateID in [untrusted as UUID?, nil] {
+        let rejected = try MappingTestClient(port: hostPort, key: key, target: target, traffic: traffic, deviceID: candidateID)
+        rejected.viewer.start()
+        try eventually("Untrusted or legacy device without approval was not rejected") { rejected.hasFailed }
+        rejected.viewer.stop()
+    }
+    try expect(file.connections.get() == 0, "Rejected device opened a target connection")
+
+    let firstClient = try MappingTestClient(port: hostPort, key: key, target: target, traffic: traffic, deviceID: trustedFirst)
+    let secondClient = try MappingTestClient(port: hostPort, key: key, target: target, traffic: traffic, deviceID: trustedSecond)
+    firstClient.viewer.start()
+    secondClient.viewer.start()
+    defer { firstClient.viewer.stop(); secondClient.viewer.stop() }
+    let firstLocal = try firstClient.listening()
+    let secondLocal = try secondClient.listening()
+
+    let firstDownload = FileDownload()
+    firstDownload.start(port: firstLocal, destination: directory.appendingPathComponent("trusted-first.bin"), file: file)
+    _ = try firstDownload.wait()
+
+    let activeFirst = try openClient(firstLocal)
+    defer { close(activeFirst) }
+    try eventually("First trusted device did not establish a second target socket") { file.connections.get() == 2 }
+
+    trusted.change { $0.remove(trustedFirst) }
+    host.host.revokeDevice(trustedFirst)
+    try eventually("Revoking a trusted device left its local listener active") { firstClient.hasFailed }
+    var byte: UInt8 = 0
+    let count = recv(activeFirst, &byte, 1, 0)
+    try expect(count == 0 || (count < 0 && errno == ECONNRESET), "Revoking a trusted device left its active socket open")
+
+    // Another trusted device on the same target must remain unaffected.
+    try expect(!secondClient.hasFailed, "Revoking one trusted device affected a different trusted device")
+    let secondDownload = FileDownload()
+    secondDownload.start(port: secondLocal, destination: directory.appendingPathComponent("trusted-second.bin"), file: file)
+    _ = try secondDownload.wait()
+    print("PASS trusted remote device auto-approval, untrusted/legacy rejection, and per-device revocation isolation")
+}
+
 @main
 struct PortMappingChecks {
     static func main() {
@@ -398,6 +460,7 @@ struct PortMappingChecks {
         else {
             try checkSlowMappingConsumer()
             try checkMapping(directory)
+            try checkTrustedDeviceMapping(directory)
         }
     }
 }

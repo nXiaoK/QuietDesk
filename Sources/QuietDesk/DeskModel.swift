@@ -2985,6 +2985,9 @@ final class DeskModel: ObservableObject {
                 throw DeskError.invalid("连接中的设备标识发生变化")
             }
             hostSession.remoteDeviceID = identity.id
+            if !hostSession.qualityProbeRequested {
+                portMappings.recordRemoteDevice(identity)
+            }
         case .controlStatus:
             guard message.payload.isEmpty else { throw DeskError.invalid("控制权限订阅消息无效") }
             refreshPermissions()
@@ -3030,6 +3033,7 @@ final class DeskModel: ObservableObject {
             applyHostVideoSettings(request, peer: peer)
         case .qualityProbeControl:
             let control = try QualityProbeControl.read(message.payload)
+            hostSession.qualityProbeRequested = true
             hostSession.streamer?.setQualityProbe(enabled: control.enabled, durationSeconds: control.durationSeconds)
         default: throw DeskError.invalid("收到当前角色不支持的消息")
         }
@@ -3143,7 +3147,7 @@ final class DeskModel: ObservableObject {
             }
             if freshFrameRequiredOnReconnect { pauseTransmission.requireFreshFrame() }
             saveConnection(name: hello.name)
-            if hello.deviceIdentityExchange == true, let id = trafficHistoryStore.localDeviceID {
+            if activeRouteBenchmarkOverride == nil, hello.deviceIdentityExchange == true, let id = trafficHistoryStore.localDeviceID {
                 peer.send(try Wire.json(.deviceIdentity, DeviceIdentity(id: id, name: Host.current().localizedName ?? "这台 Mac")))
             }
             let viewer = viewerSession

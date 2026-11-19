@@ -6,10 +6,11 @@ import Combine
 final class DeskServices {
     let trafficHistoryStore = TrafficHistoryStore()
     let trafficHistory = TrafficHistoryFeed()
-    let portMappings = PortMappingManager()
+    let portMappings: PortMappingManager
     let routeBenchmarkStore = RouteQualityBenchmarkStore()
 
     init() {
+        portMappings = PortMappingManager(localDeviceID: trafficHistoryStore.localDeviceID)
         let feed = trafficHistory
         trafficHistoryStore.observe { [weak feed] records, legacyRecords, message in
             DispatchQueue.main.async {

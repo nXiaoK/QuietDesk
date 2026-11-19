@@ -56,28 +56,119 @@ private enum PortMappingRuleChecks {
         let grant = try JSONSerialization.data(withJSONObject: ["pairingIdentity": identity.base64EncodedString(),
                                                                  "targets": [["host": target.host, "port": target.port]]])
         defaults.values["tcpMappingGrants.v1"] = grant
-        let permissions = PortMappingManager(defaults: defaults)
-        try check(permissions.allowedTargets.isEmpty, "显示授权前须先匹配本机配对身份")
+        let permissions = PortMappingManager(defaults: defaults, showsApprovalPanel: false)
+        try check(permissions.allowedTargets.isEmpty && permissions.trustedRemoteDevices.isEmpty,
+                  "显示授权前须先匹配本机配对身份")
         permissions.selectHostPairingKey(key)
-        try check(permissions.allowedTargets == [target], "相同身份恢复已批准的确切地址和端口")
+        try check(permissions.allowedTargets == [target] && permissions.trustedRemoteDevices.isEmpty,
+                  "相同身份恢复旧版已批准目标并兼容缺少远控设备字段")
         permissions.revoke(target)
-        let revoked = PortMappingManager(defaults: defaults)
+        let revoked = PortMappingManager(defaults: defaults, showsApprovalPanel: false)
         revoked.selectHostPairingKey(key)
         try check(revoked.allowedTargets.isEmpty, "撤回授权在重启后仍生效")
+
+        // Trusted remote-controlled devices skip host confirmation while unrecorded and legacy devices still require it.
+        var visibilityEvents: [Bool] = []
+        let hostManager = PortMappingManager(defaults: defaults, showsApprovalPanel: false)
+        hostManager.onApprovalVisibilityChanged = { visibilityEvents.append($0) }
+        _ = hostManager.makeHost(pairingKey: key)
+        let knownDevice = UUID(), pendingDevice = UUID(), unknownDevice = UUID()
+        let unapprovedTarget = try PortMappingTarget(host: "192.168.10.113", port: 3000)
+
+        var unknownReply: Bool?
+        hostManager.authorizeHostRequest(target: unapprovedTarget, deviceID: unknownDevice) { unknownReply = $0 }
+        var legacyReply: Bool?
+        hostManager.authorizeHostRequest(target: unapprovedTarget, deviceID: nil) { legacyReply = $0 }
+        var pendingDeviceReply: Bool?
+        hostManager.authorizeHostRequest(target: unapprovedTarget, deviceID: pendingDevice) { pendingDeviceReply = $0 }
+        try check(unknownReply == nil && legacyReply == nil && pendingDeviceReply == nil
+            && hostManager.hostApprovalPending && visibilityEvents == [true],
+            "未曾远控的设备与旧版控制端仍进入本机确认流程")
+
+        let noisyName = "Office\n\tMac " + String(repeating: "A", count: 100)
+        hostManager.recordRemoteDevice(DeviceIdentity(id: knownDevice, name: noisyName), at: Date(timeIntervalSince1970: 1_000))
+        try check(hostManager.trustedRemoteDevices.count == 1
+            && hostManager.trustedRemoteDevices[0].id == knownDevice
+            && hostManager.trustedRemoteDevices[0].name.count == 80
+            && !hostManager.trustedRemoteDevices[0].name.contains("\n"),
+            "记录远控设备时清理控制字符并限制名称长度")
+
+        var knownReply: Bool?
+        hostManager.authorizeHostRequest(target: unapprovedTarget, deviceID: knownDevice) { knownReply = $0 }
+        try check(knownReply == true && hostManager.hostApprovalPending,
+                  "曾远控过本机的设备直接放行且不影响其他待确认请求")
+
+        // Recording a device with an in-flight request resolves only that device's request.
+        hostManager.recordRemoteDevice(DeviceIdentity(id: pendingDevice, name: "Studio Mac"), at: Date(timeIntervalSince1970: 2_000))
+        try check(pendingDeviceReply == true && unknownReply == nil && legacyReply == nil && hostManager.hostApprovalPending,
+                  "补录远控设备后立即放行该设备待确认请求，保留其他未远控设备的确认")
+
+        // Denying the remaining unapproved requests clears the approval prompt.
+        hostManager.decide(unapprovedTarget, allow: false)
+        try check(unknownReply == false && legacyReply == false && !hostManager.hostApprovalPending
+            && visibilityEvents == [true, false],
+            "拒绝剩余未远控设备请求后关闭待确认状态")
+
+        // Persistence across restart requires matching the host pairing key.
+        let reloadedHost = PortMappingManager(defaults: defaults, showsApprovalPanel: false)
+        try check(reloadedHost.trustedRemoteDevices.isEmpty, "重启后匹配配对身份前不暴露远控设备记录")
+        reloadedHost.selectHostPairingKey(key)
+        try check(reloadedHost.trustedRemoteDevices.map(\.id) == [pendingDevice, knownDevice],
+                  "重启后按最近远控时间恢复免确认设备列表")
+
+        // Updating an existing device updates metadata without duplicating IDs, and caps total entries.
+        reloadedHost.recordRemoteDevice(DeviceIdentity(id: knownDevice, name: "Renamed Mac"), at: Date(timeIntervalSince1970: 3_000))
+        try check(reloadedHost.trustedRemoteDevices.count == 2
+            && reloadedHost.trustedRemoteDevices.first?.id == knownDevice
+            && reloadedHost.trustedRemoteDevices.first?.name == "Renamed Mac",
+            "同一设备再次远控更新名称和时间且不重复")
+        for index in 0..<(PortMappingManager.maximumTrustedRemoteDevices + 5) {
+            reloadedHost.recordRemoteDevice(DeviceIdentity(id: UUID(), name: "Mac \(index)"),
+                                            at: Date(timeIntervalSince1970: Double(4_000 + index)))
+        }
+        try check(reloadedHost.trustedRemoteDevices.count == PortMappingManager.maximumTrustedRemoteDevices,
+                  "远控设备记录数量受上限保护")
+
+        // Revoking a remote device persists across restart and requires confirmation again.
+        let retainedID = reloadedHost.trustedRemoteDevices[0].id
+        _ = reloadedHost.makeHost(pairingKey: key)
+        var allowedBeforeRevoke: Bool?
+        reloadedHost.authorizeHostRequest(target: unapprovedTarget, deviceID: retainedID) { allowedBeforeRevoke = $0 }
+        try check(allowedBeforeRevoke == true && !reloadedHost.hostApprovalPending, "重启恢复的远控设备仍可直接放行")
+        reloadedHost.revokeRemoteDevice(retainedID)
+        let afterDeviceRevoke = PortMappingManager(defaults: defaults, showsApprovalPanel: false)
+        _ = afterDeviceRevoke.makeHost(pairingKey: key)
+        var afterRevokeReply: Bool?
+        afterDeviceRevoke.authorizeHostRequest(target: unapprovedTarget, deviceID: retainedID) { afterRevokeReply = $0 }
+        try check(!afterDeviceRevoke.trustedRemoteDevices.contains(where: { $0.id == retainedID })
+            && afterRevokeReply == nil && afterDeviceRevoke.hostApprovalPending,
+            "撤回远控设备在重启后生效且再次请求需本机确认")
+        afterDeviceRevoke.shutdownHost()
+
         defaults.values["tcpMappingGrants.v1"] = grant
-        let rotated = PortMappingManager(defaults: defaults)
+        let rotated = PortMappingManager(defaults: defaults, showsApprovalPanel: false)
+        rotated.selectHostPairingKey(key)
+        rotated.recordRemoteDevice(DeviceIdentity(id: knownDevice, name: "Old Pair"))
         rotated.selectHostPairingKey(try PairingKey.generate())
-        let restored = PortMappingManager(defaults: defaults)
+        let restored = PortMappingManager(defaults: defaults, showsApprovalPanel: false)
         restored.selectHostPairingKey(key)
-        try check(rotated.allowedTargets.isEmpty && restored.allowedTargets.isEmpty, "更换配对码会清空旧身份授权")
+        try check(rotated.allowedTargets.isEmpty && rotated.trustedRemoteDevices.isEmpty
+            && restored.allowedTargets.isEmpty && restored.trustedRemoteDevices.isEmpty,
+            "更换配对码会清空旧身份目标授权与远控设备免确认记录")
 
         let original = Data("broken".utf8)
         defaults.values["tcpMappingRules.v1"] = original
-        let corrupted = PortMappingManager(defaults: defaults)
+        let corrupted = PortMappingManager(defaults: defaults, showsApprovalPanel: false)
         var refused = false
         do { try corrupted.saveRule(session) } catch { refused = true }
-        try check(refused && corrupted.storageError != nil && defaults.values["tcpMappingRules.v1"] == original,
-                  "损坏的已有配置保留原值并提示错误")
+        _ = corrupted.makeHost(pairingKey: key)
+        corrupted.recordRemoteDevice(DeviceIdentity(id: knownDevice, name: "Blocked"))
+        var corruptAuthReply: Bool?
+        corrupted.authorizeHostRequest(target: unapprovedTarget, deviceID: knownDevice) { corruptAuthReply = $0 }
+        try check(refused && corrupted.storageError != nil && defaults.values["tcpMappingRules.v1"] == original
+            && corrupted.trustedRemoteDevices.isEmpty && corruptAuthReply == false,
+            "损坏的已有配置保留原值、拒绝写入且不自动放行")
+        corrupted.shutdownHost()
     }
 
     private static func check(_ ok: Bool, _ message: String) throws {

@@ -75,6 +75,7 @@ final class HostSession {
     var paused = false
     var deviceIdentityAdvertised = false
     var remoteDeviceID: UUID?
+    var qualityProbeRequested = false
     var desktopActions: RemoteDesktopActionExecutor?
     var desktopActionTask: Task<Void, Never>?
     var lastDesktopActionResult: DesktopActionResult?

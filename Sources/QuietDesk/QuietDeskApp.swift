@@ -173,6 +173,7 @@ struct DeskView: View {
     @State private var showCapsSettings = false
     @State private var showOptions = false
     @State private var showFullScreenMenu = false
+    @State private var hoveringFullScreenTrigger = false
     @State private var showTrafficStatistics = false
     @State private var showSessionEffects = false
     @State private var showPortMapping = false
@@ -245,15 +246,7 @@ struct DeskView: View {
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 if sessionLayout {
-                    Button { model.canvas.releaseControl(); model.pushClipboard() } label: {
-                        Label(SessionToolAction.sendText.title(), systemImage: SessionToolAction.sendText.symbol())
-                    }.help(SessionToolAction.sendText.help).disabled(!model.connected)
-                    Button { model.canvas.releaseControl(); model.pullClipboard() } label: {
-                        Label(SessionToolAction.receiveText.title(), systemImage: SessionToolAction.receiveText.symbol())
-                    }.help(SessionToolAction.receiveText.help).disabled(!model.connected)
-                    Button { model.canvas.releaseControl(); model.copyRemoteFrame() } label: {
-                        Label(SessionToolAction.captureFrame.title(), systemImage: SessionToolAction.captureFrame.symbol())
-                    }.help(SessionToolAction.captureFrame.help).disabled(!model.connected)
+                    // Group 1: Remote Screen & Audio
                     if model.supportsDisplaySwitching, model.remoteDisplays.count > 1 {
                         Menu {
                             ForEach(model.remoteDisplays) { display in
@@ -287,36 +280,127 @@ struct DeskView: View {
                         .help(model.remoteAudioStatus.isEmpty ? "切换远端系统声音回传" : model.remoteAudioStatus)
                         .disabled(!model.connected)
                     }
-                    if model.supportsRelativeMouse {
+
+                    // Group 2: Spaces & Input Mode Menu
+                    Menu {
+                        Button {
+                            model.sendDesktopAction(.previousSpace)
+                        } label: {
+                            Label(RemoteDesktopAction.previousSpace.title, systemImage: RemoteDesktopAction.previousSpace.toolbarSymbol)
+                        }
+                        .disabled(model.desktopActionUnavailableReason != nil)
+
+                        Button {
+                            model.sendDesktopAction(.missionControl)
+                        } label: {
+                            Label(RemoteDesktopAction.missionControl.title, systemImage: RemoteDesktopAction.missionControl.toolbarSymbol)
+                        }
+                        .disabled(model.desktopActionUnavailableReason != nil)
+
+                        Button {
+                            model.sendDesktopAction(.nextSpace)
+                        } label: {
+                            Label(RemoteDesktopAction.nextSpace.title, systemImage: RemoteDesktopAction.nextSpace.toolbarSymbol)
+                        }
+                        .disabled(model.desktopActionUnavailableReason != nil)
+
+                        Divider()
+
+                        if model.supportsRelativeMouse {
+                            Button {
+                                model.canvas.releaseControl()
+                                model.setRelativeMouseEnabled(!model.relativeMouseEnabled)
+                            } label: {
+                                Label(
+                                    model.relativeMouseEnabled ? "关闭相对鼠标视角锁定" : "开启相对鼠标（3D 视角锁定）",
+                                    systemImage: model.relativeMouseCaptured ? "scope" : "cursorarrow.motionlines"
+                                )
+                            }
+                            .disabled(!model.connected || !model.canControl)
+                        }
+
                         Button {
                             model.canvas.releaseControl()
-                            model.setRelativeMouseEnabled(!model.relativeMouseEnabled)
+                            showCapsSettings = true
                         } label: {
-                            Label(model.relativeMouseEnabled ? "关闭相对鼠标" : "开启相对鼠标",
-                                  systemImage: model.relativeMouseCaptured ? "scope" : "cursorarrow.motionlines")
+                            Label(SessionToolAction.keyboard.title(), systemImage: SessionToolAction.keyboard.symbol())
                         }
-                        .help(model.relativeMouseEnabled
-                              ? "已开启相对鼠标（点击画面锁定视角，按 ⌃⌥Esc 释放光标）；点击关闭"
-                              : "开启相对鼠标（3D 视角锁定模式，按 ⌃⌥Esc 释放光标）")
-                        .disabled(!model.connected || !model.canControl)
+                    } label: {
+                        Label(
+                            model.relativeMouseCaptured ? "视角已锁" : "空间与输入",
+                            systemImage: model.relativeMouseCaptured ? "scope" : "rectangle.3.group"
+                        )
                     }
-                    desktopActionButton(.missionControl)
-                    desktopActionButton(.previousSpace)
-                    desktopActionButton(.nextSpace)
-                    Button { model.canvas.releaseControl(); showCapsSettings = true } label: {
-                        Label(SessionToolAction.keyboard.title(), systemImage: SessionToolAction.keyboard.symbol())
-                    }.help(SessionToolAction.keyboard.help)
-                    Button { model.canvas.releaseControl(); showOptions.toggle() } label: { Label("控制与设置", systemImage: "slider.horizontal.3") }
-                        .help("控制状态、连接画质、键盘、剪贴板与文件；与全屏使用同一面板")
-                        .popover(isPresented: $showOptions, arrowEdge: .top) {
-                            SessionControlsView(model: model, close: { showOptions = false },
-                                                openTraffic: openTrafficStatistics, openEffects: openSessionEffects,
-                                                openPortMapping: openPortMapping)
+                    .help(model.desktopActionUnavailableReason ?? "远端调度中心、桌面空间切换、3D 相对鼠标与键盘设置")
+
+                    // Group 3: Clipboard & Frame Capture
+                    Menu {
+                        Button {
+                            model.canvas.releaseControl()
+                            model.pushClipboard()
+                        } label: {
+                            Label(SessionToolAction.sendText.title(), systemImage: SessionToolAction.sendText.symbol())
                         }
-                    Button { model.canvas.releaseControl(); model.toggleFullScreen() } label: {
+                        .disabled(!model.connected)
+
+                        Button {
+                            model.canvas.releaseControl()
+                            model.pullClipboard()
+                        } label: {
+                            Label(SessionToolAction.receiveText.title(), systemImage: SessionToolAction.receiveText.symbol())
+                        }
+                        .disabled(!model.connected)
+
+                        Divider()
+
+                        Button {
+                            model.canvas.releaseControl()
+                            model.copyRemoteFrame()
+                        } label: {
+                            Label("截取远端画面（⌃⌘S）", systemImage: SessionToolAction.captureFrame.symbol())
+                        }
+                        .disabled(!model.connected)
+
+                        Button {
+                            model.canvas.releaseControl()
+                            model.openReceivedFiles()
+                        } label: {
+                            Label("打开接收文件目录", systemImage: "folder")
+                        }
+                    } label: {
+                        Label("剪贴板与截图", systemImage: "doc.on.clipboard")
+                    }
+                    .help("发送/获取剪贴板文字、截取远端画面（⌃⌘S）与接收文件目录")
+
+                    // Group 4: Unified Session Controls & Settings Popover
+                    Button {
+                        model.canvas.releaseControl()
+                        showOptions.toggle()
+                    } label: {
+                        Label("控制与设置", systemImage: "slider.horizontal.3")
+                    }
+                    .help("画质、防窥安全、光标、音频与端口映射；与全屏共用面板")
+                    .popover(isPresented: $showOptions, arrowEdge: .top) {
+                        SessionControlsView(
+                            model: model,
+                            close: { showOptions = false },
+                            openTraffic: openTrafficStatistics,
+                            openEffects: openSessionEffects,
+                            openPortMapping: openPortMapping
+                        )
+                    }
+
+                    // Group 5: Full Screen & Disconnect
+                    Button {
+                        model.canvas.releaseControl()
+                        model.toggleFullScreen()
+                    } label: {
                         Label(SessionToolAction.fullScreen.title(), systemImage: SessionToolAction.fullScreen.symbol())
-                    }.help(SessionToolAction.fullScreen.help)
+                    }
+                    .help(SessionToolAction.fullScreen.help)
+
                     Divider()
+
                     Button("断开") { model.stop() }
                 }
             }
@@ -436,10 +520,17 @@ struct DeskView: View {
         }
         .overlay {
             if immersive && model.showFullScreenStatistics {
-                FullScreenStatusOverlay(position: $model.fullScreenStatusPosition,
+                FullScreenStatusOverlay(
+                    position: $model.fullScreenStatusPosition,
                     backgroundOpacity: model.fullScreenStatusBackgroundOpacity,
-                    beginDrag: { model.canvas.releaseControl() }) {
-                    fullScreenMetrics
+                    beginDrag: { model.canvas.releaseControl() },
+                    capsule: model.fullScreenStatusCompact
+                ) {
+                    if model.fullScreenStatusCompact {
+                        compactFullScreenMetrics
+                    } else {
+                        fullScreenMetrics
+                    }
                 }
             }
         }
@@ -469,34 +560,47 @@ struct DeskView: View {
         .overlay(alignment: .trailing) {
             if immersive {
                 GeometryReader { geometry in
-                    HStack(spacing: 16) {
+                    HStack(spacing: 12) {
                         Spacer(minLength: 0)
                         if showFullScreenMenu {
                             SessionControlsView(model: model, close: { showFullScreenMenu = false },
                                                 openTraffic: openTrafficStatistics, openEffects: openSessionEffects,
                                                 openPortMapping: openPortMapping)
-                                .frame(height: min(568, max(0, geometry.size.height - 32)))
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                                .shadow(color: .black.opacity(0.3), radius: 16, y: 6)
+                                .frame(height: min(540, max(0, geometry.size.height - 32)))
+                                .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 15, style: .continuous)
+                                        .strokeBorder(Color.white.opacity(0.22), lineWidth: 0.9)
+                                }
+                                .shadow(color: .black.opacity(0.32), radius: 20, y: 8)
                         }
                         Button {
                             model.canvas.releaseControl()
                             showFullScreenMenu.toggle()
                         } label: {
-                            Image(systemName: "slider.horizontal.3")
-                                .font(.system(size: 20, weight: .medium)).frame(width: 44, height: 44)
+                            Image(systemName: showFullScreenMenu ? "chevron.right" : "slider.horizontal.3")
+                                .font(.system(size: 13.5, weight: .semibold))
+                                .frame(width: 26, height: 66)
                                 .foregroundStyle(showFullScreenMenu ? Color.white : Color.primary)
                                 .background {
-                                    if showFullScreenMenu { Circle().fill(Color.accentColor) }
-                                    else { Circle().fill(.regularMaterial) }
+                                    if showFullScreenMenu {
+                                        Capsule().fill(Color.accentColor)
+                                    } else {
+                                        Capsule().fill(.regularMaterial)
+                                    }
                                 }
-                                .overlay(Circle().stroke(.white.opacity(0.2)))
-                                .contentShape(Circle())
+                                .overlay(Capsule().strokeBorder(.white.opacity(0.24), lineWidth: 0.8))
+                                .contentShape(Capsule())
                         }
-                        .buttonStyle(.plain).help(showFullScreenMenu ? "收起控制与设置" : "展开控制与设置")
+                        .buttonStyle(.plain)
+                        .opacity(model.controlling && !hoveringFullScreenTrigger && !showFullScreenMenu ? 0.42 : 1.0)
+                        .onHover { hoveringFullScreenTrigger = $0 }
+                        .animation(.easeOut(duration: 0.16), value: hoveringFullScreenTrigger)
+                        .help(showFullScreenMenu ? "收起控制与设置" : "展开控制与设置")
                         .accessibilityLabel(showFullScreenMenu ? "收起控制与设置" : "展开控制与设置")
                     }
-                    .padding(.trailing, 16).frame(maxHeight: .infinity)
+                    .padding(.trailing, 8)
+                    .frame(maxHeight: .infinity)
                 }
             }
         }
@@ -692,48 +796,108 @@ struct DeskView: View {
         }
     }
 
-    /// One click sends the action; the reason it is unavailable replaces the tooltip.
-    private func desktopActionButton(_ action: RemoteDesktopAction) -> some View {
-        let reason = model.desktopActionUnavailableReason
-        return Button { model.sendDesktopAction(action) } label: { Label(action.title, systemImage: action.toolbarSymbol) }
-            .help(action.helpText(unavailableReason: reason, privacyEnabled: model.sessionEffects.privacy))
-            .disabled(reason != nil)
-    }
-
     private var statusBar: some View {
         HStack(spacing: 10) {
             if model.mode == .host {
-                Circle().fill(model.active ? .green : model.working ? .orange : .secondary).frame(width: 6, height: 6)
+                Circle()
+                    .fill(model.active ? DeskPalette.emerald : model.working ? DeskPalette.amber : .secondary)
+                    .frame(width: 6.5, height: 6.5)
                 Text(model.status).lineLimit(1).textSelection(.enabled)
                 Spacer(minLength: 8)
-                if !model.resolution.isEmpty { Text(model.resolution) }
-                Text(model.frameRate)
-                Text(model.traffic)
+                if !model.resolution.isEmpty { statusPill(model.resolution) }
+                statusPill(model.frameRate)
+                statusPill(model.traffic)
             } else if sessionLayout {
-                Label(model.relativeMouseCaptured ? "相对鼠标锁定（⌃⌥Esc 释放）" : controlStatus,
-                      systemImage: model.relativeMouseCaptured ? "scope" : (model.controlling ? "cursorarrow.rays" : "cursorarrow"))
-                    .foregroundStyle(model.controlling ? Color.accentColor : Color.secondary).lineLimit(1)
-                    .help(model.status)
+                HStack(spacing: 5) {
+                    Image(systemName: model.relativeMouseCaptured ? "scope" : (model.controlling ? "cursorarrow.rays" : "cursorarrow"))
+                    Text(model.relativeMouseCaptured ? "相对鼠标锁定（⌃⌥Esc 释放）" : controlStatus)
+                        .lineLimit(1)
+                }
+                .fontWeight(model.controlling ? .semibold : .regular)
+                .foregroundStyle(model.controlling ? Color.accentColor : Color.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background((model.controlling ? Color.accentColor : Color.primary).opacity(0.08), in: Capsule())
+                .help(model.status)
+
                 Spacer(minLength: 8)
-                Label(model.canvas.synchronizesClipboard ? "双向同步" : "同步未启用", systemImage: "arrow.triangle.2.circlepath")
-                    .help(model.clipboardStatus.isEmpty ? "文字和图片按控制端焦点同步；文件需逐次确认，接收完成后再粘贴。" : model.clipboardStatus)
-                Label(model.capsLockEnabled ? (model.capsLockRunning ? "Caps Lock 转发" : "Caps Lock 待生效") : "Caps Lock 关闭", systemImage: "capslock")
-                    .help(model.inputStatus.isEmpty ? "短按切换中英文；按住至少 0.6 秒后松开切换大写。仅在远程画面获得焦点时捕获。" : model.inputStatus)
+
                 if model.pendingFileOffer != nil {
-                    Image(systemName: "doc.on.doc").foregroundStyle(.orange).help("1 个文件请求待确认")
+                    Label("1 个文件待确认", systemImage: "doc.on.doc")
+                        .foregroundStyle(DeskPalette.amber)
                 }
                 metrics
             } else {
-                Circle().fill(locked ? .orange : .secondary).frame(width: 6, height: 6)
-                Text(locked ? model.status : model.connectionFailure == nil ? "未连接" : "连接失败").lineLimit(1)
+                Circle()
+                    .fill(locked ? DeskPalette.amber : .secondary.opacity(0.6))
+                    .frame(width: 6.5, height: 6.5)
+                Text(locked ? model.status : model.connectionFailure == nil ? "准备就绪" : "上次连接未成功")
+                    .lineLimit(1)
                 Spacer(minLength: 8)
-                Text("连接后：⌃⌥Esc 释放键盘鼠标 · ⌃⌘F 全屏 · Esc 发送到远端")
-                    .foregroundStyle(.secondary).lineLimit(1)
+                Text("连接后：⌃⌥Esc 释放键鼠 · ⌃⌘F 全屏 · ⌃⌘S 远端截图 · Esc 发送到远端")
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
         }
-        .font(.system(size: 11)).monospacedDigit().foregroundStyle(.secondary)
-        .padding(.horizontal, 12).frame(height: 28)
-        .background(Color(nsColor: .controlBackgroundColor))
+        .font(.system(size: 11))
+        .monospacedDigit()
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 16)
+        .frame(height: 30)
+        .background(.ultraThinMaterial)
+    }
+
+    private func statusPill(_ value: String) -> some View {
+        Text(value)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(DeskPalette.subtleFill, in: Capsule())
+    }
+
+    private var shortTransportLabel: String {
+        switch model.mediaTransportStatus {
+        case "UDP 视频": return "UDP"
+        case "TCP 视频": return "TCP"
+        case "TCP 兼容模式": return "TCP 兼容"
+        case "中继 UDP 视频": return "中继 UDP"
+        case "中继 TCP 视频": return "中继 TCP"
+        case "中继 TCP 兼容模式": return "中继 TCP 兼容"
+        case "直连 UDP 视频（中继打洞）": return "直连 UDP"
+        default: return model.mediaTransportStatus
+        }
+    }
+
+    @ViewBuilder
+    private var compactFullScreenMetrics: some View {
+        if model.connected {
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(model.controlling ? Color(red: 0.20, green: 0.88, blue: 0.56) : Color.white.opacity(0.55))
+                    .frame(width: 6.5, height: 6.5)
+                Text(model.controlling ? "控制中" : "已释放")
+            }
+            Text("·").foregroundStyle(.white.opacity(0.45))
+            Text("\(shortTransportLabel) \(model.latency)")
+            if !model.mediaLoss.isEmpty {
+                if model.mediaLossHigh {
+                    Text(model.mediaLoss).foregroundStyle(Color.red)
+                } else {
+                    Text(model.mediaLoss)
+                }
+            }
+            Text("·").foregroundStyle(.white.opacity(0.45))
+            if !model.activeVideoFormatBadge.isEmpty {
+                Text(model.activeVideoFormatBadge)
+            }
+            Text("\(model.frameRate) · \(model.traffic)")
+            if let since = model.connectedSince {
+                Text("·").foregroundStyle(.white.opacity(0.45))
+                Text(since, style: .timer)
+            }
+        } else {
+            Text(model.sessionPaused ? "空闲暂停" : model.reconnecting ? "正在重连…" : "未连接")
+                .foregroundStyle(Color.orange)
+        }
     }
 
     private var controlStatus: String {

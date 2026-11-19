@@ -200,6 +200,9 @@ final class DeskModel: ObservableObject {
     @Published var showFullScreenStatistics = UserDefaults.standard.bool(forKey: "showFullScreenStatistics") {
         didSet { UserDefaults.standard.set(showFullScreenStatistics, forKey: "showFullScreenStatistics") }
     }
+    @Published var fullScreenStatusCompact = UserDefaults.standard.object(forKey: "fullScreenStatusCompact") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(fullScreenStatusCompact, forKey: "fullScreenStatusCompact") }
+    }
     // The vertical status starts from its bottom-right default; a position saved for the old single row
     // ("fullScreenStatusPosition") is left for older versions and not reused.
     private static let fullScreenStatusPositionKey = "fullScreenStatusPositionV2"

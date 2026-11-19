@@ -132,6 +132,7 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
     @State private var page = Page.main
 
     private enum Page { case main, keyboard }
+
     private var title: String {
         switch page {
         case .main: return presentation.remoteName.isEmpty ? "控制与设置" : presentation.remoteName
@@ -140,68 +141,125 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top, spacing: 8) {
+        VStack(alignment: .leading, spacing: 11) {
+            // Header
+            HStack(alignment: .center, spacing: 8) {
                 if page != .main {
-                    Button { perform(.releaseControl); page = .main } label: {
-                        Image(systemName: "chevron.left").frame(width: 22, height: 24)
+                    Button {
+                        perform(.releaseControl)
+                        page = .main
+                    } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 12, weight: .semibold))
+                            .frame(width: 24, height: 24)
+                            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                     }
-                    .buttonStyle(.plain).help("返回控制与设置").accessibilityLabel("返回控制与设置")
+                    .buttonStyle(.plain)
+                    .help("返回控制与设置")
+                    .accessibilityLabel("返回控制与设置")
                 }
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(1).help(title)
-                    Text(presentation.connectionSummary).font(.system(size: 11)).foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 14, weight: .bold))
+                        .lineLimit(1)
+                        .help(title)
+                    Text(presentation.connectionSummary)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
-                Spacer(minLength: 0)
-                Button(action: close) { Image(systemName: "xmark").frame(width: 22, height: 22) }
-                    .buttonStyle(.plain).foregroundStyle(.secondary)
-                    .help("收起控制与设置").accessibilityLabel("收起控制与设置")
+
+                Spacer(minLength: 4)
+
+                Button {
+                    activate(.endSession)
+                } label: {
+                    Text(presentation.hasSession ? "断开" : "返回连接")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(presentation.hasSession ? Color.red : Color.primary)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 4)
+                        .background(
+                            (presentation.hasSession ? Color.red : Color.primary).opacity(0.10),
+                            in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        )
+                }
+                .buttonStyle(.plain)
+                .disabled(!presentation.isEnabled(.endSession))
+                .help(SessionToolAction.endSession.help)
+
+                Button(action: close) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 24, height: 24)
+                        .background(Color.primary.opacity(0.05), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("收起控制与设置")
+                .accessibilityLabel("收起控制与设置")
             }
-            Label(presentation.control.title, systemImage: presentation.control.symbol)
-                .font(.system(size: 11)).foregroundStyle(presentation.control.state == .controlling ? Color.accentColor : Color.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+
+            // Live Control Status Pill
+            HStack(spacing: 6) {
+                Image(systemName: presentation.control.symbol)
+                    .font(.system(size: 11, weight: .semibold))
+                Text(presentation.control.title)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(2)
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(presentation.control.state == .controlling ? Color.accentColor : Color.secondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                (presentation.control.state == .controlling ? Color.accentColor : Color.primary).opacity(0.07),
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+
             ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 11) {
                     switch page {
-                    case .keyboard: keyboard
+                    case .keyboard:
+                        keyboard
                     case .main:
-                        HStack(spacing: 8) {
-                            shortcutButton(.releaseControl)
-                            shortcutButton(.fullScreen)
+                        // Top 4 Quick Action Tiles + Clipboard Row
+                        HStack(spacing: 6) {
+                            quickTile(.releaseControl)
+                            quickTile(.fullScreen)
+                            quickTile(.captureFrame)
                         }
                         HStack(spacing: 6) {
-                            compactButton(.sendText)
-                            compactButton(.receiveText)
-                            compactButton(.captureFrame)
+                            compactActionPill(.sendText)
+                            compactActionPill(.receiveText)
                         }
+
+                        // Inline Remote Desktop Spaces (kept inline on main page!)
                         desktop
-                        VStack(spacing: 0) {
-                            navigationButton(.keyboard, detail: presentation.keyboardSummary)
-                        }
+
                         Divider()
+
                         settings
+
                         Divider()
-                        VStack(spacing: 0) {
-                            navigationButton(.portMapping)
-                            navigationButton(.privacy)
-                            navigationButton(.traffic)
+
+                        VStack(spacing: 2) {
+                            navigationRow(.keyboard, detail: presentation.keyboardSummary)
+                            navigationRow(.privacy)
+                            navigationRow(.portMapping)
+                            navigationRow(.traffic)
                         }
                     }
-                }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .frame(minHeight: 0)
-            Divider()
-            HStack {
-                Text("⌃⌥Esc 释放 · ⌃⌘F 切换全屏")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
-                Spacer(minLength: 4)
-                Button(presentation.hasSession ? "断开" : "返回连接") { activate(.endSession) }
-                    .foregroundStyle(presentation.hasSession ? Color.red : Color.primary)
-                    .disabled(!presentation.isEnabled(.endSession))
-            }.buttonStyle(.bordered).controlSize(.small)
         }
-        .font(.system(size: 12)).padding(14).frame(width: 324).frame(maxHeight: 568)
+        .font(.system(size: 12))
+        .padding(14)
+        .frame(width: 348)
+        .frame(maxHeight: 540)
         .background(Color(nsColor: .windowBackgroundColor))
         .onExitCommand(perform: close)
     }
@@ -212,35 +270,72 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
         if action == .keyboard { page = .keyboard }
     }
 
-    private func shortcutButton(_ action: SessionToolAction) -> some View {
+    private func quickTile(_ action: SessionToolAction) -> some View {
         Button { activate(action) } label: {
-            VStack(spacing: 3) {
-                Label(action.title(fullScreen: presentation.fullScreen), systemImage: action.symbol(fullScreen: presentation.fullScreen))
-                if let shortcut = action.shortcut { Text(shortcut).font(.system(size: 10)).foregroundStyle(.secondary) }
-            }.frame(maxWidth: .infinity)
-        }.buttonStyle(.bordered).controlSize(.regular).help(action.help)
-    }
-
-    private func compactButton(_ action: SessionToolAction) -> some View {
-        Button { activate(action) } label: {
-            VStack(spacing: 4) {
-                Image(systemName: action.symbol())
-                Text(action.title()).font(.system(size: 10))
-            }.frame(maxWidth: .infinity, minHeight: 32)
+            VStack(spacing: 3.5) {
+                Image(systemName: action.symbol(fullScreen: presentation.fullScreen))
+                    .font(.system(size: 13.5, weight: .semibold))
+                Text(action.title(fullScreen: presentation.fullScreen))
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .lineLimit(1)
+                if let shortcut = action.shortcut {
+                    Text(shortcut)
+                        .font(.system(size: 9.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 7)
+            .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
-        .buttonStyle(.bordered).controlSize(.small).help(action.help)
+        .buttonStyle(.plain)
+        .help(action.help)
         .disabled(!presentation.isEnabled(action))
     }
 
-    private func navigationButton(_ action: SessionToolAction, detail: String? = nil) -> some View {
+    private func compactActionPill(_ action: SessionToolAction) -> some View {
+        Button { activate(action) } label: {
+            HStack(spacing: 5) {
+                Image(systemName: action.symbol())
+                    .font(.system(size: 11, weight: .medium))
+                Text(action.title())
+                    .font(.system(size: 11, weight: .medium))
+            }
+            .frame(maxWidth: .infinity, minHeight: 28)
+            .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help(action.help)
+        .disabled(!presentation.isEnabled(action))
+    }
+
+    private func navigationRow(_ action: SessionToolAction, detail: String? = nil) -> some View {
         Button { activate(action) } label: {
             HStack(spacing: 8) {
-                Label(action.title(), systemImage: action.symbol())
+                Image(systemName: action.symbol())
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16)
+                Text(action.title())
+                    .font(.system(size: 12, weight: .medium))
                 Spacer(minLength: 0)
-                if let detail { Text(detail).font(.system(size: 10)).foregroundStyle(.secondary) }
-                Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
-            }.frame(minHeight: 30)
-            .contentShape(Rectangle())
-        }.buttonStyle(.plain).help(action.help)
+                if let detail {
+                    Text(detail)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(.secondary)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 8)
+            .frame(minHeight: 28)
+            .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help(action.help)
     }
 }

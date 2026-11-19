@@ -581,6 +581,39 @@ private struct RemoteCanvasChecks {
                         "The default background opacity was not applied: \(standard)")
         }
 
+        run("Capsule status mode defaults to top-center and consumes only its own bounds") {
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
+            let window = NSWindow(contentRect: canvas.bounds, styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            defer { window.close() }
+            canvas.canControl = true
+            let hosting = NSHostingView(rootView: CanvasView(canvas: canvas).overlay {
+                FullScreenStatusOverlay(position: .constant(nil), backgroundOpacity: 0.65, beginDrag: {}, capsule: true) {
+                    Text("控制中"); Text("UDP 1.8 ms"); Text("60 fps")
+                }
+            }.frame(width: 900, height: 600))
+            window.contentView = hosting
+            for _ in 0..<3 {
+                RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+                hosting.layoutSubtreeIfNeeded()
+            }
+            @MainActor func dragView(_ view: NSView) -> StatusDragView? {
+                if let view = view as? StatusDragView { return view }
+                return view.subviews.compactMap { dragView($0) }.first
+            }
+            guard let target = dragView(hosting) else { throw CanvasCheckFailure("Capsule status drag target missing") }
+            let winRect = target.convert(target.bounds, to: nil)
+            try require(abs(winRect.midX - 450) < 20 && winRect.midY > 500, "Capsule did not default near top-center: \(winRect)")
+            guard let onCapsule = NSEvent.mouseEvent(with: .leftMouseDown, location: CGPoint(x: winRect.midX, y: winRect.midY),
+                modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1),
+                  let onCanvas = NSEvent.mouseEvent(with: .leftMouseDown, location: CGPoint(x: 450, y: 300),
+                modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1) else {
+                throw CanvasCheckFailure("Could not synthesize capsule hit-test events")
+            }
+            try require(!canvas.isInputTarget(of: onCapsule) && canvas.isInputTarget(of: onCanvas),
+                        "Capsule status hit-testing leaked or blocked remote canvas")
+        }
+
         run("Keyboard routing follows the actual first responder and rejects other windows") {
             let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
             let window = NSWindow(contentRect: canvas.bounds, styleMask: .borderless, backing: .buffered, defer: false)

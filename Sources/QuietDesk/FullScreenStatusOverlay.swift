@@ -7,6 +7,7 @@ struct FullScreenStatusOverlay<Content: View>: View {
     @Binding var position: CGPoint?
     let backgroundOpacity: Double?
     let beginDrag: () -> Void
+    var capsule: Bool = false
     @ViewBuilder let content: Content
     @State private var statusSize: CGSize = .zero
     @State private var dragOrigin: CGPoint?
@@ -14,26 +15,41 @@ struct FullScreenStatusOverlay<Content: View>: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let automatic = FullScreenStatusPlacement.automaticOrigin(container: geometry.size, status: statusSize)
+            let automatic = capsule
+                ? CGPoint(x: max(12, (geometry.size.width - statusSize.width) * 0.5), y: 40)
+                : FullScreenStatusPlacement.automaticOrigin(container: geometry.size, status: statusSize)
             let saved = position.map { FullScreenStatusPlacement.origin(for: $0, container: geometry.size, status: statusSize) } ?? automatic
             let proposed = dragOrigin.map { CGPoint(x: $0.x + translation.width, y: $0.y + translation.height) } ?? saved
             let normalized = FullScreenStatusPlacement.position(for: proposed, container: geometry.size, status: statusSize)
             let origin = FullScreenStatusPlacement.origin(for: normalized, container: geometry.size, status: statusSize)
             let background = backgroundOpacity.flatMap { $0.isFinite ? min(1, max(0, $0)) : nil }
                 ?? FullScreenStatusPlacement.defaultBackgroundOpacity
-            VStack(alignment: .leading, spacing: 1) { content }
-                .font(.system(size: 11, weight: .semibold))
-                .monospacedDigit()
-                .lineLimit(1)
-                .foregroundStyle(.white)
-                // Fades in as the background clears, so the text stays readable over a bright picture.
-                .shadow(color: .black.opacity(0.6 * (1 - background)), radius: 1)
-                .fixedSize()
-                .padding(.horizontal, 6).padding(.vertical, 4)
-                .background {
-                    RoundedRectangle(cornerRadius: 6).fill(.black.opacity(background))
-                    if dragOrigin != nil { RoundedRectangle(cornerRadius: 6).strokeBorder(.white.opacity(0.5)) }
+            Group {
+                if capsule {
+                    HStack(spacing: 10) { content }
+                        .padding(.horizontal, 13)
+                        .padding(.vertical, 6)
+                        .background {
+                            Capsule().fill(.black.opacity(background))
+                            Capsule().strokeBorder(.white.opacity(dragOrigin != nil ? 0.55 : 0.18), lineWidth: 0.9)
+                        }
+                } else {
+                    VStack(alignment: .leading, spacing: 1) { content }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 4)
+                        .background {
+                            RoundedRectangle(cornerRadius: 6).fill(.black.opacity(background))
+                            if dragOrigin != nil { RoundedRectangle(cornerRadius: 6).strokeBorder(.white.opacity(0.5)) }
+                        }
                 }
+            }
+            .font(.system(size: 11, weight: .semibold))
+            .monospacedDigit()
+            .lineLimit(1)
+            .foregroundStyle(.white)
+            // Fades in as the background clears, so the text stays readable over a bright picture.
+            .shadow(color: .black.opacity(0.6 * (1 - background)), radius: 1)
+            .fixedSize()
                 // Measured directly: a size preference would be reset by the drag target, a sibling that reports
                 // the key's default, which left every position computed for a zero-sized status.
                 .onGeometryChange(for: CGSize.self, of: { $0.size }) { statusSize = $0 }

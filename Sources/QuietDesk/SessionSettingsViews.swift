@@ -117,109 +117,167 @@ struct ConnectionSettingsView: View {
 }
 
 private struct ConnectionOptionsSections: View {
+    private enum CompactTab: String, CaseIterable, Hashable {
+        case display = "画质与屏幕"
+        case inputAudio = "光标与声音"
+        case transport = "网络与同步"
+    }
+
     @ObservedObject var model: DeskModel
     let compact: Bool
+    @State private var compactTab: CompactTab = .display
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            SessionQualitySection(model: model, compact: compact)
-            Divider()
-            VStack(alignment: .leading, spacing: 8) {
-                Text("连接").font(.headline)
-                if model.connected, model.supportsDisplaySwitching, !model.remoteDisplays.isEmpty {
-                    HStack(spacing: 8) {
-                        Text("远端屏幕").foregroundStyle(.secondary)
-                        Picker("远端屏幕", selection: Binding(
-                            get: { model.remoteSelectedDisplayID },
-                            set: { model.selectRemoteDisplay($0) }
-                        )) {
-                            ForEach(model.remoteDisplays) { display in
-                                Text(display.summary).tag(display.id)
-                            }
-                        }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                        .disabled(model.remoteDisplays.count < 2 || model.displaySwitchWorking)
-                    }
-                    if !model.displaySwitchStatus.isEmpty {
-                        Text(model.displaySwitchStatus).font(.caption).foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+        Group {
+            if compact {
+                VStack(alignment: .leading, spacing: 10) {
+                    DeskSegmentedTabs(
+                        tabs: CompactTab.allCases.map { ($0, $0.rawValue) },
+                        selection: $compactTab
+                    )
+                    switch compactTab {
+                    case .display:
+                        displayAndQualityBlock
+                    case .inputAudio:
+                        cursorAndAudioBlock
+                    case .transport:
+                        networkAndClipboardBlock
                     }
                 }
+            } else {
+                VStack(alignment: .leading, spacing: 14) {
+                    displayAndQualityBlock
+                    Divider()
+                    cursorAndAudioBlock
+                    Divider()
+                    networkAndClipboardBlock
+                }
+            }
+        }
+        .toggleStyle(.switch)
+        .controlSize(.small)
+    }
+
+    private var displayAndQualityBlock: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            if model.connected, model.supportsDisplaySwitching, !model.remoteDisplays.isEmpty {
                 HStack(spacing: 8) {
-                    Text("画面显示").foregroundStyle(.secondary)
-                    Picker("画面显示", selection: $model.canvasScalingMode) {
-                        ForEach(RemoteCanvasScalingMode.allCases, id: \.self) { mode in
-                            Text(mode.title).tag(mode)
+                    Text("远端显示器").foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    Picker("远端屏幕", selection: Binding(
+                        get: { model.remoteSelectedDisplayID },
+                        set: { model.selectRemoteDisplay($0) }
+                    )) {
+                        ForEach(model.remoteDisplays) { display in
+                            Text(display.summary).tag(display.id)
                         }
                     }
                     .labelsHidden()
-                    .pickerStyle(.segmented)
+                    .pickerStyle(.menu)
+                    .disabled(model.remoteDisplays.count < 2 || model.displaySwitchWorking)
                 }
-                Toggle("本地即时光标", isOn: $model.lowLatencyCursorEnabled)
-                    .disabled(model.connected && !model.supportsIndependentCursor)
-                    .help("减少双光标跟随；远端形状不可用时使用通用指针。")
-                if model.connected {
-                    Text(model.controlTransportStatus).font(.caption).foregroundStyle(.secondary)
-                    Text(model.supportsIndependentCursor ? model.cursorStatus : "对端版本不支持独立光标")
-                        .font(.caption).foregroundStyle(.secondary)
+                if !model.displaySwitchStatus.isEmpty {
+                    Text(model.displaySwitchStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Toggle(isOn: Binding(get: { model.relativeMouseEnabled }, set: { model.setRelativeMouseEnabled($0) })) {
-                    Text("相对鼠标（3D 视角锁定）").frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .disabled(!model.connected || !model.supportsRelativeMouse || !model.canControl)
-                .help("开启后点击远程画面会隐藏并锁定本地光标，按无边界相对位移驱动远端视角或鼠标；按 ⌃⌥Esc 立即释放光标。")
-                if model.connected {
-                    Text(!model.supportsRelativeMouse ? "对端版本不支持相对鼠标视角锁定"
-                         : model.relativeMouseCaptured ? "相对鼠标已锁定 · 按 ⌃⌥Esc 立即释放光标"
-                         : model.relativeMouseEnabled ? "相对鼠标待激活 · 点击远程画面锁定光标（按 ⌃⌥Esc 释放）"
-                         : "相对鼠标未开启（适合 3D 建模/第一人称视角；会话结束自动重置）")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    Text(model.supportsTrackpadGestures ? "触控板双指缩放/旋转手势透传已就绪" : "对端版本不支持触控板缩放/旋转手势")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                }
-                Toggle(isOn: Binding(get: { model.remoteAudioEnabled }, set: { model.setRemoteAudioEnabled($0) })) {
-                    Text("远端声音回传").frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .disabled(model.connected && !model.supportsRemoteAudio)
-                .help("通过 ScreenCaptureKit 原生采集远端系统声音并以低延迟 Opus 回传；可与“被控端本机静音”同时开启。")
-                if model.connected {
-                    Text(model.supportsRemoteAudio ? model.remoteAudioStatus : "对端版本不支持远端声音回传")
-                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                }
-                Toggle("仅使用 TCP（下次连接生效）", isOn: $model.mediaTCPOnly)
-                Text(model.connected ? model.mediaRouteSummary : (model.mediaTCPOnly ? "视频使用 TCP" : "视频优先 UDP，不可用时自动使用 TCP"))
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                if model.relayEnabled { RelayPeerAssistPicker(model: model) }
-                Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) { Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading) }
-                Toggle(isOn: Binding(get: { model.disableIdleAutoPause }, set: { model.setDisableIdleAutoPause($0) })) {
-                    Text(IdleAutoPausePresentation.toggleTitle).frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .help(IdleAutoPausePresentation.toggleHelp)
-                Text(IdleAutoPausePresentation(
-                    disableAutoPause: model.disableIdleAutoPause,
-                    connected: model.connected,
-                    reconnecting: model.reconnecting,
-                    supportsSessionPause: model.supportsSessionPause,
-                    sessionPaused: model.sessionPaused,
-                    sessionPauseStatus: model.sessionPauseStatus
-                ).summary)
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                Toggle("连接诊断", isOn: $model.connectionDiagnosticsEnabled)
-                    .disabled(model.isControllingAnotherMac)
-                Text("连接前开启，结束后自动显示整段会话的线路、延迟、UDP 丢包、帧率和吞吐量。报告仅在本机内存中保留。")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                Toggle(isOn: $model.showFullScreenStatistics) { Text("全屏显示连接状态").frame(maxWidth: .infinity, alignment: .leading) }
-                if model.showFullScreenStatistics { FullScreenStatusSettings(model: model) }
-                Text("每行一项，依次为连接时长、视频线路、解码 FPS、收发流量、本次连接累计流量、往返延迟、UDP 丢包（达到 3% 时为红色）、分辨率。线路名精简显示，白字黑底，默认在右下角；背景透明度可调，可直接拖动状态调整位置。累计流量含视频、控制和剪贴板的收发，断线自动重连后重新累计。往返延迟约每 5 秒更新；不代表画面上屏延迟。静止画面 FPS 可能为 0。")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
-            Divider()
-            VStack(alignment: .leading, spacing: 8) {
-                Text("剪贴板与文件").font(.headline)
-                Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) { Text("双向同步文字、图片和文件").frame(maxWidth: .infinity, alignment: .leading) }
-                Text("文字和图片仅在按 ⌘V 或右键粘贴时按需同步，复制不占流量；文件需接收端确认后下载，完成后再粘贴。")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+
+            SessionQualitySection(model: model, compact: compact)
+
+            HStack(spacing: 8) {
+                Text("画面缩放").foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                Picker("画面显示", selection: $model.canvasScalingMode) {
+                    ForEach(RemoteCanvasScalingMode.allCases, id: \.self) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .fixedSize()
+            }
+        }
+    }
+
+    private var cursorAndAudioBlock: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            if !compact {
+                Text("光标、触控板与音频").font(.headline)
+            }
+
+            Toggle(isOn: Binding(get: { model.remoteAudioEnabled }, set: { model.setRemoteAudioEnabled($0) })) {
+                VStack(alignment: .leading, spacing: 1.5) {
+                    Text("远端系统声音回传")
+                        .fontWeight(.medium)
+                    Text(model.connected
+                         ? (model.supportsRemoteAudio ? (model.remoteAudioStatus.isEmpty ? "48 kHz Opus 低延迟音频" : model.remoteAudioStatus) : "对端版本不支持声音回传")
+                         : "可与「被控端本机静音」同时开启")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .disabled(model.connected && !model.supportsRemoteAudio)
+
+            Toggle(isOn: $model.lowLatencyCursorEnabled) {
+                VStack(alignment: .leading, spacing: 1.5) {
+                    Text("本地即时光标")
+                        .fontWeight(.medium)
+                    Text(model.connected
+                         ? (model.supportsIndependentCursor ? model.cursorStatus : "对端版本不支持独立光标")
+                         : "首帧分离视频与指针，消除双光标跟随")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .disabled(model.connected && !model.supportsIndependentCursor)
+
+            Toggle(isOn: Binding(get: { model.relativeMouseEnabled }, set: { model.setRelativeMouseEnabled($0) })) {
+                VStack(alignment: .leading, spacing: 1.5) {
+                    Text("相对鼠标（3D 视角锁定）")
+                        .fontWeight(.medium)
+                    Text(!model.connected ? "连接后可用 · 适合 3D 建模与视角旋转"
+                         : !model.supportsRelativeMouse ? "对端版本不支持相对鼠标"
+                         : model.relativeMouseCaptured ? "已锁定 · 按 ⌃⌥Esc 立即释放光标"
+                         : model.relativeMouseEnabled ? "待激活 · 点击远程画面锁定（⌃⌥Esc 释放）"
+                         : "点击画面锁定无边界位移（会话结束重置）")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .disabled(!model.connected || !model.supportsRelativeMouse || !model.canControl)
+
+            if model.connected {
+                Text("\(model.controlTransportStatus) · \(model.supportsTrackpadGestures ? "触控板缩放/旋转手势已就绪" : "旧端不含触控板缩放手势")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var networkAndClipboardBlock: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            if !compact {
+                Text("连接策略、全屏状态与剪贴板").font(.headline)
+            }
+
+            Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) {
+                VStack(alignment: .leading, spacing: 1.5) {
+                    Text("双向按需同步文字、图片与文件")
+                        .fontWeight(.medium)
+                    Text("按 ⌘V 时拉取文字图片；文件需接收端确认后下载")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            HStack(spacing: 8) {
                 Button { model.canvas.releaseControl(); model.openReceivedFiles() } label: {
                     Label("打开接收文件目录", systemImage: "folder")
                 }
@@ -228,13 +286,55 @@ private struct ConnectionOptionsSections: View {
                     Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }
                 }
             }
+
+            Divider()
+
+            Toggle(isOn: $model.showFullScreenStatistics) {
+                HStack(spacing: 6) {
+                    Text("全屏显示实时连接指标")
+                        .fontWeight(.medium)
+                    DeskInfoPopoverButton(
+                        title: "全屏连接状态说明",
+                        lines: [
+                            "单行胶囊模式精简展示控制态、线路延迟、UDP 丢包（≥3% 标红）、画质帧率与时长，默认顶部居中。",
+                            "多行详细模式逐行展示时长、线路、FPS、实时与累计流量、RTT、丢包与分辨率，默认右下角。",
+                            "可直接按住浮层拖拽调整位置；RTT 约每 5 秒更新，静止画面 0 fps 属正常省流。"
+                        ]
+                    )
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if model.showFullScreenStatistics { FullScreenStatusSettings(model: model) }
+
+            Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) {
+                Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            Toggle(isOn: Binding(get: { model.disableIdleAutoPause }, set: { model.setDisableIdleAutoPause($0) })) {
+                Text(IdleAutoPausePresentation.toggleTitle).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .help(IdleAutoPausePresentation.toggleHelp)
+
+            Toggle("仅使用 TCP 视频（下次连接生效）", isOn: $model.mediaTCPOnly)
+            Text(model.connected ? model.mediaRouteSummary : (model.mediaTCPOnly ? "下次连接视频固定走 TCP" : "优先加密 UDP，不可达自动回退 TCP"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if model.relayEnabled { RelayPeerAssistPicker(model: model) }
+
+            if !compact {
+                Toggle("结束连接后生成会话诊断报告", isOn: $model.connectionDiagnosticsEnabled)
+                    .disabled(model.isControllingAnotherMac)
+            }
+
             if !model.lastDisconnect.isEmpty {
                 Text("上次断开：\(model.lastDisconnect)")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .lineLimit(3).textSelection(.enabled).help(model.lastDisconnect)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
             }
         }
-        .toggleStyle(.switch).controlSize(.small)
     }
 }
 
@@ -337,22 +437,40 @@ private struct FullScreenStatusSettings: View {
     @ObservedObject var model: DeskModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Text("背景透明度")
+                Text("样式").foregroundStyle(.secondary)
+                Spacer()
+                Picker("状态样式", selection: $model.fullScreenStatusCompact) {
+                    Text("单行胶囊").tag(true)
+                    Text("多行详细").tag(false)
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .fixedSize()
+                .onChange(of: model.fullScreenStatusCompact) { _, _ in
+                    model.fullScreenStatusPosition = nil
+                }
+            }
+            HStack {
+                Text("背景透明度").foregroundStyle(.secondary)
                 Slider(value: Binding(get: { 1 - model.fullScreenStatusEffectiveBackgroundOpacity },
                                       set: { model.fullScreenStatusBackgroundOpacity = 1 - $0 }), in: 0...1, step: 0.05)
                     .accessibilityLabel("连接状态背景透明度")
                 Text("\(Int(((1 - model.fullScreenStatusEffectiveBackgroundOpacity) * 100).rounded()))%")
-                    .monospacedDigit().frame(width: 40, alignment: .trailing)
+                    .monospacedDigit().frame(width: 38, alignment: .trailing)
             }
             HStack {
-                Text("直接拖动状态可调整位置").font(.caption).foregroundStyle(.secondary)
+                Text("按住状态浮层可直接拖动位置").font(.caption).foregroundStyle(.secondary)
                 Spacer(minLength: 4)
-                Button("恢复自动位置") { model.fullScreenStatusPosition = nil }
-                    .buttonStyle(.link).disabled(model.fullScreenStatusPosition == nil)
+                Button("恢复默认位置") { model.fullScreenStatusPosition = nil }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .disabled(model.fullScreenStatusPosition == nil)
             }
         }
+        .padding(8)
+        .background(DeskPalette.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 

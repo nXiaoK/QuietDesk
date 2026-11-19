@@ -992,6 +992,44 @@ private struct VideoPipelineChecks {
                         "A live bitrate change failed or forced a keyframe: \(frames), errors \(errors)")
         }
 
+        run("Motion after refinement and a live settings change uses the latest encoder budget") {
+            let initial = StreamSettings(framesPerSecond: 60, megabits: 8)
+            var session: VTCompressionSession?
+            let encoder = try VideoEncoder(width: 64, height: 64, settings: initial) { native, key, value in
+                session = native
+                return VTSessionSetProperty(native, key: key, value: value)
+            }
+            defer { encoder.stop() }
+            guard let session, let pixels = CMSampleBufferGetImageBuffer(try cursorSample(.zero)) else {
+                throw VideoCheckFailure("Missing synthetic encoder session or frame")
+            }
+            func number(_ key: CFString) -> NSNumber? {
+                var value: Unmanaged<CFTypeRef>?
+                guard VTSessionCopyProperty(session, key: key, allocator: nil, valueOut: &value) == noErr else { return nil }
+                return value?.takeRetainedValue() as? NSNumber
+            }
+            let initialQuality = number(kVTCompressionPropertyKey_Quality)
+            var sequence: UInt32 = 0
+            func submit(refinementPass: Int? = nil) throws {
+                sequence += 1
+                try encoder.encode(pixels, time: CMTime(value: Int64(sequence), timescale: 60),
+                                   sequence: sequence, refinementPass: refinementPass)
+            }
+            for fps in [initial.framesPerSecond, 30] {
+                try submit(refinementPass: 4)
+                try require(number(kVTCompressionPropertyKey_ExpectedFrameRate)?.intValue == 15,
+                            "Test frame did not activate static refinement")
+                let megabits = fps == initial.framesPerSecond ? 12 : 20
+                if fps == initial.framesPerSecond { try encoder.updateBitrate(megabits: megabits) }
+                else { try encoder.updateEncodingParameters(settings: .init(framesPerSecond: fps, megabits: megabits)) }
+                try submit()
+                try require(number(kVTCompressionPropertyKey_ExpectedFrameRate)?.intValue == fps
+                            && number(kVTCompressionPropertyKey_AverageBitRate)?.intValue == megabits * 1_000_000
+                            && number(kVTCompressionPropertyKey_Quality) == initialQuality,
+                            "Motion retained refinement properties after switching to \(fps) fps at \(megabits) Mbps")
+            }
+        }
+
         run("A rejected live property restores earlier writes on the running encoder") {
             var session: VTCompressionSession?, rejected: CFString?, failures = 0
             let encoder = try VideoEncoder(width: 64, height: 64, settings: StreamSettings(framesPerSecond: 30, megabits: 8)) {

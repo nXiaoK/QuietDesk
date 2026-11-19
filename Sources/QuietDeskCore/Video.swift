@@ -13,6 +13,7 @@ public final class VideoEncoder {
     public let colorSpace: VideoColorSpace
     private var configuredSettings: StreamSettings
     private var refinementBoostActive = false
+    private var qualityToRestore: NSNumber?
     public var onOutput: ((Result<VideoPacket, Error>) -> Void)?
     public var onDropped: ((UInt32) -> Void)?
 
@@ -172,7 +173,6 @@ public final class VideoEncoder {
     public func updateBitrate(megabits: Int) throws {
         try updateProperties { try Self.setBitrate(megabits, using: $0) }
         configuredSettings.megabits = megabits
-        refinementBoostActive = false
     }
 
     public func updateEncodingParameters(settings: StreamSettings) throws {
@@ -184,7 +184,6 @@ public final class VideoEncoder {
             try Self.setKeyFrameInterval(framesPerSecond: settings.framesPerSecond, using: set)
         }
         configuredSettings = settings
-        refinementBoostActive = false
     }
 
     private static func applyColorSpaceTags(_ colorSpace: VideoColorSpace, using write: (CFString, CFTypeRef) -> Void) {
@@ -230,6 +229,14 @@ public final class VideoEncoder {
         catch { try interval(seconds: 4) }
     }
 
+    private static func restorableQuality(of session: VTCompressionSession) -> NSNumber? {
+        var saved: Unmanaged<CFTypeRef>?
+        // Some bitrate-controlled hardware encoders report -1 and reject both -1 and nil on restore.
+        guard VTSessionCopyProperty(session, key: kVTCompressionPropertyKey_Quality, allocator: nil, valueOut: &saved) == noErr,
+              let quality = saved?.takeRetainedValue() as? NSNumber, (0...1).contains(quality.doubleValue) else { return nil }
+        return quality
+    }
+
     public func encode(_ buffer: CVPixelBuffer, time: CMTime, sequence: UInt32, forceKeyFrame: Bool = false,
                        refinementPass: Int? = nil) throws {
         guard let session else { throw DeskError.invalid("编码器已停止") }
@@ -239,14 +246,19 @@ public final class VideoEncoder {
             _ = writeProperty(session, kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: boost.megabits * 1_000_000))
             _ = writeProperty(session, kVTCompressionPropertyKey_DataRateLimits,
                               [NSNumber(value: Self.dataRateLimitBytes(megabits: boost.megabits)), NSNumber(value: 1)] as CFArray)
-            _ = writeProperty(session, kVTCompressionPropertyKey_Quality, NSNumber(value: boost.quality))
+            if let original = qualityToRestore ?? Self.restorableQuality(of: session),
+               writeProperty(session, kVTCompressionPropertyKey_Quality, NSNumber(value: boost.quality)) == noErr {
+                qualityToRestore = original
+            }
             refinementBoostActive = true
         } else if refinementBoostActive {
-            _ = writeProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: configuredSettings.framesPerSecond))
-            _ = writeProperty(session, kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: configuredSettings.megabits * 1_000_000))
-            _ = writeProperty(session, kVTCompressionPropertyKey_DataRateLimits,
-                              [NSNumber(value: Self.dataRateLimitBytes(megabits: configuredSettings.megabits)), NSNumber(value: 1)] as CFArray)
-            _ = writeProperty(session, kVTCompressionPropertyKey_Quality, nil)
+            // Live settings can change during stillness. Resume motion using the latest negotiated settings.
+            try set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: configuredSettings.framesPerSecond), on: session)
+            try Self.setBitrate(configuredSettings.megabits) { try self.set($0, $1, on: session) }
+            if let qualityToRestore {
+                try set(kVTCompressionPropertyKey_Quality, qualityToRestore, on: session)
+                self.qualityToRestore = nil
+            }
             refinementBoostActive = false
         }
         let properties = forceKeyFrame ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil

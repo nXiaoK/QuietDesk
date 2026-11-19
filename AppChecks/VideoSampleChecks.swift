@@ -397,7 +397,7 @@ private struct VideoSampleChecks {
             CVPixelBufferUnlockBaseAddress(bgra, [])
 
             for space in [VideoColorSpace.sRGB, .displayP3] {
-                var recordedWrites: [(String, String)] = []
+                var nativeSession: VTCompressionSession?
                 let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 12)
                 let encoder = try VideoEncoder(
                     width: 320,
@@ -407,11 +407,21 @@ private struct VideoSampleChecks {
                     chromaSubsampling: .yuv444,
                     colorSpace: space,
                     writeProperty: { session, key, value in
-                        recordedWrites.append((key as String, value.map { "\($0)" } ?? "nil"))
+                        nativeSession = session
                         return VTSessionSetProperty(session, key: key, value: value)
                     }
                 )
                 defer { encoder.stop() }
+                guard let nativeSession else { throw SampleCheckFailure("Missing native HEVC session") }
+                func number(_ key: CFString) -> NSNumber? {
+                    var value: Unmanaged<CFTypeRef>?
+                    guard VTSessionCopyProperty(nativeSession, key: key, allocator: nil, valueOut: &value) == noErr else { return nil }
+                    return value?.takeRetainedValue() as? NSNumber
+                }
+                // Exercise a writable motion quality on one session and the hardware default on the other.
+                let explicitQuality = space == .sRGB && VTSessionSetProperty(nativeSession,
+                    key: kVTCompressionPropertyKey_Quality, value: NSNumber(value: 0.5)) == noErr
+                let motionQuality = number(kVTCompressionPropertyKey_Quality)
                 try require(encoder.usesHardware && encoder.chromaSubsampling == .yuv444 && encoder.colorSpace == space,
                             "HEVC 4:4:4 encoder did not run in hardware or lost metadata")
 
@@ -422,19 +432,20 @@ private struct VideoSampleChecks {
 
                 // Frame 1: IDR, Frame 2: static refinement pass 2, Frame 3: normal motion frame restoring rate control.
                 for (seq, refine): (UInt32, Int?) in [(1, nil), (2, 2), (3, nil)] {
-                    recordedWrites.removeAll()
                     try encoder.encode(bgra, time: CMTime(value: Int64(seq), timescale: 60),
                                        sequence: seq, forceKeyFrame: seq == 1, refinementPass: refine)
                     try require(ready.wait(timeout: .now() + 10) == .success, "HEVC 4:4:4 encode timed out")
                     guard let packet = try box.get()?.get() else { throw SampleCheckFailure("Missing HEVC 4:4:4 packet") }
                     let wirePacket = try VideoPacket.decode(packet.encode())
-                    if refine != nil {
-                        try require(recordedWrites.contains { $0.0 == (kVTCompressionPropertyKey_Quality as String) },
-                                    "Static refinement pass did not apply quality boost")
+                    if let refine {
+                        let boost = VideoEncoder.refinementParameters(for: settings, pass: refine)
+                        try require(number(kVTCompressionPropertyKey_AverageBitRate)?.intValue == boost.megabits * 1_000_000
+                                    && (!explicitQuality || (number(kVTCompressionPropertyKey_Quality)?.doubleValue ?? 0) > 0.5),
+                                    "Static refinement did not apply its bitrate or supported quality boost")
                     } else if seq == 3 {
-                        try require(recordedWrites.contains {
-                            $0.0 == (kVTCompressionPropertyKey_ExpectedFrameRate as String) && $0.1 == "60"
-                        }, "Motion frame after refinement did not restore ExpectedFrameRate")
+                        try require(number(kVTCompressionPropertyKey_ExpectedFrameRate)?.intValue == settings.framesPerSecond
+                                    && number(kVTCompressionPropertyKey_Quality) == motionQuality,
+                                    "Motion after refinement retained static frame properties")
                     }
                     if seq == 1 {
                         let samples = VideoSamples()

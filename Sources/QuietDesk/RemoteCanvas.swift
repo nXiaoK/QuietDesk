@@ -1292,8 +1292,17 @@ final class RemoteCanvas: NSView {
     }
 
     func pictureRect(for bounds: CGRect) -> CGRect {
-        let fitScale = min(bounds.width / max(1, remoteSize.width), bounds.height / max(1, remoteSize.height))
-        let scale = scalingMode == .original1To1 ? min(1, fitScale) : fitScale
+        if scalingMode == .original1To1 {
+            let size = window == nil ? remoteSize : convertFromBacking(remoteSize)
+            if size.width <= bounds.width, size.height <= bounds.height {
+                let rect = CGRect(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2,
+                                  width: size.width, height: size.height)
+                guard window != nil else { return rect }
+                return backingAlignedRect(rect, options: [.alignMinXNearest, .alignMinYNearest,
+                                                          .alignWidthNearest, .alignHeightNearest])
+            }
+        }
+        let scale = min(bounds.width / max(1, remoteSize.width), bounds.height / max(1, remoteSize.height))
         let size = CGSize(width: remoteSize.width * scale, height: remoteSize.height * scale)
         return CGRect(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2,
                       width: size.width, height: size.height)

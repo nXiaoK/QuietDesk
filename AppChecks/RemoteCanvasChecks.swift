@@ -1256,6 +1256,34 @@ private struct RemoteCanvasChecks {
                         "Oversized remote picture in 1:1 mode overflowed the window bounds")
         }
 
+        run("Retina 1:1 displays one backing pixel per source pixel and hit-tests the displayed picture") {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+                                  styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            let display = CanvasDisplayLayerProbe()
+            let canvas = RemoteCanvas(frame: window.contentView!.bounds, videoLayer: display)
+            defer { canvas.reset(); window.close() }
+            window.contentView = canvas
+            // Exercise two backing pixels per view point on both standard and Retina test displays.
+            let pixels = canvas.convertToBacking(canvas.bounds)
+            canvas.bounds.size = CGSize(width: pixels.width / 2, height: pixels.height / 2)
+            canvas.remoteSize = CGSize(width: 201, height: 101)
+            canvas.scalingMode = .original1To1
+            canvas.canControl = true
+            canvas.layout()
+            let picture = display.frame
+            let backing = canvas.convertToBacking(picture)
+            try require(backing.size == canvas.remoteSize && backing.origin.x == backing.origin.x.rounded()
+                        && backing.origin.y == backing.origin.y.rounded(),
+                        "Source pixels did not land on individual backing pixels: \(backing)")
+            var inputs: [RemoteInput] = []
+            canvas.onInput = { inputs.append($0) }
+            let target = NSPoint(x: picture.minX + picture.width * 0.75, y: picture.midY)
+            canvas.mouseDown(with: try mouse(.leftMouseDown, point: canvas.convert(target, to: nil)))
+            try require(inputs.count == 1 && abs(inputs[0].x - 0.75) < 0.001 && abs(inputs[0].y - 0.5) < 0.001,
+                        "Input disagreed with the Retina video layer's geometry: \(inputs)")
+        }
+
         run("Side mouse buttons and hardware relative pointer deltas map to scaled remote desktop coordinates") {
             let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
             canvas.remoteSize = CGSize(width: 800, height: 400) // pictureRect is 400x200 -> 2x scale on X and Y

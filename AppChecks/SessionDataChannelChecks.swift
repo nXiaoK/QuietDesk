@@ -66,6 +66,31 @@ private struct SessionDataChannelChecks {
             try require(try reader.take() as UInt32 == 0xFEED_BEEF, "Acknowledged the wrong frame")
             let metrics = channel.takeMetrics()
             try require(metrics.frames == 1 && metrics.bytes == 0, "Decoded frame metrics were not recorded")
+            try require(channel.invalidate() == nil, "An ordinary connection measured benchmark timing")
+        }
+
+        run("Benchmark timing records the first successful decode once across legacy and modern video") {
+            for legacyFirst in [true, false] {
+                let clock = ChannelBox(1.0), reads = ChannelBox(0)
+                let channel = SessionDataChannel(send: { _ in }, firstFrameClock: {
+                    reads.update { $0 += 1 }
+                    return clock.read()
+                }, onFreshFrame: { _ in })
+                let pending = ChannelBox<(() -> Void)?>(nil)
+                channel.configureVideo { _, complete in pending.update { $0 = complete } }
+                try onBackground {
+                    _ = try channel.receive(try videoMessage(1, keyFrame: true))
+                    guard let complete = pending.read() else { throw ChannelCheckFailure("Missing legacy decoder completion") }
+                    try require(reads.read() == 0, "Packet arrival started benchmark timing before decode")
+                    clock.update { $0 = 2 }
+                    if legacyFirst { complete() } else { channel.recordFrame() }
+                    clock.update { $0 = 5 }
+                    if legacyFirst { channel.recordFrame() } else { complete() }
+                    for _ in 0..<240 { channel.recordFrame() }
+                }
+                try require(channel.invalidate() == 2 && reads.read() == 1, "Wrong first decode time or repeated timing work")
+                try require(!channel.recordFrame() && channel.invalidate() == nil, "A closed channel reused its first-frame time")
+            }
         }
 
         run("A fresh-frame token completes only after a keyframe decode") {

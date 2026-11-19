@@ -6,6 +6,8 @@ final class SessionDataChannel: @unchecked Sendable {
     typealias VideoReceiver = (VideoPacket, @escaping () -> Void) -> Void
     private let lock = NSLock()
     private let send: (Message) -> Void
+    private let firstFrameClock: (() -> TimeInterval)?
+    private var firstFrameAt: TimeInterval?
     private var valid = true
     private var video: VideoReceiver?
     private var acknowledgement: ((UInt32) -> Void)?
@@ -25,8 +27,10 @@ final class SessionDataChannel: @unchecked Sendable {
     private var lastDisplaySample = (bytes: 0, frames: 0)
     private let onFreshFrame: (UUID) -> Void
 
-    init(send: @escaping (Message) -> Void, onFreshFrame: @escaping (UUID) -> Void) {
+    init(send: @escaping (Message) -> Void, firstFrameClock: (() -> TimeInterval)? = nil,
+         onFreshFrame: @escaping (UUID) -> Void) {
         self.send = send
+        self.firstFrameClock = firstFrameClock
         self.onFreshFrame = onFreshFrame
     }
 
@@ -103,13 +107,7 @@ final class SessionDataChannel: @unchecked Sendable {
             let packet = try VideoPacket.decode(message.payload)
             let token = packet.sps.isEmpty ? nil : handlers.4
             video(packet) { [weak self] in
-                guard let self else { return }
-                let accepted = self.lock.withLock {
-                    guard self.valid else { return false }
-                    self.frames += 1
-                    return true
-                }
-                guard accepted else { return }
+                guard let self, self.recordFrame() else { return }
                 var data = Data()
                 data.put(packet.sequence)
                 self.send(Message(.acknowledgement, data))
@@ -143,7 +141,15 @@ final class SessionDataChannel: @unchecked Sendable {
     }
 
     func recordBytes(_ count: Int) { lock.withLock { if valid { bytes += count } } }
-    func recordFrame() { lock.withLock { if valid { frames += 1 } } }
+    @discardableResult
+    func recordFrame() -> Bool {
+        lock.withLock {
+            guard valid else { return false }
+            frames += 1
+            if frames == 1 { firstFrameAt = firstFrameClock?() }
+            return true
+        }
+    }
     func mediaFrameReceived(_ header: MediaFrameHeader) {
         lock.withLock {
             if valid, header.isIDR { mediaFreshFrame = (header.stream, freshFrameToken) }
@@ -174,7 +180,9 @@ final class SessionDataChannel: @unchecked Sendable {
         lock.withLock { (bytes, frames, settledFragments, lostFragments) }
     }
 
-    func invalidate() {
+    /// Closing a benchmark connection also collects its first decode time under the frame counter's lock.
+    @discardableResult
+    func invalidate() -> TimeInterval? {
         lock.withLock {
             valid = false
             video = nil
@@ -191,6 +199,8 @@ final class SessionDataChannel: @unchecked Sendable {
             bytes = 0; frames = 0
             lastDisplaySample = (0, 0)
             settledFragments = 0; lostFragments = 0
+            defer { firstFrameAt = nil }
+            return firstFrameAt
         }
     }
 }

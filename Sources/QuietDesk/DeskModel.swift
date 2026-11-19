@@ -1830,7 +1830,9 @@ final class DeskModel: ObservableObject {
 
     private func makeDataChannel(for peer: Peer) -> SessionDataChannel {
         let viewer = viewerSession
-        return SessionDataChannel(send: { [weak peer] in peer?.send($0) }) { [weak self, weak peer, weak viewer] token in
+        let firstFrameClock: (() -> TimeInterval)? = activeRouteBenchmarkOverride == nil ? nil : { SessionClock.now }
+        return SessionDataChannel(send: { [weak peer] in peer?.send($0) },
+                                  firstFrameClock: firstFrameClock) { [weak self, weak peer, weak viewer] token in
             DispatchQueue.main.async {
                 guard let self, let peer, let viewer, self.peer === peer, self.viewerSession === viewer,
                       self.pauseTransmission.decodedFreshFrame(token: token) else { return }
@@ -1890,19 +1892,11 @@ final class DeskModel: ObservableObject {
         channel.configureMedia { [weak media] in media?.receive($0) ?? false }
         channel.configureReliableData { [weak media] in media?.sendReliableData($0) }
         renderer.reportDecodeTime { [weak media] milliseconds in media?.recordComputeTiming(decodeMilliseconds: milliseconds) }
-        media.onVideo = { [weak self, weak viewer, weak renderer] frame, completion in
+        media.onVideo = { [weak renderer] frame, completion in
             guard let renderer else { completion(false); return }
             channel.mediaFrameReceived(frame.header)
-            renderer.receive(frame) { [weak self, weak viewer] succeeded in
-                if succeeded {
-                    channel.recordFrame()
-                    if let self, let viewer {
-                        DispatchQueue.main.async {
-                            guard self.viewerSession === viewer else { return }
-                            self.noteRouteBenchmarkFirstFrameIfNeeded()
-                        }
-                    }
-                }
+            renderer.receive(frame) { succeeded in
+                if succeeded { channel.recordFrame() }
                 completion(succeeded)
             }
         }
@@ -2922,19 +2916,7 @@ final class DeskModel: ObservableObject {
                 peer.send(try SessionTermination(.subscribe).message())
             }
             if viewerSession.usesRelayControl { relayFallbackAttempted = false; relayFallbackCooldown.reset() }
-            let legacyReceiver = canvas.makeVideoReceiver(diagnostics: performanceDiagnostics)
-            let legacyViewer = viewerSession
-            dataChannel?.configureVideo { [weak self, weak legacyViewer] packet, acknowledged in
-                legacyReceiver(packet) {
-                    if let self, let legacyViewer {
-                        DispatchQueue.main.async {
-                            guard self.viewerSession === legacyViewer else { return }
-                            self.noteRouteBenchmarkFirstFrameIfNeeded()
-                        }
-                    }
-                    acknowledged()
-                }
-            }
+            dataChannel?.configureVideo(canvas.makeVideoReceiver(diagnostics: performanceDiagnostics))
             connected = true
             connectedSince = Date()
             sessionTraffic = peer.trafficMeter.snapshot().totals.runningTotalLabel
@@ -4895,7 +4877,9 @@ final class DeskModel: ObservableObject {
         performanceDiagnostics?.setEnabled(false)
         performanceDiagnostics = nil
         performanceRole = nil
-        dataChannel?.invalidate()
+        if let firstFrameAt = dataChannel?.invalidate(), activeRouteBenchmarkOverride?.firstFrameAt == nil {
+            activeRouteBenchmarkOverride?.firstFrameAt = firstFrameAt
+        }
         dataChannel = nil
         if mode == .viewer, target != nil, sessionInputSuspended { freshFrameRequiredOnReconnect = true }
         let oldHost = hostSession
@@ -5145,11 +5129,6 @@ final class DeskModel: ObservableObject {
         } else if let report {
             onConnectionDiagnosticReport?(report)
         }
-    }
-
-    private func noteRouteBenchmarkFirstFrameIfNeeded() {
-        guard activeRouteBenchmarkOverride != nil, activeRouteBenchmarkOverride?.firstFrameAt == nil else { return }
-        activeRouteBenchmarkOverride?.firstFrameAt = SessionClock.now
     }
 
     func beginRouteBenchmarkRun(_ id: UUID) -> Bool {

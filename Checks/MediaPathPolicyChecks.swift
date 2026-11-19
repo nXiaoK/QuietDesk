@@ -1099,6 +1099,34 @@ func runMediaPathPolicyChecks() {
                   "A bitrate upgrade inside pixel probation erased the pixel upgrade backoff")
     }
 
+    run("Bitrate increases needed to restore frame rate respect failed-step backoff on a marginal link") {
+        let ceiling = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 15)
+        let sustainable = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 3)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, applied: sustainable,
+                                             bitRates: StreamSettings.adaptiveBitRates, appliedSize: (1920, 1200), now: 0)
+        var lastReduction = 0
+        var waits: [Int] = []
+        for second in 1...386 {
+            // Scrolling at 1.4 Mbps qualifies for pixel recovery but does not fill half the 3 Mbps target.
+            // A 4 Mbps probe congests this path before the requested 60 fps becomes affordable.
+            let probing = quality.effective.megabits == 4
+            let observation = probing ? sample(loss: 0.05) : sample(received: 1.4)
+            let now = Double(second)
+            if let next = quality.observe(observation, now: now) {
+                try check(quality.confirmApplied(next, now: now), "Host confirmation failed")
+                if probing {
+                    try check(next == sustainable, "Congestion did not restore the sustainable level")
+                    lastReduction = second
+                } else {
+                    try check(next.megabits == 4 && next.framesPerSecond == 30, "Unexpected recovery step")
+                    waits.append(second - lastReduction)
+                }
+            }
+        }
+        try check(waits == [10, 10, 16, 32, 64, 120, 120],
+                  "Pixel recovery bypassed the bitrate retry delay: \(waits)")
+    }
+
     run("A narrow path starts from a capped bitrate, and the output size teaches the real screen size") {
         let ceiling = StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 60)
         let adaptive = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates, now: 0)

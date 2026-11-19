@@ -945,6 +945,7 @@ public struct MediaQualityPolicy: Sendable {
         let pixelsBelowCeiling = next.framesPerSecond < upperBound.framesPerSecond || shownEdge(next) < shownEdge(upperBound)
         let sustainedDegradedHealth = !isLocalNetwork && !localLatencyLimited && pixelsBelowCeiling
             && healthyDuration + mediaPolicyTimeTolerance >= max(Self.degradedPixelRecoveryHold, max(upgradeHold, bitrateHold) * 2)
+        var bitrateDuration = filledDuration
         if pixelsDuration + mediaPolicyTimeTolerance >= upgradeHold || sustainedDegradedHealth {
             var blockedByBitrate = false
             if let higher = StreamSettings.frameRates.first(where: { $0 > next.framesPerSecond && $0 <= upperBound.framesPerSecond }),
@@ -965,13 +966,12 @@ public struct MediaQualityPolicy: Sendable {
                     blockedByBitrate = true
                 }
             }
-            if blockedByBitrate, next.megabits < upperBound.megabits,
-               let higher = nextBitrateStep(from: next.megabits) {
-                next.megabits = higher
-                return recommendUpgrade(next, kind: .bitrate, now: now)
+            if blockedByBitrate {
+                // Desktop activity can justify the bitrate needed for a pixel upgrade after the usual bitrate hold.
+                bitrateDuration = sustainedDegradedHealth ? healthyDuration : pixelsDuration
             }
         }
-        guard next.megabits < upperBound.megabits, filledDuration + mediaPolicyTimeTolerance >= bitrateHold,
+        guard next.megabits < upperBound.megabits, bitrateDuration + mediaPolicyTimeTolerance >= bitrateHold,
               let higher = nextBitrateStep(from: next.megabits) else { return nil }
         next.megabits = higher
         return recommendUpgrade(next, kind: .bitrate, now: now)

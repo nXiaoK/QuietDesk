@@ -53,7 +53,7 @@ private final class EncodedRecoveryPacket: @unchecked Sendable {
 
 @main
 private struct VideoPipelineChecks {
-    static func main() {
+    static func main() async {
         var passed = 0, failed = 0
         func run(_ name: String, _ body: () throws -> Void) {
             do { try body(); passed += 1; print("PASS \(name)") }
@@ -70,6 +70,52 @@ private struct VideoPipelineChecks {
         func completed(_ frame: VideoFrameFlow.Encoding, dropped: Bool = false, at: TimeInterval = 1) -> VideoFrameFlow.Completion {
             let packet = dropped ? nil : VideoPacket(sequence: frame.sequence, sps: Data(), pps: Data(), avcc: Data([0, 0, 0, 2, 0x41, 0]))
             return .init(sequence: frame.sequence, packet: packet, callbackAt: at, duration: nil, diagnostic: nil)
+        }
+
+        let liveRateChange = await Task {
+            enum Rejection: Error { case capture, encoder }
+            let previous = ScreenStreamer.configuration(width: 64, height: 64, settings: .init(framesPerSecond: 30))
+            let requested = ScreenStreamer.configuration(width: 64, height: 64, settings: .init(framesPerSecond: 60))
+            let change = ScreenStreamer.CaptureFrameRateChange(previous: previous, requested: requested)
+            var captureRate = 30, encoderAttempts = 0, rollbackErrors = 0
+            do {
+                try await change.apply(updateCapture: { _, reply in DispatchQueue.global().async { reply(Rejection.capture) } },
+                    commit: { encoderAttempts += 1 }, rollbackFailed: { _ in rollbackErrors += 1 })
+                throw VideoCheckFailure("A rejected capture interval reported success")
+            } catch Rejection.capture {}
+            try require(encoderAttempts == 0, "Encoder changed before capture acknowledged the new interval")
+            do {
+                try await change.apply(updateCapture: { configuration, reply in
+                        captureRate = Int(configuration.minimumFrameInterval.timescale)
+                        reply(nil)
+                    },
+                    commit: {
+                        try require(captureRate == 60, "Encoder ran before capture switched")
+                        encoderAttempts += 1
+                        throw Rejection.encoder
+                    }, rollbackFailed: { _ in rollbackErrors += 1 })
+                throw VideoCheckFailure("A rejected encoder update reported success")
+            } catch Rejection.encoder {}
+            try require(encoderAttempts == 1 && captureRate == 30 && rollbackErrors == 0,
+                        "Encoder rejection left capture at the unconfirmed frame rate")
+            let cancelled = Task {
+                try await change.apply(updateCapture: { configuration, reply in
+                    captureRate = Int(configuration.minimumFrameInterval.timescale)
+                    if configuration === requested {
+                        withUnsafeCurrentTask { $0?.cancel() }
+                        DispatchQueue.global().async { reply(nil) }
+                    } else { reply(nil) }
+                }, commit: { encoderAttempts += 1 }, rollbackFailed: { _ in rollbackErrors += 1 })
+            }
+            do {
+                try await cancelled.value
+                throw VideoCheckFailure("Cancelled frame rate change reported success")
+            } catch is CancellationError {}
+            try require(encoderAttempts == 1 && captureRate == 30 && rollbackErrors == 0,
+                        "Cancellation lost the rollback of a late capture acknowledgement")
+        }.result
+        run("A live frame rate needs capture and encoder confirmation and rolls back on encoder rejection") {
+            try liveRateChange.get()
         }
 
         run("VideoToolbox rate-control drops and empty successful output are nonfatal") {

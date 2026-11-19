@@ -4190,8 +4190,13 @@ final class DeskModel: ObservableObject {
                 guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
                       host.settingsRequestID == request.id, !Task.isCancelled else { return }
                 // Same-size, same-codec, same-chroma changes (bitrate and/or frame rate) update the running encoder in place.
-                if self.activeVideoState != nil, codec == self.activeVideoCodec, chroma == self.activeVideoChroma,
-                   let updated = try? streamer.updateEncodingParameters(request.settings, codec: codec, chromaSubsampling: chroma) {
+                let inPlace: VideoStreamState?
+                if self.activeVideoState != nil, codec == self.activeVideoCodec, chroma == self.activeVideoChroma {
+                    inPlace = try? await streamer.updateEncodingParameters(request.settings, codec: codec, chromaSubsampling: chroma)
+                    guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
+                          host.settingsRequestID == request.id, !Task.isCancelled else { return }
+                } else { inPlace = nil }
+                if let updated = inPlace {
                     self.activeVideoState = updated
                     self.recordVideoConfiguration(updated)
                     self.videoSettingsStatus = "控制端已调整：\(updated.settings.summary)" + self.activeVideoFormatSuffix

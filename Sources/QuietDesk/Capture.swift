@@ -1000,12 +1000,39 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         }
     }
 
+    struct CaptureFrameRateChange {
+        let previous: SCStreamConfiguration
+        let requested: SCStreamConfiguration
+
+        func apply(updateCapture: (SCStreamConfiguration, @escaping @Sendable (Error?) -> Void) -> Void,
+                   commit: () throws -> Void, rollbackFailed: (Error) -> Void) async throws {
+            func install(_ configuration: SCStreamConfiguration) async throws {
+                // A cancelled caller must observe the system update before it can restore the prior interval.
+                try await withCheckedThrowingContinuation { (reply: CheckedContinuation<Void, Error>) in
+                    updateCapture(configuration) { error in
+                        if let error { reply.resume(throwing: error) } else { reply.resume() }
+                    }
+                }
+            }
+            try Task.checkCancellation()
+            try await install(requested)
+            do {
+                try Task.checkCancellation()
+                try commit()
+            } catch {
+                do { try await install(previous) }
+                catch let rollbackError { rollbackFailed(rollbackError); throw rollbackError }
+                throw error
+            }
+        }
+    }
+
     // Same-size, same-codec, same-chroma changes (bitrate and/or frame rate) update the running encoder and
     // capture interval in place without draining in-flight frames or restarting the media epoch.
     func updateEncodingParameters(_ settings: StreamSettings, codec: VideoCodec? = nil,
-                                  chromaSubsampling: VideoChromaSubsampling? = nil) throws -> VideoStreamState {
+                                  chromaSubsampling: VideoChromaSubsampling? = nil) async throws -> VideoStreamState {
         try settings.validateControlValues()
-        return try queue.sync {
+        let (state, pending) = try queue.sync { () throws -> (VideoStreamState, (SCStream, VideoEncoder, CaptureFrameRateChange)?) in
             guard running, captureStarted, let stream, let encoder, !reconfiguring, !frameFlow.encodingFailed,
                   cursorOperationID == nil, cursorFrameWaiter == nil else {
                 throw DeskError.invalid("画质正在调整，请稍后再试")
@@ -1019,22 +1046,38 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                   width == outputWidth, height == outputHeight else {
                 throw DeskError.invalid("画质尺寸或编码格式变化需要重新配置")
             }
-            let frameRateChanged = settings.framesPerSecond != currentSettings.framesPerSecond
-            if frameRateChanged {
-                try encoder.updateEncodingParameters(settings: settings)
-            } else if settings.megabits != currentSettings.megabits {
+            let state = VideoStreamState(settings: settings, width: width, height: height)
+            if settings.framesPerSecond != currentSettings.framesPerSecond {
+                func configuration(for value: StreamSettings) -> SCStreamConfiguration {
+                    Self.configuration(width: width, height: height, settings: value, includesCursor: cursorGate.included,
+                        chromaSubsampling: encoder.chromaSubsampling, colorSpace: captureColorSpace, capturesAudio: capturesAudio)
+                }
+                let change = CaptureFrameRateChange(previous: configuration(for: currentSettings), requested: configuration(for: settings))
+                return (state, (stream, encoder, change))
+            }
+            if settings.megabits != currentSettings.megabits {
                 try encoder.updateBitrate(megabits: settings.megabits)
             }
             currentSettings = settings
-            if frameRateChanged {
-                stream.updateConfiguration(Self.configuration(width: outputWidth, height: outputHeight,
-                    settings: settings, includesCursor: cursorGate.included,
-                    chromaSubsampling: encoder.chromaSubsampling, colorSpace: captureColorSpace,
-                    capturesAudio: capturesAudio), completionHandler: nil)
-                pump()
-            }
-            return VideoStreamState(settings: settings, width: outputWidth, height: outputHeight)
+            return (state, nil)
         }
+        if let (activeStream, activeEncoder, change) = pending {
+            try await change.apply(updateCapture: { activeStream.updateConfiguration($0, completionHandler: $1) }, commit: {
+                try self.queue.sync {
+                    guard self.running, self.stream === activeStream, self.encoder === activeEncoder,
+                          !self.frameFlow.encodingFailed else { throw CancellationError() }
+                    try activeEncoder.updateEncodingParameters(settings: settings)
+                    self.currentSettings = settings
+                    self.pump()
+                }
+            }, rollbackFailed: { error in
+                self.queue.sync {
+                    guard self.running, self.stream === activeStream else { return }
+                    self.reportError(error, message: "采集帧率调整失败且无法恢复原配置：\(error.localizedDescription)")
+                }
+            })
+        }
+        return state
     }
 
     /// `codec` and `chromaSubsampling` nil keep the running encoder's values.

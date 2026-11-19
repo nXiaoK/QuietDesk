@@ -180,6 +180,7 @@ struct DeskView: View {
     @State private var networkSubTab: NetworkWorkspaceSubTab = .viewerMappings
     @State private var diagnosticsSubTab: DiagnosticsWorkspaceSubTab = .benchmark
     @State private var preferencesSubTab: PreferencesWorkspaceSubTab = .keyboard
+    @State private var preferredMappingDeviceID: UUID?
     @State private var inlineBenchmarkRecord: ConnectionRecord?
     @State private var dismissedClipboardStatus = ""
     @State private var dismissedReceptionID: UUID?
@@ -543,7 +544,8 @@ struct DeskView: View {
                                 networkSubTab = .relayNodes
                                 models.workspaceSection = .network
                             },
-                            openPortMappingWorkspace: { _ in
+                            openPortMappingWorkspace: { record in
+                                preferredMappingDeviceID = record.id
                                 networkSubTab = .viewerMappings
                                 models.workspaceSection = .network
                             }
@@ -563,6 +565,7 @@ struct DeskView: View {
                             host: models.host,
                             portMappings: models.viewer.portMappings,
                             subTab: $networkSubTab,
+                            preferredDeviceID: preferredMappingDeviceID,
                             openBenchmarkForRecord: { record in
                                 inlineBenchmarkRecord = record
                                 diagnosticsSubTab = .benchmark

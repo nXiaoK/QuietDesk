@@ -23,11 +23,37 @@ struct NetworkWorkspaceView: View {
     @ObservedObject var viewer: DeskModel
     @ObservedObject var host: DeskModel
     @ObservedObject var portMappings: PortMappingManager
+    @ObservedObject private var benchmarkStore: RouteQualityBenchmarkStore
     @Binding var subTab: NetworkWorkspaceSubTab
+    var preferredDeviceID: UUID? = nil
     let openBenchmarkForRecord: (ConnectionRecord?) -> Void
+
+    init(
+        viewer: DeskModel,
+        host: DeskModel,
+        portMappings: PortMappingManager,
+        subTab: Binding<NetworkWorkspaceSubTab>,
+        preferredDeviceID: UUID? = nil,
+        openBenchmarkForRecord: @escaping (ConnectionRecord?) -> Void
+    ) {
+        self.viewer = viewer
+        self.host = host
+        self.portMappings = portMappings
+        self._benchmarkStore = ObservedObject(wrappedValue: viewer.routeBenchmarkStore)
+        self._subTab = subTab
+        self.preferredDeviceID = preferredDeviceID
+        self.openBenchmarkForRecord = openBenchmarkForRecord
+    }
 
     private var runningCount: Int {
         portMappings.rules.filter { portMappings.isEnabled($0.id) }.count
+    }
+
+    private var activeDeviceRecord: ConnectionRecord? {
+        if let preferredDeviceID, let match = viewer.connections.first(where: { $0.id == preferredDeviceID }) {
+            return match
+        }
+        return viewer.connections.first { $0.id == viewer.selectedConnectionID } ?? viewer.connections.first
     }
 
     var body: some View {
@@ -36,22 +62,12 @@ struct NetworkWorkspaceView: View {
                 DeskSegmentedTabs(
                     tabs: [
                         (.viewerMappings, runningCount > 0 ? "TCP 端口映射 (\(runningCount))" : "TCP 端口映射"),
-                        (.relayNodes, viewer.relayEnabled ? "自托管中继 (\(viewer.relayNodes.count))" : "自托管中继"),
-                        (.hostApprovals, portMappings.hostApprovalPending ? "本机映射授权 (\(portMappings.pendingTargets.count) 待确认)" : "本机映射授权")
+                        (.relayNodes, viewer.relayEnabled ? "自托管中继节点 (\(viewer.relayNodes.count))" : "自托管中继节点"),
+                        (.hostApprovals, portMappings.hostApprovalPending ? "本机被控映射授权 (\(portMappings.pendingTargets.count) 待确认)" : "本机被控映射授权")
                     ],
                     selection: $subTab
                 )
                 Spacer()
-                if subTab == .viewerMappings {
-                    Button {
-                        let selected = viewer.connections.first { $0.id == viewer.selectedConnectionID } ?? viewer.connections.first
-                        openBenchmarkForRecord(selected)
-                    } label: {
-                        Label("测试目标线路质量…", systemImage: "speedometer")
-                    }
-                    .controlSize(.small)
-                    .disabled(viewer.active || viewer.working)
-                }
             }
             .padding(.horizontal, 26)
             .padding(.top, 18)
@@ -61,36 +77,155 @@ struct NetworkWorkspaceView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     switch subTab {
                     case .viewerMappings:
-                        DeskSurfaceCard(padding: 0) {
-                            PortMappingView(model: viewer, manager: portMappings, done: {})
-                                .frame(maxWidth: .infinity)
+                        PortMappingView(
+                            model: viewer,
+                            manager: portMappings,
+                            done: {},
+                            embedded: true,
+                            preferredDeviceID: preferredDeviceID
+                        )
+
+                        if let record = activeDeviceRecord {
+                            deviceRouteSummaryCard(for: record)
                         }
                     case .relayNodes:
-                        DeskSurfaceCard(padding: 0) {
-                            RelaySettingsView(
-                                enabled: viewer.relayEnabled,
-                                nodes: viewer.relayNodes,
-                                deviceID: viewer.relayDeviceID,
-                                locked: viewer.relaySettingsLocked,
-                                measurements: viewer.relayNodeMeasurements,
-                                loadTrust: viewer.relayCertificate,
-                                saveNode: viewer.saveRelayNode,
-                                save: viewer.saveRelayConfiguration
-                            )
-                            .frame(maxWidth: .infinity)
-                        }
+                        RelaySettingsView(
+                            enabled: viewer.relayEnabled,
+                            nodes: viewer.relayNodes,
+                            deviceID: viewer.relayDeviceID,
+                            locked: viewer.relaySettingsLocked,
+                            measurements: viewer.relayNodeMeasurements,
+                            embedded: true,
+                            loadTrust: viewer.relayCertificate,
+                            saveNode: viewer.saveRelayNode,
+                            save: viewer.saveRelayConfiguration
+                        )
                     case .hostApprovals:
-                        DeskSurfaceCard(padding: 0) {
-                            PortMappingHostView(model: host, manager: host.portMappings, done: {})
-                                .frame(maxWidth: .infinity)
-                        }
+                        PortMappingHostView(
+                            model: host,
+                            manager: host.portMappings,
+                            done: {},
+                            embedded: true
+                        )
                     }
                 }
                 .padding(.horizontal, 26)
                 .padding(.bottom, 24)
+                .frame(maxWidth: 1080, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
             }
         }
         .background(DeskPalette.canvasBackground)
+    }
+
+    @ViewBuilder
+    private func deviceRouteSummaryCard(for record: ConnectionRecord) -> some View {
+        let descriptor = viewer.buildRouteBenchmarkTargetDescriptor(for: record)
+        let runs = descriptor.hasIdentity ? benchmarkStore.archive.runs(matching: descriptor) : []
+        let assessment = RouteBenchmarkHistoryEvaluator.assess(runs: runs, targetOverride: descriptor)
+
+        DeskSurfaceCard(padding: 16, cornerRadius: 14) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .center, spacing: 12) {
+                    if let assessment {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(DeskPalette.emerald.opacity(0.14))
+                                .frame(width: 42, height: 42)
+                            Text("\(assessment.overallScore)")
+                                .font(.system(size: 16, weight: .bold, design: .rounded))
+                                .monospacedDigit()
+                                .foregroundStyle(DeskPalette.emerald)
+                        }
+                    } else {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(DeskPalette.subtleFill)
+                                .frame(width: 42, height: 42)
+                            Image(systemName: "speedometer")
+                                .font(.system(size: 18))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 8) {
+                            Text("「\(ConnectionEntryPresentation.title(record))」线路质量档案")
+                                .font(.system(size: 13.5, weight: .bold))
+                            if let assessment {
+                                DeskPillBadge(
+                                    text: "累计 \(assessment.runCount) 次实测 · \(assessment.overallGrade.title)",
+                                    tint: DeskPalette.emerald
+                                )
+                            }
+                        }
+                        if let assessment, let best = assessment.recommendedRoute {
+                            Text("长期推荐：\(best.candidate.title) — \(assessment.recommendationReason)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        } else {
+                            Text("尚未执行过线路质量实测；实测可对比直连与各中继节点的真实帧率、延迟与 UDP 丢包。")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    Spacer(minLength: 8)
+
+                    Button("前往线路实测…") {
+                        openBenchmarkForRecord(record)
+                    }
+                    .controlSize(.small)
+                    .disabled(viewer.active || viewer.working)
+                }
+
+                if let assessment, !assessment.routeSummaries.isEmpty {
+                    HStack(spacing: 10) {
+                        ForEach(Array(assessment.routeSummaries.prefix(3).enumerated()), id: \.element.id) { idx, item in
+                            let isBest = idx == 0 && item.overallGrade != .unreachable
+                            VStack(alignment: .leading, spacing: 5) {
+                                HStack {
+                                    Text(item.candidate.title)
+                                        .font(.system(size: 11.5, weight: .semibold))
+                                        .lineLimit(1)
+                                    Spacer(minLength: 4)
+                                    if isBest {
+                                        Text("最佳")
+                                            .font(.system(size: 10, weight: .bold))
+                                            .foregroundStyle(DeskPalette.emerald)
+                                    }
+                                }
+                                HStack(spacing: 8) {
+                                    if let rtt = item.meanRTTMilliseconds {
+                                        Text(String(format: "延迟 %.1f ms", rtt))
+                                    }
+                                    if let loss = item.meanUDPLossPercent {
+                                        Text(String(format: "丢包 %.1f%%", loss))
+                                    }
+                                    if let fps = item.meanFPS {
+                                        Text(String(format: "%.0f fps", fps))
+                                    }
+                                }
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            }
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(
+                                isBest ? DeskPalette.emerald.opacity(0.08) : DeskPalette.subtleFill,
+                                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            )
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                    .strokeBorder(isBest ? DeskPalette.emerald.opacity(0.35) : DeskPalette.hairline, lineWidth: 0.8)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -137,6 +272,8 @@ struct DiagnosticsWorkspaceView: View {
             .padding(.top, 18)
             .padding(.bottom, 12)
 
+            Divider()
+
             Group {
                 switch subTab {
                 case .benchmark:
@@ -151,16 +288,15 @@ struct DiagnosticsWorkspaceView: View {
                             },
                             onClose: {
                                 runner.shutdown()
-                            }
+                            },
+                            embedded: true
                         )
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
                         ProgressView()
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 case .traffic:
-                    TrafficStatisticsView(model: viewer, history: history, done: {})
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    TrafficStatisticsView(model: viewer, history: history, done: {}, embedded: true)
                 }
             }
         }
@@ -212,30 +348,28 @@ struct PreferencesWorkspaceView: View {
                 VStack(alignment: .leading, spacing: 18) {
                     switch subTab {
                     case .keyboard:
-                        DeskSurfaceCard(padding: 0) {
-                            CapsLockSettingsView(model: viewer, done: {})
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                        DeskSurfaceCard(padding: 0, cornerRadius: 14) {
+                            CapsLockSettingsView(model: viewer, done: {}, embedded: true)
                         }
                     case .privacy:
-                        DeskSurfaceCard(padding: 0) {
-                            SessionEffectsView(model: viewer, done: {})
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
+                        SessionEffectsView(model: viewer, done: {}, embedded: true)
                     case .connectionDefaults:
-                        DeskSurfaceCard(padding: 0) {
+                        DeskSurfaceCard(padding: 0, cornerRadius: 14) {
                             ConnectionSettingsView(
                                 model: viewer,
                                 openCaps: { subTab = .keyboard },
                                 openTraffic: openTraffic,
                                 openEffects: { subTab = .privacy },
-                                openBenchmark: openBenchmark
+                                openBenchmark: openBenchmark,
+                                embedded: true
                             )
-                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
                 }
                 .padding(.horizontal, 26)
                 .padding(.bottom, 24)
+                .frame(maxWidth: 1080, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
             }
         }
         .background(DeskPalette.canvasBackground)

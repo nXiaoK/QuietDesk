@@ -73,11 +73,12 @@ struct ConnectionSettingsView: View {
     let openTraffic: () -> Void
     let openEffects: () -> Void
     var openBenchmark: (() -> Void)? = nil
+    var embedded: Bool = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                ConnectionOptionsSections(model: model, compact: false)
+        let content = VStack(alignment: .leading, spacing: 16) {
+            ConnectionOptionsSections(model: model, compact: false)
+            if !embedded {
                 Divider()
                 HStack(spacing: 8) {
                     Label("键盘与快捷键", systemImage: "keyboard")
@@ -96,12 +97,22 @@ struct ConnectionSettingsView: View {
                 Button(action: openEffects) { Label("被控端隐私与安全…", systemImage: "lock.shield") }
                 Button(action: openTraffic) { Label("设备历史流量…", systemImage: "chart.bar.xaxis") }
             }
-            .font(.system(size: 13))
-            .toggleStyle(.switch).controlSize(.small)
-            .padding(16).frame(width: 340)
-            .background(Color(nsColor: .windowBackgroundColor))
         }
-        .frame(width: 340).frame(maxHeight: 560)
+        .font(.system(size: 13))
+        .toggleStyle(.switch).controlSize(.small)
+
+        if embedded {
+            content
+                .padding(18)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            ScrollView {
+                content
+                    .padding(16).frame(width: 340)
+                    .background(Color(nsColor: .windowBackgroundColor))
+            }
+            .frame(width: 340).frame(maxHeight: 560)
+        }
     }
 }
 
@@ -230,35 +241,44 @@ private struct ConnectionOptionsSections: View {
 struct CapsLockSettingsView: View {
     @ObservedObject var model: DeskModel
     let done: () -> Void
+    var embedded: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "capslock")
-                    .font(.system(size: 23)).foregroundStyle(.secondary)
-                    .frame(width: 42, height: 42)
-                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("键盘与快捷键").font(.system(size: 15, weight: .semibold))
-                    Text("全屏系统快捷键与 Caps Lock 操作远端。")
-                        .font(.caption).foregroundStyle(.secondary)
+            if !embedded {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: "capslock")
+                        .font(.system(size: 23)).foregroundStyle(.secondary)
+                        .frame(width: 42, height: 42)
+                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("键盘与快捷键").font(.system(size: 15, weight: .semibold))
+                        Text("全屏系统快捷键与 Caps Lock 操作远端。")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             }
-            ScrollView { CapsLockDetails(model: model, compact: false) }
-                .frame(height: 350)
-            HStack {
-                Spacer()
-                Button("完成", action: done).buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+            if embedded {
+                CapsLockDetails(model: model, compact: false)
+            } else {
+                ScrollView { CapsLockDetails(model: model, compact: false) }
+                    .frame(height: 350)
+                HStack {
+                    Spacer()
+                    Button("完成", action: done).buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                }
             }
         }
         .font(.system(size: 13)).controlSize(.regular)
-        .padding(22).frame(width: 500)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .padding(embedded ? 18 : 22)
+        .frame(width: embedded ? nil : 500)
+        .frame(maxWidth: embedded ? .infinity : nil, alignment: .leading)
+        .background(embedded ? Color.clear : Color(nsColor: .windowBackgroundColor))
         .onAppear {
             model.canvas.releaseControl()
             model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
         }
-        .onExitCommand(perform: done)
+        .onExitCommand { if !embedded { done() } }
     }
 }
 

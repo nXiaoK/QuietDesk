@@ -6,6 +6,7 @@ struct RouteQualityBenchmarkView: View {
     @ObservedObject var runner: RouteQualityBenchmarkRunner
     let onConnectCandidate: (RouteBenchmarkCandidate, ConnectionRecord?) -> Void
     let onClose: () -> Void
+    var embedded: Bool = false
 
     @State private var expandedRunIDs: Set<UUID> = []
     @State private var didSeedInitialExpansion = false
@@ -14,7 +15,7 @@ struct RouteQualityBenchmarkView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             headerSection
-                .padding(.horizontal, 22)
+                .padding(.horizontal, embedded ? 26 : 22)
                 .padding(.vertical, 15)
 
             Divider()
@@ -36,17 +37,24 @@ struct RouteQualityBenchmarkView: View {
                         historyContent
                     }
                 }
-                .padding(.horizontal, 22)
+                .padding(.horizontal, embedded ? 26 : 22)
                 .padding(.vertical, 16)
             }
 
             Divider()
 
             footerSection
-                .padding(.horizontal, 22)
-                .padding(.vertical, 12)
+                .padding(.horizontal, embedded ? 26 : 22)
+                .padding(.vertical, 11)
         }
-        .frame(minWidth: 720, idealWidth: 780, minHeight: 580, idealHeight: 660)
+        .frame(
+            minWidth: embedded ? nil : 720,
+            idealWidth: embedded ? nil : 780,
+            maxWidth: embedded ? .infinity : nil,
+            minHeight: embedded ? nil : 580,
+            idealHeight: embedded ? nil : 660,
+            maxHeight: embedded ? .infinity : nil
+        )
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             seedExpandedRunIfNeeded()
@@ -1383,11 +1391,13 @@ struct RouteQualityBenchmarkView: View {
 
             Spacer(minLength: 12)
 
-            Button("关闭") {
-                runner.shutdown()
-                onClose()
+            if !embedded {
+                Button("关闭") {
+                    runner.shutdown()
+                    onClose()
+                }
+                .keyboardShortcut(.cancelAction)
             }
-            .keyboardShortcut(.cancelAction)
         }
     }
 

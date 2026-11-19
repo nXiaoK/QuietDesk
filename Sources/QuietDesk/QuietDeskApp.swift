@@ -30,7 +30,8 @@ struct QuietDeskApp: App {
             return UpdateSessionContext(mainWindowVisible: window?.isVisible == true && window?.isMiniaturized == false,
                 applicationActive: NSApp.isActive, isControlling: viewer.connected || viewer.working || viewer.reconnecting,
                 isFullScreen: viewer.isFullScreen, hasHostConnection: host.hasIncomingControlConnection,
-                isSharing: host.active || host.working, hasActiveConnection: viewer.connected || host.connected,
+                isSharing: host.active || host.working || host.mappingHosting,
+                hasActiveConnection: viewer.connected || host.connected || viewer.portMappings.hasRunningMappings,
                 autoStartSharing: host.autoStartSharing, hasOtherPrompt: models.updatePromptBlocked)
         }, mainWindow: { [weak models] in models?.mainWindow }, releaseControl: { [weak viewer] in viewer?.canvas.releaseControl() },
             contextChanges: models.changes)
@@ -120,7 +121,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         guard let host = models?.host else { return true }
-        return !(host.active || host.working || host.autoStartSharing)
+        return !(host.active || host.working || host.autoStartSharing || host.mappingHosting || host.portMappings.hasRunningMappings)
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
         launchedAtLogin = launchedAtLogin || NSAppleEventManager.shared().currentAppleEvent?
@@ -174,6 +175,7 @@ struct DeskView: View {
     @State private var showFullScreenMenu = false
     @State private var showTrafficStatistics = false
     @State private var showSessionEffects = false
+    @State private var showPortMapping = false
     @State private var routeBenchmarkRunner: RouteQualityBenchmarkRunner?
     @State private var dismissedClipboardStatus = ""
     @State private var dismissedReceptionID: UUID?
@@ -303,7 +305,8 @@ struct DeskView: View {
                         .help("控制状态、连接画质、键盘、剪贴板与文件；与全屏使用同一面板")
                         .popover(isPresented: $showOptions, arrowEdge: .top) {
                             SessionControlsView(model: model, close: { showOptions = false },
-                                                openTraffic: openTrafficStatistics, openEffects: openSessionEffects)
+                                                openTraffic: openTrafficStatistics, openEffects: openSessionEffects,
+                                                openPortMapping: openPortMapping)
                         }
                     Button { model.canvas.releaseControl(); model.toggleFullScreen() } label: {
                         Label(SessionToolAction.fullScreen.title(), systemImage: SessionToolAction.fullScreen.symbol())
@@ -311,6 +314,7 @@ struct DeskView: View {
                     Divider()
                     Button("断开") { model.stop() }
                 } else if model.mode == .viewer {
+                    portMappingButton
                     Button {
                         openRouteBenchmark(nil)
                     } label: {
@@ -319,10 +323,19 @@ struct DeskView: View {
                     .disabled(locked || routeBenchmarkRunner != nil)
                     .help("手动测试直连与各中继方式的实际帧率、延迟及 UDP 丢包情况，并保留历次记录生成历史总质量评估")
                     SharingBadge(host: models.host) { models.selected = .host }.disabled(roleLocked)
+                } else {
+                    portMappingButton
                 }
             }
         }
         .toolbar(immersive ? .hidden : .visible, for: .windowToolbar)
+        .sheet(isPresented: $showPortMapping) {
+            if model.mode == .host {
+                PortMappingHostView(model: model, manager: model.portMappings, done: { showPortMapping = false })
+            } else {
+                PortMappingView(model: model, manager: model.portMappings, done: { showPortMapping = false })
+            }
+        }
         .sheet(isPresented: $showCapsSettings) {
             CapsLockSettingsView(model: model, done: { showCapsSettings = false })
         }
@@ -356,6 +369,7 @@ struct DeskView: View {
             showCapsSettings = false
             showTrafficStatistics = false
             showSessionEffects = false
+            showPortMapping = false
             routeBenchmarkRunner?.shutdown()
             routeBenchmarkRunner = nil
         }
@@ -363,6 +377,7 @@ struct DeskView: View {
             showCapsSettings = false
             showTrafficStatistics = false
             showSessionEffects = false
+            showPortMapping = false
             routeBenchmarkRunner?.shutdown()
             routeBenchmarkRunner = nil
         }
@@ -386,7 +401,7 @@ struct DeskView: View {
             dismissedClipboardStatus = message
         }
         .onChange(of: model.controlling) { _, controlling in if controlling { showFullScreenMenu = false; showOptions = false } }
-        .onChange(of: showOptions || showCapsSettings || showTrafficStatistics || showSessionEffects || showFullScreenMenu || routeBenchmarkRunner != nil) { _, presented in
+        .onChange(of: showOptions || showCapsSettings || showTrafficStatistics || showSessionEffects || showPortMapping || showFullScreenMenu || routeBenchmarkRunner != nil) { _, presented in
             updates.interfacePromptVisible = presented
         }
         .onDisappear { updates.interfacePromptVisible = false }
@@ -460,7 +475,8 @@ struct DeskView: View {
                         Spacer(minLength: 0)
                         if showFullScreenMenu {
                             SessionControlsView(model: model, close: { showFullScreenMenu = false },
-                                                openTraffic: openTrafficStatistics, openEffects: openSessionEffects)
+                                                openTraffic: openTrafficStatistics, openEffects: openSessionEffects,
+                                                openPortMapping: openPortMapping)
                                 .frame(height: min(568, max(0, geometry.size.height - 32)))
                                 .clipShape(RoundedRectangle(cornerRadius: 12))
                                 .shadow(color: .black.opacity(0.3), radius: 16, y: 6)
@@ -486,6 +502,20 @@ struct DeskView: View {
                 }
             }
         }
+    }
+
+    private var portMappingButton: some View {
+        Button(action: openPortMapping) {
+            Label(SessionToolAction.portMapping.title(), systemImage: SessionToolAction.portMapping.symbol())
+        }
+        .help(model.mode == .host ? "管理本机端口映射服务及访问授权" : "为已配对设备设置 TCP 端口映射")
+    }
+
+    private func openPortMapping() {
+        model.canvas.releaseControl()
+        showOptions = false
+        showFullScreenMenu = false
+        showPortMapping = true
     }
 
     private func openTrafficStatistics() {

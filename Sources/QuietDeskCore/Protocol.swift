@@ -37,6 +37,8 @@ public enum MessageKind: UInt8, Sendable {
     case qualityProbeControl = 40
     // Sent only after both peers advertise ClipboardPreference.onDemandClipboard == true.
     case clipboardManifest = 41, clipboardPull = 42
+    // Exchanged only on connections that negotiated the dedicated mapping ALPN.
+    case mappingControl = 43, mappingData, mappingEOF
 }
 
 public struct Message: Sendable {

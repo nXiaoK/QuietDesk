@@ -72,7 +72,8 @@ private struct SessionToolsChecks {
                         "Wake reconnect was mislabeled as disconnected when input waits for a fresh frame")
         }
         run("Both surfaces use the same action set, labels and existing shortcuts") {
-            try require(SessionToolAction.allCases.count == 9, "Action inventory changed")
+            try require(SessionToolAction.allCases.count == 10 && SessionToolAction.allCases.contains(.portMapping),
+                        "Shared mapping action is missing")
             for action in SessionToolAction.allCases where action != .fullScreen {
                 try require(action.title(fullScreen: false) == action.title(fullScreen: true), "Window and full-screen names differ")
                 try require(!action.symbol().isEmpty && !action.help.isEmpty, "Missing accessible action description")

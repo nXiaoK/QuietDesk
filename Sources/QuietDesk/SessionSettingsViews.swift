@@ -267,6 +267,7 @@ struct SessionControlsView: View {
     let close: () -> Void
     let openTraffic: () -> Void
     let openEffects: () -> Void
+    let openPortMapping: () -> Void
 
     private var presentation: SessionToolsPresentation {
         SessionToolsPresentation(connected: model.connected, reconnecting: model.reconnecting,
@@ -300,6 +301,7 @@ struct SessionControlsView: View {
             case .receiveText: model.pullClipboard()
             case .captureFrame: model.copyRemoteFrame()
             case .keyboard: model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
+            case .portMapping: openPortMapping()
             case .privacy: openEffects()
             case .traffic: openTraffic()
             case .endSession:

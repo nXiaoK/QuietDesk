@@ -1,15 +1,19 @@
 import Foundation
+import CryptoKit
 import Network
 import Security
 
 public enum MediaChannelRole: String, Codable, CaseIterable, Hashable, Sendable {
-    case control, video, bulk
+    case control, video, bulk, portMapping
+
+    var isMediaAuxiliary: Bool { self == .video || self == .bulk }
 
     public var applicationProtocol: String {
         switch self {
         case .control: return "quietdesk-control/1"
         case .video: return "quietdesk-media/1"
         case .bulk: return "quietdesk-bulk/1"
+        case .portMapping: return "quietdesk-mapping/1"
         }
     }
 }
@@ -17,9 +21,24 @@ public enum MediaChannelRole: String, Codable, CaseIterable, Hashable, Sendable 
 public enum MediaSecureTransport {
     public static func tlsParameters(key: PairingKey, roles: [MediaChannelRole], responsiveAcknowledgements: Bool = true) throws -> NWParameters {
         guard !roles.isEmpty, Set(roles).count == roles.count else { throw DeskError.invalid("媒体通道角色无效") }
-        let parameters = SecureTransport.parameters(key: key, responsiveAcknowledgements: responsiveAcknowledgements)
+        let mappingOnly = roles == [.portMapping]
+        let identity = Data("quietdesk-mapping-v1".utf8)
+        let mappingKey = roles.contains(.portMapping)
+            ? Data(HMAC<SHA256>.authenticationCode(for: identity, using: SymmetricKey(data: key.data))) : Data()
+        let parameters = mappingOnly
+            ? SecureTransport.parameters(psk: mappingKey, identity: identity, responsiveAcknowledgements: false)
+            : SecureTransport.parameters(key: key, responsiveAcknowledgements: responsiveAcknowledgements)
         guard let tls = parameters.defaultProtocolStack.applicationProtocols.first(where: { $0 is NWProtocolTLS.Options }) as? NWProtocolTLS.Options else {
             throw DeskError.invalid("媒体 TLS 配置不可用")
+        }
+        if mappingOnly { parameters.serviceClass = .background }
+        else if roles.contains(.portMapping) {
+            mappingKey.withUnsafeBytes { secret in
+                identity.withUnsafeBytes { name in
+                    sec_protocol_options_add_pre_shared_key(tls.securityProtocolOptions,
+                        DispatchData(bytes: secret) as __DispatchData, DispatchData(bytes: name) as __DispatchData)
+                }
+            }
         }
         for role in roles { sec_protocol_options_add_tls_application_protocol(tls.securityProtocolOptions, role.applicationProtocol) }
         return parameters

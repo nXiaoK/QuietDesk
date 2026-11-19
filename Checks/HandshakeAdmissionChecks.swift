@@ -15,6 +15,28 @@ func runHandshakeAdmissionChecks() {
         }
         try check(gate.reserve(address: nil, now: 2) == nil, "Repeated release admitted extra connections")
     }
+    run("Authenticated desktop and mapped streams can reconnect without refunding failed handshakes") {
+        let gate = PendingHandshakeGate()
+        let address = "192.0.2.7"
+        func reserve(at time: TimeInterval) throws -> UUID {
+            guard let id = gate.reserve(address: address, now: time) else { throw CheckFailure("No authenticated channel slot at \(time)") }
+            return id
+        }
+        for _ in 0..<2 {
+            let id = try reserve(at: 1)
+            gate.release(id)
+            gate.authenticated(id)
+        }
+        for _ in 0..<8 {
+            let id = try reserve(at: 2)
+            gate.authenticated(id)
+            gate.release(id)
+        }
+        let last = try reserve(at: 3)
+        gate.release(last)
+        try check(gate.reserve(address: address, now: 4) == nil, "Authenticating refunded another connection's failed attempt")
+    }
+
     run("Handshake admission bounds pending connections and rates each endpoint separately") {
         var policy = HandshakeAdmissionPolicy()
         for count in 0..<4 {

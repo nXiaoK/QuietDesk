@@ -43,6 +43,11 @@ struct VideoFrameFlow {
     var isIdle: Bool { encoding.isEmpty && waiting.isEmpty }
     var outstanding: Int { encoding.count + waiting.count }
 
+    func isWaitingForReceiverCredit(maximumConcurrentEncodes: Int, maximumOutstandingFrames: Int) -> Bool {
+        !mediaHold && !encodingFailed && !waiting.isEmpty
+            && encoding.count < maximumConcurrentEncodes && outstanding >= maximumOutstandingFrames
+    }
+
     mutating func begin(at now: TimeInterval, maximumConcurrentEncodes: Int = 1,
                         maximumOutstandingFrames: Int = MediaBufferLimits.legacyFrameWindow,
                         isRefinement: Bool = false) -> Encoding? {
@@ -408,6 +413,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
     var onFrame: ((VideoPacket) -> Void)?
     var onEncodeDuration: ((TimeInterval) -> Void)?
+    var onFrameCreditWait: (() -> Void)?
+    private var lastCreditWaitReport: TimeInterval = 0
     var onError: ((String) -> Void)?
     var onDiagnosticError: ((Error) -> Void)?
     var onUserStop: (() -> Void)?
@@ -1841,11 +1848,18 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             armFramePacingTimer(after: delay)
             return
         }
-        guard let encoder,
-              let frame = frameFlow.begin(at: now,
-                maximumConcurrentEncodes: currentSettings.framesPerSecond >= 60 ? 2 : 1,
-                maximumOutstandingFrames: VideoFrameFlow.maximumOutstandingFrames(for: currentSettings, receiverLimit: receiverFrameWindow),
-                isRefinement: latestIsRefinement) else { return }
+        guard let encoder else { return }
+        let encodes = currentSettings.framesPerSecond >= 60 ? 2 : 1
+        let credits = VideoFrameFlow.maximumOutstandingFrames(for: currentSettings, receiverLimit: receiverFrameWindow)
+        guard let frame = frameFlow.begin(at: now, maximumConcurrentEncodes: encodes, maximumOutstandingFrames: credits,
+                                          isRefinement: latestIsRefinement) else {
+            if !latestIsRefinement, now - lastCreditWaitReport >= 0.2,
+               frameFlow.isWaitingForReceiverCredit(maximumConcurrentEncodes: encodes, maximumOutstandingFrames: credits) {
+                lastCreditWaitReport = now
+                onFrameCreditWait?()
+            }
+            return
+        }
         frameDropper.recordSubmission(at: now, isRefinement: latestIsRefinement)
         let submittedRefinementPass = latestIsRefinement ? latestRefinementPass : nil
         self.latest = nil

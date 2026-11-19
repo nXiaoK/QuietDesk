@@ -49,7 +49,7 @@ struct ConnectionView: View {
                                     Text("\(ConnectionEntryPresentation.route(record)) · \(relay.deviceID.uuidString.lowercased())")
                                         .font(.caption).monospaced().foregroundStyle(.secondary).lineLimit(2)
                                 }
-                                Text(record.lastConnected.formatted(date: .abbreviated, time: .shortened))
+                                Text(record.lastConnected == .distantPast ? "已保存 · 尚未远控" : record.lastConnected.formatted(date: .abbreviated, time: .shortened))
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()

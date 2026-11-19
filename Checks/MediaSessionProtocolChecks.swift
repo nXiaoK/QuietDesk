@@ -2,6 +2,26 @@ import Foundation
 import QuietDeskCore
 
 func runMediaSessionProtocolChecks() {
+    run("Mapping activity is optional and confined to host media stats") {
+        struct LegacyStats: Decodable {
+            let operation: String
+            let sessionID: UUID
+            let encodeMilliseconds: Double
+        }
+        let session = UUID()
+        let old = try MediaControl(.stats, sessionID: session, encodeMilliseconds: 4).message()
+        try check(MediaControl.read(old.payload).mappedTransfer == nil, "Legacy stats reported mapping activity")
+        for state in [MappedTransferState.transferring, .waitingForVideoCredit] {
+            let report = try MediaControl(.stats, sessionID: session, encodeMilliseconds: 4, mappedTransfer: state).message()
+            try check(MediaControl.read(report.payload).mappedTransfer == state, "Mapping evidence changed in transit")
+            let legacy = try JSONDecoder().decode(LegacyStats.self, from: report.payload)
+            try check(legacy.operation == "stats" && legacy.sessionID == session && legacy.encodeMilliseconds == 4,
+                      "Mapping evidence changed fields read by older viewers")
+        }
+        try rejects("Accepted mapping evidence outside stats") {
+            try MediaControl(.request, mappedTransfer: .waitingForVideoCredit).validate()
+        }
+    }
     run("Media capability is optional and old message numbers remain stable") {
         let original = Hello(name: "legacy", width: 1920, height: 1080, settings: .init(), canControl: true)
         let decoded = try Wire.readJSON(Hello.self, JSONEncoder().encode(original))

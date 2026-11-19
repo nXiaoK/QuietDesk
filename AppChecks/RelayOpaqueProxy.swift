@@ -13,13 +13,17 @@ final class RelayOpaqueProxy: @unchecked Sendable {
     private var drop = false
     private var dropped = 0
     private var abortFirstHandshake: Bool
+    // Benchmark fixtures serialize server-to-client TLS records from all connections on one link.
+    private let downlinkBytesPerSecond: Double?
+    private var downlinkFreeAt: DispatchTime = .now()
     var port: UInt16? { listener.port?.rawValue }
     var droppedRecords: Int { lock.withLock { dropped } }
     var onReady: (() -> Void)?
 
-    init(target: UInt16, abortFirstHandshake: Bool = false) throws {
+    init(target: UInt16, abortFirstHandshake: Bool = false, downlinkBytesPerSecond: Double? = nil) throws {
         self.target = NWEndpoint.Port(rawValue: target)!
         self.abortFirstHandshake = abortFirstHandshake
+        self.downlinkBytesPerSecond = downlinkBytesPerSecond
         let parameters = NWParameters.tcp
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
         listener = try NWListener(using: parameters)
@@ -31,6 +35,13 @@ final class RelayOpaqueProxy: @unchecked Sendable {
             guard let self else { connection.cancel(); return }
             let id = UUID()
             let pipe = Pipe(incoming: connection, target: self.target, queue: self.queue)
+            if let rate = self.downlinkBytesPerSecond {
+                pipe.scheduleDownlink = { [weak self] bytes, send in
+                    guard let self else { return }
+                    self.downlinkFreeAt = max(.now(), self.downlinkFreeAt) + Double(bytes) / rate
+                    self.queue.asyncAfter(deadline: self.downlinkFreeAt, execute: send)
+                }
+            }
             pipe.abortHandshake = self.abortFirstHandshake; self.abortFirstHandshake = false
             self.pipes[id] = pipe
             pipe.shouldDrop = { [weak self] in
@@ -49,12 +60,13 @@ final class RelayOpaqueProxy: @unchecked Sendable {
             for pipe in current { pipe.close() }
         }
     }
-    private final class Pipe {
+    private final class Pipe: @unchecked Sendable {
         let incoming: NWConnection
         let upstream: NWConnection
         let queue: DispatchQueue
         var shouldDrop: (() -> Bool)?
         var onClose: (() -> Void)?
+        var scheduleDownlink: ((Int, @escaping @Sendable () -> Void) -> Void)?
         var ready = 0
         var closed = false
         var video = false
@@ -101,10 +113,16 @@ final class RelayOpaqueProxy: @unchecked Sendable {
                     }
                     var record = header; record.append(payload)
                     let destination = client ? self.upstream : self.incoming
-                    destination.send(content: record, completion: .contentProcessed { [weak self] error in
+                    let wireRecord = record
+                    let send: @Sendable () -> Void = { [weak self] in
                         guard let self, !self.closed else { return }
-                        if error != nil { self.close() } else { self.read(client: client) }
-                    })
+                        destination.send(content: wireRecord, completion: .contentProcessed { [weak self] error in
+                            guard let self, !self.closed else { return }
+                            if error != nil { self.close() } else { self.read(client: client) }
+                        })
+                    }
+                    if !client, let schedule = self.scheduleDownlink { schedule(wireRecord.count, send) }
+                    else { send() }
                 }
             }
         }

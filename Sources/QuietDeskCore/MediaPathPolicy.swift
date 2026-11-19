@@ -71,6 +71,7 @@ public struct MediaComputeTiming: Sendable {
 public struct MediaPathSample: Sendable {
     public let duration: TimeInterval
     public let mediaActive: Bool
+    public let mappedTransfer: MappedTransferState?
     public let networkSamples: Int
     public let decodedFrames: Int
     public let lossFraction: Double?
@@ -91,7 +92,9 @@ public struct MediaPathSample: Sendable {
                 lossFraction: Double? = nil, jitterMilliseconds: Double? = nil, queueMilliseconds: Double? = nil,
                 encodeMilliseconds: Double? = nil, decodeMilliseconds: Double? = nil,
                 frameBudgetMilliseconds: Double = 1_000 / 60, deliveryMilliseconds: Double? = nil,
-                receivedMegabits: Double? = nil, isLocalNetwork: Bool = false, roundTripMilliseconds: Double? = nil) {
+                receivedMegabits: Double? = nil, isLocalNetwork: Bool = false, roundTripMilliseconds: Double? = nil,
+                mappedTransfer: MappedTransferState? = nil) {
+        self.mappedTransfer = mappedTransfer
         self.duration = duration; self.mediaActive = mediaActive
         self.networkSamples = networkSamples; self.decodedFrames = decodedFrames
         self.lossFraction = lossFraction; self.jitterMilliseconds = jitterMilliseconds
@@ -622,6 +625,8 @@ public struct MediaQualityPolicy: Sendable {
     private var peakComputeMilliseconds: Double?
     // Produced edges a compute reduction left, and when; not retried before the longest upgrade hold.
     private var slowEdges: [Int: TimeInterval] = [:]
+    private var mappedCreditWaitDuration: TimeInterval = 0
+    private var mappedBitrateHoldUntil: TimeInterval = -.infinity
     // Local delay reduced the load on this route, so its recovery climbs one step at a time.
     private var localLatencyLimited = false
     private var localRoundTrip: (milliseconds: Double, at: TimeInterval)?
@@ -661,6 +666,7 @@ public struct MediaQualityPolicy: Sendable {
         upgradeHold = Self.initialUpgradeHold; bitrateHold = Self.initialBitrateHold
         bitrateUpgradedAt = nil; pixelsUpgradedAt = nil
         slowEdges.removeAll(); lastAdjustment = nil; localLatencyLimited = false; localRoundTrip = nil
+        mappedBitrateHoldUntil = -.infinity
         pending = effective == settings ? nil : settings
         pendingUpgrade = nil
         return pending
@@ -670,6 +676,7 @@ public struct MediaQualityPolicy: Sendable {
     public mutating func setLocalNetwork(_ enabled: Bool, now: TimeInterval) {
         guard accept(now), isLocalNetwork != enabled else { return }
         isLocalNetwork = enabled
+        mappedBitrateHoldUntil = -.infinity
         localLatencyLimited = false; localRoundTrip = nil
         lastObservationAt = now
         resetEvidence()
@@ -717,6 +724,7 @@ public struct MediaQualityPolicy: Sendable {
     public mutating func observe(_ sample: MediaPathSample, now: TimeInterval) -> StreamSettings? {
         guard accept(now) else { return nil }
         guard sample.isValid else {
+            mappedCreditWaitDuration = 0
             if isLocalNetwork { lastObservationAt = now; resetEvidence() }
             return nil
         }
@@ -727,6 +735,8 @@ public struct MediaQualityPolicy: Sendable {
         lastObservationAt = now
         guard elapsed > 0 else { return nil }
         guard sample.mediaActive, pending == nil else { resetEvidence(); return nil }
+        if sample.mappedTransfer != nil, now < mappedBitrateHoldUntil { mappedBitrateHoldUntil = now + 6 }
+        if let next = relieveMappedFrameWait(sample, elapsed: elapsed, now: now) { return next }
         if isLocalNetwork {
             // Local links keep the chosen quality despite codec load or loss. Only sustained delay
             // reduces the load, including when congestion prevents frames from finishing decoding.
@@ -774,7 +784,7 @@ public struct MediaQualityPolicy: Sendable {
             healthyDuration += elapsed
             if !localLatencyLimited {
                 // Below the ceiling for another reason, such as a cautious start: restore it at once.
-                guard healthyDuration + mediaPolicyTimeTolerance >= 3, effective != upperBound else { return nil }
+                guard now >= mappedBitrateHoldUntil, healthyDuration + mediaPolicyTimeTolerance >= 3, effective != upperBound else { return nil }
                 lastAdjustment = .raise
                 return recommend(upperBound, now: now)
             }
@@ -824,6 +834,26 @@ public struct MediaQualityPolicy: Sendable {
         }
     }
 
+    // A full send window can hold decoded FPS below target even after the relative delay estimator
+    // has learned the slower path. Confirm that the video uses its budget and the codecs have time.
+    private mutating func relieveMappedFrameWait(_ sample: MediaPathSample, elapsed: TimeInterval, now: TimeInterval) -> StreamSettings? {
+        guard sample.mappedTransfer == .waitingForVideoCredit, now >= mappedBitrateHoldUntil,
+              Double(sample.decodedFrames) / sample.duration < Double(effective.framesPerSecond) * 0.88,
+              let received = sample.receivedMegabits, received >= Double(effective.megabits) * 0.80,
+              let compute = sample.computeMilliseconds, compute < sample.frameBudgetMilliseconds,
+              let lower = bitRates.last(where: { $0 < effective.megabits }),
+              Double(lower) >= megabits(Self.minimumBitsPerPixel, for: effective) else {
+            mappedCreditWaitDuration = 0
+            return nil
+        }
+        mappedCreditWaitDuration += elapsed
+        guard mappedCreditWaitDuration + mediaPolicyTimeTolerance >= 2 else { return nil }
+        var next = effective
+        next.megabits = lower
+        mappedBitrateHoldUntil = now + 6
+        return recommendReduction(next, adjustment: .network, now: now)
+    }
+
     @discardableResult
     public mutating func confirmApplied(_ settings: StreamSettings, now: TimeInterval) -> Bool {
         guard accept(now), pending == settings else { return false }
@@ -859,7 +889,7 @@ public struct MediaQualityPolicy: Sendable {
 
     public mutating func resetObservation(now: TimeInterval) {
         guard accept(now) else { return }
-        lastObservationAt = now; localRoundTrip = nil; resetEvidence()
+        lastObservationAt = now; localRoundTrip = nil; mappedBitrateHoldUntil = -.infinity; resetEvidence()
     }
 
     private mutating func accept(_ now: TimeInterval) -> Bool {
@@ -939,7 +969,7 @@ public struct MediaQualityPolicy: Sendable {
 
     // Smoothness, then sharpness, once the bitrate leaves room for them; otherwise a larger bitrate.
     private mutating func upgrade(now: TimeInterval) -> StreamSettings? {
-        guard now - lastChangeAt + mediaPolicyTimeTolerance >= 3 else { return nil }
+        guard now >= mappedBitrateHoldUntil, now - lastChangeAt + mediaPolicyTimeTolerance >= 3 else { return nil }
         var next = effective
         let pixelsDuration = localLatencyLimited ? filledDuration : (next.megabits < upperBound.megabits ? activeDuration : healthyDuration)
         let pixelsBelowCeiling = next.framesPerSecond < upperBound.framesPerSecond || shownEdge(next) < shownEdge(upperBound)
@@ -1022,6 +1052,7 @@ public struct MediaQualityPolicy: Sendable {
     }
 
     private mutating func resetEvidence() {
+        mappedCreditWaitDuration = 0
         computeDuration = 0; congestedDuration = 0; healthyDuration = 0; activeDuration = 0; filledDuration = 0; lastBottleneck = nil
         peakComputeMilliseconds = nil; localRoundTripCongestedDuration = 0
     }

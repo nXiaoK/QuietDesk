@@ -1282,4 +1282,37 @@ func runMediaPathPolicyChecks() {
         try check(step1.megabits > severeDegraded.megabits || step1.framesPerSecond > severeDegraded.framesPerSecond,
                   "Expected bitrate or FPS step toward sharpest desktop quality, got \(step1)")
     }
+    run("Mapped transfers only trim bitrate under sustained transport credit pressure and recover after transfer") {
+        let ceiling = StreamSettings(longestEdge: 1280, framesPerSecond: 60, megabits: 8)
+        func sample(_ state: MappedTransferState?, fps: Int = 40, rate: Double = 8, compute: Double = 2) -> MediaPathSample {
+            MediaPathSample(duration: 1, mediaActive: true, networkSamples: 0, decodedFrames: fps,
+                            encodeMilliseconds: compute, decodeMilliseconds: 2, deliveryMilliseconds: 20,
+                            receivedMegabits: rate, mappedTransfer: state)
+        }
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, bitRates: StreamSettings.adaptiveBitRates,
+                                             appliedSize: (1280, 720), now: 0)
+        for tick in 1...6 {
+            try check(quality.observe(sample(tick < 4 ? nil : .transferring), now: Double(tick)) == nil,
+                      "A mapped transfer or low frame rate alone reduced desktop quality")
+        }
+        try check(quality.observe(sample(.waitingForVideoCredit), now: 7) == nil, "A single blocked window reduced quality")
+        try check(quality.observe(sample(.waitingForVideoCredit, fps: 60), now: 8) == nil, "Full frame rate lost bitrate")
+        try check(quality.observe(sample(.waitingForVideoCredit, rate: 1), now: 9) == nil, "Quiet content lost bitrate")
+        try check(quality.observe(sample(.waitingForVideoCredit, compute: 23), now: 10) == nil, "A compute-bound window counted as link pressure")
+        try check(quality.observe(sample(.waitingForVideoCredit), now: 11) == nil, "Mixed evidence accumulated")
+        var reduced = ceiling
+        reduced.megabits = 6
+        try check(quality.observe(sample(.waitingForVideoCredit), now: 12) == reduced, "Stable frame credit pressure did not step down bitrate")
+        try check(quality.confirmApplied(reduced, now: 12), "Could not confirm bitrate step")
+        for tick in 13...50 {
+            try check(quality.observe(sample(.transferring, fps: 60, rate: 6), now: Double(tick)) == nil,
+                      "Healthy frames during the same transfer caused another quality transition")
+        }
+        var restored = false
+        for tick in 51...75 {
+            if quality.observe(sample(nil, fps: 60, rate: 6), now: Double(tick)) == ceiling { restored = true; break }
+        }
+        try check(restored, "Completing the mapped transfer left the video below its preferred ceiling")
+    }
+
 }

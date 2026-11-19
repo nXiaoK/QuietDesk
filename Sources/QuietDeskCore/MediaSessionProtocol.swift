@@ -1,5 +1,9 @@
 import Foundation
 
+public enum MappedTransferState: String, Codable, Sendable {
+    case transferring, waitingForVideoCredit
+}
+
 public struct MediaControl: Codable, Sendable {
     public enum Operation: String, Codable, Sendable {
         case request, offer, bind, bound, prepare, ready, decodedReady, commit, committed, abort, recover, stats
@@ -23,6 +27,7 @@ public struct MediaControl: Codable, Sendable {
     public let deliveryMilliseconds: Double?
     // Host stats only: true when encodeMilliseconds is a zero placeholder carrying delivery stats for an idle encode window.
     public let encodeIdle: Bool?
+    public let mappedTransfer: MappedTransferState?
     // Negotiated over request/offer to allow authenticated DTLS datagrams for cursor positions and sequenced pointer moves.
     public let datagramInteractive: Bool?
     // Negotiated over request/offer so both peers scale frame credits dynamically with FPS and measured RTT (up to 24).
@@ -38,7 +43,7 @@ public struct MediaControl: Codable, Sendable {
                 mediaFailure: Bool? = nil, encodeMilliseconds: Double? = nil, relayRouting: Bool? = nil,
                 deliveryMilliseconds: Double? = nil, receiveFrameWindow: Int? = nil, markedRepairs: Bool? = nil,
                 encodeIdle: Bool? = nil, datagramInteractive: Bool? = nil, dynamicFrameWindow: Bool? = nil,
-                parityFEC: Bool? = nil, datagramAudio: Bool? = nil) {
+                parityFEC: Bool? = nil, datagramAudio: Bool? = nil, mappedTransfer: MappedTransferState? = nil) {
         self.operation = operation; self.sessionID = sessionID; self.token = token
         self.datagramKey = datagramKey; self.role = role; self.transactionID = transactionID
         self.transportEpoch = transportEpoch; self.codecEpoch = codecEpoch; self.path = path
@@ -47,6 +52,7 @@ public struct MediaControl: Codable, Sendable {
         self.receiveFrameWindow = receiveFrameWindow
         self.markedRepairs = markedRepairs
         self.encodeIdle = encodeIdle
+        self.mappedTransfer = mappedTransfer
         self.datagramInteractive = datagramInteractive
         self.dynamicFrameWindow = dynamicFrameWindow
         self.parityFEC = parityFEC
@@ -66,6 +72,7 @@ public struct MediaControl: Codable, Sendable {
               datagramAudio == nil || operation == .request || operation == .offer,
               encodeMilliseconds == nil || operation == .stats,
               encodeIdle == nil || operation == .stats,
+              mappedTransfer == nil || operation == .stats,
               deliveryMilliseconds.map({ operation == .stats && $0.isFinite && (0...60_000).contains($0) }) ?? true else {
             throw DeskError.invalid("媒体协商参数无效")
         }
@@ -80,7 +87,7 @@ public struct MediaControl: Codable, Sendable {
                 throw DeskError.invalid("媒体会话凭据缺失")
             }
         case .bind, .bound:
-            guard sessionID != nil, let role, role != .control, token != nil else {
+            guard sessionID != nil, let role, role.isMediaAuxiliary, token != nil else {
                 throw DeskError.invalid("媒体通道绑定无效")
             }
         case .prepare, .ready, .decodedReady, .commit, .committed, .abort:
@@ -125,7 +132,7 @@ public struct MediaBindingGrant {
     public mutating func consume(_ request: MediaControl, now: TimeInterval) -> Bool {
         guard now.isFinite, now >= 0, now <= expiresAt, request.operation == .bind,
               request.sessionID == sessionID, let candidate = request.token, candidate.count == token.count,
-              let role = request.role, role != .control, !bound.contains(role) else { return false }
+              let role = request.role, role.isMediaAuxiliary, !bound.contains(role) else { return false }
         var difference: UInt8 = 0
         for (left, right) in zip(candidate, token) { difference |= left ^ right }
         guard difference == 0 else { return false }

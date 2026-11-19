@@ -21,9 +21,12 @@ public enum SecureTransport {
     }
 
     public static func parameters(key: PairingKey, responsiveAcknowledgements: Bool = false) -> NWParameters {
+        parameters(psk: key.data, identity: Data("quietdesk-v1".utf8), responsiveAcknowledgements: responsiveAcknowledgements)
+    }
+
+    static func parameters(psk: Data, identity: Data, responsiveAcknowledgements: Bool) -> NWParameters {
         let tls = NWProtocolTLS.Options()
-        let identity = Data("quietdesk-v1".utf8)
-        key.data.withUnsafeBytes { keyBytes in
+        psk.withUnsafeBytes { keyBytes in
             identity.withUnsafeBytes { identityBytes in
                 sec_protocol_options_add_pre_shared_key(tls.securityProtocolOptions,
                     DispatchData(bytes: keyBytes) as __DispatchData, DispatchData(bytes: identityBytes) as __DispatchData)
@@ -52,7 +55,7 @@ public enum SecureTransport {
 
 // All callbacks and mutable connection state belong to this peer's queue.
 public final class Peer {
-    public let queue = DispatchQueue(label: "quietdesk.peer", qos: .userInteractive)
+    public let queue: DispatchQueue
     public var onReady: (() -> Void)?
     public var onMessage: ((Message) -> Void)?
     public var onMessageHandled: ((Message, @escaping () -> Void) -> Void)?
@@ -62,6 +65,8 @@ public final class Peer {
     public var onRoundTripMilliseconds: ((Double) -> Void)?
     public private(set) var closeIsRetryable = false
     public private(set) var closeAllowsAlternateRoute = false
+    private var sawTLSFailure = false
+    var allowsUnauthenticatedRouteRetry: Bool { !ready && !sawTLSFailure && closeAllowsAlternateRoute }
     public var isLocalNetwork: Bool { localNetworkClassification == true }
     public var queuedSendBytes: Int { pendingBytesLock.withLock { max(0, trackedPendingBytes) } }
     private let pendingBytesLock = NSLock()
@@ -71,6 +76,9 @@ public final class Peer {
     private let connection: NWConnection
     private var closed = false
     private var started = false
+    private var isMapping = false
+    private var maximumReceiveBytes: Int { isMapping ? PortMappingTraffic.chunkBytes + 1 : Wire.maximumMessageBytes }
+    private var sendContext = NWConnection.ContentContext.defaultMessage
     private var ready = false
     private var lastReceived = SessionClock.uptime
     private var livenessGrace = LocalSchedulingGrace()
@@ -112,7 +120,8 @@ public final class Peer {
         }
     }
 
-    public init(connection: NWConnection, idleTimeout: TimeInterval = 30, handshakeTimeout: TimeInterval = 15, heartbeatInterval: TimeInterval = 5, diagnostics: PerformanceDiagnostics? = nil, transportDiagnosticsSupported: Bool = true) {
+    public init(connection: NWConnection, idleTimeout: TimeInterval = 30, handshakeTimeout: TimeInterval = 15, heartbeatInterval: TimeInterval = 5, diagnostics: PerformanceDiagnostics? = nil, transportDiagnosticsSupported: Bool = true, qos: DispatchQoS = .userInteractive) {
+        queue = DispatchQueue(label: "quietdesk.peer", qos: qos)
         self.connection = connection
         self.idleTimeout = idleTimeout
         self.handshakeTimeout = handshakeTimeout
@@ -137,7 +146,10 @@ public final class Peer {
                 let now = SessionClock.uptime
                 let timeout = self.ready ? self.idleTimeout : self.handshakeTimeout
                 self.livenessGrace.observe(now: now, interval: self.heartbeatInterval, allowance: min(5, timeout))
-                if !self.livenessGrace.isActive(at: now), now - self.lastReceived > timeout {
+                // A full local TCP window pauses reads on a mapping stream, including
+                // its next pong. Keep sending heartbeats and supervise its separate lease.
+                let waitingForConsumer = self.isMapping && self.waitingForMessage
+                if !waitingForConsumer, !self.livenessGrace.isActive(at: now), now - self.lastReceived > timeout {
                     self.closeAllowsAlternateRoute = !self.ready
                     self.finish(self.ready ? "连接超过 \(Int(self.idleTimeout)) 秒无数据" : "建立连接超时，请检查地址或远端状态")
                 } else if self.ready {
@@ -158,6 +170,7 @@ public final class Peer {
                     self.receiveHeader()
                 case .failed(let error):
                     if case .tls(let code) = error {
+                        self.sawTLSFailure = true
                         let failure = SecureTransport.tlsFailure(code: code, description: error.localizedDescription, afterReady: self.ready)
                         self.finish(failure.reason, retryable: failure.retryable)
                     }
@@ -167,6 +180,7 @@ public final class Peer {
                                     retryable: error != .posix(.ECONNREFUSED))
                     }
                 case .waiting(let error):
+                    if case .tls = error { self.sawTLSFailure = true }
                     if case .tls(let code) = error, SecureTransport.pairingFailureCodes.contains(code) {
                         self.finish("TLS 配对验证失败：\(error.localizedDescription)", retryable: false)
                     } else if let reason = SecureTransport.connectionFailureReason(error) {
@@ -303,7 +317,7 @@ public final class Peer {
     private func submit(_ message: OutgoingMessage, range: Range<Int>, last: Bool) {
         let content = range.count == message.data.count ? message.data : message.data.subdata(in: range)
         let meter = trafficMeter
-        connection.send(content: content, completion: .contentProcessed { [weak self] error in
+        connection.send(content: content, contentContext: sendContext, completion: .contentProcessed { [weak self] error in
             if last {
                 if let self, !self.closed {
                     self.diagnostics?.record(.sendCompletion, since: message.submittedAt, kind: message.kind, identifier: message.identifier)
@@ -373,6 +387,21 @@ public final class Peer {
         for message in unsent { message.completion?(false) }
     }
 
+    // Set from onReady, on the peer queue, before the first header can allocate a body.
+    func prepareForMapping() -> Bool {
+        guard MediaSecureTransport.negotiatedRole(on: connection) == .portMapping else { return false }
+        let metadata = NWProtocolIP.Metadata()
+        metadata.serviceClass = .background
+        sendContext = NWConnection.ContentContext(identifier: "quietdesk-mapping", metadata: [metadata])
+        onTraffic = nil
+        onRoundTripMilliseconds = nil
+        onReady = nil
+        transportDiagnosticsSupported = false
+        updateTransportDiagnostics()
+        isMapping = true
+        return true
+    }
+
     private func receiveHeader() {
         let headerStartedAt = diagnostics?.start()
         readExactly(4) { [weak self] data in
@@ -381,7 +410,7 @@ public final class Peer {
             do {
                 var reader = ByteReader(data)
                 let size: UInt32 = try reader.take()
-                guard size >= 1, size <= Wire.maximumMessageBytes else {
+                guard size >= 1, size <= self.maximumReceiveBytes else {
                     throw DeskError.invalid("无效的消息长度")
                 }
                 let bodyStartedAt = self.diagnostics?.start()
@@ -415,6 +444,7 @@ public final class Peer {
                                               self.deliverySequence == sequence else { return }
                                         self.diagnostics?.record(.messageHandler, since: handlingStartedAt, kind: kind, identifier: identifier)
                                         self.waitingForMessage = false
+                                        if self.isMapping { self.lastReceived = SessionClock.uptime }
                                         self.receiveHeader()
                                     }
                                 }

@@ -35,7 +35,7 @@ struct SessionControlPresentation: Equatable {
 }
 
 enum SessionToolAction: CaseIterable {
-    case releaseControl, fullScreen, sendText, receiveText, captureFrame, keyboard, privacy, traffic, endSession
+    case releaseControl, fullScreen, sendText, receiveText, captureFrame, keyboard, portMapping, privacy, traffic, endSession
 
     func title(fullScreen: Bool = false, hasSession: Bool = true) -> String {
         switch self {
@@ -45,6 +45,7 @@ enum SessionToolAction: CaseIterable {
         case .receiveText: return "获取文字"
         case .captureFrame: return "截取远端画面"
         case .keyboard: return "键盘与快捷键"
+        case .portMapping: return "TCP 端口映射"
         case .privacy: return "被控端隐私与安全"
         case .traffic: return "设备历史流量"
         case .endSession: return hasSession ? "断开" : "返回连接"
@@ -59,6 +60,7 @@ enum SessionToolAction: CaseIterable {
         case .receiveText: return "arrow.down.doc"
         case .captureFrame: return "camera.viewfinder"
         case .keyboard: return "keyboard"
+        case .portMapping: return "point.3.connected.trianglepath.dotted"
         case .privacy: return "lock.shield"
         case .traffic: return "chart.bar.xaxis"
         case .endSession: return "stop.circle"
@@ -82,6 +84,7 @@ enum SessionToolAction: CaseIterable {
         case .receiveText: return "获取远端剪贴板文字"
         case .captureFrame: return "把当前远端画面复制到剪贴板（⌃⌘S），防窥遮罩不会出现在截图里"
         case .keyboard: return "系统快捷键、Caps Lock 转发与本机权限的实际生效状态"
+        case .portMapping: return "在本机访问被控 Mac 允许的 TCP 服务"
         case .privacy: return "被控端防窥、静音、亮度与断开锁屏设置"
         case .traffic: return "查看本机保存的设备历史流量"
         case .endSession: return "结束本次远程连接，沿用原有停止与取消重连行为"
@@ -180,6 +183,7 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
                         settings
                         Divider()
                         VStack(spacing: 0) {
+                            navigationButton(.portMapping)
                             navigationButton(.privacy)
                             navigationButton(.traffic)
                         }
@@ -236,6 +240,7 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
                 if let detail { Text(detail).font(.system(size: 10)).foregroundStyle(.secondary) }
                 Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
             }.frame(minHeight: 30)
+            .contentShape(Rectangle())
         }.buttonStyle(.plain).help(action.help)
     }
 }

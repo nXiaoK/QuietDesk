@@ -6,6 +6,7 @@ import Combine
 final class DeskServices {
     let trafficHistoryStore = TrafficHistoryStore()
     let trafficHistory = TrafficHistoryFeed()
+    let portMappings = PortMappingManager()
     let routeBenchmarkStore = RouteQualityBenchmarkStore()
 
     init() {
@@ -44,7 +45,7 @@ final class DeskModels: ObservableObject {
     }
 
     var changes: AnyPublisher<Void, Never> {
-        viewer.objectWillChange.merge(with: host.objectWillChange).eraseToAnyPublisher()
+        viewer.objectWillChange.merge(with: host.objectWillChange, viewer.portMappings.objectWillChange).eraseToAnyPublisher()
     }
     var mainWindow: NSWindow? { viewer.mainWindow ?? host.mainWindow }
     var updatePromptBlocked: Bool { all.contains { $0.updatePromptBlocked } }
@@ -55,5 +56,9 @@ final class DeskModels: ObservableObject {
     func prepareShowWindow() { all.forEach { $0.prepareShowWindow() } }
     func setPerformanceDiagnosticsEnabled(_ enabled: Bool) { all.forEach { $0.setPerformanceDiagnosticsEnabled(enabled) } }
     func flushPerformanceDiagnostics() { all.forEach { $0.flushPerformanceDiagnostics() } }
-    func stopAll() { all.forEach { $0.stop() } }
+    func stopAll() {
+        viewer.portMappings.stopAllMappings()
+        host.setMappingHosting(false)
+        all.forEach { $0.stop() }
+    }
 }

@@ -141,7 +141,7 @@ private struct RecentConnectionRow: View {
                     Text("设备 \(relay.deviceID.uuidString.lowercased())").font(.caption).monospaced()
                         .lineLimit(1).truncationMode(.middle).help(relay.deviceID.uuidString.lowercased())
                 }
-                Text("上次连接 \(record.lastConnected.formatted(date: .abbreviated, time: .shortened))")
+                Text(record.lastConnected == .distantPast ? "已保存 · 尚未远控" : "上次连接 \(record.lastConnected.formatted(date: .abbreviated, time: .shortened))")
                     .font(.caption2).foregroundStyle(.secondary)
             }.frame(maxWidth: .infinity, alignment: .leading)
             Button("测速…", action: benchmark).controlSize(.small)

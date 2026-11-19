@@ -12,6 +12,8 @@ struct SharingView: View {
 
     private var locked: Bool { model.active || model.working }
 
+    private var listenerSettingsLocked: Bool { locked || model.mappingHosting }
+
     var body: some View {
         GeometryReader { geometry in
             ScrollView {
@@ -226,7 +228,7 @@ struct SharingView: View {
                                 }
                                 .disabled(previousCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                             }
-                            .disabled(locked)
+                            .disabled(listenerSettingsLocked)
                         }
                     }
                     Divider()
@@ -234,7 +236,7 @@ struct SharingView: View {
                         VStack(alignment: .leading, spacing: 5) {
                             Text("持有配对码即可查看和控制这台 Mac，请只交给自己的设备。")
                             Text("本机文件由当前账户权限保护，未单独加密。生成新码会让原配对码失效。")
-                            if locked { Text("共享中不可重新生成；停止共享后可用。") }
+                            if listenerSettingsLocked { Text("停止桌面共享和独立映射服务后可更换配对码。") }
                         }
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -245,7 +247,7 @@ struct SharingView: View {
                             else { confirmingRegeneration = true }
                         }
                         .controlSize(.small)
-                        .disabled(locked)
+                        .disabled(listenerSettingsLocked)
                         .confirmationDialog("重新生成配对码？", isPresented: $confirmingRegeneration, titleVisibility: .visible) {
                             Button("重新生成", role: .destructive) { model.regenerateKey() }
                             Button("取消", role: .cancel) {}
@@ -294,7 +296,7 @@ struct SharingView: View {
                                 .frame(width: 72)
                                 .accessibilityLabel("监听端口")
                         }
-                        .disabled(locked)
+                        .disabled(listenerSettingsLocked)
                     }
                     if let notice = model.displayFallbackNotice {
                         Text(notice)

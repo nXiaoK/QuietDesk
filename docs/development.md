@@ -190,6 +190,7 @@ python3 -m unittest discover -s scripts/tests -v
 | `run-session-tools-checks.sh` | 窗口/全屏共用工具的控制状态优先级、名称/快捷键、连接可用性与本机操作前释放顺序纯逻辑；只调用本地桩，不实例化模型、不操作权限、真实剪贴板或输入 |
 | `run-connection-recovery-checks.sh` | 以注入的单调时间检查真实重试计划的剩余等待、到期但尚未开始、正在建连、空闲暂停与断开投影；不实例化模型、不建立连接、不修改重试策略 |
 | `run-input-checks.sh` | 验证真实 AppKit 鼠标、滚轮事件到远程输入的转换，以及被控端 CGEvent 字段；使用离屏画布与假提交器，不向系统注入输入 |
+| `run-port-mapping-checks.sh` | 使用本机回环、合成配对码和临时文件验证映射授权、传输完整性与规则生命周期。加 `--benchmark` 可在共享限速链路上对比下载前、中、后的解码帧率、帧间隔、控制回显延迟、码率、亮度 PSNR 和画质调档，并校验下载文件的 SHA-256。 |
 | `run-video-checks.sh` | 编码丢帧恢复、三帧窗口和画质/暂停边界，CoreMedia 数据持有与合成 H.264/HEVC 编解码；不采集屏幕 |
 | `run-session-quality-checks.sh` | 画质展示的准备请求、等待确认、连续选择合并、实际生效与错误隔离，以及现有画质协议、旧端兼容、偏好恢复和合成编解码；不建立连接、不操作真实记录或凭据 |
 | `run-privacy-cursor-checks.sh` | 假后台光标接口，验证隐藏计数、重叠会话、失败重试、析构与残留清理；不隐藏真实光标 |

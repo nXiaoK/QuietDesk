@@ -60,7 +60,7 @@ private func relayPacket(_ sequence: UInt32, idr: Bool) -> VideoPacket {
                 avcc: Data([0, 0, 0, 2, idr ? 0x65 : 0x41, 0x88]))
 }
 
-private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false, wrongPairing: Bool = false, pinned: Bool = false) throws {
+private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false, wrongPairing: Bool = false, pinned: Bool = false, testMapping: Bool = false) throws {
     let queue = DispatchQueue(label: "checks.relay.host-listener")
     let key = try PairingKey.generate(), device = UUID()
     let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8)
@@ -73,12 +73,17 @@ private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false,
     let errors = RelayBox<[String]>([]), states = RelayBox<[String]>([]), sequence = RelayBox<UInt32>(0), bridgePort = RelayBox<UInt16?>(nil)
     let hostAgent = RelayBox<RelayHostRegistration?>(nil), hostReady = RelayBox(false), verifiedSource = RelayBox(false)
     let shuttingDown = RelayBox(false)
+    let allowed = RelayBox<PortMappingTarget?>(nil)
+    let mappings = PortMappingHost { target, reply in reply(target == allowed.read()) }
+    defer { mappings.stop() }
     let listener = try startRelayHostListener(parameters, queue: queue) { connection in
         let peer = Peer(connection: connection); peers.update { $0.append(peer) }
         peer.onReady = { [weak peer] in
             guard let peer else { return }
             if let role = MediaSecureTransport.negotiatedRole(on: connection), role != .control {
-                hostMedia.read()?.acceptAuxiliary(peer, role: role); return
+                if role == .portMapping { mappings.accept(peer) }
+                else { hostMedia.read()?.acceptAuxiliary(peer, role: role) }
+                return
             }
             hostReady.update { $0 = true }
             verifiedSource.update { $0 = hostAgent.read()?.ownsLocalEndpoint(connection.endpoint) == true }
@@ -157,6 +162,58 @@ private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false,
     for _ in 0..<100 where !states.read().contains(expected) { Thread.sleep(forTimeInterval: 0.01) }
     try requireRelay(states.read().contains(expected), "Wrong committed relay transport: \(states.read())")
     try requireRelay(errors.read().isEmpty, "Relayed session failed: \(errors.read())")
+    if testMapping {
+        try exerciseIndependentMapping(fixture, device: device, key: key, allowed: allowed) {
+            shuttingDown.update { $0 = true }
+            client.close()
+            bridge.stop()
+        }
+    }
+}
+
+// Run a second, mapping-only bridge against the same registered device, then close the desktop
+// bridge before opening a local flow. The lease and application bytes must survive independently.
+private func exerciseIndependentMapping(_ fixture: Fixture, device: UUID, key: PairingKey,
+                                        allowed: RelayBox<PortMappingTarget?>, closeDesktop: () -> Void) throws {
+    let queue = DispatchQueue(label: "checks.relay.mapped-service")
+    let parameters = NWParameters.tcp
+    parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+    let request = Data("mapping request".utf8), reply = Data("approved service response".utf8)
+    let service = try startRelayHostListener(parameters, queue: queue) { socket in
+        socket.start(queue: queue)
+        socket.receive(minimumIncompleteLength: request.count, maximumLength: request.count) { bytes, _, _, _ in
+            guard bytes == request else { socket.cancel(); return }
+            socket.send(content: reply, contentContext: .finalMessage, isComplete: true,
+                        completion: .contentProcessed { _ in socket.cancel() })
+        }
+    }
+    defer { service.cancel() }
+    let target = try PortMappingTarget(host: "127.0.0.1", port: service.port!.rawValue)
+    allowed.update { $0 = target }
+    let bridge = try RelayViewerBridge(endpoint: fixture.endpoint, accessKey: fixture.accessKey, deviceID: device,
+                                       udpEnabled: false, certificateAuthorities: fixture.authorities)
+    let localReady = DispatchSemaphore(value: 0), bridgePort = RelayBox<UInt16>(0)
+    bridge.onReady = { port in bridgePort.update { $0 = port }; localReady.signal() }
+    bridge.start(); defer { bridge.stop() }
+    try waitRelay(localReady, "Independent relay bridge did not bind")
+    let mapping = try PortMappingViewer(host: "127.0.0.1", port: bridgePort.read(), key: key,
+                                        target: target, localPort: 0, traffic: PortMappingTraffic())
+    let listening = DispatchSemaphore(value: 0), localPort = RelayBox<UInt16>(0)
+    mapping.onState = { state in
+        if case .listening(let port, _) = state { localPort.update { $0 = port }; listening.signal() }
+    }
+    mapping.start(); defer { mapping.stop() }
+    try waitRelay(listening, "Mapping lease failed through Go relay")
+    closeDesktop()
+    let socket = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: localPort.read())!, using: .tcp)
+    let finished = DispatchSemaphore(value: 0), response = RelayBox<Data?>(nil)
+    socket.start(queue: queue); defer { socket.cancel() }
+    socket.send(content: request, completion: .contentProcessed { _ in })
+    socket.receive(minimumIncompleteLength: reply.count, maximumLength: reply.count) { bytes, _, _, _ in
+        response.update { $0 = bytes }; finished.signal()
+    }
+    try waitRelay(finished, "Independent mapped service did not respond after desktop disconnect")
+    try requireRelay(response.read() == reply, "Relay mapping lost application data")
 }
 
 // Uses real inner TLS/DTLS and the real node, with fake video and no capture/input injection.
@@ -500,7 +557,9 @@ private func rejectedRelay(_ fixture: Fixture, wrongKey: Bool) throws {
                                  && failures.read().allSatisfy(\.retryable),
                                  "Interrupted handshake bypassed failure or stopped retries: \(failures.read())")
             }
-            run("Native endpoints preserve inner desktop TLS, independent TCP video and bulk through the Go relay") { try exerciseRelay(fixture, udp: false) }
+            run("Desktop TLS, video and bulk work through the Go relay; independent mapping survives desktop disconnect") {
+                try exerciseRelay(fixture, udp: false, testMapping: true)
+            }
             run("Native endpoints preserve inner desktop DTLS media through authenticated Go datagram routing") { try exerciseRelay(fixture, udp: true) }
             run("Assisted relay UDP punches a direct path, keeps DTLS video flowing and returns to the node when turned off") {
                 try exerciseAssistedRelay(fixture)

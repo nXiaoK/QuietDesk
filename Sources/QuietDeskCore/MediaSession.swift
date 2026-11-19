@@ -59,6 +59,9 @@ public final class MediaSession: @unchecked Sendable {
     public var onAudioPacket: ((RemoteAudioPacket) -> Void)?
     public var onReduceLoad: ((MediaBottleneck) -> Void)?
     public var onSample: ((MediaPathSample) -> Void)?
+    /// Host-side frame delivery delay above the recent minimum, excluding keyframes and planned pacing.
+    public var onVideoDeliveryDelay: ((Double) -> Void)?
+    public var hasRecentMappedPayload: (() -> Bool)?
     // Actual video route classification, delivered before its sample or direct reduction callback.
     public var onLocalNetwork: ((Bool) -> Void)?
     public var prepareAlternateDatagramPath: ((@escaping (DatagramEndpoint?) -> Void) -> Void)?
@@ -236,6 +239,8 @@ public final class MediaSession: @unchecked Sendable {
     private var sampleSettledFragments = 0
     private var sampleLostFragments = 0
     private var sampleDeliveryMilliseconds: Double?
+    private var sampleMappedTransfer: MappedTransferState?
+    private var waitingCreditStream: MediaStreamID?
     private var udpJitter = MediaJitterEstimator()
     private var deliveryEstimator = MediaDeliveryEstimator()
     private var deliveryPath: Path?
@@ -404,7 +409,7 @@ public final class MediaSession: @unchecked Sendable {
     }
 
     public func acceptAuxiliary(_ peer: Peer, role: MediaChannelRole) {
-        guard role != .control else { peer.close("辅助媒体通道角色无效"); return }
+        guard role.isMediaAuxiliary else { peer.close("辅助媒体通道角色无效"); return }
         installAuxiliaryHandlers(peer, role: role, accepting: true)
     }
 
@@ -431,6 +436,21 @@ public final class MediaSession: @unchecked Sendable {
             guard let self, !self.stopped else { return }
             if let encodeMilliseconds { self.sampleEncode.add(encodeMilliseconds) }
             if let decodeMilliseconds { self.sampleDecode.add(decodeMilliseconds) }
+        }
+    }
+
+    /// The capture pump had an eligible new image and a free encoder, but no frame credit.
+    public func recordFrameCreditWait() {
+        queue.async { [weak self] in
+            guard let self, self.side == .host, !self.stopped, !self.paused, !self.configurationSuspended,
+                  self.transaction == nil, !self.recoveryHold, let stream = self.active?.stream,
+                  self.waitingCreditStream != stream else { return }
+            let cutoff = SessionClock.now - 1 / Double(self.settings.framesPerSecond)
+            // Entries are non-IDR frames removed at the first reassembly/decoded feedback.
+            if self.deliverySentAt.contains(where: { $0.key.stream == stream && $0.value.at <= cutoff }),
+               self.hasRecentMappedPayload?() == true {
+                self.waitingCreditStream = stream
+            }
         }
     }
 
@@ -639,6 +659,7 @@ public final class MediaSession: @unchecked Sendable {
             guard side == .viewer, let milliseconds = value.encodeMilliseconds else { return }
             // Newer hosts report their window mean; an older host's per-second maximum is treated the same way.
             if value.encodeIdle != true { sampleEncode.add(milliseconds) }
+            sampleMappedTransfer = value.mappedTransfer
             if let delivery = value.deliveryMilliseconds { sampleDeliveryMilliseconds = max(sampleDeliveryMilliseconds ?? 0, delivery) }
             return
         }
@@ -828,7 +849,7 @@ public final class MediaSession: @unchecked Sendable {
     }
 
     private func openAuxiliary(_ role: MediaChannelRole) {
-        guard let host, role != .control else { return }
+        guard let host, role.isMediaAuxiliary else { return }
         do {
             let connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!,
                 using: try MediaSecureTransport.tlsParameters(key: key, roles: [role]))
@@ -900,7 +921,7 @@ public final class MediaSession: @unchecked Sendable {
     }
 
     private func receiveBinding(_ value: MediaControl, peer: Peer) throws {
-        guard value.sessionID == sessionID, let role = value.role, role != .control else { throw DeskError.invalid("媒体会话绑定不匹配") }
+        guard value.sessionID == sessionID, let role = value.role, role.isMediaAuxiliary else { throw DeskError.invalid("媒体会话绑定不匹配") }
         if side == .host {
             guard value.operation == .bind, var grant, grant.consume(value, now: SessionClock.now),
                   role == .video ? videoPeer == nil : bulkPeer == nil else { throw DeskError.invalid("媒体绑定令牌失效或重复") }
@@ -1096,6 +1117,7 @@ public final class MediaSession: @unchecked Sendable {
         if active?.path != path {
             sampleStartedAt = SessionClock.now; samplePackets = 0; sampleFrames = 0; sampleWaitMilliseconds = 0
             sampleBytes = 0; sampleSettledFragments = 0; sampleLostFragments = 0; sampleDeliveryMilliseconds = nil
+            sampleMappedTransfer = nil
             sampleEncode = MediaComputeTiming(); sampleDecode = MediaComputeTiming(); sampleDirectReduction = false
             _ = udpJitter.takeWindowMilliseconds()
             onPathSwitch?(stateLabel(path), cause)
@@ -1614,7 +1636,7 @@ public final class MediaSession: @unchecked Sendable {
                     frameBudgetMilliseconds: 1000 / Double(settings.framesPerSecond),
                     deliveryMilliseconds: sampleDeliveryMilliseconds,
                     receivedMegabits: Double(sampleBytes) * 8 / duration / 1_000_000,
-                    isLocalNetwork: localNetwork, roundTripMilliseconds: measuredRoundTrip)
+                    isLocalNetwork: localNetwork, roundTripMilliseconds: measuredRoundTrip, mappedTransfer: sampleMappedTransfer)
                 let actions = policy.observe(sample, epoch: policy.epoch, now: now)
                 if localNetwork || (!sampleDirectReduction && !actions.contains(where: { if case .reduceLoad = $0 { return true }; return false })) { onSample?(sample) }
                 // A UDP trial that has not committed yet is when loss explains a fallback, so follow
@@ -1623,6 +1645,7 @@ public final class MediaSession: @unchecked Sendable {
                 handleActions(actions)
                 sampleStartedAt = now; samplePackets = 0; sampleFrames = 0; sampleWaitMilliseconds = 0
                 sampleBytes = 0; sampleSettledFragments = 0; sampleLostFragments = 0; sampleDeliveryMilliseconds = nil
+                sampleMappedTransfer = nil
                 sampleEncode = MediaComputeTiming(); sampleDecode = MediaComputeTiming()
                 sampleDirectReduction = false
             }
@@ -1630,14 +1653,21 @@ public final class MediaSession: @unchecked Sendable {
             handleSendEvents(cache?.expire() ?? [])
             if now - sampleStartedAt >= 1 {
                 let delivery = deliveryEstimator.takeWindow(at: now).map { min(60_000, $0) }
+                if let delivery { onVideoDeliveryDelay?(delivery) }
                 if let identifier = sessionID {
-                    if let encode = sampleEncode.mean, encode <= 10_000 {
-                        sendControl(MediaControl(.stats, sessionID: identifier, encodeMilliseconds: encode, deliveryMilliseconds: delivery))
-                    } else if let delivery {
-                        sendControl(MediaControl(.stats, sessionID: identifier, encodeMilliseconds: 0,
-                                                 deliveryMilliseconds: delivery, encodeIdle: true))
+                    var mapped: MappedTransferState?
+                    if hasRecentMappedPayload?() == true {
+                        let waited = waitingCreditStream != nil && waitingCreditStream == active?.stream && transaction == nil
+                        mapped = waited ? .waitingForVideoCredit : .transferring
+                    }
+                    let encode = sampleEncode.mean.flatMap { $0 <= 10_000 ? $0 : nil }
+                    if encode != nil || delivery != nil || mapped != nil {
+                        sendControl(MediaControl(.stats, sessionID: identifier, encodeMilliseconds: encode ?? 0,
+                                                 deliveryMilliseconds: delivery, encodeIdle: encode == nil ? true : nil,
+                                                 mappedTransfer: mapped))
                     }
                 }
+                waitingCreditStream = nil
                 sampleStartedAt = now; sampleEncode = MediaComputeTiming(); sampleDecode = MediaComputeTiming()
             }
         }

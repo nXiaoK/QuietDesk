@@ -420,10 +420,10 @@ private struct PreFlightReadinessCard: View {
         }
         .padding(15)
         .frame(maxWidth: .infinity, minHeight: 158, alignment: .topLeading)
-        .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.6), lineWidth: 0.8)
+                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.65), lineWidth: 0.8)
         }
     }
 
@@ -514,6 +514,7 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
             .frame(maxWidth: 1080, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
+        .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             if records.isEmpty || failure != nil {
                 focusIncompleteField()

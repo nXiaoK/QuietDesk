@@ -251,6 +251,26 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
                     "A new hole-filling fragment was not counted as real receiving progress")
     }
 
+    run("Each new fragment hole in a paced frame gets its own reorder window") {
+        let time = MediaCheckClock()
+        let receiver = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        let parts = try MediaFragment.fragment(frame: frame(1, idr: true, bytes: 8_192))
+        _ = try receiver.receive(parts[0])
+        time.now = 0.005
+        _ = try receiver.receive(parts[2])
+        try require(feedback(receiver.poll(), .nack).isEmpty, "Frame age triggered an immediate repair")
+        time.now = 0.007
+        _ = try receiver.receive(parts[4])
+        time.now = 0.0082
+        let nacks = feedback(receiver.poll(), .nack)
+        try require(nacks.count == 1 && nacks[0].missingRanges == [.init(first: 1, count: 1)],
+                    "Repair did not distinguish the older hole from the newer one")
+        _ = try receiver.receive(parts[3])
+        _ = try receiver.receive(parts[1], isRepair: true)
+        for part in parts.dropFirst(5) { _ = try receiver.receive(part) }
+        try require(receiver.takeFragmentCounts() == (parts.count, 1), "Brief reordering added false congestion loss")
+    }
+
     run("Loss counts only fragments that missed the reorder window, including frames that expired") {
         let time = MediaCheckClock()
         let receiver = try MediaFrameReassembler(stream: stream, clock: { time.now })

@@ -125,14 +125,15 @@ public final class MediaFrameReassembler {
         let fragmented: Bool
         let firstReceivedAt: TimeInterval
         var lastProgressAt: TimeInterval
-        var highestReceivedAt: TimeInterval
         var lastNackAt: TimeInterval?
         var requestedThroughTail = false
         var bytes: Data
         var received: [Bool]
         var late: [Bool]
         var receivedCount = 0
-        var highestReceivedIndex = -1
+        private(set) var exposedCount = 0
+        private var firstMissingIndex = 0
+        private var missingSince: [Int: TimeInterval] = [:]
         var parityPayload: Data?
         var frame: MediaFrame?
         var completedAt: TimeInterval?
@@ -144,7 +145,6 @@ public final class MediaFrameReassembler {
             fragmented = true
             firstReceivedAt = now
             lastProgressAt = now
-            highestReceivedAt = now
             bytes = Data(count: totalBytes)
             received = Array(repeating: false, count: fragmentCount)
             late = Array(repeating: false, count: fragmentCount)
@@ -157,11 +157,11 @@ public final class MediaFrameReassembler {
             fragmented = true
             firstReceivedAt = now
             lastProgressAt = now
-            highestReceivedAt = now
             bytes = Data(count: totalBytes)
             received = Array(repeating: false, count: fragmentCount)
             late = Array(repeating: false, count: fragmentCount)
             parityPayload = parity.parityPayload
+            exposeFragments(upTo: fragmentCount, at: now)
         }
 
         init(_ frame: MediaFrame, bytes: Data, now: TimeInterval) {
@@ -171,24 +171,50 @@ public final class MediaFrameReassembler {
             fragmented = false
             firstReceivedAt = now
             lastProgressAt = now
-            highestReceivedAt = now
             self.bytes = bytes
             received = Array(repeating: true, count: fragmentCount)
             late = Array(repeating: false, count: fragmentCount)
             receivedCount = fragmentCount
-            highestReceivedIndex = fragmentCount - 1
+            exposedCount = fragmentCount
+            firstMissingIndex = fragmentCount
             self.frame = frame
             completedAt = now
         }
 
-        func missingRanges(includeTail: Bool) -> [MediaFragmentRange] {
+        // Originals are sent in index order, followed by parity. Each newly exposed gap starts its own timer.
+        func exposeFragments(upTo end: Int, at now: TimeInterval) {
+            guard end > exposedCount else { return }
+            for index in exposedCount..<end where !received[index] { missingSince[index] = now }
+            exposedCount = end
+        }
+
+        func markReceived(_ index: Int, at now: TimeInterval, reorderDelay: TimeInterval) {
+            if let since = missingSince.removeValue(forKey: index), now >= since + reorderDelay { late[index] = true }
+            received[index] = true
+            receivedCount += 1
+            exposeFragments(upTo: index + 1, at: now)
+            while firstMissingIndex < fragmentCount, received[firstMissingIndex] { firstMissingIndex += 1 }
+            lastProgressAt = now
+        }
+
+        func nextRepairAt(_ limits: MediaBufferLimits) -> TimeInterval {
+            let firstDeadline = missingSince[firstMissingIndex].map { $0 + limits.reorderDelay }
+                ?? (lastProgressAt + max(limits.reorderDelay, limits.nackInterval))
+            return max(firstDeadline, lastNackAt.map { $0 + limits.nackInterval } ?? firstDeadline)
+        }
+
+        func missingRanges(at now: TimeInterval, limits: MediaBufferLimits) -> [MediaFragmentRange] {
+            let includeTail = now >= lastProgressAt + max(limits.reorderDelay, limits.nackInterval)
+            func due(_ index: Int) -> Bool {
+                !received[index] && (includeTail || missingSince[index].map { now >= $0 + limits.reorderDelay } == true)
+            }
             var ranges: [MediaFragmentRange] = []
-            var index = 0
-            let end = includeTail ? received.count : highestReceivedIndex + 1
+            var index = firstMissingIndex
+            let end = includeTail ? fragmentCount : exposedCount
             while index < end, ranges.count < MediaFeedback.maximumMissingRanges {
-                if received[index] { index += 1; continue }
+                if !due(index) { index += 1; continue }
                 let first = index
-                while index < end, !received[index] { index += 1 }
+                repeat { index += 1 } while index < end && due(index)
                 ranges.append(MediaFragmentRange(first: UInt16(first), count: UInt16(index - first)))
             }
             return ranges
@@ -224,7 +250,7 @@ public final class MediaFrameReassembler {
     public func abandon() {
         let now = currentTime()
         for assembly in assemblies.values where assembly.fragmented && assembly.frame == nil {
-            let end = now - assembly.lastProgressAt >= limits.reorderDelay ? assembly.fragmentCount : assembly.highestReceivedIndex + 1
+            let end = now - assembly.lastProgressAt >= limits.reorderDelay ? assembly.fragmentCount : assembly.exposedCount
             settleFragments(end, lost: (0..<end).lazy.filter { !assembly.received[$0] || assembly.late[$0] }.count)
         }
         assemblies.removeAll()
@@ -300,16 +326,9 @@ public final class MediaFrameReassembler {
             }
         } else {
             assembly.bytes.replaceSubrange(range, with: fragment.payload)
-            assembly.received[index] = true
-            assembly.receivedCount += 1
-            let reorderedLate = index < assembly.highestReceivedIndex && now - assembly.highestReceivedAt >= limits.reorderDelay
+            assembly.markReceived(index, at: now, reorderDelay: limits.reorderDelay)
             let missingHoleLate = missingGap.map { $0.requested || now - $0.firstSeenAt >= limits.reorderDelay } ?? false
-            if reorderedLate || missingHoleLate || (isRepair && assembly.requestedThroughTail) { assembly.late[index] = true }
-            if index > assembly.highestReceivedIndex {
-                assembly.highestReceivedIndex = index
-                assembly.highestReceivedAt = now
-            }
-            assembly.lastProgressAt = now
+            if missingHoleLate || (isRepair && assembly.requestedThroughTail) { assembly.late[index] = true }
             if assembly.receivedCount == assembly.fragmentCount {
                 do {
                     assembly.frame = try MediaFrame(header: assembly.header, packetBytes: assembly.bytes)
@@ -357,6 +376,8 @@ public final class MediaFrameReassembler {
                 }
             } else {
                 existing.parityPayload = parity.parityPayload
+                existing.exposeFragments(upTo: existing.fragmentCount, at: now)
+                existing.lastProgressAt = now
             }
             assembly = existing
         } else {
@@ -370,7 +391,6 @@ public final class MediaFrameReassembler {
             bufferedBytes += parity.frameBytes
         }
         if assembly.frame == nil {
-            assembly.lastProgressAt = now
             try tryCompleteWithParity(assembly, now: now, events: &events)
         }
         updateGap(at: now)
@@ -401,18 +421,9 @@ public final class MediaFrameReassembler {
             _ = invalidate(at: assembly.header)
             throw DeskError.invalid("媒体异或校验恢复尾部非零")
         }
-        if now - assembly.firstReceivedAt >= limits.reorderDelay {
-            assembly.late[missingIndex] = true
-        }
         assembly.bytes.replaceSubrange(missingStart..<(missingStart + expectedLength),
                                        with: recovered.prefix(expectedLength))
-        assembly.received[missingIndex] = true
-        assembly.receivedCount = assembly.fragmentCount
-        if missingIndex > assembly.highestReceivedIndex {
-            assembly.highestReceivedIndex = missingIndex
-            assembly.highestReceivedAt = now
-        }
-        assembly.lastProgressAt = now
+        assembly.markReceived(missingIndex, at: now, reorderDelay: limits.reorderDelay)
         do {
             assembly.frame = try MediaFrame(header: assembly.header, packetBytes: assembly.bytes)
             assembly.completedAt = now
@@ -487,12 +498,7 @@ public final class MediaFrameReassembler {
             consider(due)
         }
         for assembly in assemblies.values where assembly.frame == nil {
-            let hasEarlyHole = assembly.receivedCount < assembly.highestReceivedIndex + 1
-            let baseDue = hasEarlyHole
-                ? assembly.firstReceivedAt + limits.reorderDelay
-                : assembly.lastProgressAt + max(limits.reorderDelay, limits.nackInterval)
-            let due = max(baseDue, assembly.lastNackAt.map { $0 + limits.nackInterval } ?? 0)
-            consider(due)
+            consider(assembly.nextRepairAt(limits))
         }
         return earliest
     }
@@ -517,25 +523,15 @@ public final class MediaFrameReassembler {
                 continue
             }
             guard let assembly = assemblies[id], assembly.frame == nil,
-                  now - assembly.firstReceivedAt >= limits.reorderDelay,
-                  assembly.lastNackAt.map({ now - $0 >= limits.nackInterval }) ?? true else { continue }
+                  now >= assembly.nextRepairAt(limits) else { continue }
             // A later fragment reveals a hole; an unseen tail may still be in the sender's
             // pacer. Only ask for that tail after unique fragments stop making progress.
-            let includeTail = now - assembly.lastProgressAt >= max(limits.reorderDelay, limits.nackInterval)
-            let missing = assembly.missingRanges(includeTail: includeTail)
+            let missing = assembly.missingRanges(at: now, limits: limits)
             if !missing.isEmpty, let feedback = try? MediaFeedback(kind: .nack, header: assembly.header, missingRanges: missing) {
                 assembly.lastNackAt = now
                 // Once a NACK spans the final fragment it has requested every remaining hole in this frame.
                 if let last = missing.last, Int(last.first) + Int(last.count) == assembly.fragmentCount {
                     assembly.requestedThroughTail = true
-                }
-                let holeEnd = max(0, assembly.highestReceivedIndex)
-                for range in missing {
-                    let start = Int(range.first)
-                    let end = min(holeEnd, start + Int(range.count))
-                    if start < end {
-                        assembly.late.replaceSubrange(start..<end, with: repeatElement(true, count: end - start))
-                    }
                 }
                 events.append(.feedback(feedback))
             }

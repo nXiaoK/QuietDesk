@@ -538,7 +538,15 @@ struct DeskView: View {
                             },
                             openTraffic: openTrafficStatistics,
                             openEffects: openSessionEffects,
-                            openBenchmark: openRouteBenchmark
+                            openBenchmark: openRouteBenchmark,
+                            openRelayWorkspace: {
+                                networkSubTab = .relayNodes
+                                models.workspaceSection = .network
+                            },
+                            openPortMappingWorkspace: { _ in
+                                networkSubTab = .viewerMappings
+                                models.workspaceSection = .network
+                            }
                         )
                     case .sharing:
                         SharingView(model: models.host, openTraffic: openTrafficStatistics)

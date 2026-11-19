@@ -110,6 +110,15 @@ private struct ConnectionEntryChecks {
                         "Relay-only mode focused hidden direct fields")
             try require(field(relay: false, strategy: .relay, address: "") == .address, "Disabled relay bypassed direct requirements")
         }
+        run("Device card symbols and saved quality labels reflect stored metadata without mutating records") {
+            let studio = ConnectionRecord(address: "10.0.0.2", port: 5908, name: "家里 Mac Studio",
+                                          videoSettings: .highest, chromaSubsampling: .yuv444)
+            let laptop = ConnectionRecord(address: "10.0.0.3", port: 5908, name: "公司 MacBook Pro")
+            try require(ConnectionEntryPresentation.deviceSymbol(studio) == "macstudio", "Unexpected Studio symbol")
+            try require(ConnectionEntryPresentation.deviceSymbol(laptop) == "laptopcomputer", "Unexpected laptop symbol")
+            try require(ConnectionEntryPresentation.savedQualityLabel(studio).contains("4:4:4"), "Missing 4:4:4 saved quality badge")
+            try require(ConnectionEntryPresentation.savedQualityLabel(laptop) == "画质：自动适配上限", "Default quality label mismatch")
+        }
         print("\(passed) passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

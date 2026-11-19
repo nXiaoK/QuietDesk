@@ -177,14 +177,21 @@ struct DeskView: View {
     @State private var showSessionEffects = false
     @State private var showPortMapping = false
     @State private var routeBenchmarkRunner: RouteQualityBenchmarkRunner?
+    @State private var networkSubTab: NetworkWorkspaceSubTab = .viewerMappings
+    @State private var diagnosticsSubTab: DiagnosticsWorkspaceSubTab = .benchmark
+    @State private var preferencesSubTab: PreferencesWorkspaceSubTab = .keyboard
+    @State private var inlineBenchmarkRecord: ConnectionRecord?
     @State private var dismissedClipboardStatus = ""
     @State private var dismissedReceptionID: UUID?
     @State private var clipboardNoticeRevision: UInt64 = 0
 
     // Sharing keeps running in the background; only a viewer session pins the window to its role.
-    private var roleLocked: Bool { models.viewer.isControllingAnotherMac || routeBenchmarkRunner != nil }
+    private var roleLocked: Bool { models.viewer.isControllingAnotherMac || routeBenchmarkRunner != nil || models.viewer.isRunningRouteBenchmark }
     private var locked: Bool { model.active || model.working }
-    private var sessionLayout: Bool { model.mode == .viewer && !model.isRunningRouteBenchmark && (model.connected || model.reconnecting) }
+    private var viewerHasSession: Bool {
+        !models.viewer.isRunningRouteBenchmark && (models.viewer.connected || models.viewer.reconnecting)
+    }
+    private var sessionLayout: Bool { model.mode == .viewer && viewerHasSession }
     private var immersive: Bool { model.isFullScreen && model.mode == .viewer }
     private var remoteTitle: String { model.remoteName.isEmpty ? model.address : model.remoteName }
     private var showClipboardActivity: Bool { model.fileTransferNotice != nil || showClipboardStatus }
@@ -207,37 +214,34 @@ struct DeskView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if updates.showBanner { UpdateBanner(controller: updates) }
-            if model.mode == .host {
-                SharingView(model: model, openTraffic: openTrafficStatistics)
-            } else if sessionLayout || immersive {
-                remoteContent
+        Group {
+            if sessionLayout || immersive {
+                VStack(spacing: 0) {
+                    if updates.showBanner && !immersive { UpdateBanner(controller: updates) }
+                    remoteContent
+                    if !immersive {
+                        Divider()
+                        statusBar
+                    }
+                }
             } else {
-                ConnectionView(model: model, showOptions: $showOptions,
-                               openCaps: { model.canvas.releaseControl(); showCapsSettings = true },
-                               openTraffic: openTrafficStatistics, openEffects: openSessionEffects,
-                               openBenchmark: openRouteBenchmark)
-            }
-            if !immersive {
-                Divider()
-                statusBar
+                workspaceShell
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .background(WindowReader(resolved: { models.attachWindow($0) }, fullScreen: { value in models.all.forEach { $0.isFullScreen = value } }).frame(width: 0, height: 0))
-        .frame(minWidth: 860, minHeight: 540)
-        .ignoresSafeArea(immersive ? .container : [], edges: .all)
+        .background(
+            WindowReader(
+                sessionChrome: sessionLayout && !immersive,
+                resolved: { models.attachWindow($0) },
+                fullScreen: { value in models.all.forEach { $0.isFullScreen = value } }
+            )
+            .frame(width: 0, height: 0)
+        )
+        .frame(minWidth: 880, minHeight: 580)
+        .ignoresSafeArea(immersive ? .container : (!sessionLayout ? .container : []), edges: immersive ? .all : .top)
         .navigationTitle(sessionLayout ? remoteTitle : "QuietDesk")
         .navigationSubtitle(sessionLayout ? "\(model.reconnecting ? "正在重连" : "已连接") · \(model.address):\(model.port)" : "为两台 Mac 之间的专注工作而做")
         .toolbar {
-            ToolbarItem(placement: .principal) {
-                Picker("模式", selection: $models.selected) {
-                    ForEach(DeskModel.Mode.allCases, id: \.self) { mode in Text(mode.rawValue).tag(mode) }
-                }
-                .pickerStyle(.segmented).frame(width: 244).disabled(roleLocked)
-                .help(roleLocked ? "断开远程连接后可切换" : "连接另一台 Mac，或共享这台 Mac；切换不会停止共享")
-            }
             ToolbarItemGroup(placement: .primaryAction) {
                 if sessionLayout {
                     Button { model.canvas.releaseControl(); model.pushClipboard() } label: {
@@ -313,22 +317,15 @@ struct DeskView: View {
                     }.help(SessionToolAction.fullScreen.help)
                     Divider()
                     Button("断开") { model.stop() }
-                } else if model.mode == .viewer {
-                    portMappingButton
-                    Button {
-                        openRouteBenchmark(nil)
-                    } label: {
-                        Label("线路测速", systemImage: "speedometer")
-                    }
-                    .disabled(locked || routeBenchmarkRunner != nil)
-                    .help("手动测试直连与各中继方式的实际帧率、延迟及 UDP 丢包情况，并保留历次记录生成历史总质量评估")
-                    SharingBadge(host: models.host) { models.selected = .host }.disabled(roleLocked)
-                } else {
-                    portMappingButton
                 }
             }
         }
-        .toolbar(immersive ? .hidden : .visible, for: .windowToolbar)
+        .toolbar(sessionLayout && !immersive ? .visible : .hidden, for: .windowToolbar)
+        .onChange(of: viewerHasSession) { _, activeSession in
+            if activeSession, models.workspaceSection != .connect {
+                models.workspaceSection = .connect
+            }
+        }
         .sheet(isPresented: $showPortMapping) {
             if model.mode == .host {
                 PortMappingHostView(model: model, manager: model.portMappings, done: { showPortMapping = false })
@@ -504,40 +501,177 @@ struct DeskView: View {
         }
     }
 
-    private var portMappingButton: some View {
-        Button(action: openPortMapping) {
-            Label(SessionToolAction.portMapping.title(), systemImage: SessionToolAction.portMapping.symbol())
+    private var workspaceShell: some View {
+        HStack(spacing: 0) {
+            DeskWorkspaceSidebar(
+                models: models,
+                viewer: models.viewer,
+                host: models.host,
+                portMappings: models.viewer.portMappings,
+                roleLocked: roleLocked
+            )
+
+            Divider()
+
+            VStack(spacing: 0) {
+                if updates.showBanner {
+                    UpdateBanner(controller: updates)
+                    Divider()
+                }
+                DeskPageHeader(
+                    title: models.workspaceSection.pageTitle,
+                    subtitle: models.workspaceSection.subtitle
+                ) {
+                    workspaceHeaderTrailing
+                }
+
+                Group {
+                    switch models.workspaceSection {
+                    case .connect:
+                        ConnectionView(
+                            model: models.viewer,
+                            showOptions: $showOptions,
+                            openCaps: {
+                                models.viewer.canvas.releaseControl()
+                                preferencesSubTab = .keyboard
+                                models.workspaceSection = .preferences
+                            },
+                            openTraffic: openTrafficStatistics,
+                            openEffects: openSessionEffects,
+                            openBenchmark: openRouteBenchmark
+                        )
+                    case .sharing:
+                        SharingView(model: models.host, openTraffic: openTrafficStatistics)
+                    case .network:
+                        NetworkWorkspaceView(
+                            viewer: models.viewer,
+                            host: models.host,
+                            portMappings: models.viewer.portMappings,
+                            subTab: $networkSubTab,
+                            openBenchmarkForRecord: { record in
+                                inlineBenchmarkRecord = record
+                                diagnosticsSubTab = .benchmark
+                                models.workspaceSection = .benchmark
+                            }
+                        )
+                    case .benchmark:
+                        DiagnosticsWorkspaceView(
+                            viewer: models.viewer,
+                            history: models.viewer.trafficHistory,
+                            subTab: $diagnosticsSubTab,
+                            benchmarkTargetRecord: $inlineBenchmarkRecord
+                        )
+                    case .preferences:
+                        PreferencesWorkspaceView(
+                            viewer: models.viewer,
+                            subTab: $preferencesSubTab,
+                            openBenchmark: {
+                                diagnosticsSubTab = .benchmark
+                                models.workspaceSection = .benchmark
+                            },
+                            openTraffic: {
+                                diagnosticsSubTab = .traffic
+                                models.workspaceSection = .benchmark
+                            }
+                        )
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                Divider()
+                statusBar
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(DeskPalette.canvasBackground)
         }
-        .help(model.mode == .host ? "管理本机端口映射服务及访问授权" : "为已配对设备设置 TCP 端口映射")
+    }
+
+    @ViewBuilder
+    private var workspaceHeaderTrailing: some View {
+        HStack(spacing: 8) {
+            if models.viewer.portMappings.hostApprovalPending {
+                Button {
+                    networkSubTab = .hostApprovals
+                    models.workspaceSection = .network
+                } label: {
+                    DeskPillBadge(
+                        text: "\(models.viewer.portMappings.pendingTargets.count) 个映射待确认",
+                        symbol: "bell.badge.fill",
+                        tint: DeskPalette.amber
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+            if models.workspaceSection == .connect {
+                Button {
+                    inlineBenchmarkRecord = nil
+                    diagnosticsSubTab = .benchmark
+                    models.workspaceSection = .benchmark
+                } label: {
+                    Label("线路实测", systemImage: "speedometer")
+                }
+                .controlSize(.small)
+                .disabled(roleLocked)
+            } else if models.workspaceSection == .sharing {
+                Button {
+                    networkSubTab = .relayNodes
+                    models.workspaceSection = .network
+                } label: {
+                    Label("中继节点", systemImage: "network")
+                }
+                .controlSize(.small)
+            }
+        }
     }
 
     private func openPortMapping() {
         model.canvas.releaseControl()
         showOptions = false
         showFullScreenMenu = false
-        showPortMapping = true
+        if sessionLayout || immersive {
+            showPortMapping = true
+        } else {
+            networkSubTab = model.mode == .host ? .hostApprovals : .viewerMappings
+            models.workspaceSection = .network
+        }
     }
 
     private func openTrafficStatistics() {
         model.canvas.releaseControl()
         showOptions = false
         showFullScreenMenu = false
-        showTrafficStatistics = true
+        if sessionLayout || immersive {
+            showTrafficStatistics = true
+        } else {
+            diagnosticsSubTab = .traffic
+            models.workspaceSection = .benchmark
+        }
     }
 
     private func openSessionEffects() {
         model.canvas.releaseControl()
         showOptions = false
         showFullScreenMenu = false
-        showSessionEffects = true
+        if sessionLayout || immersive {
+            showSessionEffects = true
+        } else {
+            preferencesSubTab = .privacy
+            models.workspaceSection = .preferences
+        }
     }
 
     private func openRouteBenchmark(_ record: ConnectionRecord? = nil) {
-        guard model.mode == .viewer, !model.active, !model.working, routeBenchmarkRunner == nil else { return }
+        guard !models.viewer.active, !models.viewer.working, routeBenchmarkRunner == nil else { return }
         model.canvas.releaseControl()
         showOptions = false
         showFullScreenMenu = false
-        routeBenchmarkRunner = RouteQualityBenchmarkRunner(model: model, record: record)
+        if sessionLayout || immersive {
+            routeBenchmarkRunner = RouteQualityBenchmarkRunner(model: models.viewer, record: record)
+        } else {
+            inlineBenchmarkRecord = record
+            diagnosticsSubTab = .benchmark
+            models.workspaceSection = .benchmark
+        }
     }
 
     /// One click sends the action; the reason it is unavailable replaces the tooltip.
@@ -663,23 +797,226 @@ struct DeskView: View {
     }
 }
 
-/// The sharing state seen from the viewer's toolbar; sharing continues while this Mac connects elsewhere.
-private struct SharingBadge: View {
+private struct DeskWorkspaceSidebar: View {
+    @ObservedObject var models: DeskModels
+    @ObservedObject var viewer: DeskModel
     @ObservedObject var host: DeskModel
-    let open: () -> Void
+    @ObservedObject var portMappings: PortMappingManager
+    let roleLocked: Bool
+    @State private var copiedHostCode = false
+
+    private var runningMappingsCount: Int {
+        portMappings.rules.filter { portMappings.isEnabled($0.id) }.count
+    }
 
     var body: some View {
-        Button(action: open) {
-            HStack(spacing: 5) {
-                Circle().fill(host.connected ? Color.orange : host.active ? Color.green : host.working ? Color.orange : Color.secondary)
-                    .frame(width: 6, height: 6)
-                Text(host.connected ? "正在被控制" : host.active ? "共享已开启" : host.working ? "正在准备共享" : "共享已停止").font(.caption)
+        VStack(alignment: .leading, spacing: 0) {
+            // Space for macOS native window traffic lights + App Brand Header
+            HStack(spacing: 10) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [Color.accentColor, Color.accentColor.opacity(0.75)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .frame(width: 32, height: 32)
+                    Image(systemName: "display.2")
+                        .font(.system(size: 14.5, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("QuietDesk")
+                        .font(.system(size: 14, weight: .bold))
+                    Text("原生双机书桌")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
             }
-            .padding(.horizontal, 8).padding(.vertical, 4)
-            .background(Color.primary.opacity(0.05), in: Capsule())
+            .padding(.horizontal, 16)
+            .padding(.top, 42)
+            .padding(.bottom, 18)
+
+            ForEach(DeskWorkspaceGroup.allCases, id: \.self) { group in
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(group.rawValue)
+                        .font(.system(size: 10.5, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 18)
+                        .padding(.bottom, 2)
+
+                    ForEach(DeskWorkspaceSection.allCases.filter { $0.group == group }) { section in
+                        sidebarRow(section)
+                    }
+                }
+                .padding(.bottom, 14)
+            }
+
+            Spacer(minLength: 12)
+
+            localHostFooterCard
+                .padding(12)
+        }
+        .frame(width: 236)
+        .background(.ultraThinMaterial)
+    }
+
+    private func sidebarRow(_ section: DeskWorkspaceSection) -> some View {
+        let active = models.workspaceSection == section
+        return Button {
+            guard !roleLocked || section == models.workspaceSection else { return }
+            models.workspaceSection = section
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: section.symbol)
+                    .font(.system(size: 13, weight: active ? .semibold : .regular))
+                    .foregroundStyle(active ? Color.accentColor : Color.secondary)
+                    .frame(width: 18)
+                Text(section.title)
+                    .font(.system(size: 13, weight: active ? .semibold : .regular))
+                    .foregroundStyle(active ? Color.primary : Color.primary.opacity(0.84))
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                sidebarAccessory(for: section, active: active)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(
+                active ? DeskPalette.cardBackground : Color.clear,
+                in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+            )
+            .overlay {
+                if active {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(DeskPalette.hairline, lineWidth: 0.8)
+                }
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
         .buttonStyle(.plain)
-        .help(host.active ? "共享在后台保持开启；连接其他 Mac 期间暂不接受控制连接。点按打开「共享这台 Mac」" : "打开「共享这台 Mac」")
+        .disabled(roleLocked && section != models.workspaceSection)
+        .padding(.horizontal, 10)
+    }
+
+    @ViewBuilder
+    private func sidebarAccessory(for section: DeskWorkspaceSection, active: Bool) -> some View {
+        switch section {
+        case .connect:
+            if !viewer.connections.isEmpty {
+                Text("\(viewer.connections.count)")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(active ? Color.accentColor : .secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1.5)
+                    .background((active ? Color.accentColor : Color.secondary).opacity(0.12), in: Capsule())
+            }
+        case .sharing:
+            Circle()
+                .fill(host.connected ? DeskPalette.amber : host.active ? DeskPalette.emerald : host.working ? DeskPalette.amber : Color.secondary.opacity(0.45))
+                .frame(width: 7, height: 7)
+        case .network:
+            if portMappings.hostApprovalPending {
+                DeskPillBadge(text: "待确认", tint: DeskPalette.amber)
+            } else if runningMappingsCount > 0 {
+                DeskPillBadge(text: "\(runningMappingsCount) 运行", tint: .accentColor)
+            } else if viewer.relayEnabled, !viewer.relayNodes.isEmpty {
+                DeskPillBadge(text: "\(viewer.relayNodes.count) 节点", tint: .secondary)
+            }
+        case .benchmark, .preferences:
+            EmptyView()
+        }
+    }
+
+    private var localHostFooterCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(host.connected ? DeskPalette.amber : host.active ? DeskPalette.emerald : host.working ? DeskPalette.amber : Color.secondary)
+                    .frame(width: 7.5, height: 7.5)
+                Text(host.connected ? "正在被控制" : host.active ? "本机共享已开启" : host.working ? "正在准备共享" : "本机共享已停止")
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text(":\(host.hostPort)")
+                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(hostFooterSubtitle)
+                .font(.system(size: 10.5))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+
+            HStack(spacing: 6) {
+                Button {
+                    host.prepareHostCode()
+                    if !host.hostCode.isEmpty {
+                        host.copyHostCode()
+                        copiedHostCode = true
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .seconds(1.2))
+                            copiedHostCode = false
+                        }
+                    } else {
+                        models.workspaceSection = .sharing
+                    }
+                } label: {
+                    Label(copiedHostCode ? "已复制" : "复制配对码", systemImage: copiedHostCode ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: 11, weight: .medium))
+                        .frame(maxWidth: .infinity)
+                }
+                .controlSize(.small)
+
+                if host.hasIncomingControlConnection {
+                    Button(role: .destructive) {
+                        host.disconnectController()
+                    } label: {
+                        Text("断开控制端")
+                            .font(.system(size: 11, weight: .medium))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .controlSize(.small)
+                } else {
+                    Button {
+                        if host.active || host.working {
+                            host.stop()
+                        } else {
+                            host.startHosting()
+                        }
+                    } label: {
+                        Text(host.active || host.working ? "停止" : "开启")
+                            .font(.system(size: 11, weight: .semibold))
+                            .frame(maxWidth: .infinity)
+                    }
+                    .controlSize(.small)
+                }
+            }
+        }
+        .padding(12)
+        .background(DeskPalette.cardBackground.opacity(0.9), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(DeskPalette.hairline, lineWidth: 0.8)
+        }
+    }
+
+    private var hostFooterSubtitle: String {
+        var parts: [String] = []
+        if host.relayEnabled, !host.relayNodes.isEmpty {
+            parts.append("中继 \(host.relayNodes.count) 节点")
+        } else {
+            parts.append("局域网/端口映射")
+        }
+        if runningMappingsCount > 0 {
+            parts.append("\(runningMappingsCount) 条映射运行中")
+        } else if host.mappingHosting {
+            parts.append("独立映射服务已开")
+        }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -758,27 +1095,55 @@ private struct TrayView: View {
 }
 
 private struct WindowReader: NSViewRepresentable {
+    let sessionChrome: Bool
     let resolved: (NSWindow) -> Void
     let fullScreen: (Bool) -> Void
     func makeNSView(context: Context) -> Probe {
-        let view = Probe(); view.resolved = resolved; view.fullScreen = fullScreen; return view
+        let view = Probe()
+        view.sessionChrome = sessionChrome
+        view.resolved = resolved
+        view.fullScreen = fullScreen
+        return view
     }
-    func updateNSView(_ view: Probe, context: Context) { view.resolved = resolved; view.fullScreen = fullScreen }
+    func updateNSView(_ view: Probe, context: Context) {
+        view.sessionChrome = sessionChrome
+        view.resolved = resolved
+        view.fullScreen = fullScreen
+        view.applyWindowChrome()
+    }
     final class Probe: NSView {
+        var sessionChrome = false
         var resolved: ((NSWindow) -> Void)?
         var fullScreen: ((Bool) -> Void)?
         private var observers: [NSObjectProtocol] = []
+        func applyWindowChrome() {
+            guard let window, !window.styleMask.contains(.fullScreen) else { return }
+            if sessionChrome {
+                if window.titleVisibility != .visible { window.titleVisibility = .visible }
+                if window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = false }
+            } else {
+                if !window.styleMask.contains(.fullSizeContentView) {
+                    window.styleMask.insert(.fullSizeContentView)
+                }
+                if window.titleVisibility != .hidden { window.titleVisibility = .hidden }
+                if !window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = true }
+            }
+        }
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             for observer in observers { NotificationCenter.default.removeObserver(observer) }
             observers.removeAll()
             guard let window else { return }
-            window.minSize = NSSize(width: 860, height: 640)
+            window.minSize = NSSize(width: 880, height: 620)
+            applyWindowChrome()
             resolved?(window)
             fullScreen?(window.styleMask.contains(.fullScreen))
             for name in [NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification] {
                 observers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.fullScreen?(self?.window?.styleMask.contains(.fullScreen) == true) }
+                    MainActor.assumeIsolated {
+                        self?.fullScreen?(self?.window?.styleMask.contains(.fullScreen) == true)
+                        self?.applyWindowChrome()
+                    }
                 })
             }
         }

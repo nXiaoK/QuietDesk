@@ -27,7 +27,31 @@ final class DeskServices {
 final class DeskModels: ObservableObject {
     /// The role shown in the main window; it does not stop the other role.
     @Published var selected: DeskModel.Mode {
-        didSet { if oldValue != selected { current.refreshPermissions(checkScreenCapture: true, retryCapsLock: true) } }
+        didSet {
+            if oldValue != selected {
+                current.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
+                if selected == .host, workspaceSection != .sharing {
+                    workspaceSection = .sharing
+                } else if selected == .viewer, workspaceSection == .sharing {
+                    workspaceSection = .connect
+                }
+            }
+        }
+    }
+    @Published var workspaceSection: DeskWorkspaceSection {
+        didSet {
+            guard oldValue != workspaceSection else { return }
+            switch workspaceSection {
+            case .sharing:
+                if selected != .host { selected = .host }
+            case .connect, .benchmark:
+                if selected != .viewer { selected = .viewer }
+            case .network, .preferences:
+                for item in all {
+                    item.refreshPermissions(checkScreenCapture: item.mode == .host, retryCapsLock: item.mode == .viewer)
+                }
+            }
+        }
     }
     let viewer: DeskModel
     let host: DeskModel
@@ -42,7 +66,9 @@ final class DeskModels: ObservableObject {
         host.sibling = viewer
         self.viewer = viewer
         self.host = host
-        selected = host.autoStartSharing ? .host : .viewer
+        let initialHost = host.autoStartSharing
+        selected = initialHost ? .host : .viewer
+        workspaceSection = initialHost ? .sharing : .connect
     }
 
     var changes: AnyPublisher<Void, Never> {

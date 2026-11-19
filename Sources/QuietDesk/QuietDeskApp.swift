@@ -549,7 +549,14 @@ struct DeskView: View {
                             }
                         )
                     case .sharing:
-                        SharingView(model: models.host, openTraffic: openTrafficStatistics)
+                        SharingView(
+                            model: models.host,
+                            openTraffic: openTrafficStatistics,
+                            openRelayWorkspace: {
+                                networkSubTab = .relayNodes
+                                models.workspaceSection = .network
+                            }
+                        )
                     case .network:
                         NetworkWorkspaceView(
                             viewer: models.viewer,

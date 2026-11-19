@@ -186,7 +186,8 @@ final class DeskModel: ObservableObject {
         var lastAppliedQualitySummary = ""
     }
 
-    @Published private(set) var isRunningRouteBenchmark = false
+    @Published private var routeBenchmarkRunID: UUID?
+    var isRunningRouteBenchmark: Bool { routeBenchmarkRunID != nil }
     private var activeRouteBenchmarkOverride: RouteBenchmarkOverride?
     private var lastRouteBenchmarkReport: ConnectionDiagnosticReport?
     private var effectiveMediaTCPOnly: Bool { activeRouteBenchmarkOverride?.mediaTCPOnly ?? mediaTCPOnly }
@@ -5151,16 +5152,16 @@ final class DeskModel: ObservableObject {
         activeRouteBenchmarkOverride?.firstFrameAt = SessionClock.now
     }
 
-    func setRouteBenchmarkMode(_ running: Bool) {
-        guard mode == .viewer else { return }
-        if running {
-            isRunningRouteBenchmark = true
-        } else {
-            if activeRouteBenchmarkOverride != nil || active || working || connected || reconnecting {
-                _ = finishRouteBenchmarkAttempt(reason: "已结束线路测速")
-            }
-            isRunningRouteBenchmark = false
-        }
+    func beginRouteBenchmarkRun(_ id: UUID) -> Bool {
+        guard mode == .viewer, routeBenchmarkRunID == nil, !active, !working, !connected, !reconnecting else { return false }
+        routeBenchmarkRunID = id
+        return true
+    }
+
+    func endRouteBenchmarkRun(_ id: UUID) {
+        guard routeBenchmarkRunID == id else { return }
+        _ = finishCurrentRouteBenchmarkAttempt(reason: "已结束线路测速")
+        routeBenchmarkRunID = nil
     }
 
     var liveRouteBenchmarkTelemetry: String {
@@ -5342,12 +5343,13 @@ final class DeskModel: ObservableObject {
     }
 
     func beginRouteBenchmarkAttempt(
+        runID: UUID,
         candidate: RouteBenchmarkCandidate,
         key: PairingKey,
         recordPreference: ConnectionRecord?,
         probeDurationSeconds: Int
     ) throws {
-        guard mode == .viewer else { throw DeskError.invalid("仅控制端可执行线路质量实测") }
+        guard routeBenchmarkRunID == runID else { throw CancellationError() }
         guard !active, !working, !connected, !reconnecting else {
             throw DeskError.invalid("当前已有活动连接，请先断开后再执行线路测速")
         }
@@ -5392,7 +5394,6 @@ final class DeskModel: ObservableObject {
             relaySelectedForTarget = false
         }
 
-        isRunningRouteBenchmark = true
         lastRouteBenchmarkReport = nil
         remoteName = ""
         connectionError = nil
@@ -5424,29 +5425,22 @@ final class DeskModel: ObservableObject {
         beginConnection(attemptTarget)
     }
 
-    func finishRouteBenchmarkAttempt(reason: String = "线路测速结束") -> RouteBenchmarkAttemptSnapshot {
-        if var override = activeRouteBenchmarkOverride {
-            let route = (mediaTransportStatus.isEmpty || (mediaTransportStatus == "TCP 兼容模式" && !connected))
-                ? controlTransportStatus
-                : mediaTransportStatus
-            if !route.isEmpty, route != "尚未连接" {
-                override.lastRouteLabel = route
-            }
-            if let state = activeVideoState {
-                override.lastAppliedQualitySummary =
-                    "\(state.width)×\(state.height) · \(state.settings.framesPerSecond) fps · \(state.settings.megabits) Mbps" + activeVideoFormatSuffix
-            }
-            activeRouteBenchmarkOverride = override
-            if override.hostSupportsQualityProbe, connected, let peer,
-               let stopProbe = try? QualityProbeControl(enabled: false, durationSeconds: 0).message() {
-                peer.send(stopProbe)
-            }
+    func finishRouteBenchmarkAttempt(runID: UUID, reason: String) -> RouteBenchmarkAttemptSnapshot? {
+        guard routeBenchmarkRunID == runID else { return nil }
+        return finishCurrentRouteBenchmarkAttempt(reason: reason)
+    }
+
+    private func finishCurrentRouteBenchmarkAttempt(reason: String) -> RouteBenchmarkAttemptSnapshot? {
+        guard var override = activeRouteBenchmarkOverride else { return nil }
+        if override.hostSupportsQualityProbe, connected, let peer,
+           let stopProbe = try? QualityProbeControl(enabled: false, durationSeconds: 0).message() {
+            peer.send(stopProbe)
         }
         let preStopFailure = connectionError
         if active || working || connected || reconnecting || connectionDiagnostics != nil || peer != nil {
             stop(reason: reason)
         }
-        let override = activeRouteBenchmarkOverride
+        override = activeRouteBenchmarkOverride ?? override
         let report = lastRouteBenchmarkReport
         let failure = connectionError ?? preStopFailure
         activeRouteBenchmarkOverride = nil
@@ -5454,25 +5448,23 @@ final class DeskModel: ObservableObject {
         connectionError = nil
         if mode == .viewer { status = "准备就绪" }
 
-        let connectMs = override.flatMap { ov in ov.helloAt.map { max(0, ($0 - ov.startedAt) * 1000) } }
-        let firstFrameMs = override.flatMap { ov in ov.firstFrameAt.map { max(0, ($0 - ov.startedAt) * 1000) } }
-        let routeLabel = (override?.lastRouteLabel.isEmpty == false) ? override!.lastRouteLabel : "未建立媒体路径"
-        let qualitySummary = override?.lastAppliedQualitySummary ?? ""
+        let connectMs = override.helloAt.map { max(0, ($0 - override.startedAt) * 1000) }
+        let firstFrameMs = override.firstFrameAt.map { max(0, ($0 - override.startedAt) * 1000) }
+        let routeLabel = override.lastRouteLabel.isEmpty ? "未建立媒体路径" : override.lastRouteLabel
 
         return RouteBenchmarkAttemptSnapshot(
             report: report,
             connectMilliseconds: connectMs,
             firstFrameMilliseconds: firstFrameMs,
             finalRouteLabel: routeLabel,
-            appliedQualitySummary: qualitySummary,
-            hostSupportsQualityProbe: override?.hostSupportsQualityProbe ?? false,
+            appliedQualitySummary: override.lastAppliedQualitySummary,
+            hostSupportsQualityProbe: override.hostSupportsQualityProbe,
             failureReason: failure
         )
     }
 
     func connectUsingBenchmarkCandidate(_ candidate: RouteBenchmarkCandidate, record: ConnectionRecord?) {
-        setRouteBenchmarkMode(false)
-        guard !active, !working else { return }
+        guard !isRunningRouteBenchmark, !active, !working else { return }
         let resolvedRecord = resolveConnectionRecordForBenchmarkCandidate(candidate, preferredRecord: record)
         do {
             let key = try resolveRouteBenchmarkPairingKey(for: resolvedRecord)

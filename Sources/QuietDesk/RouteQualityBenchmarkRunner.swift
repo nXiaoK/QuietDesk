@@ -292,7 +292,8 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
             errorMessage = "请至少勾选一条要测试的直连或中继线路"
             return
         }
-        if model.active || model.working || model.connected || model.reconnecting {
+        let runID = UUID()
+        guard model.beginRouteBenchmarkRun(runID) else {
             errorMessage = "当前已有活动连接，请先断开后再执行多线路测速"
             return
         }
@@ -300,6 +301,7 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
         do {
             key = try model.resolveRouteBenchmarkPairingKey(for: sourceRecord)
         } catch {
+            model.endRouteBenchmarkRun(runID)
             errorMessage = error.localizedDescription
             return
         }
@@ -320,7 +322,7 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
         let preference = resolvedRecordPreference()
         let snapshotTarget = currentTargetDescriptor
         activeRunContext = ActiveRunContext(
-            id: UUID(),
+            id: runID,
             startedAt: Date(),
             durationSeconds: duration.rawValue,
             target: snapshotTarget
@@ -331,7 +333,6 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
 
         runTask = Task { [weak self] in
             guard let self else { return }
-            self.model.setRouteBenchmarkMode(true)
             var hadPriorConnectedSession = false
 
             for index in selectedIndices {
@@ -347,6 +348,7 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
                 self.skipCurrentRequested = false
 
                 await self.measureRoute(
+                    runID: runID,
                     at: index,
                     candidate: candidate,
                     key: key,
@@ -363,13 +365,14 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
                 }
             }
 
+            guard self.activeRunContext?.id == runID else { return }
             let stoppedEarly = self.stopAllRequested || Task.isCancelled
             self.persistActiveRunIfNeeded(stoppedEarly: stoppedEarly)
             self.activeCandidateID = nil
             self.liveTelemetrySummary = ""
             self.isRunning = false
             self.runTask = nil
-            self.model.setRouteBenchmarkMode(false)
+            self.model.endRouteBenchmarkRun(runID)
         }
     }
 
@@ -384,6 +387,7 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
     }
 
     func shutdown() {
+        guard let runID = activeRunContext?.id else { return }
         stopAllRequested = true
         runTask?.cancel()
         runTask = nil
@@ -391,7 +395,7 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
         activeCandidateID = nil
         liveTelemetrySummary = ""
         isRunning = false
-        model.setRouteBenchmarkMode(false)
+        model.endRouteBenchmarkRun(runID)
     }
 
     private func persistActiveRunIfNeeded(stoppedEarly: Bool) {
@@ -430,6 +434,7 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
     }
 
     private func measureRoute(
+        runID: UUID,
         at index: Int,
         candidate: RouteBenchmarkCandidate,
         key: PairingKey,
@@ -451,6 +456,7 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
             let attemptStartedAt = SessionClock.now
             do {
                 try model.beginRouteBenchmarkAttempt(
+                    runID: runID,
                     candidate: candidate,
                     key: key,
                     recordPreference: preference,
@@ -465,7 +471,7 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
             var connectTimedOut = false
             while !model.connected {
                 if Task.isCancelled || stopAllRequested || skipCurrentRequested {
-                    _ = model.finishRouteBenchmarkAttempt(reason: "已跳过当前线路")
+                    _ = model.finishRouteBenchmarkAttempt(runID: runID, reason: "已跳过当前线路")
                     results[index].status = .skipped
                     return
                 }
@@ -484,8 +490,8 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
                 let reasonFallback = connectTimedOut
                     ? String(format: "超过 %.0f 秒未能建立连接", connectTimeout)
                     : "连接未建立"
-                let snapshot = model.finishRouteBenchmarkAttempt(reason: reasonFallback)
-                let failure = snapshot.failureReason ?? reasonFallback
+                let snapshot = model.finishRouteBenchmarkAttempt(runID: runID, reason: reasonFallback)
+                let failure = snapshot?.failureReason ?? reasonFallback
                 if attempt <= maxTransientBusyRetries,
                    SessionClock.now - attemptStartedAt < 4.5,
                    failure.contains("已有控制连接") {
@@ -512,7 +518,7 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
                     break
                 }
                 if skipCurrentRequested {
-                    _ = model.finishRouteBenchmarkAttempt(reason: "已跳过当前线路")
+                    _ = model.finishRouteBenchmarkAttempt(runID: runID, reason: "已跳过当前线路")
                     results[index].status = .skipped
                     return
                 }
@@ -520,7 +526,7 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
                     if elapsed >= 3.0 {
                         break
                     } else {
-                        _ = model.finishRouteBenchmarkAttempt(reason: "已停止线路测速")
+                        _ = model.finishRouteBenchmarkAttempt(runID: runID, reason: "已停止线路测速")
                         results[index].status = .skipped
                         return
                     }
@@ -532,7 +538,10 @@ final class RouteQualityBenchmarkRunner: ObservableObject, Identifiable {
                 try? await Task.sleep(for: .milliseconds(200))
             }
 
-            let snapshot = model.finishRouteBenchmarkAttempt(reason: "线路质量实测完成")
+            guard let snapshot = model.finishRouteBenchmarkAttempt(runID: runID, reason: "线路质量实测完成") else {
+                results[index].status = .skipped
+                return
+            }
             if droppedMidRun {
                 let failure = snapshot.failureReason ?? "测速过程中连接中断"
                 results[index].status = .failed(failure)

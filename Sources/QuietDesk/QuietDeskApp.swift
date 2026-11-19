@@ -332,9 +332,7 @@ struct DeskView: View {
         .sheet(isPresented: $showSessionEffects) {
             SessionEffectsView(model: model, done: { showSessionEffects = false })
         }
-        .sheet(item: $routeBenchmarkRunner, onDismiss: {
-            model.setRouteBenchmarkMode(false)
-        }) { runner in
+        .sheet(item: $routeBenchmarkRunner) { runner in
             RouteQualityBenchmarkView(
                 runner: runner,
                 onConnectCandidate: { candidate, record in

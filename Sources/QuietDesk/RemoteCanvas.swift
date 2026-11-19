@@ -425,7 +425,6 @@ final class SystemMouseCursorAssociator: MouseCursorAssociating {
 @MainActor
 final class RemoteCanvas: NSView {
     private let videoLayer: AVSampleBufferDisplayLayer
-    private let renderQueue = DispatchQueue(label: "quietdesk.canvas-render", qos: .userInteractive)
     private var displayLink: CADisplayLink?
     private var lastPresentedAt: TimeInterval = 0
     private var decoder: MediaCanvasDecoding = VideoDecoder()
@@ -435,7 +434,7 @@ final class RemoteCanvas: NSView {
     private var mediaReceiver: MediaCanvasReceiver?
     private var mediaReceiverID: UUID?
     private var displayStream: MediaStreamID?
-    private var awaitingDisplay = false
+    private var displayReadinessRequest: UUID?
     /// The decoded frame most recently handed to the display layer; the curtain is never part of it.
     private(set) var displayedFrame: CVPixelBuffer?
     private var tracking: NSTrackingArea?
@@ -836,7 +835,7 @@ final class RemoteCanvas: NSView {
     func receiveCursorPosition(_ position: CursorPosition) { if cursorState.update(position) { updateCursorPresentation() } }
 
     private func commitDisplayedStreamCursorIfReady() -> Bool {
-        guard displayedFrame != nil, !awaitingDisplay, let displayStream,
+        guard displayedFrame != nil, displayReadinessRequest == nil, let displayStream,
               cursorState.commit(displayStream) else { return false }
         refreshCursorImage(forcePublish: true)
         return true
@@ -958,6 +957,7 @@ final class RemoteCanvas: NSView {
         mediaReceiver = nil
         decoder.stop()
         mailbox.stopDiagnostics()
+        cancelDisplayReadiness()
         decoder = makeDecoder(diagnostics)
         mailbox = LatestFrameMailbox(diagnostics: diagnostics)
         self.diagnostics = diagnostics
@@ -1002,8 +1002,7 @@ final class RemoteCanvas: NSView {
             if self.mailbox !== inbox {
                 self.decoder.stop()
                 self.mailbox.stopDiagnostics()
-                self.videoLayer.stopRequestingMediaData()
-                self.awaitingDisplay = false
+                self.cancelDisplayReadiness()
                 self.videoLayer.flush()
                 self.displayedFrame = nil
                 self.formatCache.reset()
@@ -1054,24 +1053,28 @@ final class RemoteCanvas: NSView {
         }
     }
 
+    private func cancelDisplayReadiness() {
+        guard displayReadinessRequest != nil else { return }
+        displayReadinessRequest = nil
+        videoLayer.stopRequestingMediaData()
+    }
+
     private func showLatestFrame() {
         if videoLayer.status == .failed { videoLayer.flush() }
         guard videoLayer.isReadyForMoreMediaData else {
-            if !awaitingDisplay {
-                awaitingDisplay = true
-                videoLayer.requestMediaDataWhenReady(on: renderQueue) { [weak self] in
-                    DispatchQueue.main.async {
-                        MainActor.assumeIsolated {
-                            guard let self else { return }
-                            self.videoLayer.stopRequestingMediaData()
-                            self.awaitingDisplay = false
-                            self.showLatestFrame()
-                        }
+            if displayReadinessRequest == nil {
+                let request = UUID()
+                displayReadinessRequest = request
+                videoLayer.requestMediaDataWhenReady(on: .main) { [weak self] in
+                    MainActor.assumeIsolated {
+                        guard let self, self.displayReadinessRequest == request else { return }
+                        self.showLatestFrame()
                     }
                 }
             }
             return
         }
+        cancelDisplayReadiness()
         guard let received = mailbox.takeSampleWithTiming() else {
             displayLink?.isPaused = true
             return
@@ -1126,11 +1129,10 @@ final class RemoteCanvas: NSView {
         decoder = VideoDecoder()
         mailbox = LatestFrameMailbox()
         diagnostics = nil
-        videoLayer.stopRequestingMediaData()
+        cancelDisplayReadiness()
         videoLayer.flushAndRemoveImage()
         displayedFrame = nil
         formatCache.reset()
-        awaitingDisplay = false
     }
 
     func releaseControl() {
@@ -1585,6 +1587,7 @@ final class RemoteCanvas: NSView {
     }
 
     deinit {
+        if displayReadinessRequest != nil { videoLayer.stopRequestingMediaData() }
         displayLink?.invalidate()
         moveTimer?.invalidate()
         dragTimer?.invalidate()

@@ -54,9 +54,12 @@ private final class CanvasDisplayLayerProbe: AVSampleBufferDisplayLayer, @unchec
         readyRequest = (queue, block)
     }
     override func stopRequestingMediaData() { readyRequest = nil }
-    func becomeReady() {
+    func becomeReady(callbacks: Int = 1) {
         acceptsFrames = true
-        if let (queue, block) = readyRequest { readyRequest = nil; queue.async(execute: block) }
+        if let (queue, block) = readyRequest {
+            readyRequest = nil
+            queue.async { for _ in 0..<callbacks { block() } }
+        }
     }
 }
 
@@ -791,9 +794,12 @@ private struct RemoteCanvasChecks {
             drainCanvasDisplay()
             try require(display.displayedImage === oldImage && display.removals == removals,
                         "Display backpressure cleared the retained image")
-            display.becomeReady(); drainCanvasDisplay()
+            let previousEnqueues = display.displayedFormats.count
+            display.becomeReady(callbacks: 3); drainCanvasDisplay()
             try require(display.displayedImage === newImage && display.removals == removals,
                         "An unchanged cursor binding cleared the image during recovery")
+            try require(display.displayedFormats.count == previousEnqueues + 1,
+                        "Repeated readiness callbacks enqueued the same recovery frame more than once")
             canvas.receiveCursorStatus(CursorControl(.status, requestID: UUID(), cursorID: cursor, epoch: 2, enabled: false))
             canvas.receiveCursorBinding(CursorControl(.binding, cursorID: cursor, epoch: 2, enabled: false, stream: streams[3]))
             receiver.receive(try mediaFrame(stream: streams[3], id: 1, keyFrame: true)) { _ in }

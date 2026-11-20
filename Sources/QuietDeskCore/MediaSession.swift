@@ -105,6 +105,7 @@ public final class MediaSession: @unchecked Sendable {
         var diagnostic: PerformanceDiagnostics.Token?
         var frameSubmitted = false
         var localNetwork = false
+        var awaitingUDPVerification = false
     }
     private struct Datagram {
         let header: MediaFrameHeader
@@ -690,8 +691,9 @@ public final class MediaSession: @unchecked Sendable {
                 if current.stage != .preparing { sendTransaction(.ready, current) }
                 return
             }
+            let canAwaitUDP = path == .udp && !udpVerified && (udpPeer != nil || !pendingDatagramPeers.isEmpty)
             guard transport > transportEpoch, codec > codecEpoch, !paused, !configurationSuspended,
-                  path != .udp || udpVerified, path != .tcp || videoBound else {
+                  path != .udp || udpVerified || canAwaitUDP, path != .tcp || videoBound else {
                 sendTransaction(.abort, Transaction(id: id, stream: stream, path: path, started: SessionClock.now))
                 return
             }
@@ -699,28 +701,19 @@ public final class MediaSession: @unchecked Sendable {
             recoveryHold = true
             var pending = Transaction(id: id, stream: stream, path: path, started: SessionClock.now)
             pending.diagnostic = diagnostics?.start()
+            pending.awaitingUDPVerification = canAwaitUDP
             transaction = pending
             refreshInteractiveDatagramAvailability()
-            let prepare: ((@escaping (Bool) -> Void) -> Void)?
-            if let onPrepareStream { prepare = { complete in onPrepareStream(stream, complete) } }
-            else { prepare = onPrepareRecovery }
-            guard let prepare else { abortTransaction(retry: true); return }
-            prepare { [weak self] success in
-                self?.queue.async { [weak self] in
+            if canAwaitUDP {
+                sendPing()
+                queue.asyncAfter(deadline: .now() + 0.35) { [weak self] in
                     guard let self, !self.stopped, self.transaction?.id == id,
-                          self.transaction?.stage == .preparing else { return }
-                    guard success else { self.abortTransaction(retry: true); return }
-                    do {
-                        self.clearDatagrams()
-                        self.cache = try MediaRetransmissionCache(stream: stream, limits: self.bufferLimits)
-                        self.reassembledAtPeer.removeAll()
-                        self.sentHeaders.removeAll()
-                        self.nextFrameID = 1
-                        self.transaction?.stage = .ready
-                        if let pending = self.transaction { self.sendTransaction(.ready, pending) }
-                    } catch { self.abortTransaction(retry: true) }
+                          self.transaction?.awaitingUDPVerification == true else { return }
+                    self.abortTransaction(retry: true)
                 }
+                return
             }
+            startHostPreparation(id: id, stream: stream)
         case .ready:
             guard var pending = transaction, pending.id == id, pending.stream == stream, pending.path == path else { return }
             if side == .viewer {
@@ -961,6 +954,9 @@ public final class MediaSession: @unchecked Sendable {
             self.udpPeer = nil; self.udpVerified = false
             self.refreshInteractiveDatagramAvailability()
             self.clearDatagrams()
+            if self.side == .host, self.pendingDatagramPeers.isEmpty, self.transaction?.awaitingUDPVerification == true {
+                self.abortTransaction(retry: true)
+            }
             if self.side == .viewer, let probe = self.policy.probeID {
                 self.handleActions(self.policy.probeFailed(id: probe, now: SessionClock.now))
             }
@@ -1091,9 +1087,41 @@ public final class MediaSession: @unchecked Sendable {
             if side == .host { hostAssist?(secret) }
             else { onRelayedDatagramAuthenticated?(peer.endpoint, secret) }
         }
+        if side == .host, var pending = transaction, pending.awaitingUDPVerification, pending.stage == .preparing {
+            pending.awaitingUDPVerification = false
+            transaction = pending
+            startHostPreparation(id: pending.id, stream: pending.stream)
+        }
         if side == .viewer {
             if receivedPong { policy.receivedPong(epoch: policy.epoch, now: SessionClock.now) }
             if let probe = policy.probeID { handleActions(policy.probeSucceeded(id: probe, now: SessionClock.now)) }
+        }
+    }
+
+    private func startHostPreparation(id: UUID, stream: MediaStreamID) {
+        let prepare: ((@escaping (Bool) -> Void) -> Void)?
+        if let onPrepareStream { prepare = { complete in onPrepareStream(stream, complete) } }
+        else { prepare = onPrepareRecovery }
+        guard let prepare else { abortTransaction(retry: true); return }
+        prepare { [weak self] success in
+            self?.queue.async { [weak self] in
+                guard let self, !self.stopped, self.transaction?.id == id,
+                      self.transaction?.stage == .preparing,
+                      self.transaction?.awaitingUDPVerification == false else { return }
+                guard success, self.transaction?.path != .udp || self.udpVerified else {
+                    self.abortTransaction(retry: true)
+                    return
+                }
+                do {
+                    self.clearDatagrams()
+                    self.cache = try MediaRetransmissionCache(stream: stream, limits: self.bufferLimits)
+                    self.reassembledAtPeer.removeAll()
+                    self.sentHeaders.removeAll()
+                    self.nextFrameID = 1
+                    self.transaction?.stage = .ready
+                    if let pending = self.transaction { self.sendTransaction(.ready, pending) }
+                } catch { self.abortTransaction(retry: true) }
+            }
         }
     }
 

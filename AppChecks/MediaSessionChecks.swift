@@ -88,14 +88,15 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     let roundTripSampled=DispatchSemaphore(value:0)
     let reportPaths = Box<[MediaSession.DiagnosticVideoPath]>([])
     let reportRoundTrips = Box<[Double]>([]), reportFragments = Box((trial: 0, committed: 0, lost: 0))
-    let reportTailFrame = DispatchSemaphore(value: 0)
+    let reportResumeFrame = DispatchSemaphore(value: 0), reportTailFrame = DispatchSemaphore(value: 0)
+    let reportPongSeen = DispatchSemaphore(value: 0)
     let pathSwitches=Box<[(String,MediaSwitchCause)]>([])
     let overlapSent=Box(false)
     let cursorID = UUID()
     let streamPreparations = Box<[MediaStreamID]>([]), streamBindings = Box<[MediaStreamID]>([])
     let streamVideos = Box<[MediaStreamID]>([]), streamCommits = Box<[MediaStreamID]>([])
     let currentStream = Box<MediaStreamID?>(nil), hostControl = Box<Peer?>(nil)
-    let rejectedHintAttempts = Box(0), hintRetryRejected = DispatchSemaphore(value:0), hostResumed = DispatchSemaphore(value:0)
+    let rejectedHintAttempts = Box(0), allowHintRecovery = Box(false), hintRetryRejected = DispatchSemaphore(value:0), hostResumed = DispatchSemaphore(value:0)
     let stallNextFrame = Box(false), stallDatagrams = Box(0)
     let localStallFinished = DispatchSemaphore(value:0)
     func nextPacket(_ idr: Bool) -> VideoPacket { sequence.update{$0 += 1}; return packet(sequence.get(),idr:idr,largeIDR:largeIDR,hevc:hevc,largePredicted:schedulingStall) }
@@ -116,7 +117,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
                 session.diagnostics=diagnostics
                 session.onPrepareRecovery={ complete in
                     prepared.update{$0 += 1}
-                    if retryHints, committedCount.get() == 1, rejectedHintAttempts.get() < 3 {
+                    if retryHints, committedCount.get() == 1, !allowHintRecovery.get() {
                         rejectedHintAttempts.update{$0 += 1}
                         complete(false)
                         return
@@ -190,6 +191,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
                 session.onDiagnosticUDPRoundTrip = { milliseconds in
                     if committedCount.get() == 0 { errors.update { $0.append("A candidate UDP probe reached the report") } }
                     reportRoundTrips.update { $0.append(milliseconds) }
+                    reportPongSeen.signal()
                 }
                 session.onDiagnosticUDPLoss = { settled, lost in
                     let path = reportPaths.get().last
@@ -230,6 +232,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             }
             session.onVideo={ frame,complete in
                 decoded.update{$0.append(frame.header.frameID)}
+                if inspectRoundTrip, frame.header.frameID == 2 { reportResumeFrame.signal() }
                 if inspectRoundTrip, frame.header.frameID == 3 { reportTailFrame.signal() }
                 let expected = packet(frame.packet.sequence,idr:frame.header.isIDR,largeIDR:largeIDR,hevc:hevc,largePredicted:schedulingStall)
                 if frame.packet.codec != expected.codec || frame.packet.vps != expected.vps || frame.packet.sps != expected.sps {
@@ -329,6 +332,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     }
     try wait(committed,"No committed media stream; states \(states.get()), errors \(errors.get())",seconds:10)
     try wait(pathStable,"Committed path state was not published")
+    try wait(hostResumed,"Initial host commit did not resume")
     Thread.sleep(forTimeInterval:0.1)
     let expected = udp ? "UDP 视频" : auxiliary ? "TCP 视频" : "TCP 兼容模式"
     try require(states.get().contains(expected),"wrong selected path \(states.get())")
@@ -338,11 +342,16 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     try require(localRoutes.get() == [false] && !client.isLocalNetwork,
                 "A connected loopback route was not explicitly classified as non-LAN: \(localRoutes.get())")
     if inspectRoundTrip {
-        try wait(roundTripSampled,"Media route did not publish its first RTT sample",seconds:3)
         if udp {
+            let deadline = SessionClock.now + 4
+            while !roundTripSamples.get().contains(where: { $0.roundTripMilliseconds.map { $0.isFinite && $0 > 0 && $0 < 1_000 } == true }),
+                  SessionClock.now < deadline {
+                try wait(roundTripSampled, "Media route did not publish its first RTT sample", seconds: 2)
+            }
             try require(roundTripSamples.get().contains { $0.roundTripMilliseconds.map { $0.isFinite && $0 > 0 && $0 < 1_000 } == true },
                         "Authenticated UDP pongs did not provide measured RTT")
         } else {
+            try wait(roundTripSampled,"Media route did not publish its first RTT sample",seconds:3)
             try require(roundTripSamples.get().allSatisfy { $0.roundTripMilliseconds == nil },
                         "Initial TCP RTT used an unmeasured default estimate")
             let before=roundTripSamples.get().count
@@ -404,6 +413,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
         viewerSession.get()?.setPaused(false)
         try wait(committed,"Resume did not recover with a fresh IDR")
         try wait(pathStable,"Resumed path state was not published")
+        try wait(hostResumed,"Resumed host commit did not resume")
         try require(states.get().last=="UDP 视频","Pause caused a false TCP fallback")
     }
     if pathFailure {
@@ -431,7 +441,15 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             hostSession.get()?.sendVideo(nextPacket(false))
             Thread.sleep(forTimeInterval:0.05)
         }
-        try wait(deliverySampled,"Host frame delivery timing did not reach a viewer sample",seconds:3)
+        let deliveryDeadline = SessionClock.now + 4
+        while true {
+            if deliverySampled.wait(timeout: .now() + 0.05) == .success { break }
+            guard SessionClock.now < deliveryDeadline else {
+                throw Failure(message: "Host frame delivery timing did not reach a viewer sample")
+            }
+            hostSession.get()?.recordComputeTiming(encodeMilliseconds: 3)
+            hostSession.get()?.sendVideo(nextPacket(false))
+        }
         try require(committedCount.get()==commitsBefore && prepared.get()==preparedBefore,"A bitrate-only change restarted the stream")
         try require(decoded.get().count>=decodedBefore+30,"Predicted frames stopped after a live bitrate change")
         try require(errors.get().isEmpty,"Live bitrate change failed: \(errors.get())")
@@ -445,6 +463,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
         hostSession.get()?.resumeAfterConfiguration()
         try wait(committed,"Configuration did not commit a fresh epoch")
         try wait(pathStable,"Reconfigured path state was not published")
+        try wait(hostResumed,"Reconfigured host commit did not resume")
         try require(committedCount.get()>=2,"Configuration reused the old epoch")
         if failRecoveryCandidate {
             try require(rejectedCandidate.get() && prepared.get()>=4,"A failed post-IDR candidate did not recover through a fresh preparation")
@@ -454,7 +473,6 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     }
     if schedulingStall {
         guard let host = hostSession.get(), let control = hostControl.get() else { throw Failure(message:"Missing scheduling fixture host") }
-        try wait(hostResumed,"Initial host commit did not resume")
         Thread.sleep(forTimeInterval:0.3)
         stallDatagrams.update{$0=0};stallNextFrame.update{$0=true}
         host.sendVideo(nextPacket(false))
@@ -479,19 +497,21 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
         guard let control = hostControl.get(), let original = currentStream.get() else { throw Failure(message:"Missing interrupted stream") }
         for copy in 0..<3 {
             Thread.sleep(forTimeInterval:0.3)
+            while hintRetryRejected.wait(timeout: .now()) == .success {}
             control.send(try MediaControl(.recover,sessionID:original.sessionID,transportEpoch:original.transportEpoch,
                                          codecEpoch:original.codecEpoch,mediaFailure:true).message())
             try wait(hintRetryRejected,"Duplicate hint did not reach a rejected recovery prepare")
             if copy > 0 { try require(currentStream.get() == original,"Rejected prepare changed the active stream") }
         }
+        allowHintRecovery.update { $0 = true }
         try wait(committed,"Recovery did not resume after rejected prepares")
         try wait(pathStable,"Recovered path was not published")
+        try wait(hostResumed,"Recovered host did not resume after rejected prepares")
         try require(states.get().last == "UDP 视频" && pathSwitches.get().count == 1 && committedCount.get() == 2,
                     "Hints for one active stream exhausted the playback failure budget: \(states.get())")
     }
     if recoveries {
         guard let control = hostControl.get() else { throw Failure(message:"Missing fixture host control") }
-        try wait(hostResumed,"Initial host commit did not resume")
         for round in 1...4 {
             guard let stream = currentStream.get() else { throw Failure(message:"Missing committed stream") }
             Thread.sleep(forTimeInterval:0.3)
@@ -537,9 +557,15 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     if inspectDiagnostics {
         hostSession.get()?.recordComputeTiming(encodeMilliseconds:45)
         viewerSession.get()?.recordComputeTiming(decodeMilliseconds:2)
-        // Keep the local decode observation in the same receive window as the remote host statistic.
-        DispatchQueue.global().asyncAfter(deadline:.now()+0.9) { viewerSession.get()?.recordComputeTiming(decodeMilliseconds:2) }
-        try wait(sampledCompute,"Authenticated host encode timing did not reach the viewer sample",seconds:3)
+        // Keep the local decode observation present in whichever viewer window receives the host statistic.
+        let computeDeadline = SessionClock.now + 4
+        while true {
+            if sampledCompute.wait(timeout: .now() + 0.2) == .success { break }
+            guard SessionClock.now < computeDeadline else {
+                throw Failure(message: "Authenticated host encode timing did not reach the viewer sample")
+            }
+            viewerSession.get()?.recordComputeTiming(decodeMilliseconds: 2)
+        }
         let summaries=diagnostics!.drain()
         let metrics=Set(summaries.map{$0.metric})
         if largeIDR {
@@ -575,6 +601,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
         try require(paths.first == .preparing && paths.last == .committed(expected, relayedUDP: false),
                     "Report did not distinguish preparation and the committed media path: \(paths)")
         if udp {
+            try wait(reportResumeFrame, "Initial post-commit UDP P-frame did not reach the viewer")
             try require(reportFragments.get().trial == 1 && reportFragments.get().committed == 1,
                         "Initial IDR and P-frame were not attributed to the trial and committed paths")
             hostSession.get()?.sendVideo(nextPacket(false))
@@ -582,6 +609,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             let final = reportFragments.get()
             try require(final.trial == 1 && final.committed == 2 && final.lost == 0,
                         "Final UDP fragment was missing from the report at frame delivery")
+            try wait(reportPongSeen, "Report missed authenticated post-commit UDP pongs", seconds: 3)
             let measured = reportRoundTrips.get()
             try require(!measured.isEmpty && measured.allSatisfy { (0..<1_000).contains($0) },
                         "Report missed authenticated post-commit UDP pongs")
@@ -793,6 +821,8 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
                                      on: NWEndpoint.Port(rawValue: port)!)
        let listenReady = DispatchSemaphore(value: 0)
        let committed = DispatchSemaphore(value: 0)
+       let hostResumed = DispatchSemaphore(value: 0)
+       let windowExpanded = DispatchSemaphore(value: 0)
        let multiFragmentDelivered = DispatchSemaphore(value: 0)
        let hostBox = Box<MediaSession?>(nil)
        let viewerBox = Box<MediaSession?>(nil)
@@ -809,9 +839,15 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
                }
                guard let host = try? MediaSession.host(control: peer, key: key, port: port, settings: highFPS) else { return }
                hostBox.update { $0 = host }
-               host.onReceiveFrameWindow = { limit in if let limit { windows.update { $0.append(limit) } } }
+               host.onReceiveFrameWindow = { limit in
+                   if let limit {
+                       windows.update { $0.append(limit) }
+                       if (18...24).contains(limit) { windowExpanded.signal() }
+                   }
+               }
                host.onPrepareRecovery = { $0(true) }
                host.onProduceRecoveryFrame = { host.sendVideo(packet(1, idr: true, payloadBytes: 3_600)) }
+               host.onResumeFrames = { hostResumed.signal() }
                peer.onMessageHandled = { message, resume in _ = host.receive(message); resume() }
                host.start()
            }
@@ -844,15 +880,125 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
        }
        client.start()
        try wait(committed, "Dynamic window UDP stream did not commit", seconds: 8)
+       try wait(hostResumed, "Dynamic window host commit did not resume")
        guard let host = hostBox.get() else { throw Failure(message: "Missing host media session") }
        host.recordControlRoundTrip(milliseconds: 80)
-       Thread.sleep(forTimeInterval: 0.05)
+       try wait(windowExpanded, "Host did not expand dynamic frame window for 120 fps @ 80 ms RTT", seconds: 3)
        let observedWindows = windows.get()
        try require(observedWindows.contains(where: { $0 >= 18 && $0 <= 24 }),
                    "Host did not expand dynamic frame window for 120 fps @ 80 ms RTT: \(observedWindows)")
        host.sendVideo(packet(2, idr: false, payloadBytes: 3_200))
        try wait(multiFragmentDelivered, "Multi-fragment parity-protected P-frame did not arrive")
        try require(receivedFrames.get() == 1, "Multi-fragment P-frame delivered duplicate copies")
+   }
+   run("Host holds early UDP prepare until authenticated pong and aborts unverified UDP") {
+       func runEarlyPrepareCase(sendPong: Bool) throws {
+           let key = try PairingKey.generate()
+           let queue = DispatchQueue(label: "checks.early-udp-prepare")
+           let reservation = try reserveMediaPort()
+           var udpReservation = reservation.socket
+           defer { if udpReservation >= 0 { close(udpReservation) } }
+           let port = reservation.port
+           let listener = try NWListener(using: MediaSecureTransport.tlsParameters(key: key, roles: MediaChannelRole.allCases),
+                                         on: NWEndpoint.Port(rawValue: port)!)
+           let listenReady = DispatchSemaphore(value: 0)
+           let offerReceived = DispatchSemaphore(value: 0)
+           let hostPingSeen = DispatchSemaphore(value: 0)
+           let transactionSettled = DispatchSemaphore(value: 0)
+           let hostBox = Box<MediaSession?>(nil)
+           let peers = Box<[Peer]>([])
+           let offerBox = Box<MediaControl?>(nil)
+           let hostPingBox = Box<Data?>(nil)
+           let preparedCount = Box(0)
+           let outcomeBox = Box<MediaControl.Operation?>(nil)
+           let txID = UUID()
+           listener.newConnectionHandler = { incoming in
+               let peer = Peer(connection: incoming)
+               peers.update { $0.append(peer) }
+               peer.onReady = {
+                   guard let host = try? MediaSession.host(control: peer, key: key, port: port, settings: StreamSettings()) else { return }
+                   hostBox.update { $0 = host }
+                   host.onPrepareRecovery = { complete in
+                       preparedCount.update { $0 += 1 }
+                       complete(true)
+                   }
+                   peer.onMessageHandled = { message, resume in _ = host.receive(message); resume() }
+                   host.start()
+               }
+               peer.start()
+           }
+           listener.stateUpdateHandler = { if case .ready = $0 { listenReady.signal() } }
+           listener.start(queue: queue)
+           try wait(listenReady, "Early UDP prepare listener ready")
+           close(udpReservation); udpReservation = -1
+           let client = Peer(connection: NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!,
+                                                      using: try MediaSecureTransport.tlsParameters(key: key, roles: [.control])))
+           client.onMessageHandled = { message, resume in
+               if message.kind == .mediaControl, let control = try? MediaControl.read(message.payload) {
+                   if control.operation == .offer {
+                       offerBox.update { $0 = control }
+                       offerReceived.signal()
+                   } else if control.transactionID == txID, control.operation == .ready || control.operation == .abort {
+                       outcomeBox.update { $0 = control.operation }
+                       transactionSettled.signal()
+                   }
+               }
+               resume()
+           }
+           client.onReady = {
+               if let req = try? MediaControl(.request).message() { client.send(req) }
+           }
+           var udpClient: BoundedDatagramPeer?
+           defer {
+               udpClient?.close("test done")
+               hostBox.get()?.stop()
+               client.close("test done")
+               peers.get().forEach { $0.close("test done") }
+               listener.cancel()
+           }
+           client.start()
+           try wait(offerReceived, "Host did not send media offer")
+           guard let offer = offerBox.get(), let sessionID = offer.sessionID, let datagramKey = offer.datagramKey else {
+               throw Failure(message: "Offer lacked session credentials")
+           }
+           let dtlsConn = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!,
+                                       using: try MediaSecureTransport.dtlsParameters(sessionKey: datagramKey,
+                                                                                      identity: Data(sessionID.uuidString.utf8)))
+           let datagramPeer = try BoundedDatagramPeer(connection: dtlsConn,
+                                                      maximumDatagramBytes: MediaFragment.maximumDatagramBytes + 1,
+                                                      handshakeTimeout: 3)
+           udpClient = datagramPeer
+           datagramPeer.onDatagram = { data in
+               if data.first == 1, data.count == 1024, hostPingBox.get() == nil {
+                   hostPingBox.update { $0 = data }
+                   hostPingSeen.signal()
+               }
+           }
+           datagramPeer.start()
+           try wait(hostPingSeen, "Host DTLS ping did not arrive")
+           // Send TCP prepare before replying to the host's UDP challenge.
+           client.send(try MediaControl(.prepare, sessionID: sessionID, transactionID: txID,
+                                        transportEpoch: 1, codecEpoch: 1, path: "udp").message())
+           Thread.sleep(forTimeInterval: 0.04)
+           try require(preparedCount.get() == 0 && outcomeBox.get() == nil,
+                       "Host prepared or aborted UDP before challenge verification settled")
+           if sendPong, var pong = hostPingBox.get() {
+               pong[pong.startIndex] = 2
+               var viewerPing = Data([1])
+               viewerPing.append(contentsOf: repeatElement(UInt8(0x5A), count: 16))
+               viewerPing.append(Data(count: 1024 - viewerPing.count))
+               try require(datagramPeer.send(viewerPing) && datagramPeer.send(pong), "Could not send UDP verification datagrams")
+               try wait(transactionSettled, "Early UDP prepare did not become ready after pong", seconds: 3)
+               try require(outcomeBox.get() == .ready && preparedCount.get() == 1,
+                           "Verified UDP prepare did not transition to ready once: \(String(describing: outcomeBox.get())), prepared \(preparedCount.get())")
+           } else {
+               try wait(transactionSettled, "Unverified UDP prepare did not time out cleanly", seconds: 3)
+               try require(outcomeBox.get() == .abort && preparedCount.get() == 0,
+                           "Unverified UDP prepare bypassed authentication or failed to abort")
+           }
+       }
+       try runEarlyPrepareCase(sendPong: true)
+       try runEarlyPrepareCase(sendPong: false)
    }
   }
   print("Media session checks: \(passed) passed, \(failed) failed")

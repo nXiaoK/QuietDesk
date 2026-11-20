@@ -42,7 +42,7 @@ OTHER_EVENTS = set((
     "clipboardFailed clipboardEchoSuppressed permissionChanged exportRequested "
     "exportCompleted exportFailed counters performanceDiagnosticsChanged "
     "relayRegistration mediaRouteChanged mediaPathSwitch peerPathChanged "
-    "updateCheck updatePreferenceChanged updateDownload updateInstall updateCancelled"
+    "updateCheck updatePreferenceChanged autoUpdatePreferenceChanged updateDownload updateInstall updateCancelled"
 ).split())
 SUMMARY_FIELDS = {"metric", "messageKind", "unit", "count", "minimum", "maximum", "mean",
                   "p95UpperBound", "worstIdentifier", "windowMilliseconds"}

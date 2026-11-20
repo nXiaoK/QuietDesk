@@ -262,6 +262,9 @@ public enum UpdateURLPolicy {
 }
 
 public enum UpdateCheckPolicy {
+    public static let dailyInterval: TimeInterval = 24 * 60 * 60
+    public static let failureRetryInterval: TimeInterval = 60 * 60
+
     public static func shouldPresentConsent(updaterEnabled: Bool, autoCheckPreference: Bool?, mainWindowVisible: Bool,
                                             applicationActive: Bool, isControlling: Bool, isFullScreen: Bool,
                                             hasHostConnection: Bool, hasOtherPrompt: Bool) -> Bool {
@@ -269,12 +272,113 @@ public enum UpdateCheckPolicy {
             && !isControlling && !isFullScreen && !hasHostConnection && !hasOtherPrompt
     }
     public static func shouldAutomaticallyCheck(updaterEnabled: Bool, autoCheckPreference: Bool?, now: Date,
-                                               launchedAt: Date, lastCheck: Date?) -> Bool {
+                                               launchedAt: Date, lastCheck: Date?,
+                                               lastFailedCheck: Date? = nil) -> Bool {
         guard updaterEnabled, autoCheckPreference == true, now.timeIntervalSince(launchedAt) >= 120 else { return false }
-        return lastCheck.map { now.timeIntervalSince($0) >= 24 * 60 * 60 } ?? true
+        if let lastFailedCheck, now.timeIntervalSince(lastFailedCheck) < failureRetryInterval { return false }
+        return lastCheck.map { now.timeIntervalSince($0) >= dailyInterval } ?? true
     }
     public static func shouldOffer(version: String, skippedVersion: String?, manual: Bool) -> Bool {
         manual || version != skippedVersion
+    }
+}
+
+public enum UpdateAutoInstallBlockReason: Equatable, Sendable {
+    case disabled
+    case beingRemotelyControlled
+    case controllingRemoteMac
+    case fullScreenSession
+    case activeConnectionOrTunnel
+    case recentSessionCooldown
+    case blockingPrompt
+    case manualUpdateRequired
+    case newerSystemRequired
+    case deferredByUser
+
+    public var isRemoteOrTransientSessionDeferral: Bool {
+        switch self {
+        case .beingRemotelyControlled, .controllingRemoteMac, .fullScreenSession,
+             .activeConnectionOrTunnel, .recentSessionCooldown, .blockingPrompt:
+            return true
+        case .disabled, .manualUpdateRequired, .newerSystemRequired, .deferredByUser:
+            return false
+        }
+    }
+}
+
+public enum UpdateAutoInstallDecision: Equatable, Sendable {
+    case proceed
+    case blocked(UpdateAutoInstallBlockReason)
+}
+
+public enum UpdateAutoInstallPolicy {
+    /// Wait briefly after a remote control session disconnects so transient auto-reconnect blips are never interrupted.
+    public static let postSessionCooldown: TimeInterval = 10
+
+    public static func isRemoteControlActive(
+        isControlling: Bool,
+        isFullScreen: Bool,
+        hasHostConnection: Bool,
+        hasActiveConnection: Bool
+    ) -> Bool {
+        isControlling || isFullScreen || hasHostConnection || hasActiveConnection
+    }
+
+    public static func evaluate(
+        updaterEnabled: Bool,
+        autoInstallEnabled: Bool,
+        isControlling: Bool,
+        isFullScreen: Bool,
+        hasHostConnection: Bool,
+        hasActiveConnection: Bool,
+        hasBlockingPrompt: Bool = false,
+        needsManualInstall: Bool = false,
+        requiresNewerSystem: Bool = false,
+        deferredByUser: Bool = false,
+        now: Date = Date(),
+        lastRemoteSessionEndedAt: Date? = nil,
+        cooldown: TimeInterval = postSessionCooldown
+    ) -> UpdateAutoInstallDecision {
+        guard updaterEnabled, autoInstallEnabled else { return .blocked(.disabled) }
+        if needsManualInstall { return .blocked(.manualUpdateRequired) }
+        if requiresNewerSystem { return .blocked(.newerSystemRequired) }
+        if deferredByUser { return .blocked(.deferredByUser) }
+        if hasHostConnection { return .blocked(.beingRemotelyControlled) }
+        if isControlling { return .blocked(.controllingRemoteMac) }
+        if isFullScreen { return .blocked(.fullScreenSession) }
+        if hasActiveConnection { return .blocked(.activeConnectionOrTunnel) }
+        if let endedAt = lastRemoteSessionEndedAt, now.timeIntervalSince(endedAt) < cooldown {
+            return .blocked(.recentSessionCooldown)
+        }
+        if hasBlockingPrompt { return .blocked(.blockingPrompt) }
+        return .proceed
+    }
+
+    public static func downloadRetryDelay(attempt: Int) -> TimeInterval {
+        switch max(1, attempt) {
+        case 1: return 5 * 60
+        case 2: return 15 * 60
+        default: return 60 * 60
+        }
+    }
+
+    public static func deferralMessage(for reason: UpdateAutoInstallBlockReason, version: String?, readyToInstall: Bool) -> String? {
+        let label = version.map { "新版本 \($0)" } ?? "更新"
+        let action = readyToInstall ? "自动安装并重新启动" : "自动下载并安装"
+        switch reason {
+        case .beingRemotelyControlled:
+            return "\(label) 已待命 · 这台 Mac 正被远程控制，将在远程控制结束后\(action)。"
+        case .controllingRemoteMac, .fullScreenSession:
+            return "\(label) 已待命 · 当前正在远程控制其他 Mac，将在会话结束后\(action)。"
+        case .activeConnectionOrTunnel:
+            return "\(label) 已待命 · 当前存在活动连接或 TCP 端口映射，将在断开后\(action)。"
+        case .recentSessionCooldown:
+            return "\(label) 已待命 · 远程会话刚结束，确认连接空闲后即将\(action)…"
+        case .blockingPrompt:
+            return "\(label) 已待命 · 将在当前提示处理完成后\(action)。"
+        case .disabled, .manualUpdateRequired, .newerSystemRequired, .deferredByUser:
+            return nil
+        }
     }
 }
 

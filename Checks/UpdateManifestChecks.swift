@@ -190,15 +190,63 @@ func runUpdateManifestChecks() {
     run("Automatic update checks require consent, startup delay and a persistent daily interval") {
         let launch = Date(timeIntervalSince1970: 1_000)
         let now = launch.addingTimeInterval(120)
-        func due(_ preference: Bool?, time: Date = now, last: Date? = nil, enabled: Bool = true) -> Bool {
-            UpdateCheckPolicy.shouldAutomaticallyCheck(updaterEnabled: enabled, autoCheckPreference: preference, now: time, launchedAt: launch, lastCheck: last)
+        func due(_ preference: Bool?, time: Date = now, last: Date? = nil, failed: Date? = nil, enabled: Bool = true) -> Bool {
+            UpdateCheckPolicy.shouldAutomaticallyCheck(updaterEnabled: enabled, autoCheckPreference: preference,
+                                                       now: time, launchedAt: launch, lastCheck: last, lastFailedCheck: failed)
         }
         try check(!due(nil) && !due(false) && !due(true, enabled: false), "Automatic check ran without enabled consent")
         try check(!due(true, time: launch.addingTimeInterval(119.9)) && due(true), "First check ignored startup boundary")
         try check(!due(true, last: now.addingTimeInterval(-86_399)) && due(true, last: now.addingTimeInterval(-86_400)), "Daily interval boundary changed")
-        try check(!due(true, last: now.addingTimeInterval(1)), "Clock rollback caused repeated check")
+        try check(!due(true, failed: now.addingTimeInterval(-3_599)) && due(true, failed: now.addingTimeInterval(-3_600)), "Failure retry interval boundary changed")
+        try check(!due(true, last: now.addingTimeInterval(1)) && !due(true, failed: now.addingTimeInterval(1)), "Clock rollback caused repeated check")
         try check(!UpdateCheckPolicy.shouldOffer(version: "0.8.0", skippedVersion: "0.8.0", manual: false), "Skipped version was offered automatically")
         try check(UpdateCheckPolicy.shouldOffer(version: "0.8.1", skippedVersion: "0.8.0", manual: false), "Newer version inherited old skip")
+    }
+
+    run("Automatic update installation proceeds when idle or waiting for sharing, and defers during remote control") {
+        let now = Date(timeIntervalSince1970: 10_000)
+        func eval(enabled: Bool = true, autoInstall: Bool = true, controlling: Bool = false, fullScreen: Bool = false,
+                  hostConnection: Bool = false, activeConnection: Bool = false, prompt: Bool = false,
+                  manual: Bool = false, newerSystem: Bool = false, deferred: Bool = false,
+                  endedAt: Date? = nil) -> UpdateAutoInstallDecision {
+            UpdateAutoInstallPolicy.evaluate(
+                updaterEnabled: enabled, autoInstallEnabled: autoInstall,
+                isControlling: controlling, isFullScreen: fullScreen,
+                hasHostConnection: hostConnection, hasActiveConnection: activeConnection,
+                hasBlockingPrompt: prompt, needsManualInstall: manual,
+                requiresNewerSystem: newerSystem, deferredByUser: deferred,
+                now: now, lastRemoteSessionEndedAt: endedAt
+            )
+        }
+        try check(!UpdateAutoInstallPolicy.isRemoteControlActive(isControlling: false, isFullScreen: false, hasHostConnection: false, hasActiveConnection: false),
+                  "Idle session was marked as active remote control")
+        try check(UpdateAutoInstallPolicy.isRemoteControlActive(isControlling: true, isFullScreen: false, hasHostConnection: false, hasActiveConnection: false),
+                  "Viewer remote control was not detected")
+        try check(UpdateAutoInstallPolicy.isRemoteControlActive(isControlling: false, isFullScreen: false, hasHostConnection: true, hasActiveConnection: false),
+                  "Incoming host remote control was not detected")
+        try check(UpdateAutoInstallPolicy.isRemoteControlActive(isControlling: false, isFullScreen: false, hasHostConnection: false, hasActiveConnection: true),
+                  "Active tunnel or connection was not detected")
+        try check(eval() == .proceed, "Idle app with auto-install enabled could not proceed")
+        try check(eval(enabled: false) == .blocked(.disabled) && eval(autoInstall: false) == .blocked(.disabled),
+                  "Disabled auto-install proceeded")
+        try check(eval(hostConnection: true) == .blocked(.beingRemotelyControlled),
+                  "Host under remote control allowed automatic installation")
+        try check(eval(controlling: true) == .blocked(.controllingRemoteMac),
+                  "Viewer controlling remote Mac allowed automatic installation")
+        try check(eval(fullScreen: true) == .blocked(.fullScreenSession),
+                  "Fullscreen remote session allowed automatic installation")
+        try check(eval(activeConnection: true) == .blocked(.activeConnectionOrTunnel),
+                  "Active tunnel allowed automatic installation")
+        try check(eval(endedAt: now.addingTimeInterval(-9.9)) == .blocked(.recentSessionCooldown),
+                  "Post-session reconnect cooldown was bypassed")
+        try check(eval(endedAt: now.addingTimeInterval(-10.0)) == .proceed,
+                  "Post-session cooldown did not clear after 10 seconds")
+        try check(eval(prompt: true) == .blocked(.blockingPrompt),
+                  "Blocking prompt was interrupted by automatic installation")
+        try check(eval(manual: true) == .blocked(.manualUpdateRequired)
+                  && eval(newerSystem: true) == .blocked(.newerSystemRequired)
+                  && eval(deferred: true) == .blocked(.deferredByUser),
+                  "Manual, unsupported-OS or user-deferred updates proceeded automatically")
     }
 
     run("Update installation blocks remote host sessions and falls back for unsafe destinations") {

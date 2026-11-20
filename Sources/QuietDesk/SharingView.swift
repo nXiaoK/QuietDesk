@@ -6,6 +6,7 @@ struct SharingView: View {
     @ObservedObject var model: DeskModel
     let openTraffic: () -> Void
     var openRelayWorkspace: (() -> Void)? = nil
+    var updates: UpdateController? = nil
     @State private var showCode = false
     @State private var copiedCodeFeedback = false
     @State private var confirmingRegeneration = false
@@ -589,6 +590,9 @@ struct SharingView: View {
                     )
                     Toggle("启动后自动开启本机共享", isOn: $model.autoStartSharing)
                     Toggle("登录自动启动时最小化主窗口", isOn: $model.minimizeAtLogin)
+                    if let updates, updates.enabled {
+                        SharingAutoUpdateToggleRow(updates: updates)
+                    }
                 }
                 .toggleStyle(.checkbox)
                 .font(.callout)
@@ -706,5 +710,16 @@ struct SharingView: View {
             }
             .frame(maxWidth: .infinity, alignment: .topLeading)
         }
+    }
+}
+
+private struct SharingAutoUpdateToggleRow: View {
+    @ObservedObject var updates: UpdateController
+
+    var body: some View {
+        Toggle(
+            "非远程控制时自动更新安装（重启后自动恢复共享）",
+            isOn: Binding(get: { updates.autoInstallPreference }, set: { updates.setAutomaticInstall($0) })
+        )
     }
 }

@@ -34,6 +34,7 @@ private final class UpdateCheckDefaults: UserDefaults {
         } catch { writeFailed = true }
     }
     override func set(_ value: Bool, forKey key: String) { set(value as Any, forKey: key) }
+    override func removeObject(forKey defaultName: String) { set(nil, forKey: defaultName) }
 }
 
 private actor UpdateCheckFeed {
@@ -74,10 +75,12 @@ private final class UpdateCheckInstaller: UpdateInstalling, @unchecked Sendable 
     var manualReason: String?
     var ignoresLaunchCancellation = false
     var launchDelay: Duration = .milliseconds(150)
+    private var recordedOptions: UpdateInstaller.LaunchOptions?
     var downloadCount: Int { lock.withLock { downloads } }
     var launchCount: Int { lock.withLock { launches } }
     var discardCount: Int { lock.withLock { discards } }
     var abortCount: Int { lock.withLock { aborts } }
+    var lastLaunchOptions: UpdateInstaller.LaunchOptions? { lock.withLock { recordedOptions } }
 
     init(directory: URL, result: UpdateInstaller.InstallationResult? = nil) {
         self.directory = directory; self.result = result
@@ -100,7 +103,10 @@ private final class UpdateCheckInstaller: UpdateInstalling, @unchecked Sendable 
     func emitLateVerification() { lock.withLock { verifying }?() }
     func installationAvailability() -> String? { manualReason }
     func launchInstaller(for prepared: UpdateInstaller.PreparedUpdate) async throws {
-        lock.withLock { launches += 1 }
+        try await launchInstaller(for: prepared, options: .init())
+    }
+    func launchInstaller(for prepared: UpdateInstaller.PreparedUpdate, options: UpdateInstaller.LaunchOptions) async throws {
+        lock.withLock { launches += 1; recordedOptions = options }
         if ignoresLaunchCancellation {
             await Task.detached { try? await Task.sleep(for: .milliseconds(150)) }.value
         } else { try await Task.sleep(for: launchDelay) }
@@ -515,6 +521,147 @@ private struct UpdateControllerChecks {
             let duration = Date().timeIntervalSince(started)
             try requireUpdate(slow.state == .failed && duration >= 13 && duration < 20, "Production loader did not enforce its 15-second timeout")
             slow.shutdown()
+        }
+
+        await run("Automatic update toggle couples check preference, installs when idle or waiting to share, and restores host state") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
+            let installer = UpdateCheckInstaller(directory: directory)
+            var terminations = 0
+            let context = UpdateSessionContext(
+                mainWindowVisible: false,
+                applicationActive: false,
+                isSharing: true,
+                isHostDesktopSharing: true,
+                isMappingHosting: true,
+                autoStartSharing: false
+            )
+            let controller = fixture.controller(context: { context }, installer: installer, terminate: { terminations += 1 })
+            defer { controller.shutdown() }
+            try requireUpdate(!controller.autoInstallPreference, "Automatic install defaulted to enabled without user consent")
+            controller.setAutomaticInstall(true, checkImmediatelyIfIdle: false)
+            try requireUpdate(controller.autoInstallPreference && controller.autoCheckPreference == true,
+                              "Enabling automatic install did not enable automatic checks")
+            controller.tick(now: fixture.now)
+            let deadline = Date().addingTimeInterval(5)
+            while terminations == 0 && Date() < deadline { await drain() }
+            try requireUpdate(installer.downloadCount == 1 && installer.launchCount == 1 && terminations == 1,
+                              "Idle host waiting for connections did not automatically download and install update")
+            let options = installer.lastLaunchOptions
+            try requireUpdate(options?.automatic == true && options?.openInBackground == true
+                              && options?.minimizeWindowOnLaunch == true
+                              && options?.resumeHostSharing == true && options?.resumeMappingHosting == true,
+                              "Automatic install did not record background reopen and sharing recovery options")
+
+            var restoredOptions: UpdateInstaller.LaunchOptions?
+            let postUpdateInstaller = UpdateCheckInstaller(directory: directory, result: .init(
+                version: "0.8.0", build: 31, succeeded: true, message: "已自动更新到 0.8.0",
+                restartObserved: true, launchOptions: options
+            ))
+            let restarted = fixture.controller(installer: postUpdateInstaller)
+            restarted.onRestoreLaunchOptions = { restoredOptions = $0 }
+            restarted.start()
+            restarted.shutdown()
+            try requireUpdate(restoredOptions == options, "Post-update startup did not restore pre-update sharing options")
+            restarted.setAutomaticChecks(false)
+            try requireUpdate(!restarted.autoInstallPreference && restarted.autoCheckPreference == false,
+                              "Disabling automatic checks left automatic installation enabled")
+        }
+
+        await run("Automatic update defers during viewer or host remote control and installs after cooldown") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
+            fixture.defaults.set(true, forKey: "autoCheckUpdates")
+            fixture.defaults.set(true, forKey: "autoInstallUpdates")
+            let installer = UpdateCheckInstaller(directory: directory)
+            var context = UpdateSessionContext(isControlling: true, hasActiveConnection: true)
+            var terminations = 0
+            let controller = fixture.controller(context: { context }, installer: installer, terminate: { terminations += 1 })
+            defer { controller.shutdown() }
+
+            controller.tick(now: fixture.now)
+            try await settled(controller)
+            try requireUpdate(controller.manifest?.version == "0.8.0" && controller.state == .available,
+                              "Automatic check did not record available update during remote control")
+            try requireUpdate(installer.downloadCount == 0 && installer.launchCount == 0 && terminations == 0,
+                              "Automatic update downloaded or installed while viewer was controlling another Mac")
+            try requireUpdate(controller.autoInstallDeferredBySession, "Remote control deferral state was not exposed")
+
+            // Switch to incoming host control: still blocked.
+            context.isControlling = false
+            context.hasHostConnection = true
+            controller.tick(now: fixture.now.addingTimeInterval(5))
+            await drain()
+            try requireUpdate(installer.downloadCount == 0 && installer.launchCount == 0 && terminations == 0,
+                              "Automatic update started while this Mac was being remotely controlled")
+
+            // Disconnect at t = +10s; within 10s reconnect grace window (t = +15s), still deferred.
+            let endedAt = fixture.now.addingTimeInterval(10)
+            context.hasHostConnection = false
+            context.hasActiveConnection = false
+            controller.tick(now: endedAt)
+            controller.tick(now: endedAt.addingTimeInterval(5))
+            await drain()
+            try requireUpdate(installer.downloadCount == 0 && terminations == 0,
+                              "Automatic update interrupted the post-session reconnect grace period")
+
+            // Brief reconnect at t = +16s, then final disconnect at t = +20s resets grace period.
+            context.hasHostConnection = true
+            controller.tick(now: fixture.now.addingTimeInterval(16))
+            let finalEnd = fixture.now.addingTimeInterval(20)
+            context.hasHostConnection = false
+            controller.tick(now: finalEnd)
+            controller.tick(now: finalEnd.addingTimeInterval(9))
+            await drain()
+            try requireUpdate(installer.downloadCount == 0 && terminations == 0,
+                              "Reconnect did not reset post-session grace period")
+
+            // At finalEnd + 10s, session is stably idle -> automatic download + verify + install!
+            controller.tick(now: finalEnd.addingTimeInterval(10))
+            let deadline = Date().addingTimeInterval(5)
+            while terminations == 0 && Date() < deadline { await drain() }
+            try requireUpdate(installer.downloadCount == 1 && installer.launchCount == 1 && terminations == 1,
+                              "Automatic update did not proceed once remote control ended and cooldown elapsed")
+        }
+
+        await run("Viewer or host session arriving during automatic installer readiness aborts exit and resumes later") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
+            fixture.defaults.set(true, forKey: "autoCheckUpdates")
+            fixture.defaults.set(true, forKey: "autoInstallUpdates")
+            let installer = UpdateCheckInstaller(directory: directory)
+            installer.ignoresLaunchCancellation = true
+            var currentNow = fixture.now
+            var context = UpdateSessionContext()
+            var terminations = 0
+            let controller = UpdateController(
+                info: fixture.info, defaults: fixture.defaults,
+                launchedAt: fixture.now.addingTimeInterval(-120),
+                clock: { currentNow },
+                sessionContext: { context },
+                installer: installer,
+                terminateApplication: { terminations += 1 },
+                loadFeed: { [feed = fixture.feed] url, version in try await feed.fetch(url, version) }
+            )
+            defer { controller.shutdown() }
+
+            controller.tick(now: currentNow)
+            let waitInstall = Date().addingTimeInterval(3)
+            while controller.state != .installing && Date() < waitInstall { await drain() }
+            context.isControlling = true
+            try await settled(controller)
+            try requireUpdate(installer.launchCount == 1 && installer.abortCount > 0 && terminations == 0 && controller.state == .ready,
+                              "Viewer remote session starting during readiness still terminated the app")
+
+            currentNow = fixture.now.addingTimeInterval(20)
+            controller.tick(now: currentNow)
+            context.isControlling = false
+            currentNow = fixture.now.addingTimeInterval(21)
+            controller.tick(now: currentNow)
+            installer.ignoresLaunchCancellation = false
+            currentNow = fixture.now.addingTimeInterval(31)
+            controller.tick(now: currentNow)
+            let deadline = Date().addingTimeInterval(5)
+            while terminations == 0 && Date() < deadline { await drain() }
+            try requireUpdate(installer.downloadCount == 1 && installer.launchCount == 2 && terminations == 1,
+                              "Staged update did not resume automatic installation without re-downloading")
         }
 
         print("\(passed) passed, \(failed) failed (synthetic update state only)")

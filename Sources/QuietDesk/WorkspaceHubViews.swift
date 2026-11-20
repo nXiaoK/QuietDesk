@@ -17,6 +17,7 @@ enum PreferencesWorkspaceSubTab: String, CaseIterable, Hashable {
     case keyboard
     case privacy
     case connectionDefaults
+    case updates
 }
 
 struct NetworkWorkspaceView: View {
@@ -323,6 +324,7 @@ struct DiagnosticsWorkspaceView: View {
 
 struct PreferencesWorkspaceView: View {
     @ObservedObject var viewer: DeskModel
+    @ObservedObject var updates: UpdateController
     @Binding var subTab: PreferencesWorkspaceSubTab
     let openBenchmark: () -> Void
     let openTraffic: () -> Void
@@ -334,7 +336,8 @@ struct PreferencesWorkspaceView: View {
                     tabs: [
                         (.keyboard, "键盘与系统快捷键"),
                         (.privacy, "被控端防窥与自动解锁"),
-                        (.connectionDefaults, "连接、画质与诊断默认项")
+                        (.connectionDefaults, "连接、画质与诊断默认项"),
+                        (.updates, updates.manifest != nil ? "软件更新 · 新版本" : "软件更新")
                     ],
                     selection: $subTab
                 )
@@ -364,6 +367,8 @@ struct PreferencesWorkspaceView: View {
                                 embedded: true
                             )
                         }
+                    case .updates:
+                        UpdateSettingsPanel(controller: updates)
                     }
                 }
                 .padding(.horizontal, 26)

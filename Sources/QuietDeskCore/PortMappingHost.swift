@@ -8,6 +8,7 @@ public final class PortMappingHost: @unchecked Sendable {
     public typealias Authorization = (PortMappingTarget, @escaping (Bool) -> Void) -> Void
     public typealias DeviceAuthorization = (PortMappingTarget, UUID?, @escaping (Bool) -> Void) -> Void
     public var onAuthorizationWithdrawn: ((PortMappingTarget) -> Void)?
+    public var onActiveSessionsChanged: ((Bool) -> Void)?
 
     private final class Entry {
         enum Phase {
@@ -61,7 +62,9 @@ public final class PortMappingHost: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, !self.stopped else { readyPeer.close("端口映射服务已关闭"); return }
             guard self.entries.count < 40 else { readyPeer.close("端口映射连接已满"); return }
+            let wasEmpty = self.entries.isEmpty
             self.entries[id] = entry
+            if wasEmpty { self.onActiveSessionsChanged?(true) }
             self.queue.asyncAfter(deadline: .now() + 10) { [weak self, weak entry] in
                 guard let self, let entry, case .handshake = entry.phase else { return }
                 self.remove(id, reason: "映射握手超时")
@@ -162,6 +165,7 @@ public final class PortMappingHost: @unchecked Sendable {
         entry.phase = .closing
         entry.peer.close(reason)
         cleanup(phase)
+        if entries.isEmpty { onActiveSessionsChanged?(false) }
     }
 
     private func cleanup(_ phase: Entry.Phase) {

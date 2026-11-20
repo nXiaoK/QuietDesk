@@ -31,12 +31,21 @@ final class UpdateInstaller: @unchecked Sendable {
         var manualInstallationReason: String? = nil
     }
 
+    struct LaunchOptions: Codable, Equatable, Sendable {
+        var automatic: Bool = false
+        var openInBackground: Bool = false
+        var minimizeWindowOnLaunch: Bool = false
+        var resumeHostSharing: Bool = false
+        var resumeMappingHosting: Bool = false
+    }
+
     struct InstallationResult: Codable, Sendable {
         let version: String
         let build: Int
         let succeeded: Bool
         let message: String
         let restartObserved: Bool
+        var launchOptions: LaunchOptions? = nil
     }
 
     enum Failure: LocalizedError {
@@ -61,6 +70,7 @@ final class UpdateInstaller: @unchecked Sendable {
         let acknowledgementURL: URL
         let expectation: Expectation
         let currentTeamIdentifier: String?
+        var launchOptions: LaunchOptions? = nil
     }
 
     private static let installArgument = "--quietdesk-install-update-v1"
@@ -185,6 +195,10 @@ final class UpdateInstaller: @unchecked Sendable {
     }
 
     func launchInstaller(for prepared: PreparedUpdate) async throws {
+        try await launchInstaller(for: prepared, options: .init())
+    }
+
+    func launchInstaller(for prepared: PreparedUpdate, options: LaunchOptions) async throws {
         try begin()
         defer { end() }
         if let reason = prepared.manualInstallationReason { throw Failure.invalid(reason) }
@@ -204,7 +218,8 @@ final class UpdateInstaller: @unchecked Sendable {
                                readyURL: updatesDirectory.appendingPathComponent("installer-\(token).ready"),
                                acknowledgementURL: updatesDirectory.appendingPathComponent("installer-\(token).ack"),
                                expectation: prepared.expectation,
-                               currentTeamIdentifier: try Self.signingInformation(applicationURL).team)
+                               currentTeamIdentifier: try Self.signingInformation(applicationURL).team,
+                               launchOptions: options)
         let planURL = updatesDirectory.appendingPathComponent("install-plan.json")
         try Self.writePrivate(plan, to: planURL)
         try? FileManager.default.removeItem(at: plan.resultURL)
@@ -308,13 +323,14 @@ final class UpdateInstaller: @unchecked Sendable {
             try performInstallation(plan, planURL: planURL)
         } catch {
             let result = InstallationResult(version: plan.expectation.version, build: plan.expectation.build,
-                                            succeeded: false, message: error.localizedDescription, restartObserved: false)
+                                            succeeded: false, message: error.localizedDescription,
+                                            restartObserved: false, launchOptions: plan.launchOptions)
             try? writePrivate(result, to: plan.resultURL)
             if FileManager.default.fileExists(atPath: plan.applicationURL.path),
                !FileManager.default.fileExists(atPath: plan.backupURL.path),
                kill(plan.parentPID, 0) != 0, errno == ESRCH,
                (try? validateCodeSignature(plan.applicationURL)) != nil {
-                try? run("/usr/bin/open", [plan.applicationURL.path])
+                try? run("/usr/bin/open", plan.launchOptions?.openInBackground == true ? ["-g", plan.applicationURL.path] : [plan.applicationURL.path])
             }
         }
         return true
@@ -323,7 +339,10 @@ final class UpdateInstaller: @unchecked Sendable {
     static func performInstallation(_ plan: InstallPlan, planURL: URL, waitTimeout: TimeInterval = 30,
                                     restartTimeout: TimeInterval = 15,
                                     renameItem: (URL, URL) throws -> Void = renameItem,
-                                    reopen: (URL) throws -> Void = { try run("/usr/bin/open", [$0.path]) }) throws {
+                                    reopen: ((URL) throws -> Void)? = nil) throws {
+        let openApp = reopen ?? { url in
+            try run("/usr/bin/open", plan.launchOptions?.openInBackground == true ? ["-g", url.path] : [url.path])
+        }
         let deadline = Date().addingTimeInterval(waitTimeout)
         while kill(plan.parentPID, 0) == 0 || errno == EPERM {
             guard Date() < deadline else { throw Failure.invalid("等待旧应用退出超时；更新未安装。") }
@@ -356,14 +375,18 @@ final class UpdateInstaller: @unchecked Sendable {
             throw Failure.invalid("新包安装后校验失败，已恢复旧版本。")
         }
         // Publish before open: the new process may reach consumeResult before open returns.
+        let successMessage = plan.launchOptions?.automatic == true
+            ? "已自动更新到 \(plan.expectation.version)"
+            : "已更新到 \(plan.expectation.version)"
         let installed = InstallationResult(version: plan.expectation.version, build: plan.expectation.build,
-                                           succeeded: true, message: "已更新到 \(plan.expectation.version)", restartObserved: false)
+                                           succeeded: true, message: successMessage,
+                                           restartObserved: false, launchOptions: plan.launchOptions)
         try writePrivate(installed, to: plan.resultURL)
-        do { try reopen(plan.applicationURL) }
+        do { try openApp(plan.applicationURL) }
         catch {
             let result = InstallationResult(version: installed.version, build: installed.build, succeeded: true,
                                             message: "更新已安装，但自动重新启动失败。旧版备份已保留，请手动打开 QuietDesk。",
-                                            restartObserved: false)
+                                            restartObserved: false, launchOptions: plan.launchOptions)
             try writePrivate(result, to: plan.resultURL)
             return
         }
@@ -386,12 +409,13 @@ final class UpdateInstaller: @unchecked Sendable {
                 for file in [plan.resultURL, planURL, plan.acknowledgementURL] { try? FileManager.default.removeItem(at: file) }
             } else {
                 try writePrivate(InstallationResult(version: installed.version, build: installed.build, succeeded: true,
-                                                    message: installed.message, restartObserved: true), to: plan.resultURL)
+                                                    message: installed.message, restartObserved: true,
+                                                    launchOptions: plan.launchOptions), to: plan.resultURL)
             }
         } else {
             try writePrivate(InstallationResult(version: installed.version, build: installed.build, succeeded: true,
                                                 message: "更新已安装，但未观察到新应用启动。旧版备份已保留，请手动打开 QuietDesk。",
-                                                restartObserved: false), to: plan.resultURL)
+                                                restartObserved: false, launchOptions: plan.launchOptions), to: plan.resultURL)
         }
     }
 

@@ -27,14 +27,33 @@ struct QuietDeskApp: App {
         let updater = UpdateController(sessionContext: { [weak models] in
             guard let models else { return .init() }
             let viewer = models.viewer, host = models.host, window = models.mainWindow
-            return UpdateSessionContext(mainWindowVisible: window?.isVisible == true && window?.isMiniaturized == false,
-                applicationActive: NSApp.isActive, isControlling: viewer.connected || viewer.working || viewer.reconnecting,
-                isFullScreen: viewer.isFullScreen, hasHostConnection: host.hasIncomingControlConnection,
+            return UpdateSessionContext(
+                mainWindowVisible: window?.isVisible == true && window?.isMiniaturized == false,
+                applicationActive: NSApp.isActive,
+                isControlling: viewer.isControllingAnotherMac || viewer.isRunningRouteBenchmark,
+                isFullScreen: viewer.isFullScreen,
+                hasHostConnection: host.hasIncomingControlConnection,
                 isSharing: host.active || host.working || host.mappingHosting,
-                hasActiveConnection: viewer.connected || host.connected || viewer.portMappings.hasRunningMappings,
-                autoStartSharing: host.autoStartSharing, hasOtherPrompt: models.updatePromptBlocked)
+                isHostDesktopSharing: host.active || host.working,
+                isMappingHosting: host.mappingHosting,
+                hasActiveConnection: viewer.connected || host.connected || viewer.portMappings.hasRunningMappings || host.portMappings.hasIncomingMappings,
+                autoStartSharing: host.autoStartSharing,
+                hasOtherPrompt: models.updatePromptBlocked
+            )
         }, mainWindow: { [weak models] in models?.mainWindow }, releaseControl: { [weak viewer] in viewer?.canvas.releaseControl() },
             contextChanges: models.changes)
+        updater.onRestoreLaunchOptions = { [weak models] options in
+            guard let models else { return }
+            if options.minimizeWindowOnLaunch {
+                models.minimizeForBackgroundLaunch()
+            }
+            if options.resumeHostSharing && !models.host.active && !models.host.working {
+                models.host.startHosting(interactive: false)
+            }
+            if options.resumeMappingHosting && !models.host.mappingHosting {
+                models.host.setMappingHosting(true)
+            }
+        }
         _updates = StateObject(wrappedValue: updater)
         appDelegate.models = models
         appDelegate.updates = updater
@@ -56,7 +75,13 @@ struct QuietDeskApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .appInfo) {
-                if updates.enabled { Button("检查更新…") { updates.check() } }
+                if updates.enabled {
+                    Button("检查更新…") { updates.check() }
+                    Toggle("非远程控制时自动更新", isOn: Binding(
+                        get: { updates.autoInstallPreference },
+                        set: { updates.setAutomaticInstall($0) }
+                    ))
+                }
             }
             RemoteControlCommands(viewer: models.viewer, host: models.host)
         }
@@ -613,6 +638,7 @@ struct DeskView: View {
                 viewer: models.viewer,
                 host: models.host,
                 portMappings: models.viewer.portMappings,
+                updates: updates,
                 roleLocked: roleLocked
             )
 
@@ -661,7 +687,8 @@ struct DeskView: View {
                             openRelayWorkspace: {
                                 networkSubTab = .relayNodes
                                 models.workspaceSection = .network
-                            }
+                            },
+                            updates: updates
                         )
                     case .network:
                         NetworkWorkspaceView(
@@ -686,6 +713,7 @@ struct DeskView: View {
                     case .preferences:
                         PreferencesWorkspaceView(
                             viewer: models.viewer,
+                            updates: updates,
                             subTab: $preferencesSubTab,
                             openBenchmark: {
                                 diagnosticsSubTab = .benchmark
@@ -984,6 +1012,7 @@ private struct DeskWorkspaceSidebar: View {
     @ObservedObject var viewer: DeskModel
     @ObservedObject var host: DeskModel
     @ObservedObject var portMappings: PortMappingManager
+    @ObservedObject var updates: UpdateController
     let roleLocked: Bool
     @State private var copiedHostCode = false
 
@@ -1108,8 +1137,12 @@ private struct DeskWorkspaceSidebar: View {
             } else if viewer.relayEnabled, !viewer.relayNodes.isEmpty {
                 DeskPillBadge(text: "\(viewer.relayNodes.count) 节点", tint: .secondary)
             }
-        case .benchmark, .preferences:
+        case .benchmark:
             EmptyView()
+        case .preferences:
+            if updates.manifest != nil || updates.manualReleaseURL != nil {
+                DeskPillBadge(text: "有更新", tint: .accentColor)
+            }
         }
     }
 
@@ -1227,8 +1260,13 @@ private struct TrayView: View {
         Divider()
         if updates.enabled {
             Button(updates.menuTitle) { updates.check() }
+            if updates.autoInstallDeferredBySession {
+                Text("自动更新已待命（远控结束后安装）")
+            }
             Toggle("自动检查更新", isOn: Binding(get: { updates.autoCheckPreference == true },
                 set: { updates.setAutomaticChecks($0) }))
+            Toggle("非远程控制时自动更新", isOn: Binding(get: { updates.autoInstallPreference },
+                set: { updates.setAutomaticInstall($0) }))
             Divider()
         }
         Toggle("性能诊断", isOn: Binding(get: { viewer.performanceDiagnosticsEnabled },

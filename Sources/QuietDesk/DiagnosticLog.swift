@@ -14,7 +14,7 @@ final class DiagnosticLog: @unchecked Sendable {
         case permissionChanged, exportRequested, exportCompleted, exportFailed, counters
         case performanceDiagnosticsChanged, performanceWindow
         case relayRegistration, mediaRouteChanged, mediaPathSwitch, peerPathChanged
-        case updateCheck, updatePreferenceChanged, updateDownload, updateInstall, updateCancelled
+        case updateCheck, updatePreferenceChanged, autoUpdatePreferenceChanged, updateDownload, updateInstall, updateCancelled
     }
     enum Role: String, Codable { case viewer, host }
     enum StartupPhase: Int { case shareableContent = 1, listener, sessionPreparation, hello }

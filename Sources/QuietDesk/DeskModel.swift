@@ -4960,6 +4960,11 @@ final class DeskModel: ObservableObject {
         loginWindowHandled = true
     }
 
+    func minimizeForBackgroundLaunch() {
+        if let mainWindow { mainWindow.miniaturize(nil) }
+        else { shouldMinimizeOnLaunch = true }
+    }
+
     private func restartHostAfterFailure(_ reason: String) {
         let retry = hostingRequested
         recordDisconnect(reason)

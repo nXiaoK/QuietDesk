@@ -50,7 +50,7 @@ enum DeskWorkspaceSection: String, CaseIterable, Identifiable {
         case .sharing: return "管理被控状态、配对凭据、macOS 实际生效权限与默认编码档位"
         case .network: return "统一管理 TCP 端口映射隧道、自托管中继节点与本机被控映射授权"
         case .benchmark: return "执行实际视频流质量对比，查看历史总评估与按地址累计收发流量"
-        case .preferences: return "Caps Lock 远端输入法切换、系统快捷键实效权限、被控端防窥记忆与连接默认项"
+        case .preferences: return "Caps Lock 远端输入法切换、系统快捷键实效权限、被控端防窥记忆、连接默认项与自动更新"
         }
     }
 

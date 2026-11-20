@@ -81,6 +81,7 @@ final class DeskModels: ObservableObject {
     /// The host model owns launch handling: minimizing at login and starting automatic sharing.
     func initialLaunch(atLogin: Bool) { host.initialLaunch(atLogin: atLogin) }
     func prepareShowWindow() { all.forEach { $0.prepareShowWindow() } }
+    func minimizeForBackgroundLaunch() { host.minimizeForBackgroundLaunch() }
     func setPerformanceDiagnosticsEnabled(_ enabled: Bool) { all.forEach { $0.setPerformanceDiagnosticsEnabled(enabled) } }
     func flushPerformanceDiagnostics() { all.forEach { $0.flushPerformanceDiagnostics() } }
     func stopAll() {

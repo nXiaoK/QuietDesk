@@ -55,6 +55,7 @@ final class PortMappingManager: ObservableObject {
     @Published private(set) var pendingTargets: [PortMappingTarget] = []
     @Published private(set) var allowedTargets: Set<PortMappingTarget> = []
     @Published private(set) var trustedRemoteDevices: [TrustedRemoteMappingDevice] = []
+    @Published private(set) var hasIncomingMappings = false
     @Published private(set) var storageError: String?
     var onApprovalVisibilityChanged: ((Bool) -> Void)?
     var hostApprovalPending: Bool { !pendingTargets.isEmpty }
@@ -225,6 +226,14 @@ final class PortMappingManager: ObservableObject {
                 self.removeRequest(target)
             }
         }
+        server.onActiveSessionsChanged = { [weak self] active in
+            DispatchQueue.main.async {
+                guard let self, self.hostGeneration == generation else { return }
+                if self.hasIncomingMappings != active {
+                    self.hasIncomingMappings = active
+                }
+            }
+        }
         host = server
         return server
     }
@@ -362,6 +371,7 @@ final class PortMappingManager: ObservableObject {
         hostGeneration = nil
         host?.stop()
         host = nil
+        if hasIncomingMappings { hasIncomingMappings = false }
         let pending = decisions.values.flatMap { $0 }
         decisions.removeAll()
         requestedAt.removeAll()

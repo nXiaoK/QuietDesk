@@ -118,6 +118,15 @@ docker compose -f compose.image.yaml stop relay
 docker compose -f compose.image.yaml start relay
 ```
 
+**可选的宿主机 TCP 调优：**节点分别与两台 Mac 建立 TCP 连接再对接转发，节点到控制端这一程的拥塞控制由节点所在 Linux 宿主机决定。线路有丢包时，默认的 CUBIC 会把每次丢包当作拥塞而大幅降速，经节点的 TCP 视频、控制和文件都会变慢；BBR 按带宽与延迟估计发送速率，对随机丢包不敏感。内核 4.9 及以上可由管理员在宿主机上自行开启（容器共享宿主机内核，不需要改镜像或部署文件）：
+
+```sh
+sysctl net.ipv4.tcp_available_congestion_control   # 输出应包含 bbr
+sudo sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr
+```
+
+确认效果后再写入 `/etc/sysctl.d/` 使其重启后保留。这是宿主机全局设置，会影响同机其他服务；部署脚本不会代为修改。它只改善经节点的 TCP 路径，中继 UDP 视频与打洞直连不受影响；实际收益取决于线路，未在真实节点上做过对照测量。
+
 容器以固定 UID/GID `65532:65532` 运行，根文件系统只读且移除 Linux capabilities。首次创建的 Docker 命名卷自动使用正确属主与私有权限：`quietdesk-relay_state` 保存接入密钥和 `devices.json`，`quietdesk-relay_tls` 保存证书链与私钥；不写入镜像或安装包。日志自动轮转。默认项目名固定为 `quietdesk-relay`，换目录升级或在源码/镜像模式间切换仍复用原卷；如使用 `COMPOSE_PROJECT_NAME` 隔离多个节点，后续所有命令必须保持相同项目名。
 
 **更新、证书续期与回退：**先停止服务并备份这两个命名卷（含属主和权限），记录旧镜像 digest 并保留其配套部署文件。镜像部署重跑 `sh deploy.sh --ip 服务器IP` 即会拉取当前选择的镜像并重建容器；源码方式更新源码后重跑。两者保留已有证书、接入密钥和登记表；手动传入新证书时才替换证书。重建和重启会中断中继会话。证书管理器续期不会自动更新容器里的证书副本，需再次执行部署命令。证书不匹配、过期、密钥丢失且仍有登记表、状态损坏或不兼容会报错，不自动清空旧状态。

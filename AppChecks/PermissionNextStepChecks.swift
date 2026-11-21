@@ -101,6 +101,21 @@ private struct NextStepFailure: Error, CustomStringConvertible {
             let step = remote()
             try require(step.action == nil && step.detail.contains("点按远程画面") && step.detail.contains("不会自动捕获"), "Input ownership changed")
         }
+        run("Host view-only sharing switch explains local restriction without revoking macOS Accessibility") {
+            let idle = PermissionNextStep.sharing(screenRecording: true, accessibility: true, started: false, allowsRemoteControl: false)
+            let running = PermissionNextStep.sharing(screenRecording: true, accessibility: true, started: true, allowsRemoteControl: false)
+            try require(idle.action == nil && idle.title.contains("仅允许观看") && running.title.contains("正在以「仅允许观看」"),
+                        "Host view-only mode next-step presentation mismatch")
+        }
+        run("Viewer local view-only lock distinguishes self-imposed lock from missing remote permission") {
+            let step = PermissionNextStep.remoteKeyboard(
+                connected: true, reconnecting: false, canControl: true,
+                livePermissionUpdates: true, supportsInputActions: true,
+                inputSuspended: false, localViewOnly: true
+            )
+            try require(step.action == nil && step.title.contains("本机已开启仅观看防误触") && step.detail.contains("关闭防误触锁定"),
+                        "Viewer local view-only lock misattributed to host")
+        }
         print("\(passed) passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

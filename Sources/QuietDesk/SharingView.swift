@@ -100,7 +100,13 @@ struct SharingView: View {
                             .font(.system(size: 17, weight: .bold))
 
                         if model.connected {
-                            DeskPillBadge(text: "1 个控制连接", symbol: "bolt.fill", tint: DeskPalette.emerald)
+                            DeskPillBadge(
+                                text: model.hostAllowsRemoteControl ? "1 个控制连接" : "1 个观看连接",
+                                symbol: model.hostAllowsRemoteControl ? "bolt.fill" : "eye.fill",
+                                tint: model.hostAllowsRemoteControl ? DeskPalette.emerald : DeskPalette.amber
+                            )
+                        } else if !model.hostAllowsRemoteControl {
+                            DeskPillBadge(text: "仅允许观看", symbol: "eye.fill", tint: DeskPalette.amber)
                         }
                         DeskPillBadge(text: "加密监听 :\(model.hostPort)", tint: locked ? DeskPalette.emerald : .secondary, monospaced: true)
                         if locked, model.lanDiscoveryAdvertiseEnabled {
@@ -325,17 +331,27 @@ struct SharingView: View {
 
                 permissionStatusTile(
                     title: "辅助功能（键鼠注入）",
-                    subtitle: model.localAccessibility ? "远程点击、输入与自动解锁已生效" : "未生效时仅允许远端观看画面",
+                    subtitle: !model.hostAllowsRemoteControl
+                        ? "已在本机限制为仅允许观看（无需撤销系统授权）"
+                        : (model.localAccessibility ? "远程点击、输入与自动解锁已生效" : "未生效时仅允许远端观看画面"),
                     symbol: "accessibility",
                     granted: model.localAccessibility,
                     action: model.requestAccessibility
                 )
 
+                Toggle(
+                    "允许控制端操作键盘、鼠标与自动解锁（关闭则仅允许观看）",
+                    isOn: Binding(get: { model.hostAllowsRemoteControl }, set: { model.setHostAllowsRemoteControl($0) })
+                )
+                .toggleStyle(.checkbox)
+                .font(.callout)
+
                 PermissionNextStepView(
                     step: .sharing(
                         screenRecording: model.localScreenRecording,
                         accessibility: model.localAccessibility,
-                        started: locked
+                        started: locked,
+                        allowsRemoteControl: model.hostAllowsRemoteControl
                     ),
                     compact: true
                 ) { action in

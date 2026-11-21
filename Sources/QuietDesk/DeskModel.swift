@@ -282,10 +282,14 @@ final class DeskModel: ObservableObject {
     @Published private(set) var supportsTrackpadGestures = false
     @Published private(set) var relativeMouseEnabled = false
     @Published private(set) var relativeMouseCaptured = false
+    @Published private(set) var hostAllowsRemoteControl = UserDefaults.standard.object(forKey: "hostAllowsRemoteControl") as? Bool ?? true
+    @Published private(set) var viewerViewOnlyLock = UserDefaults.standard.bool(forKey: "viewerViewOnlyLock")
+    var effectiveViewerCanControl: Bool { canControl && !viewerViewOnlyLock }
     var desktopActionUnavailableReason: String? {
         if !connected { return "连接后可选择远端桌面" }
         if !supportsDesktopActions { return "被控端需更新后才能使用桌面操作" }
-        if !canControl { return "当前仅观看，需被控端辅助功能权限生效" }
+        if !canControl { return "当前仅观看，需被控端允许控制且辅助功能生效" }
+        if viewerViewOnlyLock { return "已开启本机仅观看防误触锁定，关闭后可操作远端桌面" }
         if sessionInputSuspended { return "画面暂停或恢复中，请稍候" }
         if unlockWorking { return "正在解锁远端，请稍候" }
         if desktopActionWorking { return "正在发送桌面操作…" }
@@ -309,7 +313,7 @@ final class DeskModel: ObservableObject {
     var remoteKeyboardNextStep: PermissionNextStep {
         .remoteKeyboard(connected: connected, reconnecting: reconnecting, canControl: canControl,
             livePermissionUpdates: controlStatusUpdatesEnabled, supportsInputActions: supportsInputActions,
-            inputSuspended: sessionInputSuspended)
+            inputSuspended: sessionInputSuspended, localViewOnly: viewerViewOnlyLock)
     }
     @Published private(set) var activeVideoState: VideoStreamState?
     // The host's running encoder; on the viewer, what the host last confirmed. A new connection starts with H.264.
@@ -537,7 +541,7 @@ final class DeskModel: ObservableObject {
             guard let self else { return }
             self.recordSessionActivity()
             let allowed = self.wakeInputGate.allows(value, suspended: self.sessionInputSuspended || self.desktopActionWorking || !self.connected)
-            guard self.connected, self.canControl, allowed else {
+            guard self.connected, self.effectiveViewerCanControl, allowed else {
                 if value.kind == .scroll { DiagnosticLog.shared.count(.scrollSuppressed) }
                 return
             }
@@ -791,20 +795,12 @@ final class DeskModel: ObservableObject {
             if localScreenRecording != allowed { localScreenRecording = allowed }
         }
 
-        if mode == .host, connected, canControl != accessibility {
-            canControl = accessibility
-            syncHostInputGate()
-            if !accessibility { hostSession.injector?.releaseAll() }
-            status = accessibility ? "正在共享 · 允许键盘鼠标控制" : "正在共享 · 仅观看（辅助功能未生效）"
-            if controlStatusUpdatesEnabled, let peer {
-                do { peer.send(try Wire.json(.controlStatus, ControlStatus(canControl: accessibility))) }
-                catch { peer.close(error.localizedDescription) }
-            } else if accessibility {
-                status = "辅助功能已生效 · 旧版控制端需重新连接后操作"
-            }
+        let effectiveHostControl = accessibility && hostAllowsRemoteControl
+        if mode == .host, connected, canControl != effectiveHostControl {
+            applyHostEffectiveControl(effectiveHostControl, accessibilityGranted: accessibility)
         }
 
-        canvas.updateSystemShortcutCapture(sessionActive: mode == .viewer && connected && canControl && !sessionInputSuspended && !desktopActionWorking,
+        canvas.updateSystemShortcutCapture(sessionActive: mode == .viewer && connected && effectiveViewerCanControl && !sessionInputSuspended && !desktopActionWorking,
             accessibility: accessibility, inputMonitoring: inputMonitoring, retry: retryCapsLock)
         guard mode == .viewer, capsLockEnabled else {
             canvas.capsLockMonitor.stop()
@@ -833,9 +829,74 @@ final class DeskModel: ObservableObject {
             }
         }
         if capsLockRunning != canvas.capsLockMonitor.isRunning { capsLockRunning = canvas.capsLockMonitor.isRunning }
-        canvas.usesCapsLockActions = capsLockRunning && supportsInputActions && canControl && !sessionInputSuspended && !desktopActionWorking
+        canvas.usesCapsLockActions = capsLockRunning && supportsInputActions && effectiveViewerCanControl && !sessionInputSuspended && !desktopActionWorking
         let outdated = "远端版本较旧，请更新家里 Mac 后使用 Caps Lock 切换输入法"
         if connected, !supportsInputActions, inputStatus != outdated { inputStatus = outdated }
+    }
+
+    private func hostControlSharingStatus(effectiveControl: Bool, accessibilityGranted: Bool) -> String {
+        if effectiveControl { return "正在共享 · 允许键盘鼠标控制" }
+        if !hostAllowsRemoteControl { return "正在共享 · 仅允许观看（已在本机禁止远端键鼠控制）" }
+        return accessibilityGranted ? "正在共享 · 仅观看" : "正在共享 · 仅观看（辅助功能未生效）"
+    }
+
+    private func applyHostEffectiveControl(_ effective: Bool, accessibilityGranted: Bool) {
+        canControl = effective
+        syncHostInputGate()
+        if !effective {
+            hostSession.injector?.releaseAll()
+            hostSession.desktopActionTask?.cancel()
+            hostSession.desktopActions?.cancel()
+        }
+        status = hostControlSharingStatus(effectiveControl: effective, accessibilityGranted: accessibilityGranted)
+        if controlStatusUpdatesEnabled, let peer {
+            do { peer.send(try Wire.json(.controlStatus, ControlStatus(canControl: effective))) }
+            catch { peer.close(error.localizedDescription) }
+        } else if effective {
+            status = "控制权限已开启 · 旧版控制端需重新连接后操作"
+        }
+    }
+
+    func setHostAllowsRemoteControl(_ allowed: Bool) {
+        guard hostAllowsRemoteControl != allowed else { return }
+        hostAllowsRemoteControl = allowed
+        UserDefaults.standard.set(allowed, forKey: "hostAllowsRemoteControl")
+        guard mode == .host else { return }
+        let accessibility = AXIsProcessTrusted()
+        localAccessibility = accessibility
+        let effective = accessibility && allowed
+        if connected {
+            if canControl != effective {
+                applyHostEffectiveControl(effective, accessibilityGranted: accessibility)
+            } else {
+                status = hostControlSharingStatus(effectiveControl: effective, accessibilityGranted: accessibility)
+            }
+        }
+    }
+
+    func setViewerViewOnlyLock(_ locked: Bool) {
+        guard viewerViewOnlyLock != locked else { return }
+        viewerViewOnlyLock = locked
+        UserDefaults.standard.set(locked, forKey: "viewerViewOnlyLock")
+        guard mode == .viewer else { return }
+        if locked {
+            canvas.releaseControl()
+            if relativeMouseEnabled {
+                setRelativeMouseEnabled(false)
+            }
+        }
+        canvas.canControl = effectiveViewerCanControl
+        canvas.updateSystemShortcutCapture(
+            sessionActive: connected && effectiveViewerCanControl && !sessionInputSuspended && !desktopActionWorking,
+            accessibility: localAccessibility,
+            inputMonitoring: localInputMonitoring
+        )
+        canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && effectiveViewerCanControl && !sessionInputSuspended && !desktopActionWorking
+        if connected {
+            status = locked
+                ? "已连接 · 已开启本机仅观看防误触锁定"
+                : (canControl ? "已连接 · 点击画面开始操作" : "已连接 · 仅观看（被控端未允许控制或辅助功能未生效）")
+        }
     }
 
     func prepareHostCode() {
@@ -1603,8 +1664,13 @@ final class DeskModel: ObservableObject {
                         let (width, height) = (capture.width, capture.height)
                         host.capturedDisplay = snapshot
                         self.connected = true
-                        self.canControl = AXIsProcessTrusted()
-                        self.status = self.canControl ? "正在共享 · 允许键盘鼠标控制" : "正在共享 · 仅观看（未授权辅助功能）"
+                        let accessibilityGranted = AXIsProcessTrusted()
+                        self.localAccessibility = accessibilityGranted
+                        self.canControl = accessibilityGranted && self.hostAllowsRemoteControl
+                        self.status = self.hostControlSharingStatus(
+                            effectiveControl: self.canControl,
+                            accessibilityGranted: accessibilityGranted
+                        )
                         self.resolution = "\(width) × \(height)"
                         let state = VideoStreamState(settings: settings, width: width, height: height)
                         self.activeVideoCodec = .h264
@@ -2079,7 +2145,7 @@ final class DeskModel: ObservableObject {
                 self.sessionPauseStatus = ""
                 self.freshFrameRequiredOnReconnect = false
                 self.publishSessionPause()
-                if viewer.restoreCanvasFocusAfterIdle, self.sessionWindowFocused, self.canControl,
+                if viewer.restoreCanvasFocusAfterIdle, self.sessionWindowFocused, self.effectiveViewerCanControl,
                    let window = self.mainWindow, NSApp.keyWindow === window,
                    window.firstResponder == nil || window.firstResponder === window || window.firstResponder === self.canvas {
                     window.makeFirstResponder(self.canvas)
@@ -3144,7 +3210,7 @@ final class DeskModel: ObservableObject {
             guard message.payload.isEmpty else { throw DeskError.invalid("控制权限订阅消息无效") }
             refreshPermissions()
             controlStatusUpdatesEnabled = true
-            status = canControl ? "正在共享 · 允许键盘鼠标控制" : "正在共享 · 仅观看（辅助功能未生效）"
+            status = hostControlSharingStatus(effectiveControl: canControl, accessibilityGranted: localAccessibility)
             peer.send(try Wire.json(.controlStatus, ControlStatus(canControl: canControl)))
         case .acknowledgement: break // Routed through SessionDataChannel; a late one has no frame to release.
         case .input:
@@ -3318,13 +3384,15 @@ final class DeskModel: ObservableObject {
             }
             canControl = hello.canControl
             supportsInputActions = hello.inputActions == true
-            canvas.canControl = hello.canControl
+            canvas.canControl = effectiveViewerCanControl
             controlStatusUpdatesEnabled = hello.controlStatusUpdates == true
             if controlStatusUpdatesEnabled { peer.send(Message(.controlStatus)) }
             refreshPermissions(retryCapsLock: true)
             canvas.remoteSize = CGSize(width: hello.width, height: hello.height)
             resolution = "\(hello.width) × \(hello.height)"
-            status = hello.canControl ? "已连接 · 点击画面开始操作" : "已连接 · 仅观看（家里 Mac 需开启辅助功能）"
+            status = !hello.canControl
+                ? "已连接 · 仅观看（被控端未允许控制或辅助功能未生效）"
+                : (viewerViewOnlyLock ? "已连接 · 已开启本机仅观看防误触锁定" : "已连接 · 点击画面开始操作")
             let state = VideoStreamState(settings: hello.settings, width: hello.width, height: hello.height)
             activeVideoState = state
             canvas.setPointerFrameRate(state.settings.framesPerSecond)
@@ -3535,9 +3603,11 @@ final class DeskModel: ObservableObject {
             if canControl != permission.canControl {
                 if !permission.canControl { canvas.releaseControl() }
                 canControl = permission.canControl
-                canvas.canControl = permission.canControl
-                canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && canControl && !sessionInputSuspended && !desktopActionWorking
-                status = permission.canControl ? "已连接 · 辅助功能已生效，点击画面开始操作" : "已连接 · 仅观看（家里 Mac 的辅助功能未生效）"
+                canvas.canControl = effectiveViewerCanControl
+                canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && effectiveViewerCanControl && !sessionInputSuspended && !desktopActionWorking
+                status = !permission.canControl
+                    ? "已连接 · 仅观看（被控端已关闭控制权限或辅助功能未生效）"
+                    : (viewerViewOnlyLock ? "已连接 · 被控端允许控制（本机仅观看防误触锁定中）" : "已连接 · 控制权限已生效，点击画面开始操作")
             }
         case .video:
             throw DeskError.invalid("视频会话尚未就绪")
@@ -4071,6 +4141,11 @@ final class DeskModel: ObservableObject {
 
     private func applyHostUnlock(_ request: SessionUnlockRequest, peer: Peer) {
         let host = hostSession
+        if !hostAllowsRemoteControl {
+            if let reply = try? Wire.json(.sessionUnlockResult, SessionUnlockResult(id: request.id, outcome: .failed,
+                error: "被控端已设为仅允许观看，禁止远端自动输入锁屏密码")) { peer.send(reply) }
+            return
+        }
         // A second request must not replace the running task, which clearSession has to be able to cancel.
         if portMappings.hostApprovalPending {
             if let reply = try? Wire.json(.sessionUnlockResult, SessionUnlockResult(id: request.id, outcome: .failed,
@@ -4177,6 +4252,11 @@ final class DeskModel: ObservableObject {
     private func applyHostSessionEffects(_ request: SessionEffectsRequest, peer: Peer) {
         let host = hostSession
         guard let effects = host.effects, let streamer = host.streamer else { return }
+        if !hostAllowsRemoteControl, request.state != effects.state {
+            if let reply = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(id: request.id, state: effects.state,
+                error: "被控端已设为仅允许观看，禁止远端修改本机防窥或静音状态")) { peer.send(reply) }
+            return
+        }
         guard host.effectsTask == nil else {
             if let reply = try? Wire.json(.sessionEffectsResult, SessionEffectsResult(id: request.id, state: effects.state,
                 error: "正在处理上一项被控端设置")) { peer.send(reply) }
@@ -4378,9 +4458,9 @@ final class DeskModel: ObservableObject {
             sessionPaused = idlePolicy.isPaused || pauseTransmission.desiredPaused || pauseTransmission.appliedPaused
             sessionPauseWorking = pauseTransmission.pending != nil || pauseTransmission.freshFrameToken != nil
         } else { sessionPaused = hostSession.paused; sessionPauseWorking = hostSession.pauseTask != nil }
-        canvas.updateSystemShortcutCapture(sessionActive: mode == .viewer && connected && canControl && !sessionInputSuspended && !desktopActionWorking,
+        canvas.updateSystemShortcutCapture(sessionActive: mode == .viewer && connected && effectiveViewerCanControl && !sessionInputSuspended && !desktopActionWorking,
             accessibility: localAccessibility, inputMonitoring: localInputMonitoring)
-        canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && canControl && !sessionInputSuspended && !desktopActionWorking
+        canvas.usesCapsLockActions = capsLockRunning && capsLockEnabled && supportsInputActions && effectiveViewerCanControl && !sessionInputSuspended && !desktopActionWorking
         canvas.pointerInputSuspended = sessionInputSuspended || desktopActionWorking
         if mode == .viewer { viewerSession.audioPlayer?.setPaused(sessionInputSuspended) }
         refreshClipboardFocus()

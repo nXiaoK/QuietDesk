@@ -16,12 +16,17 @@ struct PermissionNextStep: Equatable {
         }
     }
 
-    static func sharing(screenRecording: Bool, accessibility: Bool, started: Bool) -> Self {
+    static func sharing(screenRecording: Bool, accessibility: Bool, started: Bool, allowsRemoteControl: Bool = true) -> Self {
         if !screenRecording {
             return Self(title: "下一步：允许这台 Mac 录制屏幕",
                 detail: "屏幕录制未生效，无法开始传送画面。请在本机系统设置允许当前应用，返回后点“重新检测”；"
                     + (started ? "若共享已停止，生效后需重新点“开启共享”。" : "生效后仍需点“开启共享”，不会自动开始。"),
                 action: .screenRecording)
+        }
+        if !allowsRemoteControl {
+            return Self(title: started ? "正在以「仅允许观看」模式共享" : "已设为「仅允许观看」共享模式",
+                detail: "已在本机关闭远端键鼠控制，连入设备只能观看画面（及按需听取系统音频），无法点击、输入或触发自动解锁。需要恢复控制时打开上方开关即可实时生效。",
+                action: nil)
         }
         if !accessibility {
             return Self(title: "画面权限已生效，辅助功能尚未生效",
@@ -51,7 +56,8 @@ struct PermissionNextStep: Equatable {
     }
 
     static func remoteKeyboard(connected: Bool, reconnecting: Bool, canControl: Bool,
-                               livePermissionUpdates: Bool, supportsInputActions: Bool, inputSuspended: Bool) -> Self {
+                               livePermissionUpdates: Bool, supportsInputActions: Bool, inputSuspended: Bool,
+                               localViewOnly: Bool = false) -> Self {
         guard connected else {
             return Self(title: reconnecting ? "等待连接恢复后确认被控端" : "连接后确认被控端控制状态",
                 detail: "以下权限按钮只处理这台控制 Mac，不会替另一台 Mac 授权。被控端是否允许控制，以本次连接收到的状态为准。",
@@ -59,10 +65,15 @@ struct PermissionNextStep: Equatable {
         }
         if !canControl {
             return Self(title: "本次连接仅观看：请在被控 Mac 上处理",
-                detail: "请在被控 Mac 的系统设置开启 QuietDesk 辅助功能，再在被控端重新检测。"
+                detail: "请在被控 Mac 确认已开启「允许控制端操作键盘鼠标」且系统设置中 QuietDesk 辅助功能已生效，再在被控端重新检测。"
                     + (livePermissionUpdates ? "当前连接支持接收权限变化；请以实际控制状态更新为准。"
                        : "当前连接未协商权限更新；在被控端生效后，需断开再连接才能获取新状态。")
                     + "在这台控制 Mac 授权不能解除被控端限制。",
+                action: nil)
+        }
+        if localViewOnly {
+            return Self(title: "本机已开启仅观看防误触锁定",
+                detail: "被控端允许控制，但当前已在本机开启「仅观看防误触」，键盘鼠标、Caps Lock 与系统快捷键均已暂停发送。需操作远端时请先关闭防误触锁定。",
                 action: nil)
         }
         if !supportsInputActions {

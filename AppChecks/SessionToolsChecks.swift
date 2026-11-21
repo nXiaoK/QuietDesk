@@ -19,9 +19,9 @@ private struct SessionToolsChecks {
             catch { failed += 1; print("FAIL \(name): \(error)") }
         }
         func control(reconnecting: Bool = false, paused: Bool = false, suspended: Bool = false,
-                     allowed: Bool = true, focused: Bool = false) -> SessionControlPresentation {
+                     allowed: Bool = true, focused: Bool = false, localViewOnly: Bool = false) -> SessionControlPresentation {
             SessionControlPresentation(reconnecting: reconnecting, sessionPaused: paused,
-                inputSuspended: suspended, canControl: allowed, controlling: focused)
+                inputSuspended: suspended, canControl: allowed, controlling: focused, localViewOnly: localViewOnly)
         }
         func tools(connected: Bool = true, reconnecting: Bool = false, hasSession: Bool = true, fullScreen: Bool = false,
                    latency: String = "12 ms", control state: SessionControlPresentation? = nil) -> SessionToolsPresentation {
@@ -53,8 +53,13 @@ private struct SessionToolsChecks {
             try require(control().title == "已释放 · 点按画面开始控制", "Release suggested automatic control")
             try require(control(focused: true).title == "正在控制远端 · ⌃⌥Esc 释放键盘鼠标", "Emergency release missing")
         }
-        run("Viewing, suspended and reconnecting states never claim remote input is active") {
-            try require(control(allowed: false, focused: true).title == "仅观看 · 共享端辅助功能未生效", "Permission was inferred from focus")
+        run("Viewing, local view-only, suspended and reconnecting states never claim remote input is active") {
+            try require(control(allowed: false, focused: true).title == "仅观看 · 共享端未允许控制或辅助功能未生效", "Permission was inferred from focus")
+            try require(control(allowed: true, focused: true, localViewOnly: true).state == .localViewOnly
+                && control(allowed: true, focused: true, localViewOnly: true).title == "仅观看 · 本机已开启键鼠防误触锁定",
+                "Local view-only lock did not override focused controlling state")
+            try require(control(allowed: false, focused: false, localViewOnly: true).state == .viewing,
+                "Host disallowing control must take precedence over local view-only lock")
             try require(control(suspended: true, focused: true).title.contains("暂不发送"), "Suspension hidden by focus")
             try require(control(reconnecting: true, focused: true).title.contains("暂不发送"), "Reconnect hidden by focus")
             try require(control(reconnecting: true, paused: true).title == "空闲暂停 · 返回窗口后继续连接", "Paused retry state lost")

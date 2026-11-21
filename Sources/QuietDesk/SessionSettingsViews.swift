@@ -207,6 +207,19 @@ private struct ConnectionOptionsSections: View {
                 Text("光标、触控板与音频").font(.headline)
             }
 
+            Toggle(isOn: Binding(get: { model.viewerViewOnlyLock }, set: { model.setViewerViewOnlyLock($0) })) {
+                VStack(alignment: .leading, spacing: 1.5) {
+                    Text("本机仅观看防误触（锁定键鼠发送）")
+                        .fontWeight(.medium)
+                    Text(model.viewerViewOnlyLock
+                         ? "已锁定：点击画面不会接管远端键鼠，画面与声音照常播放"
+                         : "观看演示或后台任务时开启，避免误点或按键传往远端")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             Toggle(isOn: Binding(get: { model.remoteAudioEnabled }, set: { model.setRemoteAudioEnabled($0) })) {
                 VStack(alignment: .leading, spacing: 1.5) {
                     Text("远端系统声音回传")
@@ -249,7 +262,7 @@ private struct ConnectionOptionsSections: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .disabled(!model.connected || !model.supportsRelativeMouse || !model.canControl)
+            .disabled(!model.connected || !model.supportsRelativeMouse || !model.effectiveViewerCanControl)
 
             if model.connected {
                 Text("\(model.controlTransportStatus) · \(model.supportsTrackpadGestures ? "触控板缩放/旋转手势已就绪" : "旧端不含触控板缩放手势")")
@@ -394,7 +407,8 @@ struct SessionControlsView: View {
             hasSession: model.active || model.working || model.reconnecting,
             fullScreen: model.isFullScreen, remoteName: model.remoteName, latency: model.latency,
             control: SessionControlPresentation(reconnecting: model.reconnecting, sessionPaused: model.sessionPaused,
-                inputSuspended: model.sessionInputSuspended, canControl: model.canControl, controlling: model.controlling),
+                inputSuspended: model.sessionInputSuspended, canControl: model.canControl, controlling: model.controlling,
+                localViewOnly: model.viewerViewOnlyLock),
             keyboardSummary: "Caps Lock " + (!model.capsLockEnabled ? "关闭" : model.capsLockRunning ? "已就绪" : "待生效"))
     }
 

@@ -101,6 +101,10 @@ private struct RemoteControlCommands: Commands {
                 .keyboardShortcut("f", modifiers: [.control, .command])
             Button("释放键盘鼠标") { viewer.canvas.releaseControl() }
                 .keyboardShortcut(.escape, modifiers: [.control, .option])
+            Toggle("仅观看防误触（锁定键鼠发送）", isOn: Binding(
+                get: { viewer.viewerViewOnlyLock },
+                set: { viewer.setViewerViewOnlyLock($0) }
+            ))
             Button("截取远端画面到剪贴板") { viewer.copyRemoteFrame() }
                 .keyboardShortcut("s", modifiers: [.control, .command])
                 .disabled(!viewer.connected)
@@ -331,6 +335,15 @@ struct DeskView: View {
 
                         Divider()
 
+                        Button {
+                            model.setViewerViewOnlyLock(!model.viewerViewOnlyLock)
+                        } label: {
+                            Label(
+                                model.viewerViewOnlyLock ? "关闭仅观看防误触（恢复键鼠控制）" : "开启仅观看防误触（锁定键鼠发送）",
+                                systemImage: model.viewerViewOnlyLock ? "hand.raised.fill" : "hand.raised"
+                            )
+                        }
+
                         if model.supportsRelativeMouse {
                             Button {
                                 model.canvas.releaseControl()
@@ -341,7 +354,7 @@ struct DeskView: View {
                                     systemImage: model.relativeMouseCaptured ? "scope" : "cursorarrow.motionlines"
                                 )
                             }
-                            .disabled(!model.connected || !model.canControl)
+                            .disabled(!model.connected || !model.effectiveViewerCanControl)
                         }
 
                         Button {
@@ -902,7 +915,7 @@ struct DeskView: View {
                 Circle()
                     .fill(model.controlling ? Color(red: 0.20, green: 0.88, blue: 0.56) : Color.white.opacity(0.55))
                     .frame(width: 6.5, height: 6.5)
-                Text(model.controlling ? "控制中" : "已释放")
+                Text(!model.effectiveViewerCanControl ? "仅观看" : (model.controlling ? "控制中" : "已释放"))
             }
             Text("·").foregroundStyle(.white.opacity(0.45))
             Text("\(shortTransportLabel) \(model.latency)")
@@ -930,7 +943,8 @@ struct DeskView: View {
 
     private var controlStatus: String {
         SessionControlPresentation(reconnecting: model.reconnecting, sessionPaused: model.sessionPaused,
-            inputSuspended: model.sessionInputSuspended, canControl: model.canControl, controlling: model.controlling).title
+            inputSuspended: model.sessionInputSuspended, canControl: model.canControl, controlling: model.controlling,
+            localViewOnly: model.viewerViewOnlyLock).title
     }
 
     @ViewBuilder private var metrics: some View {

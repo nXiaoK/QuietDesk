@@ -1,14 +1,15 @@
 import SwiftUI
 
 struct SessionControlPresentation: Equatable {
-    enum State { case pausedReconnect, suspended, reconnecting, viewing, controlling, released }
+    enum State { case pausedReconnect, suspended, reconnecting, viewing, localViewOnly, controlling, released }
     let state: State
 
-    init(reconnecting: Bool, sessionPaused: Bool, inputSuspended: Bool, canControl: Bool, controlling: Bool) {
+    init(reconnecting: Bool, sessionPaused: Bool, inputSuspended: Bool, canControl: Bool, controlling: Bool, localViewOnly: Bool = false) {
         if sessionPaused && reconnecting { state = .pausedReconnect }
         else if inputSuspended { state = .suspended }
         else if reconnecting { state = .reconnecting }
         else if !canControl { state = .viewing }
+        else if localViewOnly { state = .localViewOnly }
         else { state = controlling ? .controlling : .released }
     }
 
@@ -17,7 +18,8 @@ struct SessionControlPresentation: Equatable {
         case .pausedReconnect: return "空闲暂停 · 返回窗口后继续连接"
         case .suspended: return "画面暂停或恢复中 · 暂不发送键盘鼠标"
         case .reconnecting: return "自动重连中 · 键盘鼠标暂不发送"
-        case .viewing: return "仅观看 · 共享端辅助功能未生效"
+        case .viewing: return "仅观看 · 共享端未允许控制或辅助功能未生效"
+        case .localViewOnly: return "仅观看 · 本机已开启键鼠防误触锁定"
         case .controlling: return "正在控制远端 · ⌃⌥Esc 释放键盘鼠标"
         case .released: return "已释放 · 点按画面开始控制"
         }
@@ -28,6 +30,7 @@ struct SessionControlPresentation: Equatable {
         case .pausedReconnect, .suspended: return "pause.circle"
         case .reconnecting: return "arrow.triangle.2.circlepath"
         case .viewing: return "eye"
+        case .localViewOnly: return "hand.raised"
         case .controlling: return "cursorarrow.rays"
         case .released: return "cursorarrow"
         }

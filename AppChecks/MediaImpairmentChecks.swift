@@ -133,6 +133,8 @@ private final class ImpairmentProxy: @unchecked Sendable {
     private var downlink: Impairment?, uplink: Impairment?
     private var armedAt: TimeInterval = 0
     private var stopped = false
+    // One-way delay of the TCP legs, which carry the control connection.
+    private var controlDelay: TimeInterval = 0
 
     init(hostPort: NWEndpoint.Port, seed: UInt64) {
         self.hostPort = hostPort
@@ -160,8 +162,9 @@ private final class ImpairmentProxy: @unchecked Sendable {
     }
 
     /// `downlink` shapes host-to-viewer datagrams (video), `uplink` the viewer's feedback.
-    func arm(downlink: Impairment?, uplink: Impairment?) {
+    func arm(downlink: Impairment?, uplink: Impairment?, controlDelay: TimeInterval = 0) {
         queue.sync {
+            self.controlDelay = controlDelay
             self.downlink = downlink; self.uplink = uplink
             armedAt = SessionClock.now
             toViewer.index = 0; toHost.index = 0
@@ -198,22 +201,24 @@ private final class ImpairmentProxy: @unchecked Sendable {
     private func relayTCP(_ incoming: NWConnection) {
         let upstream = NWConnection(host: "127.0.0.1", port: hostPort, using: plainTCP())
         pair(incoming, upstream) { [weak self] in
-            self?.copyStream(from: incoming, to: upstream)
-            self?.copyStream(from: upstream, to: incoming)
+            self?.copyStream(from: incoming, lane: Lane(upstream))
+            self?.copyStream(from: upstream, lane: Lane(incoming))
         }
     }
 
-    private func copyStream(from source: NWConnection, to destination: NWConnection) {
+    private func copyStream(from source: NWConnection, lane: Lane) {
         source.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1_024) { [weak self] data, _, complete, error in
-            guard let self, !self.stopped, error == nil, let data, !data.isEmpty else { source.cancel(); destination.cancel(); return }
-            destination.send(content: data, completion: .contentProcessed { [weak self] sendError in
-                guard sendError == nil, !complete else { source.cancel(); destination.cancel(); return }
-                self?.copyStream(from: source, to: destination)
-            })
+            guard let self, !self.stopped, error == nil, let data, !data.isEmpty, !complete else {
+                source.cancel(); lane.destination.cancel()
+                return
+            }
+            lane.pending.append((SessionClock.now + self.controlDelay, data))
+            self.drain(lane)
+            self.copyStream(from: source, lane: lane)
         }
     }
 
-    // One lane per relayed direction: datagrams leave in arrival order even when their timers are late.
+    // One lane per relayed direction: data leaves in arrival order even when its timers are late.
     private final class Lane {
         let destination: NWConnection
         var pending: [(release: TimeInterval, data: Data)] = []
@@ -313,6 +318,7 @@ private struct Scenario {
     }
     var downlink: Impairment?
     var uplink: Impairment?
+    var controlDelay: TimeInterval = 0
     var seed: UInt64 = 20_261_121
 }
 
@@ -330,6 +336,8 @@ private struct Outcome {
     var errors: [String] = []
     // Seconds from handing a frame to the host session until the viewer decoded it.
     var latencies: [TimeInterval] = []
+    // Seconds each recovery took on the viewer, from "recovering" to a committed path.
+    var recoveryTimes: [TimeInterval] = []
     // Diagnostic codes of the causes that moved video to another path (see MediaSwitchCause).
     var switches: [Int] = []
     var toViewer = ImpairmentProxy.Counts()
@@ -344,7 +352,8 @@ private struct Outcome {
         "decoded=\(decoded)/\(submitted) blocked=\(creditBlocked) recoveries=\(recoveries) reductions=\(reductions) "
             + "final=\(finalSettings.summary) latency p50/p95/max=\(latency(0.5))/\(latency(0.95))/\(latency(1))ms "
             + "longestGap=\(Int(longestGap * 1_000))ms loss=\(String(format: "%.3f", highestLoss)) "
-            + "linkDropped=\(toViewer.dropped)/\(toViewer.dropped + toViewer.forwarded) tcp=\(usedTCP) switches=\(switches)"
+            + "linkDropped=\(toViewer.dropped)/\(toViewer.dropped + toViewer.forwarded) tcp=\(usedTCP) switches=\(switches) "
+            + "recoveryMs=\(recoveryTimes.map { Int($0 * 1_000) })"
     }
 }
 
@@ -460,7 +469,15 @@ private func play(_ scenario: Scenario) throws -> Outcome {
             let media = try MediaSession.viewer(control: client, key: key, host: "127.0.0.1", port: proxyPort.rawValue,
                                                 settings: scenario.settings, udpEnabled: true)
             viewerMedia.update { $0 = media }
-            media.onState = { state in outcome.update { if $0.states.last != state, $0.states.count < 64 { $0.states.append(state) } } }
+            let recoveringSince = Shared<TimeInterval?>(nil)
+            media.onState = { state in
+                outcome.update { if $0.states.last != state, $0.states.count < 64 { $0.states.append(state) } }
+                if state == "正在恢复画面" { recoveringSince.update { $0 = $0 ?? SessionClock.now } }
+                else if state.hasSuffix("视频"), let since = recoveringSince.get() {
+                    recoveringSince.update { $0 = nil }
+                    outcome.update { if $0.recoveryTimes.count < 32 { $0.recoveryTimes.append(SessionClock.now - since) } }
+                }
+            }
             media.onPathSwitch = { _, cause in outcome.update { if $0.switches.count < 16 { $0.switches.append(cause.diagnosticCode) } } }
             media.onDatagramLoss = { fraction in if let fraction { outcome.update { $0.highestLoss = max($0.highestLoss, fraction) } } }
             media.onLocalNetwork = { local in work.async { quality.setLocalNetwork(local, now: SessionClock.now) } }
@@ -499,7 +516,7 @@ private func play(_ scenario: Scenario) throws -> Outcome {
     guard outcome.get().states.last == "UDP 视频" else {
         throw FixtureUnavailable(description: "Clean loopback did not start on UDP: \(outcome.get().states)")
     }
-    proxy.arm(downlink: scenario.downlink, uplink: scenario.uplink)
+    proxy.arm(downlink: scenario.downlink, uplink: scenario.uplink, controlDelay: scenario.controlDelay)
     Thread.sleep(forTimeInterval: scenario.seconds)
     var result = outcome.get()
     result.toViewer = proxy.counts().toViewer
@@ -620,6 +637,21 @@ private struct MediaImpairmentChecks {
             try expect(outcome.recoveries == 0 && !outcome.usedTCP, "A lost lone frame still forced a keyframe: \(outcome.recoveries)")
             try expect(outcome.decoded >= outcome.submitted - 1 && outcome.latency(1) <= 200,
                        "A lost lone frame was not delivered promptly: \(outcome.decoded)/\(outcome.submitted), \(outcome.latency(1)) ms")
+        }
+
+        // A short outage breaks the reference chain. Recovering on the path in use takes the keyframe plus
+        // about one round trip; the full exchange would add two more trips over the slower control connection.
+        var outage = Scenario(name: "Recovery on the same path does not wait for extra control round trips")
+        outage.seconds = 6
+        outage.idrBytes = 24 * 1_024
+        outage.downlink = Impairment(delay: 0.02, outage: 1.0...1.4)
+        outage.uplink = Impairment(delay: 0.02, outage: 1.0...1.4)
+        outage.controlDelay = 0.06
+        run(outage) { outcome in
+            try expect(outcome.recoveries >= 1 && !outcome.usedTCP, "The outage did not force a recovery on UDP: \(outcome.states)")
+            guard let slowest = outcome.recoveryTimes.max() else { throw ImpairmentFailure(description: "No recovery was timed") }
+            try expect(slowest <= 0.26, "A same-path recovery waited for the full exchange: \(outcome.recoveryTimes.map { Int($0 * 1_000) }) ms")
+            try expect(outcome.decoded >= 200, "Video did not resume after the recovery")
         }
 
         if failures > 0 { exit(1) }

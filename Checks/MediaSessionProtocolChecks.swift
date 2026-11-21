@@ -124,6 +124,21 @@ func runMediaSessionProtocolChecks() {
             try MediaControl(.offer, sessionID: session, token: token, datagramKey: token, fecFragmentLimit: 4_096).validate()
         }
         try rejects("Allowed a non-positive fecFragmentLimit") { try MediaControl(.request, fecFragmentLimit: 0).validate() }
+        // Fast recovery is negotiated in request/offer, and only a prepare can use it.
+        let fastRequest = try MediaControl.read(MediaControl(.request, fastRecovery: true).message().payload)
+        let fastOffer = try MediaControl.read(MediaControl(.offer, sessionID: session, token: token, datagramKey: token,
+                                                           fastRecovery: true).message().payload)
+        let fastPrepare = try MediaControl.read(MediaControl(.prepare, sessionID: session, transactionID: UUID(), transportEpoch: 2,
+                                                             codecEpoch: 2, path: "udp", fast: true).message().payload)
+        try check(legacy.fastRecovery == nil && modern.fastRecovery == nil && offer.fastRecovery == nil
+                  && fastRequest.fastRecovery == true && fastOffer.fastRecovery == true && fastPrepare.fast == true,
+                  "Lost or invented the fast recovery capability")
+        try rejects("Allowed fastRecovery outside request/offer") {
+            try MediaControl(.recover, sessionID: session, transportEpoch: 1, codecEpoch: 1, fastRecovery: true).validate()
+        }
+        try rejects("Allowed a fast flag outside prepare") {
+            try MediaControl(.ready, sessionID: session, transactionID: UUID(), transportEpoch: 2, codecEpoch: 2, path: "udp", fast: true).validate()
+        }
         var move = RemoteInput(kind: .move); move.x = 0.25; move.y = 0.75; move.pointerSequence = 42
         try move.validate()
         var zeroSeq = move; zeroSeq.pointerSequence = 0

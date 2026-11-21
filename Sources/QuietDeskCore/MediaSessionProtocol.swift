@@ -41,6 +41,11 @@ public struct MediaControl: Codable, Sendable {
     // Advertised by the viewer in its request: the most fragments a frame may have for the viewer to accept
     // block FEC shards for it. Older viewers accept 256 and reject shards of larger frames.
     public let fecFragmentLimit: Int?
+    // Negotiated over request/offer: a recovery that keeps the video path may skip the ready round trip
+    // and commit when the viewer decoded its keyframe.
+    public let fastRecovery: Bool?
+    // Prepare only, after fastRecovery was negotiated: this transaction uses that shorter exchange.
+    public let fast: Bool?
 
     public init(_ operation: Operation, sessionID: UUID? = nil, token: Data? = nil,
                 datagramKey: Data? = nil, role: MediaChannelRole? = nil, transactionID: UUID? = nil,
@@ -49,7 +54,7 @@ public struct MediaControl: Codable, Sendable {
                 deliveryMilliseconds: Double? = nil, receiveFrameWindow: Int? = nil, markedRepairs: Bool? = nil,
                 encodeIdle: Bool? = nil, datagramInteractive: Bool? = nil, dynamicFrameWindow: Bool? = nil,
                 parityFEC: Bool? = nil, blockFEC: Bool? = nil, datagramAudio: Bool? = nil, mappedTransfer: MappedTransferState? = nil,
-                fecFragmentLimit: Int? = nil) {
+                fecFragmentLimit: Int? = nil, fastRecovery: Bool? = nil, fast: Bool? = nil) {
         self.operation = operation; self.sessionID = sessionID; self.token = token
         self.datagramKey = datagramKey; self.role = role; self.transactionID = transactionID
         self.transportEpoch = transportEpoch; self.codecEpoch = codecEpoch; self.path = path
@@ -65,6 +70,8 @@ public struct MediaControl: Codable, Sendable {
         self.blockFEC = blockFEC
         self.datagramAudio = datagramAudio
         self.fecFragmentLimit = fecFragmentLimit
+        self.fastRecovery = fastRecovery
+        self.fast = fast
     }
 
     public func validate() throws {
@@ -80,6 +87,8 @@ public struct MediaControl: Codable, Sendable {
               blockFEC == nil || operation == .request || operation == .offer,
               datagramAudio == nil || operation == .request || operation == .offer,
               fecFragmentLimit.map({ operation == .request && $0 > 0 }) ?? true,
+              fastRecovery == nil || operation == .request || operation == .offer,
+              fast == nil || operation == .prepare,
               encodeMilliseconds == nil || operation == .stats,
               encodeIdle == nil || operation == .stats,
               mappedTransfer == nil || operation == .stats,

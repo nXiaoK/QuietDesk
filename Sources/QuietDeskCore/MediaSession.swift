@@ -106,7 +106,24 @@ public final class MediaSession: @unchecked Sendable {
         var frameSubmitted = false
         var localNetwork = false
         var awaitingUDPVerification = false
+        // A recovery on the path already in use: the host produces the keyframe without waiting for the
+        // viewer's ready, and each side commits once the viewer decoded it.
+        var fast = false
+        // Viewer, fast only: the host's ready arrived, so every control message sent before it has too.
+        var hostReady = false
+        // Host, fast only: the keyframe waits for a fresh pong, so it is not paced into a path still down.
+        var awaitingLiveness = false
+        // Viewer, fast only: when the datagram copy of the prepare last left, and how often.
+        var requestSentAt: TimeInterval = 0
+        var requestSends = 0
+        // Viewer, fast only: the keyframe arrived before the host's ready. Control messages the host sent
+        // while preparing this stream (its cursor binding) precede that ready, so decoding waits for it.
+        var heldFrame: MediaFrame?
     }
+    // A pong this recent shows the datagram path carried a round trip since the failure.
+    private static let recentPong: TimeInterval = 0.25
+    private static let fastRequestInterval: TimeInterval = 0.05
+    private static let maximumFastRequests = 20
     private struct Datagram {
         let header: MediaFrameHeader
         let fragmentIndex: UInt16?
@@ -150,6 +167,7 @@ public final class MediaSession: @unchecked Sendable {
     // Host only: the largest frame, in fragments, the viewer accepts block FEC shards for.
     private var fecFragmentLimit = BlockFECPlanner.legacyProtectedFrameFragments
     private var datagramAudioNegotiated = false
+    private var fastRecoveryNegotiated = false
     private var advertisedReceiveFrameWindow: Int?
     private var lastReportedReceiveWindow: Int?
     private var hasMeasuredRoundTrip = false
@@ -163,6 +181,7 @@ public final class MediaSession: @unchecked Sendable {
     private static let parityDatagramKind: UInt8 = 8
     private static let audioPacketDatagramKind: UInt8 = 9
     private static let blockFECDatagramKind: UInt8 = 10
+    private static let recoveryRequestDatagramKind: UInt8 = 11
     private var alternateRequested = false
     private var alternateProbePending = false
     private var alternateRetryDeferred = false
@@ -308,7 +327,8 @@ public final class MediaSession: @unchecked Sendable {
                                               receiveFrameWindow: MediaBufferLimits.receiveFrameWindow, markedRepairs: true,
                                               datagramInteractive: true, dynamicFrameWindow: true, parityFEC: true,
                                               blockFEC: true, datagramAudio: true,
-                                              fecFragmentLimit: BlockFECPlanner.maximumProtectedFrameFragments))
+                                              fecFragmentLimit: BlockFECPlanner.maximumProtectedFrameFragments,
+                                              fastRecovery: true))
                 self.onState?("正在优化传输")
             }
         }
@@ -640,6 +660,7 @@ public final class MediaSession: @unchecked Sendable {
             fecFragmentLimit = value.fecFragmentLimit.map { min(BlockFECPlanner.maximumProtectedFrameFragments, max(2, $0)) }
                 ?? BlockFECPlanner.legacyProtectedFrameFragments
             datagramAudioNegotiated = value.datagramAudio == true
+            fastRecoveryNegotiated = value.fastRecovery == true
             advertisedReceiveFrameWindow = value.receiveFrameWindow
             let identifier = UUID(), token = try randomBytes(32), sessionKey = try randomBytes(32)
             sessionID = identifier; bindingToken = token; datagramKey = sessionKey
@@ -661,6 +682,7 @@ public final class MediaSession: @unchecked Sendable {
             parityFECNegotiated = value.parityFEC == true
             blockFECNegotiated = value.blockFEC == true
             datagramAudioNegotiated = value.datagramAudio == true
+            fastRecoveryNegotiated = value.fastRecovery == true
             refreshInteractiveDatagramAvailability()
             fallbackAt = SessionClock.now + 1.5
             openAuxiliary(.video); openAuxiliary(.bulk)
@@ -713,6 +735,9 @@ public final class MediaSession: @unchecked Sendable {
             recoveryHold = true
             var pending = Transaction(id: id, stream: stream, path: path, started: SessionClock.now)
             pending.diagnostic = diagnostics?.start()
+            // The viewer coordinates switches and already holds this stream's receiver when it asks for the
+            // short exchange. This side's own view of the active path can lag an aborted commit, so it is not consulted.
+            pending.fast = fastRecoveryNegotiated && value.fast == true
             pending.awaitingUDPVerification = canAwaitUDP
             transaction = pending
             refreshInteractiveDatagramAvailability()
@@ -729,12 +754,15 @@ public final class MediaSession: @unchecked Sendable {
         case .ready:
             guard var pending = transaction, pending.id == id, pending.stream == stream, pending.path == path else { return }
             if side == .viewer {
+                if pending.fast {
+                    let held = pending.heldFrame
+                    pending.hostReady = true; pending.heldFrame = nil; transaction = pending
+                    if let held { handleReceiveEvents([.frameReady(held)]) }
+                    commitViewerTransaction()
+                    return
+                }
                 guard pending.stage == .preparing else { return }
-                collectLoss(abandoning: true)
-                receiver = try MediaFrameReassembler(stream: stream, limits: bufferLimits)
-                if path == .udp { receiver?.onSettledFragments = onDiagnosticUDPLoss }
-                onDiagnosticVideoPath?(path == .udp ? .trialUDP(relayed: udpRelayed) : .preparing)
-                decoding.removeAll(); reassembledLocally.removeAll()
+                try prepareViewerReceiver(stream: stream, path: path)
                 pending.stage = .ready; transaction = pending
                 sendTransaction(.ready, pending)
             } else {
@@ -757,22 +785,14 @@ public final class MediaSession: @unchecked Sendable {
             pending.stage = .decoded; transaction = pending
             sendTransaction(.commit, pending)
         case .commit:
-            guard side == .viewer, var pending = transaction, pending.id == id, pending.stream == stream,
-                  pending.path == path, pending.stage == .decoded, let packet = pending.packet else { return }
-            pending.stage = .committed; transaction = pending
-            active = (stream, path, pending.localNetwork)
-            refreshInteractiveDatagramAvailability()
-            diagnostics?.record(.mediaSwitch, since: pending.diagnostic, kind: .mediaFrame, identifier: 1)
-            recordTransport(path)
-            onCommitStream?(stream, packet)
-            _ = policy.mediaBecameUsable(epoch: policy.epoch, path: path == .udp ? .udp : .tcp, now: SessionClock.now)
-            sendTransaction(.committed, pending)
-            transaction = nil
-            reliableDeliveryFailures = 0
-            reliableFailureNotified = false
-            onDiagnosticVideoPath?(.committed(path, relayedUDP: path == .udp && udpRelayed))
-            onState?(stateLabel(path))
+            guard side == .viewer, let pending = transaction, pending.id == id, pending.stream == stream,
+                  pending.path == path, !pending.fast else { return }
+            commitViewerTransaction()
         case .committed:
+            if side == .host, let pending = transaction, pending.id == id, pending.stream == stream, pending.fast {
+                commitFastHostTransaction()
+                return
+            }
             guard side == .host, let pending = transaction, pending.id == id,
                   pending.stream == stream, pending.path == path, pending.stage == .decoded else { return }
             active = (stream, path, pending.localNetwork); transaction = nil; recoveryHold = false
@@ -784,6 +804,77 @@ public final class MediaSession: @unchecked Sendable {
             abortTransaction(retry: true, notify: false, mediaFailure: hasDeliveryFailureEvidence && value.mediaFailure == true)
         default: throw DeskError.invalid("控制通道不接受媒体绑定消息")
         }
+    }
+
+    // Viewer: the reassembler of a transaction's stream, in place before its keyframe can arrive.
+    private func prepareViewerReceiver(stream: MediaStreamID, path: Path) throws {
+        collectLoss(abandoning: true)
+        receiver = try MediaFrameReassembler(stream: stream, limits: bufferLimits)
+        if path == .udp { receiver?.onSettledFragments = onDiagnosticUDPLoss }
+        onDiagnosticVideoPath?(path == .udp ? .trialUDP(relayed: udpRelayed) : .preparing)
+        decoding.removeAll(); reassembledLocally.removeAll()
+    }
+
+    // Viewer: the transaction's keyframe decoded and, for the fast exchange, the host's ready arrived.
+    private func commitViewerTransaction() {
+        guard side == .viewer, var pending = transaction, pending.stage == .decoded, let packet = pending.packet,
+              !pending.fast || pending.hostReady else { return }
+        let stream = pending.stream, path = pending.path
+        pending.stage = .committed; transaction = pending
+        active = (stream, path, pending.localNetwork)
+        refreshInteractiveDatagramAvailability()
+        diagnostics?.record(.mediaSwitch, since: pending.diagnostic, kind: .mediaFrame, identifier: 1)
+        recordTransport(path)
+        onCommitStream?(stream, packet)
+        _ = policy.mediaBecameUsable(epoch: policy.epoch, path: path == .udp ? .udp : .tcp, now: SessionClock.now)
+        sendTransaction(.committed, pending)
+        transaction = nil
+        reliableDeliveryFailures = 0
+        reliableFailureNotified = false
+        onDiagnosticVideoPath?(.committed(path, relayedUDP: path == .udp && udpRelayed))
+        onState?(stateLabel(path))
+    }
+
+    // Host: a recovery often follows an outage, and a keyframe paced into a path that is still down is
+    // lost whole. Without a recent pong the keyframe waits for one; probes go out faster meanwhile.
+    private func produceFastKeyFrame() {
+        guard side == .host, var pending = transaction, pending.fast, pending.stage == .ready else { return }
+        if pending.path == .udp, SessionClock.uptime - lastPongAt > Self.recentPong {
+            if !pending.awaitingLiveness {
+                pending.awaitingLiveness = true; transaction = pending
+                challenge = nil
+                sendPing()
+            }
+            return
+        }
+        pending.awaitingLiveness = false; pending.stage = .producing; transaction = pending
+        onProduceRecoveryFrame?()
+    }
+
+    // Viewer: the datagram copy of a fast prepare, repeated until the host answers on either path.
+    private func sendFastRequest() {
+        guard side == .viewer, var pending = transaction, pending.fast, pending.path == .udp,
+              let request = try? transactionControl(.prepare, pending).message() else { return }
+        pending.requestSentAt = SessionClock.uptime; pending.requestSends += 1
+        transaction = pending
+        var datagram = Data([Self.recoveryRequestDatagramKind]); datagram.append(request.payload)
+        sendDatagram(datagram)
+    }
+
+    // Host: the viewer decoded the keyframe of a fast transaction, reported by its decode feedback or
+    // by its committed message, whichever arrives first.
+    private func commitFastHostTransaction() {
+        guard side == .host, let pending = transaction, pending.fast, pending.frameSubmitted, pending.stage == .producing,
+              let decoded = try? MediaFeedback(kind: .decoded, header: MediaFrameHeader(stream: pending.stream, frameID: 1, isIDR: true))
+        else { return }
+        reassembledAtPeer.insert(decoded.header)
+        handleSendEvents(cache?.handle(decoded, estimatedRoundTrip: roundTrip) ?? [])
+        guard transaction?.id == pending.id else { return }
+        diagnostics?.record(.mediaSwitch, since: pending.diagnostic, kind: .mediaFrame, identifier: 1)
+        active = (pending.stream, pending.path, pending.localNetwork); transaction = nil; recoveryHold = false
+        refreshInteractiveDatagramAvailability()
+        recordTransport(pending.path)
+        onState?(stateLabel(pending.path)); onResumeFrames?()
     }
 
     private func prepareListener(sessionKey: Data, identifier: UUID) {
@@ -851,7 +942,8 @@ public final class MediaSession: @unchecked Sendable {
                                  dynamicFrameWindow: dynamicFrameWindowNegotiated ? true : nil,
                                  parityFEC: parityFECNegotiated ? true : nil,
                                  blockFEC: blockFECNegotiated ? true : nil,
-                                 datagramAudio: datagramAudioNegotiated ? true : nil))
+                                 datagramAudio: datagramAudioNegotiated ? true : nil,
+                                 fastRecovery: fastRecoveryNegotiated ? true : nil))
     }
 
     private func openAuxiliary(_ role: MediaChannelRole) {
@@ -967,7 +1059,8 @@ public final class MediaSession: @unchecked Sendable {
             self.udpPeer = nil; self.udpVerified = false
             self.refreshInteractiveDatagramAvailability()
             self.clearDatagrams()
-            if self.side == .host, self.pendingDatagramPeers.isEmpty, self.transaction?.awaitingUDPVerification == true {
+            if self.side == .host, self.pendingDatagramPeers.isEmpty,
+               self.transaction?.awaitingUDPVerification == true || self.transaction?.awaitingLiveness == true {
                 self.abortTransaction(retry: true)
             }
             if self.side == .viewer, let probe = self.policy.probeID {
@@ -1040,6 +1133,7 @@ public final class MediaSession: @unchecked Sendable {
                     onDiagnosticUDPRoundTrip(measured * 1_000)
                 }
                 if receivedChallenge { verifiedUDP() }
+                if transaction?.awaitingLiveness == true { produceFastKeyFrame() }
             case 3, Self.repairedFragmentKind:
                 guard side == .viewer, udpVerified else { return }
                 let fragment = try MediaFragment.decode(Data(data.dropFirst()))
@@ -1064,6 +1158,12 @@ public final class MediaSession: @unchecked Sendable {
             case 4:
                 guard side == .host, udpVerified else { return }
                 receiveFeedback(try MediaFeedback.decode(Data(data.dropFirst())))
+            case Self.recoveryRequestDatagramKind:
+                // The same prepare also travels on the control connection; whichever arrives first starts it.
+                guard side == .host, fastRecoveryNegotiated, udpVerified else { return }
+                let value = try MediaControl.read(Data(data.dropFirst()))
+                guard value.operation == .prepare, value.fast == true else { return }
+                try receiveControl(value)
             case Self.cursorPositionDatagramKind:
                 guard side == .viewer, datagramInteractiveNegotiated, udpVerified else { return }
                 do {
@@ -1140,6 +1240,7 @@ public final class MediaSession: @unchecked Sendable {
                     self.nextFrameID = 1
                     self.transaction?.stage = .ready
                     if let pending = self.transaction { self.sendTransaction(.ready, pending) }
+                    if self.transaction?.fast == true { self.produceFastKeyFrame() }
                 } catch { self.abortTransaction(retry: true) }
             }
         }
@@ -1171,7 +1272,14 @@ public final class MediaSession: @unchecked Sendable {
             onPathSwitch?(stateLabel(path), cause)
         }
         onState?(active == nil ? "正在准备视频" : "正在恢复画面")
+        // Recovering on the path already in use needs no proof of the path: receive the keyframe as soon as
+        // the host can produce it, and ask on the datagram path as well, where a lost segment delays nothing.
+        if fastRecoveryNegotiated, active?.path == path, (try? prepareViewerReceiver(stream: pending.stream, path: path)) != nil {
+            pending.fast = true; pending.stage = .ready
+            transaction = pending
+        }
         sendTransaction(.prepare, pending)
+        sendFastRequest()
     }
 
     private func abortTransaction(retry: Bool, notify: Bool = true, mediaFailure: Bool = false) {
@@ -1380,6 +1488,10 @@ public final class MediaSession: @unchecked Sendable {
             switch event {
             case .frameReady(let frame):
                 guard frame.header.stream == expectedStream, let onVideo else { continue }
+                if transaction?.fast == true, transaction?.hostReady == false, transaction?.stream == frame.header.stream {
+                    transaction?.heldFrame = frame
+                    continue
+                }
                 guard decoding.insert(frame.header).inserted else { continue }
                 onVideo(frame) { [weak self] success in
                     self?.queue.async { [weak self] in
@@ -1401,7 +1513,8 @@ public final class MediaSession: @unchecked Sendable {
                         if success, var pending = self.transaction, pending.stream == frame.header.stream,
                            pending.stage == .ready, frame.header.isIDR {
                             pending.stage = .decoded; pending.packet = frame.packet; self.transaction = pending
-                            self.sendTransaction(.decodedReady, pending)
+                            if pending.fast { self.commitViewerTransaction() }
+                            else { self.sendTransaction(.decodedReady, pending) }
                         }
                     }
                 }
@@ -1456,6 +1569,9 @@ public final class MediaSession: @unchecked Sendable {
 
     private func receiveFeedback(_ feedback: MediaFeedback) {
         guard feedback.header.stream == cache?.stream else { return }
+        if feedback.kind == .decoded, transaction?.fast == true, transaction?.stream == feedback.header.stream {
+            commitFastHostTransaction()
+        }
         let targetHeader = (feedback.kind == .nack || feedback.kind == .expired)
             ? (cache?.frameHeader(for: feedback.header.frameID) ?? feedback.header)
             : feedback.header
@@ -1754,7 +1870,10 @@ public final class MediaSession: @unchecked Sendable {
             abortTransaction(retry: true, mediaFailure: hasDeliveryFailureEvidence && pending.frameSubmitted && pending.stage == .producing && !reassembledAtPeer.contains(header))
         }
         guard negotiated, !paused, !configurationSuspended else { return }
-        if udpPeer != nil, SessionClock.uptime - lastPingAt >= 0.2 { sendPing() }
+        if udpPeer != nil, SessionClock.uptime - lastPingAt >= (transaction?.awaitingLiveness == true ? Self.fastRequestInterval : 0.2) { sendPing() }
+        if side == .viewer, let pending = transaction, pending.fast, pending.path == .udp, !pending.hostReady,
+           pending.stage == .ready, receiver?.pendingFrameCount == 0, pending.requestSends < Self.maximumFastRequests,
+           uptime - pending.requestSentAt >= Self.fastRequestInterval { sendFastRequest() }
         if side == .host, udpVerified, !livenessGrace.isActive(at: uptime),
            uptime - max(lastPongAt, livenessResumedAt) >= 1 {
             udpVerified = false
@@ -1922,10 +2041,14 @@ public final class MediaSession: @unchecked Sendable {
         catch { control.close("媒体控制参数无效") }
     }
 
-    private func sendTransaction(_ operation: MediaControl.Operation, _ value: Transaction, mediaFailure: Bool? = nil) {
-        sendControl(MediaControl(operation, sessionID: value.stream.sessionID, transactionID: value.id,
+    private func transactionControl(_ operation: MediaControl.Operation, _ value: Transaction, mediaFailure: Bool? = nil) -> MediaControl {
+        MediaControl(operation, sessionID: value.stream.sessionID, transactionID: value.id,
             transportEpoch: value.stream.transportEpoch, codecEpoch: value.stream.codecEpoch, path: value.path.rawValue,
-            mediaFailure: mediaFailure))
+            mediaFailure: mediaFailure, fast: operation == .prepare && value.fast ? true : nil)
+    }
+
+    private func sendTransaction(_ operation: MediaControl.Operation, _ value: Transaction, mediaFailure: Bool? = nil) {
+        sendControl(transactionControl(operation, value, mediaFailure: mediaFailure))
     }
 
     // Counts of a reassembler that is about to be replaced still belong to the current window.

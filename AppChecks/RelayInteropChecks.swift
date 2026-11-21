@@ -340,7 +340,7 @@ private func exerciseMixedRelay(_ fixture: Fixture, drop: Bool, blocked: Bool = 
             host.read()?.setPaused(true); viewer.read()?.setPaused(true)
             Thread.sleep(forTimeInterval: 1.3)
             host.read()?.setPaused(false); viewer.read()?.setPaused(false)
-            try waitRelay(relayed, "Relay video did not recover after pause", seconds: 10)
+            try waitRelay(relayed, "Relay video did not recover after pause: \(states.read().suffix(6))", seconds: 10)
             // A closed alternate route is forgotten, so the next reliable failure can prepare a new one.
             bridgeBox.read()?.stop(); viewer.read()?.alternateDatagramPathClosed()
             try waitRelay(requested, "A closed relay route was never prepared again: \(states.read())", seconds: 15)

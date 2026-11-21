@@ -880,16 +880,26 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         try require(probes().isEmpty, "Probes were unbounded or ignored the frame's deadline")
         _ = cache.handle(try MediaFeedback(kind: .decoded, header: first.header), estimatedRoundTrip: 0.04)
 
-        // Any word from the receiver ends the silence: it knows the frame and asks for what it lacks.
+        // Only the newest frame is probed. The receiver finds older ones below what it received, so a
+        // stream that keeps sending is never probed, however late a queueing path makes its feedback.
         time.now = 1
         let second = try frame(2, bytes: 3_000), third = try frame(3, bytes: 3_000), fourth = try frame(4, bytes: 3_000)
-        for value in [second, third, fourth] { _ = try cache.insert(value, deadline: 3); cache.originalsSubmitted(value.header) }
-        time.now = 1.03
-        _ = cache.handle(try MediaFeedback(kind: .nack, header: second.header, missingRanges: [.init(first: 0, count: 1)]), estimatedRoundTrip: 0.04)
-        _ = cache.handle(try MediaFeedback(kind: .reassembled, header: third.header), estimatedRoundTrip: 0.04)
+        for value in [second, third] { _ = try cache.insert(value, deadline: 3); cache.originalsSubmitted(value.header) }
+        _ = try cache.insert(fourth, deadline: 3)
         time.now = 1.2
+        try require(probes().isEmpty, "A silent frame was probed although a newer one was still being paced")
+        cache.originalsSubmitted(fourth.header)
+        time.now = 1.4
         let quiet = probes()
-        try require(quiet.count == 1 && quiet[0].first?.header == fourth.header, "A frame the receiver reported on was probed, or the silent one was not")
+        try require(quiet.count == 1 && quiet[0].first?.header == fourth.header, "The newest silent frame was not the only one probed")
+        // Any word from the receiver about the newest frame ends its silence.
+        _ = cache.handle(try MediaFeedback(kind: .decoded, header: fourth.header), estimatedRoundTrip: 0.04)
+        let fifth = try frame(5, bytes: 3_000)
+        _ = try cache.insert(fifth, deadline: 3); cache.originalsSubmitted(fifth.header)
+        time.now = 1.43
+        _ = cache.handle(try MediaFeedback(kind: .nack, header: fifth.header, missingRanges: [.init(first: 0, count: 1)]), estimatedRoundTrip: 0.04)
+        time.now = 1.8
+        try require(probes().isEmpty, "A frame the receiver already asked about was probed")
         // A probe too close to the deadline for its answer to count is not sent.
         let late = try MediaRetransmissionCache(stream: stream, clock: { time.now })
         let brief = try frame(1, idr: true)

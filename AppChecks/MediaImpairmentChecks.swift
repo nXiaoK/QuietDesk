@@ -114,8 +114,7 @@ private func listenOnFreePair(queue: DispatchQueue, parameters: () throws -> NWP
 }
 
 // Forwards TLS and DTLS ciphertext between the viewer and the host. TCP passes untouched; each UDP
-// direction applies the armed impairment while keeping datagram boundaries and, unless jitter is
-// allowed to reorder, arrival order.
+// direction applies the armed impairment while keeping datagram boundaries and arrival order.
 private final class ImpairmentProxy: @unchecked Sendable {
     struct Counts { var forwarded = 0, dropped = 0, bytes = 0 }
     private struct Direction {
@@ -214,28 +213,48 @@ private final class ImpairmentProxy: @unchecked Sendable {
         }
     }
 
+    // One lane per relayed direction: datagrams leave in arrival order even when their timers are late.
+    private final class Lane {
+        let destination: NWConnection
+        var pending: [(release: TimeInterval, data: Data)] = []
+        var head = 0
+        var scheduled = false
+        init(_ destination: NWConnection) { self.destination = destination }
+    }
+
     private func relayUDP(_ incoming: NWConnection) {
         let upstream = NWConnection(host: "127.0.0.1", port: hostPort, using: .udp)
         pair(incoming, upstream) { [weak self] in
-            self?.copyDatagrams(from: incoming, to: upstream, towardViewer: false)
-            self?.copyDatagrams(from: upstream, to: incoming, towardViewer: true)
+            self?.copyDatagrams(from: incoming, lane: Lane(upstream), towardViewer: false)
+            self?.copyDatagrams(from: upstream, lane: Lane(incoming), towardViewer: true)
         }
     }
 
-    private func copyDatagrams(from source: NWConnection, to destination: NWConnection, towardViewer: Bool) {
+    private func copyDatagrams(from source: NWConnection, lane: Lane, towardViewer: Bool) {
         source.receiveMessage { [weak self] data, _, _, error in
             guard let self, !self.stopped, error == nil, let data, !data.isEmpty else { return }
             if let release = self.schedule(bytes: data.count, towardViewer: towardViewer) {
-                let delay = release - SessionClock.now
-                if delay <= 0.000_2 { destination.send(content: data, completion: .idempotent) }
-                else {
-                    self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
-                        guard let self, !self.stopped else { return }
-                        destination.send(content: data, completion: .idempotent)
-                    }
-                }
+                lane.pending.append((release, data))
+                self.drain(lane)
             }
-            self.copyDatagrams(from: source, to: destination, towardViewer: towardViewer)
+            self.copyDatagrams(from: source, lane: lane, towardViewer: towardViewer)
+        }
+    }
+
+    private func drain(_ lane: Lane) {
+        guard !stopped else { return }
+        let now = SessionClock.now
+        while lane.head < lane.pending.count, lane.pending[lane.head].release <= now + 0.000_2 {
+            lane.destination.send(content: lane.pending[lane.head].data, completion: .idempotent)
+            lane.head += 1
+        }
+        if lane.head == lane.pending.count { lane.pending.removeAll(keepingCapacity: true); lane.head = 0; return }
+        if lane.head >= 512 { lane.pending.removeFirst(lane.head); lane.head = 0 }
+        guard !lane.scheduled else { return }
+        lane.scheduled = true
+        queue.asyncAfter(deadline: .now() + max(0.000_2, lane.pending[lane.head].release - now)) { [weak self] in
+            lane.scheduled = false
+            self?.drain(lane)
         }
     }
 

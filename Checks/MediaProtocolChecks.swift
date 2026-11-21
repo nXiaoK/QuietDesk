@@ -432,10 +432,27 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         guard case .retransmit(let fragments)? = repair.first else { throw MediaCheckFailure(message: "Missing repair") }
         try require(fragments == [parts[1]], "Repair included unrequested fragments")
         try require(cache.handle(nack, estimatedRoundTrip: 0.005).isEmpty, "NACK duplicate bypassed repair pacing")
-        time.now = 0.02
-        try require(!cache.handle(nack, estimatedRoundTrip: 0.005).isEmpty, "Second bounded repair was suppressed")
-        time.now = 0.04
-        try require(cache.handle(nack, estimatedRoundTrip: 0.005).isEmpty, "Repair rounds were unbounded")
+        // A keyframe is the recovery itself: it is repaired for up to six rounds inside its deadline.
+        for round in 2...6 {
+            time.now = 0.009 + Double(round - 1) * 0.011
+            try require(!cache.handle(nack, estimatedRoundTrip: 0.005).isEmpty, "Keyframe repair round \(round) was suppressed")
+        }
+        time.now = 0.078
+        try require(cache.handle(nack, estimatedRoundTrip: 0.005).isEmpty, "Keyframe repair rounds were unbounded")
+        // A predicted frame keeps two rounds; its deadline leaves no room for more.
+        let predictedTime = MediaCheckClock()
+        let predictedCache = try MediaRetransmissionCache(stream: stream, clock: { predictedTime.now })
+        let key = try frame(1, idr: true)
+        _ = try predictedCache.insert(key, deadline: 1)
+        _ = predictedCache.handle(try MediaFeedback(kind: .decoded, header: key.header), estimatedRoundTrip: 0.005)
+        let predicted = try frame(2, bytes: 3_000)
+        _ = try predictedCache.insert(predicted, deadline: 1)
+        let predictedNack = try MediaFeedback(kind: .nack, header: predicted.header, missingRanges: [.init(first: 1, count: 1)])
+        try require(!predictedCache.handle(predictedNack, estimatedRoundTrip: 0.005).isEmpty, "Predicted frame was not repaired")
+        predictedTime.now = 0.02
+        try require(!predictedCache.handle(predictedNack, estimatedRoundTrip: 0.005).isEmpty, "Second bounded repair was suppressed")
+        predictedTime.now = 0.04
+        try require(predictedCache.handle(predictedNack, estimatedRoundTrip: 0.005).isEmpty, "Repair rounds were unbounded")
         time.now = 0.1
         try require(terminal(cache.expire()) == [77] && cache.requiresRecovery && cache.bufferedBytes == 0, "Expiry did not terminate sender credit")
         try require(cache.expire().isEmpty, "Expiry settled twice")

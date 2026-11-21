@@ -24,6 +24,10 @@ public struct MediaBufferLimits: Sendable {
     public let nackInterval: TimeInterval
     public let acknowledgementRepeatInterval: TimeInterval
     public let maximumRepairRounds: Int
+    // A keyframe is the recovery itself. One that a full queue or a loss burst left incomplete after two
+    // rounds would otherwise wait out its deadline and be sent again whole; while the deadline allows,
+    // asking again for what is still missing is the cheaper way.
+    public let maximumKeyFrameRepairRounds: Int
     public let repairSafetyMargin: TimeInterval
 
     public init(maximumFrameBytes: Int = MediaFrame.maximumPacketBytes,
@@ -32,7 +36,7 @@ public struct MediaBufferLimits: Sendable {
                 reorderDelay: TimeInterval = 0.003,
                 nackInterval: TimeInterval = 0.01, acknowledgementRepeatInterval: TimeInterval = 0.02,
                 maximumRepairRounds: Int = 2, repairSafetyMargin: TimeInterval = 0.005,
-                completedFrameTimeToLive: TimeInterval? = nil) {
+                completedFrameTimeToLive: TimeInterval? = nil, maximumKeyFrameRepairRounds: Int = 6) {
         self.maximumFrameBytes = maximumFrameBytes
         self.maximumBufferedBytes = maximumBufferedBytes
         self.maximumFrames = maximumFrames
@@ -43,6 +47,7 @@ public struct MediaBufferLimits: Sendable {
         self.nackInterval = nackInterval
         self.acknowledgementRepeatInterval = acknowledgementRepeatInterval
         self.maximumRepairRounds = maximumRepairRounds
+        self.maximumKeyFrameRepairRounds = maximumKeyFrameRepairRounds
         self.repairSafetyMargin = repairSafetyMargin
     }
 
@@ -54,7 +59,8 @@ public struct MediaBufferLimits: Sendable {
               reorderDelay.isFinite, reorderDelay >= 0, reorderDelay < min(frameTimeToLive, keyFrameTimeToLive),
               nackInterval.isFinite, nackInterval > 0,
               acknowledgementRepeatInterval.isFinite, acknowledgementRepeatInterval > 0,
-              (0...16).contains(maximumRepairRounds), repairSafetyMargin.isFinite, repairSafetyMargin >= 0 else {
+              (0...16).contains(maximumRepairRounds), (0...16).contains(maximumKeyFrameRepairRounds),
+              repairSafetyMargin.isFinite, repairSafetyMargin >= 0 else {
             throw DeskError.invalid("媒体缓存或时限配置无效")
         }
     }
@@ -994,7 +1000,7 @@ public final class MediaRetransmissionCache {
             guard var cached = frames[feedback.header.frameID], !cached.reassembled,
                   estimatedRoundTrip.isFinite, estimatedRoundTrip >= 0,
                   now + estimatedRoundTrip + limits.repairSafetyMargin < cached.deadline,
-                  cached.repairRounds < limits.maximumRepairRounds,
+                  cached.repairRounds < (cached.header.isIDR ? limits.maximumKeyFrameRepairRounds : limits.maximumRepairRounds),
                   cached.lastRepairAt.map({ now - $0 >= max(limits.nackInterval, estimatedRoundTrip) }) ?? true else { return events }
             var fragments: [MediaFragment] = []
             for range in feedback.missingRanges {

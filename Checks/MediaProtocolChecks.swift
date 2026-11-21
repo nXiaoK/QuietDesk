@@ -840,6 +840,77 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         try rejects { _ = try receiver.receive(overlappingShard) }
     }
 
+    run("A paced frame the receiver never reported is sent again after a quiet round trip, twice at most and inside its deadline") {
+        let time = MediaCheckClock()
+        let cache = try MediaRetransmissionCache(stream: stream, clock: { time.now })
+        let first = try frame(1, idr: true, bytes: 3_000)
+        let parts = try cache.insert(first, deadline: 1)
+        func probes(_ roundTrip: TimeInterval = 0.04) -> [[MediaFragment]] {
+            cache.tailProbes(estimatedRoundTrip: roundTrip).compactMap { if case .retransmit(let fragments) = $0 { return fragments }; return nil }
+        }
+        time.now = 0.5
+        try require(probes().isEmpty, "A frame still in the pacer was probed")
+        cache.originalsSubmitted(first.header)
+        time.now = 0.579
+        try require(probes().isEmpty, "A probe did not wait one and a half round trips plus margin")
+        time.now = 0.581
+        try require(probes() == [[parts[parts.count - 1]]] && probes().isEmpty, "The quiet frame's last fragment was not sent again exactly once")
+        time.now = 0.74
+        try require(probes().isEmpty, "The second probe did not wait longer than the first")
+        time.now = 0.742
+        try require(probes().count == 1, "A lost probe was not followed by a second one")
+        time.now = 0.95
+        try require(probes().isEmpty, "Probes were unbounded or ignored the frame's deadline")
+        _ = cache.handle(try MediaFeedback(kind: .decoded, header: first.header), estimatedRoundTrip: 0.04)
+
+        // Any word from the receiver ends the silence: it knows the frame and asks for what it lacks.
+        time.now = 1
+        let second = try frame(2, bytes: 3_000), third = try frame(3, bytes: 3_000), fourth = try frame(4, bytes: 3_000)
+        for value in [second, third, fourth] { _ = try cache.insert(value, deadline: 3); cache.originalsSubmitted(value.header) }
+        time.now = 1.03
+        _ = cache.handle(try MediaFeedback(kind: .nack, header: second.header, missingRanges: [.init(first: 0, count: 1)]), estimatedRoundTrip: 0.04)
+        _ = cache.handle(try MediaFeedback(kind: .reassembled, header: third.header), estimatedRoundTrip: 0.04)
+        time.now = 1.2
+        let quiet = probes()
+        try require(quiet.count == 1 && quiet[0].first?.header == fourth.header, "A frame the receiver reported on was probed, or the silent one was not")
+        // A probe too close to the deadline for its answer to count is not sent.
+        let late = try MediaRetransmissionCache(stream: stream, clock: { time.now })
+        let brief = try frame(1, idr: true)
+        _ = try late.insert(brief, deadline: time.now + 0.1)
+        late.originalsSubmitted(brief.header)
+        time.now += 0.09
+        try require(late.tailProbes(estimatedRoundTrip: 0.04).isEmpty, "A probe was sent although its answer would miss the deadline")
+    }
+
+    run("A probe completes a single-fragment frame lost whole and exposes the holes of a larger one") {
+        let time = MediaCheckClock()
+        let receiver = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        let start = try frame(1, idr: true)
+        _ = try receiver.receive(MediaFragment.fragment(frame: start)[0])
+        _ = receiver.decoded(start.header, success: true)
+        // Frame 2 fit one fragment and was lost; nothing follows, so the receiver has nothing to ask for.
+        time.now = 0.2
+        try require(feedback(receiver.poll(), .nack).isEmpty, "The receiver knew about a frame it never saw")
+        let small = try frame(2)
+        try require(ready(try receiver.receive(MediaFragment.fragment(frame: small)[0], isRepair: true)).map(\.header.frameID) == [2],
+                    "The probe copy did not complete the single-fragment frame")
+        _ = receiver.decoded(small.header, success: true)
+        // Frame 3 has several fragments, all lost: the probed last fragment makes the rest requestable.
+        let large = try frame(3, bytes: 4_000)
+        let parts = try MediaFragment.fragment(frame: large)
+        time.now = 0.3
+        try require(ready(try receiver.receive(parts[parts.count - 1], isRepair: true)).isEmpty, "A partial frame was released")
+        time.now = 0.304
+        let nacks = feedback(receiver.poll(), .nack)
+        try require(nacks.count == 1 && nacks[0].header.frameID == 3
+                    && nacks[0].missingRanges == [.init(first: 0, count: UInt16(parts.count - 1))],
+                    "The receiver did not ask for the fragments below the probe: \(nacks.map(\.missingRanges))")
+        var produced: [MediaFrame] = []
+        for part in parts.dropLast() { produced += ready(try receiver.receive(part, isRepair: true)) }
+        try require(produced.map(\.header.frameID) == [3] && produced[0].packet.avcc == large.packet.avcc,
+                    "The probed frame was not rebuilt from its repairs")
+    }
+
     run("Block FEC covers a native-resolution keyframe beyond the 256 fragments older viewers accept") {
         let time = MediaCheckClock()
         let keyframe = try frame(1, idr: true, bytes: 1_800_000)

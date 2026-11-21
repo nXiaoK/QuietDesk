@@ -112,6 +112,8 @@ public final class MediaSession: @unchecked Sendable {
         let fragmentIndex: UInt16?
         let data: Data
         let repair: Bool
+        // The last original fragment of its frame: once it left, the viewer's word about the frame is due.
+        var completesOriginals = false
     }
     private struct PathFingerprint: Equatable {
         let status: NWPath.Status
@@ -1488,6 +1490,16 @@ public final class MediaSession: @unchecked Sendable {
         handleSendEvents(cache?.handle(accepted, estimatedRoundTrip: roundTrip) ?? [])
     }
 
+    private func sendTailProbes() {
+        guard let probes = cache?.tailProbes(estimatedRoundTrip: roundTrip), !probes.isEmpty else { return }
+        // A paced frame the viewer never reported is loss, and its delivery time now includes the probe.
+        lastHostNackAt = SessionClock.now
+        for case .retransmit(let fragments) in probes {
+            if let header = fragments.first?.header { deliverySentAt.removeValue(forKey: header) }
+        }
+        handleSendEvents(probes)
+    }
+
     private func sendFeedback(_ feedback: MediaFeedback) {
         guard side == .viewer else { return }
         let path = transaction?.path ?? active?.path
@@ -1577,8 +1589,8 @@ public final class MediaSession: @unchecked Sendable {
             var data = Data(capacity: 1 + MediaFragment.encodedHeaderBytes + fragment.payload.count)
             data.append(kindByte)
             data.append(fragment.encode())
-            encoded.append(Datagram(header: fragment.header, fragmentIndex: fragment.fragmentIndex,
-                                    data: data, repair: repair))
+            encoded.append(Datagram(header: fragment.header, fragmentIndex: fragment.fragmentIndex, data: data, repair: repair,
+                                    completesOriginals: !repair && Int(fragment.fragmentIndex) + 1 == Int(fragment.fragmentCount)))
             if !repair, let blockShards = shardsByEndIndex[idx] {
                 for (shardHeader, shardData) in blockShards {
                     encoded.append(Datagram(header: shardHeader, fragmentIndex: nil, data: shardData, repair: false))
@@ -1642,6 +1654,7 @@ public final class MediaSession: @unchecked Sendable {
             if !item.repair, let fragmentIndex = item.fragmentIndex {
                 originalSubmittedCounts[item.header] = max(originalSubmittedCounts[item.header] ?? 0, Int(fragmentIndex) + 1)
             }
+            if item.completesOriginals { cache?.originalsSubmitted(item.header) }
             pacingCredit -= Double(item.data.count); pendingDatagramBytes -= item.data.count; datagramOffset += 1
         }
         pendingDatagrams.removeAll(keepingCapacity: true); datagramOffset = 0
@@ -1811,6 +1824,7 @@ public final class MediaSession: @unchecked Sendable {
             }
         } else {
             handleSendEvents(cache?.expire() ?? [])
+            sendTailProbes()
             if now - sampleStartedAt >= 1 {
                 let delivery = deliveryEstimator.takeWindow(at: now).map { min(60_000, $0) }
                 if let delivery { onVideoDeliveryDelay?(delivery) }

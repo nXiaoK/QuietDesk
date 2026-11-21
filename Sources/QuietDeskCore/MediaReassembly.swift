@@ -856,7 +856,16 @@ public final class MediaRetransmissionCache {
         var reassembled = false
         var repairRounds = 0
         var lastRepairAt: TimeInterval?
+        // When pacing of the original fragments finished, and whether the receiver reported on the
+        // frame since: reassembled, or asked for some of it.
+        var submittedAt: TimeInterval?
+        var heard = false
+        var probes = 0
+        var lastProbeAt: TimeInterval?
     }
+    public static let maximumTailProbes = 2
+    // Recent time from a frame's last original fragment to the receiver's first word about it.
+    private var feedbackDelay: TimeInterval = 0
 
     public init(stream: MediaStreamID, firstFrameID: UInt64 = 1, limits: MediaBufferLimits = .init(),
                 clock: @escaping () -> TimeInterval = { SessionClock.now }) throws {
@@ -906,6 +915,47 @@ public final class MediaRetransmissionCache {
         frames[frameID]?.header
     }
 
+    /// The sender finished pacing a frame's original fragments.
+    public func originalsSubmitted(_ header: MediaFrameHeader) {
+        guard header.stream == stream, var cached = frames[header.frameID], cached.header == header,
+              cached.submittedAt == nil else { return }
+        cached.submittedAt = currentTime()
+        frames[header.frameID] = cached
+    }
+
+    /// A receiver asks for fragments only below something it received. A frame lost whole with nothing
+    /// after it, such as the last small frame before the screen goes still, stays unknown to it until
+    /// the sender's deadline replaces the whole reference chain. After a quiet round trip without any
+    /// word about a paced frame, its last fragment goes out again: that completes a single-fragment
+    /// frame and shows the receiver what else to ask for.
+    public func tailProbes(estimatedRoundTrip: TimeInterval) -> [MediaSendEvent] {
+        guard !requiresRecovery, estimatedRoundTrip.isFinite, estimatedRoundTrip >= 0 else { return [] }
+        let now = currentTime()
+        let quiet = max(0.03, max(estimatedRoundTrip, feedbackDelay) * 1.5 + 0.02)
+        var events: [MediaSendEvent] = []
+        for id in frames.keys.sorted() {
+            guard var cached = frames[id], !cached.heard, !cached.reassembled, cached.probes < Self.maximumTailProbes,
+                  let submittedAt = cached.submittedAt, let last = cached.fragments.last,
+                  now - (cached.lastProbeAt ?? submittedAt) >= quiet * Double(cached.probes + 1),
+                  now + estimatedRoundTrip + limits.repairSafetyMargin < cached.deadline else { continue }
+            cached.probes += 1
+            cached.lastProbeAt = now
+            frames[id] = cached
+            events.append(.retransmit([last]))
+        }
+        return events
+    }
+
+    // The receiver's first word about a frame also measures how long that word takes on this path.
+    private func heard(_ id: UInt64, at now: TimeInterval) {
+        guard var cached = frames[id], !cached.heard else { return }
+        cached.heard = true
+        frames[id] = cached
+        guard cached.probes == 0, let submittedAt = cached.submittedAt else { return }
+        let delay = max(0, now - submittedAt)
+        feedbackDelay = delay >= feedbackDelay ? delay : feedbackDelay + (delay - feedbackDelay) / 8
+    }
+
     public func handle(_ feedback: MediaFeedback, estimatedRoundTrip: TimeInterval) -> [MediaSendEvent] {
         guard feedback.header.stream == stream, !requiresRecovery else { return [] }
         let now = currentTime()
@@ -931,6 +981,7 @@ public final class MediaRetransmissionCache {
         case .expired:
             if frames[feedback.header.frameID] != nil { events += invalidate(at: feedback.header) }
         case .reassembled:
+            heard(feedback.header.frameID, at: now)
             if var cached = frames[feedback.header.frameID] {
                 if !cached.reassembled, let timeout = limits.completedFrameTimeToLive {
                     cached.deadline = max(cached.deadline, now + timeout)
@@ -939,6 +990,7 @@ public final class MediaRetransmissionCache {
                 frames[feedback.header.frameID] = cached
             }
         case .nack:
+            heard(feedback.header.frameID, at: now)
             guard var cached = frames[feedback.header.frameID], !cached.reassembled,
                   estimatedRoundTrip.isFinite, estimatedRoundTrip >= 0,
                   now + estimatedRoundTrip + limits.repairSafetyMargin < cached.deadline,
@@ -973,6 +1025,7 @@ public final class MediaRetransmissionCache {
         needsFirstIDR = true
         requiresRecovery = firstFrameID == UInt64.max
         highestInserted = nil
+        feedbackDelay = 0
         return events
     }
 

@@ -603,6 +603,25 @@ private struct MediaImpairmentChecks {
             try expect(outcome.latency(0.95) <= 40, "Lost small frames still waited for a repair round trip: p95 \(outcome.latency(0.95)) ms")
         }
 
+        // The last small frame before the screen goes still: lost whole, with nothing after it to reveal
+        // the gap. The proxy drops the first copy of every such frame and lets later copies through.
+        var tail = Scenario(name: "A lone small frame lost whole is sent again instead of replacing the reference chain")
+        tail.seconds = 8
+        tail.frameBytes = { _, index in index % 60 == 0 ? 600 : nil }
+        let copies = Shared(0)
+        tail.downlink = Impairment(delay: 0.01, drop: { bytes, _ in
+            guard (640...760).contains(bytes) else { return false }
+            copies.update { $0 += 1 }
+            return copies.get() % 2 == 1
+        })
+        tail.uplink = Impairment(delay: 0.01)
+        run(tail) { outcome in
+            try expect(outcome.toViewer.dropped >= 6, "The proxy did not drop the lone frames")
+            try expect(outcome.recoveries == 0 && !outcome.usedTCP, "A lost lone frame still forced a keyframe: \(outcome.recoveries)")
+            try expect(outcome.decoded >= outcome.submitted - 1 && outcome.latency(1) <= 200,
+                       "A lost lone frame was not delivered promptly: \(outcome.decoded)/\(outcome.submitted), \(outcome.latency(1)) ms")
+        }
+
         if failures > 0 { exit(1) }
     }
 

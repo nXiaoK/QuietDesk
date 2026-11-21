@@ -23,6 +23,7 @@ public struct RemoteAudioControl: Codable, Equatable, Sendable {
     public let channels: Int?
     public let framesPerPacket: Int?
     public let magicCookie: Data?
+    public let redundantOpus: Bool?
     public let error: String?
 
     public init(
@@ -34,6 +35,7 @@ public struct RemoteAudioControl: Codable, Equatable, Sendable {
         channels: Int? = nil,
         framesPerPacket: Int? = nil,
         magicCookie: Data? = nil,
+        redundantOpus: Bool? = nil,
         error: String? = nil
     ) {
         self.operation = operation
@@ -44,11 +46,12 @@ public struct RemoteAudioControl: Codable, Equatable, Sendable {
         self.channels = channels
         self.framesPerPacket = framesPerPacket
         self.magicCookie = magicCookie
+        self.redundantOpus = redundantOpus
         self.error = error
     }
 
-    public static func request(id: UUID = UUID(), enabled: Bool) -> Self {
-        Self(.request, requestID: id, enabled: enabled)
+    public static func request(id: UUID = UUID(), enabled: Bool, redundantOpus: Bool? = nil) -> Self {
+        Self(.request, requestID: id, enabled: enabled, redundantOpus: enabled ? redundantOpus : nil)
     }
 
     public static func status(
@@ -56,6 +59,7 @@ public struct RemoteAudioControl: Codable, Equatable, Sendable {
         enabled: Bool,
         epoch: UInt32? = nil,
         magicCookie: Data? = nil,
+        redundantOpus: Bool? = nil,
         error: String? = nil
     ) -> Self {
         Self(
@@ -67,6 +71,7 @@ public struct RemoteAudioControl: Codable, Equatable, Sendable {
             channels: enabled ? Self.channels : nil,
             framesPerPacket: enabled ? Self.framesPerPacket : nil,
             magicCookie: enabled ? magicCookie : nil,
+            redundantOpus: enabled ? redundantOpus : nil,
             error: error
         )
     }
@@ -80,6 +85,7 @@ public struct RemoteAudioControl: Codable, Equatable, Sendable {
                   channels == nil,
                   framesPerPacket == nil,
                   magicCookie == nil,
+                  (enabled || redundantOpus == nil),
                   error == nil else {
                 throw DeskError.invalid("远端音频请求参数无效")
             }
@@ -107,7 +113,8 @@ public struct RemoteAudioControl: Codable, Equatable, Sendable {
                       sampleRate == nil,
                       channels == nil,
                       framesPerPacket == nil,
-                      magicCookie == nil else {
+                      magicCookie == nil,
+                      redundantOpus == nil else {
                     throw DeskError.invalid("远端音频关闭状态参数无效")
                 }
             }
@@ -129,6 +136,7 @@ public struct RemoteAudioControl: Codable, Equatable, Sendable {
 public struct RemoteAudioPacket: Equatable, Sendable {
     public static let formatVersion: UInt8 = 1
     public static let headerBytes = 16
+    public static let flagHasPreviousOpusPayload: UInt8 = 0x01
     // Fits within MediaFragment.maximumDatagramBytes (1100) so 1 (datagram kind) + 16 + payload <= 1101.
     public static let maximumPayloadBytes = MediaFragment.maximumDatagramBytes - headerBytes
 
@@ -136,24 +144,56 @@ public struct RemoteAudioPacket: Equatable, Sendable {
     public let sequence: UInt64
     public let channels: UInt8
     public let opusPayload: Data
+    public let previousOpusPayload: Data?
 
-    public init(epoch: UInt32, sequence: UInt64, channels: UInt8 = UInt8(RemoteAudioControl.channels), opusPayload: Data) throws {
+    public init(
+        epoch: UInt32,
+        sequence: UInt64,
+        channels: UInt8 = UInt8(RemoteAudioControl.channels),
+        opusPayload: Data,
+        previousOpusPayload: Data? = nil
+    ) throws {
         guard epoch > 0 else {
             throw DeskError.invalid("远端音频数据包代次无效")
         }
         guard channels == 1 || channels == 2 else {
             throw DeskError.invalid("远端音频声道数无效")
         }
-        guard !opusPayload.isEmpty, opusPayload.count <= Self.maximumPayloadBytes else {
-            throw DeskError.invalid("远端音频负载长度无效")
+        if let prev = previousOpusPayload {
+            guard sequence > 1 else {
+                throw DeskError.invalid("首包音频不能携带前序冗余负载")
+            }
+            guard !prev.isEmpty,
+                  !opusPayload.isEmpty,
+                  2 + prev.count + opusPayload.count <= Self.maximumPayloadBytes else {
+                throw DeskError.invalid("远端音频冗余负载长度无效")
+            }
+        } else {
+            guard !opusPayload.isEmpty, opusPayload.count <= Self.maximumPayloadBytes else {
+                throw DeskError.invalid("远端音频负载长度无效")
+            }
         }
         self.epoch = epoch
         self.sequence = sequence
         self.channels = channels
         self.opusPayload = opusPayload
+        self.previousOpusPayload = previousOpusPayload
     }
 
     public func encode() -> Data {
+        if let prev = previousOpusPayload {
+            var out = Data(capacity: Self.headerBytes + 2 + prev.count + opusPayload.count)
+            out.append(Self.formatVersion)
+            out.append(Self.flagHasPreviousOpusPayload)
+            out.append(channels)
+            out.append(0) // reserved
+            out.put(epoch)
+            out.put(sequence)
+            out.put(UInt16(prev.count))
+            out.append(prev)
+            out.append(opusPayload)
+            return out
+        }
         var out = Data(capacity: Self.headerBytes + opusPayload.count)
         out.append(Self.formatVersion)
         out.append(0) // flags
@@ -175,12 +215,34 @@ public struct RemoteAudioPacket: Equatable, Sendable {
         let flags: UInt8 = try reader.take()
         let channels: UInt8 = try reader.take()
         let reserved: UInt8 = try reader.take()
-        guard version == Self.formatVersion, flags == 0, reserved == 0 else {
+        guard version == Self.formatVersion,
+              (flags & ~Self.flagHasPreviousOpusPayload) == 0,
+              reserved == 0 else {
             throw DeskError.invalid("远端音频数据包头部版本或标志无效")
         }
         let epoch: UInt32 = try reader.take()
         let sequence: UInt64 = try reader.take()
-        let payload = try reader.bytes(data.count - Self.headerBytes)
+        let remaining = data.count - Self.headerBytes
+        if (flags & Self.flagHasPreviousOpusPayload) != 0 {
+            guard sequence > 1, remaining >= 4 else {
+                throw DeskError.invalid("远端音频冗余数据包字段无效")
+            }
+            let prevLen: UInt16 = try reader.take()
+            let prevCount = Int(prevLen)
+            guard prevCount > 0, prevCount < remaining - 2 else {
+                throw DeskError.invalid("远端音频前序冗余长度越界")
+            }
+            let prev = try reader.bytes(prevCount)
+            let payload = try reader.bytes(remaining - 2 - prevCount)
+            return try Self(
+                epoch: epoch,
+                sequence: sequence,
+                channels: channels,
+                opusPayload: payload,
+                previousOpusPayload: prev
+            )
+        }
+        let payload = try reader.bytes(remaining)
         return try Self(epoch: epoch, sequence: sequence, channels: channels, opusPayload: payload)
     }
 }
@@ -689,8 +751,14 @@ public final class OpusAudioDecoder {
     }
 }
 
+public enum RemoteAudioPlayoutStep: Equatable, Sendable {
+    case packet(RemoteAudioPacket)
+    case conceal(packetCount: Int)
+}
+
 /// Bounded sequence-reordering jitter buffer for 20 ms remote audio packets.
-/// Caps total queued audio latency so network bursts never cause audio to drift behind live video.
+/// Recovers single-packet losses via piggybacked previous Opus payloads (`0-RTT` audio FEC) and caps total
+/// queued audio latency so network bursts never cause audio to drift behind live video.
 public struct RemoteAudioJitterBuffer: Sendable {
     public let prebufferPackets: Int
     public let maxTotalBufferedPackets: Int
@@ -702,6 +770,8 @@ public struct RemoteAudioJitterBuffer: Sendable {
     public private(set) var droppedOverflowCount = 0
     public private(set) var reorderedCount = 0
     public private(set) var gapSkippedCount = 0
+    public private(set) var recoveredRedundantCount = 0
+    public private(set) var concealedPacketCount = 0
     private var buffered: [UInt64: RemoteAudioPacket] = [:]
     private var highestSeenSequence: UInt64?
 
@@ -736,6 +806,20 @@ public struct RemoteAudioJitterBuffer: Sendable {
         if buffered[packet.sequence] != nil {
             droppedDuplicateCount += 1
             return false
+        }
+        if let prevOpus = packet.previousOpusPayload, packet.sequence > 1 {
+            let prevSeq = packet.sequence - 1
+            let stillNeeded = nextExpectedSequence == nil || prevSeq >= nextExpectedSequence!
+            if stillNeeded, buffered[prevSeq] == nil,
+               let recovered = try? RemoteAudioPacket(
+                   epoch: packet.epoch,
+                   sequence: prevSeq,
+                   channels: packet.channels,
+                   opusPayload: prevOpus
+               ) {
+                buffered[prevSeq] = recovered
+                recoveredRedundantCount += 1
+            }
         }
         if let highest = highestSeenSequence, packet.sequence < highest {
             reorderedCount += 1
@@ -798,5 +882,177 @@ public struct RemoteAudioJitterBuffer: Sendable {
             currentInFlight += 1
         }
         return ready
+    }
+
+    public mutating func popReadySteps(
+        inFlightPlayoutBuffers: Int,
+        maxInFlightBuffers: Int = 3
+    ) -> [RemoteAudioPlayoutStep] {
+        if inFlightPlayoutBuffers == 0 && buffered.isEmpty {
+            startedPlayout = false
+        }
+        if !startedPlayout {
+            guard buffered.count >= prebufferPackets else { return [] }
+            startedPlayout = true
+            if nextExpectedSequence == nil {
+                nextExpectedSequence = buffered.keys.min()
+            }
+        }
+
+        var steps: [RemoteAudioPlayoutStep] = []
+        var currentInFlight = max(0, inFlightPlayoutBuffers)
+        while currentInFlight < maxInFlightBuffers, !buffered.isEmpty {
+            guard let expected = nextExpectedSequence ?? buffered.keys.min() else { break }
+            if let exact = buffered.removeValue(forKey: expected) {
+                nextExpectedSequence = expected &+ 1
+                steps.append(.packet(exact))
+                currentInFlight += 1
+                continue
+            }
+            if currentInFlight >= 2 && buffered.count < 2 {
+                break
+            }
+            guard let nextAvailable = buffered.keys.min(),
+                  let packet = buffered.removeValue(forKey: nextAvailable) else {
+                break
+            }
+            if nextAvailable > expected {
+                let missing = Int(min(UInt64(1_000), nextAvailable - expected))
+                gapSkippedCount += missing
+                let roomBeforePacket = max(0, maxInFlightBuffers - 1 - currentInFlight)
+                let concealCount = min(2, missing, roomBeforePacket)
+                if concealCount > 0 {
+                    steps.append(.conceal(packetCount: concealCount))
+                    concealedPacketCount += concealCount
+                    currentInFlight += concealCount
+                }
+            }
+            nextExpectedSequence = nextAvailable &+ 1
+            steps.append(.packet(packet))
+            currentInFlight += 1
+        }
+        return steps
+    }
+}
+
+/// Pitch-correlated waveform Packet Loss Concealment (PLC) for 48 kHz stereo remote audio.
+/// Eliminates audible pops/clicks across multi-packet UDP bursts by repeating pitch-aligned waveform periods
+/// with smooth decay and applying a 2.5 ms raised-cosine crossfade when live packets resume.
+public struct AudioLossConcealer: Sendable {
+    public static let crossfadeFrames = 120 // 2.5 ms @ 48 kHz
+    private static let seamBlendFrames = 32
+    private let frameSamples = RemoteAudioControl.framesPerPacket
+    private let channels = RemoteAudioControl.channels
+    private var lastFrame: [Float] = []
+    private var continuationTail: [Float] = []
+    public private(set) var concealStreak = 0
+
+    public init() {}
+
+    public mutating func reset() {
+        lastFrame.removeAll(keepingCapacity: true)
+        continuationTail.removeAll(keepingCapacity: true)
+        concealStreak = 0
+    }
+
+    public mutating func observeDecoded(_ samples: [Float]) -> [Float] {
+        guard !samples.isEmpty, samples.count % channels == 0 else { return samples }
+        var out = samples
+        if concealStreak > 0, !continuationTail.isEmpty {
+            let availableFrames = min(
+                Self.crossfadeFrames,
+                out.count / channels,
+                continuationTail.count / channels
+            )
+            if availableFrames > 0 {
+                let denom = Float(availableFrames)
+                for frame in 0..<availableFrames {
+                    let weight = 0.5 - 0.5 * cos(.pi * (Float(frame) + 0.5) / denom)
+                    let base = frame * channels
+                    for ch in 0..<channels {
+                        let blended = (1.0 - weight) * continuationTail[base + ch] + weight * out[base + ch]
+                        out[base + ch] = blended.isFinite ? max(-1.0, min(1.0, blended)) : 0
+                    }
+                }
+            }
+        }
+        let keepFloats = min(out.count, frameSamples * channels)
+        lastFrame = Array(out.suffix(keepFloats))
+        continuationTail.removeAll(keepingCapacity: true)
+        concealStreak = 0
+        return out
+    }
+
+    public mutating func synthesizeConcealment() -> [Float] {
+        concealStreak += 1
+        let outputFloats = frameSamples * channels
+        let tailFloats = Self.crossfadeFrames * channels
+        let historyFrames = lastFrame.count / channels
+        guard concealStreak <= 2, historyFrames >= 160 else {
+            continuationTail = [Float](repeating: 0, count: tailFloats)
+            return [Float](repeating: 0, count: outputFloats)
+        }
+
+        let period = estimatePitchPeriod(historyFrames: historyFrames)
+        let startGain: Float = concealStreak == 1 ? 0.86 : 0.54
+        let endGain: Float = concealStreak == 1 ? 0.54 : 0.18
+        let totalNeededFrames = frameSamples + Self.crossfadeFrames
+        let cycleStart = historyFrames - period
+        let blendLen = min(Self.seamBlendFrames, period / 4)
+
+        var generated = [Float](repeating: 0, count: totalNeededFrames * channels)
+        for f in 0..<totalNeededFrames {
+            let phase = f % period
+            let progress = Float(f) / Float(max(1, totalNeededFrames - 1))
+            let gain = startGain + (endGain - startGain) * progress
+            let srcIndex = (cycleStart + phase) * channels
+            for ch in 0..<channels {
+                var sample = lastFrame[srcIndex + ch]
+                if phase < blendLen, cycleStart >= blendLen {
+                    let w = Float(phase) / Float(blendLen)
+                    let seamSample = lastFrame[(historyFrames - blendLen + phase) * channels + ch]
+                    sample = (1.0 - w) * seamSample + w * sample
+                }
+                let scaled = sample * gain
+                generated[f * channels + ch] = scaled.isFinite ? max(-1.0, min(1.0, scaled)) : 0
+            }
+        }
+
+        continuationTail = Array(generated.suffix(tailFloats))
+        return Array(generated.prefix(outputFloats))
+    }
+
+    private func estimatePitchPeriod(historyFrames: Int) -> Int {
+        let window = min(144, historyFrames / 2)
+        let minLag = 60
+        let maxLag = min(384, historyFrames - window)
+        guard maxLag > minLag, window >= 48 else {
+            return max(64, historyFrames / 2)
+        }
+
+        let refStart = historyFrames - window
+        var bestLag = 120
+        var bestScore: Float = -1.0
+        var lag = minLag
+        while lag <= maxLag {
+            let candStart = refStart - lag
+            var dot: Float = 0
+            var candEnergy: Float = 1e-6
+            for i in stride(from: 0, to: window, by: 2) {
+                let rIdx = (refStart + i) * channels
+                let cIdx = (candStart + i) * channels
+                let rMono = lastFrame[rIdx] + (channels > 1 ? lastFrame[rIdx + 1] : 0)
+                let cMono = lastFrame[cIdx] + (channels > 1 ? lastFrame[cIdx + 1] : 0)
+                dot += rMono * cMono
+                candEnergy += cMono * cMono
+            }
+            let score = dot / sqrt(candEnergy)
+            if score > bestScore {
+                bestScore = score
+                bestLag = lag
+            }
+            lag += 2
+        }
+        return bestLag
     }
 }

@@ -348,4 +348,105 @@ func runRemoteAudioChecks() {
         try check(epoch2Batch.map(\.sequence) == [1, 2] && epoch2Batch.allSatisfy { $0.epoch == 2 },
                   "Epoch 2 reset did not deliver [1, 2]")
     }
+
+    run("Piggybacked Opus redundancy recovers lost single UDP packets in-order with zero extra delay") {
+        let reqID = UUID()
+        let reqRedundant = RemoteAudioControl.request(id: reqID, enabled: true, redundantOpus: true)
+        let decodedReq = try RemoteAudioControl.read(try reqRedundant.message().payload)
+        try check(decodedReq.redundantOpus == true, "redundantOpus request lost flag")
+
+        let statusRedundant = RemoteAudioControl.status(requestID: reqID, enabled: true, epoch: 1, redundantOpus: true)
+        let decodedStatus = try RemoteAudioControl.read(try statusRedundant.message().payload)
+        try check(decodedStatus.redundantOpus == true, "redundantOpus status lost flag")
+
+        let opus1 = Data([0xFC, 0x11, 0x22, 0x33])
+        let opus2 = Data([0xFC, 0x44, 0x55, 0x66, 0x77])
+        let opus3 = Data([0xFC, 0x88, 0x99])
+        let opus4 = Data([0xFC, 0xAA, 0xBB, 0xCC])
+
+        // Sequence 1 cannot carry previousOpusPayload
+        try rejects("Accepted previousOpusPayload on sequence 1") {
+            _ = try RemoteAudioPacket(epoch: 1, sequence: 1, opusPayload: opus1, previousOpusPayload: opus1)
+        }
+
+        let p1 = try RemoteAudioPacket(epoch: 1, sequence: 1, opusPayload: opus1)
+        let p2 = try RemoteAudioPacket(epoch: 1, sequence: 2, opusPayload: opus2, previousOpusPayload: opus1)
+        let p3 = try RemoteAudioPacket(epoch: 1, sequence: 3, opusPayload: opus3, previousOpusPayload: opus2)
+        let p4 = try RemoteAudioPacket(epoch: 1, sequence: 4, opusPayload: opus4, previousOpusPayload: opus3)
+
+        let p2Wire = p2.encode()
+        try check(1 + p2Wire.count <= MediaFragment.maximumDatagramBytes + 1, "Redundant audio datagram exceeded MTU")
+        let p2Decoded = try RemoteAudioPacket.decode(p2Wire)
+        try check(p2Decoded == p2 && p2Decoded.previousOpusPayload == opus1 && p2Decoded.opusPayload == opus2,
+                  "Redundant audio packet round-trip mismatch")
+
+        // Simulate p1 arriving, p2 DROPPED in UDP transit, p3 arriving carrying redundant opus2, and p4 arriving!
+        var jb = RemoteAudioJitterBuffer(prebufferPackets: 2, maxTotalBufferedPackets: 5)
+        _ = jb.push(p1, inFlightPlayoutBuffers: 0)
+        // p2 lost! p3 arrives:
+        _ = jb.push(p3, inFlightPlayoutBuffers: 0)
+        try check(jb.recoveredRedundantCount == 1, "Expected recoveredRedundantCount == 1 from p3's piggybacked opus2")
+
+        let steps = jb.popReadySteps(inFlightPlayoutBuffers: 0, maxInFlightBuffers: 4)
+        let recoveredSeqs: [UInt64] = steps.compactMap {
+            if case .packet(let pkt) = $0 { return pkt.sequence }
+            return nil
+        }
+        try check(recoveredSeqs == [1, 2, 3] && jb.gapSkippedCount == 0 && jb.concealedPacketCount == 0,
+                  "Expected seamless [1, 2, 3] with zero skipped gaps, got \(steps)")
+        if case .packet(let recoveredP2) = steps[1] {
+            try check(recoveredP2.opusPayload == opus2, "Recovered packet 2 payload mismatch")
+        } else {
+            throw CheckFailure("Step 1 was not packet 2")
+        }
+
+        // Now simulate 2 consecutive packets lost (seq 4 & 5 lost, seq 6 arrives with redundant 5 -> seq 4 concealed, 5 & 6 played):
+        let opus5 = Data([0xFC, 0x05])
+        let opus6 = Data([0xFC, 0x06])
+        let p6 = try RemoteAudioPacket(epoch: 1, sequence: 6, opusPayload: opus6, previousOpusPayload: opus5)
+        _ = jb.push(p6, inFlightPlayoutBuffers: 0)
+        let burstSteps = jb.popReadySteps(inFlightPlayoutBuffers: 0, maxInFlightBuffers: 4)
+        try check(burstSteps.count == 3, "Expected [.conceal(1), .packet(5), .packet(6)], got \(burstSteps)")
+        try check(burstSteps[0] == .conceal(packetCount: 1), "Expected 1 PLC frame for unrecovered seq 4")
+    }
+
+    run("AudioLossConcealer preserves pitch continuity across burst loss and crossfades resumption smoothly") {
+        var plc = AudioLossConcealer()
+        // Before any history, PLC emits clean silence
+        let cold = plc.synthesizeConcealment()
+        try check(cold.count == 960 * 2 && cold.allSatisfy { $0 == 0 }, "Cold PLC should emit 960 stereo frames of silence")
+        plc.reset()
+
+        // Feed a 250 Hz stereo sine wave (period = 48000 / 250 = 192 frames)
+        var history = [Float](repeating: 0, count: 960 * 2)
+        for f in 0..<960 {
+            let phase = Float(f) * 2.0 * .pi * 250.0 / 48_000.0
+            history[f * 2] = sin(phase) * 0.6
+            history[f * 2 + 1] = cos(phase) * 0.5
+        }
+        let observed = plc.observeDecoded(history)
+        try check(observed == history && plc.concealStreak == 0, "Normal decoded frame should pass through untouched")
+
+        let c1 = plc.synthesizeConcealment()
+        let c2 = plc.synthesizeConcealment()
+        let c3 = plc.synthesizeConcealment()
+        try check(c1.count == 960 * 2 && c2.count == 960 * 2 && c3.count == 960 * 2, "PLC chunk sizes invalid")
+
+        let peak1 = c1.map { abs($0) }.max() ?? 0
+        let peak2 = c2.map { abs($0) }.max() ?? 0
+        let peak3 = c3.map { abs($0) }.max() ?? 0
+        try check(peak1 > 0.30 && peak1 < 0.60, "PLC frame 1 should attenuate gently: peak1=\(peak1)")
+        try check(peak2 > 0.08 && peak2 < peak1, "PLC frame 2 should decay further: peak2=\(peak2)")
+        try check(peak3 == 0, "PLC beyond 2 frames (40 ms) should mute cleanly: peak3=\(peak3)")
+
+        // Reset to 1 concealed frame, then feed an opposite-phase step to verify 2.5 ms raised-cosine crossfade prevents a jump
+        plc.reset()
+        _ = plc.observeDecoded(history)
+        _ = plc.synthesizeConcealment()
+        let abruptResume = [Float](repeating: -0.6, count: 960 * 2)
+        let smoothedResume = plc.observeDecoded(abruptResume)
+        // First sample of smoothedResume is weighted ~0% toward abruptResume (-0.6), avoiding an instant full-scale step
+        try check(abs(smoothedResume[0] - (-0.6)) > 0.25 && abs(smoothedResume[959 * 2] - (-0.6)) < 1e-5,
+                  "Expected raised-cosine crossfade at start and exact convergence after 120 frames")
+    }
 }

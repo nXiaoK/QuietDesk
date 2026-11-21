@@ -6,6 +6,7 @@ import QuietDeskCore
 final class HostAudioSender: @unchecked Sendable {
     let epoch: UInt32
     let magicCookie: Data?
+    let piggybackPreviousFrame: Bool
 
     private let encodeQueue = DispatchQueue(label: "quietdesk.audio-encode", qos: .userInteractive)
     private let lock = NSLock()
@@ -14,15 +15,21 @@ final class HostAudioSender: @unchecked Sendable {
     private var queuedSampleChunks = 0
     private var encoder: OpusAudioEncoder?
     private var sequence: UInt64 = 0
+    private var lastOpusPayload: Data?
     private let sendPacket: (RemoteAudioPacket) -> Void
 
-    init(epoch: UInt32, sendPacket: @escaping (RemoteAudioPacket) -> Void) throws {
+    init(
+        epoch: UInt32,
+        piggybackPreviousFrame: Bool = false,
+        sendPacket: @escaping (RemoteAudioPacket) -> Void
+    ) throws {
         guard epoch > 0 else {
             throw DeskError.invalid("远端音频发送代次无效")
         }
         let opusEncoder = try OpusAudioEncoder()
         self.epoch = epoch
         self.magicCookie = opusEncoder.magicCookie
+        self.piggybackPreviousFrame = piggybackPreviousFrame
         self.encoder = opusEncoder
         self.sendPacket = sendPacket
     }
@@ -35,6 +42,7 @@ final class HostAudioSender: @unchecked Sendable {
         }
         guard changed else { return }
         encodeQueue.async { [weak self] in
+            self?.lastOpusPayload = nil
             self?.encoder?.reset()
         }
     }
@@ -47,6 +55,7 @@ final class HostAudioSender: @unchecked Sendable {
         }
         guard wasRunning else { return }
         encodeQueue.async { [weak self] in
+            self?.lastOpusPayload = nil
             self?.encoder = nil
         }
     }
@@ -88,10 +97,21 @@ final class HostAudioSender: @unchecked Sendable {
                     return
                 }
                 self.sequence &+= 1
+                let previous: Data?
+                if self.piggybackPreviousFrame,
+                   self.sequence > 1,
+                   let prev = self.lastOpusPayload,
+                   2 + prev.count + opusPayload.count <= RemoteAudioPacket.maximumPayloadBytes {
+                    previous = prev
+                } else {
+                    previous = nil
+                }
+                self.lastOpusPayload = opusPayload
                 if let packet = try? RemoteAudioPacket(
                     epoch: self.epoch,
                     sequence: self.sequence,
-                    opusPayload: opusPayload
+                    opusPayload: opusPayload,
+                    previousOpusPayload: previous
                 ) {
                     self.sendPacket(packet)
                 }
@@ -223,6 +243,7 @@ final class ViewerAudioPlayer: @unchecked Sendable {
     private var paused = false
     private var decoder: OpusAudioDecoder?
     private var jitterBuffer = RemoteAudioJitterBuffer(prebufferPackets: 2, maxTotalBufferedPackets: 5)
+    private var lossConcealer = AudioLossConcealer()
     private var backend: AudioPlayoutBackend?
     private let makeBackend: (DispatchQueue) throws -> AudioPlayoutBackend
     private var inFlightBuffers = 0
@@ -251,6 +272,7 @@ final class ViewerAudioPlayer: @unchecked Sendable {
             self.activeEpoch = epoch
             self.paused = paused
             self.jitterBuffer.reset(epoch: epoch)
+            self.lossConcealer.reset()
             self.backend?.resetPlayout()
             self.decoder = try? OpusAudioDecoder(magicCookie: magicCookie)
         }
@@ -265,6 +287,7 @@ final class ViewerAudioPlayer: @unchecked Sendable {
                 self.playoutGeneration &+= 1
                 self.inFlightBuffers = 0
                 self.jitterBuffer.reset(epoch: self.activeEpoch)
+                self.lossConcealer.reset()
                 self.decoder?.reset()
                 self.backend?.resetPlayout()
             }
@@ -284,6 +307,7 @@ final class ViewerAudioPlayer: @unchecked Sendable {
             self.paused = false
             self.reportedOutputError = false
             self.jitterBuffer.reset(epoch: 0)
+            self.lossConcealer.reset()
             self.decoder = nil
             self.backend?.stop()
             self.backend = nil
@@ -307,11 +331,11 @@ final class ViewerAudioPlayer: @unchecked Sendable {
         }
         guard let decoder else { return }
 
-        let readyPackets = jitterBuffer.popReadyPackets(
+        let readySteps = jitterBuffer.popReadySteps(
             inFlightPlayoutBuffers: inFlightBuffers,
             maxInFlightBuffers: Self.maxInFlightBuffers
         )
-        guard !readyPackets.isEmpty else { return }
+        guard !readySteps.isEmpty else { return }
 
         if backend == nil {
             do {
@@ -324,23 +348,37 @@ final class ViewerAudioPlayer: @unchecked Sendable {
         guard let backend else { return }
 
         let generation = playoutGeneration
-        for packet in readyPackets {
-            guard let decoded = try? decoder.decode(packet.opusPayload), !decoded.isEmpty else {
-                continue
-            }
+        func scheduleChunk(_ samples: [Float]) -> Bool {
             inFlightBuffers += 1
             do {
-                try backend.scheduleInterleavedStereo48k(decoded) { [weak self] in
+                try backend.scheduleInterleavedStereo48k(samples) { [weak self] in
                     self?.playoutQueue.async {
                         guard let self, self.playoutGeneration == generation else { return }
                         self.inFlightBuffers = max(0, self.inFlightBuffers - 1)
                         self.drainPlayoutQueue()
                     }
                 }
+                return true
             } catch {
                 inFlightBuffers = max(0, inFlightBuffers - 1)
                 reportOutputFailureOnce(error.localizedDescription)
-                break
+                return false
+            }
+        }
+
+        outer: for step in readySteps {
+            switch step {
+            case .conceal(let packetCount):
+                for _ in 0..<packetCount {
+                    let concealed = lossConcealer.synthesizeConcealment()
+                    if !scheduleChunk(concealed) { break outer }
+                }
+            case .packet(let packet):
+                guard let rawDecoded = try? decoder.decode(packet.opusPayload), !rawDecoded.isEmpty else {
+                    continue
+                }
+                let smoothed = lossConcealer.observeDecoded(rawDecoded)
+                if !scheduleChunk(smoothed) { break outer }
             }
         }
     }

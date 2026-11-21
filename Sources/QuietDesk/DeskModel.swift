@@ -2557,7 +2557,11 @@ final class DeskModel: ObservableObject {
         viewer.audioRequestedEnabled = desired
         remoteAudioWorking = true
         do {
-            peer.send(try RemoteAudioControl.request(id: id, enabled: desired).message())
+            peer.send(try RemoteAudioControl.request(
+                id: id,
+                enabled: desired,
+                redundantOpus: desired ? true : nil
+            ).message())
         } catch {
             viewer.audioRequestID = nil
             remoteAudioWorking = false
@@ -2614,9 +2618,13 @@ final class DeskModel: ObservableObject {
                     return
                 }
                 let nextEpoch = host.audioEpoch + 1
+                let useRedundantOpus = request.redundantOpus == true
                 do {
                     let media = host.media
-                    let sender = try HostAudioSender(epoch: nextEpoch) { [weak media, weak peer] packet in
+                    let sender = try HostAudioSender(
+                        epoch: nextEpoch,
+                        piggybackPreviousFrame: useRedundantOpus
+                    ) { [weak media, weak peer] packet in
                         if let media {
                             _ = media.sendAudioPacket(packet)
                         } else if let peer, peer.queuedSendBytes <= MediaSession.maximumTCPAudioFallbackPendingBytes {
@@ -2649,7 +2657,8 @@ final class DeskModel: ObservableObject {
                         requestID: requestID,
                         enabled: true,
                         epoch: nextEpoch,
-                        magicCookie: sender.magicCookie
+                        magicCookie: sender.magicCookie,
+                        redundantOpus: useRedundantOpus ? true : nil
                     ).message())
                 } catch {
                     guard self.generation == token, self.hostSession === host, self.peer === peer, !Task.isCancelled else { return }
@@ -3753,7 +3762,9 @@ final class DeskModel: ObservableObject {
             if control.enabled, let epoch = control.epoch {
                 viewerSession.audioPlayer?.start(epoch: epoch, magicCookie: control.magicCookie, paused: sessionInputSuspended)
                 remoteAudioStreaming = true
-                remoteAudioStatus = "正在播放远端系统声音（Opus 48 kHz 立体声）"
+                remoteAudioStatus = control.redundantOpus == true
+                    ? "正在播放远端系统声音（Opus 48 kHz · 抗丢包冗余与补偿）"
+                    : "正在播放远端系统声音（Opus 48 kHz 立体声）"
             } else {
                 viewerSession.audioPlayer?.stop()
                 remoteAudioStreaming = false

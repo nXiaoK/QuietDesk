@@ -839,4 +839,44 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         _ = try receiver.receive(validShard)
         try rejects { _ = try receiver.receive(overlappingShard) }
     }
+
+    run("Block FEC covers a native-resolution keyframe beyond the 256 fragments older viewers accept") {
+        let time = MediaCheckClock()
+        let keyframe = try frame(1, idr: true, bytes: 1_800_000)
+        let parts = try MediaFragment.fragment(frame: keyframe)
+        try require(parts.count > BlockFECPlanner.legacyProtectedFrameFragments
+                    && parts.count <= BlockFECPlanner.maximumProtectedFrameFragments,
+                    "Fixture is not a large keyframe inside the advertised limit: \(parts.count)")
+        let blocks = try MediaFrameFECShard.makeBlocks(header: keyframe.header, frameBytes: parts[0].frameBytes,
+                                                       fragments: parts, parityPerBlock: 2)
+        // Two fragments lost in every block, the worst this parity repairs, and nothing is asked for again.
+        let receiver = try MediaFrameReassembler(stream: stream, limits: MediaBufferLimits(keyFrameTimeToLive: 5), clock: { time.now })
+        var produced: [MediaFrame] = []
+        for entry in blocks {
+            let start = entry.descriptor.start, end = start + entry.descriptor.dataCount
+            for index in start..<end where index != start && index != end - 1 { produced += ready(try receiver.receive(parts[index])) }
+            for shard in entry.shards {
+                try require(try MediaFrameFECShard.decode(shard.encode()) == shard, "A large-frame shard changed on the wire")
+                produced += ready(try receiver.receive(shard))
+            }
+            time.now += 0.000_5
+        }
+        try require(produced.count == 1 && produced[0].packet.avcc == keyframe.packet.avcc,
+                    "A large keyframe with two losses per block was not rebuilt from parity")
+        try require(feedback(receiver.poll(), .nack).isEmpty, "Parity recovery of a large keyframe still requested repairs")
+        try require(receiver.wasRepaired(keyframe.header) == true
+                    && receiver.parityShardCount(of: keyframe.header) == blocks.reduce(0) { $0 + $1.shards.count },
+                    "The receiver lost track of the parity paced with the frame")
+        // The sender's pacing time for the frame includes that parity.
+        let plain = MediaSession.udpPacingSpan(payloadBytes: parts[0].frameBytes, megabits: 20)
+        let protected = MediaSession.udpPacingSpan(payloadBytes: parts[0].frameBytes, megabits: 20,
+                                                   parityShards: blocks.reduce(0) { $0 + $1.shards.count })
+        try require(protected > plain * 1.19 && protected < plain * 1.22, "Parity was left out of the pacing time: \(plain) \(protected)")
+        try rejects {
+            _ = try MediaFrameFECShard(header: keyframe.header, frameBytes: (BlockFECPlanner.maximumProtectedFrameFragments + 1)
+                                       * MediaFragment.maximumPayloadBytes, fragmentCount: UInt16(BlockFECPlanner.maximumProtectedFrameFragments + 1),
+                                       blockStart: 0, blockDataCount: 10, parityIndex: 0, parityCount: 1,
+                                       parityPayload: Data(count: MediaFragment.maximumPayloadBytes))
+        }
+    }
 }

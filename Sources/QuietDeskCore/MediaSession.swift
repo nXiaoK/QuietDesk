@@ -145,6 +145,8 @@ public final class MediaSession: @unchecked Sendable {
     private var dynamicFrameWindowNegotiated = false
     private var parityFECNegotiated = false
     private var blockFECNegotiated = false
+    // Host only: the largest frame, in fragments, the viewer accepts block FEC shards for.
+    private var fecFragmentLimit = BlockFECPlanner.legacyProtectedFrameFragments
     private var datagramAudioNegotiated = false
     private var advertisedReceiveFrameWindow: Int?
     private var lastReportedReceiveWindow: Int?
@@ -303,7 +305,8 @@ public final class MediaSession: @unchecked Sendable {
                 self.sendControl(MediaControl(.request, relayRouting: self.relayRoutingEnabled ? true : nil,
                                               receiveFrameWindow: MediaBufferLimits.receiveFrameWindow, markedRepairs: true,
                                               datagramInteractive: true, dynamicFrameWindow: true, parityFEC: true,
-                                              blockFEC: true, datagramAudio: true))
+                                              blockFEC: true, datagramAudio: true,
+                                              fecFragmentLimit: BlockFECPlanner.maximumProtectedFrameFragments))
                 self.onState?("正在优化传输")
             }
         }
@@ -632,6 +635,8 @@ public final class MediaSession: @unchecked Sendable {
             dynamicFrameWindowNegotiated = value.dynamicFrameWindow == true
             parityFECNegotiated = value.parityFEC == true
             blockFECNegotiated = value.blockFEC == true
+            fecFragmentLimit = value.fecFragmentLimit.map { min(BlockFECPlanner.maximumProtectedFrameFragments, max(2, $0)) }
+                ?? BlockFECPlanner.legacyProtectedFrameFragments
             datagramAudioNegotiated = value.datagramAudio == true
             advertisedReceiveFrameWindow = value.receiveFrameWindow
             let identifier = UUID(), token = try randomBytes(32), sessionKey = try randomBytes(32)
@@ -1240,18 +1245,21 @@ public final class MediaSession: @unchecked Sendable {
         return recentNackEvents.reduce(0) { $0 + $1.count }
     }
 
+    private var hasRecentLoss: Bool { lastHostNackAt.map { SessionClock.now - $0 <= 8.0 } ?? false }
+
     private func desiredBlockFECParityCount(isIDR: Bool, fragmentCount: Int, payloadBytes: Int) -> Int {
-        guard blockFECNegotiated,
-              (2...MediaFrameFECShard.maximumProtectedFragments).contains(fragmentCount),
-              pendingDatagramBytes == 0 else { return 0 }
-        let now = SessionClock.now
-        let recentMissing = recentNackedFragmentCount(at: now)
-        let recentLoss = lastHostNackAt.map { now - $0 <= 8.0 } ?? false
+        guard blockFECNegotiated, (2...fecFragmentLimit).contains(fragmentCount) else { return 0 }
+        let recentMissing = recentNackedFragmentCount(at: SessionClock.now)
+        let recentLoss = hasRecentLoss
+        // Frames queued behind the pacer are the large ones of a scroll or a video. On a path that is
+        // losing they need parity most, so a short backlog keeps one step less of it instead of none.
+        let backlogged = pendingDatagramBytes > 0
+        if backlogged, !recentLoss || Double(pendingDatagramBytes) > bytesPerSecond * 0.1 { return 0 }
         let rawParity: Int
         if recentMissing >= 6 {
-            rawParity = 3
+            rawParity = backlogged ? 2 : 3
         } else if recentLoss {
-            rawParity = 2
+            rawParity = backlogged ? 1 : 2
         } else if isIDR || settings.framesPerSecond >= 60 || roundTrip >= 0.015 {
             rawParity = 1
         } else {
@@ -1272,6 +1280,22 @@ public final class MediaSession: @unchecked Sendable {
             }
         }
         return 0
+    }
+
+    // A frame that fits one fragment has no block to protect: a lost copy is the whole frame, and when
+    // nothing follows it the viewer cannot even ask for it. On a path that is losing, a second copy a few
+    // milliseconds later (apart from the first in a loss burst) costs one datagram.
+    private static let singleFragmentRepeatDelay: TimeInterval = 0.004
+
+    private func repeatSingleFragment(_ fragment: MediaFragment) {
+        guard hasRecentLoss else { return }
+        let header = fragment.header
+        queue.asyncAfter(deadline: .now() + Self.singleFragmentRepeatDelay) { [weak self] in
+            guard let self, !self.stopped, !self.paused, !self.configurationSuspended,
+                  self.cache?.frameHeader(for: header.frameID) == header, !self.reassembledAtPeer.contains(header),
+                  (self.transaction?.stream ?? self.active?.stream) == header.stream else { return }
+            self.enqueue([fragment])
+        }
     }
 
     private func shouldEmitParity(isIDR: Bool, fragmentCount: Int, payloadBytes: Int) -> Bool {
@@ -1303,9 +1327,18 @@ public final class MediaSession: @unchecked Sendable {
             let header = MediaFrameHeader(stream: target.0, frameID: nextFrameID, isIDR: isIDR)
             let frame = try MediaFrame(header: header, packet: packet)
             let bytes = frame.packetBytes.count
-            let paced = Self.udpPacingSpan(payloadBytes: bytes, megabits: settings.megabits)
+            let fragmentCount = (bytes + MediaFragment.maximumPayloadBytes - 1) / MediaFragment.maximumPayloadBytes
+            let blockParityCount = target.1 == .udp
+                ? desiredBlockFECParityCount(isIDR: isIDR, fragmentCount: fragmentCount, payloadBytes: bytes) : 0
+            let parityShards = blockParityCount > 0
+                ? BlockFECPlanner.partition(fragmentCount: fragmentCount, parityPerBlock: blockParityCount).reduce(0) { $0 + $1.parityCount } : 0
+            // The frame leaves together with its parity, after what the pacer already holds. Waiting there
+            // must not use up the delivery deadline; it still shows in the delivery estimate, where
+            // sustained queueing behind earlier frames is load the quality policy lowers.
+            let paced = Self.udpPacingSpan(payloadBytes: bytes, megabits: settings.megabits, parityShards: parityShards)
+            let queued = target.1 == .udp ? Double(pendingDatagramBytes) / bytesPerSecond : 0
             let budget = target.1 != .udp ? 5
-                : isIDR ? max(1, paced + roundTrip * 2 + 0.2) : max(0.25, paced + roundTrip * 3 + 0.08)
+                : isIDR ? max(1, queued + paced + roundTrip * 2 + 0.2) : max(0.25, queued + paced + roundTrip * 3 + 0.08)
             let fragments = try cache!.insert(frame, deadline: SessionClock.now + min(5, budget))
             sentHeaders.insert(header)
             if deliveryPath != target.1 { deliveryPath = target.1; deliveryEstimator.reset(); deliverySentAt.removeAll() }
@@ -1316,7 +1349,6 @@ public final class MediaSession: @unchecked Sendable {
             if transaction != nil { transaction?.frameSubmitted = true }
             nextFrameID += 1
             if target.1 == .udp {
-                let blockParityCount = desiredBlockFECParityCount(isIDR: isIDR, fragmentCount: fragments.count, payloadBytes: bytes)
                 if blockParityCount > 0,
                    let fecBlocks = try? MediaFrameFECShard.makeBlocks(
                        header: header,
@@ -1329,6 +1361,7 @@ public final class MediaSession: @unchecked Sendable {
                     let parity = shouldEmitParity(isIDR: isIDR, fragmentCount: fragments.count, payloadBytes: bytes)
                         ? (try? MediaFrameParity.make(header: header, frameBytes: bytes, fragments: fragments)) : nil
                     enqueue(fragments, parity: parity)
+                    if fragments.count == 1 { repeatSingleFragment(fragments[0]) }
                 }
             }
             else {
@@ -1379,7 +1412,8 @@ public final class MediaSession: @unchecked Sendable {
                     // A frame that waited for a retransmission or FEC measures the repair, not the path's queue.
                     if !feedback.header.isIDR, receiver?.wasRepaired(feedback.header) != true {
                         let paced = Self.udpPacingSpan(payloadBytes: receiver?.fragmentedBytes(of: feedback.header) ?? 0,
-                                                       megabits: settings.megabits)
+                                                       megabits: settings.megabits,
+                                                       parityShards: receiver?.parityShardCount(of: feedback.header) ?? 0)
                         sampleWaitMilliseconds = max(sampleWaitMilliseconds, max(0, waited - paced) * 1000)
                     }
                     recordDuration(.mediaReassembly, seconds: waited, identifier: feedback.header.frameID)
@@ -1579,10 +1613,12 @@ public final class MediaSession: @unchecked Sendable {
         return min(32_768.0, max(Double(MediaFragment.maximumDatagramBytes + 1) * 4, rate * 0.008))
     }
 
-    public static func udpPacingSpan(payloadBytes: Int, megabits: Int) -> TimeInterval {
+    /// Time the pacer needs for a frame and the parity shards sent with it.
+    public static func udpPacingSpan(payloadBytes: Int, megabits: Int, parityShards: Int = 0) -> TimeInterval {
         guard payloadBytes > 0 else { return 0 }
         let fragments = max(1, (payloadBytes + MediaFragment.maximumPayloadBytes - 1) / MediaFragment.maximumPayloadBytes)
         let wireBytes = payloadBytes + fragments * (1 + MediaFragment.encodedHeaderBytes)
+            + max(0, parityShards) * (1 + MediaFrameFECShard.encodedHeaderBytes + MediaFragment.maximumPayloadBytes)
         return Double(wireBytes) / udpPacingBytesPerSecond(megabits: megabits)
     }
 

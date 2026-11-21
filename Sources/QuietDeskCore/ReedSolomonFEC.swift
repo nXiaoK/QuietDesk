@@ -244,7 +244,11 @@ public enum ReedSolomonGF256 {
 }
 
 public enum BlockFECPlanner {
-    public static let maximumProtectedFrameFragments = 256
+    /// The largest frame, in fragments, that every viewer negotiating block FEC accepts shards for.
+    public static let legacyProtectedFrameFragments = 256
+    /// The largest frame a current viewer accepts shards for, advertised as `MediaControl.fecFragmentLimit`;
+    /// about 4 MB, which covers native-resolution keyframes.
+    public static let maximumProtectedFrameFragments = 4_096
     public static let maximumBlockDataCount = 10
     public static let maximumParityCount = 3
 
@@ -260,7 +264,7 @@ public enum BlockFECPlanner {
         }
     }
 
-    /// Splits `fragmentCount` (`2...256`) into balanced blocks of at most `maximumBlockDataCount` fragments.
+    /// Splits `fragmentCount` (`2...maximumProtectedFrameFragments`) into balanced blocks of at most `maximumBlockDataCount` fragments.
     public static func partition(fragmentCount: Int, parityPerBlock: Int) -> [BlockDescriptor] {
         guard (2...maximumProtectedFrameFragments).contains(fragmentCount),
               (1...maximumParityCount).contains(parityPerBlock) else {

@@ -92,7 +92,14 @@ func runReedSolomonFECChecks() {
                   "2-fragment block did not clamp parity count to dataCount - 1")
         try check(BlockFECPlanner.partition(fragmentCount: 1, parityPerBlock: 1).isEmpty,
                   "1-fragment frame should not use block FEC")
-        try check(BlockFECPlanner.partition(fragmentCount: 257, parityPerBlock: 1).isEmpty,
-                  ">256-fragment frame exceeded block FEC cap")
+        // Frames beyond the 256 fragments older viewers accept are planned up to the advertised limit.
+        let large = BlockFECPlanner.partition(fragmentCount: 1_725, parityPerBlock: 2)
+        try check(large.count == 173 && large.reduce(0) { $0 + $1.dataCount } == 1_725
+                  && large.allSatisfy { (9...10).contains($0.dataCount) && $0.parityCount == 2 }
+                  && zip(large, large.dropFirst()).allSatisfy { $0.start + $0.dataCount == $1.start },
+                  "A native-resolution keyframe was not split into contiguous balanced blocks")
+        try check(BlockFECPlanner.legacyProtectedFrameFragments == 256
+                  && BlockFECPlanner.partition(fragmentCount: BlockFECPlanner.maximumProtectedFrameFragments + 1, parityPerBlock: 1).isEmpty,
+                  "The block FEC frame limits changed")
     }
 }

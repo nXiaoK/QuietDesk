@@ -328,13 +328,22 @@ private struct Outcome {
     var longestGap: TimeInterval = 0
     var highestLoss = 0.0
     var errors: [String] = []
+    // Seconds from handing a frame to the host session until the viewer decoded it.
+    var latencies: [TimeInterval] = []
     // Diagnostic codes of the causes that moved video to another path (see MediaSwitchCause).
     var switches: [Int] = []
     var toViewer = ImpairmentProxy.Counts()
     var usedTCP: Bool { states.contains { $0 != "UDP 视频" && $0.contains("TCP") } }
+    /// Frame latency in milliseconds at a share of the decoded frames, 0 without frames.
+    func latency(_ share: Double) -> Int {
+        guard !latencies.isEmpty else { return 0 }
+        let sorted = latencies.sorted()
+        return Int(sorted[min(sorted.count - 1, Int(Double(sorted.count) * share))] * 1_000)
+    }
     var summary: String {
         "decoded=\(decoded)/\(submitted) blocked=\(creditBlocked) recoveries=\(recoveries) reductions=\(reductions) "
-            + "final=\(finalSettings.summary) longestGap=\(Int(longestGap * 1_000))ms loss=\(String(format: "%.3f", highestLoss)) "
+            + "final=\(finalSettings.summary) latency p50/p95/max=\(latency(0.5))/\(latency(0.95))/\(latency(1))ms "
+            + "longestGap=\(Int(longestGap * 1_000))ms loss=\(String(format: "%.3f", highestLoss)) "
             + "linkDropped=\(toViewer.dropped)/\(toViewer.dropped + toViewer.forwarded) tcp=\(usedTCP) switches=\(switches)"
     }
 }
@@ -357,12 +366,12 @@ private func play(_ scenario: Scenario) throws -> Outcome {
     var applied = scenario.settings, sequence: UInt32 = 0, frameIndex = 0
     var outstanding = Set<UInt32>(), window = MediaBufferLimits.legacyFrameWindow
     var producing = false, held = true, timer: DispatchSourceTimer?
-    var sizes: [UInt32: (idr: Bool, bytes: Int)] = [:]
+    var sizes: [UInt32: (idr: Bool, bytes: Int, at: TimeInterval)] = [:]
     let sizeLock = NSLock()
     func submit(idr: Bool, bytes: Int, to media: MediaSession) {
         sequence &+= 1
         outstanding.insert(sequence)
-        sizeLock.withLock { sizes[sequence] = (idr, bytes) }
+        sizeLock.withLock { sizes[sequence] = (idr, bytes, SessionClock.now) }
         outcome.update { $0.submitted += 1 }
         media.sendVideo(fixturePacket(sequence: sequence, idr: idr, bytes: bytes))
     }
@@ -475,7 +484,7 @@ private func play(_ scenario: Scenario) throws -> Outcome {
                     if producing, let last = lastDecodedAt { outcome.update { $0.longestGap = max($0.longestGap, now - last) } }
                     lastDecodedAt = now
                 }
-                outcome.update { $0.decoded += 1; $0.decodedBytes += frame.packet.avcc.count }
+                outcome.update { $0.decoded += 1; $0.decodedBytes += frame.packet.avcc.count; $0.latencies.append(now - expected.at) }
                 complete(true)
             }
             client.onMessageHandled = { message, resume in _ = media.receive(message); resume() }
@@ -581,6 +590,19 @@ private struct MediaImpairmentChecks {
             try expect(outcome.decoded >= 150, "Video stopped flowing through the bottleneck")
         }
 
+        // Typing or a blinking caret: every frame fits one fragment, so a lost datagram is a whole frame
+        // that block FEC cannot cover. Across a 40 ms round trip a repair request costs about 50 ms.
+        var typing = Scenario(name: "Single-fragment frames on a lossy path arrive from their second copy, not a repair round trip")
+        typing.seconds = 8
+        typing.frameBytes = { _, _ in 600 }
+        typing.downlink = Impairment(loss: 0.08, delay: 0.02)
+        typing.uplink = Impairment(loss: 0.08, delay: 0.02)
+        run(typing) { outcome in
+            try expect(outcome.toViewer.dropped >= 40, "The proxy dropped too little to exercise small-frame loss")
+            try expect(!outcome.usedTCP && outcome.decoded >= 380, "Small-frame loss broke playback")
+            try expect(outcome.latency(0.95) <= 40, "Lost small frames still waited for a repair round trip: p95 \(outcome.latency(0.95)) ms")
+        }
+
         if failures > 0 { exit(1) }
     }
 
@@ -604,6 +626,14 @@ private struct MediaImpairmentChecks {
         narrow.seconds = 12
         narrow.downlink = Impairment(delay: 0.015, bytesPerSecond: 500_000); narrow.uplink = Impairment(delay: 0.015)
         scenarios.append(narrow)
+        var bursty = Scenario(name: "six-frame bursts of 4x-budget frames, clean link with 10 ms delay")
+        bursty.seconds = 8
+        bursty.frameBytes = { settings, index in
+            let budget = settings.megabits * 125_000 / settings.framesPerSecond
+            return index % 60 < 6 ? budget * 4 : budget / 4
+        }
+        bursty.downlink = Impairment(delay: 0.01); bursty.uplink = Impairment(delay: 0.01)
+        scenarios.append(bursty)
         var small = Scenario(name: "single-fragment frames with 5% loss")
         small.seconds = 8
         small.frameBytes = { _, _ in 600 }

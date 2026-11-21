@@ -38,6 +38,9 @@ public struct MediaControl: Codable, Sendable {
     public let blockFEC: Bool?
     // Negotiated over request/offer to allow authenticated DTLS datagrams for low-latency Opus remote audio packets.
     public let datagramAudio: Bool?
+    // Advertised by the viewer in its request: the most fragments a frame may have for the viewer to accept
+    // block FEC shards for it. Older viewers accept 256 and reject shards of larger frames.
+    public let fecFragmentLimit: Int?
 
     public init(_ operation: Operation, sessionID: UUID? = nil, token: Data? = nil,
                 datagramKey: Data? = nil, role: MediaChannelRole? = nil, transactionID: UUID? = nil,
@@ -45,7 +48,8 @@ public struct MediaControl: Codable, Sendable {
                 mediaFailure: Bool? = nil, encodeMilliseconds: Double? = nil, relayRouting: Bool? = nil,
                 deliveryMilliseconds: Double? = nil, receiveFrameWindow: Int? = nil, markedRepairs: Bool? = nil,
                 encodeIdle: Bool? = nil, datagramInteractive: Bool? = nil, dynamicFrameWindow: Bool? = nil,
-                parityFEC: Bool? = nil, blockFEC: Bool? = nil, datagramAudio: Bool? = nil, mappedTransfer: MappedTransferState? = nil) {
+                parityFEC: Bool? = nil, blockFEC: Bool? = nil, datagramAudio: Bool? = nil, mappedTransfer: MappedTransferState? = nil,
+                fecFragmentLimit: Int? = nil) {
         self.operation = operation; self.sessionID = sessionID; self.token = token
         self.datagramKey = datagramKey; self.role = role; self.transactionID = transactionID
         self.transportEpoch = transportEpoch; self.codecEpoch = codecEpoch; self.path = path
@@ -60,6 +64,7 @@ public struct MediaControl: Codable, Sendable {
         self.parityFEC = parityFEC
         self.blockFEC = blockFEC
         self.datagramAudio = datagramAudio
+        self.fecFragmentLimit = fecFragmentLimit
     }
 
     public func validate() throws {
@@ -74,6 +79,7 @@ public struct MediaControl: Codable, Sendable {
               parityFEC == nil || operation == .request || operation == .offer,
               blockFEC == nil || operation == .request || operation == .offer,
               datagramAudio == nil || operation == .request || operation == .offer,
+              fecFragmentLimit.map({ operation == .request && $0 > 0 }) ?? true,
               encodeMilliseconds == nil || operation == .stats,
               encodeIdle == nil || operation == .stats,
               mappedTransfer == nil || operation == .stats,

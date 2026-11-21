@@ -116,6 +116,14 @@ func runMediaSessionProtocolChecks() {
         try rejects("Allowed blockFEC outside request/offer") {
             try MediaControl(.recover, sessionID: session, transportEpoch: 1, codecEpoch: 1, blockFEC: true).validate()
         }
+        // The FEC frame limit is the viewer's own statement: optional, positive and only in its request.
+        let limited = try MediaControl.read(MediaControl(.request, blockFEC: true, fecFragmentLimit: 4_096).message().payload)
+        try check(legacy.fecFragmentLimit == nil && modern.fecFragmentLimit == nil && limited.fecFragmentLimit == 4_096,
+                  "Lost or invented the viewer's FEC frame limit")
+        try rejects("Allowed fecFragmentLimit outside the request") {
+            try MediaControl(.offer, sessionID: session, token: token, datagramKey: token, fecFragmentLimit: 4_096).validate()
+        }
+        try rejects("Allowed a non-positive fecFragmentLimit") { try MediaControl(.request, fecFragmentLimit: 0).validate() }
         var move = RemoteInput(kind: .move); move.x = 0.25; move.y = 0.75; move.pointerSequence = 42
         try move.validate()
         var zeroSeq = move; zeroSeq.pointerSequence = 0

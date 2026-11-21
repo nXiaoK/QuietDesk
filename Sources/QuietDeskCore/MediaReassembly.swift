@@ -370,8 +370,11 @@ public final class MediaFrameReassembler {
                 events.append(.feedback(try MediaFeedback(kind: .reassembled, header: assembly.header)))
             } else {
                 try tryCompleteWithParity(assembly, now: now, events: &events)
-                if assembly.frame == nil {
-                    try tryRecoverFECBlocks(assembly, candidateBlockStart: nil, now: now, events: &events)
+                // A data fragment can only complete the block it belongs to.
+                if assembly.frame == nil, let block = assembly.fecBlocks.values.first(where: {
+                    $0.blockStart <= index && index < $0.blockStart + $0.blockDataCount
+                }) {
+                    try tryRecoverFECBlock(assembly, start: block.blockStart, now: now, events: &events)
                 }
             }
         }
@@ -542,69 +545,62 @@ public final class MediaFrameReassembler {
         }
 
         if assembly.frame == nil {
-            try tryRecoverFECBlocks(assembly, candidateBlockStart: blockStart, now: now, events: &events)
+            try tryRecoverFECBlock(assembly, start: blockStart, now: now, events: &events)
         }
         updateGap(at: now)
         events += readyFrame()
         return events
     }
 
-    private func tryRecoverFECBlocks(
+    private func tryRecoverFECBlock(
         _ assembly: Assembly,
-        candidateBlockStart: Int?,
+        start: Int,
         now: TimeInterval,
         events: inout [MediaReceiveEvent]
     ) throws {
-        guard assembly.frame == nil, !assembly.fecBlocks.isEmpty else { return }
-        let blockKeys: [Int] = candidateBlockStart.map { [$0] } ?? assembly.fecBlocks.keys.sorted()
-        for start in blockKeys {
-            guard let block = assembly.fecBlocks[start], !block.parityPayloads.isEmpty else { continue }
-            let end = start + block.blockDataCount
-            var missingCount = 0
-            for index in start..<end where !assembly.received[index] {
-                missingCount += 1
-            }
-            guard missingCount > 0, block.parityPayloads.count >= missingCount else { continue }
+        guard assembly.frame == nil, let block = assembly.fecBlocks[start], !block.parityPayloads.isEmpty else { return }
+        let end = start + block.blockDataCount
+        let missingCount = (start..<end).lazy.filter { !assembly.received[$0] }.count
+        guard missingCount > 0, block.parityPayloads.count >= missingCount else { return }
 
-            var dataSlices: [Data?] = []
-            dataSlices.reserveCapacity(block.blockDataCount)
-            for index in start..<end {
-                if assembly.received[index] {
-                    let byteStart = index * MediaFragment.maximumPayloadBytes
-                    let byteLen = min(MediaFragment.maximumPayloadBytes, assembly.totalBytes - byteStart)
-                    dataSlices.append(assembly.bytes.subdata(in: byteStart..<(byteStart + byteLen)))
-                } else {
-                    dataSlices.append(nil)
-                }
+        var dataSlices: [Data?] = []
+        dataSlices.reserveCapacity(block.blockDataCount)
+        for index in start..<end {
+            if assembly.received[index] {
+                let byteStart = index * MediaFragment.maximumPayloadBytes
+                let byteLen = min(MediaFragment.maximumPayloadBytes, assembly.totalBytes - byteStart)
+                dataSlices.append(assembly.bytes.subdata(in: byteStart..<(byteStart + byteLen)))
+            } else {
+                dataSlices.append(nil)
             }
+        }
 
-            let recoveredMap: [Int: [UInt8]]?
-            do {
-                recoveredMap = try ReedSolomonGF256.reconstructMissingDataShards(
-                    dataShards: dataSlices,
-                    parityShards: block.parityPayloads,
-                    shardLength: MediaFragment.maximumPayloadBytes,
-                    parityCount: block.parityCount
-                )
-            } catch {
+        let recoveredMap: [Int: [UInt8]]?
+        do {
+            recoveredMap = try ReedSolomonGF256.reconstructMissingDataShards(
+                dataShards: dataSlices,
+                parityShards: block.parityPayloads,
+                shardLength: MediaFragment.maximumPayloadBytes,
+                parityCount: block.parityCount
+            )
+        } catch {
+            _ = invalidate(at: assembly.header)
+            throw error
+        }
+        guard let recoveredMap, !recoveredMap.isEmpty else { return }
+
+        for (relativeCol, fullBytes) in recoveredMap.sorted(by: { $0.key < $1.key }) {
+            let fragmentIndex = start + relativeCol
+            let byteStart = fragmentIndex * MediaFragment.maximumPayloadBytes
+            let expectedLength = min(MediaFragment.maximumPayloadBytes, assembly.totalBytes - byteStart)
+            if expectedLength < MediaFragment.maximumPayloadBytes,
+               fullBytes[expectedLength..<MediaFragment.maximumPayloadBytes].contains(where: { $0 != 0 }) {
                 _ = invalidate(at: assembly.header)
-                throw error
+                throw DeskError.invalid("媒体分块纠错恢复尾部非零")
             }
-            guard let recoveredMap, !recoveredMap.isEmpty else { continue }
-
-            for (relativeCol, fullBytes) in recoveredMap.sorted(by: { $0.key < $1.key }) {
-                let fragmentIndex = start + relativeCol
-                let byteStart = fragmentIndex * MediaFragment.maximumPayloadBytes
-                let expectedLength = min(MediaFragment.maximumPayloadBytes, assembly.totalBytes - byteStart)
-                if expectedLength < MediaFragment.maximumPayloadBytes,
-                   fullBytes[expectedLength..<MediaFragment.maximumPayloadBytes].contains(where: { $0 != 0 }) {
-                    _ = invalidate(at: assembly.header)
-                    throw DeskError.invalid("媒体分块纠错恢复尾部非零")
-                }
-                assembly.bytes.replaceSubrange(byteStart..<(byteStart + expectedLength), with: fullBytes.prefix(expectedLength))
-                assembly.markReceived(fragmentIndex, at: now, reorderDelay: limits.reorderDelay)
-                assembly.repaired = true
-            }
+            assembly.bytes.replaceSubrange(byteStart..<(byteStart + expectedLength), with: fullBytes.prefix(expectedLength))
+            assembly.markReceived(fragmentIndex, at: now, reorderDelay: limits.reorderDelay)
+            assembly.repaired = true
         }
 
         if assembly.receivedCount == assembly.fragmentCount {
@@ -666,6 +662,12 @@ public final class MediaFrameReassembler {
         guard let assembly = assemblies[header.frameID], assembly.header == header, assembly.fragmented,
               let completedAt = assembly.completedAt else { return nil }
         return completedAt - assembly.firstReceivedAt
+    }
+
+    /// Parity shards the sender paced with a held fragmented frame, as far as their blocks arrived.
+    public func parityShardCount(of header: MediaFrameHeader) -> Int? {
+        guard let assembly = assemblies[header.frameID], assembly.header == header, assembly.fragmented else { return nil }
+        return assembly.fecBlocks.values.reduce(assembly.parityPayload == nil ? 0 : 1) { $0 + $1.parityCount }
     }
 
     /// Whether a held fragmented frame completed only through repair: a fragment that missed the reorder

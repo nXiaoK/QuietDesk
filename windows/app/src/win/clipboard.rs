@@ -1,7 +1,7 @@
 //! The clipboard's text.
 
 use super::util::{failed, from_wide, wide};
-use quietdesk_core::error::{DeskError, Result};
+use quietdesk_core::error::Result;
 use windows::Win32::Foundation::{HANDLE, HGLOBAL};
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock};
@@ -45,5 +45,4 @@ pub fn set_text(text: &str) -> Result<()> {
         let _ = CloseClipboard();
         stored.map_err(failed("写入剪贴板"))
     }
-    .map_err(|error: DeskError| error)
 }

@@ -9,6 +9,7 @@ final class HostInputGate: @unchecked Sendable {
         var desktopActionRunning = false
         var injector: InputInjector?
         var unlocker: HostScreenUnlocker?
+        var textTyper: HostTextTyper?
     }
 
     private let lock = NSLock()
@@ -30,6 +31,7 @@ final class HostInputGate: @unchecked Sendable {
             state.desktopActionRunning = false
             state.injector = nil
             state.unlocker = nil
+            state.textTyper = nil
         }
     }
 }
@@ -81,6 +83,9 @@ final class HostSession {
     var lastDesktopActionResult: DesktopActionResult?
     var unlocker: HostScreenUnlocker?
     var unlockTask: Task<Void, Never>?
+    var textTyper: HostTextTyper?
+    var typeTextRequestID: UUID?
+    var typeTextTask: Task<Void, Never>?
     private var initialSettingsContinuation: CheckedContinuation<StreamSettingsRequest?, Never>?
     private var initialSettingsTimeout: Task<Void, Never>?
 
@@ -159,4 +164,7 @@ final class ViewerSession {
     var unlockAutomatic = false
     var unlockTask: Task<Void, Never>?
     var unlockTimeout: Task<Void, Never>?
+    var typeTextRequestID: UUID?
+    var typeTextCharacterCount = 0
+    var typeTextTimeout: Task<Void, Never>?
 }

@@ -519,6 +519,7 @@ final class RemoteCanvas: NSView {
     var holdsPaste: (() -> Bool)?
     private(set) var interactionRevision: UInt64 = 0
     var onRelease: (() -> Void)?
+    var onExplicitRelease: (() -> Void)?
     var onFocus: ((Bool) -> Void)?
     var onFailure: ((String) -> Void)?
     var onFullScreen: ((Bool) -> Void)?
@@ -1554,6 +1555,7 @@ final class RemoteCanvas: NSView {
             return
         }
         if SystemShortcutRouting.localAction(keyCode: event.keyCode, flags: UInt64(event.modifierFlags.rawValue)) == .releaseControl {
+            onExplicitRelease?()
             releaseControl()
             return
         }

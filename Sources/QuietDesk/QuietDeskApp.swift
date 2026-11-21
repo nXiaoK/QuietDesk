@@ -99,12 +99,20 @@ private struct RemoteControlCommands: Commands {
         CommandMenu("远程控制") {
             Button(viewer.isFullScreen ? "退出全屏" : "进入全屏") { viewer.toggleFullScreen() }
                 .keyboardShortcut("f", modifiers: [.control, .command])
-            Button("释放键盘鼠标") { viewer.canvas.releaseControl() }
+            Button("释放键盘鼠标") {
+                viewer.cancelRemoteTypedText()
+                viewer.canvas.releaseControl()
+            }
                 .keyboardShortcut(.escape, modifiers: [.control, .option])
             Toggle("仅观看防误触（锁定键鼠发送）", isOn: Binding(
                 get: { viewer.viewerViewOnlyLock },
                 set: { viewer.setViewerViewOnlyLock($0) }
             ))
+            Button("模拟键入本机剪贴板文字") { viewer.typeLocalClipboardText() }
+                .disabled(viewer.remoteTypingUnavailableReason != nil)
+            if viewer.remoteTypingWorking {
+                Button("停止模拟键入") { viewer.cancelRemoteTypedText() }
+            }
             Button("截取远端画面到剪贴板") { viewer.copyRemoteFrame() }
                 .keyboardShortcut("s", modifiers: [.control, .command])
                 .disabled(!viewer.connected)
@@ -206,6 +214,7 @@ struct DeskView: View {
     @State private var showTrafficStatistics = false
     @State private var showSessionEffects = false
     @State private var showPortMapping = false
+    @State private var showTypeTextSheet = false
     @State private var routeBenchmarkRunner: RouteQualityBenchmarkRunner?
     @State private var networkSubTab: NetworkWorkspaceSubTab = .viewerMappings
     @State private var diagnosticsSubTab: DiagnosticsWorkspaceSubTab = .benchmark
@@ -392,6 +401,31 @@ struct DeskView: View {
                         Divider()
 
                         Button {
+                            model.typeLocalClipboardText()
+                        } label: {
+                            Label("模拟键入本机剪贴板文字", systemImage: "keyboard.badge.ellipsis")
+                        }
+                        .disabled(model.remoteTypingUnavailableReason != nil)
+
+                        Button {
+                            model.canvas.releaseControl()
+                            showTypeTextSheet = true
+                        } label: {
+                            Label("输入文字/密码模拟键入…", systemImage: "ellipsis.rectangle")
+                        }
+                        .disabled(model.remoteTypingUnavailableReason != nil)
+
+                        if model.remoteTypingWorking {
+                            Button(role: .destructive) {
+                                model.cancelRemoteTypedText()
+                            } label: {
+                                Label("停止模拟键入", systemImage: "xmark.circle")
+                            }
+                        }
+
+                        Divider()
+
+                        Button {
                             model.canvas.releaseControl()
                             model.copyRemoteFrame()
                         } label: {
@@ -465,6 +499,9 @@ struct DeskView: View {
         .sheet(isPresented: $showSessionEffects) {
             SessionEffectsView(model: model, done: { showSessionEffects = false })
         }
+        .sheet(isPresented: $showTypeTextSheet) {
+            RemoteTypeTextSheet(model: model, done: { showTypeTextSheet = false })
+        }
         .sheet(item: $routeBenchmarkRunner) { runner in
             RouteQualityBenchmarkView(
                 runner: runner,
@@ -490,6 +527,7 @@ struct DeskView: View {
             showTrafficStatistics = false
             showSessionEffects = false
             showPortMapping = false
+            showTypeTextSheet = false
             routeBenchmarkRunner?.shutdown()
             routeBenchmarkRunner = nil
         }
@@ -498,6 +536,7 @@ struct DeskView: View {
             showTrafficStatistics = false
             showSessionEffects = false
             showPortMapping = false
+            showTypeTextSheet = false
             routeBenchmarkRunner?.shutdown()
             routeBenchmarkRunner = nil
         }
@@ -521,7 +560,7 @@ struct DeskView: View {
             dismissedClipboardStatus = message
         }
         .onChange(of: model.controlling) { _, controlling in if controlling { showFullScreenMenu = false; showOptions = false } }
-        .onChange(of: showOptions || showCapsSettings || showTrafficStatistics || showSessionEffects || showPortMapping || showFullScreenMenu || routeBenchmarkRunner != nil) { _, presented in
+        .onChange(of: showOptions || showCapsSettings || showTrafficStatistics || showSessionEffects || showPortMapping || showTypeTextSheet || showFullScreenMenu || routeBenchmarkRunner != nil) { _, presented in
             updates.interfacePromptVisible = presented
         }
         .onDisappear { updates.interfacePromptVisible = false }
@@ -583,6 +622,12 @@ struct DeskView: View {
                 // While 控制与设置 is open, its inline desktop row shows the status; otherwise show a top notice.
                 if !(immersive ? showFullScreenMenu : showOptions), let notice = model.desktopActionNotice {
                     Label(notice, systemImage: "exclamationmark.triangle")
+                        .font(.callout).foregroundStyle(.white)
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(.black.opacity(0.72), in: Capsule())
+                }
+                if !(immersive ? showFullScreenMenu : showOptions), let notice = model.remoteTypingNotice {
+                    Label(notice, systemImage: model.remoteTypingWorking ? "keyboard.badge.ellipsis" : "keyboard")
                         .font(.callout).foregroundStyle(.white)
                         .padding(.horizontal, 14).padding(.vertical, 8)
                         .background(.black.opacity(0.72), in: Capsule())

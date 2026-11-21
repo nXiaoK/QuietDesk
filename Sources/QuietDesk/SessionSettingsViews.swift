@@ -126,6 +126,7 @@ private struct ConnectionOptionsSections: View {
     @ObservedObject var model: DeskModel
     let compact: Bool
     @State private var compactTab: CompactTab = .display
+    @State private var showTypeTextSheet = false
 
     var body: some View {
         Group {
@@ -297,6 +298,43 @@ private struct ConnectionOptionsSections: View {
                 .help(ClipboardSync.receivingDirectory)
                 if let id = model.receivingFileID {
                     Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }
+                }
+            }
+
+            if model.connected {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 8) {
+                        Button {
+                            model.typeLocalClipboardText()
+                        } label: {
+                            Label("模拟键入剪贴板", systemImage: "keyboard.badge.ellipsis")
+                        }
+                        .disabled(model.remoteTypingUnavailableReason != nil)
+                        .help(model.remoteTypingUnavailableReason ?? "不经过远端剪贴板，将本机剪贴板纯文本逐字符键入远端焦点框")
+
+                        Button {
+                            model.canvas.releaseControl()
+                            showTypeTextSheet = true
+                        } label: {
+                            Label("输入文字/密码…", systemImage: "ellipsis.rectangle")
+                        }
+                        .disabled(model.remoteTypingUnavailableReason != nil)
+
+                        if model.remoteTypingWorking {
+                            Button("停止", role: .destructive) {
+                                model.cancelRemoteTypedText()
+                            }
+                        }
+                    }
+                    if !model.remoteTypingStatus.isEmpty {
+                        Text(model.remoteTypingStatus)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .sheet(isPresented: $showTypeTextSheet) {
+                    RemoteTypeTextSheet(model: model, done: { showTypeTextSheet = false })
                 }
             }
 
@@ -647,5 +685,114 @@ private struct CapsPermissionRow: View {
             Button(compact ? "系统设置…" : "打开系统设置…", action: openSettings).controlSize(.small)
         }
         .padding(.horizontal, compact ? 8 : 10).padding(.vertical, compact ? 7 : 8)
+    }
+}
+
+struct RemoteTypeTextSheet: View {
+    @ObservedObject var model: DeskModel
+    let done: () -> Void
+    @State private var text = ""
+    @State private var concealed = true
+    @State private var submitReturn = false
+    @State private var localError: String?
+
+    private var normalizedText: String {
+        TypeTextRequest.normalizeLineEndings(text)
+    }
+
+    private var overLimit: Bool {
+        normalizedText.count > TypeTextRequest.maximumCharacterCount
+            || normalizedText.utf8.count > TypeTextRequest.maximumUTF8Bytes
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "keyboard.badge.ellipsis")
+                    .font(.system(size: 22))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 40, height: 40)
+                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("模拟键入文字 / 密码")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text("先在远端画面点选目标输入框，再在此发送。内容经加密会话逐字符模拟键盘按下，不写入远端剪贴板。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Picker("输入模式", selection: $concealed) {
+                Text("隐藏输入（密码 / 令牌）").tag(true)
+                Text("明文多行文字").tag(false)
+            }
+            .pickerStyle(.segmented)
+
+            if concealed {
+                SecureField("输入密码、sudo 口令或一次性验证码", text: $text)
+                    .textFieldStyle(.roundedBorder)
+                    .onSubmit { submit() }
+            } else {
+                TextEditor(text: $text)
+                    .font(.system(size: 12.5, design: .monospaced))
+                    .frame(height: 110)
+                    .padding(4)
+                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(Color.secondary.opacity(0.25), lineWidth: 1)
+                    )
+            }
+
+            HStack {
+                Toggle("键入完成后自动按回车提交", isOn: $submitReturn)
+                    .toggleStyle(.checkbox)
+                    .controlSize(.small)
+                Spacer()
+                Text("\(normalizedText.count)/\(TypeTextRequest.maximumCharacterCount) 字符 · \(normalizedText.utf8.count)/\(TypeTextRequest.maximumUTF8Bytes) 字节")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(overLimit ? Color.red : Color.secondary)
+            }
+
+            if let errorMessage = localError ?? model.remoteTypingUnavailableReason {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Button("取消") {
+                    text = ""
+                    done()
+                }
+                .keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("开始模拟键入") {
+                    submit()
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(normalizedText.isEmpty || overLimit || model.remoteTypingUnavailableReason != nil)
+            }
+        }
+        .font(.system(size: 13))
+        .padding(22)
+        .frame(width: 460)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .onChange(of: text) { _, _ in localError = nil }
+        .onDisappear { text = "" }
+    }
+
+    private func submit() {
+        guard !normalizedText.isEmpty, !overLimit else { return }
+        if model.sendRemoteTypedText(text, submitReturn: submitReturn) {
+            text = ""
+            done()
+        } else {
+            localError = model.remoteTypingStatus
+        }
     }
 }

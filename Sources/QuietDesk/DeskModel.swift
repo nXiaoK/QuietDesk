@@ -293,6 +293,23 @@ final class DeskModel: ObservableObject {
         if sessionInputSuspended { return "画面暂停或恢复中，请稍候" }
         if unlockWorking { return "正在解锁远端，请稍候" }
         if desktopActionWorking { return "正在发送桌面操作…" }
+        if remoteTypingWorking { return "正在模拟键入文字…" }
+        return nil
+    }
+    @Published private(set) var supportsRemoteTextTyping = false
+    @Published private(set) var remoteTypingWorking = false
+    @Published private(set) var remoteTypingStatus = ""
+    @Published private(set) var remoteTypingNotice: String?
+    private var remoteTypingNoticeTask: Task<Void, Never>?
+    var remoteTypingUnavailableReason: String? {
+        if !connected { return "连接后可使用模拟键入" }
+        if !supportsRemoteTextTyping { return "被控端需更新后才能使用模拟键入" }
+        if !canControl { return "当前仅观看，需被控端允许控制且辅助功能生效" }
+        if viewerViewOnlyLock { return "已开启本机仅观看防误触锁定，关闭后可模拟键入" }
+        if sessionInputSuspended { return "画面暂停或恢复中，请稍候" }
+        if unlockWorking { return "正在解锁远端，请稍候" }
+        if desktopActionWorking { return "正在发送桌面操作…" }
+        if remoteTypingWorking { return "正在模拟键入文字…" }
         return nil
     }
     // Typing a saved lock screen password on the host after connecting (sessionUnlockV1).
@@ -582,6 +599,9 @@ final class DeskModel: ObservableObject {
             guard let self, self.mode == .viewer, self.connected else { return }
             self.peer?.send(Message(.releaseInput))
         }
+        canvas.onExplicitRelease = { [weak self] in
+            self?.cancelRemoteTypedText()
+        }
         canvas.onFocus = { [weak self] focused in
             guard let self else { return }
             self.controlling = focused
@@ -847,6 +867,7 @@ final class DeskModel: ObservableObject {
             hostSession.injector?.releaseAll()
             hostSession.desktopActionTask?.cancel()
             hostSession.desktopActions?.cancel()
+            hostSession.typeTextTask?.cancel()
         }
         status = hostControlSharingStatus(effectiveControl: effective, accessibilityGranted: accessibilityGranted)
         if controlStatusUpdatesEnabled, let peer {
@@ -880,6 +901,7 @@ final class DeskModel: ObservableObject {
         UserDefaults.standard.set(locked, forKey: "viewerViewOnlyLock")
         guard mode == .viewer else { return }
         if locked {
+            cancelRemoteTypedText()
             canvas.releaseControl()
             if relativeMouseEnabled {
                 setRelativeMouseEnabled(false)
@@ -1561,7 +1583,7 @@ final class DeskModel: ObservableObject {
                     let current = activeInputGate.snapshot()
                     guard !current.closed, current.sessionReady else { return false }
                     if current.desktopActionRunning { continue }
-                    if current.unlocker?.typing == true, [.keyDown, .keyUp, .flags].contains(input.kind) { continue }
+                    if (current.unlocker?.typing == true || current.textTyper?.typing == true), [.keyDown, .keyUp, .flags].contains(input.kind) { continue }
                     if input.kind == .scroll {
                         DiagnosticLog.shared.count(.scrollReceived)
                         if !current.canInject { DiagnosticLog.shared.count(.scrollSuppressed) }
@@ -1779,7 +1801,8 @@ final class DeskModel: ObservableObject {
                             relativeMouseV1: true,
                             trackpadGesturesV1: true,
                             initialCursorNegotiationV1: true,
-                            qualityProbeV1: true)))
+                            qualityProbeV1: true,
+                            typeTextV1: true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -3194,6 +3217,8 @@ final class DeskModel: ObservableObject {
             applyHostSessionEffects(try Wire.readJSON(SessionEffectsRequest.self, message.payload), peer: peer)
         case .sessionUnlockRequest:
             applyHostUnlock(try Wire.readJSON(SessionUnlockRequest.self, message.payload), peer: peer)
+        case .typeTextRequest:
+            applyHostTypeText(try Wire.readJSON(TypeTextRequest.self, message.payload), peer: peer)
         case .deviceIdentity:
             guard hostSession.deviceIdentityAdvertised else {
                 throw DeskError.invalid("当前连接未启用设备标识交换")
@@ -3259,8 +3284,8 @@ final class DeskModel: ObservableObject {
 
     private func handleHostImmediateInput(_ input: RemoteInput, peer: Peer) throws {
         if hostSession.desktopActionTask != nil || portMappings.hostApprovalPending { return }
-        // Keys from the viewer must not mix into the password being typed on the lock screen.
-        if hostSession.unlocker?.typing == true, [.keyDown, .keyUp, .flags].contains(input.kind) { return }
+        // Keys from the viewer must not mix into the password or simulated text being typed on the host.
+        if (hostSession.unlocker?.typing == true || hostSession.textTyper?.typing == true), [.keyDown, .keyUp, .flags].contains(input.kind) { return }
         if input.kind == .scroll {
             DiagnosticLog.shared.count(.scrollReceived)
             if !canControl || hostSession.paused || hostSession.pauseTask != nil { DiagnosticLog.shared.count(.scrollSuppressed) }
@@ -3286,6 +3311,9 @@ final class DeskModel: ObservableObject {
             desktopActionStatus = result.error ?? "已向远端发送“\(request.action.title)”快捷键；请点按远端画面继续。"
             if let error = result.error { showDesktopActionNotice(error) }
             publishSessionPause()
+        case .typeTextResult:
+            guard supportsRemoteTextTyping else { throw DeskError.invalid("模拟键入功能未协商") }
+            receiveTypeTextResult(try Wire.readJSON(TypeTextResult.self, message.payload))
         case .sessionTermination:
             guard viewerSession.helloReceived, viewerSession.terminationSubscribed else {
                 throw DeskError.invalid("当前连接未启用结束通知")
@@ -3410,6 +3438,7 @@ final class DeskModel: ObservableObject {
             supportsAdaptiveVideo = supportsHighRefreshVideoSettings && hello.adaptiveVideoV1 == true
             supportsSessionUnlock = hello.sessionUnlockV1 == true
             supportsDesktopActions = hello.desktopActionsV1 == true
+            supportsRemoteTextTyping = hello.typeTextV1 == true
             supportsDisplaySwitching = hello.displaySwitchingV1 == true
             if supportsDisplaySwitching {
                 remoteDisplays = hello.displays ?? []
@@ -4161,6 +4190,7 @@ final class DeskModel: ObservableObject {
         host.unlocker = unlocker
         host.desktopActionTask?.cancel()
         host.desktopActions?.cancel()
+        host.typeTextTask?.cancel()
         syncHostInputGate(host)
         host.injector?.releaseAll()
         DiagnosticLog.shared.record(.sessionUnlock, role: .host, state: .requested)
@@ -4171,6 +4201,170 @@ final class DeskModel: ObservableObject {
             DiagnosticLog.shared.record(.sessionUnlock, role: .host,
                 state: result.outcome == .unlocked ? .succeeded : result.outcome == .notLocked ? .disabled : .failed)
             if let reply = try? Wire.json(.sessionUnlockResult, result) { peer.send(reply) }
+        }
+    }
+
+    func typeLocalClipboardText() {
+        guard mode == .viewer else { return }
+        if let reason = remoteTypingUnavailableReason {
+            showRemoteTypingNotice(reason)
+            return
+        }
+        guard !ClipboardPrivacy.isSensitive() else {
+            showRemoteTypingNotice("本机剪贴板内容已标记为敏感，请使用「输入文字/密码模拟键入…」手动确认发送")
+            return
+        }
+        guard let text = NSPasteboard.general.string(forType: .string), !text.isEmpty else {
+            showRemoteTypingNotice("本机剪贴板中没有可模拟键入的纯文本")
+            return
+        }
+        _ = sendRemoteTypedText(text, submitReturn: false)
+    }
+
+    @discardableResult
+    func sendRemoteTypedText(_ rawText: String, submitReturn: Bool = false) -> Bool {
+        guard mode == .viewer else { return false }
+        if let reason = remoteTypingUnavailableReason {
+            showRemoteTypingNotice(reason)
+            return false
+        }
+        guard let peer else { return false }
+        let request: TypeTextRequest
+        do {
+            request = try TypeTextRequest(text: rawText, submitReturn: submitReturn)
+        } catch {
+            showRemoteTypingNotice(error.localizedDescription)
+            return false
+        }
+        canvas.releaseControl()
+        let viewer = viewerSession
+        viewer.typeTextTimeout?.cancel()
+        viewer.typeTextRequestID = request.id
+        viewer.typeTextCharacterCount = request.text.count
+        remoteTypingWorking = true
+        let statusMessage = "正在模拟键入 \(request.text.count) 个字符（不写入远端剪贴板）…"
+        remoteTypingStatus = statusMessage
+        showRemoteTypingNotice(statusMessage, persistent: true)
+        do {
+            peer.send(try Wire.json(.typeTextRequest, request))
+        } catch {
+            viewer.typeTextRequestID = nil
+            viewer.typeTextCharacterCount = 0
+            remoteTypingWorking = false
+            showRemoteTypingNotice(error.localizedDescription)
+            return false
+        }
+        let timeoutSeconds = max(10.0, Double(request.text.count) * 0.05 + 8.0)
+        viewer.typeTextTimeout = Task { [weak self, weak peer, weak viewer] in
+            do { try await Task.sleep(for: .seconds(timeoutSeconds)) } catch { return }
+            guard let self, let peer, let viewer, self.peer === peer, self.viewerSession === viewer,
+                  viewer.typeTextRequestID == request.id else { return }
+            viewer.typeTextRequestID = nil
+            viewer.typeTextCharacterCount = 0
+            viewer.typeTextTimeout = nil
+            self.remoteTypingWorking = false
+            self.showRemoteTypingNotice("未收到模拟键入完成回执，请检查远端输入框；未自动重试")
+        }
+        return true
+    }
+
+    func cancelRemoteTypedText() {
+        guard mode == .viewer, let requestID = viewerSession.typeTextRequestID else { return }
+        viewerSession.typeTextRequestID = nil
+        viewerSession.typeTextCharacterCount = 0
+        viewerSession.typeTextTimeout?.cancel()
+        viewerSession.typeTextTimeout = nil
+        remoteTypingWorking = false
+        if connected, let peer, let payload = try? Wire.json(.typeTextRequest, TypeTextRequest.cancel(id: requestID)) {
+            peer.send(payload)
+        }
+        showRemoteTypingNotice("已停止远端模拟键入")
+    }
+
+    private func receiveTypeTextResult(_ result: TypeTextResult) {
+        let viewer = viewerSession
+        guard result.id == viewer.typeTextRequestID else { return }
+        viewer.typeTextRequestID = nil
+        viewer.typeTextCharacterCount = 0
+        viewer.typeTextTimeout?.cancel()
+        viewer.typeTextTimeout = nil
+        remoteTypingWorking = false
+        if let error = result.error {
+            showRemoteTypingNotice(error)
+        } else if result.cancelled {
+            showRemoteTypingNotice("模拟键入已停止（已输入 \(result.typedCount) 个字符）")
+        } else {
+            showRemoteTypingNotice("已完成模拟键入（共 \(result.typedCount) 个字符，未写入远端剪贴板）")
+        }
+    }
+
+    private func showRemoteTypingNotice(_ text: String, persistent: Bool = false) {
+        remoteTypingNoticeTask?.cancel()
+        remoteTypingNotice = text
+        remoteTypingStatus = text
+        guard !persistent else { return }
+        remoteTypingNoticeTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(5)) } catch { return }
+            self?.remoteTypingNotice = nil
+        }
+    }
+
+    private func applyHostTypeText(_ request: TypeTextRequest, peer: Peer) {
+        let host = hostSession
+        if request.cancel {
+            if host.typeTextRequestID == request.id {
+                host.typeTextTask?.cancel()
+            }
+            return
+        }
+        let rejection: String?
+        if !canControl || !hostAllowsRemoteControl || host.injector == nil {
+            rejection = "被控端当前不允许接收键盘输入"
+        } else if portMappings.hostApprovalPending {
+            rejection = "本机正在确认端口映射"
+        } else if host.paused || host.pauseTask != nil {
+            rejection = "远端画面暂停或恢复中，请稍候"
+        } else if host.unlockTask != nil {
+            rejection = "远端正在解锁，请稍候"
+        } else if host.desktopActionTask != nil {
+            rejection = "正在发送桌面操作，请稍候"
+        } else if host.typeTextTask != nil {
+            rejection = "正在执行上一次模拟键入，请稍候"
+        } else {
+            rejection = nil
+        }
+        if let rejection {
+            if let result = try? TypeTextResult(id: request.id, typedCount: 0, error: rejection),
+               let reply = try? Wire.json(.typeTextResult, result) {
+                peer.send(reply)
+            }
+            return
+        }
+        let typer = HostTextTyper(canInject: { [weak self, weak peer, weak host] in
+            guard let self, let peer, let host else { return false }
+            return self.peer === peer
+                && self.hostSession === host
+                && self.canControl
+                && self.hostAllowsRemoteControl
+                && !host.paused
+                && host.pauseTask == nil
+                && !self.portMappings.hostApprovalPending
+        })
+        host.textTyper = typer
+        host.typeTextRequestID = request.id
+        host.injector?.releaseAll()
+        syncHostInputGate(host)
+        host.typeTextTask = Task { [weak self, weak peer, weak host] in
+            let result = await typer.type(request)
+            guard let self, let peer, let host, self.peer === peer, self.hostSession === host else { return }
+            if host.typeTextRequestID == request.id {
+                host.typeTextRequestID = nil
+                host.typeTextTask = nil
+            }
+            self.syncHostInputGate(host)
+            if let reply = try? Wire.json(.typeTextResult, result) {
+                peer.send(reply)
+            }
         }
     }
 
@@ -4504,6 +4698,7 @@ final class DeskModel: ObservableObject {
         }
         host.desktopActionTask?.cancel()
         host.desktopActions?.cancel()
+        host.typeTextTask?.cancel()
         host.injector?.releaseAll()
         let token = generation
         let capture = host.captureTask, video = host.settingsTask, cursor = host.cursorTask,
@@ -4572,6 +4767,7 @@ final class DeskModel: ObservableObject {
         let desktopRunning = host.desktopActionTask != nil
         let injector = host.injector
         let unlocker = host.unlocker
+        let textTyper = host.textTyper
         host.inputGate.update { snapshot in
             guard !snapshot.closed else { return }
             snapshot.sessionReady = ready
@@ -4579,6 +4775,7 @@ final class DeskModel: ObservableObject {
             snapshot.desktopActionRunning = desktopRunning
             snapshot.injector = injector
             snapshot.unlocker = unlocker
+            snapshot.textTyper = textTyper
         }
     }
 
@@ -5387,6 +5584,8 @@ final class DeskModel: ObservableObject {
         oldHost.desktopActionTask?.cancel()
         oldHost.desktopActions?.cancel()
         oldViewer.desktopActionTimeout?.cancel()
+        oldHost.typeTextTask?.cancel()
+        oldViewer.typeTextTimeout?.cancel()
         oldHost.displayTask?.cancel()
         oldViewer.displaySwitchTimeout?.cancel()
         oldHost.audioTask?.cancel()
@@ -5398,6 +5597,11 @@ final class DeskModel: ObservableObject {
         desktopActionStatus = ""
         desktopActionNoticeTask?.cancel()
         desktopActionNotice = nil
+        supportsRemoteTextTyping = false
+        remoteTypingWorking = false
+        remoteTypingStatus = ""
+        remoteTypingNoticeTask?.cancel()
+        remoteTypingNotice = nil
         supportsDisplaySwitching = false
         remoteDisplays = []
         remoteSelectedDisplayID = 0

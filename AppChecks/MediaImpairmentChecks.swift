@@ -46,6 +46,8 @@ private struct Impairment {
     var outage: ClosedRange<TimeInterval>?
     // Deterministic rule on (ciphertext size, index among datagrams of this direction since arming).
     var drop: (@Sendable (Int, Int) -> Bool)?
+    // Each selected ciphertext length identifies one fixture frame. Drop its first datagram only.
+    var firstCopyLoss: (sizes: Range<Int>, promptWithin: TimeInterval)?
 }
 
 private func reservePort() throws -> (descriptor: Int32, port: NWEndpoint.Port) {
@@ -116,7 +118,8 @@ private func listenOnFreePair(queue: DispatchQueue, parameters: () throws -> NWP
 // Forwards TLS and DTLS ciphertext between the viewer and the host. TCP passes untouched; each UDP
 // direction applies the armed impairment while keeping datagram boundaries and arrival order.
 private final class ImpairmentProxy: @unchecked Sendable {
-    struct Counts { var forwarded = 0, dropped = 0, bytes = 0 }
+    struct Counts { var forwarded = 0, dropped = 0, bytes = 0, promptCopies = 0 }
+    private enum CopyReceipt { case dropped(at: TimeInterval), repeated }
     private struct Direction {
         var random: SplitMix64
         var dropping = false
@@ -124,6 +127,7 @@ private final class ImpairmentProxy: @unchecked Sendable {
         var busyUntil: TimeInterval = 0
         var lastRelease: TimeInterval = 0
         var counts = Counts()
+        var copiesBySize: [Int: CopyReceipt] = [:]
     }
     private let queue = DispatchQueue(label: "checks.media-impairment.proxy", qos: .userInteractive)
     private let hostPort: NWEndpoint.Port
@@ -168,6 +172,7 @@ private final class ImpairmentProxy: @unchecked Sendable {
             self.downlink = downlink; self.uplink = uplink
             armedAt = SessionClock.now
             toViewer.index = 0; toHost.index = 0
+            toViewer.copiesBySize.removeAll(); toHost.copiesBySize.removeAll()
         }
     }
 
@@ -273,6 +278,19 @@ private final class ImpairmentProxy: @unchecked Sendable {
         guard let model else { state.counts.forwarded += 1; state.counts.bytes += bytes; return now }
         let index = state.index
         state.index += 1
+        var promptCopy = false
+        if let rule = model.firstCopyLoss, rule.sizes.contains(bytes) {
+            switch state.copiesBySize[bytes] {
+            case nil:
+                state.copiesBySize[bytes] = .dropped(at: now)
+                return dropped()
+            case .dropped(let first):
+                state.copiesBySize[bytes] = .repeated
+                promptCopy = now - first < rule.promptWithin
+            case .repeated:
+                break
+            }
+        }
         if model.drop?(bytes, index) == true { return dropped() }
         if let outage = model.outage, outage.contains(now - armedAt) { return dropped() }
         if let burst = model.burst {
@@ -293,6 +311,7 @@ private final class ImpairmentProxy: @unchecked Sendable {
         release = max(release, state.lastRelease)
         state.lastRelease = release
         state.counts.forwarded += 1; state.counts.bytes += bytes
+        if promptCopy { state.counts.promptCopies += 1 }
         return release
     }
 }
@@ -543,8 +562,9 @@ private func play(_ scenario: Scenario) throws -> Outcome {
     proxy.arm(downlink: scenario.downlink, uplink: scenario.uplink, controlDelay: scenario.controlDelay)
     armedAt.update { $0 = SessionClock.now }
     Thread.sleep(forTimeInterval: scenario.seconds)
+    let toViewer = proxy.counts().toViewer
     var result = outcome.get()
-    result.toViewer = proxy.counts().toViewer
+    result.toViewer = toViewer
     return result
 }
 
@@ -632,21 +652,27 @@ private struct MediaImpairmentChecks {
             try expect(outcome.decoded >= 150, "Video stopped flowing through the bottleneck")
         }
 
-        // Typing or a blinking caret: every frame fits one fragment, so a lost datagram is a whole frame
-        // that block FEC cannot cover. Across a 40 ms round trip a repair request costs about 50 ms.
+        // Mark every sixth frame with a unique payload length. DTLS-GCM preserves the size difference,
+        // so even interleaved copies can be paired in the proxy without inspecting the encrypted video.
         var typing = Scenario(name: "Single-fragment frames on a lossy path arrive from their second copy, not a repair round trip")
         typing.seconds = 8
-        typing.frameBytes = { _, _ in 600 }
-        typing.downlink = Impairment(loss: 0.08, delay: 0.02)
-        typing.uplink = Impairment(loss: 0.08, delay: 0.02)
+        typing.idrBytes = 256
+        typing.frameBytes = { _, index in index.isMultiple(of: 6) ? 600 + index / 6 : 256 }
+        let oneWayDelay: TimeInterval = 0.08
+        typing.downlink = Impairment(delay: oneWayDelay, firstCopyLoss: (600..<1_000, oneWayDelay))
+        typing.uplink = Impairment(delay: oneWayDelay)
         run(typing) { outcome in
-            try expect(outcome.toViewer.dropped >= 40, "The proxy dropped too little to exercise small-frame loss")
+            let dropped = outcome.toViewer.dropped
+            let prompt = outcome.toViewer.promptCopies
+            // Count the next datagram of the same size only if it beat even one leg of the feedback
+            // round trip. Deduct all undecoded frames, including those still in flight at shutdown.
+            let promptAndDecoded = max(0, prompt - (outcome.submitted - outcome.decoded))
+            print("SMALL-FRAME first copies dropped=\(dropped) prompt second copies=\(prompt) "
+                  + "prompt and decoded at least=\(promptAndDecoded) latency p90=\(outcome.latency(0.9)) ms")
+            try expect(dropped >= 40, "The proxy dropped too little to exercise small-frame loss")
+            try expect(promptAndDecoded * 5 >= dropped * 4,
+                       "Fewer than 80% of dropped small frames arrived promptly from a second copy")
             try expect(!outcome.usedTCP && outcome.decoded >= 380, "Small-frame loss broke playback")
-            // A frame that lost both copies waits for a repair and holds back the few frames behind it, so
-            // the slowest few percent vary from run to run. Without second copies every lost frame does,
-            // which puts more than a fifth of the frames beyond a round trip.
-            print("SMALL-FRAME latency p90=\(outcome.latency(0.9)) ms p95=\(outcome.latency(0.95)) ms")
-            try expect(outcome.latency(0.9) <= 40, "Lost small frames still waited for a repair round trip: p90 \(outcome.latency(0.9)) ms")
         }
 
         // The last small frame before the screen goes still: lost whole, with nothing after it to reveal

@@ -396,6 +396,7 @@ final class DeskModel: ObservableObject {
     private var pending: [UUID: Peer] = [:]
     private var hostSession = HostSession()
     private var viewerSession = ViewerSession()
+    private var startingBitrates = MediaStartingBitrate()
     private var generation = UUID()
     private var activity: NSObjectProtocol?
     private var metricsTimer: Timer?
@@ -3499,12 +3500,19 @@ final class DeskModel: ObservableObject {
                                              relayRouting: hello.relayTransportV1 == true && target?.relay != nil)
                     // Start non-LAN and relayed sessions from a conservative bitrate so the initial keyframe
                     // and refinement burst cannot overflow unknown WAN uplinks; healthy paths climb quickly.
-                    let initialMaxMegabits: Int? = if viewerSession.usesRelayControl {
+                    let defaultMaxMegabits: Int? = if viewerSession.usesRelayControl {
                         MediaQualityPolicy.relayStartingMegabits
                     } else if let address = target?.address, !MediaQualityPolicy.isLikelyLocalHost(address) {
                         MediaQualityPolicy.wanDirectStartingMegabits
                     } else {
                         nil
+                    }
+                    // A reconnect soon after a session on this route starts from the bitrate that session settled at.
+                    // Route benchmarks neither read nor update that memory, so their runs stay comparable.
+                    viewerSession.startingBitrateRoute = activeRouteBenchmarkOverride == nil ? startingBitrateRoute : nil
+                    let initialMaxMegabits = defaultMaxMegabits.map { fallback in
+                        guard let route = viewerSession.startingBitrateRoute else { return fallback }
+                        return startingBitrates.maximum(route: route, fallback: fallback, now: SessionClock.now)
                     }
                     if supportsAdaptiveVideo, let maximumMegabits = initialMaxMegabits, var tuning = videoTuning,
                        let start = viewerSession.mediaQuality?.startingSettings(maximumMegabits: maximumMegabits), start != tuning.desired {
@@ -4536,6 +4544,17 @@ final class DeskModel: ObservableObject {
         }
     }
 
+    /// Identifies the video route of the current target for `startingBitrates`: a relayed session and a
+    /// direct one to the same Mac are different paths.
+    private var startingBitrateRoute: String? {
+        guard let target else { return nil }
+        if viewerSession.usesRelayControl {
+            guard let relay = target.relay else { return nil }
+            return "relay|\(relay.endpoint.host.lowercased())|\(relay.endpoint.port)|\(relay.deviceID.uuidString)"
+        }
+        return "direct|\(target.address.lowercased())|\(target.port)"
+    }
+
     private func saveVideoPreference(_ settings: StreamSettings) {
         guard activeRouteBenchmarkOverride == nil, let target,
               let record = ConnectionStore.matching(connections, address: target.address, port: target.port, preferredID: target.recordID, relay: target.relay),
@@ -5530,6 +5549,11 @@ final class DeskModel: ObservableObject {
 
     private func clearSession() {
         if mode == .viewer { portMappings.stopSessionMappings() }
+        // Only a session whose video ran on a path that is not the local network says what the route carries.
+        if let route = viewerSession.startingBitrateRoute, viewerSession.mediaCommitted,
+           let quality = viewerSession.mediaQuality, !quality.isLocalNetwork, let settled = quality.settledMegabits {
+            startingBitrates.remember(settled, reducing: quality.effective.megabits < settled, route: route, now: SessionClock.now)
+        }
         if activeRouteBenchmarkOverride != nil {
             let route = (mediaTransportStatus.isEmpty || (mediaTransportStatus == "TCP 兼容模式" && !connected))
                 ? controlTransportStatus

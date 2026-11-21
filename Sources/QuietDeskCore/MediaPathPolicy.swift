@@ -527,6 +527,34 @@ public struct MediaPathPolicy: Sendable {
     }
 }
 
+/// The bitrate a video route settled at in its last session. A reconnect soon after, most often the
+/// automatic one after a drop, starts there instead of the cautious default: a narrow path is not
+/// overshot a second time, and a proven one does not climb again. Kept in memory only and short-lived:
+/// the same target reached later, or from another network, proves nothing.
+public struct MediaStartingBitrate: Sendable {
+    public static let lifetime: TimeInterval = 10 * 60
+    private var entries: [String: (megabits: Int, reducing: Bool, at: TimeInterval)] = [:]
+
+    public init() {}
+
+    /// `reducing` marks a session that ended below its settled bitrate, on its way down.
+    public mutating func remember(_ megabits: Int, reducing: Bool, route: String, now: TimeInterval) {
+        guard megabits > 0, now.isFinite else { return }
+        entries = entries.filter { now - $0.value.at < Self.lifetime }
+        if entries.count >= 32, entries[route] == nil, let oldest = entries.min(by: { $0.value.at < $1.value.at }) {
+            entries.removeValue(forKey: oldest.key)
+        }
+        entries[route] = (megabits, reducing, now)
+    }
+
+    /// The starting cap for this route: its settled bitrate while fresh, otherwise the default. A session
+    /// that ended while reducing may have met a path that got worse, so it never raises the default.
+    public func maximum(route: String, fallback: Int, now: TimeInterval) -> Int {
+        guard let entry = entries[route], now >= entry.at, now - entry.at < Self.lifetime else { return fallback }
+        return entry.reducing ? min(entry.megabits, fallback) : entry.megabits
+    }
+}
+
 // Automatic recommendations change pending/effective settings, never the user's preferred ceiling.
 // The coordinator serializes requests and confirms only settings actually applied by the host.
 //
@@ -680,6 +708,12 @@ public struct MediaQualityPolicy: Sendable {
             if let received { receivedSum += received * elapsed; receivedDuration += elapsed }
         }
     }
+    /// Seconds a bitrate stays in effect before it counts as settled.
+    public static let settledBitrateHold: TimeInterval = 30
+    /// The bitrate most recently in effect for `settledBitrateHold` without a change on this route, if any.
+    /// A level passed through for seconds while climbing or collapsing is not one the route settled at.
+    public private(set) var settledMegabits: Int?
+    private var bitrateHeld: (megabits: Int, since: TimeInterval)?
     /// Loss this path showed at a lower bitrate as well; up to about it, loss alone changes nothing.
     public private(set) var toleratedLoss = 0.0
     private var lossEvidence = LossEvidence()
@@ -735,6 +769,7 @@ public struct MediaQualityPolicy: Sendable {
         isLocalNetwork = enabled
         mappedBitrateHoldUntil = -.infinity
         localLatencyLimited = false; localRoundTrip = nil
+        settledMegabits = nil; bitrateHeld = nil
         forgetLoss()
         lastObservationAt = now
         resetEvidence()
@@ -781,6 +816,8 @@ public struct MediaQualityPolicy: Sendable {
     // Local links still need sampled delay after a path action asks to reduce the load.
     public mutating func observe(_ sample: MediaPathSample, now: TimeInterval) -> StreamSettings? {
         guard accept(now) else { return nil }
+        if bitrateHeld?.megabits != effective.megabits { bitrateHeld = (effective.megabits, now) }
+        else if let held = bitrateHeld, now - held.since + mediaPolicyTimeTolerance >= Self.settledBitrateHold { settledMegabits = held.megabits }
         guard sample.isValid else {
             mappedCreditWaitDuration = 0
             if isLocalNetwork { lastObservationAt = now; resetEvidence() }
@@ -1024,7 +1061,8 @@ public struct MediaQualityPolicy: Sendable {
 
     public mutating func resetObservation(now: TimeInterval) {
         guard accept(now) else { return }
-        lastObservationAt = now; localRoundTrip = nil; mappedBitrateHoldUntil = -.infinity; forgetLoss(); resetEvidence()
+        lastObservationAt = now; localRoundTrip = nil; mappedBitrateHoldUntil = -.infinity; bitrateHeld = nil
+        forgetLoss(); resetEvidence()
     }
 
     private mutating func accept(_ now: TimeInterval) -> Bool {

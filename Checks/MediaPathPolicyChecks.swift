@@ -1164,6 +1164,65 @@ func runMediaPathPolicyChecks() {
         try rejects("Unknown bitrate steps were accepted") { _ = try MediaQualityPolicy(hostDefault: native, bitRates: [7, 9], now: 0) }
     }
 
+    run("A reconnect soon after a session starts from the bitrate that route settled at, and only then") {
+        var memory = MediaStartingBitrate()
+        let direct = "direct|home.test|5908", relay = "relay|node.test|7443|device"
+        try check(memory.maximum(route: direct, fallback: 20, now: 0) == 20, "An unknown route did not use the default cap")
+        memory.remember(3, reducing: false, route: direct, now: 100)
+        memory.remember(50, reducing: false, route: relay, now: 100)
+        try check(memory.maximum(route: direct, fallback: 20, now: 160) == 3 && memory.maximum(route: relay, fallback: 15, now: 160) == 50,
+                  "A fresh session's settled bitrate was not resumed, or routes were mixed")
+        try check(memory.maximum(route: "relay|other.test|7443|device", fallback: 15, now: 160) == 15, "Another route used this route's bitrate")
+        let expiry = 100 + MediaStartingBitrate.lifetime
+        try check(memory.maximum(route: direct, fallback: 20, now: expiry - 1) == 3 && memory.maximum(route: direct, fallback: 20, now: expiry) == 20
+                  && memory.maximum(route: direct, fallback: 20, now: 50) == 20,
+                  "A stale or future entry still set the starting bitrate")
+        // A session that ended on its way down may have met a worse path: it can lower the default, never raise it.
+        memory.remember(50, reducing: true, route: relay, now: 200)
+        memory.remember(3, reducing: true, route: direct, now: 200)
+        try check(memory.maximum(route: relay, fallback: 15, now: 210) == 15 && memory.maximum(route: direct, fallback: 20, now: 210) == 3,
+                  "A session that ended while reducing raised the default starting cap, or lost its lower level")
+        memory.remember(0, reducing: false, route: direct, now: 220); memory.remember(8, reducing: false, route: direct, now: .nan)
+        try check(memory.maximum(route: direct, fallback: 20, now: 230) == 3, "An invalid value replaced a valid one")
+        for index in 0..<40 { memory.remember(4, reducing: false, route: "direct|host-\(index)|5908", now: 300 + Double(index)) }
+        try check(memory.maximum(route: "direct|host-39|5908", fallback: 20, now: 400) == 4
+                  && memory.maximum(route: "direct|host-0|5908", fallback: 20, now: 400) == 20,
+                  "The memory was unbounded or dropped its newest route")
+        // The remembered value only caps the start; the ceiling still bounds it.
+        let ceiling = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 30)
+        let capped = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates, now: 0)
+        try check(capped.startingSettings(maximumMegabits: 3).megabits == 3 && capped.startingSettings(maximumMegabits: 50) == ceiling,
+                  "A remembered bitrate exceeded the chosen ceiling or was not applied")
+    }
+
+    run("A bitrate counts as settled only after thirty seconds in effect, not while climbing or collapsing") {
+        let ceiling = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 20)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
+                                             appliedSize: (1920, 1200), now: 0)
+        for second in 1...29 { _ = quality.observe(sample(received: 1), now: Double(second)) }
+        try check(quality.settledMegabits == nil, "A bitrate settled before it was held for thirty seconds")
+        _ = quality.observe(sample(received: 1), now: 30); _ = quality.observe(sample(received: 1), now: 31)
+        try check(quality.settledMegabits == 20, "A bitrate held for thirty seconds did not settle: \(String(describing: quality.settledMegabits))")
+        // A collapse in the last seconds of a session leaves the settled level where it was.
+        var time = 31.0
+        for _ in 0..<3 {
+            time += 1
+            if let next = quality.observe(sample(delivery: 600), now: time) { _ = quality.confirmApplied(next, now: time) }
+        }
+        try check(quality.effective.megabits < 10 && quality.settledMegabits == 20, "A collapse of a few seconds replaced the settled bitrate")
+        // The lower level becomes the settled one only after it lasted as well.
+        for _ in 0..<32 { time += 1; _ = quality.observe(sample(received: 0.2), now: time) }
+        try check(quality.settledMegabits == quality.effective.megabits, "A sustained lower bitrate did not become the settled one")
+        // Another route, and time spent suspended, do not count towards settling.
+        quality.setLocalNetwork(true, now: time)
+        try check(quality.settledMegabits == nil, "A route change kept the previous route's settled bitrate")
+        quality.setLocalNetwork(false, now: time)
+        for _ in 0..<20 { time += 1; _ = quality.observe(sample(received: 0.2), now: time) }
+        quality.resetObservation(now: time)
+        for _ in 0..<20 { time += 1; _ = quality.observe(sample(received: 0.2), now: time) }
+        try check(quality.settledMegabits == nil, "Time before a suspension counted towards a settled bitrate")
+    }
+
     run("Network condition follows delay growth; loss and jitter count only with it, and all need evidence") {
         try check(sample(loss: 0.12).networkCondition == .healthy && sample(loss: 0.04).networkCondition == .healthy
                   && sample(jitter: 80).networkCondition == .healthy && sample(loss: 0.12).measuredLoss == 0.12,

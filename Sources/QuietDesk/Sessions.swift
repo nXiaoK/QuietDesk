@@ -140,6 +140,8 @@ final class ViewerSession {
     var mediaCommitted = false
     var pointerSequence: UInt64 = 0
     var mediaQuality: MediaQualityPolicy?
+    /// Identifies this session's video route for the starting-bitrate memory; nil when it takes no part.
+    var startingBitrateRoute: String?
     var automaticVideoSettings: StreamSettings?
     var automaticVideoAdjustment: MediaQualityPolicy.Adjustment?
     var terminationSubscribed = false

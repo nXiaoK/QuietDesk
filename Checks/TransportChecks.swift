@@ -12,6 +12,17 @@ func runTransportChecks() {
         try check(SecureTransport.connectionFailureReason(.tls(-9800)) == nil, "TLS error was classified as network failure")
     }
 
+    run("Encrypted media datagrams are marked interactive video; control and mapping keep their classes") {
+        let media = try MediaSecureTransport.dtlsParameters(sessionKey: Data(repeating: 0x42, count: 32), identity: Data("media".utf8))
+        try check(media.serviceClass == .interactiveVideo, "Media datagrams lost their interactive video class")
+        let key = try PairingKey.generate()
+        try check(try MediaSecureTransport.tlsParameters(key: key, roles: [.control]).serviceClass == .bestEffort
+                  && SecureTransport.parameters(key: key).serviceClass == .bestEffort,
+                  "The control connection changed its service class")
+        try check(try MediaSecureTransport.tlsParameters(key: key, roles: [.portMapping]).serviceClass == .background,
+                  "Port mapping lost its background class")
+    }
+
     run("Pairing TLS failures before readiness stop reconnecting") {
         for code in [errSSLBadRecordMac, errSSLPeerDecryptError, errSSLPeerHandshakeFail] {
             let failure = SecureTransport.tlsFailure(code: code, description: "test", afterReady: false)

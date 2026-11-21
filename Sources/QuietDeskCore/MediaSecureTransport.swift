@@ -62,7 +62,10 @@ public enum MediaSecureTransport {
         sec_protocol_options_set_peer_authentication_required(dtls.securityProtocolOptions, false)
         sec_protocol_options_set_tls_tickets_enabled(dtls.securityProtocolOptions, false)
         sec_protocol_options_set_tls_resumption_enabled(dtls.securityProtocolOptions, false)
-        return NWParameters(dtls: dtls, udp: NWProtocolUDP.Options())
+        let parameters = NWParameters(dtls: dtls, udp: NWProtocolUDP.Options())
+        // Interactive video: Wi-Fi schedules it in the video access category instead of best effort.
+        parameters.serviceClass = .interactiveVideo
+        return parameters
     }
 
     public static func negotiatedRole(on connection: NWConnection) -> MediaChannelRole? {

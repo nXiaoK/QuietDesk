@@ -96,7 +96,10 @@ final class RelayUDPPipe {
     init(endpoint: RelayEndpoint, port: UInt16, id: Data, key: Data, side: UInt8, queue: DispatchQueue) throws {
         guard id.count == 16, key.count == 32, side <= 1, port > 0 else { throw RelayServiceError.invalid }
         self.id = id; self.key = key; self.side = side; self.queue = queue
-        connection = NWConnection(host: NWEndpoint.Host(endpoint.host), port: NWEndpoint.Port(rawValue: port)!, using: .udp)
+        // The relayed datagrams are the desktop's interactive video, and are marked like the direct path.
+        let parameters = NWParameters.udp
+        parameters.serviceClass = .interactiveVideo
+        connection = NWConnection(host: NWEndpoint.Host(endpoint.host), port: NWEndpoint.Port(rawValue: port)!, using: parameters)
     }
 
     func start() {

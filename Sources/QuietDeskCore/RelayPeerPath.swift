@@ -673,6 +673,8 @@ final class RelayPeerSocket {
         guard bound else { Darwin.close(descriptor); throw RelayTransportError.network }
         // Video bursts are much larger than the default UDP buffers; a smaller system limit only means more drops.
         _ = option(SOL_SOCKET, SO_RCVBUF, 2 << 20); _ = option(SOL_SOCKET, SO_SNDBUF, 2 << 20)
+        // The punched path carries the same interactive video as the relayed one.
+        _ = option(SOL_SOCKET, SO_NET_SERVICE_TYPE, NET_SERVICE_TYPE_VI)
         self.descriptor = descriptor
         port = UInt16(bigEndian: address.sin6_port)
         source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: queue)

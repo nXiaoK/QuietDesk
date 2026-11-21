@@ -1,5 +1,16 @@
 # 构建与检查记录
 
+## Windows 版第一版：Mac 控制 Windows、Windows 控制 Mac（2026-11-22）
+
+- 新增 `windows/`（Rust）：`core` 为与平台无关的协议实现（TLS 1.2 / PSK / AES-128-GCM 由随源码构建的 OpenSSL 3.6.3 提供、消息与会话、键位与修饰键映射、BGRA/NV12 转换与缩放、光标绘制），`app` 为原生 Win32 程序（桌面复制采集并回退 GDI、Media Foundation H.264 编解码、`SendInput`、Direct2D 窗口、DPAPI 保存配对码），`probe` 为检查用的无界面两端。Windows 端按“旧版基线协议”互通：视频走控制连接、三帧确认窗口，只声明已实现的能力（动态画质至 60 fps、控制状态、空闲暂停、结束通知、手动文字剪贴板）。**macOS 应用源码未改动**，现有发行版即可互通。
+- 方案取舍：TLS 选 OpenSSL 而不自写握手；先用 `openssl` 命令行与 Network.framework 在回环上验证了两个方向、带与不带 ALPN、主机同时登记映射 PSK 时均可互通。交叉编译用固定并校验 SHA-256 的 llvm-mingw 20261104 与 Rust 1.100.0 的 `x86_64-pc-windows-gnullvm`；`Cargo.lock` 中 86 个依赖发布均已满 7 天（6 个更新的版本已回退）。
+- `run-windows-interop-checks.sh`：`core` 单元测试 47 项、Rust 两端回环 2 项通过（重复 40 轮无失败）；与本机 Swift 实现的互通 11 项通过，连续 6 次全通过。覆盖 Mac 控制端 → Windows 被控端与 Windows 控制端 → Mac 被控端：配对、Hello 能力字段、首帧前画质协商、VideoToolbox 解码 Windows 端封装的码流、Mac `MediaSession` 发出的帧与编码器输出逐字节一致、确认窗口、画质上限与失败回退、暂停恢复关键帧、键位/修饰键/点击计数/滚轮经 Mac 自身 `InputInjector` 生成的事件、剪贴板文字、结束通知、错误配对码。
+- 检查中发现并修正的自身缺陷：关闭连接时丢弃对端最后发出的结束通知（约 1/40 概率，改为半关闭后等待对端收尾）；握手期间对端直接断开被报成配对码错误；Wine 的编码器不支持按需关键帧且会先缓存约 54 帧（改为必要时重建编码器，且一帧没有输出也计入帧间隔）；互通夹具未持有已接受的连接。另确认一条既有行为：Mac 控制端配对码错误时，Network.framework 把被控端的告警报为 `-9820` 并停在等待状态，对 Mac 被控端也是如此，未改动。
+- `build-windows.sh`：生成 `outputs/windows/QuietDesk-0.7.3-Windows-x64.zip`（`QuietDesk.exe` 约 6.3 MB，PE32+ GUI x86-64），导入表只含 Windows 自带的库。`run-windows-wine-checks.sh`（Wine 10.0，linux/amd64 容器）：GDI 采集 1280×800、编码 240 帧并解码（两个关键帧位置正确）、Windows 被控端与 Windows 控制端互连解码约 180 帧通过；主窗口在 Wine 中可创建，控件位置正常（容器无中文字体，文字未核对）。
+- 边界：**没有在任何真实 Windows 电脑上运行过**。Wine 没有桌面复制、编解码来自 GStreamer、未验证 `SendInput`、键盘钩子、Direct2D 上屏、DPAPI、防火墙与高 DPI；Windows 自带 H.264 编码器的低延迟模式、按需关键帧与参数集位置只按文档实现。真实延迟、帧率与画质没有数据。Windows 版未代码签名，未接入 `run-all-checks.sh`、CI 与发布流程。
+- 未实现并保留：UDP 视频与纠错、中继、独立光标、远端声音、自动剪贴板与文件、多显示器、HEVC、硬件编码与 GPU 缩放、端口映射、断线自动重连、以系统服务运行（UAC/锁屏）、Windows ARM64 包、macOS 端对“对端是 Windows”的界面文案。
+- 本轮既有检查：Python 测试 64 项通过；`run-all-checks.sh` 未执行（macOS 源码无改动）。未启动或中断生产连接（5908 端口未使用），未操作真实权限、剪贴板、钥匙串、登录项或输入源，未推送、安装或发布。用户工作区中未提交的 `AppChecks/MediaImpairmentChecks.swift` 与 `.idea/` 未触碰。本机新增：Rust 1.100.0 工具链及其 Windows 目标、Docker 镜像 `quietdesk-wine-check:local`、`work/toolchains/` 下的 llvm-mingw。中间文件在 `work/windows-client-20261121/`。
+
 ## 弱网、恢复与画质保持（2026-11-21）
 
 - 新增 `run-media-impairment-checks.sh`：真实 `MediaSession` 两端经回环 TLS/DTLS，密文代理按固定种子施加随机/突发丢包、延迟抖动、浅队列与深队列瓶颈、短时中断和控制连接延迟，合成编码端按帧窗口出帧并运行实际画质策略。默认 8 项为通过判定，已接入 `run-all-checks.sh`；`--matrix` 打印 12 个场景的测量值（含各档码率生效时间），`--only` 选场景，`--trace` 打印切换事务，用于改动前后对照。

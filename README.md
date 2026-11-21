@@ -61,6 +61,8 @@
 
 配对码等同控制凭据，请仅通过可信渠道传递。[权限与常见问题 →](docs/usage.md#permissions)
 
+**Mac 与 Windows 互控（第一版）**：仓库包含可在 macOS 上交叉编译的 Windows 版，支持 Mac 控制 Windows 与 Windows 控制 Mac，使用同样的配对码，macOS 版无需升级。该版本尚未在真实 Windows 电脑上验收，范围与限制见 [Windows 版说明](docs/windows.md)。
+
 ## 更新应用
 
 首次安装带更新器的版本仍需从 [Releases](https://github.com/nXiaoK/QuietDesk/releases/latest) 手动下载。当前仓库的更新公钥表为空，应用内更新入口保持关闭；维护者配置公钥并发布后，才会启用此功能。
@@ -78,7 +80,7 @@
 
 ## 文档与开发
 
-[详细使用](docs/usage.md) · [UDP/TCP 传输](docs/udp-tcp-transport.md) · [自托管中继](docs/relay.md) · [安全说明](docs/security.md) · [构建与检查](docs/development.md)
+[详细使用](docs/usage.md) · [Windows 版（第一版）](docs/windows.md) · [UDP/TCP 传输](docs/udp-tcp-transport.md) · [自托管中继](docs/relay.md) · [安全说明](docs/security.md) · [构建与检查](docs/development.md)
 
 已安装 Apple 命令行开发工具、Swift 5.9+ 和 Python 3 后，可在仓库中构建：
 

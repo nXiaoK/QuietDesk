@@ -60,6 +60,8 @@ These are UI demonstrations, not evidence of real-device performance or permissi
 
 Treat the pairing code as a remote-control credential and share it only through a trusted channel. [Permissions and troubleshooting (Chinese) →](docs/usage.md#permissions)
 
+**Mac and Windows (first version):** the repository contains a Windows build that is cross-compiled on macOS. A Mac can control a Windows PC and a Windows PC can control a Mac with the same pairing codes, and the macOS app needs no update. It has not been validated on a real Windows PC yet; see [the Windows notes (Chinese)](docs/windows.md) for scope and limits.
+
 ## Updating QuietDesk
 
 The first version with the updater must still be installed manually from [Releases](https://github.com/nXiaoK/QuietDesk/releases/latest). The repository currently has an empty update public-key table, so update controls remain hidden until the maintainer configures a public key and publishes an enabled build.
@@ -77,7 +79,7 @@ Release builds remain ad-hoc signed. **After every update, grant Screen Recordin
 
 ## Documentation & development
 
-[User guide (Chinese)](docs/usage.md) · [UDP/TCP transport (Chinese)](docs/udp-tcp-transport.md) · [Security (Chinese)](docs/security.md) · [Build & test (Chinese)](docs/development.md)
+[User guide (Chinese)](docs/usage.md) · [Windows build, first version (Chinese)](docs/windows.md) · [UDP/TCP transport (Chinese)](docs/udp-tcp-transport.md) · [Security (Chinese)](docs/security.md) · [Build & test (Chinese)](docs/development.md)
 
 With Apple Command Line Tools, Swift 5.9+ and Python 3 installed, run from the repository:
 

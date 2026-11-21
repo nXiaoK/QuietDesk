@@ -220,6 +220,25 @@ QUIETDESK_CHECK_BUILD_DIR="$PWD/.build/clipboard-checks" ./scripts/run-app-check
 
 本页说明运行方法，不记录本轮执行结果。[BUILD-AND-CHECKS.md](../BUILD-AND-CHECKS.md) 按功能或版本记录实际检查范围，旧版本记录不能作为当前源码或本地候选版的验收结论；已发布包及 CI 结果以对应 Releases、Actions 记录为准。
 
+## Windows 版开发与检查
+
+Windows 版位于 `windows/`（Rust 工作区，工具链版本固定在 `windows/rust-toolchain.toml`，依赖版本固定在 `windows/Cargo.lock`）：
+
+| 目录 | 内容 |
+| --- | --- |
+| `windows/core` | 与平台无关的协议实现：TLS-PSK（OpenSSL，随源码构建）、消息与会话、键位映射、像素转换；可在 macOS 上编译和测试 |
+| `windows/probe` | 无界面的被控端/控制端，供互通检查驱动 |
+| `windows/app` | Windows 程序：采集、Media Foundation 编解码、输入注入、Direct2D 窗口与界面；另含只用于检查的 `quietdesk-wincheck` |
+
+```sh
+./scripts/run-windows-interop-checks.sh            # core 的单元与回环测试，再与本机 Swift 实现双向互通
+./scripts/run-windows-interop-checks.sh --rust-only
+./scripts/run-windows-wine-checks.sh               # 交叉编译后在 Wine 容器中运行，需要 Docker
+./scripts/build-windows.sh                         # 生成 outputs/windows/ 下的 ZIP 与 SHA-256
+```
+
+`build-windows.sh` 使用 `scripts/windows-toolchain.sh` 准备 llvm-mingw（固定发行版并校验 SHA-256，放在 `work/toolchains/`）和 Rust 的 `x86_64-pc-windows-gnullvm` 目标，并检查可执行文件只导入 Windows 自带的库。构建缓存在 `work/windows-build/`。这些脚本尚未接入 `run-all-checks.sh` 与发布流程；各检查的范围和 Wine 的局限见 [Windows 版说明](windows.md#检查)。修改协议相关代码时，两端都要改：`Sources/QuietDeskCore` 与 `windows/core`，并运行互通检查。
+
 ## 中继开发与检查
 
 `./scripts/run-all-checks.sh` 也运行节点 vet/race、连接记录隔离和原生端到端回环测试；需要允许本机回环端口及系统视频服务。可单独执行：

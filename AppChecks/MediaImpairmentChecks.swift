@@ -328,12 +328,14 @@ private struct Outcome {
     var longestGap: TimeInterval = 0
     var highestLoss = 0.0
     var errors: [String] = []
+    // Diagnostic codes of the causes that moved video to another path (see MediaSwitchCause).
+    var switches: [Int] = []
     var toViewer = ImpairmentProxy.Counts()
     var usedTCP: Bool { states.contains { $0 != "UDP 视频" && $0.contains("TCP") } }
     var summary: String {
         "decoded=\(decoded)/\(submitted) blocked=\(creditBlocked) recoveries=\(recoveries) reductions=\(reductions) "
             + "final=\(finalSettings.summary) longestGap=\(Int(longestGap * 1_000))ms loss=\(String(format: "%.3f", highestLoss)) "
-            + "linkDropped=\(toViewer.dropped)/\(toViewer.dropped + toViewer.forwarded) tcp=\(usedTCP)"
+            + "linkDropped=\(toViewer.dropped)/\(toViewer.dropped + toViewer.forwarded) tcp=\(usedTCP) switches=\(switches)"
     }
 }
 
@@ -450,6 +452,7 @@ private func play(_ scenario: Scenario) throws -> Outcome {
                                                 settings: scenario.settings, udpEnabled: true)
             viewerMedia.update { $0 = media }
             media.onState = { state in outcome.update { if $0.states.last != state, $0.states.count < 64 { $0.states.append(state) } } }
+            media.onPathSwitch = { _, cause in outcome.update { if $0.switches.count < 16 { $0.switches.append(cause.diagnosticCode) } } }
             media.onDatagramLoss = { fraction in if let fraction { outcome.update { $0.highestLoss = max($0.highestLoss, fraction) } } }
             media.onLocalNetwork = { local in work.async { quality.setLocalNetwork(local, now: SessionClock.now) } }
             media.onReduceLoad = { cause in
@@ -498,7 +501,12 @@ private func play(_ scenario: Scenario) throws -> Outcome {
 private struct MediaImpairmentChecks {
     static func main() {
         var failures = 0
+        // `--only <text>` plays just the scenarios whose name contains the text.
+        let only = CommandLine.arguments.firstIndex(of: "--only").flatMap { index in
+            CommandLine.arguments.indices.contains(index + 1) ? CommandLine.arguments[index + 1] : nil
+        }
         func run(_ scenario: Scenario, _ verify: ((Outcome) throws -> Void)?) {
+            if let only, !scenario.name.contains(only) { return }
             do {
                 var attempt = 1
                 var played: Outcome?
@@ -543,6 +551,34 @@ private struct MediaImpairmentChecks {
             try expect(!outcome.usedTCP, "Light loss moved video off UDP: \(outcome.states)")
             try expect(outcome.finalSettings.megabits == 12, "Light loss lowered the bitrate")
             try expect(outcome.decoded >= 150 && outcome.recoveries <= 1, "Light loss broke playback")
+        }
+
+        var lossy = Scenario(name: "Five percent random loss without delay growth keeps the chosen bitrate")
+        lossy.seconds = 6
+        lossy.downlink = Impairment(loss: 0.05)
+        lossy.uplink = Impairment(loss: 0.05)
+        run(lossy) { outcome in
+            try expect(outcome.toViewer.dropped >= 150, "The proxy dropped too little to look like a lossy path")
+            try expect(outcome.finalSettings == lossy.settings, "Loss the transport repaired lowered the quality")
+            try expect(!outcome.usedTCP && outcome.decoded >= 300, "A lossy but uncongested path broke playback: \(outcome.states)")
+        }
+
+        var jittery = Scenario(name: "Delay jitter without loss keeps the chosen bitrate")
+        jittery.seconds = 6
+        jittery.downlink = Impairment(delay: 0.02, jitter: 0.04)
+        jittery.uplink = Impairment(delay: 0.02, jitter: 0.04)
+        run(jittery) { outcome in
+            try expect(outcome.finalSettings == jittery.settings, "Jitter alone lowered the quality")
+            try expect(!outcome.usedTCP && outcome.recoveries == 0 && outcome.decoded >= 250, "Jitter alone broke playback")
+        }
+
+        var narrow = Scenario(name: "A bottleneck a third of the stream still lowers the bitrate to what it carries")
+        narrow.seconds = 12
+        narrow.downlink = Impairment(delay: 0.015, bytesPerSecond: 500_000)
+        narrow.uplink = Impairment(delay: 0.015)
+        run(narrow) { outcome in
+            try expect(outcome.finalSettings.megabits <= 6, "Real congestion did not lower the bitrate")
+            try expect(outcome.decoded >= 150, "Video stopped flowing through the bottleneck")
         }
 
         if failures > 0 { exit(1) }

@@ -196,7 +196,7 @@ final class PortMappingManager: ObservableObject {
     func noteVideoPressure() { traffic.noteVideoPressure() }
 
     func observeVideo(_ sample: MediaPathSample) {
-        if sample.networkCondition == .congested || sample.networkCondition == .severe { traffic.noteVideoPressure() }
+        if sample.showsPathStress { traffic.noteVideoPressure() }
         else if let delay = sample.deliveryMilliseconds { traffic.noteVideoDeliveryDelay(delay) }
     }
 

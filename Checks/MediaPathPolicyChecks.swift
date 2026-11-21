@@ -725,9 +725,9 @@ func runMediaPathPolicyChecks() {
 
     run("Automatic quality recommendations wait for confirmation and never overwrite the preferred ceiling") {
         var quality = try MediaQualityPolicy(hostDefault: .highest, preferred: .highest, now: 0)
-        try check(quality.observe(sample(loss: 0.1), now: 0.5) == nil, "A loss window changed quality right after a change")
-        let recommendation = quality.observe(sample(loss: 0.1), now: 1.5)
-        // Severe loss halves the bitrate; at 8K-class sizes 30 Mbps is below the readable floor for 60 fps.
+        try check(quality.observe(sample(delivery: 600), now: 0.5) == nil, "A severe window changed quality right after a change")
+        let recommendation = quality.observe(sample(delivery: 600), now: 1.5)
+        // A severe queue halves the bitrate; at 8K-class sizes 30 Mbps is below the readable floor for 60 fps.
         let lower = StreamSettings(longestEdge: 8192, framesPerSecond: 30, megabits: 30)
         try check(recommendation == lower && quality.pending == lower && quality.effective == .highest,
                   "Recommendation changed actual settings before confirmation: \(String(describing: recommendation))")
@@ -995,33 +995,33 @@ func runMediaPathPolicyChecks() {
         quality.rejectPending(now: 6)
         try check(quality.pending == nil && quality.effective == .highest
                   && quality.reduceLoad(for: .network, now: 7) == nil, "Rejection changed actual quality or skipped spacing")
-        try check(quality.observe(sample(loss: 0.05), now: 9) == nil, "One congested window changed quality")
+        try check(quality.observe(sample(delivery: 200), now: 9) == nil, "One congested window changed quality")
         quality.resetObservation(now: 20)
-        try check(quality.observe(sample(loss: 0.05), now: 21) == nil, "Suspension retained congestion time")
+        try check(quality.observe(sample(delivery: 200), now: 21) == nil, "Suspension retained congestion time")
         try rejects("Invalid settings were accepted") {
             _ = try MediaQualityPolicy(hostDefault: StreamSettings(framesPerSecond: 999), now: 0)
         }
     }
 
-    run("Network adaptation trims bitrate on congestion, halves it on severe loss and keeps text readable") {
+    run("Network adaptation trims bitrate on congestion, halves it on a severe queue and keeps text readable") {
         let ceiling = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 30)
         var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
                                              appliedSize: (1920, 1240), now: 0)
-        try check(quality.observe(sample(loss: 0.05), now: 3) == nil, "One congested window changed quality")
-        let trimmed = quality.observe(sample(loss: 0.05), now: 4)
+        try check(quality.observe(sample(loss: 0.05, queue: 70), now: 3) == nil, "One congested window changed quality")
+        let trimmed = quality.observe(sample(loss: 0.05, queue: 70), now: 4)
         try check(trimmed == StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 20), "Congestion did not trim bitrate: \(String(describing: trimmed))")
         _ = quality.confirmApplied(trimmed!, now: 4)
         var steps: [StreamSettings] = []
         var time = 4.0
         for _ in 0..<6 {
             time += 1
-            if let next = quality.observe(sample(loss: 0.2), now: time) { steps.append(next); _ = quality.confirmApplied(next, now: time) }
+            if let next = quality.observe(sample(loss: 0.2, queue: 70), now: time) { steps.append(next); _ = quality.confirmApplied(next, now: time) }
         }
         try check(steps == [StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 10),
                             StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 5),
                             StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 2),
                             StreamSettings(longestEdge: 1280, framesPerSecond: 30, megabits: 1)],
-                  "Severe loss did not halve bitrate before lowering frame rate, then size: \(steps)")
+                  "Heavy loss with a growing queue did not halve bitrate before lowering frame rate, then size: \(steps)")
         var tcp = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates, now: 0)
         func reliable(_ delivery: Double?) -> MediaPathSample {
             sample(count: 0, loss: nil, jitter: nil, queue: nil, delivery: delivery)
@@ -1055,7 +1055,7 @@ func runMediaPathPolicyChecks() {
         while up == nil { time += 1; up = failing.observe(sample(), now: time) }
         _ = failing.confirmApplied(up!, now: time)
         time += 1
-        guard let down = failing.observe(sample(loss: 0.2), now: time) else { throw CheckFailure("Failed step was not reduced") }
+        guard let down = failing.observe(sample(delivery: 600), now: time) else { throw CheckFailure("Failed step was not reduced") }
         _ = failing.confirmApplied(down, now: time)
         try check(failing.bitrateHold == MediaQualityPolicy.initialBitrateHold * 2, "A bitrate step that failed soon did not back off")
         try check(failing.upgradeHold == MediaQualityPolicy.initialUpgradeHold, "A bitrate failure delayed frame rate or size upgrades")
@@ -1092,7 +1092,7 @@ func runMediaPathPolicyChecks() {
         try check(secondUp == StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 50), "Expected bitrate upgrade within probation")
         _ = bothProbation.confirmApplied(secondUp!, now: pTime)
         pTime += 1
-        guard let bothReduced = bothProbation.observe(sample(loss: 0.2), now: pTime) else { throw CheckFailure("Expected reduction after combined upgrade") }
+        guard let bothReduced = bothProbation.observe(sample(delivery: 600), now: pTime) else { throw CheckFailure("Expected reduction after combined upgrade") }
         _ = bothProbation.confirmApplied(bothReduced, now: pTime)
         try check(bothProbation.bitrateHold == MediaQualityPolicy.initialBitrateHold * 2
                   && bothProbation.upgradeHold == MediaQualityPolicy.initialUpgradeHold * 2,
@@ -1108,7 +1108,8 @@ func runMediaPathPolicyChecks() {
         var waits: [Int] = []
         for second in 1...386 {
             // Scrolling at 1.4 Mbps qualifies for pixel recovery but does not fill half the 3 Mbps target.
-            // A 4 Mbps probe congests this path before the requested 60 fps becomes affordable.
+            // A 4 Mbps probe makes this path lose packets before the requested 60 fps becomes affordable:
+            // loss that arrives with an upgrade still on probation takes the upgrade back.
             let probing = quality.effective.megabits == 4
             let observation = probing ? sample(loss: 0.05) : sample(received: 1.4)
             let now = Double(second)
@@ -1163,17 +1164,91 @@ func runMediaPathPolicyChecks() {
         try rejects("Unknown bitrate steps were accepted") { _ = try MediaQualityPolicy(hostDefault: native, bitRates: [7, 9], now: 0) }
     }
 
-    run("Network condition classifies loss, delivery growth and queueing, and needs evidence") {
-        try check(sample(loss: 0.12).networkCondition == .severe && sample(loss: 0.04).networkCondition == .congested
-                  && sample(loss: 0.0).networkCondition == .healthy && sample(loss: 0.02).networkCondition == nil,
-                  "UDP loss thresholds changed")
+    run("Network condition follows delay growth; loss and jitter count only with it, and all need evidence") {
+        try check(sample(loss: 0.12).networkCondition == .healthy && sample(loss: 0.04).networkCondition == .healthy
+                  && sample(jitter: 80).networkCondition == .healthy && sample(loss: 0.12).measuredLoss == 0.12,
+                  "Loss or jitter without delay growth was classified as congestion")
+        try check(sample(loss: 0.12, queue: 70).networkCondition == .severe && sample(loss: 0.04, queue: 70).networkCondition == .congested
+                  && sample(loss: 0.02, queue: 70).networkCondition == nil && sample(loss: 0.12, delivery: 90).networkCondition == .severe,
+                  "Loss corroborated by delay growth changed its thresholds")
         try check(sample(queue: 150).networkCondition == .congested && sample(queue: 70).networkCondition == nil,
                   "Queue thresholds changed")
         func reliable(_ delivery: Double?) -> MediaPathSample { sample(count: 0, loss: nil, jitter: nil, queue: nil, delivery: delivery) }
         try check(reliable(600).networkCondition == .severe && reliable(200).networkCondition == .congested
                   && reliable(20).networkCondition == .healthy && reliable(nil).networkCondition == nil,
                   "Delivery thresholds changed")
-        try check(sample(count: 2, loss: 0.5).networkCondition == nil, "Sparse UDP windows were classified")
+        try check(sample(count: 2, loss: 0.5).networkCondition == nil && sample(count: 2, loss: 0.5).measuredLoss == nil,
+                  "Sparse UDP windows were classified")
+        // Transfers sharing the path yield on any stress, including what quality adaptation tolerates.
+        try check(sample(loss: 0.04).showsPathStress && sample(jitter: 40).showsPathStress && reliable(200).showsPathStress
+                  && !sample().showsPathStress && !sample(count: 2, loss: 0.5).showsPathStress && !reliable(20).showsPathStress,
+                  "Path stress for background transfers changed")
+    }
+
+    run("Loss without delay growth keeps the quality, and upgrades continue under it") {
+        let ceiling = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 20)
+        let start = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 10)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, applied: start,
+                                             bitRates: StreamSettings.adaptiveBitRates, appliedSize: (1920, 1200), now: 0)
+        var raised: [Int] = []
+        for second in 1...40 {
+            guard let next = quality.observe(sample(loss: 0.06, jitter: 60), now: Double(second)) else { continue }
+            try check(next.megabits > quality.effective.megabits, "Moderate loss or jitter alone lowered the bitrate: \(next)")
+            raised.append(next.megabits); _ = quality.confirmApplied(next, now: Double(second))
+        }
+        try check(raised == [15, 20] && quality.effective == ceiling && quality.toleratedLoss == 0,
+                  "A lossy but uncongested path did not reach its ceiling: \(raised)")
+    }
+
+    run("Heavy loss that ignores a lower bitrate is the path's own: the settings return and it is tolerated") {
+        let ceiling = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 20)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
+                                             appliedSize: (1920, 1200), now: 0)
+        try check(quality.observe(sample(loss: 0.15, received: 12), now: 1) == nil, "One heavy-loss window changed quality")
+        // The probe lowers what is actually sent: three quarters of the 12 Mbps received, not of the 20 Mbps target.
+        let probe = quality.observe(sample(loss: 0.15, received: 12), now: 2)
+        try check(probe == StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 8) && quality.lastAdjustment == .network,
+                  "Sustained heavy loss did not probe a lower bitrate: \(String(describing: probe))")
+        _ = quality.confirmApplied(probe!, now: 2)
+        try check(quality.observe(sample(loss: 0.16, received: 7), now: 3) == nil
+                  && quality.observe(sample(loss: 0.14, received: 7), now: 4) == nil, "The loss probe was judged before three seconds")
+        let restored = quality.observe(sample(loss: 0.15, received: 7), now: 5)
+        try check(restored == ceiling && quality.lastAdjustment == .raise && quality.toleratedLoss >= 0.15,
+                  "Loss that stayed at a lower bitrate did not restore the settings: \(String(describing: restored))")
+        _ = quality.confirmApplied(ceiling, now: 5)
+        for second in 6...40 {
+            try check(quality.observe(sample(loss: 0.17, received: 12), now: Double(second)) == nil,
+                      "Tolerated loss lowered the quality again")
+        }
+        // Clearly more loss than the path showed before is new evidence.
+        var again: StreamSettings?
+        for second in 41...43 where again == nil { again = quality.observe(sample(loss: 0.4, received: 12), now: Double(second)) }
+        try check(again?.megabits == 6, "Loss far above the tolerated level did not probe again: \(String(describing: again))")
+        // A new route or a manual choice forgets what the old path tolerated.
+        quality.rejectPending(now: 43)
+        _ = try quality.chooseManually(ceiling, now: 44)
+        try check(quality.toleratedLoss == 0, "A manual choice kept the previous path's loss tolerance")
+    }
+
+    run("Heavy loss that falls with the bitrate was congestion: the reduction stays") {
+        let ceiling = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 20)
+        for stillFull in [false, true] {
+            var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
+                                                 appliedSize: (1920, 1200), now: 0)
+            _ = quality.observe(sample(loss: 0.3, received: 8), now: 1)
+            // A quarter lost and more: the probe halves what the path delivered.
+            guard let probe = quality.observe(sample(loss: 0.3, received: 8), now: 2) else { throw CheckFailure("No loss probe") }
+            try check(probe.megabits == 4, "A policed path was not probed below what it delivered: \(probe)")
+            _ = quality.confirmApplied(probe, now: 2)
+            // Either the loss is gone, or it stays while the path still delivers all it did before.
+            let after = stillFull ? sample(loss: 0.3, received: 8) : sample(loss: 0.01, received: 3.9)
+            for second in 3...5 {
+                let next = quality.observe(after, now: Double(second))
+                try check(next == nil || next!.megabits < probe.megabits, "A congested path got its bitrate back: \(String(describing: next))")
+                if let next { _ = quality.confirmApplied(next, now: Double(second)) }
+            }
+            try check(quality.toleratedLoss == 0 && quality.effective.megabits <= 4, "Congestion loss was tolerated")
+        }
     }
 
     run("Delivery estimator reports growth over its recent minimum and forgets an old baseline") {
@@ -1222,8 +1297,9 @@ func runMediaPathPolicyChecks() {
         guard let sustained = jitter.takeWindowMilliseconds(), sustained >= 30 else {
             throw CheckFailure("Sustained RTT variation did not cross the 30 ms congestion threshold")
         }
-        try check(sample(jitter: sustained).networkCondition == .congested && sample(jitter: spikeJitter).networkCondition == .healthy,
-                  "Measured UDP jitter did not drive MediaPathSample network condition")
+        try check(sample(jitter: sustained).showsPathStress && !sample(jitter: spikeJitter).showsPathStress
+                  && sample(jitter: sustained).networkCondition == .healthy,
+                  "Measured UDP jitter did not mark path stress, or was taken for congestion")
         jitter.reset()
         try check(jitter.takeWindowMilliseconds() == nil, "Reset jitter estimator retained old samples")
     }

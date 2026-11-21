@@ -133,30 +133,49 @@ public struct MediaPathSample: Sendable {
         }
     }
 
+    /// Loss this high breaks frames faster than repair restores them.
+    public static let heavyLoss = 0.10
+    /// Below that, loss counts as congestion only together with growing delay.
+    public static let corroboratedLoss = 0.03
+
+    /// Loss in a window with enough datagrams to trust it.
+    public var measuredLoss: Double? { hasDatagramEvidence ? lossFraction : nil }
+
     var bottleneck: MediaBottleneck? {
-        // Direct loss/jitter/delivery evidence survives a simultaneous compute bottleneck. A queue alone does not.
-        if hasDatagramEvidence, (lossFraction ?? 0) >= 0.03 || (jitterMilliseconds ?? 0) >= 30 { return .network }
+        // Delivery growth survives a simultaneous compute bottleneck. A queue or loss alone does not:
+        // the path may lose that much at any bitrate, while the codec time is measured.
         if (deliveryMilliseconds ?? 0) >= 150 { return .network }
         // The slower codec is the one named, so the time per frame reported with it is its own.
         if let computeMilliseconds, computeMilliseconds >= frameBudgetMilliseconds * Self.computeMargin {
             return (decodeMilliseconds ?? 0) > (encodeMilliseconds ?? 0) ? .decoder : .encoder
         }
-        if hasDatagramEvidence, (queueMilliseconds ?? 0) >= 60 { return .network }
+        if hasDatagramEvidence, (queueMilliseconds ?? 0) >= 60 || (lossFraction ?? 0) >= Self.heavyLoss { return .network }
         return nil
     }
 
-    // Loss is the primary UDP signal; delivery growth covers TCP, where the system hides loss as delay.
-    // The coordinator leaves keyframes out of the queue figure, so pacing one large frame is not congestion.
+    // Growing delay is the congestion signal on UDP and TCP alike: frames are queueing on the path.
+    // Loss or jitter without it belongs to the path (radio, a lossy hop); repair and FEC carry that and
+    // a lower bitrate would not, so loss joins this verdict only when delay corroborates it.
+    // The coordinator leaves keyframes and repaired frames out of the delay figures, so pacing one
+    // large frame or waiting for a retransmission is not congestion.
     public var networkCondition: MediaNetworkCondition? {
         guard hasNetworkEvidence else { return nil }
-        let datagram = hasDatagramEvidence
-        let loss = datagram ? lossFraction ?? 0 : 0
-        let queue = datagram ? queueMilliseconds ?? 0 : 0
+        let loss = measuredLoss ?? 0
+        let queue = hasDatagramEvidence ? queueMilliseconds ?? 0 : 0
         let delivery = deliveryMilliseconds ?? 0
-        if loss >= 0.10 || delivery >= 500 { return .severe }
-        if loss >= 0.03 || delivery >= 150 || queue >= 120 || (datagram && (jitterMilliseconds ?? 0) >= 30) { return .congested }
-        if loss < 0.01, delivery < 80, queue < 60 { return .healthy }
-        return nil
+        let delayed = delivery >= 80 || queue >= 60
+        if delivery >= 500 || (loss >= Self.heavyLoss && delayed) { return .severe }
+        if delivery >= 150 || queue >= 120 || (loss >= Self.corroboratedLoss && delayed) { return .congested }
+        return delayed ? nil : .healthy
+    }
+
+    /// Any sign of stress on the video path, including loss and jitter that quality adaptation
+    /// tolerates. Background transfers sharing the path yield on it.
+    public var showsPathStress: Bool {
+        guard hasNetworkEvidence else { return false }
+        if (deliveryMilliseconds ?? 0) >= 150 { return true }
+        guard hasDatagramEvidence else { return false }
+        return (lossFraction ?? 0) >= Self.corroboratedLoss || (queueMilliseconds ?? 0) >= 120 || (jitterMilliseconds ?? 0) >= 30
     }
 }
 
@@ -515,6 +534,11 @@ public struct MediaPathPolicy: Sendable {
 // longest edge drop only once the bitrate is too low to keep them sharp. Raising the bitrate needs healthy
 // windows in which video actually filled a meaningful part of it, so a quiet screen never proves a level
 // the path cannot carry. Compute pressure lowers the frame rate to what the codec sustains before the size.
+//
+// Loss without delay growth lowers the bitrate only when it is heavy or arrived with an upgrade still on
+// probation. The first reduction for heavy loss is a probe: when the loss stays although less is sent
+// and delivered, the path loses that much at any bitrate, so the previous settings return and that much
+// loss is tolerated from then on instead of walking the quality down to its floor.
 public struct MediaQualityPolicy: Sendable {
     // An upgrade reduced again within the probation window failed; each failure doubles the healthy
     // time needed before the next one, so an unsustainable level is not retried every few seconds.
@@ -527,6 +551,12 @@ public struct MediaQualityPolicy: Sendable {
     /// Sustained zero-loss healthy decoded duration after which degraded resolution/FPS may step back up
     /// even when normal office/coding screen activity stays below half of the current bitrate target.
     public static let degradedPixelRecoveryHold: TimeInterval = 45
+    /// Seconds of loss measurements after a loss probe applied that decide whether it helped.
+    public static let lossTrialDuration: TimeInterval = 3
+    /// Loss still at this share of what caused the probe did not respond to the lower bitrate.
+    public static let unresponsiveLossShare = 0.7
+    /// Tolerated loss fades over about this long once the path stops losing.
+    public static let lossToleranceMemory: TimeInterval = 60
     /// Initial bitrate cap for non-LAN direct WAN targets before path capacity is proven.
     public static let wanDirectStartingMegabits = 20
     /// Initial bitrate cap for relayed targets, leaving headroom above Retina 60 fps readable floor.
@@ -631,6 +661,32 @@ public struct MediaQualityPolicy: Sendable {
     private var localLatencyLimited = false
     private var localRoundTrip: (milliseconds: Double, at: TimeInterval)?
     private var localRoundTripCongestedDuration: TimeInterval = 0
+    // A reduction made to learn whether loss follows the bitrate, and what it measured once applied.
+    private struct LossProbe: Sendable {
+        let trigger: Double
+        let received: Double?
+        let restore: StreamSettings
+        let settings: StreamSettings
+        var measured = LossEvidence()
+    }
+    // Time-weighted loss and received bitrate over consecutive windows.
+    private struct LossEvidence: Sendable {
+        var duration: TimeInterval = 0
+        private var lossSum = 0.0, receivedSum = 0.0, receivedDuration: TimeInterval = 0
+        var loss: Double { duration > 0 ? lossSum / duration : 0 }
+        var received: Double? { receivedDuration > 0 ? receivedSum / receivedDuration : nil }
+        mutating func add(loss: Double, received: Double?, elapsed: TimeInterval) {
+            duration += elapsed; lossSum += loss * elapsed
+            if let received { receivedSum += received * elapsed; receivedDuration += elapsed }
+        }
+    }
+    /// Loss this path showed at a lower bitrate as well; up to about it, loss alone changes nothing.
+    public private(set) var toleratedLoss = 0.0
+    private var lossEvidence = LossEvidence()
+    private var lossProbe: LossProbe?
+    private var smoothedLoss: Double?
+    // Loss before the upgrade now on probation: loss well above it came with the higher rate.
+    private var lossBeforeUpgrade = 0.0
 
     /// `bitRates` are the steps the host accepts; the ceiling itself always comes from the user or host.
     public init(hostDefault: StreamSettings, preferred: StreamSettings? = nil, applied: StreamSettings? = nil,
@@ -667,6 +723,7 @@ public struct MediaQualityPolicy: Sendable {
         bitrateUpgradedAt = nil; pixelsUpgradedAt = nil
         slowEdges.removeAll(); lastAdjustment = nil; localLatencyLimited = false; localRoundTrip = nil
         mappedBitrateHoldUntil = -.infinity
+        forgetLoss()
         pending = effective == settings ? nil : settings
         pendingUpgrade = nil
         return pending
@@ -678,6 +735,7 @@ public struct MediaQualityPolicy: Sendable {
         isLocalNetwork = enabled
         mappedBitrateHoldUntil = -.infinity
         localLatencyLimited = false; localRoundTrip = nil
+        forgetLoss()
         lastObservationAt = now
         resetEvidence()
     }
@@ -806,17 +864,27 @@ public struct MediaQualityPolicy: Sendable {
             return reduceLoad(for: cause, computeMilliseconds: sample.computeMilliseconds, now: now)
         }
         computeDuration = 0; lastBottleneck = nil
+        let loss = sample.measuredLoss
+        if let loss { smoothedLoss = smoothedLoss.map { $0 + (loss - $0) * 0.3 } ?? loss }
         switch sample.networkCondition {
         case .severe?:
-            congestedDuration = 0; healthyDuration = 0; activeDuration = 0; filledDuration = 0
+            congestedDuration = 0; lossEvidence = LossEvidence(); healthyDuration = 0; activeDuration = 0; filledDuration = 0
             return reduceLoad(for: .network, severe: true, now: now)
         case .congested?:
             healthyDuration = 0; activeDuration = 0; filledDuration = 0; peakComputeMilliseconds = nil
+            lossEvidence = LossEvidence()
             congestedDuration += elapsed
             guard congestedDuration + mediaPolicyTimeTolerance >= 2 else { return nil }
             return reduceLoad(for: .network, now: now)
         case .healthy?:
             congestedDuration = 0
+            if let loss {
+                switch judgeLoss(loss, received: sample.receivedMegabits, elapsed: elapsed, now: now) {
+                case .tolerated: break
+                case .unproven: healthyDuration = 0; activeDuration = 0; filledDuration = 0; return nil
+                case .change(let next): return next
+                }
+            }
             guard sample.decodedFrames > 0 else { return nil }
             healthyDuration += elapsed
             if let compute = sample.computeMilliseconds { peakComputeMilliseconds = max(peakComputeMilliseconds ?? 0, compute) }
@@ -829,9 +897,76 @@ public struct MediaQualityPolicy: Sendable {
             return upgrade(now: now)
         case nil:
             // Between thresholds, or a quiet screen: neither a reason to reduce nor proof for more.
-            congestedDuration = 0
+            congestedDuration = 0; lossEvidence = LossEvidence()
             return nil
         }
+    }
+
+    private enum LossVerdict { case tolerated, unproven, change(StreamSettings) }
+
+    // Loss in a window without delay growth. Tolerated loss lets the window count as healthy; unproven
+    // loss neither changes anything yet nor supports an upgrade.
+    private mutating func judgeLoss(_ loss: Double, received: Double?, elapsed: TimeInterval, now: TimeInterval) -> LossVerdict {
+        if let smoothedLoss, smoothedLoss * 2 < toleratedLoss {
+            toleratedLoss -= (toleratedLoss - smoothedLoss * 2) * min(1, elapsed / Self.lossToleranceMemory)
+        }
+        if let probe = lossProbe, probe.settings != effective { lossProbe = nil }
+        if var probe = lossProbe {
+            probe.measured.add(loss: loss, received: received, elapsed: elapsed)
+            guard probe.measured.duration + mediaPolicyTimeTolerance >= Self.lossTrialDuration else {
+                lossProbe = probe
+                return .unproven
+            }
+            lossProbe = nil
+            // A full path keeps delivering what it can carry; random loss delivers less when less is sent.
+            let after = probe.measured.loss
+            let deliveredLess = probe.received.flatMap { before in probe.measured.received.map { $0 <= before * 0.9 } } ?? true
+            if after >= probe.trigger * Self.unresponsiveLossShare, deliveredLess {
+                toleratedLoss = max(toleratedLoss, after, probe.trigger)
+                lossEvidence = LossEvidence()
+                let restore = withinCeiling(probe.restore)
+                guard restore != effective else { return .tolerated }
+                lastAdjustment = .raise
+                return .change(recommend(restore, now: now))
+            }
+        }
+        let onProbation = bitrateUpgradedAt != nil || pixelsUpgradedAt != nil
+        let risen = onProbation && loss >= max(MediaPathSample.corroboratedLoss, lossBeforeUpgrade * 2 + 0.01)
+        guard loss > toleratedLoss * 1.3 + 0.02, loss >= MediaPathSample.heavyLoss || risen else {
+            lossEvidence = LossEvidence()
+            return .tolerated
+        }
+        lossEvidence.add(loss: loss, received: received, elapsed: elapsed)
+        guard lossEvidence.duration + mediaPolicyTimeTolerance >= 2, now - lastChangeAt + mediaPolicyTimeTolerance >= 2 else { return .unproven }
+        let evidence = lossEvidence
+        lossEvidence = LossEvidence()
+        // Loss that came with an upgrade still on probation takes that upgrade back.
+        if risen { return reduceLoad(for: .network, now: now).map { .change($0) } ?? .unproven }
+        let current = withinCeiling(effective)
+        guard current == effective else { return .change(recommendReduction(current, adjustment: .network, now: now)) }
+        // The probe has to lower what is actually sent, which a quiet screen keeps below the target.
+        var sent = current
+        if let received = evidence.received, received < Double(current.megabits) { sent.megabits = max(1, Int(received.rounded(.up))) }
+        var next = networkReduction(from: sent, factor: evidence.loss >= 0.25 ? 0.5 : 0.75)
+        next.megabits = min(next.megabits, current.megabits)
+        guard next != effective else {
+            // Nothing lower to try: the remaining choice is to carry the loss.
+            toleratedLoss = max(toleratedLoss, evidence.loss)
+            return .tolerated
+        }
+        let recommended = recommendReduction(next, adjustment: .network, now: now)
+        lossProbe = LossProbe(trigger: evidence.loss, received: evidence.received, restore: effective, settings: next)
+        return .change(recommended)
+    }
+
+    private func withinCeiling(_ settings: StreamSettings) -> StreamSettings {
+        StreamSettings(longestEdge: min(settings.longestEdge, upperBound.longestEdge),
+                       framesPerSecond: min(settings.framesPerSecond, upperBound.framesPerSecond),
+                       megabits: min(settings.megabits, upperBound.megabits))
+    }
+
+    private mutating func forgetLoss() {
+        toleratedLoss = 0; lossProbe = nil; smoothedLoss = nil; lossBeforeUpgrade = 0; lossEvidence = LossEvidence()
     }
 
     // A full send window can hold decoded FPS below target even after the relative delay estimator
@@ -883,13 +1018,13 @@ public struct MediaQualityPolicy: Sendable {
 
     public mutating func rejectPending(now: TimeInterval) {
         guard accept(now) else { return }
-        pending = nil; pendingUpgrade = nil; lastChangeAt = now; lastObservationAt = now
+        pending = nil; pendingUpgrade = nil; lossProbe = nil; lastChangeAt = now; lastObservationAt = now
         resetEvidence()
     }
 
     public mutating func resetObservation(now: TimeInterval) {
         guard accept(now) else { return }
-        lastObservationAt = now; localRoundTrip = nil; mappedBitrateHoldUntil = -.infinity; resetEvidence()
+        lastObservationAt = now; localRoundTrip = nil; mappedBitrateHoldUntil = -.infinity; forgetLoss(); resetEvidence()
     }
 
     private mutating func accept(_ now: TimeInterval) -> Bool {
@@ -1015,13 +1150,14 @@ public struct MediaQualityPolicy: Sendable {
 
     private mutating func recommendUpgrade(_ settings: StreamSettings, kind: UpgradeKind, now: TimeInterval) -> StreamSettings {
         let recommended = recommend(settings, now: now)
+        lossBeforeUpgrade = smoothedLoss ?? 0
         pendingUpgrade = kind
         lastAdjustment = .raise
         return recommended
     }
 
     private mutating func recommend(_ settings: StreamSettings, now: TimeInterval) -> StreamSettings {
-        pending = settings; pendingUpgrade = nil; lastChangeAt = now; resetEvidence()
+        pending = settings; pendingUpgrade = nil; lastChangeAt = now; lossProbe = nil; resetEvidence()
         return settings
     }
 
@@ -1054,6 +1190,6 @@ public struct MediaQualityPolicy: Sendable {
     private mutating func resetEvidence() {
         mappedCreditWaitDuration = 0
         computeDuration = 0; congestedDuration = 0; healthyDuration = 0; activeDuration = 0; filledDuration = 0; lastBottleneck = nil
-        peakComputeMilliseconds = nil; localRoundTripCongestedDuration = 0
+        peakComputeMilliseconds = nil; localRoundTripCongestedDuration = 0; lossEvidence = LossEvidence()
     }
 }

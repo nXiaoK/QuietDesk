@@ -1376,7 +1376,8 @@ public final class MediaSession: @unchecked Sendable {
                 // The reassembler owns this wait, so late, repeated or expired fragments cannot leave stale timing.
                 if feedback.kind == .reassembled, let waited = receiver?.collectionDuration(of: feedback.header) {
                     // The sender paces each frame at about the target rate; only time beyond that is queueing.
-                    if !feedback.header.isIDR {
+                    // A frame that waited for a retransmission or FEC measures the repair, not the path's queue.
+                    if !feedback.header.isIDR, receiver?.wasRepaired(feedback.header) != true {
                         let paced = Self.udpPacingSpan(payloadBytes: receiver?.fragmentedBytes(of: feedback.header) ?? 0,
                                                        megabits: settings.megabits)
                         sampleWaitMilliseconds = max(sampleWaitMilliseconds, max(0, waited - paced) * 1000)
@@ -1438,6 +1439,8 @@ public final class MediaSession: @unchecked Sendable {
             if recentNackEvents.count < 128 {
                 recentNackEvents.append((now, missingCount))
             }
+            // Its delivery time now includes a repair round trip, which is loss rather than queueing.
+            deliverySentAt.removeValue(forKey: targetHeader)
             accepted = filtered
         }
         if feedback.kind == .reassembled || feedback.kind == .decoded, let sent = deliverySentAt.removeValue(forKey: feedback.header) {

@@ -127,6 +127,8 @@ public final class MediaFrameReassembler {
         var lastProgressAt: TimeInterval
         var lastNackAt: TimeInterval?
         var requestedThroughTail = false
+        // Completed with a retransmission, a NACK in flight or FEC rather than by plain arrival.
+        var repaired = false
         var bytes: Data
         var received: [Bool]
         var late: [Bool]
@@ -335,8 +337,9 @@ public final class MediaFrameReassembler {
             }
             missingGap = missingFrames.removeValue(forKey: fragment.header.frameID)
             assembly = Assembly(fragment, now: now)
-            if missingGap?.requested == true, assembly.fragmentCount == 1 {
-                assembly.requestedThroughTail = true
+            if missingGap?.requested == true {
+                assembly.repaired = true
+                if assembly.fragmentCount == 1 { assembly.requestedThroughTail = true }
             }
             assemblies[fragment.header.frameID] = assembly
             bufferedBytes += fragment.frameBytes
@@ -352,6 +355,7 @@ public final class MediaFrameReassembler {
         } else {
             assembly.bytes.replaceSubrange(range, with: fragment.payload)
             assembly.markReceived(index, at: now, reorderDelay: limits.reorderDelay)
+            if isRepair { assembly.repaired = true }
             let missingHoleLate = missingGap.map { $0.requested || now - $0.firstSeenAt >= limits.reorderDelay } ?? false
             if missingHoleLate || (isRepair && assembly.requestedThroughTail) { assembly.late[index] = true }
             if assembly.receivedCount == assembly.fragmentCount {
@@ -452,6 +456,7 @@ public final class MediaFrameReassembler {
         assembly.bytes.replaceSubrange(missingStart..<(missingStart + expectedLength),
                                        with: recovered.prefix(expectedLength))
         assembly.markReceived(missingIndex, at: now, reorderDelay: limits.reorderDelay)
+        assembly.repaired = true
         do {
             assembly.frame = try MediaFrame(header: assembly.header, packetBytes: assembly.bytes)
             assembly.completedAt = now
@@ -598,6 +603,7 @@ public final class MediaFrameReassembler {
                 }
                 assembly.bytes.replaceSubrange(byteStart..<(byteStart + expectedLength), with: fullBytes.prefix(expectedLength))
                 assembly.markReceived(fragmentIndex, at: now, reorderDelay: limits.reorderDelay)
+                assembly.repaired = true
             }
         }
 
@@ -662,6 +668,14 @@ public final class MediaFrameReassembler {
         return completedAt - assembly.firstReceivedAt
     }
 
+    /// Whether a held fragmented frame completed only through repair: a fragment that missed the reorder
+    /// window, a retransmission or FEC. Its collection time then measures the repair, not path queueing.
+    public func wasRepaired(_ header: MediaFrameHeader) -> Bool? {
+        guard let assembly = assemblies[header.frameID], assembly.header == header, assembly.fragmented,
+              assembly.completedAt != nil else { return nil }
+        return assembly.repaired || assembly.late.contains(true)
+    }
+
     /// Delay until the earliest pending NACK check for a missing frame or fragment hole, if any.
     public var nextPollDelay: TimeInterval? {
         guard !requiresRecovery else { return nil }
@@ -708,6 +722,7 @@ public final class MediaFrameReassembler {
             let missing = assembly.missingRanges(at: now, limits: limits)
             if !missing.isEmpty, let feedback = try? MediaFeedback(kind: .nack, header: assembly.header, missingRanges: missing) {
                 assembly.lastNackAt = now
+                assembly.repaired = true
                 // Once a NACK spans the final fragment it has requested every remaining hole in this frame.
                 if let last = missing.last, Int(last.first) + Int(last.count) == assembly.fragmentCount {
                     assembly.requestedThroughTail = true

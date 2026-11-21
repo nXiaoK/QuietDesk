@@ -157,8 +157,8 @@ final class DeskModel: ObservableObject {
         }
     }
     var mediaRouteSummary: String { mediaLoss.isEmpty ? mediaTransportStatus : mediaTransportStatus + " · " + mediaLoss }
-    /// UDP loss at the level adaptive quality treats as congestion; the full-screen status shows it in red.
-    var mediaLossHigh: Bool { (mediaLossFraction ?? 0) >= 0.03 }
+    /// UDP loss at the level adaptive quality counts as congestion once delay grows with it; the full-screen status shows it in red.
+    var mediaLossHigh: Bool { (mediaLossFraction ?? 0) >= MediaPathSample.corroboratedLoss }
     private var mediaRouteValue = ""
     private var peerPathState = RelayPeerPathState.relay
     @Published var connectionDiagnosticsEnabled = UserDefaults.standard.bool(forKey: "connectionDiagnosticsEnabled") {

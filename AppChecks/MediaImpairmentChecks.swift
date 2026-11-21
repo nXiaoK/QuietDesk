@@ -338,6 +338,8 @@ private struct Outcome {
     var latencies: [TimeInterval] = []
     // Seconds each recovery took on the viewer, from "recovering" to a committed path.
     var recoveryTimes: [TimeInterval] = []
+    // Applied settings over time, as seconds after arming and megabits@fps.
+    var timeline: [String] = []
     // Diagnostic codes of the causes that moved video to another path (see MediaSwitchCause).
     var switches: [Int] = []
     var toViewer = ImpairmentProxy.Counts()
@@ -353,7 +355,7 @@ private struct Outcome {
             + "final=\(finalSettings.summary) latency p50/p95/max=\(latency(0.5))/\(latency(0.95))/\(latency(1))ms "
             + "longestGap=\(Int(longestGap * 1_000))ms loss=\(String(format: "%.3f", highestLoss)) "
             + "linkDropped=\(toViewer.dropped)/\(toViewer.dropped + toViewer.forwarded) tcp=\(usedTCP) switches=\(switches) "
-            + "recoveryMs=\(recoveryTimes.map { Int($0 * 1_000) })"
+            + "recoveryMs=\(recoveryTimes.map { Int($0 * 1_000) }) timeline=\(timeline.joined(separator: " "))"
     }
 }
 
@@ -369,6 +371,21 @@ private func play(_ scenario: Scenario) throws -> Outcome {
     func fail(_ message: String) {
         guard !finished.get() else { return }
         outcome.update { if $0.errors.count < 8 { $0.errors.append(message) } }
+    }
+    let armedAt = Shared<TimeInterval?>(nil)
+    // `--trace` prints states, switch transactions and settings with the time since the link was armed.
+    let tracing = CommandLine.arguments.contains("--trace")
+    func trace(_ text: @autoclosure () -> String) {
+        guard tracing, let armed = armedAt.get() else { return }
+        print(String(format: "TRACE %7.3f ", SessionClock.now - armed) + text())
+    }
+    func traceControl(_ side: String, _ message: Message) {
+        guard tracing, message.kind == .mediaControl, let value = try? MediaControl.read(message.payload),
+              value.operation != .stats else { return }
+        // Read from the encoded message, so the harness also builds against revisions without the field.
+        let fast = String(decoding: message.payload, as: UTF8.self).contains("\"fast\":true")
+        trace("\(side) received \(value.operation.rawValue) \(value.path ?? "") epoch \(value.transportEpoch.map(String.init) ?? "-")"
+              + (fast ? " fast" : "") + (value.mediaFailure == true ? " mediaFailure" : ""))
     }
 
     // Synthetic encoder state, owned by `work`.
@@ -423,11 +440,12 @@ private func play(_ scenario: Scenario) throws -> Outcome {
                     work.async {
                         guard let media else { return }
                         if producing { outcome.update { $0.recoveries += 1 } }
+                        trace("host produces keyframe")
                         submit(idr: true, bytes: scenario.idrBytes, to: media)
                     }
                 }
                 media.onResumeFrames = { work.async { held = false; if !producing { producing = true; schedule(); streaming.signal() } } }
-                peer.onMessageHandled = { message, resume in _ = media.receive(message); resume() }
+                peer.onMessageHandled = { message, resume in traceControl("host", message); _ = media.receive(message); resume() }
                 media.start()
             } catch { fail("host setup: \(error)") }
         }
@@ -460,7 +478,12 @@ private func play(_ scenario: Scenario) throws -> Outcome {
             hostMedia.get()?.updateSettings(next, restartsStream: !inPlace)
             viewerMedia.get()?.updateSettings(next, restartsStream: !inPlace)
             _ = quality.confirmApplied(next, now: SessionClock.now)
-            outcome.update { $0.finalSettings = next }
+            let elapsed = armedAt.get().map { SessionClock.now - $0 } ?? 0
+            trace("settings \(next.summary)")
+            outcome.update {
+                $0.finalSettings = next
+                if $0.timeline.count < 24 { $0.timeline.append(String(format: "%.1fs:%d@%d", elapsed, next.megabits, next.framesPerSecond)) }
+            }
             if !inPlace { schedule() }
         }
     }
@@ -472,6 +495,7 @@ private func play(_ scenario: Scenario) throws -> Outcome {
             let recoveringSince = Shared<TimeInterval?>(nil)
             media.onState = { state in
                 outcome.update { if $0.states.last != state, $0.states.count < 64 { $0.states.append(state) } }
+                trace("viewer state \(state)")
                 if state == "正在恢复画面" { recoveringSince.update { $0 = $0 ?? SessionClock.now } }
                 else if state.hasSuffix("视频"), let since = recoveringSince.get() {
                     recoveringSince.update { $0 = nil }
@@ -504,7 +528,7 @@ private func play(_ scenario: Scenario) throws -> Outcome {
                 outcome.update { $0.decoded += 1; $0.decodedBytes += frame.packet.avcc.count; $0.latencies.append(now - expected.at) }
                 complete(true)
             }
-            client.onMessageHandled = { message, resume in _ = media.receive(message); resume() }
+            client.onMessageHandled = { message, resume in traceControl("viewer", message); _ = media.receive(message); resume() }
             media.start()
         } catch { fail("viewer setup: \(error)") }
     }
@@ -517,6 +541,7 @@ private func play(_ scenario: Scenario) throws -> Outcome {
         throw FixtureUnavailable(description: "Clean loopback did not start on UDP: \(outcome.get().states)")
     }
     proxy.arm(downlink: scenario.downlink, uplink: scenario.uplink, controlDelay: scenario.controlDelay)
+    armedAt.update { $0 = SessionClock.now }
     Thread.sleep(forTimeInterval: scenario.seconds)
     var result = outcome.get()
     result.toViewer = proxy.counts().toViewer
@@ -677,6 +702,15 @@ private struct MediaImpairmentChecks {
         narrow.seconds = 12
         narrow.downlink = Impairment(delay: 0.015, bytesPerSecond: 500_000); narrow.uplink = Impairment(delay: 0.015)
         scenarios.append(narrow)
+        // A deep queue delays instead of dropping: delay grows for seconds before anything is lost.
+        var bloated = Scenario(name: "4 Mbps bottleneck with a two-second queue under a 12 Mbps stream")
+        bloated.seconds = 14
+        bloated.downlink = Impairment(delay: 0.015, bytesPerSecond: 500_000, queueBytes: 1_000_000); bloated.uplink = Impairment(delay: 0.015)
+        scenarios.append(bloated)
+        var marginal = Scenario(name: "10 Mbps bottleneck with a one-second queue under a 12 Mbps stream")
+        marginal.seconds = 14
+        marginal.downlink = Impairment(delay: 0.015, bytesPerSecond: 1_250_000, queueBytes: 1_250_000); marginal.uplink = Impairment(delay: 0.015)
+        scenarios.append(marginal)
         var bursty = Scenario(name: "six-frame bursts of 4x-budget frames, clean link with 10 ms delay")
         bursty.seconds = 8
         bursty.frameBytes = { settings, index in

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "probe"]
+members = ["core", "probe", "app"]
 
 [workspace.package]
 edition = "2024"
@@ -10,6 +10,7 @@ publish = false
 
 [workspace.dependencies]
 quietdesk-core = { path = "core" }
+flexi_logger = { version = "0.31.10", default-features = false }
 log = "0.4.34"
 openssl = { version = "0.10.82", features = ["vendored"] }
 serde = { version = "1.0.229", features = ["derive"] }

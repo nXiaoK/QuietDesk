@@ -342,6 +342,18 @@ final class DeskModel: ObservableObject {
     @Published var minimizeAtLogin = UserDefaults.standard.object(forKey: "minimizeAtLogin") as? Bool ?? true {
         didSet { UserDefaults.standard.set(minimizeAtLogin, forKey: "minimizeAtLogin") }
     }
+    @Published var lanDiscoveryAdvertiseEnabled = UserDefaults.standard.bool(forKey: "lanDiscoveryAdvertise") {
+        didSet {
+            UserDefaults.standard.set(lanDiscoveryAdvertiseEnabled, forKey: "lanDiscoveryAdvertise")
+            updateHostBonjourService()
+        }
+    }
+    @Published private(set) var lanScanning = false
+    @Published private(set) var discoveredLANHosts: [DiscoveredLANHost] = []
+    @Published private(set) var lanScanStatus = ""
+    @Published var wakeStatusNotice: String?
+    private var lanScanner: BonjourLANScanner?
+    private var lanScanStopTask: Task<Void, Never>?
     weak var mainWindow: NSWindow?
     let canvas = RemoteCanvas()
 
@@ -1283,6 +1295,7 @@ final class DeskModel: ObservableObject {
                     self.hostStartupPhase = .listener
                     try self.ensureHostListener(key: key, port: port)
                     self.active = true
+                    self.updateHostBonjourService()
                     // Keep hidden sharing responsive; a clock alone cannot exempt App Nap scheduling delays.
                     self.activity = ProcessInfo.processInfo.beginActivity(
                         options: [.idleSystemSleepDisabled, .idleDisplaySleepDisabled, .userInitiated, .latencyCritical],
@@ -1410,7 +1423,20 @@ final class DeskModel: ObservableObject {
         }
         mappingServer = portMappings.makeHost(pairingKey: key)
         listener = server
+        updateHostBonjourService()
         server.start(queue: DispatchQueue(label: "quietdesk.listener"))
+    }
+
+    private func updateHostBonjourService() {
+        guard mode == .host, let listener else { return }
+        if lanDiscoveryAdvertiseEnabled, (hostingRequested || active) {
+            listener.service = BonjourDiscovery.nwListenerService(
+                name: Host.current().localizedName ?? "QuietDesk Mac",
+                deviceID: trafficHistoryStore.localDeviceID
+            )
+        } else {
+            listener.service = nil
+        }
     }
 
     private func hostListenerFailed(_ reason: String) {
@@ -1995,6 +2021,7 @@ final class DeskModel: ObservableObject {
 
     private func connect(savedRelayRoute: RelayConnectionInfo?) {
         guard !active, !working else { return }
+        stopLANScan()
         remoteName = ""
         connectionError = nil
         if sibling?.hasIncomingControlConnection == true {
@@ -2901,12 +2928,12 @@ final class DeskModel: ObservableObject {
         catch { self.error = "连接记录已移除，但保存的锁屏密码未能删除：\(error.localizedDescription)" }
     }
 
-    private func saveConnection(name: String) {
+    private func saveConnection(name: String, remoteDeviceID: UUID? = nil) {
         guard activeRouteBenchmarkOverride == nil, !savedTarget, let target else { return }
         do {
             let existing = ConnectionStore.matching(connections, address: target.address, port: target.port, preferredID: target.recordID, relay: target.relay)
             var record = existing
-                ?? ConnectionRecord(address: target.address, port: target.port, name: name, videoSettings: viewerQualityPolicy.preferred, chromaSubsampling: savedChromaPreference, relay: target.relay)
+                ?? ConnectionRecord(address: target.address, port: target.port, name: name, videoSettings: viewerQualityPolicy.preferred, chromaSubsampling: savedChromaPreference, relay: target.relay, deviceID: remoteDeviceID)
             // Relay device IDs are scoped to a node, so another node gets its own record. This session
             // authenticated with the source record's pairing code, which proves it is the same Mac, so
             // that record's lock screen password follows.
@@ -2917,6 +2944,7 @@ final class DeskModel: ObservableObject {
                 Self.setAutoUnlock(Self.autoUnlocks(source), for: record.id)
             }
             record.address = target.address; record.port = target.port; record.relay = target.relay
+            if let remoteDeviceID { record.deviceID = remoteDeviceID }
             record.name = name
             record.lastConnected = Date()
             try KeyStore.save(target.key, account: "remote." + record.id.uuidString)
@@ -2925,6 +2953,127 @@ final class DeskModel: ObservableObject {
             try ConnectionStore.save(connections)
             savedTarget = true
         } catch { self.error = "已连接，但快捷连接保存失败：\(error.localizedDescription)" }
+    }
+
+    func toggleLANScan() {
+        if lanScanning {
+            stopLANScan()
+        } else {
+            startLANScan()
+        }
+    }
+
+    func startLANScan(durationSeconds: TimeInterval = 15) {
+        guard mode == .viewer, !active, !working else { return }
+        stopLANScan()
+        let scanner = BonjourLANScanner(excludedDeviceID: trafficHistoryStore.localDeviceID)
+        lanScanner = scanner
+        lanScanning = true
+        discoveredLANHosts = []
+        lanScanStatus = "正在扫描局域网内开启发现广播的 Mac…"
+        scanner.onUpdate = { [weak self, weak scanner] hosts in
+            DispatchQueue.main.async {
+                guard let self, let scanner, self.lanScanner === scanner else { return }
+                self.discoveredLANHosts = hosts
+                if self.lanScanning {
+                    self.lanScanStatus = hosts.isEmpty
+                        ? "正在扫描局域网内开启发现广播的 Mac…"
+                        : "已发现 \(hosts.count) 台局域网 Mac"
+                }
+            }
+        }
+        scanner.onError = { [weak self, weak scanner] message in
+            DispatchQueue.main.async {
+                guard let self, let scanner, self.lanScanner === scanner else { return }
+                self.stopLANScan()
+                self.lanScanStatus = message
+            }
+        }
+        scanner.start()
+        let clampedSeconds = max(3, min(60, durationSeconds))
+        lanScanStopTask = Task { [weak self, weak scanner] in
+            do { try await Task.sleep(for: .seconds(clampedSeconds)) } catch { return }
+            guard let self, let scanner, self.lanScanner === scanner, self.lanScanning else { return }
+            self.stopLANScan()
+            self.lanScanStatus = self.discoveredLANHosts.isEmpty
+                ? "扫描结束 · 未发现开启「局域网发现」的 Mac"
+                : "扫描完成 · 共发现 \(self.discoveredLANHosts.count) 台局域网 Mac"
+        }
+    }
+
+    func stopLANScan(clearResults: Bool = false) {
+        lanScanStopTask?.cancel()
+        lanScanStopTask = nil
+        lanScanner?.stop()
+        lanScanner = nil
+        if lanScanning {
+            lanScanning = false
+        }
+        if clearResults {
+            discoveredLANHosts = []
+            lanScanStatus = ""
+        } else if !discoveredLANHosts.isEmpty {
+            lanScanStatus = "已发现 \(discoveredLANHosts.count) 台局域网 Mac"
+        } else if lanScanStatus.hasPrefix("正在扫描") {
+            lanScanStatus = ""
+        }
+    }
+
+    func hasSavedCredential(for discovered: DiscoveredLANHost) -> Bool {
+        guard let matched = BonjourDiscovery.matchingRecord(for: discovered, in: connections) else { return false }
+        return (try? KeyStore.load(account: "remote." + matched.id.uuidString)) != nil
+    }
+
+    func connectOrFillDiscoveredHost(_ discovered: DiscoveredLANHost) {
+        guard mode == .viewer, !active, !working else { return }
+        if sibling?.hasIncomingControlConnection == true {
+            connectionError = "这台 Mac 正在被另一台 Mac 控制；对方断开后才能连接其他 Mac，共享无需关闭"
+            return
+        }
+        stopLANScan()
+        let matched = BonjourDiscovery.matchingRecord(for: discovered, in: connections)
+        relayStrategy = .direct
+        address = discovered.host
+        port = String(discovered.port)
+        selectedConnectionID = matched?.id
+        connectionError = nil
+        if let matched, let savedKey = try? KeyStore.load(account: "remote." + matched.id.uuidString) {
+            viewerCode = savedKey.code
+            connect(savedRelayRoute: nil)
+        }
+    }
+
+    func saveWakeOnLAN(_ configuration: WakeOnLANConfiguration?, for recordID: UUID) throws {
+        guard let index = connections.firstIndex(where: { $0.id == recordID }) else {
+            throw DeskError.invalid("未找到对应的已保存连接记录")
+        }
+        var updated = connections
+        updated[index].wakeOnLAN = configuration
+        try ConnectionStore.save(updated)
+        connections = updated
+        if let configuration {
+            wakeStatusNotice = "已为「\(ConnectionEntryPresentation.title(updated[index]))」保存网络唤醒配置（\(configuration.macAddress.formatted)）"
+        } else {
+            wakeStatusNotice = "已清除「\(ConnectionEntryPresentation.title(updated[index]))」的网络唤醒配置"
+        }
+    }
+
+    func sendWakeOnLAN(for record: ConnectionRecord) {
+        guard let configuration = record.wakeOnLAN else {
+            wakeStatusNotice = "此设备尚未配置物理网卡 MAC 地址，请先在更多操作中配置网络唤醒"
+            return
+        }
+        do {
+            let directHint = record.address.trimmingCharacters(in: .whitespacesAndNewlines)
+            let endpoints = try WakeOnLANSender.send(
+                configuration,
+                directHost: directHint.isEmpty ? nil : directHint
+            )
+            let routeSummary = endpoints.prefix(2).map(\.label).joined(separator: "、")
+            wakeStatusNotice = "已向 \(routeSummary) 发送「\(ConnectionEntryPresentation.title(record))」的网络唤醒魔术包（\(configuration.macAddress.formatted)）；实际唤醒取决于目标 Mac 电源与有线网络设置。"
+        } catch {
+            wakeStatusNotice = "发送网络唤醒包失败：\(error.localizedDescription)"
+        }
     }
 
     private func recordDisconnect(_ reason: String) {
@@ -3149,7 +3298,7 @@ final class DeskModel: ObservableObject {
                 pauseTransmission.choose(paused: true)
             }
             if freshFrameRequiredOnReconnect { pauseTransmission.requireFreshFrame() }
-            saveConnection(name: hello.name)
+            saveConnection(name: hello.name, remoteDeviceID: hello.deviceID)
             if activeRouteBenchmarkOverride == nil, hello.deviceIdentityExchange == true, let id = trafficHistoryStore.localDeviceID {
                 peer.send(try Wire.json(.deviceIdentity, DeviceIdentity(id: id, name: Host.current().localizedName ?? "这台 Mac")))
             }
@@ -5327,7 +5476,11 @@ final class DeskModel: ObservableObject {
         freshFrameRequiredOnReconnect = false
         sessionPauseStatus = ""
         hostingRequested = false
-        if mode == .host, !mappingHosting { closeHostListener() }
+        if mode == .viewer { stopLANScan() }
+        if mode == .host {
+            if !mappingHosting { closeHostListener() }
+            else { updateHostBonjourService() }
+        }
         relaySelectedForTarget = false
         relayFallbackAttempted = false
         relayFallbackCooldown.reset()

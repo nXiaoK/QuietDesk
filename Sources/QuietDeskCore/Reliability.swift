@@ -24,7 +24,7 @@ public struct RelayFallbackCooldown {
     public mutating func reset() { failures = 0; retryAt = 0 }
 }
 
-public struct ConnectionRecord: Codable, Identifiable, Equatable {
+public struct ConnectionRecord: Codable, Identifiable, Equatable, Sendable {
     public let id: UUID
     public var address: String
     public var port: UInt16
@@ -33,14 +33,18 @@ public struct ConnectionRecord: Codable, Identifiable, Equatable {
     public var videoSettings: StreamSettings?
     public var chromaSubsampling: VideoChromaSubsampling?
     public var relay: RelayConnectionInfo?
-    public init(id: UUID = UUID(), address: String, port: UInt16, name: String, lastConnected: Date = Date(), videoSettings: StreamSettings? = nil, chromaSubsampling: VideoChromaSubsampling? = nil, relay: RelayConnectionInfo? = nil) {
+    public var deviceID: UUID?
+    public var wakeOnLAN: WakeOnLANConfiguration?
+    public init(id: UUID = UUID(), address: String, port: UInt16, name: String, lastConnected: Date = Date(), videoSettings: StreamSettings? = nil, chromaSubsampling: VideoChromaSubsampling? = nil, relay: RelayConnectionInfo? = nil, deviceID: UUID? = nil, wakeOnLAN: WakeOnLANConfiguration? = nil) {
         self.id = id; self.address = address; self.port = port; self.name = name; self.lastConnected = lastConnected
         self.videoSettings = videoSettings
         self.chromaSubsampling = chromaSubsampling
         self.relay = relay
+        self.deviceID = deviceID
+        self.wakeOnLAN = wakeOnLAN
     }
     private enum CodingKeys: String, CodingKey {
-        case id, address, port, name, lastConnected, videoSettings, chromaSubsampling, relay, higherFrameRateVideoSettings
+        case id, address, port, name, lastConnected, videoSettings, chromaSubsampling, relay, higherFrameRateVideoSettings, deviceID, wakeOnLAN
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -52,6 +56,8 @@ public struct ConnectionRecord: Codable, Identifiable, Equatable {
         videoSettings = try values.decodeIfPresent(StreamSettings.self, forKey: .videoSettings)
         chromaSubsampling = try? values.decode(VideoChromaSubsampling.self, forKey: .chromaSubsampling)
         relay = try values.decodeIfPresent(RelayConnectionInfo.self, forKey: .relay)
+        deviceID = try? values.decode(UUID.self, forKey: .deviceID)
+        wakeOnLAN = try? values.decode(WakeOnLANConfiguration.self, forKey: .wakeOnLAN)
         if let higher = try? values.decode(StreamSettings.self, forKey: .higherFrameRateVideoSettings),
            higher.framesPerSecond > 60, (try? higher.validateControlValues()) != nil,
            higher.highRefreshCompatible == videoSettings {
@@ -68,6 +74,8 @@ public struct ConnectionRecord: Codable, Identifiable, Equatable {
         try values.encodeIfPresent(videoSettings?.highRefreshCompatible, forKey: .videoSettings)
         try values.encodeIfPresent(chromaSubsampling, forKey: .chromaSubsampling)
         try values.encodeIfPresent(relay, forKey: .relay)
+        try values.encodeIfPresent(deviceID, forKey: .deviceID)
+        try values.encodeIfPresent(wakeOnLAN, forKey: .wakeOnLAN)
         if let videoSettings, videoSettings.framesPerSecond > 60 {
             try values.encode(videoSettings, forKey: .higherFrameRateVideoSettings)
         }

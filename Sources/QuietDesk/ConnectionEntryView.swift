@@ -36,6 +36,12 @@ enum ConnectionEntryPresentation {
         guard !query.isEmpty else { return records }
         return records.filter { record in
             var fields = [record.name, record.address, String(record.port)]
+            if let deviceID = record.deviceID {
+                fields.append(deviceID.uuidString)
+            }
+            if let wake = record.wakeOnLAN {
+                fields.append(wake.macAddress.formatted)
+            }
             if let relay = record.relay {
                 fields += [relay.deviceID.uuidString, relay.endpoint.host, String(relay.endpoint.port)]
             }
@@ -118,6 +124,10 @@ struct RecentConnectionsView: View {
     var runningMappingsCount: (ConnectionRecord) -> Int = { _ in 0 }
     var preFlight: ConnectionPreFlightSummary? = nil
     var openPreferences: (() -> Void)? = nil
+    var wakeRecord: ((ConnectionRecord) -> Void)? = nil
+    var configureWakeRecord: ((ConnectionRecord) -> Void)? = nil
+    var wakeNotice: String? = nil
+    var dismissWakeNotice: (() -> Void)? = nil
 
     private var matches: [ConnectionRecord] { ConnectionEntryPresentation.matching(records, query: query) }
     private var searching: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -140,11 +150,30 @@ struct RecentConnectionsView: View {
                     .disabled(locked)
             }
 
+            if let wakeNotice, !wakeNotice.isEmpty {
+                HStack(alignment: .center, spacing: 10) {
+                    Image(systemName: "bolt.horizontal.fill")
+                        .foregroundStyle(Color.accentColor)
+                    Text(wakeNotice)
+                        .font(.caption)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if let dismissWakeNotice {
+                        Button("收起", action: dismissWakeNotice)
+                            .buttonStyle(.link)
+                            .font(.caption)
+                    }
+                }
+                .padding(10)
+                .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            }
+
             if matches.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("没有匹配的连接记录")
                         .font(.callout.weight(.semibold))
-                    Text("试试设备名称、域名、IP 或完整设备标识，也可以清除搜索条件。")
+                    Text("试试设备名称、域名、IP、MAC 或完整设备标识，也可以清除搜索条件。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -167,7 +196,9 @@ struct RecentConnectionsView: View {
                             connect: { connect(record) },
                             remove: { remove(record) },
                             benchmark: { benchmark(record) },
-                            openMapping: { openMapping(record) }
+                            openMapping: { openMapping(record) },
+                            wake: wakeRecord.map { fn in { fn(record) } },
+                            configureWake: configureWakeRecord.map { fn in { fn(record) } }
                         )
                         .disabled(locked)
                     }
@@ -240,6 +271,8 @@ private struct ConnectionDeskCard: View {
     let remove: () -> Void
     let benchmark: () -> Void
     let openMapping: () -> Void
+    var wake: (() -> Void)? = nil
+    var configureWake: (() -> Void)? = nil
 
     private var badgeColor: Color {
         switch badge?.tone {
@@ -342,6 +375,13 @@ private struct ConnectionDeskCard: View {
 
                 Spacer(minLength: 4)
 
+                if record.wakeOnLAN != nil, let wake {
+                    Button("唤醒", action: wake)
+                        .controlSize(.small)
+                        .help("发送 Wake-on-LAN 魔术包唤醒此设备（\(record.wakeOnLAN?.macAddress.formatted ?? "")）")
+                        .accessibilityLabel("网络唤醒 \(ConnectionEntryPresentation.title(record))")
+                }
+
                 Button("测速", action: benchmark)
                     .controlSize(.small)
                     .help("实测此记录可用的直连与各中继线路质量及丢包情况")
@@ -355,6 +395,12 @@ private struct ConnectionDeskCard: View {
                 Menu {
                     Button("测试线路质量…", action: benchmark)
                     Button("配置 TCP 端口映射…", action: openMapping)
+                    if record.wakeOnLAN != nil, let wake {
+                        Button("发送网络唤醒包 (WOL)", action: wake)
+                    }
+                    if let configureWake {
+                        Button(record.wakeOnLAN == nil ? "配置网络唤醒 (MAC)…" : "修改网络唤醒配置…", action: configureWake)
+                    }
                     Divider()
                     Button("移除此记录", role: .destructive, action: remove)
                 } label: {
@@ -382,6 +428,12 @@ private struct ConnectionDeskCard: View {
             Button("连接", action: connect)
             Button("测试线路质量…", action: benchmark)
             Button("配置 TCP 端口映射…", action: openMapping)
+            if record.wakeOnLAN != nil, let wake {
+                Button("发送网络唤醒包 (WOL)", action: wake)
+            }
+            if let configureWake {
+                Button(record.wakeOnLAN == nil ? "配置网络唤醒 (MAC)…" : "修改网络唤醒配置…", action: configureWake)
+            }
             Divider()
             Button("移除", role: .destructive, action: remove)
         }
@@ -473,6 +525,17 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
     var qualityBadge: (ConnectionRecord) -> ConnectionRecordCardBadge? = { _ in nil }
     var runningMappingsCount: (ConnectionRecord) -> Int = { _ in 0 }
     var preFlight: ConnectionPreFlightSummary? = nil
+    var lanScanning = false
+    var discoveredLANHosts: [DiscoveredLANHost] = []
+    var lanScanStatus = ""
+    var toggleLANScan: (() -> Void)? = nil
+    var dismissLANScan: (() -> Void)? = nil
+    var hasSavedCredentialForDiscovered: (DiscoveredLANHost) -> Bool = { _ in false }
+    var selectDiscoveredHost: (DiscoveredLANHost) -> Void = { _ in }
+    var wakeRecord: ((ConnectionRecord) -> Void)? = nil
+    var configureWakeRecord: ((ConnectionRecord) -> Void)? = nil
+    var wakeNotice: String? = nil
+    var dismissWakeNotice: (() -> Void)? = nil
     @State private var query = ""
     @State private var expandedRecords = false
     @FocusState private var focusedField: ConnectionEntryPresentation.Field?
@@ -505,7 +568,11 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                         qualityBadge: qualityBadge,
                         runningMappingsCount: runningMappingsCount,
                         preFlight: preFlight,
-                        openPreferences: openCaps
+                        openPreferences: openCaps,
+                        wakeRecord: wakeRecord,
+                        configureWakeRecord: configureWakeRecord,
+                        wakeNotice: wakeNotice,
+                        dismissWakeNotice: dismissWakeNotice
                     )
                 }
             }
@@ -627,16 +694,105 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                     }
                 }
 
+                if let toggleLANScan {
+                    Button(action: toggleLANScan) {
+                        Label(
+                            lanScanning ? "停止局域网扫描" : "扫描局域网 Mac",
+                            systemImage: lanScanning ? "stop.circle" : "dot.radiowaves.left.and.right"
+                        )
+                    }
+                    .disabled(locked)
+                }
+
                 Spacer(minLength: 0)
             }
             .buttonStyle(.link)
             .font(.caption)
+
+            if lanScanning || !discoveredLANHosts.isEmpty || !lanScanStatus.isEmpty {
+                lanDiscoverySection
+            }
         }
         .padding(18)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .strokeBorder(Color(nsColor: .separatorColor).opacity(0.65), lineWidth: 0.8)
+        }
+    }
+
+    private var lanDiscoverySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+            HStack(spacing: 8) {
+                if lanScanning {
+                    ProgressView()
+                        .controlSize(.mini)
+                } else {
+                    Image(systemName: "dot.radiowaves.left.and.right")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                Text(lanScanStatus.isEmpty ? "局域网发现" : lanScanStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                if !lanScanning, let dismissLANScan {
+                    Button("收起", action: dismissLANScan)
+                        .buttonStyle(.link)
+                        .font(.caption)
+                }
+            }
+
+            if !discoveredLANHosts.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(discoveredLANHosts) { host in
+                            let hasCredential = hasSavedCredentialForDiscovered(host)
+                            HStack(spacing: 10) {
+                                Image(systemName: "desktopcomputer")
+                                    .font(.system(size: 13.5, weight: .medium))
+                                    .foregroundStyle(Color.accentColor)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack(spacing: 5) {
+                                        Text(host.serviceName)
+                                            .font(.system(size: 12, weight: .semibold))
+                                            .lineLimit(1)
+                                        if hasCredential {
+                                            Text("已配对")
+                                                .font(.system(size: 9.5, weight: .semibold))
+                                                .foregroundStyle(Color(red: 0.07, green: 0.64, blue: 0.44))
+                                                .padding(.horizontal, 5)
+                                                .padding(.vertical, 1.5)
+                                                .background(Color(red: 0.07, green: 0.64, blue: 0.44).opacity(0.12), in: Capsule())
+                                        }
+                                    }
+                                    Text(host.endpointLabel)
+                                        .font(.system(size: 10.5, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Button(hasCredential ? "连接" : "填入") {
+                                    selectDiscoveredHost(host)
+                                    if !hasCredential {
+                                        focusedField = .code
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.mini)
+                                .disabled(locked)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                    .strokeBorder(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.8)
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

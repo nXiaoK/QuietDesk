@@ -119,6 +119,16 @@ private struct ConnectionEntryChecks {
             try require(ConnectionEntryPresentation.savedQualityLabel(studio).contains("4:4:4"), "Missing 4:4:4 saved quality badge")
             try require(ConnectionEntryPresentation.savedQualityLabel(laptop) == "画质：自动适配上限", "Default quality label mismatch")
         }
+        run("Saved records with Wake-on-LAN MAC or direct deviceID are searchable without mutating metadata") {
+            let directID = UUID(uuidString: "CCCC1111-2222-3333-4444-555566667777")!
+            let wol = try WakeOnLANConfiguration(macAddress: MACAddress(parsing: "A4:83:E7:44:55:66"))
+            let desktop = ConnectionRecord(address: "10.0.0.9", port: 5908, name: "书房台式机",
+                                           deviceID: directID, wakeOnLAN: wol)
+            try require(ConnectionEntryPresentation.matching([desktop, records[0]], query: "a4:83:e7").map(\.id) == [desktop.id],
+                        "Wake-on-LAN MAC search failed")
+            try require(ConnectionEntryPresentation.matching([desktop, records[0]], query: "cccc1111").map(\.id) == [desktop.id],
+                        "Direct deviceID search failed")
+        }
         print("\(passed) passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

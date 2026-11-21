@@ -958,13 +958,23 @@ public struct MediaQualityPolicy: Sendable {
             // A full path keeps delivering what it can carry; random loss delivers less when less is sent.
             let after = probe.measured.loss
             let deliveredLess = probe.received.flatMap { before in probe.measured.received.map { $0 <= before * 0.9 } } ?? true
-            if after >= probe.trigger * Self.unresponsiveLossShare, deliveredLess {
-                toleratedLoss = max(toleratedLoss, after, probe.trigger)
+            if after >= probe.trigger * Self.unresponsiveLossShare {
                 lossEvidence = LossEvidence()
-                let restore = withinCeiling(probe.restore)
-                guard restore != effective else { return .tolerated }
-                lastAdjustment = .raise
-                return .change(recommend(restore, now: now))
+                if deliveredLess {
+                    toleratedLoss = max(toleratedLoss, after, probe.trigger)
+                    let restore = withinCeiling(probe.restore)
+                    guard restore != effective else { return .tolerated }
+                    lastAdjustment = .raise
+                    return .change(recommend(restore, now: now))
+                }
+                // The loss stayed and the path still delivers as much: it is full below the probe as well.
+                var carried = withinCeiling(effective)
+                if let received = probe.measured.received, received < Double(carried.megabits) {
+                    carried.megabits = max(1, Int(received.rounded(.up)))
+                }
+                let next = networkReduction(from: carried, factor: 0.75)
+                guard next != effective else { return .unproven }
+                return .change(recommendReduction(next, adjustment: .network, now: now))
             }
         }
         let onProbation = bitrateUpgradedAt != nil || pixelsUpgradedAt != nil
@@ -981,11 +991,21 @@ public struct MediaQualityPolicy: Sendable {
         if risen { return reduceLoad(for: .network, now: now).map { .change($0) } ?? .unproven }
         let current = withinCeiling(effective)
         guard current == effective else { return .change(recommendReduction(current, adjustment: .network, now: now)) }
-        // The probe has to lower what is actually sent, which a quiet screen keeps below the target.
+        // The probe has to lower what is actually sent, which a quiet screen keeps below the target. What
+        // arrived is also what a full path carries, so three quarters of it leaves room for repair and
+        // parity without giving up more than congestion requires.
         var sent = current
         if let received = evidence.received, received < Double(current.megabits) { sent.megabits = max(1, Int(received.rounded(.up))) }
-        var next = networkReduction(from: sent, factor: evidence.loss >= 0.25 ? 0.5 : 0.75)
+        var next = networkReduction(from: sent, factor: 0.75)
         next.megabits = min(next.megabits, current.megabits)
+        // A probe is an experiment, and a new frame rate or size would restart the stream on a path that is
+        // already losing. While the bitrate alone can drop and keep this picture readable, only it changes;
+        // recoveries interrupt what arrives, so the estimate above tends to be low rather than high.
+        if next.framesPerSecond != current.framesPerSecond || next.longestEdge != current.longestEdge,
+           let readable = bitRates.first(where: { Double($0) >= megabits(Self.minimumBitsPerPixel, for: current) }),
+           readable < current.megabits {
+            next = current; next.megabits = readable
+        }
         guard next != effective else {
             // Nothing lower to try: the remaining choice is to carry the loss.
             toleratedLoss = max(toleratedLoss, evidence.loss)

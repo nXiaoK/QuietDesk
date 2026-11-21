@@ -1244,6 +1244,33 @@ func runMediaPathPolicyChecks() {
                   "Path stress for background transfers changed")
     }
 
+    run("A loss probe changes only the bitrate while the picture stays readable, and goes further when the path is still full") {
+        let ceiling = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 12)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
+                                             appliedSize: (1920, 1200), now: 0)
+        // Recoveries interrupt what arrives, so a path that carries 4 Mbps shows less: three quarters of
+        // that would need 30 fps, which restarts the stream. The probe stops at the lowest readable bitrate.
+        _ = quality.observe(sample(loss: 0.5, received: 2.6), now: 1)
+        let probe = quality.observe(sample(loss: 0.5, received: 2.6), now: 2)
+        try check(probe == StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 3),
+                  "The loss probe restarted the stream instead of lowering the bitrate alone: \(String(describing: probe))")
+        _ = quality.confirmApplied(probe!, now: 2)
+        // The loss stays and the path delivers as much as before: it is full below the probe too, so the
+        // next step follows at once and may now lower the frame rate.
+        try check(quality.observe(sample(loss: 0.45, received: 2.8), now: 3) == nil
+                  && quality.observe(sample(loss: 0.45, received: 2.8), now: 4) == nil, "The probe was judged early")
+        let further = quality.observe(sample(loss: 0.45, received: 2.8), now: 5)
+        try check(further == StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 2) && quality.toleratedLoss == 0,
+                  "A path that stayed full under the probe was not lowered further at once: \(String(describing: further))")
+        // At the readable floor already, the full reduction is the only probe left.
+        let low = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 3)
+        var floor = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, applied: low, bitRates: StreamSettings.adaptiveBitRates,
+                                           appliedSize: (1920, 1200), now: 0)
+        _ = floor.observe(sample(loss: 0.3, received: 3), now: 1)
+        try check(floor.observe(sample(loss: 0.3, received: 3), now: 2) == StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 2),
+                  "Heavy loss at the readable floor had no probe left")
+    }
+
     run("Loss without delay growth keeps the quality, and upgrades continue under it") {
         let ceiling = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 20)
         let start = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 10)
@@ -1282,7 +1309,7 @@ func runMediaPathPolicyChecks() {
         // Clearly more loss than the path showed before is new evidence.
         var again: StreamSettings?
         for second in 41...43 where again == nil { again = quality.observe(sample(loss: 0.4, received: 12), now: Double(second)) }
-        try check(again?.megabits == 6, "Loss far above the tolerated level did not probe again: \(String(describing: again))")
+        try check(again?.megabits == 8, "Loss far above the tolerated level did not probe again: \(String(describing: again))")
         // A new route or a manual choice forgets what the old path tolerated.
         quality.rejectPending(now: 43)
         _ = try quality.chooseManually(ceiling, now: 44)
@@ -1295,9 +1322,11 @@ func runMediaPathPolicyChecks() {
             var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
                                                  appliedSize: (1920, 1200), now: 0)
             _ = quality.observe(sample(loss: 0.3, received: 8), now: 1)
-            // A quarter lost and more: the probe halves what the path delivered.
+            // What arrived is what a full path carries: the probe goes to three quarters of it in one step,
+            // not through the 20 Mbps target's own ladder and not further than congestion requires.
             guard let probe = quality.observe(sample(loss: 0.3, received: 8), now: 2) else { throw CheckFailure("No loss probe") }
-            try check(probe.megabits == 4, "A policed path was not probed below what it delivered: \(probe)")
+            try check(probe == StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 6),
+                      "A policed path was not probed just below what it delivered: \(probe)")
             _ = quality.confirmApplied(probe, now: 2)
             // Either the loss is gone, or it stays while the path still delivers all it did before.
             let after = stillFull ? sample(loss: 0.3, received: 8) : sample(loss: 0.01, received: 3.9)
@@ -1306,7 +1335,7 @@ func runMediaPathPolicyChecks() {
                 try check(next == nil || next!.megabits < probe.megabits, "A congested path got its bitrate back: \(String(describing: next))")
                 if let next { _ = quality.confirmApplied(next, now: Double(second)) }
             }
-            try check(quality.toleratedLoss == 0 && quality.effective.megabits <= 4, "Congestion loss was tolerated")
+            try check(quality.toleratedLoss == 0 && quality.effective.megabits <= 6, "Congestion loss was tolerated")
         }
     }
 

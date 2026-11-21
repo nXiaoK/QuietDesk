@@ -747,4 +747,96 @@ func runMediaProtocolChecks(check run: (String, () throws -> Void) -> Void) {
         for id in UInt64(6)...UInt64(11) { _ = try cache.insert(frame(id, sequence: UInt32(id)), deadline: 1) }
         try require(cache.pendingFrameCount == 10, "Updating sender cache limits did not unlock expanded BDP window")
     }
+
+    run("Block Reed-Solomon FEC recovers multi-packet bursts across 24-fragment keyframes and P-frames in 0 RTT") {
+        let time = MediaCheckClock()
+        let bigIDR = try frame(1, idr: true, bytes: 24_500)
+        let idrFragments = try MediaFragment.fragment(frame: bigIDR)
+        try require(idrFragments.count == 24 && idrFragments.last!.payload.count < MediaFragment.maximumPayloadBytes,
+                    "Expected 24-fragment IDR fixture with shorter tail fragment, got \(idrFragments.count)")
+        let idrBlocks = try MediaFrameFECShard.makeBlocks(
+            header: bigIDR.header,
+            frameBytes: idrFragments[0].frameBytes,
+            fragments: idrFragments,
+            parityPerBlock: 3
+        )
+        try require(idrBlocks.count == 3, "Expected 3 balanced 8-fragment blocks")
+        for block in idrBlocks {
+            for shard in block.shards {
+                let encoded = shard.encode()
+                try require(encoded.count <= MediaFragment.maximumDatagramBytes,
+                            "Encoded FEC shard exceeded 1100-byte datagram ceiling: \(encoded.count)")
+                let decoded = try MediaFrameFECShard.decode(encoded)
+                try require(decoded == shard, "MediaFrameFECShard wire round-trip mismatch")
+                guard case .fecShard(let dispatched) = try MediaDatagram.decode(encoded), dispatched == shard else {
+                    throw MediaCheckFailure(message: "MediaDatagram did not dispatch fecShard")
+                }
+            }
+        }
+
+        // Drop 3 consecutive packets in block 0 [1, 2, 3], 2 packets in block 1 [9, 14], and 3 packets including the shorter tail in block 2 [16, 20, 23]!
+        let dropped: Set<Int> = [1, 2, 3, 9, 14, 16, 20, 23]
+        let receiver = try MediaFrameReassembler(stream: stream, clock: { time.now })
+        var produced: [MediaFrame] = []
+        for (blockIdx, entry) in idrBlocks.enumerated() {
+            let range = entry.descriptor.start..<(entry.descriptor.start + entry.descriptor.dataCount)
+            for idx in range where !dropped.contains(idx) {
+                produced += ready(try receiver.receive(idrFragments[idx]))
+            }
+            time.now += 0.001
+            // Even when block 1 drops only 2 fragments, receiving any 2 of its 3 parity shards recovers it!
+            let shardsToDeliver = blockIdx == 1 ? [entry.shards[0], entry.shards[2]] : entry.shards
+            for shard in shardsToDeliver {
+                produced += ready(try receiver.receive(shard))
+            }
+        }
+        try require(produced.count == 1 && produced[0].packet.avcc == bigIDR.packet.avcc,
+                    "24-fragment IDR with 8 lost fragments across 3 bursts did not recover in 0 RTT")
+        try require(feedback(receiver.poll(), .nack).isEmpty,
+                    "0-RTT Reed-Solomon recovery should not emit NACKs")
+        _ = receiver.decoded(bigIDR.header, success: true)
+
+        // Reverse order: FEC shards arrive BEFORE the last surviving data fragments, and overlapping block boundaries are rejected.
+        let pFrame = try frame(2, bytes: 11_800)
+        let pParts = try MediaFragment.fragment(frame: pFrame)
+        let pBlocks = try MediaFrameFECShard.makeBlocks(
+            header: pFrame.header,
+            frameBytes: pParts[0].frameBytes,
+            fragments: pParts,
+            parityPerBlock: 2
+        )
+        // Deliver FEC shards first, then data fragments omitting 2 fragments in each block.
+        for entry in pBlocks {
+            for shard in entry.shards {
+                try require(ready(try receiver.receive(shard)).isEmpty, "FEC shards alone completed a frame")
+            }
+        }
+        var pProduced: [MediaFrame] = []
+        for entry in pBlocks {
+            let start = entry.descriptor.start
+            let end = start + entry.descriptor.dataCount
+            for idx in start..<end where idx != start && idx != end - 1 {
+                pProduced += ready(try receiver.receive(pParts[idx]))
+            }
+        }
+        try require(pProduced.count == 1 && pProduced[0].packet.avcc == pFrame.packet.avcc,
+                    "FEC-first out-of-order arrival failed to reconstruct 2 missing fragments per block")
+        _ = receiver.decoded(pFrame.header, success: true)
+
+        // Malicious overlapping block range on a new frame must be rejected and invalidate the frame.
+        let badFrame = try frame(3, bytes: 9_000)
+        let badParts = try MediaFragment.fragment(frame: badFrame)
+        let validShard = try MediaFrameFECShard(
+            header: badFrame.header, frameBytes: badParts[0].frameBytes,
+            fragmentCount: UInt16(badParts.count), blockStart: 0, blockDataCount: 5,
+            parityIndex: 0, parityCount: 1, parityPayload: Data(repeating: 0, count: MediaFragment.maximumPayloadBytes)
+        )
+        let overlappingShard = try MediaFrameFECShard(
+            header: badFrame.header, frameBytes: badParts[0].frameBytes,
+            fragmentCount: UInt16(badParts.count), blockStart: 3, blockDataCount: 4,
+            parityIndex: 0, parityCount: 1, parityPayload: Data(repeating: 0, count: MediaFragment.maximumPayloadBytes)
+        )
+        _ = try receiver.receive(validShard)
+        try rejects { _ = try receiver.receive(overlappingShard) }
+    }
 }

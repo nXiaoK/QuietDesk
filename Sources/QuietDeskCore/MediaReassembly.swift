@@ -132,9 +132,16 @@ public final class MediaFrameReassembler {
         var late: [Bool]
         var receivedCount = 0
         private(set) var exposedCount = 0
+        struct FECBlock {
+            let blockStart: Int
+            let blockDataCount: Int
+            let parityCount: Int
+            var parityPayloads: [Int: Data] = [:]
+        }
         private var firstMissingIndex = 0
         private var missingSince: [Int: TimeInterval] = [:]
         var parityPayload: Data?
+        var fecBlocks: [Int: FECBlock] = [:]
         var frame: MediaFrame?
         var completedAt: TimeInterval?
 
@@ -162,6 +169,24 @@ public final class MediaFrameReassembler {
             late = Array(repeating: false, count: fragmentCount)
             parityPayload = parity.parityPayload
             exposeFragments(upTo: fragmentCount, at: now)
+        }
+
+        init(_ shard: MediaFrameFECShard, now: TimeInterval) {
+            header = shard.header
+            totalBytes = shard.frameBytes
+            fragmentCount = Int(shard.fragmentCount)
+            fragmented = true
+            firstReceivedAt = now
+            lastProgressAt = now
+            bytes = Data(count: totalBytes)
+            received = Array(repeating: false, count: fragmentCount)
+            late = Array(repeating: false, count: fragmentCount)
+            let start = Int(shard.blockStart)
+            let dataCount = Int(shard.blockDataCount)
+            var block = FECBlock(blockStart: start, blockDataCount: dataCount, parityCount: Int(shard.parityCount))
+            block.parityPayloads[Int(shard.parityIndex)] = shard.parityPayload
+            fecBlocks[start] = block
+            exposeFragments(upTo: start + dataCount, at: now)
         }
 
         init(_ frame: MediaFrame, bytes: Data, now: TimeInterval) {
@@ -341,6 +366,9 @@ public final class MediaFrameReassembler {
                 events.append(.feedback(try MediaFeedback(kind: .reassembled, header: assembly.header)))
             } else {
                 try tryCompleteWithParity(assembly, now: now, events: &events)
+                if assembly.frame == nil {
+                    try tryRecoverFECBlocks(assembly, candidateBlockStart: nil, now: now, events: &events)
+                }
             }
         }
         updateGap(at: now)
@@ -433,6 +461,157 @@ public final class MediaFrameReassembler {
             throw error
         }
         events.append(.feedback(try MediaFeedback(kind: .reassembled, header: assembly.header)))
+    }
+
+    public func receive(_ shard: MediaFrameFECShard) throws -> [MediaReceiveEvent] {
+        guard shard.header.stream == stream, !requiresRecovery else { return [] }
+        let now = currentTime()
+        var events = expire(at: now)
+        guard !requiresRecovery else { return events }
+        if shard.header.frameID < expectedFrameID {
+            if let lastDecoded { events.append(.feedback(try MediaFeedback(kind: .decoded, header: lastDecoded))) }
+            return events
+        }
+        let distance = shard.header.frameID - expectedFrameID
+        guard distance < UInt64(limits.maximumFrames), shard.header.frameID < UInt64.max,
+              shard.frameBytes <= limits.maximumFrameBytes else {
+            return events + invalidate(at: shard.header)
+        }
+        let blockStart = Int(shard.blockStart)
+        let blockDataCount = Int(shard.blockDataCount)
+        let parityCount = Int(shard.parityCount)
+        let parityIndex = Int(shard.parityIndex)
+
+        let assembly: Assembly
+        if let existing = assemblies[shard.header.frameID] {
+            guard existing.header == shard.header, existing.totalBytes == shard.frameBytes,
+                  existing.fragmentCount == Int(shard.fragmentCount) else {
+                _ = invalidate(at: shard.header)
+                throw DeskError.invalid("同一媒体帧的分块纠错帧元数据冲突")
+            }
+            if var block = existing.fecBlocks[blockStart] {
+                guard block.blockDataCount == blockDataCount, block.parityCount == parityCount else {
+                    _ = invalidate(at: shard.header)
+                    throw DeskError.invalid("同一媒体帧的分块纠错块参数冲突")
+                }
+                if let existingPayload = block.parityPayloads[parityIndex] {
+                    guard existingPayload == shard.parityPayload else {
+                        _ = invalidate(at: shard.header)
+                        throw DeskError.invalid("重复媒体分块纠错内容冲突")
+                    }
+                } else {
+                    block.parityPayloads[parityIndex] = shard.parityPayload
+                    existing.fecBlocks[blockStart] = block
+                    existing.exposeFragments(upTo: blockStart + blockDataCount, at: now)
+                    existing.lastProgressAt = now
+                }
+            } else {
+                let newRange = blockStart..<(blockStart + blockDataCount)
+                for other in existing.fecBlocks.values {
+                    let otherRange = other.blockStart..<(other.blockStart + other.blockDataCount)
+                    if newRange.overlaps(otherRange) {
+                        _ = invalidate(at: shard.header)
+                        throw DeskError.invalid("同一媒体帧的分块纠错范围重叠")
+                    }
+                }
+                guard existing.fecBlocks.count < MediaFrameFECShard.maximumProtectedFragments else {
+                    _ = invalidate(at: shard.header)
+                    throw DeskError.invalid("媒体分块纠错块数量超限")
+                }
+                var block = Assembly.FECBlock(blockStart: blockStart, blockDataCount: blockDataCount, parityCount: parityCount)
+                block.parityPayloads[parityIndex] = shard.parityPayload
+                existing.fecBlocks[blockStart] = block
+                existing.exposeFragments(upTo: blockStart + blockDataCount, at: now)
+                existing.lastProgressAt = now
+            }
+            assembly = existing
+        } else {
+            guard assemblies.count < limits.maximumFrames,
+                  shard.frameBytes <= limits.maximumBufferedBytes - bufferedBytes else {
+                return events + invalidate(at: shard.header)
+            }
+            _ = missingFrames.removeValue(forKey: shard.header.frameID)
+            assembly = Assembly(shard, now: now)
+            assemblies[shard.header.frameID] = assembly
+            bufferedBytes += shard.frameBytes
+        }
+
+        if assembly.frame == nil {
+            try tryRecoverFECBlocks(assembly, candidateBlockStart: blockStart, now: now, events: &events)
+        }
+        updateGap(at: now)
+        events += readyFrame()
+        return events
+    }
+
+    private func tryRecoverFECBlocks(
+        _ assembly: Assembly,
+        candidateBlockStart: Int?,
+        now: TimeInterval,
+        events: inout [MediaReceiveEvent]
+    ) throws {
+        guard assembly.frame == nil, !assembly.fecBlocks.isEmpty else { return }
+        let blockKeys: [Int] = candidateBlockStart.map { [$0] } ?? assembly.fecBlocks.keys.sorted()
+        for start in blockKeys {
+            guard let block = assembly.fecBlocks[start], !block.parityPayloads.isEmpty else { continue }
+            let end = start + block.blockDataCount
+            var missingCount = 0
+            for index in start..<end where !assembly.received[index] {
+                missingCount += 1
+            }
+            guard missingCount > 0, block.parityPayloads.count >= missingCount else { continue }
+
+            var dataSlices: [Data?] = []
+            dataSlices.reserveCapacity(block.blockDataCount)
+            for index in start..<end {
+                if assembly.received[index] {
+                    let byteStart = index * MediaFragment.maximumPayloadBytes
+                    let byteLen = min(MediaFragment.maximumPayloadBytes, assembly.totalBytes - byteStart)
+                    dataSlices.append(assembly.bytes.subdata(in: byteStart..<(byteStart + byteLen)))
+                } else {
+                    dataSlices.append(nil)
+                }
+            }
+
+            let recoveredMap: [Int: [UInt8]]?
+            do {
+                recoveredMap = try ReedSolomonGF256.reconstructMissingDataShards(
+                    dataShards: dataSlices,
+                    parityShards: block.parityPayloads,
+                    shardLength: MediaFragment.maximumPayloadBytes,
+                    parityCount: block.parityCount
+                )
+            } catch {
+                _ = invalidate(at: assembly.header)
+                throw error
+            }
+            guard let recoveredMap, !recoveredMap.isEmpty else { continue }
+
+            for (relativeCol, fullBytes) in recoveredMap.sorted(by: { $0.key < $1.key }) {
+                let fragmentIndex = start + relativeCol
+                let byteStart = fragmentIndex * MediaFragment.maximumPayloadBytes
+                let expectedLength = min(MediaFragment.maximumPayloadBytes, assembly.totalBytes - byteStart)
+                if expectedLength < MediaFragment.maximumPayloadBytes,
+                   fullBytes[expectedLength..<MediaFragment.maximumPayloadBytes].contains(where: { $0 != 0 }) {
+                    _ = invalidate(at: assembly.header)
+                    throw DeskError.invalid("媒体分块纠错恢复尾部非零")
+                }
+                assembly.bytes.replaceSubrange(byteStart..<(byteStart + expectedLength), with: fullBytes.prefix(expectedLength))
+                assembly.markReceived(fragmentIndex, at: now, reorderDelay: limits.reorderDelay)
+            }
+        }
+
+        if assembly.receivedCount == assembly.fragmentCount {
+            do {
+                assembly.frame = try MediaFrame(header: assembly.header, packetBytes: assembly.bytes)
+                assembly.completedAt = now
+                settleFragments(assembly.fragmentCount, lost: assembly.late.lazy.filter { $0 }.count)
+            } catch {
+                _ = invalidate(at: assembly.header)
+                throw error
+            }
+            events.append(.feedback(try MediaFeedback(kind: .reassembled, header: assembly.header)))
+        }
     }
 
     // TCP already provides a complete envelope, but reference ordering and epoch fences remain identical.

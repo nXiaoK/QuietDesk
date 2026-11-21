@@ -93,17 +93,17 @@ func runMediaSessionProtocolChecks() {
     run("A media request can opt in to marked repairs and legacy requests omit the capability") {
         let legacy = try MediaControl.read(Data(#"{"operation":"request"}"#.utf8))
         let modern = try MediaControl.read(MediaControl(.request, markedRepairs: true, datagramInteractive: true,
-                                                        dynamicFrameWindow: true, parityFEC: true).message().payload)
+                                                        dynamicFrameWindow: true, parityFEC: true, blockFEC: true).message().payload)
         try check(legacy.markedRepairs == nil && legacy.datagramInteractive == nil
-                  && legacy.dynamicFrameWindow == nil && legacy.parityFEC == nil
+                  && legacy.dynamicFrameWindow == nil && legacy.parityFEC == nil && legacy.blockFEC == nil
                   && modern.markedRepairs == true && modern.datagramInteractive == true
-                  && modern.dynamicFrameWindow == true && modern.parityFEC == true,
-                  "Lost the viewer's repair, interactive datagram, dynamic window or parity FEC capability")
+                  && modern.dynamicFrameWindow == true && modern.parityFEC == true && modern.blockFEC == true,
+                  "Lost the viewer's repair, interactive datagram, dynamic window, parity FEC or block FEC capability")
         let session = UUID(), token = Data(repeating: 0x33, count: 32)
         let offer = try MediaControl.read(MediaControl(.offer, sessionID: session, token: token, datagramKey: token,
-                                                       datagramInteractive: true, dynamicFrameWindow: true, parityFEC: true).message().payload)
-        try check(offer.datagramInteractive == true && offer.dynamicFrameWindow == true && offer.parityFEC == true,
-                  "Lost offer datagramInteractive, dynamicFrameWindow or parityFEC capability")
+                                                       datagramInteractive: true, dynamicFrameWindow: true, parityFEC: true, blockFEC: true).message().payload)
+        try check(offer.datagramInteractive == true && offer.dynamicFrameWindow == true && offer.parityFEC == true && offer.blockFEC == true,
+                  "Lost offer datagramInteractive, dynamicFrameWindow, parityFEC or blockFEC capability")
         try rejects("Allowed datagramInteractive outside request/offer") {
             try MediaControl(.recover, sessionID: session, transportEpoch: 1, codecEpoch: 1, datagramInteractive: true).validate()
         }
@@ -112,6 +112,9 @@ func runMediaSessionProtocolChecks() {
         }
         try rejects("Allowed parityFEC outside request/offer") {
             try MediaControl(.recover, sessionID: session, transportEpoch: 1, codecEpoch: 1, parityFEC: true).validate()
+        }
+        try rejects("Allowed blockFEC outside request/offer") {
+            try MediaControl(.recover, sessionID: session, transportEpoch: 1, codecEpoch: 1, blockFEC: true).validate()
         }
         var move = RemoteInput(kind: .move); move.x = 0.25; move.y = 0.75; move.pointerSequence = 42
         try move.validate()

@@ -341,16 +341,152 @@ public struct MediaFrameParity: Equatable, Sendable {
     }
 }
 
+public struct MediaFrameFECShard: Equatable, Sendable {
+    public static let maximumProtectedFragments = BlockFECPlanner.maximumProtectedFrameFragments
+    public static let maximumBlockDataCount = ReedSolomonGF256.maximumDataShards
+    public static let maximumParityCount = ReedSolomonGF256.maximumParityShards
+    public static let encodedHeaderBytes = MediaWire.headerBytes + 12
+
+    public let header: MediaFrameHeader
+    public let frameBytes: Int
+    public let fragmentCount: UInt16
+    public let blockStart: UInt16
+    public let blockDataCount: UInt8
+    public let parityIndex: UInt8
+    public let parityCount: UInt8
+    public let parityPayload: Data
+
+    public init(
+        header: MediaFrameHeader,
+        frameBytes: Int,
+        fragmentCount: UInt16,
+        blockStart: UInt16,
+        blockDataCount: UInt8,
+        parityIndex: UInt8,
+        parityCount: UInt8,
+        parityPayload: Data
+    ) throws {
+        guard frameBytes > MediaFragment.maximumPayloadBytes, frameBytes <= MediaFrame.maximumPacketBytes else {
+            throw DeskError.invalid("媒体分块纠错总长度无效")
+        }
+        let expectedCount = (frameBytes + MediaFragment.maximumPayloadBytes - 1) / MediaFragment.maximumPayloadBytes
+        guard (2...Self.maximumProtectedFragments).contains(expectedCount),
+              Int(fragmentCount) == expectedCount,
+              (2...Self.maximumBlockDataCount).contains(Int(blockDataCount)),
+              (1...Self.maximumParityCount).contains(Int(parityCount)),
+              parityIndex < parityCount,
+              Int(blockStart) + Int(blockDataCount) <= expectedCount,
+              parityPayload.count == MediaFragment.maximumPayloadBytes else {
+            throw DeskError.invalid("媒体分块纠错元数据无效")
+        }
+        self.header = header
+        self.frameBytes = frameBytes
+        self.fragmentCount = fragmentCount
+        self.blockStart = blockStart
+        self.blockDataCount = blockDataCount
+        self.parityIndex = parityIndex
+        self.parityCount = parityCount
+        self.parityPayload = parityPayload
+    }
+
+    public static func makeBlocks(
+        header: MediaFrameHeader,
+        frameBytes: Int,
+        fragments: [MediaFragment],
+        parityPerBlock: Int
+    ) throws -> [(descriptor: BlockFECPlanner.BlockDescriptor, shards: [MediaFrameFECShard])] {
+        let descriptors = BlockFECPlanner.partition(fragmentCount: fragments.count, parityPerBlock: parityPerBlock)
+        guard !descriptors.isEmpty else {
+            throw DeskError.invalid("媒体分块纠错分片数超出范围")
+        }
+        for (idx, fragment) in fragments.enumerated() {
+            guard fragment.header == header,
+                  fragment.frameBytes == frameBytes,
+                  Int(fragment.fragmentCount) == fragments.count,
+                  Int(fragment.fragmentIndex) == idx else {
+                throw DeskError.invalid("媒体分块纠错分片头或顺序不一致")
+            }
+        }
+        var results: [(descriptor: BlockFECPlanner.BlockDescriptor, shards: [MediaFrameFECShard])] = []
+        results.reserveCapacity(descriptors.count)
+        for descriptor in descriptors {
+            let slice = fragments[descriptor.start..<(descriptor.start + descriptor.dataCount)].map(\.payload)
+            let encodedPayloads = try ReedSolomonGF256.encodeParityShards(
+                dataShards: slice,
+                shardLength: MediaFragment.maximumPayloadBytes,
+                parityCount: descriptor.parityCount
+            )
+            let shards = try encodedPayloads.enumerated().map { parityIdx, payload in
+                try MediaFrameFECShard(
+                    header: header,
+                    frameBytes: frameBytes,
+                    fragmentCount: UInt16(fragments.count),
+                    blockStart: UInt16(descriptor.start),
+                    blockDataCount: UInt8(descriptor.dataCount),
+                    parityIndex: UInt8(parityIdx),
+                    parityCount: UInt8(descriptor.parityCount),
+                    parityPayload: payload
+                )
+            }
+            results.append((descriptor, shards))
+        }
+        return results
+    }
+
+    public func encode() -> Data {
+        var data = MediaWire.begin(5, header: header)
+        data.put(UInt32(frameBytes))
+        data.put(fragmentCount)
+        data.put(blockStart)
+        data.append(blockDataCount)
+        data.append(parityIndex)
+        data.append(parityCount)
+        data.append(0) // reserved
+        data.append(parityPayload)
+        return data
+    }
+
+    public static func decode(_ data: Data) throws -> MediaFrameFECShard {
+        guard data.count <= MediaFragment.maximumDatagramBytes else {
+            throw DeskError.invalid("媒体分块纠错数据报过大")
+        }
+        var reader = ByteReader(data)
+        let header = try MediaWire.header(&reader, kind: 5)
+        let frameBytes: UInt32 = try reader.take()
+        let count: UInt16 = try reader.take()
+        let start: UInt16 = try reader.take()
+        let dataCount: UInt8 = try reader.take()
+        let parityIndex: UInt8 = try reader.take()
+        let parityCount: UInt8 = try reader.take()
+        let reserved: UInt8 = try reader.take()
+        guard reserved == 0 else {
+            throw DeskError.invalid("媒体分块纠错保留标志无效")
+        }
+        return try MediaFrameFECShard(
+            header: header,
+            frameBytes: Int(frameBytes),
+            fragmentCount: count,
+            blockStart: start,
+            blockDataCount: dataCount,
+            parityIndex: parityIndex,
+            parityCount: parityCount,
+            parityPayload: reader.bytes(reader.remaining)
+        )
+    }
+}
+
 public enum MediaDatagram: Sendable {
     case fragment(MediaFragment)
     case feedback(MediaFeedback)
     case parity(MediaFrameParity)
+    case fecShard(MediaFrameFECShard)
 
     public func encode() -> Data {
         switch self {
         case .fragment(let fragment): return fragment.encode()
         case .feedback(let feedback): return feedback.encode()
         case .parity(let parity): return parity.encode()
+        case .fecShard(let shard): return shard.encode()
         }
     }
 
@@ -362,6 +498,7 @@ public enum MediaDatagram: Sendable {
         case 2: return .fragment(try MediaFragment.decode(data))
         case 3: return .feedback(try MediaFeedback.decode(data))
         case 4: return .parity(try MediaFrameParity.decode(data))
+        case 5: return .fecShard(try MediaFrameFECShard.decode(data))
         default: throw DeskError.invalid("未知媒体数据报类型")
         }
     }

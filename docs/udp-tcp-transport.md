@@ -140,6 +140,6 @@ python3 scripts/analyze-performance.py viewer.txt host.txt --output report.md
 
 真实 M2/M3 两台 Mac 的 Wi‑Fi 动态桌面、相同内容下的自动／仅 TCP 对照、弱网与公网映射、系统网络切换、macOS 14 与 Intel 实机仍待验收。当前不承诺固定恢复秒数、持续 60 fps，或已经达到其他远程产品的实际流畅度。
 
-新版已增加按能力协商的 [独立光标](independent-cursor.md)，旧端仍将光标放在视频中。FEC 前向纠错和音频传输不在本次实现范围，系统权限要求保持原样；自托管中继及其视频打洞见[自托管中继](relay.md)。
+新版已增加按能力协商的 [独立光标](independent-cursor.md)、分块 Reed-Solomon 多包自适应前向纠错（`blockFEC`，兼容单包 `parityFEC`）与远端系统音频（`remoteAudioV1`），旧端仍将光标放在视频中并沿用原有分片重传；系统权限要求保持原样，自托管中继及其视频打洞见[自托管中继](relay.md)。
 
 主要实现入口：[会话协调](../Sources/QuietDeskCore/MediaSession.swift)、[系统加密传输](../Sources/QuietDeskCore/MediaSecureTransport.swift)、[媒体封装](../Sources/QuietDeskCore/MediaProtocol.swift)、[重组与发送缓存](../Sources/QuietDeskCore/MediaReassembly.swift)、[路径与画质策略](../Sources/QuietDeskCore/MediaPathPolicy.swift)、[画布候选解码](../Sources/QuietDesk/RemoteCanvas.swift)。

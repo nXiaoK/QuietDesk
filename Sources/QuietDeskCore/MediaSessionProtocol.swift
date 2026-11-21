@@ -34,6 +34,8 @@ public struct MediaControl: Codable, Sendable {
     public let dynamicFrameWindow: Bool?
     // Negotiated over request/offer so UDP video streams can protect multi-fragment P-frames with single-packet XOR parity FEC.
     public let parityFEC: Bool?
+    // Negotiated over request/offer so UDP video streams can protect large P-frames and IDR keyframes with multi-shard Cauchy Reed-Solomon block FEC.
+    public let blockFEC: Bool?
     // Negotiated over request/offer to allow authenticated DTLS datagrams for low-latency Opus remote audio packets.
     public let datagramAudio: Bool?
 
@@ -43,7 +45,7 @@ public struct MediaControl: Codable, Sendable {
                 mediaFailure: Bool? = nil, encodeMilliseconds: Double? = nil, relayRouting: Bool? = nil,
                 deliveryMilliseconds: Double? = nil, receiveFrameWindow: Int? = nil, markedRepairs: Bool? = nil,
                 encodeIdle: Bool? = nil, datagramInteractive: Bool? = nil, dynamicFrameWindow: Bool? = nil,
-                parityFEC: Bool? = nil, datagramAudio: Bool? = nil, mappedTransfer: MappedTransferState? = nil) {
+                parityFEC: Bool? = nil, blockFEC: Bool? = nil, datagramAudio: Bool? = nil, mappedTransfer: MappedTransferState? = nil) {
         self.operation = operation; self.sessionID = sessionID; self.token = token
         self.datagramKey = datagramKey; self.role = role; self.transactionID = transactionID
         self.transportEpoch = transportEpoch; self.codecEpoch = codecEpoch; self.path = path
@@ -56,6 +58,7 @@ public struct MediaControl: Codable, Sendable {
         self.datagramInteractive = datagramInteractive
         self.dynamicFrameWindow = dynamicFrameWindow
         self.parityFEC = parityFEC
+        self.blockFEC = blockFEC
         self.datagramAudio = datagramAudio
     }
 
@@ -69,6 +72,7 @@ public struct MediaControl: Codable, Sendable {
               datagramInteractive == nil || operation == .request || operation == .offer,
               dynamicFrameWindow == nil || operation == .request || operation == .offer,
               parityFEC == nil || operation == .request || operation == .offer,
+              blockFEC == nil || operation == .request || operation == .offer,
               datagramAudio == nil || operation == .request || operation == .offer,
               encodeMilliseconds == nil || operation == .stats,
               encodeIdle == nil || operation == .stats,

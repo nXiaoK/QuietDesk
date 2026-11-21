@@ -144,11 +144,13 @@ public final class MediaSession: @unchecked Sendable {
     private var datagramInteractiveNegotiated = false
     private var dynamicFrameWindowNegotiated = false
     private var parityFECNegotiated = false
+    private var blockFECNegotiated = false
     private var datagramAudioNegotiated = false
     private var advertisedReceiveFrameWindow: Int?
     private var lastReportedReceiveWindow: Int?
     private var hasMeasuredRoundTrip = false
     private var lastHostNackAt: TimeInterval?
+    private var recentNackEvents: [(at: TimeInterval, count: Int)] = []
     private let interactiveDatagramLock = NSLock()
     private var interactiveDatagramAvailable = false
     private static let repairedFragmentKind: UInt8 = 5
@@ -156,6 +158,7 @@ public final class MediaSession: @unchecked Sendable {
     private static let interactiveInputDatagramKind: UInt8 = 7
     private static let parityDatagramKind: UInt8 = 8
     private static let audioPacketDatagramKind: UInt8 = 9
+    private static let blockFECDatagramKind: UInt8 = 10
     private var alternateRequested = false
     private var alternateProbePending = false
     private var alternateRetryDeferred = false
@@ -300,7 +303,7 @@ public final class MediaSession: @unchecked Sendable {
                 self.sendControl(MediaControl(.request, relayRouting: self.relayRoutingEnabled ? true : nil,
                                               receiveFrameWindow: MediaBufferLimits.receiveFrameWindow, markedRepairs: true,
                                               datagramInteractive: true, dynamicFrameWindow: true, parityFEC: true,
-                                              datagramAudio: true))
+                                              blockFEC: true, datagramAudio: true))
                 self.onState?("正在优化传输")
             }
         }
@@ -628,6 +631,7 @@ public final class MediaSession: @unchecked Sendable {
             datagramInteractiveNegotiated = value.datagramInteractive == true
             dynamicFrameWindowNegotiated = value.dynamicFrameWindow == true
             parityFECNegotiated = value.parityFEC == true
+            blockFECNegotiated = value.blockFEC == true
             datagramAudioNegotiated = value.datagramAudio == true
             advertisedReceiveFrameWindow = value.receiveFrameWindow
             let identifier = UUID(), token = try randomBytes(32), sessionKey = try randomBytes(32)
@@ -648,6 +652,7 @@ public final class MediaSession: @unchecked Sendable {
             datagramInteractiveNegotiated = value.datagramInteractive == true
             dynamicFrameWindowNegotiated = value.dynamicFrameWindow == true
             parityFECNegotiated = value.parityFEC == true
+            blockFECNegotiated = value.blockFEC == true
             datagramAudioNegotiated = value.datagramAudio == true
             refreshInteractiveDatagramAvailability()
             fallbackAt = SessionClock.now + 1.5
@@ -838,6 +843,7 @@ public final class MediaSession: @unchecked Sendable {
                                  datagramInteractive: datagramInteractiveNegotiated ? true : nil,
                                  dynamicFrameWindow: dynamicFrameWindowNegotiated ? true : nil,
                                  parityFEC: parityFECNegotiated ? true : nil,
+                                 blockFEC: blockFECNegotiated ? true : nil,
                                  datagramAudio: datagramAudioNegotiated ? true : nil))
     }
 
@@ -1041,6 +1047,13 @@ public final class MediaSession: @unchecked Sendable {
                 samplePackets += 1; sampleBytes += data.count; lastVideoAt = SessionClock.now
                 handleReceiveEvents(try receiver?.receive(parity) ?? [])
                 scheduleReceiverPoll()
+            case Self.blockFECDatagramKind:
+                guard side == .viewer, blockFECNegotiated, udpVerified else { return }
+                let shard = try MediaFrameFECShard.decode(Data(data.dropFirst()))
+                guard shard.header.stream == expectedStream else { return }
+                samplePackets += 1; sampleBytes += data.count; lastVideoAt = SessionClock.now
+                handleReceiveEvents(try receiver?.receive(shard) ?? [])
+                scheduleReceiverPoll()
             case 4:
                 guard side == .host, udpVerified else { return }
                 receiveFeedback(try MediaFeedback.decode(Data(data.dropFirst())))
@@ -1222,8 +1235,47 @@ public final class MediaSession: @unchecked Sendable {
                                  keyFrameTimeToLive: 5, completedFrameTimeToLive: 5)
     }
 
+    private func recentNackedFragmentCount(at now: TimeInterval) -> Int {
+        recentNackEvents.removeAll { now - $0.at > 5.0 }
+        return recentNackEvents.reduce(0) { $0 + $1.count }
+    }
+
+    private func desiredBlockFECParityCount(isIDR: Bool, fragmentCount: Int, payloadBytes: Int) -> Int {
+        guard blockFECNegotiated,
+              (2...MediaFrameFECShard.maximumProtectedFragments).contains(fragmentCount),
+              pendingDatagramBytes == 0 else { return 0 }
+        let now = SessionClock.now
+        let recentMissing = recentNackedFragmentCount(at: now)
+        let recentLoss = lastHostNackAt.map { now - $0 <= 8.0 } ?? false
+        let rawParity: Int
+        if recentMissing >= 6 {
+            rawParity = 3
+        } else if recentLoss {
+            rawParity = 2
+        } else if isIDR || settings.framesPerSecond >= 60 || roundTrip >= 0.015 {
+            rawParity = 1
+        } else {
+            return 0
+        }
+        if isIDR {
+            return min(rawParity, 2)
+        }
+        let fps = Double(max(1, settings.framesPerSecond))
+        let perFrameBudget = (Double(max(1, settings.megabits)) * 125_000.0) / fps
+        let budgetScale = (recentLoss || roundTrip >= 0.015) ? 1.35 : 1.15
+        for candidate in stride(from: rawParity, through: 1, by: -1) {
+            let blocks = BlockFECPlanner.partition(fragmentCount: fragmentCount, parityPerBlock: candidate)
+            let totalShards = blocks.reduce(0) { $0 + $1.parityCount }
+            let totalBytes = payloadBytes + totalShards * MediaFragment.maximumPayloadBytes
+            if Double(totalBytes) <= perFrameBudget * budgetScale || (recentLoss && candidate == 1) {
+                return candidate
+            }
+        }
+        return 0
+    }
+
     private func shouldEmitParity(isIDR: Bool, fragmentCount: Int, payloadBytes: Int) -> Bool {
-        guard parityFECNegotiated, !isIDR, (2...MediaFrameParity.maximumProtectedFragments).contains(fragmentCount),
+        guard !blockFECNegotiated, parityFECNegotiated, !isIDR, (2...MediaFrameParity.maximumProtectedFragments).contains(fragmentCount),
               pendingDatagramBytes == 0 else { return false }
         let fps = Double(max(1, settings.framesPerSecond))
         let perFrameBudget = (Double(max(1, settings.megabits)) * 125_000.0) / fps
@@ -1264,9 +1316,20 @@ public final class MediaSession: @unchecked Sendable {
             if transaction != nil { transaction?.frameSubmitted = true }
             nextFrameID += 1
             if target.1 == .udp {
-                let parity = shouldEmitParity(isIDR: isIDR, fragmentCount: fragments.count, payloadBytes: bytes)
-                    ? (try? MediaFrameParity.make(header: header, frameBytes: bytes, fragments: fragments)) : nil
-                enqueue(fragments, parity: parity)
+                let blockParityCount = desiredBlockFECParityCount(isIDR: isIDR, fragmentCount: fragments.count, payloadBytes: bytes)
+                if blockParityCount > 0,
+                   let fecBlocks = try? MediaFrameFECShard.makeBlocks(
+                       header: header,
+                       frameBytes: bytes,
+                       fragments: fragments,
+                       parityPerBlock: blockParityCount
+                   ) {
+                    enqueue(fragments, fecBlocks: fecBlocks)
+                } else {
+                    let parity = shouldEmitParity(isIDR: isIDR, fragmentCount: fragments.count, payloadBytes: bytes)
+                        ? (try? MediaFrameParity.make(header: header, frameBytes: bytes, fragments: fragments)) : nil
+                    enqueue(fragments, parity: parity)
+                }
             }
             else {
                 let peer = target.1 == .tcp ? videoPeer : control
@@ -1361,7 +1424,8 @@ public final class MediaSession: @unchecked Sendable {
             : feedback.header
         var accepted = feedback
         if feedback.kind == .nack {
-            lastHostNackAt = SessionClock.now
+            let now = SessionClock.now
+            lastHostNackAt = now
             let submitted = originalSubmittedCounts[targetHeader] ?? 0
             let ranges = feedback.missingRanges.compactMap { range -> MediaFragmentRange? in
                 let first = Int(range.first), end = min(submitted, Int(range.first) + Int(range.count))
@@ -1369,6 +1433,11 @@ public final class MediaSession: @unchecked Sendable {
                 return MediaFragmentRange(first: range.first, count: UInt16(end - first))
             }
             guard !ranges.isEmpty, let filtered = try? MediaFeedback(kind: .nack, header: targetHeader, missingRanges: ranges) else { return }
+            let missingCount = ranges.reduce(0) { $0 + Int($1.count) }
+            recentNackEvents.removeAll { now - $0.at > 5.0 }
+            if recentNackEvents.count < 128 {
+                recentNackEvents.append((now, missingCount))
+            }
             accepted = filtered
         }
         if feedback.kind == .reassembled || feedback.kind == .decoded, let sent = deliverySentAt.removeValue(forKey: feedback.header) {
@@ -1433,7 +1502,12 @@ public final class MediaSession: @unchecked Sendable {
         }
     }
 
-    private func enqueue(_ fragments: [MediaFragment], repair: Bool = false, parity: MediaFrameParity? = nil) {
+    private func enqueue(
+        _ fragments: [MediaFragment],
+        repair: Bool = false,
+        parity: MediaFrameParity? = nil,
+        fecBlocks: [(descriptor: BlockFECPlanner.BlockDescriptor, shards: [MediaFrameFECShard])] = []
+    ) {
         guard !fragments.isEmpty else { return }
         let kindByte: UInt8 = repair && viewerAcceptsMarkedRepairs ? Self.repairedFragmentKind : 3
         let encodedParity: Data? = parity.map { value in
@@ -1443,17 +1517,36 @@ public final class MediaSession: @unchecked Sendable {
             data.append(payload)
             return data
         }
+        var shardsByEndIndex: [Int: [(MediaFrameHeader, Data)]] = [:]
+        var totalFECBytes = 0
+        for entry in fecBlocks {
+            let triggerAfterIndex = entry.descriptor.start + entry.descriptor.dataCount - 1
+            for shard in entry.shards {
+                let payload = shard.encode()
+                var data = Data(capacity: 1 + payload.count)
+                data.append(Self.blockFECDatagramKind)
+                data.append(payload)
+                totalFECBytes += data.count
+                shardsByEndIndex[triggerAfterIndex, default: []].append((shard.header, data))
+            }
+        }
         let bytes = fragments.reduce(0) { $0 + 1 + MediaFragment.encodedHeaderBytes + $1.payload.count }
             + (encodedParity?.count ?? 0)
+            + totalFECBytes
         guard bytes <= 32 * 1024 * 1024 - pendingDatagramBytes else { requestRecovery(); return }
         var encoded: [Datagram] = []
-        encoded.reserveCapacity(fragments.count + (encodedParity == nil ? 0 : 1))
-        for fragment in fragments {
+        encoded.reserveCapacity(fragments.count + (encodedParity == nil ? 0 : 1) + fecBlocks.reduce(0) { $0 + $1.shards.count })
+        for (idx, fragment) in fragments.enumerated() {
             var data = Data(capacity: 1 + MediaFragment.encodedHeaderBytes + fragment.payload.count)
             data.append(kindByte)
             data.append(fragment.encode())
             encoded.append(Datagram(header: fragment.header, fragmentIndex: fragment.fragmentIndex,
                                     data: data, repair: repair))
+            if !repair, let blockShards = shardsByEndIndex[idx] {
+                for (shardHeader, shardData) in blockShards {
+                    encoded.append(Datagram(header: shardHeader, fragmentIndex: nil, data: shardData, repair: false))
+                }
+            }
         }
         if let parity, let encodedParity {
             encoded.append(Datagram(header: parity.header, fragmentIndex: nil, data: encodedParity, repair: false))

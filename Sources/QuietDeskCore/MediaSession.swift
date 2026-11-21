@@ -111,8 +111,11 @@ public final class MediaSession: @unchecked Sendable {
         var fast = false
         // Viewer, fast only: the host's ready arrived, so every control message sent before it has too.
         var hostReady = false
-        // Host, fast only: the keyframe waits for a fresh pong, so it is not paced into a path still down.
+        // Host, fast on UDP only: the keyframe waits for the pong of a ping sent after this transaction
+        // began. That ping crossed the path behind everything the old stream had sent, so its answer shows
+        // the path is up and its queue no longer holds the old stream's datagrams.
         var awaitingLiveness = false
+        var livenessFrom: TimeInterval = 0
         // Viewer, fast only: when the datagram copy of the prepare last left, and how often.
         var requestSentAt: TimeInterval = 0
         var requestSends = 0
@@ -120,8 +123,6 @@ public final class MediaSession: @unchecked Sendable {
         // while preparing this stream (its cursor binding) precede that ready, so decoding waits for it.
         var heldFrame: MediaFrame?
     }
-    // A pong this recent shows the datagram path carried a round trip since the failure.
-    private static let recentPong: TimeInterval = 0.25
     private static let fastRequestInterval: TimeInterval = 0.05
     private static let maximumFastRequests = 20
     private struct Datagram {
@@ -219,6 +220,8 @@ public final class MediaSession: @unchecked Sendable {
     private var livenessResumedAt: TimeInterval = 0
     private var livenessGrace = LocalSchedulingGrace()
     private var roundTrip: TimeInterval = 0.01
+    // When the challenge of the latest answered ping was first sent.
+    private var lastAnsweredChallengeAt: TimeInterval = 0
     private var controlRoundTrip: (milliseconds: Double, at: TimeInterval)?
     private var reportedLocalNetwork: Bool?
     private var videoPeer: Peer?
@@ -739,6 +742,11 @@ public final class MediaSession: @unchecked Sendable {
             // short exchange. This side's own view of the active path can lag an aborted commit, so it is not consulted.
             pending.fast = fastRecoveryNegotiated && value.fast == true
             pending.awaitingUDPVerification = canAwaitUDP
+            if pending.fast, path == .udp, !canAwaitUDP {
+                pending.awaitingLiveness = true; pending.livenessFrom = SessionClock.uptime
+                challenge = nil
+                sendPing()
+            }
             transaction = pending
             refreshInteractiveDatagramAvailability()
             if canAwaitUDP {
@@ -835,18 +843,12 @@ public final class MediaSession: @unchecked Sendable {
         onState?(stateLabel(path))
     }
 
-    // Host: a recovery often follows an outage, and a keyframe paced into a path that is still down is
-    // lost whole. Without a recent pong the keyframe waits for one; probes go out faster meanwhile.
+    // Host: a recovery follows an outage or a queue that overflowed, and a keyframe paced into either is
+    // lost. It leaves once the stream is prepared and the transaction's own ping was answered; pings go
+    // out faster meanwhile.
     private func produceFastKeyFrame() {
         guard side == .host, var pending = transaction, pending.fast, pending.stage == .ready else { return }
-        if pending.path == .udp, SessionClock.uptime - lastPongAt > Self.recentPong {
-            if !pending.awaitingLiveness {
-                pending.awaitingLiveness = true; transaction = pending
-                challenge = nil
-                sendPing()
-            }
-            return
-        }
+        if pending.awaitingLiveness, lastAnsweredChallengeAt < pending.livenessFrom { return }
         pending.awaitingLiveness = false; pending.stage = .producing; transaction = pending
         onProduceRecoveryFrame?()
     }
@@ -1121,6 +1123,7 @@ public final class MediaSession: @unchecked Sendable {
                 let measured = now - challengeSentAt
                 guard measured >= 0, measured < 1 else { return }
                 self.challenge = nil
+                lastAnsweredChallengeAt = challengeSentAt
                 lastPongAt = now
                 roundTrip = max(0.001, min(2, measured))
                 hasMeasuredRoundTrip = true

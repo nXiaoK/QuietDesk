@@ -21,7 +21,7 @@
 | WP5 | 输入补全（输入状态回馈、Caps Lock 同步、相对鼠标、手势、设备身份） | 中，可拆分 | 键盘动作与反馈已提交 `22bdedd`，相对鼠标已提交 `4b32a41`，精密滚动和手势已提交 `a9c4c70`，设备身份已提交 `4e67c77`。已完成软件验收，物理键鼠及触摸设备待实机确认 |
 | WP6 | 自动剪贴板，图片与文件 | 大 | 已提交 macOS `fe4ec9c`、Windows `97793b9`。双向配对 TLS、隔离原生剪贴板及窗口检查通过，真实 Finder / 资源管理器组合待验 |
 | WP7 | 视频性能：GPU 缩放与色彩转换、硬件编码、HEVC、60 fps 以上、码率自适应 | 大，可拆分 | 每秒性能统计已提交 `e9002e1`。已按用户决定优先开发双向文件粘贴。GPU、硬件编码及 HEVC 等待 Windows 实机 |
-| WP8 | 远端声音 | 中 | 未开始 |
+| WP8 | 远端声音 | 中 | 已提交 `4e57867`。双向配对 TLS、Wine 虚拟声卡、默认输出切换与窗口菜单检查通过，物理声卡和蓝牙耳机待 Windows 实机确认 |
 | WP9 | 辅助 TCP 通道与 UDP 视频（DTLS、分片、补传、FEC、路径策略） | 特大，分 5 步 | 未开始，依赖 WP1 |
 | WP10 | 自托管中继 | 大 | 未开始，依赖 WP9 |
 | WP11 | 会话工具：模拟键入、桌面操作、静音/黑屏遮罩/断开后锁屏、自动解锁、画质探测 | 中，可拆分 | 未开始 |
@@ -51,6 +51,7 @@ windows/
     video.rs     VideoPacket、H.264 Annex B 与 AVCC 转换、H264FrameAssembler
     host.rs      被控端会话（HostPlatform、FrameSink、HostOptions/HostCommand/HostEvent）
     viewer.rs    控制端会话（ViewerPlatform、ViewerCommand/ViewerEvent/ViewerEnd）
+    audio.rs audio_session.rs  Opus、抖动缓冲、远端声音开关与设备生命周期
     clipboard.rs  剪贴板能力协商、清单、按需拉取、接收确认与文件传输
     media.rs     媒体会话线格式与双方状态机，供 host.rs / viewer.rs 协商与传输视频
     keymap.rs input.rs   macOS 键码与 PC 扫描码互译、修饰键映射、点击计数、滚轮
@@ -59,6 +60,7 @@ windows/
   probe/    无界面的被控端/控制端，经标准输入输出驱动，供互通检查使用
   app/      Windows 程序（只在 Windows 目标上编译）
     win/capture.rs   按所选显示器使用桌面复制或 GDI 采集
+    win/audio.rs     WASAPI 默认输出设备的系统声音回环采集与播放
     win/codec.rs     Media Foundation H.264 软件编码器与解码器
     win/pipeline.rs  采集线程：采集→光标→NV12→编码→FrameSink
     win/inject.rs    SendInput
@@ -71,7 +73,7 @@ AppChecks/WindowsInteropChecks.swift   与 macOS 实现的双向互通检查
 scripts/run-windows-interop-checks.sh  Rust 测试 + 上述互通检查
 scripts/run-windows-wine-checks.sh     交叉编译产物在 Wine 容器中的冒烟检查
 scripts/build-windows.sh               交叉编译并打包到 outputs/windows/
-scripts/windows-toolchain.sh           固定版本并校验摘要的 llvm-mingw
+scripts/windows-toolchain.sh           经校验的 llvm-mingw 与构建 libopus 所需的 CMake
 scripts/check-cargo-lock-age.py        检查锁定的依赖是否已发布满 7 天
 ```
 
@@ -81,6 +83,7 @@ scripts/check-cargo-lock-age.py        检查锁定的依赖是否已发布满 7
 - 两端支持时使用控制连接上的 `shared` 流，H.264 视频通过 `mediaFrame` 发送并以 `mediaFeedback` 确认。首次切换前和对接旧版本时继续支持 `video` / `acknowledgement`。Windows 被控端最多等待 3 帧确认。
 - 被控端能枚举活动屏幕时声明 `displaySwitchingV1`，能读取当前控制台的键盘大写状态时声明 `inputActions`。两项能力独立协商。
 - Windows 剪贴板监听器启动后，被控端声明 `clipboardSync` 和 `physicalFilePasteV1`。两端通过消息 11 确认可用能力和开关。复制文件只通告类型，首次读取才索取预览，接收端同意后传输内容。
+- Windows 被控端通过 `remoteAudioV1` 声明远端系统声音。控制端可在会话内开启声音，设备启动成功后才确认开启。
 - 控制端只使用被控端 Hello 里声明且自己已实现的能力；收到未协商的消息类型即断开，与 macOS 一致。
 
 ### 2.2 WP1 开工前的验证基线
@@ -286,9 +289,9 @@ Windows 使用独立 STA 持有 OLE 剪贴板。格式枚举和查询只返回�
 
 ### WP8 远端声音
 
-**macOS 参考（待核实）**：`RemoteAudio.swift`（已确认：`RemoteAudioControl`（消息 38）操作 `request` / `status`，字段 `requestID`、`enabled`、`epoch`、`sampleRate`、`channels`、`framesPerPacket`、`magicCookie`(≤256 字节)、`redundantOpus`、`error`(≤240 字符)；参数 48 kHz、双声道、每包 960 帧（20 ms）、目标码率 96 kbps；`RemoteAudioPacket`（消息 39）头 16 字节、标志位 `0x01` 表示带上一包的冗余负载；另有 `RemoteAudioJitterBuffer`、`AudioLossConcealer`）；应用侧 `RemoteAudioStream.swift`、`DeskModel.applyHostAudioRequest` / `setRemoteAudioEnabled`；Hello 的 `remoteAudioV1`。
+Windows 被控端通过 WASAPI 回环采集默认输出设备，控制端通过 WASAPI 播放。系统共享模式负责采样率与格式转换。与 macOS 的 `RemoteAudio.swift`、`RemoteAudioStream.swift` 对齐，使用 48 kHz 双声道和 20 ms 的 Opus 帧。Windows 编码无需附带 `magicCookie`；已用 Apple 解码器验证。Windows 解码器也通过了 Apple 编码和携带原生 cookie 的输入检查。
 
-**要做的事**：Opus 用 libopus（选能随源码静态构建并能用 llvm-mingw 交叉编译的 crate，先做一次交叉编译验证）。被控端：WASAPI 回环采集默认输出设备 → 重采样到 48 kHz 双声道 → Opus → `audioFrame`（走控制连接；UDP 就绪后可改走数据报）。控制端：解码 → 抖动缓冲 → WASAPI 播放。`magicCookie` 是 macOS 编码器给解码器的配置，Windows 作为编码端时该字段如何填写、macOS 解码端是否要求它，必须先读 `status` 的校验与 `OpusAudioDecoder` 再定。默认关闭，由控制端开启。
+控制连接上的消息 38 协商开关，消息 39 携带音频包。设备准备成功后才报告启用。远端状态按请求 ID 匹配，音频按会话代次、暂停修订及包序处理。发送队列超过 512 KiB 时丢弃拥塞音频，关闭、失败或超时只结束音频。UDP 音频见 WP9e。
 
 ### WP9 辅助 TCP 通道与 UDP 视频
 
@@ -345,7 +348,8 @@ Windows 使用独立 STA 持有 OLE 剪贴板。格式枚举和查询只返回�
 5. 配对码：重启后仍在（DPAPI）；“重新生成”后旧码失效。
 6. WP2 之后：两个方向都只看到一个光标且跟手；形状随上下文变化（箭头、文本、手形、缩放）。
 7. WP3 之后：被控端重启、网络切换后自动恢复；被控端主动结束后不重连。
-8. 之后各 WP 把自己的实机条目补到这里。
+8. Mac 与 Windows 互相复制文件夹，在对端 Finder 或资源管理器中粘贴、确认接收并检查目录内容。
+9. 双向开启系统声音，播放左右声道可辨识的内容，检查长时间音画延迟、暂停恢复，以及拔插或切换蓝牙与有线输出设备后的表现。
 
 ## 附录 A 已核实的协议笔记
 
@@ -442,7 +446,7 @@ Windows 使用独立 STA 持有 OLE 剪贴板。格式枚举和查询只返回�
 | 34 | sessionTermination | 已实现 |
 | 35–36 | desktopActionRequest、desktopActionResult | WP11 |
 | 37 | displayControl | WP4 已接入两端的屏幕选择与状态更新 |
-| 38–39 | audioControl、audioFrame | WP8 |
+| 38–39 | audioControl、audioFrame | WP8 已接入系统声音与设备开关 |
 | 40 | qualityProbeControl | WP11 |
 | 41–42 | clipboardManifest、clipboardPull | WP6 |
 | 43–45 | mappingControl、mappingData、mappingEOF | WP12 |

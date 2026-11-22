@@ -1,4 +1,5 @@
 pub mod app;
+mod audio;
 pub mod canvas;
 pub mod capture;
 pub mod clipboard;

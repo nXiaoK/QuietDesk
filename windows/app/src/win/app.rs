@@ -204,6 +204,9 @@ pub(super) fn open_clipboard(role: Role, enabled: bool) -> Option<SessionClipboa
 
 /// Where a viewer session reports to. Called from the network and decode threads.
 pub trait ViewerSink: Send + Sync + 'static {
+    fn plays_audio(&self) -> bool {
+        false
+    }
     fn clipboard_preference(&self) -> Option<bool> {
         None
     }
@@ -238,6 +241,12 @@ impl<S: ViewerSink> WindowsViewer<S> {
 }
 
 impl<S: ViewerSink> ViewerPlatform for WindowsViewer<S> {
+    fn supports_audio_playback(&self) -> bool {
+        self.sink.plays_audio()
+    }
+    fn start_audio_playback(&mut self, epoch: std::num::NonZeroU32, paused: bool) -> Result<quietdesk_core::audio_session::AudioPlayback> {
+        super::audio::start_playback(epoch, paused)
+    }
     fn open_clipboard(&mut self) -> Option<SessionClipboard> {
         open_clipboard(Role::Viewer, self.sink.clipboard_preference()?)
     }

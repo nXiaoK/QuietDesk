@@ -348,6 +348,12 @@ fn stopped() -> DeskError {
 }
 
 impl HostPlatform for WindowsHost {
+    fn supports_audio_capture(&self) -> bool {
+        true
+    }
+    fn start_audio_capture(&mut self, epoch: std::num::NonZeroU32, redundant: bool, paused: bool) -> Result<quietdesk_core::audio_session::AudioCapture> {
+        super::audio::start_capture(epoch, redundant, paused)
+    }
     fn open_clipboard(&mut self, enabled: bool) -> Option<quietdesk_core::clipboard_session::SessionClipboard> {
         super::app::open_clipboard(quietdesk_core::clipboard::Role::Host, enabled)
     }

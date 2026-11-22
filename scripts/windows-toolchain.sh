@@ -18,9 +18,11 @@ if [[ ! -x "$toolchain_directory/bin/x86_64-w64-mingw32-clang" ]]; then
     mv "$toolchain_root/$toolchain_archive.part" "$toolchain_root/$toolchain_archive"
     tar -xJf "$toolchain_root/$toolchain_archive" -C "$toolchain_root"
 fi
-export PATH="$toolchain_directory/bin:$PATH"
+cmake_bin="$(bash scripts/windows-cmake.sh)" || return 1
+export PATH="$toolchain_directory/bin:$cmake_bin:$PATH"
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=x86_64-w64-mingw32-clang
 export CC_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang
+export CXX_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-clang++
 export AR_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-llvm-ar
 export RANLIB_x86_64_pc_windows_gnullvm=x86_64-w64-mingw32-llvm-ranlib
 export CARGO_TARGET_DIR="${QUIETDESK_WINDOWS_TARGET_DIR:-$PWD/work/windows-build/target}"

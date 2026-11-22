@@ -15,20 +15,32 @@ binary, = [row["executable"] for row in builds
 print(binary)
 ')"
 image=quietdesk-wine-check:local
-docker image inspect "$image" >/dev/null 2>&1 || docker build --platform linux/amd64 -t "$image" -f windows/wine-check.Dockerfile windows >/dev/null
+docker build --platform linux/amd64 -t "$image" -f windows/wine-check.Dockerfile windows >/dev/null
 export QUIETDESK_WINCHECK_PAIRING_CODE="$(python3 -c 'import os; print(os.urandom(32).hex())')"
 # Limit only this container when testing Wine under a CPU translator.
 container_args=(--rm --init --network none --platform linux/amd64)
 if [[ -n "${QUIETDESK_WINE_CPUSET:-}" ]]; then container_args+=(--cpuset-cpus "$QUIETDESK_WINE_CPUSET"); fi
-# The clipboard checks own their Wine prefix and desktop. The media run gets a fresh one.
+# The native checks own their Wine prefix, clipboard, desktop and audio server. The media run gets a fresh prefix.
 docker run -i "${container_args[@]}" -v "$native_test:/qa/native-tests.exe:ro" "$image" bash -s <<'NATIVE_CHECKS'
 set -eu
-export LC_ALL=C.UTF-8 XDG_RUNTIME_DIR=/tmp DISPLAY=:99 WINEDEBUG=-all QUIETDESK_ISOLATED_CLIPBOARD_CHECK=1
+export LC_ALL=C.UTF-8 XDG_RUNTIME_DIR=/tmp/quietdesk-runtime DISPLAY=:99 WINEDEBUG=-all
+test ! -e /dev/snd
+install -d -m 700 "$XDG_RUNTIME_DIR"
+pulseaudio --daemonize --exit-idle-time=-1
+pactl load-module module-null-sink sink_name=quietdesk_test_sink rate=44100 channels=2 >/dev/null
+pactl set-default-sink quietdesk_test_sink
 Xvfb :99 -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1 &
 sleep 2
 timeout 120 wineboot -i >/dev/null 2>&1
 timeout 90 wine /qa/native-tests.exe --test-threads=1
-timeout 60 wine /qa/native-tests.exe clipboard_native_ --ignored --test-threads=1
+QUIETDESK_ISOLATED_CLIPBOARD_CHECK=1 timeout 60 wine /qa/native-tests.exe clipboard_native_ --ignored --test-threads=1
+audio_test=win::audio::tests::wasapi_virtual_stereo_roundtrip_pause_resume
+QUIETDESK_ISOLATED_AUDIO_CHECK=1 timeout 60 wine /qa/native-tests.exe "$audio_test" --exact --ignored --test-threads=1 > /tmp/quietdesk-audio-check.log || {
+    cat /tmp/quietdesk-audio-check.log
+    exit 1
+}
+cat /tmp/quietdesk-audio-check.log
+grep -qF "test result: ok. 1 passed; 0 failed;" /tmp/quietdesk-audio-check.log
 NATIVE_CHECKS
 
 docker run -i "${container_args[@]}" -e QUIETDESK_WINCHECK_PAIRING_CODE -v "$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/release:/app:ro" "$image" bash -s <<'WINE_CHECKS'

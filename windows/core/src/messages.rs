@@ -100,6 +100,8 @@ pub struct Hello {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clipboard_sync: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_audio_v1: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub physical_file_paste_v1: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relative_mouse_v1: Option<bool>,
@@ -571,6 +573,7 @@ mod tests {
             can_control: true,
             input_actions: None,
             clipboard_sync: None,
+            remote_audio_v1: None,
             physical_file_paste_v1: None,
             relative_mouse_v1: None,
             trackpad_gestures_v1: None,

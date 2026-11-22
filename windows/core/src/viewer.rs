@@ -1,6 +1,7 @@
 //! The viewer side of a session: the role of `DeskModel.handleViewer` in the macOS application, for a
 //! viewer that receives video over the control connection and uses only what the host advertised.
 
+use crate::audio_session::{AudioPlayback, ViewerAudio};
 use crate::clipboard_session::SessionClipboard;
 use crate::cursor::{CursorControl, CursorOperation, CursorPosition, CursorPresentationState, CursorShape};
 use crate::display::{DisplayControl, RemoteDisplayInfo};
@@ -36,6 +37,7 @@ pub enum ViewerCommand {
     ReleaseInput,
     Quality(StreamSettings),
     SelectDisplay(u32),
+    RemoteAudio(bool),
     SendClipboard(String),
     RequestClipboard,
     AutomaticClipboard {
@@ -60,6 +62,7 @@ pub enum ViewerEvent {
         relative_mouse: bool,
         trackpad_gestures: bool,
         clipboard_sync: bool,
+        remote_audio: bool,
     },
     /// The stream now has this size and quality; `error` says why a requested change was not applied.
     Stream {
@@ -87,6 +90,11 @@ pub enum ViewerEvent {
     RoundTrip(f64),
     ClipboardText(String),
     ClipboardStatus(String),
+    Audio {
+        enabled: bool,
+        pending: bool,
+        error: Option<String>,
+    },
 }
 
 /// Why a session ended.
@@ -117,6 +125,12 @@ impl From<DeskError> for ViewerEnd {
 }
 
 pub trait ViewerPlatform {
+    fn supports_audio_playback(&self) -> bool {
+        false
+    }
+    fn start_audio_playback(&mut self, _epoch: std::num::NonZeroU32, _paused: bool) -> Result<AudioPlayback> {
+        Err(DeskError::platform("当前系统不支持播放远端声音"))
+    }
     fn open_clipboard(&mut self) -> Option<SessionClipboard> {
         None
     }
@@ -161,6 +175,7 @@ struct ViewerSession<'a, P: ViewerPlatform> {
     waiting_for_input_echo: bool,
     clipboard_requested: Option<Instant>,
     clipboard: Option<SessionClipboard>,
+    audio: ViewerAudio,
     host_ended: bool,
     progress: &'a AttemptProgress,
 }
@@ -210,6 +225,7 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
         waiting_for_input_echo: false,
         clipboard_requested: None,
         clipboard: None,
+        audio: ViewerAudio::default(),
         host_ended: false,
         progress: &progress,
     };
@@ -227,6 +243,7 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
                 Some(PeerEvent::Closed(reason)) => Err(reason),
                 None => Err(DeskError::Network("连接已关闭".to_string())),
             },
+            audio = session.audio.next() => session.audio.deliver(audio, &peer, session.platform),
             status = SessionClipboard::next(&mut session.clipboard, &peer) => match status {
                 Ok(Some(status)) => { session.platform.event(ViewerEvent::ClipboardStatus(status)); Ok(()) }
                 Ok(None) => Ok(()),
@@ -363,6 +380,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 if self.pending_pause == Some(result.id) {
                     self.pending_pause = None;
                     self.paused = result.paused;
+                    self.audio.pause(self.paused);
                     if self.media.is_some() {
                         self.update_media(|media| media.set_paused(result.paused, Instant::now()))?;
                     }
@@ -377,6 +395,8 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 self.host_ended = true;
                 return Err(DeskError::Network(HOST_ENDED_REASON.to_string()));
             }
+            MessageKind::AudioControl if self.audio.supported => self.audio.status(&message, self.platform, self.paused, self.peer)?,
+            MessageKind::AudioFrame if self.audio.supported => self.audio.frame(&message, self.paused, self.peer, self.platform)?,
             kind if SessionClipboard::accepts(kind) => {
                 self.clipboard.as_ref().ok_or_else(|| DeskError::invalid("尚未协商自动剪贴板"))?.receive(message)?;
             }
@@ -401,7 +421,9 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         if hello.clipboard_sync == Some(true) {
             self.clipboard = self.platform.open_clipboard();
         }
+        self.audio.supported = hello.remote_audio_v1 == Some(true) && self.platform.supports_audio_playback();
         self.platform.event(ViewerEvent::Connected {
+            remote_audio: self.audio.supported,
             clipboard_sync: self.clipboard.is_some(),
             name: device_display_name(&hello.name),
             device_id: hello.device_id,
@@ -653,6 +675,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 self.display_event(None);
                 Ok(())
             }
+            ViewerCommand::RemoteAudio(enabled) => self.audio.request(enabled, self.peer, self.platform),
             ViewerCommand::SendClipboard(text) => {
                 if text.len() > wire::MAXIMUM_CLIPBOARD_BYTES {
                     return Err(DeskError::invalid("文字剪贴板最大支持 1 MB"));

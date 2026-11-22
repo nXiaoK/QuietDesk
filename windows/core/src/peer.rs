@@ -77,6 +77,10 @@ impl PeerHandle {
         Ok(())
     }
 
+    pub(crate) fn queued_send_bytes(&self) -> usize {
+        self.shared.pending_bytes.load(Ordering::Relaxed)
+    }
+
     /// Sends what is queued, then closes the connection.
     pub fn close(&self) {
         let _ = self.outgoing.send(Outgoing::Close(None));

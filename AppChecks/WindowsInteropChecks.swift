@@ -239,6 +239,55 @@ private final class InteropClipboard: @unchecked Sendable {
     }
 }
 
+private enum StereoTone {
+    static func encode() throws -> (cookie: Data?, packets: [Data]) {
+        let encoder = try OpusAudioEncoder()
+        let count = RemoteAudioControl.framesPerPacket
+        var packets: [Data] = []
+        for block in 0..<20 where packets.count < 12 {
+            var samples: [Float] = []
+            for frame in block * count..<(block + 1) * count {
+                for frequency in [330.0, 660.0] {
+                    let phase = 2 * Double.pi * frequency * Double(frame) / Double(RemoteAudioControl.sampleRate)
+                    samples.append(Float(0.15 * sin(phase)))
+                }
+            }
+            packets += try encoder.encode(interleavedStereoSamples: samples)
+        }
+        try require(packets.count >= 12, "Apple's Opus encoder produced too few packets")
+        return (encoder.magicCookie, packets)
+    }
+
+    static func checkWindowsPackets(_ packets: [RemoteAudioPacket], status: RemoteAudioControl) throws {
+        let decoder = try OpusAudioDecoder(magicCookie: status.magicCookie)
+        var channels = [[Float](), [Float]()]
+        for (index, packet) in packets.enumerated() {
+            try require(packet.epoch == status.epoch && packet.sequence == UInt64(index + 1) && packet.channels == 2,
+                        "The audio packets did not start at sequence one in the confirmed stereo epoch")
+            let expectedPrevious = index > 0 && status.redundantOpus == true ? packets[index - 1].opusPayload : nil
+            try require(packet.previousOpusPayload == expectedPrevious, "The encoded predecessor differed from the negotiated packet history")
+            let pcm = try decoder.decode(packet.opusPayload)
+            if index >= 3 {
+                try require(pcm.count == RemoteAudioControl.framesPerPacket * 2, "The decoded packet did not contain 20 ms of stereo")
+                for frame in stride(from: 0, to: pcm.count, by: 2) {
+                    channels[0].append(pcm[frame]); channels[1].append(pcm[frame + 1])
+                }
+            }
+        }
+        for (n, channel) in channels.enumerated() {
+            let levels = [440.0, 880.0].map { frequency in
+                var c = 0.0, s = 0.0
+                for (index, sample) in channel.enumerated() {
+                    let phase = 2 * Double.pi * frequency * Double(index) / Double(RemoteAudioControl.sampleRate)
+                    c += Double(sample) * cos(phase); s += Double(sample) * sin(phase)
+                }
+                return 2 * hypot(c, s) / Double(channel.count)
+            }
+            try require(levels[n] > 0.05 && levels[n] > 3 * levels[1 - n], "The Mac decoded unexpected tones on channel \(n): \(levels)")
+        }
+    }
+}
+
 private final class MacViewer: @unchecked Sendable {
     struct State {
         var ready = false
@@ -267,6 +316,8 @@ private final class MacViewer: @unchecked Sendable {
         var pauses: [SessionPauseResult] = []
         var clipboard: [String] = []
         var terminated = false
+        var audioStatuses: [RemoteAudioControl] = []
+        var audioPackets: [RemoteAudioPacket] = []
         var holdAcknowledgements = false
     }
     let state = Shared(State())
@@ -376,6 +427,13 @@ private final class MacViewer: @unchecked Sendable {
                 }
                 state.displayUpdates.append(update)
             }
+        case .audioControl where state.get().hello?.remoteAudioV1 == true:
+            let status = try RemoteAudioControl.read(message.payload)
+            try require(status.operation == .status, "The Windows host sent an audio request")
+            state.update { $0.audioStatuses.append(status) }
+        case .audioFrame where state.get().hello?.remoteAudioV1 == true:
+            let packet = try RemoteAudioPacket.decode(message.payload)
+            state.update { $0.audioPackets.append(packet) }
         case .inputStatus where state.get().hello?.inputActions == true:
             let feedback = try Wire.readJSON(InputFeedback.self, message.payload)
             state.update { $0.inputFeedback.append(feedback) }
@@ -632,6 +690,7 @@ private final class MacHost: @unchecked Sendable {
         var pauseRequests: [Bool] = []
         var clipboard = "Mac 主机剪贴板"
         var received: [MessageKind] = []
+        var audioRequests: [RemoteAudioControl] = []
         var identities: [DeviceIdentity] = []
         var posted: [PostedEvent] = []
         var inputs: [RemoteInput] = []
@@ -650,6 +709,7 @@ private final class MacHost: @unchecked Sendable {
     private let size: (width: Int, height: Int)
     private let injector: InputInjector
     let keyboard = SyntheticInputSources()
+    private let advertiseAudio: Bool
     private let inputActions: Bool
     private let relativeMouse: Bool
     private let trackpadGestures: Bool
@@ -662,7 +722,8 @@ private final class MacHost: @unchecked Sendable {
     init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int), advertiseMedia: Bool, cursorImage: CursorImage?,
          externalPackets: [VideoPacket] = [], inputActions: Bool = true, relativeMouse: Bool = true, trackpadGestures: Bool = true,
          deviceID: UUID? = UUID(), identityExchange: Bool? = true, prepareHello: @escaping (Message) throws -> Message = { $0 },
-         on port: NWEndpoint.Port = .any, clipboard: InteropClipboard? = nil) throws {
+         on port: NWEndpoint.Port = .any, clipboard: InteropClipboard? = nil, advertiseAudio: Bool = true) throws {
+        self.advertiseAudio = advertiseAudio
         self.advertiseMedia = advertiseMedia
         self.cursorImage = cursorImage
         self.key = key
@@ -760,7 +821,7 @@ private final class MacHost: @unchecked Sendable {
                     displaySwitchingV1: self.externalPackets.isEmpty ? nil : true,
                     displays: self.externalPackets.isEmpty ? nil : self.state.get().displays,
                     selectedDisplayID: self.externalPackets.isEmpty ? nil : self.state.get().selectedDisplay,
-                    remoteAudioV1: true, relativeMouseV1: self.relativeMouse ? true : nil, trackpadGesturesV1: self.trackpadGestures ? true : nil,
+                    remoteAudioV1: self.advertiseAudio ? true : nil, relativeMouseV1: self.relativeMouse ? true : nil, trackpadGesturesV1: self.trackpadGestures ? true : nil,
                     initialCursorNegotiationV1: self.cursorImage == nil ? nil : true, qualityProbeV1: true, typeTextV1: true,
                     physicalFilePasteV1: self.clipboard?.physical == true ? true : nil))
                 peer.send(try self.prepareHello(hello))
@@ -819,6 +880,10 @@ private final class MacHost: @unchecked Sendable {
             if state.get().media?.receive(message) == true { return }
         }
         switch message.kind {
+        case .audioControl where advertiseAudio:
+            let request = try RemoteAudioControl.read(message.payload)
+            try require(request.operation == .request, "The Windows viewer sent an audio status")
+            state.update { $0.audioRequests.append(request) }
         case .deviceIdentity:
             guard identityExchange == true else { throw Failure("The viewer sent an identity without negotiation") }
             let identity = try Wire.readJSON(DeviceIdentity.self, message.payload)
@@ -1158,6 +1223,57 @@ private struct WindowsInteropChecks {
                 try require(probe.all("configured").count == 1 && settings(try probe.next("configured")) == [2560, 60, 20, 640, 360],
                             "The Windows host started its stream more than once or with other settings")
                 try until("control status arrives") { viewer.state.get().control == [true] }
+            }
+        }
+
+        run("A Mac decodes Windows stereo Opus across pause, disable and a new epoch") {
+            try withWindowsHost(["--synthetic-audio"]) { _, viewer in
+                try until("Windows offers remote sound and starts video") { viewer.state.get().hello?.remoteAudioV1 == true && !viewer.state.get().decoded.isEmpty }
+                try require(viewer.state.get().audioPackets.isEmpty, "Sound started before a viewer requested it")
+                func toggle(_ enabled: Bool, redundancy: Bool = false) throws -> RemoteAudioControl {
+                    let request = RemoteAudioControl.request(enabled: enabled, redundantOpus: redundancy ? true : nil)
+                    viewer.peer.send(try request.message())
+                    try until("Windows confirms the matching sound request") { viewer.state.get().audioStatuses.contains { $0.requestID == request.requestID } }
+                    let status = viewer.state.get().audioStatuses.first { $0.requestID == request.requestID }!
+                    try require(status.enabled == enabled && status.error == nil && (status.redundantOpus == true) == redundancy,
+                                "Windows confirmed a different sound configuration")
+                    return status
+                }
+                let first = try toggle(true, redundancy: true)
+                try until("eight redundant audio packets arrive") { viewer.state.get().audioPackets.count >= 8 }
+                try StereoTone.checkWindowsPackets(Array(viewer.state.get().audioPackets.prefix(8)), status: first)
+                viewer.peer.send(try Wire.json(.sessionPauseRequest, SessionPauseRequest(paused: true)))
+                try until("the host confirms pause") { viewer.state.get().pauses.last?.paused == true }
+                let pausedCount = viewer.state.get().audioPackets.count
+                usleep(120_000)
+                try require(viewer.state.get().audioPackets.count == pausedCount, "Audio continued after pause was confirmed")
+                viewer.peer.send(try Wire.json(.sessionPauseRequest, SessionPauseRequest(paused: false)))
+                try until("audio resumes in the same epoch") { viewer.state.get().audioPackets.count > pausedCount }
+                let resumed = viewer.state.get().audioPackets[pausedCount]
+                try require(resumed.epoch == first.epoch && resumed.previousOpusPayload == nil,
+                            "The resumed stream carried a stale epoch or pre-pause audio redundancy")
+                _ = try toggle(false)
+                let stopped = viewer.state.get()
+                try until("video advances after sound is disabled") { viewer.state.get().decoded.count > stopped.decoded.count + 4 }
+                try require(viewer.state.get().audioPackets.count == stopped.audioPackets.count, "Windows continued sending after sound was disabled")
+                let second = try toggle(true)
+                try require(second.epoch! > first.epoch!, "Windows reused the previous audio epoch")
+                try until("eight plain audio packets arrive") { viewer.state.get().audioPackets.filter { $0.epoch == second.epoch }.count >= 8 }
+                try StereoTone.checkWindowsPackets(Array(viewer.state.get().audioPackets.filter { $0.epoch == second.epoch }.prefix(8)), status: second)
+            }
+        }
+
+        run("A Windows capture failure reaches the Mac without interrupting video") {
+            try withWindowsHost(["--synthetic-audio", "--fail-audio"]) { _, viewer in
+                try until("the Mac sees audio support") { viewer.state.get().hello?.remoteAudioV1 == true }
+                let request = RemoteAudioControl.request(enabled: true)
+                viewer.peer.send(try request.message())
+                try until("the Mac receives the capture error") { viewer.state.get().audioStatuses.contains { $0.requestID == request.requestID } }
+                let state = viewer.state.get(), status = state.audioStatuses.last!
+                try require(!status.enabled && status.epoch == nil && status.error?.contains("Synthetic audio capture") == true,
+                            "Windows concealed its capture failure")
+                try until("video continues with capture unavailable") { viewer.state.get().decoded.count > state.decoded.count + 3 }
+                try require(viewer.state.get().audioPackets.isEmpty, "A failed capture emitted audio")
             }
         }
 
@@ -1636,11 +1752,11 @@ private struct WindowsInteropChecks {
 
         func withMacHost(advertiseMedia: Bool = true, cursorImage: CursorImage? = nil, twoDisplays: Bool = false, inputActions: Bool = true, relativeMouse: Bool = true,
                          trackpadGestures: Bool = true, deviceID: UUID? = UUID(), identityExchange: Bool? = true, prepareHello: @escaping (Message) throws -> Message = { $0 },
-                         viewerKey: PairingKey? = nil, quality: String = "1920,60,20", clipboard: InteropClipboard? = nil,
+                         viewerKey: PairingKey? = nil, quality: String = "1920,60,20", clipboard: InteropClipboard? = nil, advertiseAudio: Bool = true,
                          _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
             let host = try MacHost(key: key, packets: packets, size: size, advertiseMedia: advertiseMedia, cursorImage: cursorImage,
                                    externalPackets: twoDisplays ? externalPackets : [], inputActions: inputActions, relativeMouse: relativeMouse, trackpadGestures: trackpadGestures,
-                                   deviceID: deviceID, identityExchange: identityExchange, prepareHello: prepareHello, clipboard: clipboard)
+                                   deviceID: deviceID, identityExchange: identityExchange, prepareHello: prepareHello, clipboard: clipboard, advertiseAudio: advertiseAudio)
             defer { host.stop() }
             let probe = try Probe(probePath, ["viewer", "--code", (viewerKey ?? key).code, "--port", "\(host.port)", "--quality", quality] + extra)
             defer { probe.stop() }
@@ -1700,6 +1816,80 @@ private struct WindowsInteropChecks {
             try probe.send(["command": "holdAcknowledgements", "hold": false])
             for sequence in sequences { try probe.send(["command": "acknowledge", "sequence": Int(sequence)]) }
             try until("decode receipts reopen the Mac capture window") { probe.all("frame").count > frames.count + 6 }
+        }
+
+        run("A Windows viewer decodes Mac stereo Opus, discards stale sound and stops on request") {
+            try withMacHost(["--synthetic-audio"]) { host, probe in
+                try require(try probe.next("connected")["remoteAudio"] as? Bool == true, "The Mac audio capability was lost")
+                _ = try probe.next("mediaCommitted")
+                let source = try StereoTone.encode()
+                guard let peer = host.state.get().peer, let media = host.state.get().media else { throw Failure("The Mac has no active session") }
+                try probe.send(["command": "remoteAudio", "enabled": true])
+                try until("Mac receives the sound request") { host.state.get().audioRequests.count == 1 }
+                let request = host.state.get().audioRequests[0]
+                try require(request.enabled && request.redundantOpus == true, "Windows did not negotiate redundant Opus")
+                let epoch: UInt32 = 17
+                peer.send(try RemoteAudioControl.status(requestID: UUID(), enabled: false, error: "Obsolete request").message())
+                peer.send(try RemoteAudioControl.status(requestID: request.requestID, enabled: true, epoch: epoch,
+                                                        magicCookie: source.cookie, redundantOpus: true).message())
+                _ = try probe.next("audio") { $0["enabled"] as? Bool == true && $0["pending"] as? Bool == false }
+                try require(!probe.all("audio").contains { $0["error"] as? String == "Obsolete request" }, "A stale sound response replaced the pending request")
+                func packet(_ index: Int, epoch: UInt32) throws -> RemoteAudioPacket {
+                    try RemoteAudioPacket(epoch: epoch, sequence: UInt64(index + 1), opusPayload: source.packets[index],
+                                          previousOpusPayload: index > 0 ? source.packets[index - 1] : nil)
+                }
+                for i in 0..<2 { _ = try media.sendAudioPacket(packet(i, epoch: epoch - 1)) }
+                for i in 0..<12 where i != 4 {
+                    try require(try media.sendAudioPacket(packet(i, epoch: epoch)), "The Mac could not send an Opus packet")
+                    usleep(20_000)
+                }
+                try until("Windows decodes the missing packet from the next redundant packet") { probe.all("audioSamples").count >= 12 }
+                let samples = probe.all("audioSamples")
+                try require(samples.count == 12 && samples.allSatisfy { $0["epoch"] as? Int == Int(epoch) && $0["frames"] as? Int == 960 },
+                            "The viewer played a stale epoch, skipped a packet or decoded the wrong duration")
+                let audible = samples.dropFirst(3).allSatisfy { sample in
+                    guard let levels = sample["levels"] as? [[Double]], levels.count == 2, levels.allSatisfy({ $0.count == 2 }) else { return false }
+                    return (0..<2).allSatisfy { levels[$0][$0] > 0.05 && levels[$0][$0] > 3 * levels[$0][1 - $0] }
+                }
+                try require(audible, "The sound Windows actually decoded did not preserve the left and right Mac tones")
+                try probe.send(["command": "remoteAudio", "enabled": false])
+                try until("Mac receives the mute request") { host.state.get().audioRequests.count == 2 }
+                let stop = host.state.get().audioRequests[1]
+                try require(!stop.enabled && stop.requestID != request.requestID, "Muting reused the enable request")
+                peer.send(try RemoteAudioControl.status(requestID: stop.requestID, enabled: false).message())
+                _ = try probe.next("audio") { $0["enabled"] as? Bool == false && $0["pending"] as? Bool == false }
+                for i in 0..<3 { _ = try media.sendAudioPacket(packet(i, epoch: epoch)) }
+                let before = probe.all("frame").count
+                try until("video continues after muting") { probe.all("frame").count > before + 6 }
+                try require(probe.all("audioSamples").count == samples.count, "Windows played late audio after muting")
+            }
+        }
+
+        run("A Windows playback error stops Mac capture while video continues") {
+            try withMacHost(["--synthetic-audio", "--fail-audio"]) { host, probe in
+                _ = try probe.next("connected")
+                try probe.send(["command": "remoteAudio", "enabled": true])
+                try until("Mac receives the request before playback fails") { host.state.get().audioRequests.count == 1 }
+                guard let peer = host.state.get().peer else { throw Failure("Missing authenticated peer") }
+                peer.send(try RemoteAudioControl.status(requestID: host.state.get().audioRequests[0].requestID, enabled: true, epoch: 1).message())
+                _ = try probe.next("audio") { $0["enabled"] as? Bool == false && ($0["error"] as? String)?.contains("Synthetic audio playback") == true }
+                try until("Windows releases the Mac's capture") { host.state.get().audioRequests.last?.enabled == false }
+                peer.send(try RemoteAudioControl.status(requestID: host.state.get().audioRequests.last?.requestID, enabled: false).message())
+                let count = probe.all("frame").count
+                try until("pictures continue after the playback error") { probe.all("frame").count > count + 4 }
+                try require(probe.all("audioSamples").isEmpty, "The unavailable playback worker reported decoded samples")
+            }
+        }
+
+        run("A Windows viewer keeps sound disabled when the Mac omits remoteAudioV1") {
+            try withMacHost(advertiseAudio: false, ["--synthetic-audio"]) { host, probe in
+                try require(try probe.next("connected")["remoteAudio"] as? Bool == false, "Windows advertised an unavailable session capability")
+                try probe.send(["command": "remoteAudio", "enabled": true])
+                try probe.send(["command": "pause", "paused": true])
+                _ = try probe.next("paused")
+                try require(host.state.get().audioRequests.isEmpty && !host.state.get().received.contains(.audioControl),
+                            "Windows sent an audio message to a legacy Mac")
+            }
         }
 
         run("A Windows viewer pairs with a Mac host, reads the application's hello and confirms its settings before capture starts") {

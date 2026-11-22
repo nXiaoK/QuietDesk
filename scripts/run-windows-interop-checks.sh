@@ -2,6 +2,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+cmake_bin="$(bash scripts/windows-cmake.sh)"
+export PATH="$cmake_bin:$PATH"
 check_root="${QUIETDESK_CHECK_BUILD_DIR:-$PWD/work/windows-interop-checks}"
 export CLANG_MODULE_CACHE_PATH="$check_root/ModuleCache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"

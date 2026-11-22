@@ -22,8 +22,8 @@ archive="$output/QuietDesk-$version-Windows-x64.zip"
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
 mkdir -p "$output"
-cp "$built/QuietDesk.exe" LICENSE "$staging/"
+cp "$built/QuietDesk.exe" LICENSE windows/licenses/THIRD-PARTY-OPUS.txt "$staging/"
 rm -f "$archive"
-(cd "$staging" && zip -q -X "$archive" QuietDesk.exe LICENSE)
+(cd "$staging" && zip -q -X "$archive" QuietDesk.exe LICENSE THIRD-PARTY-OPUS.txt)
 unzip -tq "$archive" >/dev/null
 (cd "$output" && shasum -a 256 "$(basename "$archive")" | tee "SHA256SUMS-$version-Windows.txt")

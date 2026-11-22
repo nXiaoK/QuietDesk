@@ -1,6 +1,8 @@
 //! A host session and a viewer session of this crate talking over an in-memory connection, with
 //! stand-ins for capture, decoding, input and the clipboard.
 
+use quietdesk_core::audio::{AudioControl, AudioEncoder, AudioPacket, AudioState, INTERLEAVED_SAMPLES};
+use quietdesk_core::audio_session::{AudioCapture, AudioPlayback, CaptureEvent, CaptureWorker, PlaybackEvent, PlaybackWorker};
 use quietdesk_core::display::{DisplaySwitch, HostDisplays, RemoteDisplayInfo};
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::host::{self, FrameSink, HostCommand, HostEvent, HostOptions, HostPlatform, InputActionOutcome};
@@ -18,6 +20,8 @@ use tokio::sync::mpsc;
 
 #[derive(Default)]
 struct HostLog {
+    audio_input: Option<(std::num::NonZeroU32, CaptureWorker)>,
+    supports_sound: bool,
     configured: Vec<StreamSettings>,
     injected: Vec<InjectOp>,
     clipboard: Option<String>,
@@ -51,6 +55,16 @@ struct FakeHost {
 }
 
 impl HostPlatform for FakeHost {
+    fn supports_audio_capture(&self) -> bool {
+        self.log.lock().unwrap().supports_sound
+    }
+
+    fn start_audio_capture(&mut self, epoch: std::num::NonZeroU32, _redundant: bool, paused: bool) -> Result<AudioCapture> {
+        let (input, worker) = AudioCapture::channel(paused);
+        self.log.lock().unwrap().audio_input = Some((epoch, worker));
+        Ok(input)
+    }
+
     fn supports_trackpad_gestures(&self) -> bool {
         self.log.lock().unwrap().supports_gestures
     }
@@ -195,6 +209,8 @@ fn key_frame() -> EncodedFrame {
 
 #[derive(Default)]
 struct ViewerLog {
+    supports_sound: bool,
+    audio_output: Option<PlaybackWorker>,
     events: Vec<ViewerEvent>,
     packets: Vec<VideoPacket>,
     /// Packet index of the decoded keyframe at each commit.
@@ -221,6 +237,16 @@ impl FakeViewer {
 }
 
 impl ViewerPlatform for FakeViewer {
+    fn supports_audio_playback(&self) -> bool {
+        self.log.lock().unwrap().supports_sound
+    }
+
+    fn start_audio_playback(&mut self, _epoch: std::num::NonZeroU32, paused: bool) -> Result<AudioPlayback> {
+        let (output, worker) = AudioPlayback::channel(paused);
+        self.log.lock().unwrap().audio_output = Some(worker);
+        Ok(output)
+    }
+
     fn local_identity(&self) -> Option<&DeviceIdentity> {
         self.identity.as_ref()
     }
@@ -401,6 +427,7 @@ async fn a_session_negotiates_streams_controls_and_ends_as_the_macos_roles_do() 
                     relative_mouse: false,
                     trackpad_gestures: false,
                     clipboard_sync: false,
+                    remote_audio: false,
                 }
             );
             assert!(log.events.contains(&ViewerEvent::Control(true)), "the viewer subscribed to control changes");
@@ -1046,4 +1073,110 @@ async fn an_old_host_gets_legacy_acknowledgements_and_cannot_send_unnegotiated_m
         assert_eq!(log.packets, [packet]);
         assert!(log.commits.is_empty());
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_sound_request_releases_capture_and_a_late_status_cannot_start_playback() {
+    let (left, right) = tokio::io::duplex(8192);
+    let (host, mut messages) = peer::spawn(left, PeerConfig::default());
+    let (viewer, incoming) = peer::spawn(right, PeerConfig::default());
+    let (commands, queue) = mpsc::unbounded_channel();
+    let (acknowledgements, decoded) = mpsc::unbounded_channel();
+    let log = Arc::new(Mutex::new(ViewerLog { supports_sound: true, ..Default::default() }));
+    let mut platform = FakeViewer { log: log.clone(), acknowledgements, identity: None };
+    let settings = StreamSettings::new(1920, 30, 8);
+    let exchange = async {
+        let hello = serde_json::json!({"version":1,"name":"test","width":640,"height":360,"settings":settings,"canControl":false,"remoteAudioV1":true});
+        host.send(&Message::json(MessageKind::Hello, &hello).unwrap()).unwrap();
+        until("the viewer can ask for sound", || log.lock().unwrap().events.iter().any(|e| matches!(e, ViewerEvent::Connected { remote_audio: true, .. })))
+            .await;
+        commands.send(ViewerCommand::RemoteAudio(true)).unwrap();
+        commands.send(ViewerCommand::RemoteAudio(true)).unwrap();
+        commands.send(ViewerCommand::ReleaseInput).unwrap();
+        let AudioControl::Request { request_id, enabled: true, .. } = AudioControl::read(&next_message(&mut messages).await).unwrap() else {
+            panic!("missing enable request")
+        };
+        assert_eq!(next_message(&mut messages).await.kind, MessageKind::ReleaseInput);
+        tokio::time::advance(Duration::from_secs(16)).await;
+        let release = AudioControl::read(&next_message(&mut messages).await).unwrap();
+        assert!(matches!(release, AudioControl::Request { enabled: false, .. }));
+        assert!(
+            log.lock()
+                .unwrap()
+                .events
+                .iter()
+                .any(|e| matches!(e, ViewerEvent::Audio { enabled:false, pending:false, error:Some(error) } if error.contains("超时")))
+        );
+        let status = |id, epoch| {
+            AudioControl::Status { request_id: Some(id), state: AudioState::Enabled { epoch, magic_cookie: None, redundant_opus: true } }.message().unwrap()
+        };
+        host.send(&status(request_id, 1.try_into().unwrap())).unwrap();
+        host.send(&Message::new(MessageKind::Video, VideoPacket::h264(9, key_frame()).encode().unwrap())).unwrap();
+        assert_eq!(next_message(&mut messages).await.kind, MessageKind::Acknowledgement);
+        assert!(log.lock().unwrap().audio_output.is_none());
+        commands.send(ViewerCommand::RemoteAudio(true)).unwrap();
+        let AudioControl::Request { request_id: retry_id, enabled: true, .. } = AudioControl::read(&next_message(&mut messages).await).unwrap() else {
+            panic!("missing retry")
+        };
+        assert_ne!(retry_id, request_id);
+        host.send(&status(retry_id, 2.try_into().unwrap())).unwrap();
+        until("the new epoch opens the local audio worker", || log.lock().unwrap().audio_output.is_some()).await;
+        let playing = ViewerEvent::Audio { enabled: true, pending: false, error: None };
+        let worker = log.lock().unwrap().audio_output.take().unwrap();
+        assert!(!log.lock().unwrap().events.contains(&playing));
+        worker.events.send(PlaybackEvent::Ready).await.unwrap();
+        until("sound is active after the worker confirms it", || log.lock().unwrap().events.contains(&playing)).await;
+        commands.send(ViewerCommand::Disconnect).unwrap();
+    };
+    let (end, ()) =
+        tokio::time::timeout(Duration::from_secs(20), async { tokio::join!(viewer::run(viewer, incoming, &mut platform, settings, queue, decoded), exchange) })
+            .await
+            .unwrap();
+    assert!(end.local_stop);
+}
+
+#[tokio::test]
+async fn audio_encoded_before_a_pause_cannot_escape_after_the_same_epoch_resumes() {
+    use quietdesk_core::messages::{SessionPauseRequest, SessionPauseResult};
+    let (left, right) = tokio::io::duplex(8192);
+    let (host, incoming) = peer::spawn(left, PeerConfig::default());
+    let (viewer, mut messages) = peer::spawn(right, PeerConfig::default());
+    let log = Arc::new(Mutex::new(HostLog { supports_sound: true, ..Default::default() }));
+    let mut platform = FakeHost { log: log.clone(), sink: Arc::default() };
+    let (commands, queue) = mpsc::unbounded_channel();
+    let exchange = async {
+        let hello: Hello = next_message(&mut messages).await.read_json().unwrap();
+        assert_eq!(hello.remote_audio_v1, Some(true));
+        let request_id = uuid::Uuid::new_v4();
+        viewer.send(&AudioControl::Request { request_id, enabled: true, redundant_opus: false }.message().unwrap()).unwrap();
+        until("the host creates its capture worker", || log.lock().unwrap().audio_input.is_some()).await;
+        let (epoch, worker) = log.lock().unwrap().audio_input.take().unwrap();
+        let original = worker.paused.borrow().revision;
+        worker.events.send(CaptureEvent::Ready).await.unwrap();
+        let status = AudioControl::read(&next_message(&mut messages).await).unwrap();
+        assert!(matches!(status,AudioControl::Status{request_id:Some(id),state:AudioState::Enabled{epoch:current,..}} if id==request_id && current==epoch));
+        let mut encoder = AudioEncoder::new(epoch, false).unwrap();
+        let pcm = [0.0; INTERLEAVED_SAMPLES];
+        let old_packet = encoder.encode(&pcm).unwrap();
+        for paused in [true, false] {
+            let request = SessionPauseRequest { id: uuid::Uuid::new_v4(), paused };
+            viewer.send(&Message::json(MessageKind::SessionPauseRequest, &request).unwrap()).unwrap();
+            let result: SessionPauseResult = next_message(&mut messages).await.read_json().unwrap();
+            assert_eq!((result.id, result.paused, result.error), (request.id, paused, None));
+        }
+        let resumed = *worker.paused.borrow();
+        assert!(!resumed.paused && resumed.revision > original);
+        worker.events.send(CaptureEvent::Packet(old_packet, original)).await.unwrap();
+        encoder.reset_after_pause().unwrap();
+        let current = encoder.encode(&pcm).unwrap();
+        let expected_sequence = current.sequence();
+        worker.events.send(CaptureEvent::Packet(current, resumed.revision)).await.unwrap();
+        let frame = next_message(&mut messages).await;
+        assert_eq!(frame.kind, MessageKind::AudioFrame);
+        assert_eq!(AudioPacket::read(&frame.payload).unwrap().sequence(), expected_sequence);
+        commands.send(HostCommand::End).unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(host::run(host, incoming, &mut platform, host_options(), queue, |_| {}), exchange) })
+        .await
+        .unwrap();
 }

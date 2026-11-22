@@ -4,9 +4,11 @@
 //! H.264 stream where the Windows application would capture and encode, the viewer role reports what it
 //! receives where the application would decode and draw. Everything in between is the code that ships.
 
+mod audio;
 mod clipboard;
 
 use clipboard::SyntheticClipboard;
+use quietdesk_core::audio_session::{AudioCapture, AudioPlayback};
 use quietdesk_core::clipboard::Role;
 use quietdesk_core::clipboard_session::SessionClipboard;
 use quietdesk_core::cursor::CursorImage;
@@ -27,6 +29,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::num::NonZeroU32;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -104,6 +107,8 @@ struct ReplayHost {
     synthetic_cursor: bool,
     cursor_samples: Option<watch::Sender<Option<HostCursorSample>>>,
     synthetic_displays: bool,
+    synthetic_audio: bool,
+    fail_audio: bool,
     synthetic_keyboard: bool,
     synthetic_relative_mouse: bool,
     synthetic_trackpad: bool,
@@ -192,6 +197,14 @@ impl HostPlatform for ReplayHost {
         }
         self.cursor_samples = samples;
         Ok(())
+    }
+
+    fn supports_audio_capture(&self) -> bool {
+        self.synthetic_audio
+    }
+
+    fn start_audio_capture(&mut self, epoch: NonZeroU32, redundant: bool, paused: bool) -> Result<AudioCapture> {
+        audio::capture(epoch, redundant, paused, self.fail_audio)
     }
 
     fn supports_input_actions(&self) -> bool {
@@ -340,6 +353,8 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
             synthetic_cursor: arguments.contains_key("synthetic-cursor"),
             cursor_samples: None,
             synthetic_displays,
+            synthetic_audio: arguments.contains_key("synthetic-audio"),
+            fail_audio: arguments.contains_key("fail-audio"),
             synthetic_keyboard: arguments.contains_key("synthetic-keyboard"),
             synthetic_relative_mouse: arguments.contains_key("synthetic-relative-mouse"),
             synthetic_trackpad: arguments.contains_key("synthetic-trackpad"),
@@ -392,6 +407,8 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
 
 /// Stands in for decoding and display: reports each frame and acknowledges it.
 struct ReportingViewer {
+    synthetic_audio: bool,
+    fail_audio: bool,
     clipboard: Option<SyntheticClipboard>,
     acknowledgements: mpsc::UnboundedSender<DecodeReceipt>,
     feedback: Arc<Mutex<ScriptFeedback>>,
@@ -426,6 +443,14 @@ impl ViewerPlatform for ReportingViewer {
         self.clipboard.as_ref()?.open(Role::Viewer, true)
     }
 
+    fn supports_audio_playback(&self) -> bool {
+        self.synthetic_audio
+    }
+
+    fn start_audio_playback(&mut self, epoch: NonZeroU32, paused: bool) -> Result<AudioPlayback> {
+        audio::playback(epoch, paused, self.fail_audio)
+    }
+
     fn local_identity(&self) -> Option<&DeviceIdentity> {
         self.identity.as_ref()
     }
@@ -442,10 +467,22 @@ impl ViewerPlatform for ReportingViewer {
 
     fn event(&mut self, event: ViewerEvent) {
         emit(match event {
-            ViewerEvent::Connected { name, device_id, can_control, stream, live_settings, input_actions, relative_mouse, trackpad_gestures, .. } => {
+            ViewerEvent::Connected {
+                name,
+                device_id,
+                can_control,
+                stream,
+                live_settings,
+                input_actions,
+                relative_mouse,
+                trackpad_gestures,
+                remote_audio,
+                ..
+            } => {
                 json!({ "event": "connected", "name": name, "canControl": can_control, "stream": stream_json(stream), "liveSettings": live_settings,
-                    "inputActions": input_actions, "relativeMouse": relative_mouse, "trackpadGestures": trackpad_gestures, "deviceID": device_id })
+                    "remoteAudio": remote_audio, "inputActions": input_actions, "relativeMouse": relative_mouse, "trackpadGestures": trackpad_gestures, "deviceID": device_id })
             }
+            ViewerEvent::Audio { enabled, pending, error } => json!({"event":"audio","enabled":enabled,"pending":pending,"error":error}),
             ViewerEvent::InputStatus(feedback) => json!({ "event": "inputStatus", "message": feedback.message, "capsLocked": feedback.caps_locked }),
             ViewerEvent::InputActionTimeout => json!({ "event": "inputActionTimeout" }),
             ViewerEvent::Stream { stream, error } => json!({ "event": "stream", "stream": stream_json(stream), "error": error }),
@@ -555,6 +592,9 @@ enum Script {
         text: String,
     },
     RequestClipboard,
+    RemoteAudio {
+        enabled: bool,
+    },
     SelectDisplay {
         id: u32,
     },
@@ -638,6 +678,7 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
                 },
                 Ok(Script::SendClipboard { text }) => ViewerCommand::SendClipboard(text),
                 Ok(Script::RequestClipboard) => ViewerCommand::RequestClipboard,
+                Ok(Script::RemoteAudio { enabled }) => ViewerCommand::RemoteAudio(enabled),
                 Ok(Script::SelectDisplay { id }) => ViewerCommand::SelectDisplay(id),
                 Ok(Script::Pause { paused }) => ViewerCommand::Pause(paused),
                 Ok(Script::HoldAcknowledgements { hold }) => {
@@ -694,7 +735,14 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
             async move {
                 let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
                 let (acknowledgements, acknowledged) = mpsc::unbounded_channel();
-                let mut platform = ReportingViewer { acknowledgements, feedback, identity, clipboard };
+                let mut platform = ReportingViewer {
+                    acknowledgements,
+                    feedback,
+                    identity,
+                    clipboard,
+                    synthetic_audio: arguments.contains_key("synthetic-audio"),
+                    fail_audio: arguments.contains_key("fail-audio"),
+                };
                 let end = attempt.run(peer.clone(), incoming, &mut platform, acknowledged).await;
                 peer.finished().await;
                 end

@@ -1,6 +1,7 @@
 //! The host side of a session: the role of `DeskModel.accept` and `handleHost` in the macOS application,
 //! for a host that streams over the control connection and advertises only what it implements.
 
+use crate::audio_session::{AudioCapture, HostAudio};
 use crate::clipboard_session::SessionClipboard;
 use crate::cursor::{CursorControl, CursorImage, CursorOperation, CursorPosition, CursorReason, CursorShape};
 use crate::display::{DisplayControl, DisplaySwitch, HostDisplays, RemoteDisplayInfo};
@@ -213,6 +214,12 @@ pub trait HostPlatform {
     fn input_action(&mut self, _action: InputAction) -> impl Future<Output = Result<InputActionOutcome>> + Send + 'static {
         std::future::ready(Err(DeskError::platform("当前系统不支持远端键盘动作")))
     }
+    fn supports_audio_capture(&self) -> bool {
+        false
+    }
+    fn start_audio_capture(&mut self, _epoch: std::num::NonZeroU32, _redundant: bool, _paused: bool) -> Result<AudioCapture> {
+        Err(DeskError::platform("当前系统不支持回传声音"))
+    }
     fn open_clipboard(&mut self, _enabled: bool) -> Option<SessionClipboard> {
         None
     }
@@ -278,6 +285,8 @@ struct HostSession<'a, P: HostPlatform> {
     options: HostOptions,
     viewer_identity: Option<DeviceIdentity>,
     clipboard: Option<SessionClipboard>,
+    audio: HostAudio,
+    supports_audio: bool,
     displays: Option<HostDisplays>,
     display_subscribed: bool,
     remote_display: Option<u32>,
@@ -318,6 +327,8 @@ pub async fn run<P: HostPlatform>(
     let trackpad_gestures = platform.supports_trackpad_gestures();
     let clipboard = platform.open_clipboard(options.clipboard);
     let mut session = HostSession {
+        supports_audio: platform.supports_audio_capture(),
+        audio: HostAudio::default(),
         clipboard,
         peer: &peer,
         platform,
@@ -378,6 +389,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 _ = tokio::time::sleep_until(start_by), if self.state.is_none() => self.start(initial, events).await.map(drop),
                 _ = tokio::time::sleep_until(media_deadline.unwrap_or(start_by)), if !self.paused && media_deadline.is_some() => self.tick_media(),
                 _ = tokio::time::sleep_until(gesture_check.unwrap_or(start_by)), if gesture_check.is_some() => { self.platform.check_gestures(); Ok(()) }
+                audio = self.audio.next() => self.audio.deliver(audio, self.paused, self.peer),
                 status = SessionClipboard::next(&mut self.clipboard, self.peer) => match status {
                     Ok(Some(status)) => { events(HostEvent::ClipboardStatus(status)); Ok(()) }
                     Ok(None) => Ok(()),
@@ -434,6 +446,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 can_control: self.options.allow_control,
                 input_actions: self.input_actions.then_some(true),
                 clipboard_sync: self.clipboard.is_some().then_some(true),
+                remote_audio_v1: self.supports_audio.then_some(true),
                 physical_file_paste_v1: self.clipboard.is_some().then_some(true),
                 relative_mouse_v1: self.relative_mouse.then_some(true),
                 trackpad_gestures_v1: self.trackpad_gestures.then_some(true),
@@ -893,6 +906,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 let error = match self.platform.set_paused(request.paused).await {
                     Ok(()) => {
                         self.paused = request.paused;
+                        self.audio.pause(self.paused);
                         if let Some(clipboard) = &self.clipboard {
                             clipboard.preferences(self.options.clipboard, !self.paused)?;
                         }
@@ -928,6 +942,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 }
                 self.termination_subscribed = true;
             }
+            MessageKind::AudioControl if self.supports_audio => self.audio.control(&message, self.platform, self.paused, self.peer)?,
             kind if SessionClipboard::accepts(kind) => {
                 self.clipboard.as_ref().ok_or_else(|| DeskError::invalid("尚未协商自动剪贴板"))?.receive(message)?;
             }

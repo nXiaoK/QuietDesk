@@ -62,6 +62,7 @@ const CANCEL_RETRY: usize = 105;
 const MENU_CAPS_ACTIONS: usize = 106;
 const MENU_RELATIVE_MOUSE: usize = 107;
 const MENU_AUTO_CLIPBOARD: usize = 108;
+const MENU_REMOTE_AUDIO: usize = 109;
 const MENU_QUALITY: usize = 200;
 const MENU_DISPLAY: usize = 300;
 
@@ -89,6 +90,10 @@ impl Mailbox {
 }
 
 impl ViewerSink for Mailbox {
+    fn plays_audio(&self) -> bool {
+        true
+    }
+
     fn clipboard_preference(&self) -> Option<bool> {
         Some(self.clipboard_enabled.load(Ordering::Relaxed))
     }
@@ -183,6 +188,10 @@ struct Canvas {
     can_control: bool,
     supports_pause: bool,
     supports_clipboard: bool,
+    supports_audio: bool,
+    audio_wanted: bool,
+    audio_playing: bool,
+    audio_pending: bool,
     last_clipboard_preference: Option<(bool, bool)>,
     retry: Option<RetryStatus>,
     retry_panel: RetryPanel,
@@ -247,6 +256,7 @@ pub(super) fn open(
         AppendMenuW(session, MF_STRING | MF_GRAYED, MENU_CAPS_ACTIONS, w!("独立转发 Caps Lock（短按切输入法，长按切大写）"))?;
         AppendMenuW(session, MF_STRING | MF_GRAYED, MENU_RELATIVE_MOUSE, w!("相对鼠标（Ctrl+Alt+Esc 释放）"))?;
         AppendMenuW(session, MF_STRING | MF_GRAYED, MENU_AUTO_CLIPBOARD, w!("自动同步剪贴板"))?;
+        AppendMenuW(session, MF_STRING | MF_GRAYED, MENU_REMOTE_AUDIO, w!("播放远端系统声音"))?;
         AppendMenuW(session, MF_STRING, MENU_SEND_CLIPBOARD, w!("发送本机剪贴板文字"))?;
         AppendMenuW(session, MF_STRING, MENU_REQUEST_CLIPBOARD, w!("获取远端剪贴板文字"))?;
         AppendMenuW(session, MF_SEPARATOR, 0, None)?;
@@ -323,6 +333,10 @@ pub(super) fn open(
             can_control: false,
             supports_pause: false,
             supports_clipboard: false,
+            supports_audio: false,
+            audio_wanted: false,
+            audio_playing: false,
+            audio_pending: false,
             last_clipboard_preference: None,
             retry: None,
             retry_panel,
@@ -547,6 +561,7 @@ impl Canvas {
             (MENU_CAPS_ACTIONS, self.supports_input_actions, self.caps_forwarding),
             (MENU_RELATIVE_MOUSE, self.relative_supported, self.relative_enabled),
             (MENU_AUTO_CLIPBOARD, self.supports_clipboard, self.mailbox.clipboard_enabled.load(Ordering::Relaxed)),
+            (MENU_REMOTE_AUDIO, self.supports_audio && !self.audio_pending, self.audio_playing),
         ] {
             let enabled = self.connected && supported;
             unsafe {
@@ -927,6 +942,9 @@ impl Canvas {
             self.connected = false;
             self.supports_input_actions = false;
             self.supports_clipboard = false;
+            self.supports_audio = false;
+            self.audio_playing = false;
+            self.audio_pending = false;
             self.last_clipboard_preference = None;
             self.supports_gestures = false;
             self.touchpad = None;
@@ -1000,7 +1018,16 @@ impl Canvas {
     unsafe fn session_event(&mut self, event: ViewerEvent) {
         match event {
             ViewerEvent::Connected {
-                name, device_id, can_control, session_pause, input_actions, relative_mouse, trackpad_gestures, clipboard_sync, ..
+                name,
+                device_id,
+                can_control,
+                session_pause,
+                input_actions,
+                relative_mouse,
+                trackpad_gestures,
+                clipboard_sync,
+                remote_audio,
+                ..
             } => {
                 if self.retry.take().is_some() {
                     unsafe {
@@ -1013,6 +1040,12 @@ impl Canvas {
                 self.can_control = can_control;
                 self.supports_pause = session_pause;
                 self.supports_clipboard = clipboard_sync;
+                self.supports_audio = remote_audio;
+                self.audio_playing = false;
+                self.audio_pending = remote_audio && self.audio_wanted;
+                if self.audio_pending {
+                    self.send(ViewerCommand::RemoteAudio(true));
+                }
                 self.update_clipboard_preference();
                 self.supports_input_actions = input_actions;
                 self.supports_gestures = trackpad_gestures;
@@ -1091,6 +1124,21 @@ impl Canvas {
                 }
             }
             ViewerEvent::RoundTrip(_) | ViewerEvent::MediaCommitted(_) => {}
+            ViewerEvent::Audio { enabled, pending, error } => {
+                self.audio_playing = enabled;
+                self.audio_pending = pending;
+                if !pending {
+                    self.audio_wanted = enabled;
+                }
+                self.update_input_menu();
+                if let Some(error) = error {
+                    self.set_title(&format!("远端声音未开启：{}", error.replace(char::is_control, " ")));
+                } else if pending {
+                    self.set_title(if self.audio_wanted { "正在开启远端声音…" } else { "正在关闭远端声音…" });
+                } else {
+                    self.set_title(if enabled { "远端系统声音已开启" } else { "远端系统声音已关闭" });
+                }
+            }
             ViewerEvent::ClipboardStatus(status) => self.set_title(&status),
             ViewerEvent::ClipboardText(text) => match clipboard::set_text(&text) {
                 Ok(()) => self.set_title("已接收远端剪贴板文字"),
@@ -1376,6 +1424,12 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
             }
             WM_COMMAND => match wparam.0 & 0xFFFF {
                 MENU_FULL_SCREEN => canvas.toggle_full_screen(),
+                MENU_REMOTE_AUDIO if canvas.connected && canvas.current_generation() && canvas.supports_audio && !canvas.audio_pending && !canvas.closing => {
+                    canvas.audio_wanted = !canvas.audio_wanted;
+                    canvas.audio_pending = true;
+                    canvas.update_input_menu();
+                    canvas.send(ViewerCommand::RemoteAudio(canvas.audio_wanted));
+                }
                 MENU_RELATIVE_MOUSE if canvas.connected && canvas.current_generation() && canvas.relative_supported && !canvas.closing => {
                     canvas.release();
                     canvas.relative_enabled = !canvas.relative_enabled;

@@ -12,9 +12,9 @@
 | --- | --- | --- | --- |
 | — | 第一版：协议核心、Windows 被控端与控制端、构建与检查 | — | 已完成（`dafab21`、`4e236d7`、`d34ad04`） |
 | — | 编码器低延迟修复（实机反馈“光标跟随慢”的直接原因） | — | 已提交 `e8b0508`，**待实机确认**（见 WP0） |
-| — | 媒体会话的线格式与状态机 `windows/core/src/media.rs` | — | 已提交 `5da7c0c`，**尚未接入会话** |
+| — | 媒体会话的线格式与状态机 `windows/core/src/media.rs` | — | 基础实现已提交 `5da7c0c`，会话接入见 WP1 |
 | WP0 | 实机确认编码器修复 | 小 | 待用户执行 |
-| WP1 | 媒体会话接入（控制连接上的 `shared` 路径） | 中 | 未开始 |
+| WP1 | 媒体会话接入（控制连接上的 `shared` 路径） | 中 | 已完成 `cc31c4a`，双向互通与 Wine 验收通过。Windows 10/11 实机表现待确认 |
 | WP2 | 独立光标（本地即时光标） | 中 | 未开始，依赖 WP1 |
 | WP3 | 控制端断线自动重连与空闲暂停 | 小 | 未开始 |
 | WP4 | 多显示器 | 中 | 未开始 |
@@ -51,7 +51,7 @@ windows/
     video.rs     VideoPacket、H.264 Annex B 与 AVCC 转换、H264FrameAssembler
     host.rs      被控端会话（HostPlatform、FrameSink、HostOptions/HostCommand/HostEvent）
     viewer.rs    控制端会话（ViewerPlatform、ViewerCommand/ViewerEvent/ViewerEnd）
-    media.rs     媒体会话线格式与双方状态机（已测试，未接入 host.rs / viewer.rs）
+    media.rs     媒体会话线格式与双方状态机，供 host.rs / viewer.rs 协商与传输视频
     keymap.rs input.rs   macOS 键码与 PC 扫描码互译、修饰键映射、点击计数、滚轮
     pixel.rs     BGRA→NV12（面积平均缩放，BT.709 视频范围）、NV12→BGRA、光标绘制
     tests/loopback.rs    Rust 被控端 ↔ Rust 控制端的回环测试
@@ -73,13 +73,13 @@ scripts/windows-toolchain.sh           固定版本并校验摘要的 llvm-mingw
 scripts/check-cargo-lock-age.py        检查锁定的依赖是否已发布满 7 天
 ```
 
-Windows 端目前按 macOS 应用对**旧版本对端**的兼容路径互通，macOS 源码没有改动：
+初版 Windows 端通过 macOS 的旧版兼容路径互通。WP1 在此基础上增加了可选媒体会话。
 
-- 被控端 Hello 只声明：`liveSettings`、`controlStatusUpdates`、`extendedVideoSettings`、`preferredSettings`、`highRefreshVideoSettings`、`preferredHighRefreshSettings`、`sessionPause`、`sessionTerminationV1`、`initialStreamNegotiationV1`。
-- 视频是 H.264，走控制连接上的旧版 `video` 消息，控制端用 `acknowledgement` 确认，未确认帧上限 3（`FrameSink::WINDOW`）。
+- 被控端 Hello 声明 `liveSettings`、`controlStatusUpdates`、`extendedVideoSettings`、`preferredSettings`、`highRefreshVideoSettings`、`preferredHighRefreshSettings`、`sessionPause`、`sessionTerminationV1`、`initialStreamNegotiationV1`，WP1 新增 `mediaTransportV1`。
+- 两端支持时使用控制连接上的 `shared` 流，H.264 视频通过 `mediaFrame` 发送并以 `mediaFeedback` 确认。首次切换前和对接旧版本时继续支持 `video` / `acknowledgement`。Windows 被控端最多等待 3 帧确认。
 - 控制端只使用被控端 Hello 里声明且自己已实现的能力；收到未协商的消息类型即断开，与 macOS 一致。
 
-### 2.2 验证到哪一步
+### 2.2 WP1 开工前的验证基线
 
 | 检查 | 当前结果 | 覆盖 |
 | --- | --- | --- |
@@ -158,6 +158,8 @@ python3 scripts/check-cargo-lock-age.py
 即使修复生效，视频里的光标仍要经过采集、转换、编码、网络、解码才显示，Mac 上会同时看到本机箭头和稍后跟上的远端光标。彻底解决靠 WP2。
 
 ### WP1 媒体会话接入（控制连接上的 `shared` 路径）
+
+当前实现用同一个锁保护采集许可、帧代次和待确认数量。被控端异步等待采集线程收到关键帧请求后才放行首帧。控制端按解码提交记录区分旧版和媒体帧确认，Windows 平台用输出样本的时间戳核对媒体帧。下文保留最初的实施步骤，接手 WP2 时以当前代码接口为准。
 
 **目标**：Windows 两个角色都用 macOS 的媒体会话传视频（`mediaFrame` + `mediaFeedback`），仍只走控制连接。这是独立光标（WP2）的前提：macOS 控制端只有在媒体流提交之后才请求独立光标，macOS 被控端在媒体流准备之前收到光标请求会直接断开（“光标功能未协商”）。
 
@@ -428,7 +430,7 @@ python3 scripts/check-cargo-lock-age.py
 | 21 | deviceIdentity | WP5 |
 | 22–23 | sessionEffectsRequest、sessionEffectsResult | WP11 |
 | 24–25 | sessionPauseRequest、sessionPauseResult | 已实现 |
-| 26–28 | mediaControl、mediaFrame、mediaFeedback | 编解码与状态机已有，接入为 WP1 |
+| 26–28 | mediaControl、mediaFrame、mediaFeedback | WP1 已接入两个角色的控制连接 |
 | 29–31 | cursorControl、cursorShape、cursorPosition | WP2 |
 | 32–33 | sessionUnlockRequest、sessionUnlockResult | WP11（依赖 WP13） |
 | 34 | sessionTermination | 已实现 |

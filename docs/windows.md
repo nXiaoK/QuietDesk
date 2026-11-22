@@ -1,8 +1,8 @@
-# Windows 版（第一版）
+# Windows 版
 
 QuietDesk for Windows 让 Mac 可以远程控制 Windows 电脑，也让 Windows 电脑可以远程控制 Mac。它是独立的原生 Win32 程序（Rust 编写，单个 `QuietDesk.exe`，不需要安装运行库），与 macOS 版使用同一套配对码和基线协议，**macOS 版无需改动或升级即可互通**。
 
-> 这一版在 macOS 上交叉编译，并经过与 macOS 实现的回环互通检查和 Wine 下的冒烟检查，**尚未在真实 Windows 电脑上运行过**。首次实机使用请按文末“实机验收”逐项确认，遇到问题请附上日志。
+> 第一版已在 Windows 被控端试用。本次更新的 TCP 媒体会话和此前的编码器低延迟修复仍待 Windows 10/11 实机确认。
 
 ## 获取
 
@@ -45,7 +45,7 @@ PC 键盘的修饰键可在“键盘”中选择：
 | 包含 | 说明 |
 | --- | --- |
 | 配对与加密 | 与 macOS 版相同的 TLS 1.2 / PSK / AES-128-GCM，配对码通用 |
-| 画面 | H.264，经控制连接传输（macOS 版称为“TCP 兼容模式”）；被控端不变化时不出帧 |
+| 画面 | H.264 媒体会话（TCP 兼容模式）。支持该能力的两端通过现有加密控制连接传输视频，确认新流的首个关键帧后继续出帧。与旧版连接时自动使用原视频协议 |
 | 画质 | 控制端可调分辨率、帧率（最高 60 fps）与码率；Windows 被控端另有“画质上限” |
 | 键鼠 | 键盘、鼠标移动/点击/拖拽/双击、滚轮与触控板滚动、侧键；失去焦点时释放按键 |
 | 其他 | 被控端“允许控制”开关即时生效、手动文字剪贴板、空闲暂停、被控端结束通知 |
@@ -72,9 +72,15 @@ Windows 被控端的已知限制：
 ./scripts/run-windows-wine-checks.sh      # Windows 可执行文件在 Wine 容器中的冒烟检查，需要 Docker
 ```
 
-- 互通检查用 Windows 端的同一份协议代码（`windows/core`，经无界面的 `quietdesk-probe`）对接本机的 `Peer`、`Hello`、画质协商、VideoToolbox 编解码、`MediaSession` 与输入注入器：配对、能力字段、三帧确认窗口、画质调整与失败回退、暂停恢复、键位与修饰键、点击计数、滚轮、剪贴板文字、结束通知、错误配对码。不采集屏幕、不注入真实输入、不使用 5908 端口。
+- 互通检查用 Windows 协议代码对接 macOS 的 `Peer`、VideoToolbox 和 `MediaSession`，覆盖双向媒体流提交、视频内容、三帧确认窗口、画质切换、暂停恢复及旧版兼容。输入和剪贴板检查使用合成数据。
 - Wine 检查运行交叉编译出的 Windows 程序本身：GDI 采集、Media Foundation 编码与解码、Windows 被控端与 Windows 控制端互连出画。Wine 的桌面复制未实现、编解码由 GStreamer 提供，**不等同于 Windows 自带组件的行为**。
 
-## 实机验收（尚未进行）
+## 实机验收
+
+用 Mac 控制 Windows，再用 Windows 控制 Mac。每个方向先确认静止桌面有首帧，再打开会持续变化的窗口、切换一次分辨率、暂停并恢复，确认画面都能继续更新。
+
+- Mac 控制 Windows 时，在 Windows 日志中查找 `host committed shared media stream`。首个关键帧日志里的 `after 1 captured frames` 可用于核对编码器启动时机。
+- Windows 控制 Mac 时，查找 `viewer committed shared media stream`。两个方向都应在建流、分辨率切换和恢复后看到对应角色的提交记录，后两次记录里的代次应递增。
+- 当前光标随视频传送。实机上“只显示一个跟手的光标”是后续独立光标工作包的验收项。
 
 以下只能在真实 Windows 电脑上确认：桌面复制采集与光标绘制、系统 H.264 编码器的低延迟与按需关键帧、解码与 Direct2D 显示、`SendInput` 键鼠与高 DPI/多显示器坐标、键盘钩子与全屏、防火墙提示、DPAPI 读写、界面在不同缩放比例下的排版，以及两个方向的实际延迟与帧率。

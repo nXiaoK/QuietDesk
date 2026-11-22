@@ -1,5 +1,14 @@
 # 构建与检查记录
 
+## Windows WP1 · 控制连接上的媒体会话（2026-11-22）
+
+- Windows 控制端和被控端均已接入 H.264 `shared` 媒体流。首个流提交前仍可收发旧版视频。切换画质和暂停恢复后重新请求当前桌面的关键帧，收到该帧的解码确认并完成提交后才放行后续帧。
+- Windows 控制端先离屏解码新流首帧，等被控端提交该流后再显示。解码确认携带流身份；只有连续完成的帧才产生累计确认。回归检查覆盖乱序解码、晚到的旧版或旧流回调、缺帧后多次恢复、初始画质确认延迟、编码器拒绝画质和发送窗口回收。
+- Rust 的 63 项单元测试（含 3 项 TLS 测试）与 5 项内存回环测试通过。Rust 格式检查、本机与 Windows x64 的 Clippy 通过。
+- 13 项 Swift ↔ Rust 回环 TLS 互通检查通过。两端使用真实的 Swift `MediaSession` 与 Rust 会话代码，用合成视频及 VideoToolbox 核对帧内容、解码反馈、画质切换和暂停恢复。旧版能力缺失的对端也能继续收发视频。
+- Wine 的 GDI 采集、Media Foundation 编解码和双端连接三项均通过。解码器现为输入样本设置一致的时间戳、时长及帧率，支持根据输入帧率生成输出时间戳的变换器。双端会话在 30 秒内显示 602 帧，其中 601 帧在首帧提交后到达。Windows 10/11 的桌面复制、系统编解码延迟和实际显示效果仍待实机确认。
+- 实机包 `outputs/windows/wp1/QuietDesk-0.7.3-Windows-x64.zip` 包含未签名的 x64 GUI 程序和许可证，已校验系统 DLL 导入表、ZIP 及 SHA-256（`59444bd67285fd810247f485825d35ccfcec276cfcf8cf9a4112e420194551d5`）。
+
 ## Windows 版：媒体会话模块与后续实施方案（2026-11-22）
 
 - 新增 `windows/core/src/media.rs`：macOS `MediaSession` 在控制连接上传视频（`shared` 路径）所需的线格式（`MediaFrame`、`MediaFeedback`、`MediaControl` 及其校验）和双方状态机（request/offer/prepare/ready/decodedReady/commit/committed/abort/recover）。**尚未接入被控端与控制端会话**：Windows 端仍不声明 `mediaTransportV1`，行为与此前相同。它是独立光标的前提——macOS 控制端只在媒体流提交后才请求独立光标，这是实机反馈“光标跟随慢”的根本解法。

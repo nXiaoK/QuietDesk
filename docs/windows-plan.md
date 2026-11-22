@@ -15,7 +15,7 @@
 | — | 媒体会话的线格式与状态机 `windows/core/src/media.rs` | — | 基础实现已提交 `5da7c0c`，会话接入见 WP1 |
 | WP0 | 实机确认编码器修复 | 小 | 待用户执行 |
 | WP1 | 媒体会话接入（控制连接上的 `shared` 路径） | 中 | 已完成 `cc31c4a`，双向互通与 Wine 验收通过。Windows 10/11 实机表现待确认 |
-| WP2 | 独立光标（本地即时光标） | 中 | 未开始，依赖 WP1 |
+| WP2 | 独立光标（本地即时光标） | 中 | 已提交 `945008b`。双向协议与 Wine 检查通过，单光标观感、热点和延迟待 Windows 实机确认 |
 | WP3 | 控制端断线自动重连与空闲暂停 | 小 | 未开始 |
 | WP4 | 多显示器 | 中 | 未开始 |
 | WP5 | 输入补全（输入状态回馈、Caps Lock 同步、相对鼠标、手势、设备身份） | 中，可拆分 | 未开始 |
@@ -75,7 +75,7 @@ scripts/check-cargo-lock-age.py        检查锁定的依赖是否已发布满 7
 
 初版 Windows 端通过 macOS 的旧版兼容路径互通。WP1 在此基础上增加了可选媒体会话。
 
-- 被控端 Hello 声明 `liveSettings`、`controlStatusUpdates`、`extendedVideoSettings`、`preferredSettings`、`highRefreshVideoSettings`、`preferredHighRefreshSettings`、`sessionPause`、`sessionTerminationV1`、`initialStreamNegotiationV1`，WP1 新增 `mediaTransportV1`。
+- 被控端 Hello 声明 `liveSettings`、`controlStatusUpdates`、`extendedVideoSettings`、`preferredSettings`、`highRefreshVideoSettings`、`preferredHighRefreshSettings`、`sessionPause`、`sessionTerminationV1`、`initialStreamNegotiationV1`。WP1 新增 `mediaTransportV1`，WP2 在平台支持光标采样时声明 `independentCursorV1`，在首个媒体流提交后独立协商。
 - 两端支持时使用控制连接上的 `shared` 流，H.264 视频通过 `mediaFrame` 发送并以 `mediaFeedback` 确认。首次切换前和对接旧版本时继续支持 `video` / `acknowledgement`。Windows 被控端最多等待 3 帧确认。
 - 控制端只使用被控端 Hello 里声明且自己已实现的能力；收到未协商的消息类型即断开，与 macOS 一致。
 
@@ -431,7 +431,7 @@ python3 scripts/check-cargo-lock-age.py
 | 22–23 | sessionEffectsRequest、sessionEffectsResult | WP11 |
 | 24–25 | sessionPauseRequest、sessionPauseResult | 已实现 |
 | 26–28 | mediaControl、mediaFrame、mediaFeedback | WP1 已接入两个角色的控制连接 |
-| 29–31 | cursorControl、cursorShape、cursorPosition | WP2 |
+| 29–31 | cursorControl、cursorShape、cursorPosition | WP2 已接入两个角色的控制连接 |
 | 32–33 | sessionUnlockRequest、sessionUnlockResult | WP11（依赖 WP13） |
 | 34 | sessionTermination | 已实现 |
 | 35–36 | desktopActionRequest、desktopActionResult | WP11 |

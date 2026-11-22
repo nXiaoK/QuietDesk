@@ -19,8 +19,8 @@
 | WP3 | 控制端断线自动重连与空闲暂停 | 小 | 已完成 `fcb8215`。回环重启恢复、主动结束、配对失败及隔离 Wine 窗口检查通过 |
 | WP4 | 多显示器 | 中 | 已提交 `3567d16`。双向切屏、失败回滚和 Wine 单屏窗口验收通过。物理双屏热插拔与混合 DPI 待 Windows 实机确认 |
 | WP5 | 输入补全（输入状态回馈、Caps Lock 同步、相对鼠标、手势、设备身份） | 中，可拆分 | 键盘动作与反馈已提交 `22bdedd`，相对鼠标已提交 `4b32a41`，精密滚动和手势已提交 `a9c4c70`，设备身份已提交 `4e67c77`。已完成软件验收，物理键鼠及触摸设备待实机确认 |
-| WP6 | 自动剪贴板，图片与文件 | 大 | 未开始 |
-| WP7 | 视频性能：GPU 缩放与色彩转换、硬件编码、HEVC、60 fps 以上、码率自适应 | 大，可拆分 | 每秒性能统计已提交 `e9002e1`。Windows 实机基线和硬件路径待验，后续优化待开发 |
+| WP6 | 自动剪贴板，图片与文件 | 大 | 已提交 macOS `fe4ec9c`、Windows `97793b9`。双向配对 TLS、隔离原生剪贴板及窗口检查通过，真实 Finder / 资源管理器组合待验 |
+| WP7 | 视频性能：GPU 缩放与色彩转换、硬件编码、HEVC、60 fps 以上、码率自适应 | 大，可拆分 | 每秒性能统计已提交 `e9002e1`。已按用户决定优先开发双向文件粘贴。GPU、硬件编码及 HEVC 等待 Windows 实机 |
 | WP8 | 远端声音 | 中 | 未开始 |
 | WP9 | 辅助 TCP 通道与 UDP 视频（DTLS、分片、补传、FEC、路径策略） | 特大，分 5 步 | 未开始，依赖 WP1 |
 | WP10 | 自托管中继 | 大 | 未开始，依赖 WP9 |
@@ -51,6 +51,7 @@ windows/
     video.rs     VideoPacket、H.264 Annex B 与 AVCC 转换、H264FrameAssembler
     host.rs      被控端会话（HostPlatform、FrameSink、HostOptions/HostCommand/HostEvent）
     viewer.rs    控制端会话（ViewerPlatform、ViewerCommand/ViewerEvent/ViewerEnd）
+    clipboard.rs  剪贴板能力协商、清单、按需拉取、接收确认与文件传输
     media.rs     媒体会话线格式与双方状态机，供 host.rs / viewer.rs 协商与传输视频
     keymap.rs input.rs   macOS 键码与 PC 扫描码互译、修饰键映射、点击计数、滚轮
     pixel.rs     BGRA→NV12（面积平均缩放，BT.709 视频范围）、NV12→BGRA、光标绘制
@@ -60,7 +61,8 @@ windows/
     win/capture.rs   按所选显示器使用桌面复制或 GDI 采集
     win/codec.rs     Media Foundation H.264 软件编码器与解码器
     win/pipeline.rs  采集线程：采集→光标→NV12→编码→FrameSink
-    win/inject.rs    SendInput；win/clipboard.rs 文字剪贴板
+    win/inject.rs    SendInput
+    win/clipboard*   Win32 格式监听、OLE 延迟粘贴、接收确认和本地文件存储
     win/app.rs       监听与会话生命周期、解码线程、日志
     win/canvas.rs    控制端窗口（Direct2D、键盘钩子、全屏、菜单）
     win/ui.rs        主窗口；win/settings.rs 设置与 DPAPI
@@ -78,6 +80,7 @@ scripts/check-cargo-lock-age.py        检查锁定的依赖是否已发布满 7
 - 被控端 Hello 声明 `liveSettings`、`controlStatusUpdates`、`extendedVideoSettings`、`preferredSettings`、`highRefreshVideoSettings`、`preferredHighRefreshSettings`、`sessionPause`、`sessionTerminationV1`、`initialStreamNegotiationV1`。WP1 新增 `mediaTransportV1`，WP2 在平台支持光标采样时声明 `independentCursorV1`，在首个媒体流提交后独立协商。
 - 两端支持时使用控制连接上的 `shared` 流，H.264 视频通过 `mediaFrame` 发送并以 `mediaFeedback` 确认。首次切换前和对接旧版本时继续支持 `video` / `acknowledgement`。Windows 被控端最多等待 3 帧确认。
 - 被控端能枚举活动屏幕时声明 `displaySwitchingV1`，能读取当前控制台的键盘大写状态时声明 `inputActions`。两项能力独立协商。
+- Windows 剪贴板监听器启动后，被控端声明 `clipboardSync` 和 `physicalFilePasteV1`。两端通过消息 11 确认可用能力和开关。复制文件只通告类型，首次读取才索取预览，接收端同意后传输内容。
 - 控制端只使用被控端 Hello 里声明且自己已实现的能力；收到未协商的消息类型即断开，与 macOS 一致。
 
 ### 2.2 WP1 开工前的验证基线
@@ -260,12 +263,14 @@ python3 scripts/check-cargo-lock-age.py
 
 ### WP6 自动剪贴板，图片与文件
 
-**macOS 参考（待核实，体量大）**：`ClipboardTransfer.swift`（1478 行，协议与传输）、`ClipboardStorage.swift`、`ClipboardFileResult.swift`、应用侧 `ClipboardSync.swift`（1478 行）与 `ClipboardFilePrompt.swift`；检查脚本 `run-session-data-checks.sh`、`run-file-result-checks.sh`。已确认的事实：Hello 能力位 `clipboardSync`；消息 11 `clipboardSettings`（`ClipboardPreference { enabled, session, fileApproval, receivesAutomaticUpdates, chunkWindow, decoupledFileTransfer, onDemandClipboard }`）、12–17 `clipboardBegin/Entry/Chunk/End/Receipt/Cancel`、41 `clipboardManifest`、42 `clipboardPull`；内容种类 `text` / `png` / `files`；自动同步上限文字 16 MiB、图片 64 MiB，文件条目上限 200 000；修订号 `ClipboardRevision { counter, origin }`。
+**macOS 实现**：`ClipboardTransfer.swift`（协议与传输）、`ClipboardStorage.swift`、`ClipboardFileResult.swift`、应用侧 `ClipboardSync.swift` 与 `ClipboardFilePrompt.swift`；检查脚本 `run-session-data-checks.sh`、`run-file-result-checks.sh`。已确认的事实：Hello 能力位 `clipboardSync`；消息 11 `clipboardSettings`（`ClipboardPreference { enabled, session, fileApproval, receivesAutomaticUpdates, chunkWindow, decoupledFileTransfer, onDemandClipboard, physicalFilePasteV1 }`）、12–17 `clipboardBegin/Entry/Chunk/End/Receipt/Cancel`、41 `clipboardManifest`、42 `clipboardPull`；内容种类 `text` / `png` / `files`；自动同步上限文字 16 MiB、图片 64 MiB，文件条目上限 200 000；修订号 `ClipboardRevision { counter, origin }`。
 
-**建议分两步**
+**实现范围**
 
 1. 文字与图片自动同步：`AddClipboardFormatListener` 监听；文字 `CF_UNICODETEXT`；图片在 PNG 与 `CF_DIBV5` 之间转换；按清单/拉取（on-demand）流程实现，回环抑制（自己写入的内容不再回传）；界面开关沿用现有“允许控制端读写剪贴板文字”并扩展。
 2. 文件：用户已选择在接收端实际粘贴时才开始传输。Windows 接收端使用 OLE 延迟渲染，发送端读取 `CF_HDROP`。用户已授权为此修改 macOS 源码，使 Windows 发往 Mac 时也从接收端请求粘贴内容开始传输。两端协商新能力后使用该行为，保留与旧客户端的兼容。保留文件接收确认、会话目录与提示，校验路径、文件名、大小和条目数，拒绝越界路径。
+
+Windows 使用独立 STA 持有 OLE 剪贴板。格式枚举和查询只返回类型；第一次读取内容才发消息 42。文件请求关联原清单的修订号，新传输通过 `pullRequestID` 匹配。文件条目和字节只在接收端确认后发送。显式拖入继续走原有接收确认。两端接收目录均按传输隔离，完整接收后才向剪贴板公布文件。Windows 当前协商逐块确认。
 
 **完成标准**：互通检查用真实的 `ClipboardTransfer` 对接；不读写真实剪贴板（`probe` 用内存里的假剪贴板）。
 

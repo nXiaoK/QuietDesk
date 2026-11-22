@@ -108,6 +108,11 @@ impl FrameSink {
         self.window.lock().unwrap().has_credit()
     }
 
+    /// Maximum frame credits granted by the current media negotiation and measured path.
+    pub fn credit_limit(&self) -> usize {
+        self.window.lock().unwrap().limit
+    }
+
     /// Frames queued at capture or waiting for the viewer to acknowledge them.
     pub fn outstanding(&self) -> usize {
         self.window.lock().unwrap().outstanding

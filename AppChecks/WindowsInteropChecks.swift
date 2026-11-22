@@ -653,7 +653,7 @@ private final class MacViewer: @unchecked Sendable {
 
     // A receiver delays genuine nonce echoes to vary the measured RTT. Holding only decoded receipts
     // lets the sender finish each UDP frame while measuring how many frames received capture credit.
-    func checkDatagramWindow(_ window: Int, pongDelay: Double, recording: [Data]) throws {
+    func checkDatagramWindow(_ window: Int, pongDelay: Double, recording: [Data], probe: Probe) throws {
         let modern = window != MediaBufferLimits.legacyFrameWindow
         let offer = try requestMedia(dynamic: modern ? true : nil, fast: modern ? true : nil)
         guard let session = offer.sessionID, let secret = offer.datagramKey, offer.path == "udp" else { throw Failure("Missing datagram endpoint") }
@@ -684,6 +684,10 @@ private final class MacViewer: @unchecked Sendable {
             } else if data.first == 2, data.dropFirst() == nonce.dropFirst() { echoes.update { $0 += 1 } }
             else if data.first == 3 || data.first == 5 { records.update { $0.append(data) } }
         }
+        func releasePongs() {
+            let delayed = gate.update { value in defer { value = (false, []) }; return value.pongs }
+            for pong in delayed { _ = udp.send(pong) }
+        }
         udp.start()
         try until("fresh echoes measure the authenticated path") { echoes.get() >= 3 }
 
@@ -711,8 +715,7 @@ private final class MacViewer: @unchecked Sendable {
                 usleep(45_000)
                 try require(try !records.get().contains { try MediaFragment.decode(Data($0.dropFirst())).header.stream == stream },
                             "The host released the candidate IDR before the new nonce was returned")
-                let delayed = gate.update { value in defer { value = (false, []) }; return value.pongs }
-                for pong in delayed { _ = udp.send(pong) }
+                releasePongs()
                 peer.send(prepare)
             } else { peer.send(try message(.ready)) }
             var frames: [MediaFrameHeader] = []
@@ -735,6 +738,10 @@ private final class MacViewer: @unchecked Sendable {
                                 peer.send(try message(.decodedReady))
                                 try until("Windows sends the full protocol commit") { responses().contains(.commit) }
                             }
+                            if epoch == 1 {
+                                try probe.send(["command": "observeCaptureWindow", "enabled": true])
+                                _ = try probe.next("captureWindowArmed")
+                            }
                             peer.send(try message(.committed))
                         }
                     case .recoveryRequired: throw Failure("An undamaged frame required another epoch")
@@ -748,18 +755,36 @@ private final class MacViewer: @unchecked Sendable {
                     if fragment.header.stream == stream { try handle(receiver.receive(fragment)) }
                 }
             }
-            let needed = epoch == 1 ? window + 1 : 2
-            let by = SessionClock.uptime + 4
-            while frames.count < needed && SessionClock.uptime < by { try poll(); usleep(500) }
-            try require(frames.count >= needed, "The host supplied only \(frames.count - 1) of \(needed - 1) frame credits")
             if epoch == 1 {
-                let stalled = SessionClock.uptime + 0.09
-                while SessionClock.uptime < stalled { try poll(); usleep(500) }
-                try require(frames.count == needed, "The host exceeded the \(window)-frame window: \(frames.count - 1)")
+                var snapshot: [String: Any]?
+                let by = SessionClock.uptime + 4
+                while snapshot == nil && SessionClock.uptime < by {
+                    try poll(); snapshot = probe.all("captureWindowFull").last; usleep(500)
+                }
+                guard let snapshot, let limit = snapshot["limit"] as? Int else { throw Failure("The capture window did not fill") }
+                try require(snapshot["outstanding"] as? Int == limit && snapshot["excessDropped"] as? Bool == true,
+                            "The sender admitted an access unit beyond its actual \(limit)-frame limit")
+                let maximum = MediaBufferLimits.maximumDynamicFrameWindow
+                let expected = !modern || window == maximum ? limit == window : (window...maximum).contains(limit)
+                try require(expected, "Unexpected negotiated capture limit \(limit) for a minimum nonce delay of \(pongDelay)s")
+                let filled = SessionClock.uptime + 3
+                while frames.count < limit + 1 && SessionClock.uptime < filled { try poll(); usleep(500) }
+                try require(frames.count == limit + 1, "The receiver got \(frames.count - 1) frames for a measured grant of \(limit)")
+                gate.update { $0.closed = true }
                 _ = udp.send(Data([4]) + (try MediaFeedback(kind: .decoded, header: frames[1]).encode()))
-                let resumed = SessionClock.uptime + 2
-                while frames.count == needed && SessionClock.uptime < resumed { try poll(); usleep(500) }
-                try require(frames.count == needed + 1, "One decoded receipt did not release exactly one capture credit")
+                let released = try probe.next("captureCreditReleased")
+                releasePongs()
+                guard let remaining = released["remaining"] as? Int, let nextLimit = released["limit"] as? Int, let queued = released["queued"] as? Bool
+                else { throw Failure("Missing capture credit observation") }
+                try require(remaining == limit - 1 && queued == (remaining < nextLimit), "One decoded receipt did not release exactly one capture credit")
+                let count = limit + 1 + (queued ? 1 : 0), resumed = SessionClock.uptime + 2
+                while frames.count < count && SessionClock.uptime < resumed { try poll(); usleep(500) }
+                try require(frames.count == count, "The next access unit did not match the available capture credit")
+                try probe.send(["command": "observeCaptureWindow", "enabled": false])
+            } else {
+                let by = SessionClock.uptime + 4
+                while frames.count < 2 && SessionClock.uptime < by { try poll(); usleep(500) }
+                try require(frames.count >= 2, "The new epoch did not resume video")
             }
             let replies = responses()
             try require(fast ? !replies.isEmpty && replies.allSatisfy { $0 == .ready } : replies == [.ready, .commit],
@@ -1850,10 +1875,10 @@ private struct WindowsInteropChecks {
         }
 
         for (window, delay) in [(3, 0.0), (8, 0.046), (24, 0.27)] {
-            run("Windows grants \(window) measured decode credits and uses the negotiated UDP recovery exchange") {
-                try withWindowsHost(useMedia: false, udp: true, preferred: StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 8)) { _, viewer in
+            run("Windows enforces its measured decode window with a \(Int(delay * 1000)) ms nonce delay and uses the negotiated UDP recovery exchange") {
+                try withWindowsHost(useMedia: false, udp: true, preferred: StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 8)) { probe, viewer in
                     try until("Windows applies the requested frame rate") { !viewer.state.get().results.isEmpty && !viewer.state.get().decoded.isEmpty }
-                    try viewer.checkDatagramWindow(window, pongDelay: delay, recording: replayFrames)
+                    try viewer.checkDatagramWindow(window, pongDelay: delay, recording: replayFrames, probe: probe)
                 }
             }
         }

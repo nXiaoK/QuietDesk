@@ -14,7 +14,9 @@ use quietdesk_core::clipboard_session::SessionClipboard;
 use quietdesk_core::cursor::CursorImage;
 use quietdesk_core::display::{DisplaySwitch, HostDisplays, RemoteDisplayInfo};
 use quietdesk_core::error::{DeskError, Result};
-use quietdesk_core::host::{self, FrameSink, HostCommand, HostConnections, HostCursorSample, HostEvent, HostOptions, HostPlatform, InputActionOutcome};
+use quietdesk_core::host::{
+    self, FrameSink, FrameSubmission, HostCommand, HostConnections, HostCursorSample, HostEvent, HostOptions, HostPlatform, InputActionOutcome,
+};
 use quietdesk_core::input::{CapsLockPress, DoubleClick, InjectOp, PcKeyEvent, ViewerInputTranslator};
 use quietdesk_core::keymap::{MacModifierMapping, PcModifierMapping};
 use quietdesk_core::media::{DecodeReceipt, MediaStreamId};
@@ -93,6 +95,15 @@ struct Replay {
     external_attached: bool,
     reject_next_switch: bool,
     refuse_layout: bool,
+    window_check: WindowCheck,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowCheck {
+    Off,
+    Filling,
+    Full(usize),
+    Released,
 }
 
 const EXTERNAL_SIZE: (u32, u32) = (320, 240);
@@ -319,16 +330,33 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
         external_attached: synthetic_displays,
         reject_next_switch: false,
         refuse_layout: false,
+        window_check: WindowCheck::Off,
     }));
     let producer = replay.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(4)).await;
             let mut replay = producer.lock().unwrap();
-            let Some(sink) = replay.sink.clone().filter(|sink| !replay.paused && sink.has_credit()) else { continue };
+            let Some(sink) = replay.sink.clone().filter(|_| !replay.paused) else { continue };
             let frames = if replay.display_id == 2 { external.as_ref().expect("the selected display has a recording") } else { &frames };
-            if sink.submit(frames[replay.next].clone()) {
+            let check = replay.window_check;
+            let outstanding = sink.outstanding();
+            if check == WindowCheck::Released || matches!(check, WindowCheck::Full(held) if outstanding >= held) {
+                continue;
+            }
+            let queued = sink.has_credit() && sink.try_submit(frames[replay.next].clone()) == FrameSubmission::Queued;
+            if queued {
                 replay.next = (replay.next + 1) % frames.len();
+            }
+            // No await separates admission from observation on the probe's current-thread runtime.
+            if check == WindowCheck::Filling && queued && sink.outstanding() >= sink.credit_limit() {
+                let held = sink.outstanding();
+                let excess = sink.try_submit(frames[replay.next].clone());
+                emit(json!({"event":"captureWindowFull","limit":sink.credit_limit(),"outstanding":held,"excessDropped":excess == FrameSubmission::Dropped}));
+                replay.window_check = WindowCheck::Full(held);
+            } else if matches!(check, WindowCheck::Full(_)) {
+                emit(json!({"event":"captureCreditReleased","remaining":outstanding,"limit":sink.credit_limit(),"queued":queued}));
+                replay.window_check = WindowCheck::Released;
             }
         }
     });
@@ -403,6 +431,11 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
                         Some("rejectNextDisplay") => {
                             replay.lock().unwrap().reject_next_switch = true;
                             emit(json!({ "event": "displayFailureArmed" }));
+                        }
+                        Some("observeCaptureWindow") => {
+                            let enabled = line["enabled"].as_bool() == Some(true);
+                            replay.lock().unwrap().window_check = if enabled { WindowCheck::Filling } else { WindowCheck::Off };
+                            if enabled { emit(json!({"event":"captureWindowArmed"})); }
                         }
                         Some("refuseLayout") => {
                             replay.lock().unwrap().refuse_layout = true;

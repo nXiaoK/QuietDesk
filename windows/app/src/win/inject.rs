@@ -5,6 +5,7 @@ use quietdesk_core::host::InputActionOutcome;
 use quietdesk_core::input::{InjectOp, MouseButton};
 use quietdesk_core::keymap::PcKey;
 use quietdesk_core::messages::{InputAction, InputFeedback};
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::os::windows::{ffi::OsStringExt, fs::OpenOptionsExt, io::AsRawHandle};
@@ -14,13 +15,13 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::*;
 use windows::Win32::Devices::HumanInterfaceDevice::{
     GUID_DEVINTERFACE_KEYBOARD, IOCTL_KEYBOARD_QUERY_INDICATORS, KEYBOARD_CAPS_LOCK_ON, KEYBOARD_INDICATOR_PARAMETERS,
 };
-use windows::Win32::Foundation::{HANDLE, RECT};
+use windows::Win32::Foundation::{HANDLE, POINT, RECT};
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetSystemMetrics, GetWindowThreadProcessId, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GUITHREADINFO, GetClipCursor, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetSystemMetrics, GetWindowThreadProcessId, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 use windows::core::PCWSTR;
 
@@ -262,42 +263,199 @@ fn mouse(flags: MOUSE_EVENT_FLAGS, data: i32, position: (i32, i32)) -> INPUT {
     }
 }
 
-/// Injects operations in order. `display` is the shared display in virtual-desktop pixels.
-pub fn inject(operations: &[InjectOp], display: RECT) -> bool {
+fn contains(display: RECT, p: POINT) -> bool {
+    (display.left..display.right).contains(&p.x) && (display.top..display.bottom).contains(&p.y)
+}
+
+fn normalized_pixel(pixel: i32, min: i32, end: i32, origin: i32, extent: i32) -> Option<i32> {
+    // A normalized coordinate selects a pixel bin. On very wide desktops not every pixel is representable.
+    let extent = u64::try_from(extent).ok().filter(|e| *e != 0)?;
+    let offset = |v: i32| (i64::from(v) - i64::from(origin)).clamp(0, extent as i64) as u64;
+    let low = (offset(min) * 65536).div_ceil(extent);
+    let high = (offset(end) * 65536).div_ceil(extent);
+    if low >= high {
+        return None;
+    }
+    let center = ((offset(pixel) * 2 + 1) * 32768) / extent;
+    Some(center.clamp(low, high - 1) as i32)
+}
+
+fn cursor_clip() -> Option<RECT> {
+    let mut clip = RECT::default();
+    unsafe {
+        GetClipCursor(&mut clip).ok()?;
+    }
+    Some(clip)
+}
+
+fn absolute_move(p: POINT, display: RECT, clip: RECT) -> Option<INPUT> {
+    // The system may have confined the cursor to a different screen or window.
+    unsafe {
+        let x = normalized_pixel(
+            p.x,
+            display.left.max(clip.left),
+            display.right.min(clip.right),
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+        )?;
+        let y = normalized_pixel(
+            p.y,
+            display.top.max(clip.top),
+            display.bottom.min(clip.bottom),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )?;
+        Some(mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, 0, (x, y)))
+    }
+}
+
+struct RelativePointer {
+    point: POINT,
+    confined: bool,
+    clip: RECT,
+}
+
+impl RelativePointer {
+    fn new(display: RECT, point: POINT, clip: RECT) -> Option<Self> {
+        if !contains(display, point) || !contains(clip, point) {
+            return None;
+        }
+        let confined = display.left <= clip.left && display.top <= clip.top && clip.right <= display.right && clip.bottom <= display.bottom;
+        Some(Self { point, confined, clip })
+    }
+
+    fn current(display: RECT) -> Option<Self> {
+        let mut point = POINT::default();
+        unsafe {
+            GetCursorPos(&mut point).ok()?;
+        }
+        Self::new(display, point, cursor_clip()?)
+    }
+
+    fn movement(&self, display: RECT, dx: i32, dy: i32, absolute: impl FnOnce(POINT) -> Option<INPUT>) -> Option<INPUT> {
+        if self.confined {
+            // Windows may accelerate relative movement. An existing system or game clip keeps it on this display.
+            return Some(mouse(MOUSEEVENTF_MOVE, 0, (dx, dy)));
+        }
+        absolute(POINT {
+            x: self.point.x.saturating_add(dx).clamp(display.left, display.right - 1),
+            y: self.point.y.saturating_add(dy).clamp(display.top, display.bottom - 1),
+        })
+    }
+}
+
+#[derive(Default)]
+pub(super) struct MouseButtons {
+    held: BTreeSet<MouseButton>,
+    pending_releases: BTreeSet<MouseButton>,
+}
+
+impl MouseButtons {
+    fn submit(&mut self, button: MouseButton, down: bool, on_target: bool, submit: impl FnOnce() -> bool) -> bool {
+        // A rejected press has no corresponding release, including when the monitor has since disappeared.
+        if self.held.contains(&button) == down || (down && !on_target) {
+            return false;
+        }
+        if !submit() {
+            if !down {
+                self.pending_releases.insert(button);
+            }
+            return false;
+        }
+        if down {
+            self.held.insert(button);
+        } else {
+            self.held.remove(&button);
+            self.pending_releases.remove(&button);
+        }
+        true
+    }
+
+    pub(super) fn release_all(&mut self) {
+        self.release(self.held.clone());
+    }
+
+    fn retry_releases(&mut self) {
+        let pending = std::mem::take(&mut self.pending_releases);
+        self.release(pending);
+    }
+
+    fn release(&mut self, buttons: BTreeSet<MouseButton>) {
+        for button in buttons {
+            self.submit(button, false, false, || send(&mut vec![button_input(button, false)]));
+        }
+    }
+}
+
+fn button_input(button: MouseButton, down: bool) -> INPUT {
+    let (flags, data) = match (button, down) {
+        (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
+        (MouseButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
+        (MouseButton::Right, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
+        (MouseButton::Right, false) => (MOUSEEVENTF_RIGHTUP, 0),
+        (MouseButton::Middle, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
+        (MouseButton::Middle, false) => (MOUSEEVENTF_MIDDLEUP, 0),
+        (MouseButton::X1, true) => (MOUSEEVENTF_XDOWN, 1),
+        (MouseButton::X1, false) => (MOUSEEVENTF_XUP, 1),
+        (MouseButton::X2, true) => (MOUSEEVENTF_XDOWN, 2),
+        (MouseButton::X2, false) => (MOUSEEVENTF_XUP, 2),
+    };
+
+    mouse(flags, data, (0, 0))
+}
+
+/// Injects operations in order. A missing display still permits releasing held input.
+pub(super) fn inject(operations: &[InjectOp], display: Option<RECT>, buttons: &mut MouseButtons) -> bool {
+    // Revocation can arrive with an empty batch after the peer's previous button-up failed.
+    buttons.retry_releases();
     let mut inputs = Vec::with_capacity(operations.len() + 1);
-    let mut complete = true;
+    let mut on_target = display.is_some();
+    let mut anchor = None;
+    let mut complete = on_target;
+    let rect = display.unwrap_or_default();
     for operation in operations {
+        if display.is_none() && !matches!(operation, InjectOp::Key { down: false, .. } | InjectOp::Button { down: false, .. }) {
+            continue;
+        }
         match *operation {
             InjectOp::Key { key: pressed, down } => inputs.push(key(pressed, down)),
-            InjectOp::Move { x, y } => unsafe {
-                let (left, top) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
-                let (width, height) = (GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2), GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2));
-                let pixel_x = f64::from(display.left) + x * f64::from(display.right - display.left - 1);
-                let pixel_y = f64::from(display.top) + y * f64::from(display.bottom - display.top - 1);
-                // Absolute positions cover the virtual desktop in 65536 steps.
-                let scaled = |pixel: f64, origin: i32, extent: i32| ((pixel - f64::from(origin)) * 65535.0 / f64::from(extent - 1)).round() as i32;
-                inputs.push(mouse(
-                    MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                    0,
-                    (scaled(pixel_x, left, width), scaled(pixel_y, top, height)),
-                ));
-            },
-            InjectOp::Button { button, down } => {
-                let (flags, data) = match (button, down) {
-                    (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
-                    (MouseButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
-                    (MouseButton::Right, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
-                    (MouseButton::Right, false) => (MOUSEEVENTF_RIGHTUP, 0),
-                    (MouseButton::Middle, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
-                    (MouseButton::Middle, false) => (MOUSEEVENTF_MIDDLEUP, 0),
-                    (MouseButton::X1, true) => (MOUSEEVENTF_XDOWN, 1),
-                    (MouseButton::X1, false) => (MOUSEEVENTF_XUP, 1),
-                    (MouseButton::X2, true) => (MOUSEEVENTF_XDOWN, 2),
-                    (MouseButton::X2, false) => (MOUSEEVENTF_XUP, 2),
+            InjectOp::Move { x, y } => {
+                let point = POINT {
+                    x: rect.left + (x * f64::from(rect.right - rect.left - 1)).round() as i32,
+                    y: rect.top + (y * f64::from(rect.bottom - rect.top - 1)).round() as i32,
                 };
-                inputs.push(mouse(flags, data, (0, 0)));
+                let moved = cursor_clip().and_then(|clip| absolute_move(point, rect, clip));
+                on_target = moved.is_some();
+                complete &= on_target;
+                inputs.extend(moved);
             }
-            InjectOp::Wheel { vertical, horizontal } => {
+            InjectOp::RelativeMove { dx, dy } => {
+                let movement = RelativePointer::current(rect).and_then(|p| p.movement(rect, dx, dy, |point| absolute_move(point, rect, p.clip)));
+                on_target = movement.is_some();
+                complete &= on_target;
+                inputs.extend(movement);
+            }
+            InjectOp::CurrentPointer => {
+                let current = RelativePointer::current(rect);
+                on_target = current.is_some_and(|p| {
+                    if p.confined {
+                        return true;
+                    }
+                    // Anchor the button or wheel and deliver it in the same SendInput batch.
+                    anchor = absolute_move(p.point, rect, p.clip);
+                    anchor.is_some()
+                });
+                complete &= on_target;
+            }
+            InjectOp::Button { button, down } => {
+                complete &= buttons.submit(button, down, on_target, || {
+                    inputs.extend(anchor.take());
+                    inputs.push(button_input(button, down));
+                    send(&mut inputs)
+                });
+            }
+            InjectOp::Wheel { vertical, horizontal } if on_target => {
+                inputs.extend(anchor.take());
                 if vertical != 0 {
                     inputs.push(mouse(MOUSEEVENTF_WHEEL, vertical, (0, 0)));
                 }
@@ -305,6 +463,7 @@ pub fn inject(operations: &[InjectOp], display: RECT) -> bool {
                     inputs.push(mouse(MOUSEEVENTF_HWHEEL, horizontal, (0, 0)));
                 }
             }
+            InjectOp::Wheel { .. } => {}
             InjectOp::CapsLock(wanted) => {
                 // The lock state is read when the events before it have been delivered.
                 complete &= send(&mut inputs);
@@ -314,6 +473,9 @@ pub fn inject(operations: &[InjectOp], display: RECT) -> bool {
                 }
             }
         }
+    }
+    if !on_target {
+        buttons.release_all();
     }
     complete & send(&mut inputs)
 }
@@ -336,6 +498,58 @@ mod tests {
     use super::*;
     use InputAction::{SwitchInputSource, ToggleCapsLock};
     use InputActionOutcome::{Confirmed, Unconfirmed};
+
+    #[test]
+    fn relative_mouse_keeps_full_native_delta_inside_an_existing_clip() {
+        let display = RECT { left: -1200, right: 0, top: 40, bottom: 1020 };
+        let point = POINT { x: -1, y: 40 };
+        let pointer = RelativePointer::new(display, point, display).unwrap();
+        let input = pointer.movement(display, 950, -600, |_| panic!("relative move was positioned absolutely")).unwrap();
+        let m = unsafe { input.Anonymous.mi };
+        assert_eq!((m.dwFlags, m.dx, m.dy), (MOUSEEVENTF_MOVE, 950, -600));
+    }
+
+    #[test]
+    fn unlocked_multiscreen_pointer_stays_in_shared_pixels_and_stops_after_local_takeover() {
+        let display = RECT { left: -1200, right: 0, top: 40, bottom: 1020 };
+        let desktop = RECT { left: -1200, right: 1920, top: 0, bottom: 1080 };
+        let pointer = RelativePointer::new(display, POINT { x: -5, y: 44 }, desktop).unwrap();
+        let mut actual = None;
+        pointer.movement(display, 200, -100, |p| {
+            actual = Some(p);
+            None
+        });
+        assert_eq!(actual, Some(POINT { x: -1, y: 40 }));
+        assert!(RelativePointer::new(display, POINT { x: 0, y: 50 }, desktop).is_none());
+    }
+
+    #[test]
+    fn absolute_coordinates_land_on_shared_pixel_across_virtual_desktop_boundaries() {
+        for (origin, extent, min, end) in [(-1960, 5100, -40, 1900), (-64000, 84000, -1921, 0)] {
+            for pixel in [min, min + 1, end - 2, end - 1] {
+                let encoded = normalized_pixel(pixel, min, end, origin, extent).unwrap();
+                let landed = i64::from(origin) + i64::from(encoded) * i64::from(extent) / 65536;
+                assert!((i64::from(min)..i64::from(end)).contains(&landed));
+                assert!((landed - i64::from(pixel)).abs() <= 1);
+            }
+        }
+        assert!(normalized_pixel(0, 500, 499, 0, 3000).is_none());
+    }
+
+    #[test]
+    fn only_accepted_button_downs_can_be_released_after_capture_is_lost() {
+        let mut buttons = MouseButtons::default();
+        let b = MouseButton::Left;
+        assert!(!buttons.submit(b, true, false, || panic!("off-display press")));
+        assert!(!buttons.submit(b, true, true, || false));
+        assert!(!buttons.submit(b, false, false, || panic!("release of a rejected press")));
+        assert!(buttons.submit(b, true, true, || true));
+        assert!(!buttons.submit(b, false, false, || false));
+        assert!(buttons.pending_releases.contains(&b));
+        assert!(buttons.submit(b, false, false, || true));
+        assert!(buttons.pending_releases.is_empty());
+        assert!(!buttons.submit(b, false, true, || panic!("already released")));
+    }
 
     #[test]
     fn short_press_closes_caps_before_it_cycles_the_input_source() {

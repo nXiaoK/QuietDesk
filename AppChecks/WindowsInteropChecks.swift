@@ -500,6 +500,7 @@ private struct PostedEvent {
     let flags: CGEventFlags
     let sourceID: String
     let location: CGPoint
+    let motion: (x: Int64, y: Int64)
     let clicks: Int64
     let button: Int64
     let repeated: Bool
@@ -540,6 +541,7 @@ private final class MacHost: @unchecked Sendable {
         var clipboard = "Mac 主机剪贴板"
         var received: [MessageKind] = []
         var posted: [PostedEvent] = []
+        var inputs: [RemoteInput] = []
         var pointer = CGPoint(x: -1, y: -1)
         var released = 0
     }
@@ -556,16 +558,18 @@ private final class MacHost: @unchecked Sendable {
     private let injector: InputInjector
     let keyboard = SyntheticInputSources()
     private let inputActions: Bool
+    private let relativeMouse: Bool
     private var pump: DispatchSourceTimer?
 
     init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int), advertiseMedia: Bool, cursorImage: CursorImage?,
-         externalPackets: [VideoPacket] = [], inputActions: Bool = true, on port: NWEndpoint.Port = .any) throws {
+         externalPackets: [VideoPacket] = [], inputActions: Bool = true, relativeMouse: Bool = true, on port: NWEndpoint.Port = .any) throws {
         self.advertiseMedia = advertiseMedia
         self.cursorImage = cursorImage
         self.key = key
         self.packets = packets
         self.externalPackets = externalPackets
         self.inputActions = inputActions
+        self.relativeMouse = relativeMouse
         self.size = size
         let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8)
         let state = Shared(State(applied: VideoStreamState(settings: settings, width: size.width, height: size.height)))
@@ -579,7 +583,8 @@ private final class MacHost: @unchecked Sendable {
         injector = InputInjector(concurrentBounds: CGRect(x: 0, y: 0, width: 1600, height: 900), isTrusted: { true },
             postEvent: { event in
                 let posted = PostedEvent(type: event.type, keyCode: event.getIntegerValueField(.keyboardEventKeycode), flags: event.flags, sourceID: keyboard.active.get(),
-                    location: event.location, clicks: event.getIntegerValueField(.mouseEventClickState),
+                    location: event.location, motion: (event.getIntegerValueField(.mouseEventDeltaX), event.getIntegerValueField(.mouseEventDeltaY)),
+                    clicks: event.getIntegerValueField(.mouseEventClickState),
                     button: event.getIntegerValueField(.mouseEventButtonNumber),
                     repeated: event.getIntegerValueField(.keyboardEventAutorepeat) != 0,
                     lines: (event.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2), event.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1)),
@@ -649,7 +654,7 @@ private final class MacHost: @unchecked Sendable {
                     displaySwitchingV1: self.externalPackets.isEmpty ? nil : true,
                     displays: self.externalPackets.isEmpty ? nil : self.state.get().displays,
                     selectedDisplayID: self.externalPackets.isEmpty ? nil : self.state.get().selectedDisplay,
-                    remoteAudioV1: true, relativeMouseV1: true, trackpadGesturesV1: true,
+                    remoteAudioV1: true, relativeMouseV1: self.relativeMouse ? true : nil, trackpadGesturesV1: true,
                     initialCursorNegotiationV1: self.cursorImage == nil ? nil : true, qualityProbeV1: true, typeTextV1: true)))
                 // The application waits this long for the viewer's first settings before it starts capture.
                 DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in self?.state.update { $0.streaming = true } }
@@ -790,6 +795,7 @@ private final class MacHost: @unchecked Sendable {
             state.get().media?.setPaused(request.paused)
         case .input:
             let input = try Wire.readJSON(RemoteInput.self, message.payload)
+            state.update { $0.inputs.append(input) }
             if let feedback = try await injector.receive(input) {
                 peer.send(try Wire.json(.inputStatus, feedback))
             }
@@ -1173,6 +1179,62 @@ private struct WindowsInteropChecks {
             }
         }
 
+        run("A Mac viewer sends ordered relative motion and releases the Windows pointer at its current position") {
+            try withWindowsHost(["--synthetic-relative-mouse"]) { probe, viewer in
+                try until("Windows offers relative mouse on the active picture") {
+                    let s = viewer.state.get()
+                    return s.hello?.relativeMouseV1 == true && !s.decoded.isEmpty
+                }
+                func next() throws -> [String] { try probe.next("inject")["operations"] as? [String] ?? [] }
+                var down = RemoteInput(kind: .down)
+                down.x = 0.2; down.y = 0.3; down.pointerSequence = 10
+                try viewer.send(down)
+                try require(try next() == ["Move { x: 0.2, y: 0.3 }", "Button { button: Left, down: true }"], "The click that acquires the pointer changed position")
+                var drag = RemoteInput(kind: .drag)
+                drag.x = 0.5; drag.y = 0.5; drag.relativeMouse = true; drag.pointerSequence = 11
+                drag.pointerDeltaX = 32.5; drag.pointerDeltaY = -15.5
+                try viewer.send(drag)
+                try require(try next() == ["RelativeMove { dx: 32, dy: -15 }"], "Windows used the picture center for locked drag")
+                try viewer.send(drag)
+                drag.pointerSequence = 12; drag.pointerDeltaX = 0.5; drag.pointerDeltaY = -0.5
+                try viewer.send(drag)
+                try require(try next() == ["RelativeMove { dx: 1, dy: -1 }"], "A duplicate or fractional Mac delta changed the accumulated Windows movement")
+
+                var wheel = RemoteInput(kind: .scroll)
+                wheel.x = 0.5; wheel.y = 0.5; wheel.relativeMouse = true; wheel.pointerSequence = 13
+                wheel.deltaY = -36; wheel.lineDeltaX = 0; wheel.lineDeltaY = -3
+                try viewer.send(wheel)
+                try require(try next() == ["CurrentPointer", "Wheel { vertical: -120, horizontal: 0 }"], "Locked scrolling jumped to the center")
+                var up = RemoteInput(kind: .up)
+                up.x = 0.5; up.y = 0.5; up.relativeMouse = true; up.pointerSequence = 12
+                try viewer.send(up)
+                try require(try next() == ["CurrentPointer", "Button { button: Left, down: false }"], "An older button release was lost or moved the pointer")
+                down.relativeMouse = true; down.pointerSequence = 14
+                try viewer.send(down)
+                try require(try next() == ["CurrentPointer", "Button { button: Left, down: true }"], "Locked clicking did not use the current pointer")
+                viewer.peer.send(Message(.releaseInput))
+                try require(try next() == ["Button { button: Left, down: false }"], "Releasing control left the Windows button down")
+                var move = RemoteInput(kind: .move)
+                move.x = 0.75; move.y = 0.25; move.pointerSequence = 15
+                try viewer.send(move)
+                try require(try next() == ["Move { x: 0.75, y: 0.25 }"], "The Windows pointer remained locked after release")
+                drag.pointerDeltaY = nil
+                viewer.peer.send(try Wire.json(.input, drag))
+                try require((try probe.next("ended")["reason"] as? String)?.contains("指针") == true, "Windows accepted a relative movement with a missing delta")
+            }
+            try withWindowsHost { probe, viewer in
+                try until("the absolute-only Windows host is sharing") { !viewer.state.get().decoded.isEmpty }
+                var move = RemoteInput(kind: .move)
+                move.x = 0.5; move.y = 0.5; move.relativeMouse = true; move.pointerDeltaX = 5; move.pointerDeltaY = -2
+                try viewer.send(move)
+                var absolute = RemoteInput(kind: .move)
+                absolute.x = 0.125; absolute.y = 0.25
+                try viewer.send(absolute)
+                try require(try probe.next("inject")["operations"] as? [String] == ["Move { x: 0.125, y: 0.25 }"],
+                            "Windows injected a locked movement without advertising the capability")
+            }
+        }
+
         run("Mac keys, modifiers, clicks and scrolling reach a Windows host as the keys at the same positions") {
             func operations(_ probe: Probe) throws -> [String] { (try probe.next("inject")["operations"] as? [String]) ?? [] }
             try withWindowsHost { probe, viewer in
@@ -1265,9 +1327,9 @@ private struct WindowsInteropChecks {
             }
         }
 
-        func withMacHost(advertiseMedia: Bool = true, cursorImage: CursorImage? = nil, twoDisplays: Bool = false, inputActions: Bool = true, viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
+        func withMacHost(advertiseMedia: Bool = true, cursorImage: CursorImage? = nil, twoDisplays: Bool = false, inputActions: Bool = true, relativeMouse: Bool = true, viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
             let host = try MacHost(key: key, packets: packets, size: size, advertiseMedia: advertiseMedia, cursorImage: cursorImage,
-                                   externalPackets: twoDisplays ? externalPackets : [], inputActions: inputActions)
+                                   externalPackets: twoDisplays ? externalPackets : [], inputActions: inputActions, relativeMouse: relativeMouse)
             defer { host.stop() }
             let probe = try Probe(probePath, ["viewer", "--code", (viewerKey ?? key).code, "--port", "\(host.port)", "--quality", quality] + extra)
             defer { probe.stop() }
@@ -1495,6 +1557,49 @@ private struct WindowsInteropChecks {
                 host.state.get().peer?.send(try Wire.json(.inputStatus, InputFeedback(message: "Unsolicited", capsLocked: true)))
                 try require(try probe.next("ended")["retryable"] as? Bool == false && probe.all("inputStatus").isEmpty,
                             "Windows trusted an unnegotiated input status")
+            }
+        }
+
+        run("Windows relative input reaches the Mac injector with raw edge deltas, anchored clicks and a matching release") {
+            try withMacHost { host, probe in
+                try require(try probe.next("connected")["relativeMouse"] as? Bool == true, "The Windows viewer missed the Mac's relative pointer capability")
+                _ = try probe.next("frame")
+                host.state.update { $0.pointer = CGPoint(x: 1550, y: 50) }
+                try probe.send(["command": "relativeMove", "dx": 30.5, "dy": -20.5])
+                try probe.send(["command": "relativeMove", "dx": 60.5, "dy": -50.5])
+                let button: [String: Any] = ["command": "button", "button": 0, "down": true, "x": 0.1, "y": 0.2,
+                                             "atMilliseconds": 1000, "pixel": [200, 300], "relative": true]
+                try probe.send(button)
+                try probe.send(["command": "relativeMove", "dx": -7, "dy": 13])
+                try probe.send(["command": "wheel", "vertical": 1, "horizontal": 0, "x": 0.1, "y": 0.2, "relative": true])
+                try probe.send(["command": "release"])
+                try probe.send(["command": "move", "x": 1, "y": 1])
+                try probe.send(["command": "requestClipboard"])
+                _ = try probe.next("clipboardText")
+                let s = host.state.get()
+                try require(s.inputs.map(\.kind) == [.move, .move, .down, .drag, .scroll, .move]
+                            && s.inputs.compactMap(\.pointerSequence) == (1...6).map(UInt64.init),
+                            "Windows lost the pointer order, drag or unlocked move")
+                try require(s.inputs.prefix(5).allSatisfy { $0.relativeMouse == true && $0.x == 0.5 && $0.y == 0.5 } && s.inputs.last?.relativeMouse == nil,
+                            "Windows continued to use absolute positions during pointer lock")
+                let events = s.posted
+                try require(events.map(\.type) == [.mouseMoved, .mouseMoved, .leftMouseDown, .leftMouseDragged, .scrollWheel, .leftMouseUp, .mouseMoved],
+                            "Windows motion caused a lost release or extra mouse movement on the Mac")
+                let edge = CGPoint(x: 1599, y: 0), dragged = CGPoint(x: 1592, y: 13)
+                try require(events[0].location == CGPoint(x: 1580.5, y: 29.5) && events[0].motion == (30, -20)
+                            && events[1].location == edge && events[1].motion == (61, -51), "The Mac injector lost raw motion or subpixel remainder at the screen edge")
+                try require(events[2].location == edge && events[3...5].allSatisfy { $0.location == dragged } && events[6].location == CGPoint(x: 1599, y: 899),
+                            "A button, scroll or release changed the virtual pointer position")
+            }
+            try withMacHost(relativeMouse: false) { host, probe in
+                try require(try probe.next("connected")["relativeMouse"] as? Bool == false, "Windows enabled raw input for an older Mac")
+                try probe.send(["command": "relativeMove", "dx": 9, "dy": 5])
+                try probe.send(["command": "move", "x": 0.25, "y": 0.75])
+                try probe.send(["command": "requestClipboard"])
+                _ = try probe.next("clipboardText")
+                let inputs = host.state.get().inputs
+                try require(inputs.count == 1 && inputs[0].kind == .move && inputs[0].relativeMouse == nil && inputs[0].pointerDeltaX == nil
+                            && inputs[0].x == 0.25 && inputs[0].y == 0.75, "An old Mac received a locked movement or lost its absolute move")
             }
         }
 

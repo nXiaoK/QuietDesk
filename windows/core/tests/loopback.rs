@@ -369,7 +369,8 @@ async fn a_session_negotiates_streams_controls_and_ends_as_the_macos_roles_do() 
                     stream: hello_stream,
                     live_settings: true,
                     session_pause: true,
-                    input_actions: true
+                    input_actions: true,
+                    relative_mouse: false,
                 }
             );
             assert!(log.events.contains(&ViewerEvent::Control(true)), "the viewer subscribed to control changes");
@@ -596,6 +597,35 @@ async fn a_forwarded_modifier_cannot_combine_with_the_platform_shortcut() {
         fixture.viewer_commands.send(ViewerCommand::Disconnect).unwrap();
     })
     .await;
+}
+
+#[tokio::test]
+async fn an_unadvertised_relative_mouse_cannot_click_the_absolute_placeholder() {
+    use quietdesk_core::messages::Hello;
+    let (left, right) = tokio::io::duplex(8192);
+    let (host, incoming) = peer::spawn(left, PeerConfig::default());
+    let (viewer, mut messages) = peer::spawn(right, PeerConfig::default());
+    let log = Arc::new(Mutex::new(HostLog::default()));
+    let mut platform = FakeHost { log: log.clone(), sink: Arc::default() };
+    let (commands, queue) = mpsc::unbounded_channel();
+    let exchange = async {
+        let hello: Hello = next_message(&mut messages).await.read_json().unwrap();
+        assert!(hello.relative_mouse_v1.is_none());
+        until("capture starts", || !log.lock().unwrap().configured.is_empty()).await;
+        let mut absolute = RemoteInput::new(InputKind::Move);
+        absolute.x = 0.8;
+        absolute.y = 0.3;
+        for input in [RemoteInput::new(InputKind::Down).at_current_pointer(), absolute] {
+            viewer.send(&Message::json(MessageKind::Input, &input).unwrap()).unwrap();
+        }
+        let moved = InjectOp::Move { x: 0.8, y: 0.3 };
+        until("ordinary movement is accepted", || log.lock().unwrap().injected.contains(&moved)).await;
+        assert_eq!(log.lock().unwrap().injected, [moved]);
+        commands.send(HostCommand::End).unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(host::run(host, incoming, &mut platform, host_options(), queue, |_| {}), exchange) })
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

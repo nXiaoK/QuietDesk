@@ -9,6 +9,7 @@ mod viewer_cursor;
 pub use viewer_cursor::read_back_cursor;
 pub mod inject;
 pub mod pipeline;
+mod relative_mouse;
 pub mod settings;
 pub mod ui;
 pub mod util;

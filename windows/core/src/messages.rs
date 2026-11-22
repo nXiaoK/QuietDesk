@@ -92,6 +92,8 @@ pub struct Hello {
     pub can_control: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_actions: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_mouse_v1: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_settings: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -285,6 +287,10 @@ impl InputAction {
 }
 
 impl InputKind {
+    pub(crate) fn is_pointer(self) -> bool {
+        matches!(self, Self::Move | Self::Drag | Self::Down | Self::Up | Self::Scroll | Self::Magnify | Self::Rotate | Self::SmartMagnify)
+    }
+
     pub fn action(self) -> Option<InputAction> {
         match self {
             Self::SwitchInputSource => Some(InputAction::SwitchInputSource),
@@ -318,6 +324,14 @@ pub struct RemoteInput {
     pub is_repeat: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub independent_caps_lock: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_mouse: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pointer_delta_x: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pointer_delta_y: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pointer_sequence: Option<u64>,
     /// Line deltas of a wheel without precise deltas; `delta_x`/`delta_y` then carry the pixel equivalent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_delta_x: Option<f64>,
@@ -328,6 +342,7 @@ pub struct RemoteInput {
 impl RemoteInput {
     pub const MAXIMUM_LINE_DELTA: f64 = 250.0;
     pub const MAXIMUM_PIXEL_DELTA: f64 = 3000.0;
+    pub const MAXIMUM_POINTER_DELTA: f64 = 10_000.0;
     pub const MAXIMUM_BUTTON: i64 = 31;
     pub const MAXIMUM_KEY_CODE: u16 = 127;
 
@@ -344,14 +359,38 @@ impl RemoteInput {
             clicks: 1,
             is_repeat: false,
             independent_caps_lock: None,
+            relative_mouse: None,
+            pointer_delta_x: None,
+            pointer_delta_y: None,
+            pointer_sequence: None,
             line_delta_x: None,
             line_delta_y: None,
         }
     }
 
+    /// Use the host's current pointer instead of a normalized picture position.
+    pub fn at_current_pointer(mut self) -> Self {
+        self.x = 0.5;
+        self.y = 0.5;
+        self.relative_mouse = Some(true);
+        self
+    }
+
     pub fn validate(&self) -> Result<()> {
         let unit = |value: f64| value.is_finite() && (0.0..=1.0).contains(&value);
         let bounded = |value: f64, limit: f64| value.is_finite() && value.abs() <= limit;
+        let motion = matches!(self.kind, InputKind::Move | InputKind::Drag);
+        if self.pointer_sequence == Some(0) || (!self.kind.is_pointer() && (self.pointer_sequence.is_some() || self.relative_mouse.is_some())) {
+            return Err(DeskError::invalid("远端指针参数无效"));
+        }
+        let valid_delta = match (self.pointer_delta_x, self.pointer_delta_y) {
+            (None, None) => !motion || self.relative_mouse != Some(true),
+            (Some(x), Some(y)) => motion && bounded(x, Self::MAXIMUM_POINTER_DELTA) && bounded(y, Self::MAXIMUM_POINTER_DELTA),
+            _ => false,
+        };
+        if !valid_delta {
+            return Err(DeskError::invalid("远端指针增量参数无效"));
+        }
         let lines = match (self.line_delta_x, self.line_delta_y) {
             (None, None) => true,
             (Some(x), Some(y)) => self.kind == InputKind::Scroll && bounded(x, Self::MAXIMUM_LINE_DELTA) && bounded(y, Self::MAXIMUM_LINE_DELTA),
@@ -424,6 +463,7 @@ mod tests {
             settings: StreamSettings::new(1920, 30, 8),
             can_control: true,
             input_actions: None,
+            relative_mouse_v1: None,
             live_settings: Some(true),
             control_status_updates: None,
             extended_video_settings: None,
@@ -500,6 +540,35 @@ mod tests {
         assert!(input.validate().is_err());
         input.key_code = 0;
         input.line_delta_x = Some(1.0);
+        assert!(input.validate().is_err());
+    }
+
+    #[test]
+    fn relative_motion_requires_two_bounded_finite_deltas_and_a_pointer_kind() {
+        let mut input = RemoteInput::new(InputKind::Move).at_current_pointer();
+        assert!(input.validate().is_err());
+        input.pointer_delta_x = Some(-RemoteInput::MAXIMUM_POINTER_DELTA);
+        assert!(input.validate().is_err());
+        for invalid in [f64::INFINITY, f64::NAN, RemoteInput::MAXIMUM_POINTER_DELTA + 1.0] {
+            input.pointer_delta_y = Some(invalid);
+            assert!(input.validate().is_err());
+        }
+        input.pointer_delta_y = Some(0.0);
+        assert!(input.validate().is_ok());
+        input.relative_mouse = None;
+        assert!(input.validate().is_ok(), "Swift can send deltas alongside absolute motion");
+        input.kind = InputKind::Down;
+        assert!(input.validate().is_err());
+        input.pointer_delta_x = None;
+        input.pointer_delta_y = None;
+        input.pointer_sequence = Some(0);
+        assert!(input.validate().is_err());
+        input.pointer_sequence = Some(u64::MAX);
+        assert!(input.validate().is_ok());
+        input.kind = InputKind::Flags;
+        assert!(input.validate().is_err());
+        input.pointer_sequence = None;
+        input.relative_mouse = Some(false);
         assert!(input.validate().is_err());
     }
 

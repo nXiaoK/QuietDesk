@@ -183,6 +183,9 @@ pub trait HostPlatform {
     fn supports_input_actions(&self) -> bool {
         false
     }
+    fn supports_relative_mouse(&self) -> bool {
+        false
+    }
     /// Dropping the future cancels remaining work. Feedback describes the host's observed lock state.
     fn input_action(&mut self, _action: InputAction) -> impl Future<Output = Result<InputActionOutcome>> + Send + 'static {
         std::future::ready(Err(DeskError::platform("当前系统不支持远端键盘动作")))
@@ -249,6 +252,7 @@ struct HostSession<'a, P: HostPlatform> {
     remote_display: Option<u32>,
     translator: HostInputTranslator,
     input_actions: bool,
+    relative_mouse: bool,
     input_action: Option<PendingInputAction>,
     queued_input: VecDeque<RemoteInput>,
     keyboard_needs_click: bool,
@@ -278,6 +282,7 @@ pub async fn run<P: HostPlatform>(
 ) -> DeskError {
     let translator = HostInputTranslator::new(options.modifiers);
     let input_actions = platform.supports_input_actions();
+    let relative_mouse = platform.supports_relative_mouse();
     let mut session = HostSession {
         peer: &peer,
         platform,
@@ -287,6 +292,7 @@ pub async fn run<P: HostPlatform>(
         remote_display: None,
         translator,
         input_actions,
+        relative_mouse,
         input_action: None,
         queued_input: VecDeque::new(),
         keyboard_needs_click: false,
@@ -378,6 +384,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 settings: initial,
                 can_control: self.options.allow_control,
                 input_actions: self.input_actions.then_some(true),
+                relative_mouse_v1: self.relative_mouse.then_some(true),
                 live_settings: Some(true),
                 control_status_updates: Some(true),
                 extended_video_settings: Some(true),
@@ -756,6 +763,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
             MessageKind::Input => {
                 let mut input: RemoteInput = message.read_json()?;
                 input.validate()?;
+                if input.relative_mouse == Some(true) && !self.relative_mouse {
+                    return Ok(());
+                }
                 if !self.input_actions {
                     input.independent_caps_lock = None;
                 }

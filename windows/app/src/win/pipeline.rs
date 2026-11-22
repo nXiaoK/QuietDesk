@@ -16,7 +16,6 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
-use windows::Win32::Foundation::RECT;
 
 enum Command {
     Size(Sender<Result<(u32, u32)>>),
@@ -298,6 +297,7 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
 /// What a host session needs from this PC. Dropping it ends the capture thread.
 pub struct WindowsHost {
     commands: Sender<Command>,
+    buttons: inject::MouseButtons,
     input_display: Arc<Mutex<Option<Display>>>,
 }
 
@@ -311,7 +311,7 @@ impl WindowsHost {
         let input_display = Arc::new(Mutex::new(None));
         let shared = input_display.clone();
         std::thread::Builder::new().name("capture".to_string()).spawn(move || run(queue, shared, preferred, capture_lost)).expect("the capture thread starts");
-        Self { commands, input_display }
+        Self { commands, buttons: inject::MouseButtons::default(), input_display }
     }
 }
 
@@ -320,6 +320,10 @@ fn stopped() -> DeskError {
 }
 
 impl HostPlatform for WindowsHost {
+    fn supports_relative_mouse(&self) -> bool {
+        true
+    }
+
     fn supports_input_actions(&self) -> bool {
         inject::supports_input_actions()
     }
@@ -377,15 +381,7 @@ impl HostPlatform for WindowsHost {
 
     fn inject(&mut self, operations: &[InjectOp]) -> bool {
         let area = self.input_display.lock().unwrap().as_ref().filter(|d| d.still_at_bounds()).map(|d| d.bounds);
-        if let Some(area) = area {
-            inject::inject(operations, area)
-        } else {
-            // Clearing held inputs still works after the captured monitor disappears.
-            for op in operations.iter().filter(|op| matches!(op, InjectOp::Key { down: false, .. } | InjectOp::Button { down: false, .. })) {
-                inject::inject(std::slice::from_ref(op), RECT::default());
-            }
-            false
-        }
+        inject::inject(operations, area, &mut self.buttons)
     }
 
     fn clipboard_text(&mut self) -> Option<String> {
@@ -396,5 +392,7 @@ impl HostPlatform for WindowsHost {
         clipboard::set_text(text)
     }
 
-    fn stop(&mut self) {}
+    fn stop(&mut self) {
+        self.buttons.release_all();
+    }
 }

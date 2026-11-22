@@ -94,6 +94,7 @@ struct ReplayHost {
     cursor_samples: Option<watch::Sender<Option<HostCursorSample>>>,
     synthetic_displays: bool,
     synthetic_keyboard: bool,
+    synthetic_relative_mouse: bool,
     caps_locked: bool,
     alternate_layout: bool,
 }
@@ -179,6 +180,10 @@ impl HostPlatform for ReplayHost {
 
     fn supports_input_actions(&self) -> bool {
         self.synthetic_keyboard
+    }
+
+    fn supports_relative_mouse(&self) -> bool {
+        self.synthetic_relative_mouse
     }
 
     fn input_action(&mut self, action: InputAction) -> impl Future<Output = Result<InputActionOutcome>> + Send + 'static {
@@ -313,6 +318,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
             cursor_samples: None,
             synthetic_displays,
             synthetic_keyboard: arguments.contains_key("synthetic-keyboard"),
+            synthetic_relative_mouse: arguments.contains_key("synthetic-relative-mouse"),
             caps_locked: false,
             alternate_layout: false,
         };
@@ -400,8 +406,8 @@ impl ViewerPlatform for ReportingViewer {
 
     fn event(&mut self, event: ViewerEvent) {
         emit(match event {
-            ViewerEvent::Connected { name, can_control, stream, live_settings, input_actions, .. } => {
-                json!({ "event": "connected", "name": name, "canControl": can_control, "stream": stream_json(stream), "liveSettings": live_settings, "inputActions":input_actions })
+            ViewerEvent::Connected { name, can_control, stream, live_settings, input_actions, relative_mouse, .. } => {
+                json!({ "event": "connected", "name": name, "canControl": can_control, "stream": stream_json(stream), "liveSettings": live_settings, "inputActions":input_actions, "relativeMouse":relative_mouse })
             }
             ViewerEvent::InputStatus(feedback) => json!({ "event": "inputStatus", "message": feedback.message, "capsLocked": feedback.caps_locked }),
             ViewerEvent::InputActionTimeout => json!({ "event": "inputActionTimeout" }),
@@ -455,6 +461,10 @@ enum Script {
         x: f64,
         y: f64,
     },
+    RelativeMove {
+        dx: f64,
+        dy: f64,
+    },
     #[serde(rename_all = "camelCase")]
     Button {
         button: i64,
@@ -463,12 +473,16 @@ enum Script {
         y: f64,
         at_milliseconds: u64,
         pixel: (i32, i32),
+        #[serde(default)]
+        relative: bool,
     },
     Wheel {
         vertical: f64,
         horizontal: f64,
         x: f64,
         y: f64,
+        #[serde(default)]
+        relative: bool,
     },
     Release,
     Quality {
@@ -522,10 +536,18 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
                     ViewerCommand::Input(action.remote_input())
                 }
                 Ok(Script::Move { x, y }) => ViewerCommand::Input(translator.pointer_move(x, y)),
-                Ok(Script::Button { button, down, x, y, at_milliseconds, pixel }) => {
-                    ViewerCommand::Input(translator.button(button, down, x, y, Duration::from_millis(at_milliseconds), pixel))
+                Ok(Script::RelativeMove { dx, dy }) => {
+                    let Some(input) = translator.relative_pointer_move(dx, dy) else { continue };
+                    ViewerCommand::Input(input)
                 }
-                Ok(Script::Wheel { vertical, horizontal, x, y }) => ViewerCommand::Input(translator.wheel(vertical, horizontal, x, y)),
+                Ok(Script::Button { button, down, x, y, at_milliseconds, pixel, relative }) => {
+                    let input = translator.button(button, down, x, y, Duration::from_millis(at_milliseconds), pixel);
+                    ViewerCommand::Input(if relative { input.at_current_pointer() } else { input })
+                }
+                Ok(Script::Wheel { vertical, horizontal, x, y, relative }) => {
+                    let input = translator.wheel(vertical, horizontal, x, y);
+                    ViewerCommand::Input(if relative { input.at_current_pointer() } else { input })
+                }
                 Ok(Script::Release) => {
                     translator.release_all();
                     press.lock().unwrap().reset();

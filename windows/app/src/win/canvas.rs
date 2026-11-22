@@ -2,6 +2,7 @@
 
 use super::app::{DisplayGeometry, Frame, ViewerSink, run_viewer};
 use super::clipboard;
+use super::relative_mouse::RelativeMouse;
 use super::settings::{Settings, VIEWER_QUALITIES};
 use super::util::{display_label, wide};
 use super::viewer_cursor::ViewerCursor;
@@ -9,6 +10,7 @@ use quietdesk_core::cursor::CursorPresentationState;
 use quietdesk_core::display::RemoteDisplayInfo;
 use quietdesk_core::input::{CapsLockPress, DoubleClick, PcKeyEvent, ViewerInputTranslator};
 use quietdesk_core::media::MediaStreamId;
+use quietdesk_core::messages::{InputKind, RemoteInput};
 use quietdesk_core::pairing::PairingKey;
 use quietdesk_core::reliability::{RetryStatus, ViewerControl};
 use quietdesk_core::viewer::{ViewerCommand, ViewerEnd, ViewerEvent};
@@ -27,6 +29,7 @@ use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject, ScreenToCl
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::HRAWINPUT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetAsyncKeyState, GetCapture, GetDoubleClickTime, GetFocus, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, ReleaseCapture, SetCapture, SetFocus,
     TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL,
@@ -54,6 +57,7 @@ const MENU_DISCONNECT: usize = 103;
 const RETRY_NOW: usize = 104;
 const CANCEL_RETRY: usize = 105;
 const MENU_CAPS_ACTIONS: usize = 106;
+const MENU_RELATIVE_MOUSE: usize = 107;
 const MENU_QUALITY: usize = 200;
 const MENU_DISPLAY: usize = 300;
 
@@ -110,6 +114,26 @@ impl ViewerSink for Mailbox {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PendingMove {
+    Absolute(f64, f64),
+    Relative(f64, f64),
+}
+
+impl PendingMove {
+    fn relative(dx: f64, dy: f64) -> Self {
+        let limit = RemoteInput::MAXIMUM_POINTER_DELTA;
+        Self::Relative(dx.clamp(-limit, limit), dy.clamp(-limit, limit))
+    }
+
+    fn accumulating(self, earlier: Option<Self>) -> Self {
+        match (self, earlier) {
+            (Self::Relative(x, y), Some(Self::Relative(px, py))) => Self::relative(px + x, py + y),
+            (latest, _) => latest,
+        }
+    }
+}
+
 struct Canvas {
     window: HWND,
     owner: HWND,
@@ -145,7 +169,10 @@ struct Canvas {
     supports_input_actions: bool,
     session_menu: HMENU,
     hook: Option<HHOOK>,
-    pending_move: Option<(f64, f64)>,
+    relative_supported: bool,
+    relative_enabled: bool,
+    relative_mouse: Option<RelativeMouse>,
+    pending_move: Option<PendingMove>,
     last_move: Instant,
     full_screen: Option<(WINDOW_STYLE, WINDOWPLACEMENT, HMENU)>,
     paused: bool,
@@ -189,6 +216,7 @@ pub fn open(
         let session = CreatePopupMenu()?;
         AppendMenuW(session, MF_STRING, MENU_FULL_SCREEN, w!("全屏\tCtrl+Alt+Enter"))?;
         AppendMenuW(session, MF_STRING | MF_GRAYED, MENU_CAPS_ACTIONS, w!("独立转发 Caps Lock（短按切输入法，长按切大写）"))?;
+        AppendMenuW(session, MF_STRING | MF_GRAYED, MENU_RELATIVE_MOUSE, w!("相对鼠标（Ctrl+Alt+Esc 释放）"))?;
         AppendMenuW(session, MF_STRING, MENU_SEND_CLIPBOARD, w!("发送本机剪贴板文字"))?;
         AppendMenuW(session, MF_STRING, MENU_REQUEST_CLIPBOARD, w!("获取远端剪贴板文字"))?;
         AppendMenuW(session, MF_SEPARATOR, 0, None)?;
@@ -272,6 +300,9 @@ pub fn open(
             session_menu: session,
             hook: None,
             pending_move: None,
+            relative_supported: false,
+            relative_enabled: false,
+            relative_mouse: None,
             last_move: Instant::now(),
             full_screen: None,
             paused: false,
@@ -440,10 +471,14 @@ fn retry_title(status: &RetryStatus, now: Instant) -> String {
 
 impl Canvas {
     fn send(&self, mut command: ViewerCommand) {
-        if let ViewerCommand::Input(input) = &mut command
-            && self.uses_caps_actions()
-        {
-            input.independent_caps_lock = Some(true);
+        if let ViewerCommand::Input(mut input) = command {
+            if self.uses_caps_actions() {
+                input.independent_caps_lock = Some(true);
+            }
+            if self.relative_mouse.is_some() && matches!(input.kind, InputKind::Down | InputKind::Up | InputKind::Scroll) {
+                input = input.at_current_pointer();
+            }
+            command = ViewerCommand::Input(input);
         }
         if self.current_generation() {
             let _ = self.commands.send(command.into());
@@ -454,11 +489,41 @@ impl Canvas {
         self.caps_forwarding && self.supports_input_actions && self.hook.is_some() && self.controlling() && self.owns_input()
     }
 
-    fn update_caps_menu(&self) {
-        let enabled = self.connected && self.supports_input_actions;
-        unsafe {
-            let _ = EnableMenuItem(self.session_menu, MENU_CAPS_ACTIONS as u32, if enabled { MF_ENABLED } else { MF_GRAYED });
-            CheckMenuItem(self.session_menu, MENU_CAPS_ACTIONS as u32, if enabled && self.caps_forwarding { MF_CHECKED.0 } else { MF_UNCHECKED.0 });
+    fn update_input_menu(&self) {
+        for (id, supported, selected) in
+            [(MENU_CAPS_ACTIONS, self.supports_input_actions, self.caps_forwarding), (MENU_RELATIVE_MOUSE, self.relative_supported, self.relative_enabled)]
+        {
+            let enabled = self.connected && supported;
+            unsafe {
+                let _ = EnableMenuItem(self.session_menu, id as u32, if enabled { MF_ENABLED } else { MF_GRAYED });
+                CheckMenuItem(self.session_menu, id as u32, if enabled && selected { MF_CHECKED.0 } else { MF_UNCHECKED.0 });
+            }
+        }
+    }
+
+    fn capture_relative_mouse(&mut self) {
+        if !self.relative_enabled
+            || !self.relative_supported
+            || self.relative_mouse.is_some()
+            || !self.controlling()
+            || !self.owns_input()
+            || self.hook.is_none()
+        {
+            return;
+        }
+        let Some((x, y, w, h)) = self.picture() else { return };
+        self.flush_move();
+        match RelativeMouse::capture(self.window, POINT { x: (x + w / 2.0) as i32, y: (y + h / 2.0) as i32 }) {
+            Ok(mouse) => {
+                self.relative_mouse = Some(mouse);
+                self.update_pointer();
+                self.set_title("相对鼠标已锁定，Ctrl+Alt+Esc 释放");
+            }
+            Err(error) => {
+                self.relative_enabled = false;
+                self.update_input_menu();
+                self.set_title(&format!("无法锁定相对鼠标：{error}"));
+            }
         }
     }
 
@@ -530,13 +595,15 @@ impl Canvas {
     fn update_pointer(&mut self) {
         let position = self.pointer_in_client();
         let owns = self.controlling() && self.owns_input();
-        self.local_pointer = owns && position.and_then(|(x, y)| self.fraction(x, y)).is_some_and(Self::inside_picture);
+        self.local_pointer = self.relative_mouse.is_none() && owns && position.and_then(|(x, y)| self.fraction(x, y)).is_some_and(Self::inside_picture);
         if position.is_none() {
             return;
         }
         let independent = self.independent();
         unsafe {
-            let handle = if independent && self.local_pointer {
+            let handle = if self.relative_mouse.is_some() {
+                None
+            } else if independent && self.local_pointer {
                 self.cursor.handle()
             } else if !independent && self.controlling() && self.hook.is_some() {
                 None
@@ -548,12 +615,29 @@ impl Canvas {
     }
 
     fn flush_move(&mut self) {
-        if let Some((x, y)) = self.pending_move.take()
+        if let Some(movement) = self.pending_move.take()
             && self.controlling()
             && self.owns_input()
         {
             self.last_move = Instant::now();
-            self.send(ViewerCommand::Input(self.translator.pointer_move(x, y)));
+            let input = match movement {
+                PendingMove::Absolute(x, y) => self.translator.pointer_move(x, y),
+                PendingMove::Relative(dx, dy) if self.relative_mouse.is_some() => {
+                    let Some(input) = self.translator.relative_pointer_move(dx, dy) else { return };
+                    input
+                }
+                _ => return,
+            };
+            self.send(ViewerCommand::Input(input));
+        }
+    }
+
+    fn pace_move(&mut self, movement: PendingMove) {
+        self.pending_move = Some(movement.accumulating(self.pending_move.take()));
+        if self.last_move.elapsed() >= MOVE_INTERVAL {
+            self.flush_move();
+        } else {
+            unsafe { SetTimer(Some(self.window), MOVE_TIMER, MOVE_INTERVAL.as_millis() as u32, None) };
         }
     }
 
@@ -681,6 +765,7 @@ impl Canvas {
     /// Stops forwarding keys and tells the host to let go of everything.
     unsafe fn release(&mut self) {
         self.caps_press.reset();
+        self.relative_mouse.take();
         if let Some(hook) = self.hook.take() {
             let _ = unsafe { UnhookWindowsHookEx(hook) };
         }
@@ -713,6 +798,7 @@ impl Canvas {
                 self.set_title("键盘监听未就绪，Caps Lock 独立转发未启用");
             }
         }
+        self.capture_relative_mouse();
     }
 
     /// One key event of this PC: a local shortcut, or input for the host.
@@ -778,7 +864,9 @@ impl Canvas {
         unsafe {
             self.connected = false;
             self.supports_input_actions = false;
-            self.update_caps_menu();
+            self.relative_enabled = false;
+            self.relative_supported = false;
+            self.update_input_menu();
             let _ = self.displays.update(self.window, &[], None, false);
             self.can_control = false;
             self.release();
@@ -844,7 +932,7 @@ impl Canvas {
 
     unsafe fn session_event(&mut self, event: ViewerEvent) {
         match event {
-            ViewerEvent::Connected { name, can_control, session_pause, input_actions, .. } => {
+            ViewerEvent::Connected { name, can_control, session_pause, input_actions, relative_mouse, .. } => {
                 if self.retry.take().is_some() {
                     unsafe {
                         let _ = KillTimer(Some(self.window), RETRY_TIMER);
@@ -856,7 +944,8 @@ impl Canvas {
                 self.can_control = can_control;
                 self.supports_pause = session_pause;
                 self.supports_input_actions = input_actions;
-                self.update_caps_menu();
+                self.relative_supported = relative_mouse;
+                self.update_input_menu();
                 self.reconcile_pause();
                 self.set_title(if can_control { "已连接，点击画面开始操作" } else { "已连接 · 仅观看" });
                 let name = wide(&self.name);
@@ -999,6 +1088,9 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 let _ = DestroyWindow(window);
             }
             WM_SIZE => {
+                if canvas.relative_mouse.is_some() {
+                    canvas.release();
+                }
                 canvas.update_attention(GetForegroundWindow() == window, IsWindowVisible(window).as_bool(), wparam.0 as u32 == SIZE_MINIMIZED);
                 if canvas.retry.is_some() {
                     canvas.retry_panel.layout(window);
@@ -1006,6 +1098,9 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 canvas.draw();
             }
             WM_ACTIVATE => {
+                if (wparam.0 & 0xffff) as u32 == WA_INACTIVE && canvas.relative_mouse.is_some() {
+                    canvas.release();
+                }
                 canvas.update_attention((wparam.0 & 0xffff) as u32 != WA_INACTIVE, IsWindowVisible(window).as_bool(), IsIconic(window).as_bool());
                 return DefWindowProcW(window, message, wparam, lparam);
             }
@@ -1034,6 +1129,25 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 return LRESULT(1);
             }
             WM_MOUSELEAVE => canvas.draw(),
+            WM_INPUT => {
+                if canvas.controlling()
+                    && canvas.owns_input()
+                    && wparam.0 as u32 == RIM_INPUT
+                    && let Some((dx, dy)) = canvas.relative_mouse.as_ref().and_then(|mouse| mouse.delta(HRAWINPUT(lparam.0 as _)))
+                    && let Some((_, _, width, height)) = canvas.picture()
+                    && let Some((_, video_w, video_h)) = &canvas.bitmap
+                {
+                    canvas.pace_move(PendingMove::relative(
+                        f64::from(dx) * *video_w as f64 / f64::from(width),
+                        f64::from(dy) * *video_h as f64 / f64::from(height),
+                    ));
+                }
+                return DefWindowProcW(window, message, wparam, lparam);
+            }
+            WM_MOVE | WM_ENTERSIZEMOVE | WM_ENTERMENULOOP | WM_CANCELMODE if canvas.relative_mouse.is_some() => {
+                canvas.release();
+                return DefWindowProcW(window, message, wparam, lparam);
+            }
             WM_MOUSEMOVE => {
                 if canvas.independent() {
                     let _ = TrackMouseEvent(&mut TRACKMOUSEEVENT {
@@ -1048,7 +1162,7 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                         canvas.draw();
                     }
                 }
-                if !canvas.controlling() || !canvas.owns_input() {
+                if !canvas.controlling() || !canvas.owns_input() || canvas.relative_mouse.is_some() {
                     return LRESULT(0);
                 }
                 let (x, y) = point(lparam);
@@ -1056,12 +1170,7 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                     if canvas.independent() && !Canvas::inside_picture(position) && GetCapture() != window {
                         return LRESULT(0);
                     }
-                    canvas.pending_move = Some(position);
-                    if canvas.last_move.elapsed() >= MOVE_INTERVAL {
-                        canvas.flush_move();
-                    } else {
-                        SetTimer(Some(window), MOVE_TIMER, MOVE_INTERVAL.as_millis() as u32, None);
-                    }
+                    canvas.pace_move(PendingMove::Absolute(position.0, position.1));
                 }
             }
             WM_TIMER if wparam.0 == MOVE_TIMER => {
@@ -1133,10 +1242,19 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
             }
             WM_COMMAND => match wparam.0 & 0xFFFF {
                 MENU_FULL_SCREEN => canvas.toggle_full_screen(),
+                MENU_RELATIVE_MOUSE if canvas.connected && canvas.current_generation() && canvas.relative_supported && !canvas.closing => {
+                    canvas.release();
+                    canvas.relative_enabled = !canvas.relative_enabled;
+                    canvas.update_input_menu();
+                    canvas.capture_keyboard();
+                    if canvas.relative_enabled && canvas.relative_mouse.is_none() {
+                        canvas.set_title("点击远端画面锁定相对鼠标，Ctrl+Alt+Esc 释放");
+                    }
+                }
                 MENU_CAPS_ACTIONS if canvas.connected && canvas.current_generation() && canvas.supports_input_actions && !canvas.closing => {
                     canvas.release();
                     canvas.caps_forwarding = !canvas.caps_forwarding;
-                    canvas.update_caps_menu();
+                    canvas.update_input_menu();
                     SendMessageW(canvas.owner, WM_CAPS_PREFERENCE, Some(WPARAM(usize::from(canvas.caps_forwarding))), None);
                     canvas.capture_keyboard();
                 }
@@ -1191,6 +1309,17 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pacing_accumulates_relative_motion_and_replaces_absolute_motion() {
+        let a = PendingMove::relative(0.75, -2.25);
+        let b = PendingMove::relative(1.0, -0.75).accumulating(Some(a));
+        assert!(matches!(b, PendingMove::Relative(1.75, -3.0)));
+        let at_limit = PendingMove::relative(9999.0, -9999.0).accumulating(Some(b));
+        assert!(matches!(at_limit, PendingMove::Relative(10000.0, -10000.0)));
+        assert!(matches!(PendingMove::Absolute(0.2, 0.8).accumulating(Some(b)), PendingMove::Absolute(0.2, 0.8)));
+        assert!(matches!(a.accumulating(Some(PendingMove::Absolute(0.8, 0.2))), PendingMove::Relative(0.75, -2.25)));
+    }
 
     #[test]
     fn a_modifier_held_before_control_keeps_its_whole_chord_local() {

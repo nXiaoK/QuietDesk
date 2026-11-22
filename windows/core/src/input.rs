@@ -60,6 +60,13 @@ pub enum InjectOp {
         x: f64,
         y: f64,
     },
+    /// Raw mouse movement in remote pixels, independent of the normalized picture position.
+    RelativeMove {
+        dx: i32,
+        dy: i32,
+    },
+    /// Target a button or wheel event at the current pointer on the shared display.
+    CurrentPointer,
     Button {
         button: MouseButton,
         down: bool,
@@ -88,6 +95,8 @@ pub struct HostInputTranslator {
     keys: BTreeSet<PcKey>,
     buttons: BTreeSet<MouseButton>,
     wheel_remainder: (f64, f64),
+    pointer_remainder: (f64, f64),
+    highest_pointer_sequence: u64,
 }
 
 impl HostInputTranslator {
@@ -99,12 +108,22 @@ impl HostInputTranslator {
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
             wheel_remainder: (0.0, 0.0),
+            pointer_remainder: (0.0, 0.0),
+            highest_pointer_sequence: 0,
         }
     }
 
     /// The operations for one validated event. Kinds this host did not advertise produce nothing.
     pub fn translate(&mut self, input: &RemoteInput) -> Vec<InjectOp> {
         let mut ops = Vec::new();
+        if let Some(sequence) = input.pointer_sequence {
+            if sequence <= self.highest_pointer_sequence && matches!(input.kind, InputKind::Move | InputKind::Drag) {
+                return ops;
+            }
+            self.highest_pointer_sequence = self.highest_pointer_sequence.max(sequence);
+        }
+        let relative = input.relative_mouse == Some(true);
+        let target = if relative { InjectOp::CurrentPointer } else { InjectOp::Move { x: input.x, y: input.y } };
         let independent = input.independent_caps_lock == Some(true);
         match input.kind {
             InputKind::KeyDown | InputKind::KeyUp | InputKind::Flags if independent && input.key_code == mac::CAPS_LOCK => {}
@@ -139,10 +158,23 @@ impl HostInputTranslator {
                 }
                 ops.push(InjectOp::Key { key, down });
             }
-            InputKind::Move | InputKind::Drag => ops.push(InjectOp::Move { x: input.x, y: input.y }),
+            InputKind::Move | InputKind::Drag if relative => {
+                let dx = self.pointer_remainder.0 + input.pointer_delta_x.unwrap_or_default();
+                let dy = self.pointer_remainder.1 + input.pointer_delta_y.unwrap_or_default();
+                self.pointer_remainder = (dx.fract(), dy.fract());
+                let (dx, dy) = (dx as i32, dy as i32);
+                if dx != 0 || dy != 0 {
+                    ops.push(InjectOp::RelativeMove { dx, dy });
+                }
+            }
+            InputKind::Move | InputKind::Drag => {
+                self.pointer_remainder = (0.0, 0.0);
+                ops.push(target);
+            }
             InputKind::Down | InputKind::Up => {
                 let down = input.kind == InputKind::Down;
-                ops.push(InjectOp::Move { x: input.x, y: input.y });
+                self.pointer_remainder = (0.0, 0.0);
+                ops.push(target);
                 let Some(button) = MouseButton::from_number(input.button) else { return ops };
                 if if down { self.buttons.insert(button) } else { self.buttons.remove(&button) } {
                     ops.push(InjectOp::Button { button, down });
@@ -150,7 +182,8 @@ impl HostInputTranslator {
             }
             InputKind::Scroll => {
                 // The wheel goes to the window under the pointer.
-                ops.push(InjectOp::Move { x: input.x, y: input.y });
+                self.pointer_remainder = (0.0, 0.0);
+                ops.push(target);
                 let (x, y) = match (input.line_delta_x, input.line_delta_y) {
                     (Some(x), Some(y)) => (x * WHEEL_UNITS_PER_LINE, y * WHEEL_UNITS_PER_LINE),
                     _ => (input.delta_x * WHEEL_UNITS_PER_PIXEL, input.delta_y * WHEEL_UNITS_PER_PIXEL),
@@ -181,6 +214,7 @@ impl HostInputTranslator {
         self.apply_modifiers(&mut ops);
         ops.extend(std::mem::take(&mut self.buttons).into_iter().map(|button| InjectOp::Button { button, down: false }));
         self.wheel_remainder = (0.0, 0.0);
+        self.pointer_remainder = (0.0, 0.0);
         ops
     }
 
@@ -313,6 +347,18 @@ impl ViewerInputTranslator {
         input.button = *button;
         input.clicks = self.click.filter(|click| click.button == *button).map_or(1, |click| click.count);
         input
+    }
+
+    /// Convert already-scaled remote pixel deltas to a move or drag for a locked viewer.
+    pub fn relative_pointer_move(&self, dx: f64, dy: f64) -> Option<RemoteInput> {
+        if !dx.is_finite() || !dy.is_finite() || (dx == 0.0 && dy == 0.0) {
+            return None;
+        }
+        let limit = RemoteInput::MAXIMUM_POINTER_DELTA;
+        let mut input = self.pointer_move(0.5, 0.5).at_current_pointer();
+        input.pointer_delta_x = Some(dx.clamp(-limit, limit));
+        input.pointer_delta_y = Some(dy.clamp(-limit, limit));
+        Some(input)
     }
 
     /// Buttons whose press was forwarded and still needs a matching release.
@@ -498,6 +544,52 @@ mod tests {
 
     fn viewer(mapping: PcModifierMapping) -> ViewerInputTranslator {
         ViewerInputTranslator::new(mapping, DoubleClick { interval: Duration::from_millis(500), distance: 4 })
+    }
+
+    #[test]
+    fn locked_motion_accumulates_subpixels_until_a_pointer_anchor_or_release() {
+        let mut host = HostInputTranslator::new(MacModifierMapping::Standard);
+        let viewer = viewer(PcModifierMapping::Standard);
+        let motion = viewer.relative_pointer_move(1.5, -0.5).unwrap();
+        assert_eq!(host.translate(&motion), [InjectOp::RelativeMove { dx: 1, dy: 0 }]);
+        assert_eq!(host.translate(&motion), [InjectOp::RelativeMove { dx: 2, dy: -1 }]);
+        let fraction = viewer.relative_pointer_move(0.75, -0.75).unwrap();
+        for kind in [InputKind::Down, InputKind::Up, InputKind::Scroll, InputKind::Move] {
+            assert!(host.translate(&fraction).is_empty());
+            let mut anchor = RemoteInput::new(kind);
+            if kind != InputKind::Move {
+                anchor = anchor.at_current_pointer();
+            }
+            let operations = host.translate(&anchor);
+            assert_eq!(operations[0], if kind == InputKind::Move { InjectOp::Move { x: 0.0, y: 0.0 } } else { InjectOp::CurrentPointer });
+        }
+        assert!(host.translate(&fraction).is_empty());
+        host.release_all();
+        assert!(host.translate(&fraction).is_empty());
+    }
+
+    #[test]
+    fn late_pointer_motion_is_dropped_across_release_but_buttons_are_still_released() {
+        let mut host = HostInputTranslator::new(MacModifierMapping::Standard);
+        let mut viewer = viewer(PcModifierMapping::Standard);
+        let mut down = viewer.button(0, true, 0.2, 0.3, Duration::ZERO, (20, 30));
+        down.pointer_sequence = Some(4);
+        assert_eq!(host.translate(&down)[1], InjectOp::Button { button: MouseButton::Left, down: true });
+        let mut drag = viewer.relative_pointer_move(12000.0, -3.0).unwrap();
+        assert_eq!((drag.kind, drag.button, drag.x, drag.y), (InputKind::Drag, 0, 0.5, 0.5));
+        drag.pointer_sequence = Some(5);
+        assert_eq!(host.translate(&drag), [InjectOp::RelativeMove { dx: 10000, dy: -3 }]);
+        assert!(host.translate(&drag).is_empty());
+        let mut up = viewer.button(0, false, 0.1, 0.8, Duration::ZERO, (20, 30)).at_current_pointer();
+        up.pointer_sequence = Some(3);
+        assert_eq!(host.translate(&up), [InjectOp::CurrentPointer, InjectOp::Button { button: MouseButton::Left, down: false }]);
+        host.release_all();
+        drag.pointer_sequence = Some(4);
+        assert!(host.translate(&drag).is_empty());
+        let absolute = RemoteInput::new(InputKind::Move);
+        assert_eq!(host.translate(&absolute), [InjectOp::Move { x: 0.0, y: 0.0 }]);
+        assert!(viewer.relative_pointer_move(f64::NAN, 1.0).is_none());
+        assert!(viewer.relative_pointer_move(0.0, 0.0).is_none());
     }
 
     fn pc_event(key: PcKey, down: bool) -> PcKeyEvent {

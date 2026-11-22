@@ -51,6 +51,7 @@ pub enum ViewerEvent {
         live_settings: bool,
         session_pause: bool,
         input_actions: bool,
+        relative_mouse: bool,
     },
     /// The stream now has this size and quality; `error` says why a requested change was not applied.
     Stream {
@@ -140,6 +141,7 @@ struct ViewerSession<'a, P: ViewerPlatform> {
     input_reply_deadline: Option<Instant>,
     queued_input: VecDeque<RemoteInput>,
     input_echo_sequence: u32,
+    pointer_sequence: u64,
     waiting_for_input_echo: bool,
     clipboard_requested: Option<Instant>,
     host_ended: bool,
@@ -187,6 +189,7 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
         input_reply_deadline: None,
         queued_input: VecDeque::new(),
         input_echo_sequence: 0,
+        pointer_sequence: 0,
         waiting_for_input_echo: false,
         clipboard_requested: None,
         host_ended: false,
@@ -323,7 +326,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                     self.platform.event(ViewerEvent::InputStatus(feedback));
                     while self.queued_input.front().is_some_and(|next| self.input_reply_deadline.is_none() || next.kind.action().is_none()) {
                         let input = self.queued_input.pop_front().unwrap();
-                        self.send_input(&input)?;
+                        self.send_input(input)?;
                     }
                 }
             }
@@ -376,6 +379,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             live_settings,
             session_pause: hello.session_pause == Some(true),
             input_actions: hello.input_actions == Some(true),
+            relative_mouse: hello.relative_mouse_v1 == Some(true),
         });
         if hello.input_actions == Some(true) {
             self.peer.order_input_echoes(MessageKind::Pong);
@@ -572,6 +576,9 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 if !hello.can_control || self.paused || self.pending_pause.is_some() || self.display_request.is_some() {
                     return Ok(());
                 }
+                if input.relative_mouse == Some(true) && hello.relative_mouse_v1 != Some(true) {
+                    return Ok(());
+                }
                 if hello.input_actions != Some(true) {
                     if input.kind.action().is_some() {
                         return Ok(());
@@ -586,7 +593,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                     self.queued_input.push_back(input);
                     Ok(())
                 } else {
-                    self.send_input(&input)
+                    self.send_input(input)
                 }
             }
             ViewerCommand::ReleaseInput => self.cancel_input_replies(true),
@@ -645,11 +652,17 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         Ok(())
     }
 
-    fn send_input(&mut self, input: &RemoteInput) -> Result<()> {
+    fn send_input(&mut self, mut input: RemoteInput) -> Result<()> {
         if input.kind.action().is_some() {
             self.input_reply_deadline = Some(Instant::now() + INPUT_REPLY_TIMEOUT);
         }
-        self.peer.send(&Message::json(MessageKind::Input, input)?)
+        if input.kind.is_pointer() {
+            input.pointer_sequence = self.pointer_sequence.checked_add(1);
+            if let Some(sequence) = input.pointer_sequence {
+                self.pointer_sequence = sequence;
+            }
+        }
+        self.peer.send(&Message::json(MessageKind::Input, &input)?)
     }
 
     fn input_timeout(&mut self) -> Result<()> {
@@ -698,6 +711,48 @@ mod tests {
         }
         fn event(&mut self, event: ViewerEvent) {
             self.0.send(event).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn only_a_capable_host_receives_locked_motion_and_sequence_numbers_follow_wire_order() {
+        use crate::messages::InputKind;
+        for supported in [false, true] {
+            let (left, right) = tokio::io::duplex(8192);
+            let (host, mut from_viewer) = peer::spawn(left, PeerConfig::default());
+            let (viewer, incoming) = peer::spawn(right, PeerConfig::default());
+            let (input, commands) = mpsc::unbounded_channel();
+            let (_decoder, acks) = mpsc::unbounded_channel();
+            let (notices, mut events) = mpsc::unbounded_channel();
+            let mut observer = Observer(notices);
+            let quality = StreamSettings::new(1920, 30, 8);
+            let exchange = async {
+                let mut hello = serde_json::json!({"version":1,"name":"host","width":1280,"height":720,"settings":quality,"canControl":true});
+                if supported {
+                    hello["relativeMouseV1"] = serde_json::Value::Bool(true);
+                }
+                host.send(&Message::json(MessageKind::Hello, &hello).unwrap()).unwrap();
+                assert!(matches!(events.recv().await.unwrap(), ViewerEvent::Connected{relative_mouse,..} if relative_mouse==supported));
+                let mut relative = RemoteInput::new(InputKind::Move).at_current_pointer();
+                relative.pointer_delta_x = Some(3.0);
+                relative.pointer_delta_y = Some(-4.0);
+                input.send(ViewerCommand::Input(relative)).unwrap();
+                input.send(ViewerCommand::ReleaseInput).unwrap();
+                input.send(ViewerCommand::Input(RemoteInput::new(InputKind::Down))).unwrap();
+                if supported {
+                    let movement: RemoteInput = next(&mut from_viewer).await.read_json().unwrap();
+                    assert_eq!((movement.pointer_sequence, movement.relative_mouse), (Some(1), Some(true)));
+                }
+                assert_eq!(next(&mut from_viewer).await.kind, MessageKind::ReleaseInput);
+                let absolute: RemoteInput = next(&mut from_viewer).await.read_json().unwrap();
+                assert_eq!((absolute.kind, absolute.relative_mouse, absolute.pointer_sequence), (InputKind::Down, None, Some(if supported { 2 } else { 1 })));
+                input.send(ViewerCommand::Disconnect).unwrap();
+            };
+            let (end, ()) =
+                tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(run(viewer, incoming, &mut observer, quality, commands, acks), exchange) })
+                    .await
+                    .unwrap();
+            assert!(end.local_stop);
         }
     }
 

@@ -4,6 +4,8 @@
 use super::codec::{H264Decoder, MediaFoundation, Picture};
 use super::pipeline::WindowsHost;
 use super::util::Com;
+use quietdesk_core::clipboard::{Exchange, Role};
+use quietdesk_core::clipboard_session::SessionClipboard;
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::host::{self, HostCommand, HostEvent, HostOptions};
 use quietdesk_core::media::{DecodeReceipt, MediaStreamId};
@@ -191,8 +193,20 @@ impl Frame {
     }
 }
 
+pub(super) fn open_clipboard(role: Role, enabled: bool) -> Option<SessionClipboard> {
+    use super::clipboard_session::{NativeClipboard, storage_root};
+    use super::clipboard_storage::WindowsStorage;
+
+    let exchange = Exchange::with_storage(role, storage_root().ok()?, enabled, true, Arc::new(WindowsStorage)).ok()?;
+    let owner = NativeClipboard::start(exchange.input.clone(), role == Role::Viewer).ok()?;
+    Some(SessionClipboard::new(exchange, move |action| owner.action(action)))
+}
+
 /// Where a viewer session reports to. Called from the network and decode threads.
 pub trait ViewerSink: Send + Sync + 'static {
+    fn clipboard_preference(&self) -> Option<bool> {
+        None
+    }
     fn local_identity(&self) -> Option<&DeviceIdentity> {
         None
     }
@@ -224,6 +238,9 @@ impl<S: ViewerSink> WindowsViewer<S> {
 }
 
 impl<S: ViewerSink> ViewerPlatform for WindowsViewer<S> {
+    fn open_clipboard(&mut self) -> Option<SessionClipboard> {
+        open_clipboard(Role::Viewer, self.sink.clipboard_preference()?)
+    }
     fn local_identity(&self) -> Option<&DeviceIdentity> {
         self.sink.local_identity()
     }

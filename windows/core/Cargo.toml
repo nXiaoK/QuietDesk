@@ -19,5 +19,8 @@ tokio-openssl.workspace = true
 unicode-segmentation = "1.12"
 uuid.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

@@ -5,6 +5,8 @@
 //! H.264 access units acknowledged by sequence number. It has no platform dependencies, so the
 //! same code runs in the Windows application and in the interoperability checks on macOS.
 
+pub mod clipboard;
+pub mod clipboard_session;
 pub mod cursor;
 pub mod cursor_pixels;
 pub mod display;

@@ -61,6 +61,7 @@ const RETRY_NOW: usize = 104;
 const CANCEL_RETRY: usize = 105;
 const MENU_CAPS_ACTIONS: usize = 106;
 const MENU_RELATIVE_MOUSE: usize = 107;
+const MENU_AUTO_CLIPBOARD: usize = 108;
 const MENU_QUALITY: usize = 200;
 const MENU_DISPLAY: usize = 300;
 
@@ -78,6 +79,7 @@ struct Mailbox {
     generation: AtomicU64,
     ended: Mutex<Option<ViewerEnd>>,
     frame_posted: AtomicBool,
+    clipboard_enabled: AtomicBool,
 }
 
 impl Mailbox {
@@ -87,6 +89,9 @@ impl Mailbox {
 }
 
 impl ViewerSink for Mailbox {
+    fn clipboard_preference(&self) -> Option<bool> {
+        Some(self.clipboard_enabled.load(Ordering::Relaxed))
+    }
     fn local_identity(&self) -> Option<&DeviceIdentity> {
         self.local_identity.as_ref()
     }
@@ -177,6 +182,8 @@ struct Canvas {
     connected: bool,
     can_control: bool,
     supports_pause: bool,
+    supports_clipboard: bool,
+    last_clipboard_preference: Option<(bool, bool)>,
     retry: Option<RetryStatus>,
     retry_panel: RetryPanel,
     fresh_after: Option<u64>,
@@ -239,6 +246,7 @@ pub(super) fn open(
         AppendMenuW(session, MF_STRING, MENU_FULL_SCREEN, w!("全屏\tCtrl+Alt+Enter"))?;
         AppendMenuW(session, MF_STRING | MF_GRAYED, MENU_CAPS_ACTIONS, w!("独立转发 Caps Lock（短按切输入法，长按切大写）"))?;
         AppendMenuW(session, MF_STRING | MF_GRAYED, MENU_RELATIVE_MOUSE, w!("相对鼠标（Ctrl+Alt+Esc 释放）"))?;
+        AppendMenuW(session, MF_STRING | MF_GRAYED, MENU_AUTO_CLIPBOARD, w!("自动同步剪贴板"))?;
         AppendMenuW(session, MF_STRING, MENU_SEND_CLIPBOARD, w!("发送本机剪贴板文字"))?;
         AppendMenuW(session, MF_STRING, MENU_REQUEST_CLIPBOARD, w!("获取远端剪贴板文字"))?;
         AppendMenuW(session, MF_SEPARATOR, 0, None)?;
@@ -282,6 +290,7 @@ pub(super) fn open(
             generation: AtomicU64::new(0),
             ended: Mutex::new(None),
             frame_posted: AtomicBool::new(false),
+            clipboard_enabled: AtomicBool::new(settings.clipboard),
         });
         let double_click = DoubleClick { interval: Duration::from_millis(u64::from(GetDoubleClickTime())), distance: GetSystemMetrics(SM_CXDOUBLECLK) / 2 };
         let quality = settings.viewer_quality();
@@ -313,6 +322,8 @@ pub(super) fn open(
             connected: false,
             can_control: false,
             supports_pause: false,
+            supports_clipboard: false,
+            last_clipboard_preference: None,
             retry: None,
             retry_panel,
             fresh_after: Some(0),
@@ -519,10 +530,24 @@ impl Canvas {
         self.caps_forwarding && self.supports_input_actions && self.hook.is_some() && self.controlling() && self.owns_input()
     }
 
+    fn update_clipboard_preference(&mut self) {
+        if !self.connected || !self.supports_clipboard || self.closing {
+            return;
+        }
+        let enabled = self.mailbox.clipboard_enabled.load(Ordering::Relaxed);
+        let receives = enabled && !self.owns_input() && !self.paused && !self.attention.idle;
+        if self.last_clipboard_preference != Some((enabled, receives)) {
+            self.last_clipboard_preference = Some((enabled, receives));
+            self.send(ViewerCommand::AutomaticClipboard { enabled, receives });
+        }
+    }
+
     fn update_input_menu(&self) {
-        for (id, supported, selected) in
-            [(MENU_CAPS_ACTIONS, self.supports_input_actions, self.caps_forwarding), (MENU_RELATIVE_MOUSE, self.relative_supported, self.relative_enabled)]
-        {
+        for (id, supported, selected) in [
+            (MENU_CAPS_ACTIONS, self.supports_input_actions, self.caps_forwarding),
+            (MENU_RELATIVE_MOUSE, self.relative_supported, self.relative_enabled),
+            (MENU_AUTO_CLIPBOARD, self.supports_clipboard, self.mailbox.clipboard_enabled.load(Ordering::Relaxed)),
+        ] {
             let enabled = self.connected && supported;
             unsafe {
                 let _ = EnableMenuItem(self.session_menu, id as u32, if enabled { MF_ENABLED } else { MF_GRAYED });
@@ -819,6 +844,7 @@ impl Canvas {
         }
         if self.connected {
             self.send(ViewerCommand::ReleaseInput);
+            self.update_clipboard_preference();
         }
     }
 
@@ -834,6 +860,7 @@ impl Canvas {
             }
         }
         self.capture_relative_mouse();
+        self.update_clipboard_preference();
     }
 
     /// One key event of this PC: a local shortcut, or input for the host.
@@ -899,6 +926,8 @@ impl Canvas {
         unsafe {
             self.connected = false;
             self.supports_input_actions = false;
+            self.supports_clipboard = false;
+            self.last_clipboard_preference = None;
             self.supports_gestures = false;
             self.touchpad = None;
             self.relative_enabled = false;
@@ -954,6 +983,7 @@ impl Canvas {
                 }
                 let _ = self.commands.send(ViewerControl::Idle(self.attention.idle));
                 self.reconcile_pause();
+                self.update_clipboard_preference();
             }
         }
     }
@@ -969,7 +999,9 @@ impl Canvas {
 
     unsafe fn session_event(&mut self, event: ViewerEvent) {
         match event {
-            ViewerEvent::Connected { name, device_id, can_control, session_pause, input_actions, relative_mouse, trackpad_gestures, .. } => {
+            ViewerEvent::Connected {
+                name, device_id, can_control, session_pause, input_actions, relative_mouse, trackpad_gestures, clipboard_sync, ..
+            } => {
                 if self.retry.take().is_some() {
                     unsafe {
                         let _ = KillTimer(Some(self.window), RETRY_TIMER);
@@ -980,6 +1012,8 @@ impl Canvas {
                 self.connected = true;
                 self.can_control = can_control;
                 self.supports_pause = session_pause;
+                self.supports_clipboard = clipboard_sync;
+                self.update_clipboard_preference();
                 self.supports_input_actions = input_actions;
                 self.supports_gestures = trackpad_gestures;
                 self.touchpad = Touchpad::open(self.window, trackpad_gestures).ok();
@@ -1027,6 +1061,7 @@ impl Canvas {
             ViewerEvent::Paused { paused, error } => {
                 let request = self.pending_pause.take();
                 self.paused = paused;
+                self.update_clipboard_preference();
                 if paused && self.owns_input() {
                     unsafe { self.release() };
                 }
@@ -1056,6 +1091,7 @@ impl Canvas {
                 }
             }
             ViewerEvent::RoundTrip(_) | ViewerEvent::MediaCommitted(_) => {}
+            ViewerEvent::ClipboardStatus(status) => self.set_title(&status),
             ViewerEvent::ClipboardText(text) => match clipboard::set_text(&text) {
                 Ok(()) => self.set_title("已接收远端剪贴板文字"),
                 Err(error) => self.set_title(&error.to_string()),
@@ -1355,6 +1391,11 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                     canvas.update_input_menu();
                     SendMessageW(canvas.owner, WM_CAPS_PREFERENCE, Some(WPARAM(usize::from(canvas.caps_forwarding))), None);
                     canvas.capture_keyboard();
+                }
+                MENU_AUTO_CLIPBOARD if canvas.connected && canvas.supports_clipboard && !canvas.closing => {
+                    canvas.mailbox.clipboard_enabled.fetch_xor(true, Ordering::Relaxed);
+                    canvas.update_input_menu();
+                    canvas.update_clipboard_preference();
                 }
                 MENU_SEND_CLIPBOARD if canvas.connected && canvas.current_generation() && !canvas.closing => match clipboard::text() {
                     Some(text) => canvas.send(ViewerCommand::SendClipboard(text)),

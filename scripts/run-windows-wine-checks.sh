@@ -6,16 +6,35 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ./scripts/build-windows.sh --build-only
 source scripts/windows-toolchain.sh
+# Cargo identifies the current test executable even when older builds share the same cache.
+native_test="$(cd windows && cargo test --locked --target x86_64-pc-windows-gnullvm --release -p quietdesk-app --lib --no-run --message-format=json | python3 -c '
+import json, sys
+builds = (json.loads(line) for line in sys.stdin)
+binary, = [row["executable"] for row in builds
+           if row.get("executable") and "lib" in row["target"]["kind"] and row["profile"]["test"]]
+print(binary)
+')"
 image=quietdesk-wine-check:local
 docker image inspect "$image" >/dev/null 2>&1 || docker build --platform linux/amd64 -t "$image" -f windows/wine-check.Dockerfile windows >/dev/null
 export QUIETDESK_WINCHECK_PAIRING_CODE="$(python3 -c 'import os; print(os.urandom(32).hex())')"
 # Limit only this container when testing Wine under a CPU translator.
 container_args=(--rm --init --network none --platform linux/amd64)
 if [[ -n "${QUIETDESK_WINE_CPUSET:-}" ]]; then container_args+=(--cpuset-cpus "$QUIETDESK_WINE_CPUSET"); fi
+# The clipboard checks own their Wine prefix and desktop. The media run gets a fresh one.
+docker run -i "${container_args[@]}" -v "$native_test:/qa/native-tests.exe:ro" "$image" bash -s <<'NATIVE_CHECKS'
+set -eu
+export LC_ALL=C.UTF-8 XDG_RUNTIME_DIR=/tmp DISPLAY=:99 WINEDEBUG=-all QUIETDESK_ISOLATED_CLIPBOARD_CHECK=1
+Xvfb :99 -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1 &
+sleep 2
+timeout 120 wineboot -i >/dev/null 2>&1
+timeout 90 wine /qa/native-tests.exe --test-threads=1
+timeout 60 wine /qa/native-tests.exe clipboard_native_ --ignored --test-threads=1
+NATIVE_CHECKS
+
 docker run -i "${container_args[@]}" -e QUIETDESK_WINCHECK_PAIRING_CODE -v "$CARGO_TARGET_DIR/x86_64-pc-windows-gnullvm/release:/app:ro" "$image" bash -s <<'WINE_CHECKS'
 {
 set -o pipefail
-export XDG_RUNTIME_DIR=/tmp DISPLAY=:99 WINEDEBUG=-all
+export LC_ALL=C.UTF-8 XDG_RUNTIME_DIR=/tmp DISPLAY=:99 WINEDEBUG=-all
 Xvfb :99 -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1 &
 sleep 2
 timeout 120 wineboot -i >/dev/null 2>&1

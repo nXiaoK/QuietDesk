@@ -181,6 +181,64 @@ private func writeRecording(_ packets: [VideoPacket], to path: String) throws ->
 }
 
 /// The viewer steps of `DeskModel.handleViewer` that every released version performs, on Core types.
+private final class InteropClipboard: @unchecked Sendable {
+    let directory: URL
+    let physical: Bool
+    let transfer = Shared<ClipboardTransfer?>(nil)
+    let copied = Shared<ClipboardPayload?>(nil)
+    let manifest = Shared<ClipboardManifest?>(nil)
+    let offers = Shared<[ClipboardFileOffer]>([])
+    let applied = Shared<[ClipboardPayload]>([])
+    let sent = Shared<[MessageKind]>([])
+    let received = Shared<[MessageKind]>([])
+    let completedSends = Shared<[Bool]>([])
+    private let session = Shared<UUID?>(nil)
+
+    init(_ directory: URL, physical: Bool = true) {
+        self.directory = directory
+        self.physical = physical
+    }
+
+    func greet(_ peer: Peer, id: UUID) throws {
+        session.update { $0 = id }
+        peer.send(try Wire.json(.clipboardSettings, ClipboardPreference(enabled: true, session: id,
+                    receivesAutomaticUpdates: true, physicalFilePasteV1: physical ? true : nil)))
+    }
+
+    func receive(_ message: Message, from peer: Peer) throws -> Bool {
+        switch message.kind {
+        case .clipboardSettings:
+            let preference = try Wire.readJSON(ClipboardPreference.self, message.payload)
+            guard let id = preference.session, preference.enabled, preference.fileApproval == true,
+                  preference.onDemandClipboard == true, !physical || preference.physicalFilePasteV1 == true else {
+                throw Failure("The Windows peer did not negotiate compatible clipboard settings")
+            }
+            if let existing = session.get() { try require(existing == id, "Clipboard session changed") }
+            else { try greet(peer, id: id) }
+            if transfer.get() != nil { return true }
+            let copy = ClipboardTransfer(storage: directory.appendingPathComponent("received-by-mac"), requireFileApproval: true,
+                allowsChunkWindow: preference.chunkWindow == true, allowsDecoupledFileTransfer: preference.decoupledFileTransfer == true,
+                allowsOnDemandClipboard: true, allowsPhysicalFilePaste: physical)
+            copy.onSend = { [weak peer, sent] message in sent.update { $0.append(message.kind) }; peer?.send(message) }
+            copy.onManifest = { [manifest] next in manifest.update { $0 = next } }
+            copy.onFileOffer = { [offers] in if let offer = $0 { offers.update { $0.append(offer) } } }
+            copy.onReceive = { [applied] payload in applied.update { $0.append(payload) } }
+            copy.validatePulledPNG = { NSBitmapImageRep(data: $0) != nil }
+            copy.onPullRequested = { [weak copy, copied, completedSends] request in
+                guard let payload = copied.get() else { copy?.rejectPull(request, reason: "synthetic copy expired"); return }
+                copy?.sendPulled(payload, requestID: request.requestID) { success in completedSends.update { $0.append(success) } }
+            }
+            transfer.update { $0 = copy }
+        case .clipboardManifest, .clipboardPull, .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd, .clipboardReceipt, .clipboardCancel:
+            guard let copy = transfer.get() else { throw Failure("Clipboard data preceded negotiation") }
+            received.update { $0.append(message.kind) }
+            copy.receive(message)
+        default: return false
+        }
+        return true
+    }
+}
+
 private final class MacViewer: @unchecked Sendable {
     struct State {
         var ready = false
@@ -220,12 +278,15 @@ private final class MacViewer: @unchecked Sendable {
     private let key: PairingKey
     private let useMedia: Bool
     private let identity: DeviceIdentity?
+    private let clipboard: InteropClipboard?
 
-    init(port: UInt16, key: PairingKey, preferred: StreamSettings, useMedia: Bool, identity: DeviceIdentity? = nil) {
+    init(port: UInt16, key: PairingKey, preferred: StreamSettings, useMedia: Bool, identity: DeviceIdentity? = nil,
+         clipboard: InteropClipboard? = nil) {
         self.port = port
         self.key = key
         self.useMedia = useMedia
         self.identity = identity
+        self.clipboard = clipboard
         self.preferred = preferred
         let connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!,
                                       using: SecureTransport.parameters(key: key, responsiveAcknowledgements: true))
@@ -241,6 +302,7 @@ private final class MacViewer: @unchecked Sendable {
     }
 
     private func handle(_ message: Message) throws {
+        if try clipboard?.receive(message, from: peer) == true { return }
         if let media = state.get().media {
             if message.kind == .mediaFrame {
                 let frame = try MediaFrame.decode(message.payload)
@@ -263,6 +325,10 @@ private final class MacViewer: @unchecked Sendable {
         case .hello:
             let hello = try Wire.readJSON(Hello.self, message.payload)
             try hello.validate()
+            if let clipboard {
+                try require(hello.clipboardSync == true && hello.physicalFilePasteV1 == true, "The Windows host omitted clipboard capabilities")
+                try clipboard.greet(peer, id: UUID())
+            }
             let applied = VideoStreamState(settings: hello.settings, width: hello.width, height: hello.height)
             var tuning = try VideoTuningSession(applied: applied, preferred: preferred)
             if hello.sessionTerminationV1 == true { peer.send(try SessionTermination(.subscribe).message()) }
@@ -380,6 +446,7 @@ private final class MacViewer: @unchecked Sendable {
     }
 
     func stop() {
+        clipboard?.transfer.get()?.stop()
         let media = state.update { state -> MediaSession? in
             defer { state.media = nil; state.heldDecodes.removeAll() }
             return state.media
@@ -589,12 +656,13 @@ private final class MacHost: @unchecked Sendable {
     private let deviceID: UUID?
     private let identityExchange: Bool?
     private let prepareHello: (Message) throws -> Message
+    private let clipboard: InteropClipboard?
     private var pump: DispatchSourceTimer?
 
     init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int), advertiseMedia: Bool, cursorImage: CursorImage?,
          externalPackets: [VideoPacket] = [], inputActions: Bool = true, relativeMouse: Bool = true, trackpadGestures: Bool = true,
          deviceID: UUID? = UUID(), identityExchange: Bool? = true, prepareHello: @escaping (Message) throws -> Message = { $0 },
-         on port: NWEndpoint.Port = .any) throws {
+         on port: NWEndpoint.Port = .any, clipboard: InteropClipboard? = nil) throws {
         self.advertiseMedia = advertiseMedia
         self.cursorImage = cursorImage
         self.key = key
@@ -606,6 +674,7 @@ private final class MacHost: @unchecked Sendable {
         self.deviceID = deviceID
         self.identityExchange = identityExchange
         self.prepareHello = prepareHello
+        self.clipboard = clipboard
         self.size = size
         let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8)
         let state = Shared(State(applied: VideoStreamState(settings: settings, width: size.width, height: size.height)))
@@ -692,7 +761,8 @@ private final class MacHost: @unchecked Sendable {
                     displays: self.externalPackets.isEmpty ? nil : self.state.get().displays,
                     selectedDisplayID: self.externalPackets.isEmpty ? nil : self.state.get().selectedDisplay,
                     remoteAudioV1: true, relativeMouseV1: self.relativeMouse ? true : nil, trackpadGesturesV1: self.trackpadGestures ? true : nil,
-                    initialCursorNegotiationV1: self.cursorImage == nil ? nil : true, qualityProbeV1: true, typeTextV1: true))
+                    initialCursorNegotiationV1: self.cursorImage == nil ? nil : true, qualityProbeV1: true, typeTextV1: true,
+                    physicalFilePasteV1: self.clipboard?.physical == true ? true : nil))
                 peer.send(try self.prepareHello(hello))
                 // The application waits this long for the viewer's first settings before it starts capture.
                 DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in self?.state.update { $0.streaming = true } }
@@ -737,6 +807,7 @@ private final class MacHost: @unchecked Sendable {
 
     private func handle(_ message: Message, peer: Peer) async throws {
         state.update { $0.received.append(message.kind) }
+        if try clipboard?.receive(message, from: peer) == true { return }
         if advertiseMedia {
             if message.kind == .mediaControl {
                 let control = try MediaControl.read(message.payload)
@@ -900,6 +971,7 @@ private final class MacHost: @unchecked Sendable {
 
     func stop() {
         pump?.cancel()
+        clipboard?.transfer.get()?.stop()
         listener.cancel()
         let current = state.update { state -> State in
             defer { state.peer = nil; state.media = nil; state.accepted.removeAll() }
@@ -913,6 +985,101 @@ private final class MacHost: @unchecked Sendable {
 private func settings(_ event: [String: Any]) -> [Int] {
     guard let stream = event["stream"] as? [String: Any], let settings = stream["settings"] as? [String: Any] else { return [] }
     return ["longestEdge", "framesPerSecond", "megabits"].compactMap { settings[$0] as? Int } + ["width", "height"].compactMap { stream[$0] as? Int }
+}
+
+private func checkPhysicalClipboard(_ board: InteropClipboard, _ probe: Probe) throws {
+    try until("the clipboard peers exchange enabled preferences") { board.transfer.get() != nil }
+    guard let transfer = board.transfer.get() else { throw Failure("Clipboard did not start") }
+    let text = "QuietDesk 内存粘贴 🖥️"
+    board.copied.update { $0 = .text(Data(text.utf8)) }
+    transfer.announceManifest(kind: .text)
+    _ = try probe.next("clipboardManifest", matching: { $0["kind"] as? String == "text" })
+    try require(board.sent.get() == [.clipboardManifest], "Mac transmitted text on copy")
+    try probe.send(["command": "clipboardPaste"])
+    let pasted = try probe.next("clipboardApplied")
+    try require((pasted["content"] as? [String: Any])?["text"] as? String == text, "Windows did not receive the UTF-8 text")
+    try until("Windows acknowledges the text") { board.completedSends.get() == [true] }
+
+    let windowsText = "Windows → Mac 文本"
+    try probe.send(["command": "copyText", "text": windowsText])
+    try until("Mac receives the text manifest") { board.manifest.get()?.kind == .text }
+    guard let textManifest = board.manifest.get() else { throw Failure("Missing text manifest") }
+    guard case .text(let bytes)? = transfer.pullPayloadSynchronously(revision: textManifest.revision, kind: .text) else {
+        throw Failure("Mac could not pull Windows text")
+    }
+    try require(bytes == Data(windowsText.utf8), "Windows text changed on the Mac")
+
+    let png = try SyntheticCursor.image().png
+    board.copied.update { $0 = .png(png) }
+    transfer.announceManifest(kind: .png)
+    _ = try probe.next("clipboardManifest", matching: { $0["kind"] as? String == "png" })
+    try probe.send(["command": "clipboardPaste"])
+    let pastedPNG = try probe.next("clipboardApplied")
+    try require((pastedPNG["content"] as? [String: Any])?["bytes"] as? [UInt8] == Array(png), "Mac PNG changed on Windows")
+    try until("Windows acknowledges the image") { board.completedSends.get() == [true, true] }
+
+    let readsBeforeImage = probe.all("clipboardRead").count
+    try probe.send(["command": "copyPng", "bytes": Array(png)])
+    try until("Mac receives the image manifest") { board.manifest.get()?.kind == .png }
+    try require(probe.all("clipboardRead").count == readsBeforeImage, "Windows rendered PNG before Mac requested it")
+    guard let image = board.manifest.get() else { throw Failure("Missing image manifest") }
+    let pulled = transfer.pullPayloadSynchronously(revision: image.revision, kind: .png)
+    guard case .png(let pixels)? = pulled else { throw Failure("Mac did not validate the pulled PNG") }
+    try require(pixels == png, "The pulled PNG bytes changed")
+
+    let folder = board.directory.appendingPathComponent("收件目录", isDirectory: true)
+    let empty = board.directory.appendingPathComponent("empty.txt")
+    let contents = Data((0..<90_000).map { UInt8(truncatingIfNeeded: $0) })
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    try contents.write(to: folder.appendingPathComponent("inside.bin"))
+    try Data().write(to: empty)
+    let names = [folder.lastPathComponent, empty.lastPathComponent]
+    func verifyFiles(_ roots: [URL]) throws {
+        try require(roots.map(\.lastPathComponent) == names, "The file roots were lost or reordered")
+        try require(try Data(contentsOf: roots[0].appendingPathComponent("inside.bin")) == contents, "Nested file data changed")
+        try require(try Data(contentsOf: roots[1]).isEmpty, "Zero-length file changed")
+    }
+    func fileMessages(_ messages: [MessageKind]) -> Int {
+        messages.filter { $0 == .clipboardEntry || $0 == .clipboardChunk }.count
+    }
+    let previousSent = fileMessages(board.sent.get())
+    board.copied.update { $0 = .files([folder, empty]) }
+    transfer.announceManifest(kind: .files)
+    _ = try probe.next("clipboardManifest", matching: { $0["kind"] as? String == "files" })
+    try require(probe.all("clipboardOffer").isEmpty, "File offer appeared on copy")
+    try probe.send(["command": "clipboardPaste"])
+    let offer = try probe.next("clipboardOffer")
+    try require(offer["count"] as? Int == names.count && offer["bytes"] as? Int == contents.count &&
+                fileMessages(board.sent.get()) == previousSent, "File content or an incorrect offer arrived before approval")
+    try probe.send(["command": "clipboardDecision", "accept": true])
+    let saved = try probe.next("clipboardApplied")
+    guard let paths = (saved["content"] as? [String: Any])?["paths"] as? [String] else { throw Failure("Windows did not apply file paths") }
+    try verifyFiles(paths.map { URL(fileURLWithPath: $0) })
+    try until("Windows confirms local publication of both roots") { board.completedSends.get() == [true, true, true] }
+
+    for accept in [false, true] {
+        board.manifest.update { $0 = nil }
+        try probe.send(["command": "copyFiles", "names": names])
+        try until("Mac receives Windows file manifest") { board.manifest.get()?.kind == .files }
+        guard let manifest = board.manifest.get() else { throw Failure("Missing Windows file manifest") }
+        let initial = fileMessages(board.received.get()), offerCount = board.offers.get().count
+        transfer.requestFilePaste(revision: manifest.revision)
+        transfer.requestFilePaste(revision: manifest.revision)
+        try until("Windows replies to the file pull") { board.offers.get().count > offerCount }
+        guard let approval = board.offers.get().last else { throw Failure("Missing Mac file approval") }
+        try require(approval.count == 2 && approval.names == names && approval.bytes == UInt64(contents.count) &&
+                    initial == fileMessages(board.received.get()), "Windows sent file data before Mac approval")
+        let cancellations = board.sent.get().filter { $0 == .clipboardCancel }.count
+        transfer.respondToFileOffer(id: approval.id, accept: accept)
+        if accept {
+            try until("Mac publishes the approved files") { !board.applied.get().isEmpty }
+            guard case .files(let roots)? = board.applied.get().last else { throw Failure("Mac published the wrong content kind") }
+            try verifyFiles(roots)
+        } else {
+            try until("Mac cancels the rejected offer") { board.sent.get().filter { $0 == .clipboardCancel }.count > cancellations }
+            try require(initial == fileMessages(board.received.get()) && board.applied.get().isEmpty, "Declined files were transferred")
+        }
+    }
 }
 
 @main
@@ -954,14 +1121,14 @@ private struct WindowsInteropChecks {
         let windowsIdentityOptions = ["--device-id", windowsID.uuidString, "--name", "  合成\nWindows\t电脑  "]
         let command = Int(CGEventFlags.maskCommand.rawValue) | 0x08, shift = Int(CGEventFlags.maskShift.rawValue) | 0x02
 
-        func withWindowsHost(_ extra: [String] = [], useMedia: Bool = true, viewerKey: PairingKey? = nil, identity: DeviceIdentity? = nil,
+        func withWindowsHost(_ extra: [String] = [], useMedia: Bool = true, viewerKey: PairingKey? = nil, identity: DeviceIdentity? = nil, clipboard: InteropClipboard? = nil,
                              preferred: StreamSettings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8),
                              _ body: (Probe, MacViewer) throws -> Void) throws {
             let probe = try Probe(probePath, ["host", "--code", key.code, "--recording", recording, "--size", "\(size.width)x\(size.height)",
                                               "--name", "检查用 Windows 电脑"] + extra)
             defer { probe.stop() }
             guard let port = try probe.next("listening")["port"] as? Int else { throw Failure("The probe did not report its port") }
-            let viewer = MacViewer(port: UInt16(port), key: viewerKey ?? key, preferred: preferred, useMedia: useMedia, identity: identity)
+            let viewer = MacViewer(port: UInt16(port), key: viewerKey ?? key, preferred: preferred, useMedia: useMedia, identity: identity, clipboard: clipboard)
             defer { viewer.stop() }
             try body(probe, viewer)
             let failures = viewer.state.get().failures
@@ -979,7 +1146,7 @@ private struct WindowsInteropChecks {
                             && hello.controlStatusUpdates == true && hello.sessionPause == true && hello.sessionTerminationV1 == true
                             && hello.initialStreamNegotiationV1 == true, "Hello did not announce what the Windows host implements")
                 try require(hello.mediaTransportV1 == true, "The Windows host omitted the media capability")
-                try require(hello.independentCursorV1 == nil && hello.clipboardSync == nil && hello.inputActions == nil
+                try require(hello.independentCursorV1 == nil && hello.clipboardSync == nil && hello.physicalFilePasteV1 == nil && hello.inputActions == nil
                             && hello.hevcVideoV1 == nil && hello.adaptiveVideoV1 == nil && hello.higherFrameRateVideoV1 == nil && hello.remoteAudioV1 == nil
                             && hello.displaySwitchingV1 == nil && hello.sessionEffects == nil && hello.deviceIdentityExchange == nil
                             && hello.relativeMouseV1 == nil && hello.trackpadGesturesV1 == nil && hello.typeTextV1 == nil && hello.desktopActionsV1 == nil,
@@ -1469,16 +1636,52 @@ private struct WindowsInteropChecks {
 
         func withMacHost(advertiseMedia: Bool = true, cursorImage: CursorImage? = nil, twoDisplays: Bool = false, inputActions: Bool = true, relativeMouse: Bool = true,
                          trackpadGestures: Bool = true, deviceID: UUID? = UUID(), identityExchange: Bool? = true, prepareHello: @escaping (Message) throws -> Message = { $0 },
-                         viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
+                         viewerKey: PairingKey? = nil, quality: String = "1920,60,20", clipboard: InteropClipboard? = nil,
+                         _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
             let host = try MacHost(key: key, packets: packets, size: size, advertiseMedia: advertiseMedia, cursorImage: cursorImage,
                                    externalPackets: twoDisplays ? externalPackets : [], inputActions: inputActions, relativeMouse: relativeMouse, trackpadGestures: trackpadGestures,
-                                   deviceID: deviceID, identityExchange: identityExchange, prepareHello: prepareHello)
+                                   deviceID: deviceID, identityExchange: identityExchange, prepareHello: prepareHello, clipboard: clipboard)
             defer { host.stop() }
             let probe = try Probe(probePath, ["viewer", "--code", (viewerKey ?? key).code, "--port", "\(host.port)", "--quality", quality] + extra)
             defer { probe.stop() }
             try body(host, probe)
             let failures = host.state.get().failures
             try require(failures.isEmpty, "The macOS host rejected what the Windows viewer sent: \(failures)")
+        }
+
+        for windowsHost in [true, false] {
+            let role = windowsHost ? "host" : "viewer"
+            run("The Windows \(role) transfers on-demand clipboard content and approved file roots with the Mac over TLS") {
+                let directory = URL(fileURLWithPath: work).appendingPathComponent("clipboard-\(role)", isDirectory: true)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                let board = InteropClipboard(directory)
+                let arguments = ["--synthetic-clipboard", directory.path]
+                if windowsHost {
+                    try withWindowsHost(arguments, useMedia: false, clipboard: board) { probe, _ in try checkPhysicalClipboard(board, probe) }
+                } else {
+                    try withMacHost(advertiseMedia: false, clipboard: board, arguments) { _, probe in try checkPhysicalClipboard(board, probe) }
+                }
+            }
+        }
+
+        run("A Windows viewer uses the original file approval with a Mac that offers only on-demand text and images") {
+            let directory = URL(fileURLWithPath: work).appendingPathComponent("legacy-clipboard", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let board = InteropClipboard(directory, physical: false)
+            let file = directory.appendingPathComponent("legacy.txt")
+            try Data([7, 5, 1]).write(to: file)
+            try withMacHost(advertiseMedia: false, clipboard: board, ["--synthetic-clipboard", directory.path]) { _, probe in
+                try until("legacy clipboard negotiation") { board.transfer.get() != nil }
+                guard let transfer = board.transfer.get() else { throw Failure("No legacy file transfer") }
+                try probe.send(["command": "copyFiles", "names": [file.lastPathComponent]])
+                try until("the old Mac gets the Windows file offer") { !board.offers.get().isEmpty }
+                guard let offer = board.offers.get().first else { throw Failure("No legacy file offer") }
+                try require(board.received.get() == [.clipboardBegin] && offer.count == 1, "Windows sent a file pull or data before the old Mac approved")
+                transfer.respondToFileOffer(id: offer.id, accept: true)
+                try until("the old Mac stores the file") { !board.applied.get().isEmpty }
+                guard case .files(let files)? = board.applied.get().last, let url = files.first else { throw Failure("Wrong legacy payload") }
+                try require(try Data(contentsOf: url) == Data([7, 5, 1]), "Legacy file contents changed")
+            }
         }
 
         func verifyWindowsViewerWindow(_ host: MacHost, _ probe: Probe) throws {

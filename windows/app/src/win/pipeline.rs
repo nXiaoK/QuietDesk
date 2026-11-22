@@ -348,6 +348,10 @@ fn stopped() -> DeskError {
 }
 
 impl HostPlatform for WindowsHost {
+    fn open_clipboard(&mut self, enabled: bool) -> Option<quietdesk_core::clipboard_session::SessionClipboard> {
+        super::app::open_clipboard(quietdesk_core::clipboard::Role::Host, enabled)
+    }
+
     fn supports_trackpad_gestures(&self) -> bool {
         self.gestures.available()
     }

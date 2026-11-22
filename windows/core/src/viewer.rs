@@ -1,6 +1,7 @@
 //! The viewer side of a session: the role of `DeskModel.handleViewer` in the macOS application, for a
 //! viewer that receives video over the control connection and uses only what the host advertised.
 
+use crate::clipboard_session::SessionClipboard;
 use crate::cursor::{CursorControl, CursorOperation, CursorPosition, CursorPresentationState, CursorShape};
 use crate::display::{DisplayControl, RemoteDisplayInfo};
 use crate::error::{DeskError, Result};
@@ -37,6 +38,10 @@ pub enum ViewerCommand {
     SelectDisplay(u32),
     SendClipboard(String),
     RequestClipboard,
+    AutomaticClipboard {
+        enabled: bool,
+        receives: bool,
+    },
     /// Stops or resumes the picture while keeping the session, when the host supports it.
     Pause(bool),
     Disconnect,
@@ -54,6 +59,7 @@ pub enum ViewerEvent {
         input_actions: bool,
         relative_mouse: bool,
         trackpad_gestures: bool,
+        clipboard_sync: bool,
     },
     /// The stream now has this size and quality; `error` says why a requested change was not applied.
     Stream {
@@ -80,6 +86,7 @@ pub enum ViewerEvent {
     },
     RoundTrip(f64),
     ClipboardText(String),
+    ClipboardStatus(String),
 }
 
 /// Why a session ended.
@@ -110,6 +117,9 @@ impl From<DeskError> for ViewerEnd {
 }
 
 pub trait ViewerPlatform {
+    fn open_clipboard(&mut self) -> Option<SessionClipboard> {
+        None
+    }
     /// The installation's persistent identity, if available for this authenticated session.
     fn local_identity(&self) -> Option<&DeviceIdentity> {
         None
@@ -150,6 +160,7 @@ struct ViewerSession<'a, P: ViewerPlatform> {
     pointer_sequence: u64,
     waiting_for_input_echo: bool,
     clipboard_requested: Option<Instant>,
+    clipboard: Option<SessionClipboard>,
     host_ended: bool,
     progress: &'a AttemptProgress,
 }
@@ -198,6 +209,7 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
         pointer_sequence: 0,
         waiting_for_input_echo: false,
         clipboard_requested: None,
+        clipboard: None,
         host_ended: false,
         progress: &progress,
     };
@@ -214,6 +226,11 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
                 Some(PeerEvent::RoundTrip(milliseconds)) => { session.platform.event(ViewerEvent::RoundTrip(milliseconds)); Ok(()) }
                 Some(PeerEvent::Closed(reason)) => Err(reason),
                 None => Err(DeskError::Network("连接已关闭".to_string())),
+            },
+            status = SessionClipboard::next(&mut session.clipboard, &peer) => match status {
+                Ok(Some(status)) => { session.platform.event(ViewerEvent::ClipboardStatus(status)); Ok(()) }
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
             },
             receipt = acknowledgements.recv() => match receipt {
                 Some(receipt) => session.decoded(receipt),
@@ -360,6 +377,9 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 self.host_ended = true;
                 return Err(DeskError::Network(HOST_ENDED_REASON.to_string()));
             }
+            kind if SessionClipboard::accepts(kind) => {
+                self.clipboard.as_ref().ok_or_else(|| DeskError::invalid("尚未协商自动剪贴板"))?.receive(message)?;
+            }
             MessageKind::Clipboard => {
                 // Only text this viewer asked for moments ago is taken.
                 if self.clipboard_requested.take().is_some_and(|asked| asked.elapsed() <= CLIPBOARD_REPLY_TIMEOUT) {
@@ -378,7 +398,11 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         self.stream = Some(stream);
         let live_settings = hello.live_settings == Some(true);
         let _ = self.progress.hello.set(std::time::Instant::now());
+        if hello.clipboard_sync == Some(true) {
+            self.clipboard = self.platform.open_clipboard();
+        }
         self.platform.event(ViewerEvent::Connected {
+            clipboard_sync: self.clipboard.is_some(),
             name: device_display_name(&hello.name),
             device_id: hello.device_id,
             can_control: hello.can_control,
@@ -635,6 +659,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 }
                 self.peer.send(&Message::new(MessageKind::Clipboard, text.into_bytes()))
             }
+            ViewerCommand::AutomaticClipboard { enabled, receives } => self.clipboard.as_ref().map_or(Ok(()), |copy| copy.preferences(enabled, receives)),
             ViewerCommand::RequestClipboard => {
                 self.clipboard_requested = Some(Instant::now());
                 self.peer.send(&Message::empty(MessageKind::RequestClipboard))

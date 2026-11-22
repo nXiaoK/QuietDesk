@@ -98,6 +98,10 @@ pub struct Hello {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_actions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub clipboard_sync: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_file_paste_v1: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub relative_mouse_v1: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trackpad_gestures_v1: Option<bool>,
@@ -566,6 +570,8 @@ mod tests {
             settings: StreamSettings::new(1920, 30, 8),
             can_control: true,
             input_actions: None,
+            clipboard_sync: None,
+            physical_file_paste_v1: None,
             relative_mouse_v1: None,
             trackpad_gestures_v1: None,
             live_settings: Some(true),

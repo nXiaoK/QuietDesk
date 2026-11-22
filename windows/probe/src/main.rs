@@ -4,6 +4,11 @@
 //! H.264 stream where the Windows application would capture and encode, the viewer role reports what it
 //! receives where the application would decode and draw. Everything in between is the code that ships.
 
+mod clipboard;
+
+use clipboard::SyntheticClipboard;
+use quietdesk_core::clipboard::Role;
+use quietdesk_core::clipboard_session::SessionClipboard;
 use quietdesk_core::cursor::CursorImage;
 use quietdesk_core::display::{DisplaySwitch, HostDisplays, RemoteDisplayInfo};
 use quietdesk_core::error::{DeskError, Result};
@@ -94,6 +99,7 @@ struct ReplayHost {
     size: (u32, u32),
     replay: Arc<Mutex<Replay>>,
     clipboard: Option<String>,
+    synthetic_clipboard: Option<SyntheticClipboard>,
     refuse_edge: Option<i64>,
     synthetic_cursor: bool,
     cursor_samples: Option<watch::Sender<Option<HostCursorSample>>>,
@@ -106,6 +112,10 @@ struct ReplayHost {
 }
 
 impl HostPlatform for ReplayHost {
+    fn open_clipboard(&mut self, enabled: bool) -> Option<SessionClipboard> {
+        self.synthetic_clipboard.as_ref()?.open(Role::Host, enabled)
+    }
+
     fn display_size(&mut self) -> Result<(u32, u32)> {
         Ok(if self.replay.lock().unwrap().display_id == 2 { EXTERNAL_SIZE } else { self.size })
     }
@@ -320,10 +330,12 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
         emit(json!({ "event": "accepted" }));
         let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
         let (commands, command_queue) = mpsc::unbounded_channel();
+        let clipboard = arguments.get("synthetic-clipboard").map(|directory| SyntheticClipboard::new(directory));
         let mut platform = ReplayHost {
             size: (width, height),
             replay: replay.clone(),
             clipboard: Some("probe host clipboard 剪贴板".to_string()),
+            synthetic_clipboard: clipboard.clone(),
             refuse_edge,
             synthetic_cursor: arguments.contains_key("synthetic-cursor"),
             cursor_samples: None,
@@ -337,6 +349,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
         let report = |event: HostEvent| match event {
             HostEvent::Streaming(stream) => emit(json!({ "event": "streaming", "stream": stream_json(stream) })),
             HostEvent::ViewerIdentity(identity) => emit(json!({ "event": "viewerIdentity", "id": identity.id, "name": identity.name })),
+            HostEvent::ClipboardStatus(message) => emit(json!({"event":"clipboardStatus","message":message})),
             _ => {}
         };
         let session = host::run(peer.clone(), incoming, &mut platform, options.clone(), command_queue, report);
@@ -347,6 +360,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
                 accepted = listener.accept() => drop(accepted?),
                 line = lines.recv() => {
                     let Some(line) = line else { let _ = commands.send(HostCommand::End); break ((&mut session).await, true) };
+                    if clipboard.as_ref().is_some_and(|copy| copy.command(&line)) { continue; }
                     match line["command"].as_str() {
                         Some("allowControl") => { let _ = commands.send(HostCommand::AllowControl(line["value"].as_bool() == Some(true))); }
                         Some("detachExternal") => {
@@ -378,6 +392,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
 
 /// Stands in for decoding and display: reports each frame and acknowledges it.
 struct ReportingViewer {
+    clipboard: Option<SyntheticClipboard>,
     acknowledgements: mpsc::UnboundedSender<DecodeReceipt>,
     feedback: Arc<Mutex<ScriptFeedback>>,
     identity: Option<DeviceIdentity>,
@@ -407,6 +422,10 @@ impl ReportingViewer {
 }
 
 impl ViewerPlatform for ReportingViewer {
+    fn open_clipboard(&mut self) -> Option<SessionClipboard> {
+        self.clipboard.as_ref()?.open(Role::Viewer, true)
+    }
+
     fn local_identity(&self) -> Option<&DeviceIdentity> {
         self.identity.as_ref()
     }
@@ -450,6 +469,7 @@ impl ViewerPlatform for ReportingViewer {
             ViewerEvent::Paused { paused, error } => json!({ "event": "paused", "paused": paused, "error": error }),
             ViewerEvent::RoundTrip(milliseconds) => json!({ "event": "roundTrip", "milliseconds": milliseconds }),
             ViewerEvent::ClipboardText(text) => json!({ "event": "clipboardText", "text": text }),
+            ViewerEvent::ClipboardStatus(message) => json!({"event":"clipboardStatus","message":message}),
         });
     }
 }
@@ -565,9 +585,13 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
     let input = Mutex::new(new_translator());
     let press = Mutex::new(CapsLockPress::default());
     let independent = arguments.contains_key("independent-caps");
+    let clipboard = arguments.get("synthetic-clipboard").map(|directory| SyntheticClipboard::new(directory));
 
     let script = async {
         while let Some(line) = lines.recv().await {
+            if clipboard.as_ref().is_some_and(|copy| copy.command(&line)) {
+                continue;
+            }
             let mut translator = input.lock().unwrap();
             let command = match serde_json::from_value::<Script>(line) {
                 Ok(Script::Key { scan_code, extended, virtual_key, down, repeat, caps_lock }) => {
@@ -666,10 +690,11 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
             *feedback.lock().unwrap() = ScriptFeedback::default();
             let feedback = feedback.clone();
             let identity = identity.clone();
+            let clipboard = clipboard.clone();
             async move {
                 let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
                 let (acknowledgements, acknowledged) = mpsc::unbounded_channel();
-                let mut platform = ReportingViewer { acknowledgements, feedback, identity };
+                let mut platform = ReportingViewer { acknowledgements, feedback, identity, clipboard };
                 let end = attempt.run(peer.clone(), incoming, &mut platform, acknowledged).await;
                 peer.finished().await;
                 end

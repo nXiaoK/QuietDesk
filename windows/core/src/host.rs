@@ -1,6 +1,7 @@
 //! The host side of a session: the role of `DeskModel.accept` and `handleHost` in the macOS application,
 //! for a host that streams over the control connection and advertises only what it implements.
 
+use crate::clipboard_session::SessionClipboard;
 use crate::cursor::{CursorControl, CursorImage, CursorOperation, CursorPosition, CursorReason, CursorShape};
 use crate::display::{DisplayControl, DisplaySwitch, HostDisplays, RemoteDisplayInfo};
 use crate::error::{DeskError, Result};
@@ -212,6 +213,9 @@ pub trait HostPlatform {
     fn input_action(&mut self, _action: InputAction) -> impl Future<Output = Result<InputActionOutcome>> + Send + 'static {
         std::future::ready(Err(DeskError::platform("当前系统不支持远端键盘动作")))
     }
+    fn open_clipboard(&mut self, _enabled: bool) -> Option<SessionClipboard> {
+        None
+    }
     fn clipboard_text(&mut self) -> Option<String>;
     fn set_clipboard_text(&mut self, text: &str) -> Result<()>;
     fn stop(&mut self);
@@ -250,6 +254,7 @@ pub enum HostEvent {
     RoundTrip(f64),
     Displays { displays: Vec<RemoteDisplayInfo>, selected: u32, error: Option<String> },
     LocalDisplaySelected(Option<u32>),
+    ClipboardStatus(String),
 }
 
 enum DisplayChange {
@@ -272,6 +277,7 @@ struct HostSession<'a, P: HostPlatform> {
     platform: &'a mut P,
     options: HostOptions,
     viewer_identity: Option<DeviceIdentity>,
+    clipboard: Option<SessionClipboard>,
     displays: Option<HostDisplays>,
     display_subscribed: bool,
     remote_display: Option<u32>,
@@ -310,7 +316,9 @@ pub async fn run<P: HostPlatform>(
     let input_actions = platform.supports_input_actions();
     let relative_mouse = platform.supports_relative_mouse();
     let trackpad_gestures = platform.supports_trackpad_gestures();
+    let clipboard = platform.open_clipboard(options.clipboard);
     let mut session = HostSession {
+        clipboard,
         peer: &peer,
         platform,
         options,
@@ -370,6 +378,11 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 _ = tokio::time::sleep_until(start_by), if self.state.is_none() => self.start(initial, events).await.map(drop),
                 _ = tokio::time::sleep_until(media_deadline.unwrap_or(start_by)), if !self.paused && media_deadline.is_some() => self.tick_media(),
                 _ = tokio::time::sleep_until(gesture_check.unwrap_or(start_by)), if gesture_check.is_some() => { self.platform.check_gestures(); Ok(()) }
+                status = SessionClipboard::next(&mut self.clipboard, self.peer) => match status {
+                    Ok(Some(status)) => { events(HostEvent::ClipboardStatus(status)); Ok(()) }
+                    Ok(None) => Ok(()),
+                    Err(error) => Err(error),
+                },
                 frame = next_frame(&mut self.frames) => self.send_frame(frame),
                 feedback = async { self.input_action.as_mut().expect("active input action").await }, if self.input_action.is_some() => self.finish_input_action(feedback),
                 sample = self.cursor.changed(), if !self.paused => match sample {
@@ -380,7 +393,10 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 command = commands.recv() => match command {
                     Some(HostCommand::End) | None => Err(self.end()),
                     Some(HostCommand::AllowControl(allowed)) => self.allow_control(allowed),
-                    Some(HostCommand::Clipboard(enabled)) => { self.options.clipboard = enabled; Ok(()) }
+                    Some(HostCommand::Clipboard(enabled)) => {
+                        self.options.clipboard = enabled;
+                        self.clipboard.as_ref().map_or(Ok(()), |copy| copy.preferences(enabled, !self.paused))
+                    }
                     Some(HostCommand::RefreshDisplays) => self.change_display(DisplayChange::Refresh, events).await,
                     Some(HostCommand::SelectDisplay(id)) => self.change_display(DisplayChange::Local(id), events).await,
                 },
@@ -417,6 +433,8 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 settings: initial,
                 can_control: self.options.allow_control,
                 input_actions: self.input_actions.then_some(true),
+                clipboard_sync: self.clipboard.is_some().then_some(true),
+                physical_file_paste_v1: self.clipboard.is_some().then_some(true),
                 relative_mouse_v1: self.relative_mouse.then_some(true),
                 trackpad_gestures_v1: self.trackpad_gestures.then_some(true),
                 live_settings: Some(true),
@@ -875,6 +893,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 let error = match self.platform.set_paused(request.paused).await {
                     Ok(()) => {
                         self.paused = request.paused;
+                        if let Some(clipboard) = &self.clipboard {
+                            clipboard.preferences(self.options.clipboard, !self.paused)?;
+                        }
                         if self.paused
                             && let Some(abort) = self.media.paused()
                         {
@@ -906,6 +927,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
                     return Err(DeskError::invalid("结束连接消息方向无效"));
                 }
                 self.termination_subscribed = true;
+            }
+            kind if SessionClipboard::accepts(kind) => {
+                self.clipboard.as_ref().ok_or_else(|| DeskError::invalid("尚未协商自动剪贴板"))?.receive(message)?;
             }
             MessageKind::Clipboard => {
                 let text = String::from_utf8(message.payload).ok().filter(|text| text.len() <= wire::MAXIMUM_CLIPBOARD_BYTES);

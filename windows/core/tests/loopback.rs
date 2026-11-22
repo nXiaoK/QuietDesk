@@ -400,6 +400,7 @@ async fn a_session_negotiates_streams_controls_and_ends_as_the_macos_roles_do() 
                     input_actions: true,
                     relative_mouse: false,
                     trackpad_gestures: false,
+                    clipboard_sync: false,
                 }
             );
             assert!(log.events.contains(&ViewerEvent::Control(true)), "the viewer subscribed to control changes");

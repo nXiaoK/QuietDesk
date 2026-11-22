@@ -257,6 +257,7 @@ impl Main {
                 self.save();
                 self.refresh_displays();
             }
+            HostNotice::Session(HostEvent::ClipboardStatus(status)) => self.update_session_status(status),
             HostNotice::Session(HostEvent::Paused(true)) => self.update_session_status("控制端已暂停画面，连接保持".into()),
             HostNotice::Session(_) => {}
             HostNotice::Ended(reason) => {
@@ -437,7 +438,7 @@ impl Main {
             add(button, "复制", push, false, 70, 374, 80, 26, COPY_CODE)?;
             add(button, "重新生成", push, false, 158, 374, 90, 26, NEW_CODE)?;
             add(button, "允许控制端操作键盘和鼠标", check, false, 24, 408, 236, 22, ALLOW_CONTROL)?;
-            add(button, "允许控制端读写剪贴板文字", check, false, 264, 408, 274, 22, ALLOW_CLIPBOARD)?;
+            add(button, "允许同步剪贴板文字、图片和文件", check, false, 264, 408, 274, 22, ALLOW_CLIPBOARD)?;
             add(label, "共享屏幕", 0, false, 24, 438, 64, 20, 0)?;
             add(combo, "", drop, false, 92, 434, 446, 240, SHARED_DISPLAY)?;
             add(label, "画质上限", 0, false, 24, 468, 64, 20, 0)?;

@@ -22,7 +22,7 @@
 | WP6 | 自动剪贴板，图片与文件 | 大 | macOS `fe4ec9c`、Windows `97793b9` 实现按粘贴拉取。`1289a24` 支持一次粘贴到目标文件夹。双向配对 TLS、独立 AppKit 读取和隔离 Windows Shell 文件复制通过，真实 Finder / 资源管理器组合待验 |
 | WP7 | 视频性能：GPU 缩放与色彩转换、硬件编码、HEVC、60 fps 以上、码率自适应 | 大，可拆分 | 每秒性能统计已提交 `e9002e1`。已按用户决定优先开发双向文件粘贴。GPU、硬件编码及 HEVC 等待 Windows 实机 |
 | WP8 | 远端声音 | 中 | 已提交 `4e57867`。双向配对 TLS、Wine 虚拟声卡、默认输出切换与窗口菜单检查通过，物理声卡和蓝牙耳机待 Windows 实机确认 |
-| WP9 | 辅助 TCP 通道与 UDP 视频（DTLS、分片、补传、FEC、路径策略） | 特大，分 5 步 | 9a 独立视频与批量 TCP 已提交 `1e243d1`。9b 加密 UDP、分片及补传已提交 `c1b892e`，双向互通、丢包、黑洞回退及 Windows 连续解码已验证。9c 已提交 `4836e39`，双向 XOR 与分组纠错及旧端补传已验证。9d 已提交 `02c34c6`，双向自动重探、动态帧窗口与同路径快速恢复已验证。9e 待交付 |
+| WP9 | 辅助 TCP 通道与 UDP 视频、光标、指针和声音 | 特大，分 5 步 | 9a 独立 TCP `1e243d1`，9b 加密 UDP、分片与补传 `c1b892e`，9c 纠错 `4836e39`，9d 路径恢复与动态帧窗口 `02c34c6`，9e 光标、指针与音频 `b6069fc`。双向互通、UDP 中断回退和隔离 Windows 验证已通过。真实网络与设备体验待验 |
 | WP10 | 自托管中继 | 大 | 未开始，依赖 WP9 |
 | WP11 | 会话工具：模拟键入、桌面操作、静音/黑屏遮罩/断开后锁屏、自动解锁、画质探测 | 中，可拆分 | 未开始 |
 | WP12 | 端口映射 | 中 | 未开始 |
@@ -300,13 +300,13 @@ Windows 被控端通过 WASAPI 回环采集默认输出设备，控制端通过 
 
 ### WP9 辅助 TCP 通道与 UDP 视频
 
-体量最大，建议拆成 9a–9e 逐步交付，每步都保持 `shared` 路径可用作回退。全部待核实，除特别注明外。
+9a–9e 分步交付，每步保留 `shared` 路径回退。软件验证覆盖配对回环、受控网络中断和隔离 Windows 桌面。真实跨网线路和物理设备的表现待实机确认。
 
 - **9a 辅助 TCP 视频通道**：同一端口上按 ALPN 区分连接（已核实：`quietdesk-control/1`、`quietdesk-media/1`、`quietdesk-bulk/1`、`quietdesk-mapping/1`，见 `MediaSecureTransport.swift`）。Windows 监听器现在区分控制、视频和批量三种连接。新连接发 `bind { sessionID, role, token }`，被控端核对 offer 里发出的 `token`（`MediaBindingGrant`，已核实有效期 15 秒；重复绑定等其余规则见 `receiveBinding`）后回 `bound`；之后 macOS 控制端会立即选择 `tcp` 路径，不再等 1.5 秒。好处是视频与控制消息不再互相排队。对照 `MediaSession.receiveBinding` / `acceptAuxiliary` / `openAuxiliary`。Windows 用控制会话 UUID、令牌和 ALPN 角色绑定辅助连接，批量通道只传剪贴板清单与传输记录。视频通道结束后重新协商关键帧并降级 `shared`。
 - **9b UDP 与 DTLS**：DTLS 1.2、`TLS_PSK_WITH_AES_128_GCM_SHA256`，密钥是 offer 里的 `datagramKey`（32 字节），身份是会话 UUID 的字符串（已核实：`prepareListener` 用 `identifier.uuidString`，即大写形式，并在会话的同一端口号上监听 UDP）。OpenSSL 支持 DTLS-PSK，需要一层把 UDP 数据报接到 `SslStream` 的适配并处理多对端分流。数据报首字节为类型（已核实）：1 探测（共 1024 字节：类型 + 16 字节随机数 + 填充）、2 应答（原样回送，首字节改 2）、3 分片、4 反馈、5 补传的分片、6 光标位置、7 交互输入、8 奇偶校验、9 音频包、10 分组 FEC、11 恢复请求。类型字节之后的记录不超过 1100 字节。先做握手、探测验证、分片与重组、基于 `nack` 的补传。参考 `MediaSession.startUDP` / `sendPing` / `verifiedUDP`、`MediaProtocol.swift` 的 `MediaFragment`、`MediaReassembly.swift`。
 - **9c 前向纠错**：单包 XOR 奇偶校验（`MediaFrameParity`）与 Cauchy Reed-Solomon 分组 FEC（`ReedSolomonFEC.swift`、`MediaFrameFECShard`）。GF(256) 运算用成熟 crate 前先确认生成矩阵与 macOS 完全一致，否则只能照搬实现并用 macOS 生成的向量做测试。
 - **9d 路径策略与发送节奏**：`MediaPathPolicy.swift`（1253 行：UDP 试用、回退、恢复）、`VideoSendPacing.swift`、动态帧窗口（`dynamicFrameWindow`，上限 24）、快速恢复（`fastRecovery`）。
-- **9e 数据报上的交互数据**：光标位置（6）、指针移动（7）、音频（9），对应 `datagramInteractive` / `datagramAudio`。
+- **9e 数据报上的交互数据**：双方分别协商 `datagramInteractive` 和 `datagramAudio`。经验证的 DTLS 传输独立光标位置（6）、绝对指针移动（7）和 Opus（9）。鼠标按键、键盘与光标形状走可靠连接。用同一指针序号处理两条路径上的先后关系。UDP 中断时，可靠连接接续同一音频会话和指针，无需重新连接或开启声音。
 
 **检查**：macOS 仓库已有 `run-media-session-checks.sh`、`run-media-transport-checks.sh`、`run-media-impairment-checks.sh`、`run-media-blackhole-checks.sh`，互通检查应复用其中的丢包与黑洞夹具。总体说明见 `docs/udp-tcp-transport.md`。
 

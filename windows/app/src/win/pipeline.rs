@@ -2,17 +2,18 @@
 
 use super::capture::ScreenCapture;
 use super::codec::{H264Encoder, MediaFoundation};
+use super::host_cursor::CursorSampler;
 use super::util::Com;
 use super::{clipboard, inject};
 use quietdesk_core::error::{DeskError, Result};
-use quietdesk_core::host::{FrameSink, HostPlatform};
+use quietdesk_core::host::{FrameSink, HostCursorSample, HostPlatform};
 use quietdesk_core::input::InjectOp;
 use quietdesk_core::messages::{StreamSettings, VideoStreamState};
 use quietdesk_core::pixel::{Nv12Converter, draw_pointer};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use windows::Win32::Foundation::RECT;
 
 enum Command {
@@ -20,6 +21,7 @@ enum Command {
     Configure(StreamSettings, FrameSink, oneshot::Sender<Result<VideoStreamState>>),
     Pause(bool, oneshot::Sender<Result<()>>),
     KeyFrame(oneshot::Sender<Result<()>>),
+    Cursor(Option<watch::Sender<Option<HostCursorSample>>>, oneshot::Sender<Result<()>>),
 }
 
 struct Stream {
@@ -79,10 +81,11 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
     let media = MediaFoundation::start();
     let mut capture: Option<ScreenCapture> = None;
     let mut stream: Option<Stream> = None;
+    let mut sampler: Option<CursorSampler> = None;
     let mut paused = false;
-    let open = |capture: &mut Option<ScreenCapture>| -> Result<(usize, usize)> {
+    let open = |capture: &mut Option<ScreenCapture>, independent| -> Result<(usize, usize)> {
         if capture.is_none() {
-            let opened = ScreenCapture::open()?;
+            let opened = ScreenCapture::for_cursor_mode(independent)?;
             *bounds.lock().unwrap() = opened.bounds;
             *capture = Some(opened);
         }
@@ -91,20 +94,21 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
     };
     loop {
         let active = stream.as_ref().filter(|_| !paused);
-        // An idle pipeline waits for its next command; a running one only looks for one between frames.
-        let command = match active {
-            Some(active) if active.sink.has_credit() => commands.recv_timeout(active.due.saturating_duration_since(Instant::now())),
-            Some(_) => commands.recv_timeout(Duration::from_millis(2)),
+        let now = Instant::now();
+        let video_wait = active.map(|active| if active.sink.has_credit() { active.due.saturating_duration_since(now) } else { Duration::from_millis(2) });
+        let cursor_wait = sampler.as_ref().filter(|_| !paused && capture.is_some()).map(|cursor| cursor.next_poll.saturating_duration_since(now));
+        let command = match video_wait.into_iter().chain(cursor_wait).min() {
+            Some(wait) => commands.recv_timeout(wait),
             None => commands.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         match command {
             Ok(Command::Size(reply)) => {
-                let _ = reply.send(open(&mut capture).map(|(width, height)| (width as u32, height as u32)));
+                let _ = reply.send(open(&mut capture, sampler.is_some()).map(|(width, height)| (width as u32, height as u32)));
             }
             Ok(Command::Configure(settings, sink, reply)) => {
                 stream = None;
                 let opened = match &media {
-                    Ok(_) => open(&mut capture).and_then(|source| open_stream(source, settings, sink)),
+                    Ok(_) => open(&mut capture, sampler.is_some()).and_then(|source| open_stream(source, settings, sink)),
                     Err(error) => Err(DeskError::platform(error.to_string())),
                 };
                 let _ = reply.send(opened.map(|(opened, state)| {
@@ -131,8 +135,27 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
                 });
                 let _ = reply.send(result);
             }
+            Ok(Command::Cursor(output, reply)) => {
+                let result = (|| {
+                    let independent = output.is_some();
+                    let screen = capture.as_mut().ok_or_else(stopped)?;
+                    let next_sampler = output.map(|tx| CursorSampler::new(tx, screen.bounds, paused)).transpose()?;
+                    if independent != sampler.is_some() {
+                        screen.set_cursor_mode(independent)?;
+                        if let Some(stream) = &mut stream {
+                            stream.restart_from_key_frame();
+                        }
+                    }
+                    sampler = next_sampler;
+                    Ok(())
+                })();
+                let _ = reply.send(result);
+            }
             Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {}
+        }
+        if !paused && let (Some(sampler), Some(screen)) = (&mut sampler, &capture) {
+            sampler.poll(screen.bounds);
         }
         let (Some(active), Some(screen), false) = (&mut stream, &mut capture, paused) else { continue };
         if !active.sink.has_credit() || Instant::now() < active.due {
@@ -147,14 +170,17 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
                 let size = (screen.width(), screen.height());
                 capture = None;
                 std::thread::sleep(Duration::from_millis(300));
-                match open(&mut capture) {
+                match open(&mut capture, sampler.is_some()) {
                     Ok(reopened) if reopened == size => active.restart_from_key_frame(),
                     Ok(_) => {
                         // The session announced another size; ending it lets the viewer connect again.
                         log::warn!("the shared display changed its size, ending the stream");
                         stream = None;
                     }
-                    Err(error) => log::warn!("screen capture is not available yet: {error}"),
+                    Err(error) => {
+                        log::warn!("screen capture could not be reopened, ending the stream: {error}");
+                        stream = None;
+                    }
                 }
                 continue;
             }
@@ -238,6 +264,16 @@ fn stopped() -> DeskError {
 }
 
 impl HostPlatform for WindowsHost {
+    fn supports_independent_cursor(&self) -> bool {
+        true
+    }
+
+    async fn configure_cursor(&mut self, samples: Option<watch::Sender<Option<HostCursorSample>>>) -> Result<()> {
+        let (reply, answer) = oneshot::channel();
+        self.commands.send(Command::Cursor(samples, reply)).map_err(|_| stopped())?;
+        answer.await.map_err(|_| stopped())?
+    }
+
     fn display_size(&mut self) -> Result<(u32, u32)> {
         let (reply, answer) = channel();
         self.commands.send(Command::Size(reply)).map_err(|_| stopped())?;

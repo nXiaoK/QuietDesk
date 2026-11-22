@@ -1,6 +1,7 @@
 //! The host side of a session: the role of `DeskModel.accept` and `handleHost` in the macOS application,
 //! for a host that streams over the control connection and advertises only what it implements.
 
+use crate::cursor::{CursorControl, CursorImage, CursorOperation, CursorPosition, CursorReason, CursorShape};
 use crate::error::{DeskError, Result};
 use crate::input::{HostInputTranslator, InjectOp};
 use crate::keymap::MacModifierMapping;
@@ -16,8 +17,9 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
+use uuid::Uuid;
 
 /// How long a host that announced `initialStreamNegotiationV1` waits for the viewer's first settings
 /// before it starts with the ones in its hello.
@@ -94,6 +96,59 @@ impl FrameSink {
     }
 }
 
+#[derive(Clone)]
+pub struct HostCursorSample {
+    pub image: Option<Arc<CursorImage>>,
+    pub inside_display: bool,
+    pub x: f64,
+    pub y: f64,
+}
+
+struct HostCursor {
+    id: Uuid,
+    epoch: u32,
+    revision: u64,
+    sequence: u64,
+    samples: Option<watch::Receiver<Option<HostCursorSample>>>,
+    previous: Option<HostCursorSample>,
+}
+
+impl HostCursor {
+    async fn changed(&mut self) -> Result<Option<HostCursorSample>> {
+        let Some(samples) = &mut self.samples else { return std::future::pending().await };
+        samples.changed().await.map_err(|_| DeskError::platform("光标采集已停止"))?;
+        Ok(samples.borrow_and_update().clone())
+    }
+
+    fn send_sample(&mut self, peer: &PeerHandle, sample: HostCursorSample) -> Result<()> {
+        let previous = self.previous.as_ref();
+        if previous.is_none_or(|last| match (&last.image, &sample.image) {
+            (Some(a), Some(b)) => !Arc::ptr_eq(a, b) && a != b,
+            (None, None) => false,
+            _ => true,
+        }) {
+            self.revision += 1;
+            peer.send(&CursorShape { cursor_id: self.id, epoch: self.epoch, revision: self.revision, image: sample.image.clone() }.message()?)?;
+        }
+        if previous.is_none_or(|last| (last.inside_display, last.x, last.y) != (sample.inside_display, sample.x, sample.y)) {
+            self.sequence += 1;
+            peer.send(
+                &CursorPosition {
+                    cursor_id: self.id,
+                    epoch: self.epoch,
+                    sequence: self.sequence,
+                    inside_display: sample.inside_display,
+                    x: sample.x,
+                    y: sample.y,
+                }
+                .message()?,
+            )?;
+        }
+        self.previous = Some(sample);
+        Ok(())
+    }
+}
+
 /// What a host needs from its machine. The session calls these from one task, never concurrently.
 pub trait HostPlatform {
     /// Pixel size of the display that will be shared.
@@ -103,6 +158,13 @@ pub trait HostPlatform {
     fn configure(&mut self, settings: StreamSettings, frames: FrameSink) -> impl Future<Output = Result<VideoStreamState>> + Send;
     /// Finishes any in-progress encode and arms a keyframe of the current screen before the gate opens.
     fn request_key_frame(&mut self) -> impl Future<Output = Result<()>> + Send;
+    fn supports_independent_cursor(&self) -> bool {
+        false
+    }
+    /// On failure the platform keeps its previous capture mode and sampler.
+    fn configure_cursor(&mut self, _samples: Option<watch::Sender<Option<HostCursorSample>>>) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(Err(DeskError::platform("当前采集方式无法单独传送光标")))
+    }
     /// Stops or resumes frame production; a resumed stream continues with a keyframe of the current screen.
     fn set_paused(&mut self, paused: bool) -> impl Future<Output = Result<()>> + Send;
     fn inject(&mut self, operations: &[InjectOp]);
@@ -150,6 +212,8 @@ struct HostSession<'a, P: HostPlatform> {
     frames: Option<mpsc::UnboundedReceiver<CapturedFrame>>,
     window: Arc<Mutex<FrameWindow>>,
     media: HostMedia,
+    media_prepared: bool,
+    cursor: HostCursor,
     recover_after: Instant,
     unacknowledged: VecDeque<u32>,
     sequence: u32,
@@ -178,6 +242,8 @@ pub async fn run<P: HostPlatform>(
         frames: None,
         window: Arc::new(Mutex::new(FrameWindow::new(Gate::Open))),
         media: HostMedia::default(),
+        media_prepared: false,
+        cursor: HostCursor { id: Uuid::new_v4(), epoch: 0, revision: 0, sequence: 0, samples: None, previous: None },
         recover_after: Instant::now(),
         unacknowledged: VecDeque::new(),
         sequence: 0,
@@ -217,6 +283,11 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 _ = tokio::time::sleep_until(start_by), if self.state.is_none() => self.start(initial, events).await.map(drop),
                 _ = tokio::time::sleep_until(media_deadline.unwrap_or(start_by)), if !self.paused && media_deadline.is_some() => self.tick_media(),
                 frame = next_frame(&mut self.frames) => self.send_frame(frame),
+                sample = self.cursor.changed(), if !self.paused => match sample {
+                    Ok(Some(sample)) => self.cursor.send_sample(self.peer, sample),
+                    Ok(None) => Ok(()),
+                    Err(error) => Err(error),
+                },
                 command = commands.recv() => match command {
                     Some(HostCommand::End) | None => Err(self.end()),
                     Some(HostCommand::AllowControl(allowed)) => self.allow_control(allowed),
@@ -252,6 +323,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 preferred_high_refresh_settings: Some(preferred.high_refresh_compatible()),
                 session_pause: Some(true),
                 media_transport_v1: Some(true),
+                independent_cursor_v1: self.platform.supports_independent_cursor().then_some(true),
                 session_termination_v1: Some(true),
                 initial_stream_negotiation_v1: Some(true),
             },
@@ -320,8 +392,56 @@ impl<P: HostPlatform> HostSession<'_, P> {
     }
 
     fn finish_preparation(&mut self) -> Result<()> {
+        if let Some(stream) = self.media.preparing().filter(|_| self.cursor.epoch > 0) {
+            self.peer.send(&CursorControl::binding(self.cursor.id, self.cursor.epoch, self.cursor.samples.is_some(), stream).message()?)?;
+        }
         if let Some(ready) = self.media.prepared() {
             self.send_control(ready)?;
+            self.media_prepared = true;
+        }
+        Ok(())
+    }
+
+    async fn configure_cursor(&mut self, request: CursorControl) -> Result<()> {
+        if request.operation != CursorOperation::Request || !self.platform.supports_independent_cursor() || !self.media_prepared {
+            return Err(DeskError::invalid("光标功能未协商"));
+        }
+        let epoch = self.cursor.epoch.checked_add(1).ok_or_else(|| DeskError::Network("光标模式代次已耗尽，请重新连接".into()))?;
+        let (settled, controls) = self.media.interrupted();
+        self.sync_gate();
+        self.settle(settled);
+        for control in controls.into_iter().filter(|c| c.operation == MediaOperation::Abort) {
+            self.send_control(control)?;
+        }
+        let (sender, receiver) = watch::channel(None);
+        let reason = match self.platform.configure_cursor(request.enabled.then_some(sender)).await {
+            Ok(()) => {
+                self.cursor.samples = request.enabled.then_some(receiver);
+                self.paused.then_some(CursorReason::WaitingForResume)
+            }
+            Err(error) => {
+                log::warn!("cursor capture mode was retained: {error}");
+                Some(CursorReason::Unavailable)
+            }
+        };
+        self.cursor.epoch = epoch;
+        self.cursor.sequence = 0;
+        self.cursor.revision = 0;
+        self.cursor.previous = None;
+        let id = request.request_id.expect("validated cursor request");
+        self.peer.send(&CursorControl::status(id, self.cursor.id, epoch, self.cursor.samples.is_some(), reason).message()?)?;
+        if !self.paused {
+            self.send_current_cursor()?;
+            if let Some(recover) = self.media.recovery() {
+                self.send_control(recover)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn send_current_cursor(&mut self) -> Result<()> {
+        if let Some(sample) = self.cursor.samples.as_mut().and_then(|rx| rx.borrow_and_update().clone()) {
+            self.cursor.send_sample(self.peer, sample)?;
         }
         Ok(())
     }
@@ -424,6 +544,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 }
             }
             MessageKind::MediaControl => self.receive_control(MediaControl::read(&message)?).await?,
+            MessageKind::CursorControl => self.configure_cursor(CursorControl::read(&message)?).await?,
             MessageKind::MediaFeedback => {
                 let feedback = MediaFeedback::decode(&message.payload)?;
                 let update = self.media.feedback(&feedback);
@@ -449,6 +570,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
                             self.send_control(abort)?;
                         }
                         self.sync_gate();
+                        if !self.paused {
+                            self.send_current_cursor()?;
+                        }
                         events(HostEvent::Paused(self.paused));
                         None
                     }

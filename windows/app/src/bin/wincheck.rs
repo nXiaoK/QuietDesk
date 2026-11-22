@@ -51,6 +51,10 @@ fn main() {
             }
             println!("PASS capture {}x{} changed={changed} non-black pixels={lit} pointer={}", capture.width(), capture.height(), capture.pointer().is_some());
         }
+        Some("cursor") => {
+            cursor_check().unwrap_or_else(|error| fail("cursor", error));
+            println!("PASS native cursor pixels, hotspot and system sampling");
+        }
         Some("codec") => {
             let _media = MediaFoundation::start().unwrap_or_else(|error| fail("Media Foundation", error));
             let (width, height) = (640usize, 360usize);
@@ -121,11 +125,18 @@ fn main() {
                 committed: Option<MediaStreamId>,
                 media_pictures: u64,
                 showed_candidate: bool,
+                cursor_stream: Option<MediaStreamId>,
             }
             #[derive(Default)]
             struct Report(Mutex<Counts>);
             impl ViewerSink for Report {
                 fn event(&self, event: ViewerEvent) {
+                    if let ViewerEvent::Cursor(cursor) = &event {
+                        if cursor.enabled && cursor.position.is_some() {
+                            self.0.lock().unwrap().cursor_stream = cursor.committed_stream();
+                        }
+                        return;
+                    }
                     if let ViewerEvent::MediaCommitted(stream) = event {
                         let mut counts = self.0.lock().unwrap();
                         counts.committed = Some(stream);
@@ -177,12 +188,63 @@ fn main() {
                     fail("viewer", "no picture decoded after the shared media stream committed");
                 }
             }
+            if arguments.iter().any(|argument| argument == "--require-cursor") {
+                if counts.cursor_stream.is_none() || counts.cursor_stream != counts.committed {
+                    fail("cursor", "the active stream has no independent cursor position");
+                }
+                println!("PASS cursor on the committed stream");
+            }
             if pictures > 0 && frame.width > 0 { println!("PASS viewer") } else { fail("viewer", "no picture was decoded") }
         }
         _ => {
             println!(
-                "usage: quietdesk-wincheck capture | codec | host --code C [--port P] [--seconds S] | viewer --code C [--host H] [--port P] [--seconds S] [--require-media]"
+                "usage: quietdesk-wincheck capture | cursor | codec | host --code C [--port P] [--seconds S] | viewer --code C [--host H] [--port P] [--seconds S] [--require-media] [--require-cursor]"
             )
         }
     }
+}
+
+#[cfg(windows)]
+fn cursor_check() -> quietdesk_core::error::Result<()> {
+    use quietdesk_core::cursor::CursorImage;
+    use quietdesk_core::error::DeskError;
+    use quietdesk_core::host::HostPlatform;
+    use quietdesk_windows::win::{pipeline::WindowsHost, read_back_cursor};
+    use windows::Win32::UI::WindowsAndMessaging::{CURSOR_SHOWING, CURSORINFO, GetCursorInfo};
+
+    // An asymmetric synthetic cursor lets a flip, swapped channel, mask or misplaced hot spot show up.
+    let pixels = [[255, 0, 0, 128], [0, 0, 0, 0], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255], [0, 0, 0, 255]];
+    let original = CursorImage::from_rgba(3, 2, 3.0, 2.0, 2.0, 1.0, pixels.as_flattened())?;
+    for scale in [1usize, 2] {
+        let image = read_back_cursor(&original, (96 * scale) as u32)?;
+        if (usize::from(image.pixel_width), usize::from(image.pixel_height)) != (3 * scale, 2 * scale)
+            || (image.logical_width, image.logical_height, image.hot_spot_x, image.hot_spot_y) != (3.0, 2.0, 2.0, 1.0)
+        {
+            return Err(DeskError::platform(format!("cursor dimensions or hotspot changed at {} DPI", scale * 96)));
+        }
+        for (i, actual) in image.rgba()?.as_chunks::<4>().0.iter().enumerate() {
+            let x = i % (3 * scale);
+            let y = i / (3 * scale);
+            if *actual != pixels[y / scale * 3 + x / scale] {
+                return Err(DeskError::platform(format!("cursor pixel at ({x},{y}) changed at {} DPI: {actual:?}", scale * 96)));
+            }
+        }
+    }
+
+    let mut host = WindowsHost::start();
+    let (w, h) = host.display_size()?;
+    let runtime = tokio::runtime::Builder::new_current_thread().build().map_err(|error| DeskError::platform(error.to_string()))?;
+    let (updates, mut samples) = tokio::sync::watch::channel(None);
+    runtime.block_on(host.configure_cursor(Some(updates)))?;
+    let sample = samples.borrow_and_update().clone().ok_or_else(|| DeskError::platform("missing initial system cursor sample"))?;
+    let mut info = CURSORINFO { cbSize: size_of::<CURSORINFO>() as u32, ..Default::default() };
+    unsafe { GetCursorInfo(&mut info) }.map_err(|e| DeskError::platform(e.to_string()))?;
+    let x = f64::from(info.ptScreenPos.x) / f64::from(w);
+    let y = f64::from(info.ptScreenPos.y) / f64::from(h);
+    let inside = info.flags == CURSOR_SHOWING && (0.0..1.0).contains(&x) && (0.0..1.0).contains(&y);
+    if (sample.x, sample.y, sample.inside_display) != (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0), inside) {
+        return Err(DeskError::platform("sample position disagrees with virtual desktop"));
+    }
+    runtime.block_on(host.configure_cursor(None))?;
+    Ok(())
 }

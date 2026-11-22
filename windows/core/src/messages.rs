@@ -105,6 +105,8 @@ pub struct Hello {
     pub session_pause: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_transport_v1: Option<bool>,
+    #[serde(rename = "independentCursorV1", default, skip_serializing_if = "Option::is_none")]
+    pub independent_cursor_v1: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_termination_v1: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -378,6 +380,7 @@ mod tests {
             preferred_high_refresh_settings: None,
             session_pause: None,
             media_transport_v1: None,
+            independent_cursor_v1: None,
             session_termination_v1: None,
             initial_stream_negotiation_v1: None,
         };

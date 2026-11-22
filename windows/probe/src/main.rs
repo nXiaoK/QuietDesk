@@ -4,8 +4,9 @@
 //! H.264 stream where the Windows application would capture and encode, the viewer role reports what it
 //! receives where the application would decode and draw. Everything in between is the code that ships.
 
+use quietdesk_core::cursor::CursorImage;
 use quietdesk_core::error::{DeskError, Result};
-use quietdesk_core::host::{self, FrameSink, HostCommand, HostEvent, HostOptions, HostPlatform};
+use quietdesk_core::host::{self, FrameSink, HostCommand, HostCursorSample, HostEvent, HostOptions, HostPlatform};
 use quietdesk_core::input::{DoubleClick, InjectOp, PcKeyEvent, ViewerInputTranslator};
 use quietdesk_core::keymap::{MacModifierMapping, PcModifierMapping};
 use quietdesk_core::media::{DecodeReceipt, MediaStreamId};
@@ -22,7 +23,7 @@ use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 fn emit(event: Value) {
     let mut output = std::io::stdout().lock();
@@ -80,6 +81,8 @@ struct ReplayHost {
     replay: Arc<Mutex<Replay>>,
     clipboard: Option<String>,
     refuse_edge: Option<i64>,
+    synthetic_cursor: bool,
+    cursor_samples: Option<watch::Sender<Option<HostCursorSample>>>,
 }
 
 impl HostPlatform for ReplayHost {
@@ -109,6 +112,20 @@ impl HostPlatform for ReplayHost {
 
     async fn request_key_frame(&mut self) -> Result<()> {
         self.replay.lock().unwrap().next = 0;
+        Ok(())
+    }
+
+    fn supports_independent_cursor(&self) -> bool {
+        self.synthetic_cursor
+    }
+
+    async fn configure_cursor(&mut self, samples: Option<watch::Sender<Option<HostCursorSample>>>) -> Result<()> {
+        if let Some(sender) = &samples {
+            let pixels = [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 0, 255];
+            let image = CursorImage::from_rgba(3, 2, 1.5, 1.0, 0.5, 0.25, &pixels)?;
+            sender.send_replace(Some(HostCursorSample { image: Some(Arc::new(image)), inside_display: true, x: 0.25, y: 0.75 }));
+        }
+        self.cursor_samples = samples;
         Ok(())
     }
 
@@ -197,8 +214,14 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
         emit(json!({ "event": "accepted" }));
         let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
         let (commands, command_queue) = mpsc::unbounded_channel();
-        let mut platform =
-            ReplayHost { size: (width, height), replay: replay.clone(), clipboard: Some("probe host clipboard 剪贴板".to_string()), refuse_edge };
+        let mut platform = ReplayHost {
+            size: (width, height),
+            replay: replay.clone(),
+            clipboard: Some("probe host clipboard 剪贴板".to_string()),
+            refuse_edge,
+            synthetic_cursor: arguments.contains_key("synthetic-cursor"),
+            cursor_samples: None,
+        };
         let report = |event: HostEvent| {
             if let HostEvent::Streaming(stream) = event {
                 emit(json!({ "event": "streaming", "stream": stream_json(stream) }));
@@ -279,6 +302,15 @@ impl ViewerPlatform for ReportingViewer {
                 "event": "mediaCommitted", "sessionID": stream.session_id.to_string(),
                 "transportEpoch": stream.transport_epoch, "codecEpoch": stream.codec_epoch
             }),
+            ViewerEvent::Cursor(cursor) => {
+                let image = cursor.image.as_ref().map(|image| match image.rgba() {
+                    Ok(bytes) => json!({ "rgba": hex(&bytes), "width": image.pixel_width, "height": image.pixel_height,
+                        "logicalWidth": image.logical_width, "logicalHeight": image.logical_height, "hotSpotX": image.hot_spot_x, "hotSpotY": image.hot_spot_y }),
+                    Err(error) => json!({ "error": error.to_string() }),
+                });
+                let position = cursor.position.as_ref().map(|p| json!({ "inside": p.inside_display, "x": p.x, "y": p.y }));
+                json!({ "event": "cursor", "enabled": cursor.enabled, "image": image, "position": position })
+            }
             ViewerEvent::Control(can_control) => json!({ "event": "control", "canControl": can_control }),
             ViewerEvent::Paused { paused, error } => json!({ "event": "paused", "paused": paused, "error": error }),
             ViewerEvent::RoundTrip(milliseconds) => json!({ "event": "roundTrip", "milliseconds": milliseconds }),

@@ -113,6 +113,7 @@ pub async fn serve_host(
 /// The latest decoded picture, shared between the decode thread and the window that draws it.
 #[derive(Default)]
 pub struct Frame {
+    pub stream: Option<MediaStreamId>,
     pub width: usize,
     pub height: usize,
     /// Rows of `width * 4` bytes, top down.
@@ -191,6 +192,7 @@ fn decode<S: ViewerSink>(
     let publish = |picture: Picture<'_>, stream| {
         {
             let mut visible = frame.lock().unwrap();
+            visible.stream = stream;
             visible.update(picture);
             visible.serial += 1;
         }
@@ -209,6 +211,7 @@ fn decode<S: ViewerSink>(
                 };
                 {
                     let mut visible = frame.lock().unwrap();
+                    opening.stream = Some(stream);
                     opening.serial = visible.serial + 1;
                     *visible = opening;
                 }

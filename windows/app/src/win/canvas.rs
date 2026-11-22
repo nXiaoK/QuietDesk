@@ -4,8 +4,11 @@ use super::app::{Frame, ViewerSink, run_viewer};
 use super::clipboard;
 use super::settings::VIEWER_QUALITIES;
 use super::util::wide;
+use super::viewer_cursor::ViewerCursor;
+use quietdesk_core::cursor::CursorPresentationState;
 use quietdesk_core::input::{DoubleClick, PcKeyEvent, ViewerInputTranslator};
 use quietdesk_core::keymap::PcModifierMapping;
+use quietdesk_core::media::MediaStreamId;
 use quietdesk_core::messages::StreamSettings;
 use quietdesk_core::pairing::PairingKey;
 use quietdesk_core::viewer::{ViewerCommand, ViewerEnd, ViewerEvent};
@@ -21,7 +24,11 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{ScreenToClient, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, ReleaseCapture, SetCapture, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetDoubleClickTime, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE, VK_RETURN,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
@@ -54,7 +61,14 @@ impl Mailbox {
 
 impl ViewerSink for Mailbox {
     fn event(&self, event: ViewerEvent) {
-        self.events.lock().unwrap().push_back(event);
+        let mut events = self.events.lock().unwrap();
+        // A newer snapshot includes the previous shape and position. One pending notification suffices.
+        if matches!(event, ViewerEvent::Cursor(_)) && matches!(events.back(), Some(ViewerEvent::Cursor(_))) {
+            *events.back_mut().unwrap() = event;
+            return;
+        }
+        events.push_back(event);
+        drop(events);
         self.post(WM_SESSION_EVENT);
     }
 
@@ -74,6 +88,12 @@ struct Canvas {
     frame: Arc<Mutex<Frame>>,
     target: Option<ID2D1HwndRenderTarget>,
     bitmap: Option<(ID2D1Bitmap, usize, usize)>,
+    uploaded_serial: Option<u64>,
+    drawn_stream: Option<MediaStreamId>,
+    latest_cursor: Arc<CursorPresentationState>,
+    shown_cursor: Option<Arc<CursorPresentationState>>,
+    cursor: ViewerCursor,
+    local_pointer: bool,
     factory: ID2D1Factory,
     translator: ViewerInputTranslator,
     started: Instant,
@@ -161,6 +181,12 @@ pub fn open(
             frame: frame.clone(),
             target: None,
             bitmap: None,
+            uploaded_serial: None,
+            drawn_stream: None,
+            latest_cursor: Arc::default(),
+            shown_cursor: None,
+            cursor: ViewerCursor::default(),
+            local_pointer: false,
             factory: D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?,
             translator: ViewerInputTranslator::new(mapping, double_click),
             started: Instant::now(),
@@ -224,6 +250,51 @@ impl Canvas {
         self.connected && self.can_control && !self.paused
     }
 
+    fn independent(&self) -> bool {
+        self.shown_cursor.as_ref().is_some_and(|state| state.enabled)
+    }
+
+    fn owns_input(&self) -> bool {
+        std::ptr::eq(FOCUSED.get(), self)
+    }
+
+    fn inside_picture(position: (f64, f64)) -> bool {
+        (0.0..1.0).contains(&position.0) && (0.0..1.0).contains(&position.1)
+    }
+
+    fn pointer_in_client(&self) -> Option<(i32, i32)> {
+        unsafe {
+            let mut point = POINT::default();
+            GetCursorPos(&mut point).ok()?;
+            if WindowFromPoint(point) != self.window || !ScreenToClient(self.window, &mut point).as_bool() {
+                return None;
+            }
+            let mut rect = RECT::default();
+            GetClientRect(self.window, &mut rect).ok()?;
+            (point.x >= 0 && point.x < rect.right && point.y >= 0 && point.y < rect.bottom).then_some((point.x, point.y))
+        }
+    }
+
+    fn update_pointer(&mut self) {
+        let position = self.pointer_in_client();
+        let owns = self.controlling() && self.owns_input();
+        self.local_pointer = owns && position.and_then(|(x, y)| self.fraction(x, y)).is_some_and(Self::inside_picture);
+        if position.is_none() {
+            return;
+        }
+        let independent = self.independent();
+        unsafe {
+            let handle = if independent && self.local_pointer {
+                self.cursor.handle()
+            } else if !independent && self.controlling() && self.hook.is_some() {
+                None
+            } else {
+                LoadCursorW(None, IDC_ARROW).ok()
+            };
+            SetCursor(handle);
+        }
+    }
+
     fn flush_move(&mut self) {
         if let Some((x, y)) = self.pending_move.take() {
             self.last_move = Instant::now();
@@ -238,25 +309,35 @@ impl Canvas {
             let size = D2D_SIZE_U { width: (client.right - client.left).max(1) as u32, height: (client.bottom - client.top).max(1) as u32 };
             let format = D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE };
             if self.target.is_none() {
-                let properties = D2D1_RENDER_TARGET_PROPERTIES { pixelFormat: format, dpiX: 96.0, dpiY: 96.0, ..Default::default() };
+                let properties = D2D1_RENDER_TARGET_PROPERTIES {
+                    pixelFormat: format,
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                    usage: D2D1_RENDER_TARGET_USAGE_GDI_COMPATIBLE,
+                    ..Default::default()
+                };
                 let window = D2D1_HWND_RENDER_TARGET_PROPERTIES { hwnd: self.window, pixelSize: size, presentOptions: D2D1_PRESENT_OPTIONS_IMMEDIATELY };
                 match self.factory.CreateHwndRenderTarget(&properties, &window) {
                     Ok(target) => self.target = Some(target),
                     Err(error) => return log::error!("the picture cannot be drawn: {error}"),
                 }
                 self.bitmap = None;
+                self.uploaded_serial = None;
             }
             let Some(target) = self.target.clone() else { return };
             {
                 let frame = self.frame.lock().unwrap();
-                if frame.width > 0 && frame.bgra.len() == frame.width * frame.height * 4 {
+                if frame.width > 0 && self.uploaded_serial != Some(frame.serial) && frame.bgra.len() == frame.width * frame.height * 4 {
                     if self.bitmap.as_ref().is_none_or(|(_, width, height)| (*width, *height) != (frame.width, frame.height)) {
                         let properties = D2D1_BITMAP_PROPERTIES { pixelFormat: format, dpiX: 96.0, dpiY: 96.0 };
                         let created = target.CreateBitmap(D2D_SIZE_U { width: frame.width as u32, height: frame.height as u32 }, None, 0, &properties);
                         self.bitmap = created.ok().map(|bitmap| (bitmap, frame.width, frame.height));
                     }
-                    if let Some((bitmap, _, _)) = &self.bitmap {
-                        let _ = bitmap.CopyFromMemory(None, frame.bgra.as_ptr().cast(), (frame.width * 4) as u32);
+                    if let Some((bitmap, _, _)) = &self.bitmap
+                        && bitmap.CopyFromMemory(None, frame.bgra.as_ptr().cast(), (frame.width * 4) as u32).is_ok()
+                    {
+                        self.uploaded_serial = Some(frame.serial);
+                        self.drawn_stream = frame.stream;
                     }
                 }
             }
@@ -267,8 +348,22 @@ impl Canvas {
                 let area = D2D_RECT_F { left, top, right: left + width, bottom: top + height };
                 target.DrawBitmap(bitmap, Some(&area), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
             }
+            if self.latest_cursor.committed_stream() == self.drawn_stream {
+                self.shown_cursor = Some(self.latest_cursor.clone());
+            } else if self.shown_cursor.as_ref().is_some_and(|s| s.committed_stream() != self.drawn_stream) {
+                self.shown_cursor = None;
+            }
+            let shape = self.shown_cursor.as_ref().filter(|s| s.enabled).and_then(|s| s.image.as_ref());
+            self.cursor.update(shape, GetDpiForWindow(self.window).max(96));
+            self.update_pointer();
+            if !self.local_pointer
+                && let Some(pos) = self.shown_cursor.as_ref().filter(|s| s.enabled).and_then(|s| s.position.as_ref()).filter(|p| p.inside_display)
+                && let Some(rect) = self.picture()
+                && let Err(error) = self.cursor.draw(&target, rect, pos.x, pos.y)
+            {
+                log::debug!("could not draw the independent cursor: {error}");
+            }
             if target.EndDraw(None, None).is_err() {
-                // The device was lost; the next draw creates a new target.
                 self.target = None;
                 self.bitmap = None;
             }
@@ -345,6 +440,7 @@ impl Canvas {
                     self.toggle_full_screen();
                 } else {
                     self.release();
+                    self.draw();
                     self.set_title("已释放控制，点击画面继续");
                 }
             }
@@ -381,8 +477,16 @@ impl Canvas {
                     unsafe { self.release() };
                 }
                 self.set_title(if can_control { "被控端允许控制" } else { "仅观看（被控端已关闭控制）" });
+                unsafe { self.draw() };
             }
-            ViewerEvent::Paused { paused, .. } => self.paused = paused,
+            ViewerEvent::Paused { paused, .. } => {
+                self.paused = paused;
+                unsafe { self.draw() };
+            }
+            ViewerEvent::Cursor(state) => {
+                self.latest_cursor = state;
+                unsafe { self.draw() };
+            }
             ViewerEvent::RoundTrip(_) | ViewerEvent::MediaCommitted(_) => {}
             ViewerEvent::ClipboardText(text) => match clipboard::set_text(&text) {
                 Ok(()) => self.set_title("已接收远端剪贴板文字"),
@@ -448,16 +552,47 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 }
                 canvas.draw();
             }
-            WM_SETFOCUS => canvas.capture_keyboard(),
-            WM_KILLFOCUS => canvas.release(),
-            WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT && canvas.controlling() && canvas.hook.is_some() => {
-                // The host draws its own pointer into the picture.
-                SetCursor(None);
+            WM_SETFOCUS => {
+                canvas.capture_keyboard();
+                canvas.draw();
+            }
+            WM_KILLFOCUS => {
+                canvas.release();
+                canvas.draw();
+            }
+            WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
+                let owned = canvas.local_pointer;
+                canvas.update_pointer();
+                if owned != canvas.local_pointer && canvas.independent() {
+                    canvas.draw();
+                }
                 return LRESULT(1);
             }
-            WM_MOUSEMOVE if canvas.controlling() => {
+            WM_MOUSELEAVE => canvas.draw(),
+            WM_MOUSEMOVE => {
+                if canvas.independent() {
+                    let _ = TrackMouseEvent(&mut TRACKMOUSEEVENT {
+                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: window,
+                        dwHoverTime: 0,
+                    });
+                    let owned = canvas.local_pointer;
+                    canvas.update_pointer();
+                    if owned != canvas.local_pointer {
+                        canvas.draw();
+                    }
+                }
+                if !canvas.controlling() {
+                    return LRESULT(0);
+                }
                 let (x, y) = point(lparam);
                 if let Some(position) = canvas.fraction(x, y) {
+                    if canvas.independent()
+                        && !(canvas.owns_input() && (Canvas::inside_picture(position) || windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == window))
+                    {
+                        return LRESULT(0);
+                    }
                     canvas.pending_move = Some(position);
                     if canvas.last_move.elapsed() >= MOVE_INTERVAL {
                         canvas.flush_move();
@@ -474,6 +609,11 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 if canvas.controlling() =>
             {
                 let down = matches!(message, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN);
+                let (x, y) = point(lparam);
+                let position = canvas.fraction(x, y);
+                if canvas.independent() && ((down && !position.is_some_and(Canvas::inside_picture)) || (!down && !canvas.owns_input())) {
+                    return LRESULT(0);
+                }
                 let button = match message {
                     WM_LBUTTONDOWN | WM_LBUTTONUP => 0,
                     WM_RBUTTONDOWN | WM_RBUTTONUP => 1,
@@ -486,8 +626,7 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 } else {
                     let _ = ReleaseCapture();
                 }
-                let (x, y) = point(lparam);
-                if let Some((fraction_x, fraction_y)) = canvas.fraction(x, y) {
+                if let Some((fraction_x, fraction_y)) = position {
                     canvas.flush_move();
                     let input = canvas.translator.button(button, down, fraction_x, fraction_y, canvas.started.elapsed(), (x, y));
                     canvas.send(ViewerCommand::Input(input));
@@ -499,13 +638,18 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 let mut position = POINT { x, y };
                 let _ = ScreenToClient(window, &mut position);
                 if let Some((fraction_x, fraction_y)) = canvas.fraction(position.x, position.y) {
+                    if canvas.independent() && !(canvas.owns_input() && Canvas::inside_picture((fraction_x, fraction_y))) {
+                        return LRESULT(0);
+                    }
                     canvas.flush_move();
                     let (vertical, horizontal) = if message == WM_MOUSEWHEEL { (notches, 0.0) } else { (0.0, notches) };
                     canvas.send(ViewerCommand::Input(canvas.translator.wheel(vertical, horizontal, fraction_x, fraction_y)));
                 }
             }
             // Without the hook, keys still arrive as messages, minus the ones Windows keeps.
-            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP if canvas.hook.is_none() && canvas.controlling() => {
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
+                if canvas.hook.is_none() && canvas.controlling() && (!canvas.independent() || canvas.owns_input()) =>
+            {
                 let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
                 canvas.key(wparam.0 as u32, ((lparam.0 >> 16) & 0xFF) as u32, lparam.0 & (1 << 24) != 0, down);
             }

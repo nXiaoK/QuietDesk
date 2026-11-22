@@ -1,5 +1,6 @@
 //! The pixels of one display: desktop duplication where the system offers it, GDI otherwise.
 
+use super::host_cursor::CursorIcon;
 use super::util::failed;
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::pixel::{PointerKind, PointerShape};
@@ -30,9 +31,70 @@ struct Duplication {
 
 struct Gdi {
     screen: HDC,
-    memory: HDC,
+    surface: DibSurface,
+}
+
+/// A top-down 32-bit DIB selected into its own memory DC.
+pub(super) struct DibSurface {
+    pub(super) dc: HDC,
     bitmap: HBITMAP,
-    bits: *const u8,
+    bits: *mut c_void,
+    bytes: usize,
+}
+
+impl DibSurface {
+    pub(super) fn new(width: i32, height: i32) -> Result<Self> {
+        let pixels = i64::from(width) * i64::from(height);
+        if width <= 0 || height <= 0 || pixels > isize::MAX as i64 / 4 {
+            return Err(DeskError::platform("位图尺寸无效"));
+        }
+        let bytes = pixels as usize * 4;
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            if dc.is_invalid() {
+                return Err(DeskError::platform("无法创建内存设备上下文"));
+            }
+            let mut surface = Self { dc, bitmap: HBITMAP::default(), bits: std::ptr::null_mut(), bytes };
+            let header = BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                ..Default::default()
+            };
+            let layout = BITMAPINFO { bmiHeader: header, ..Default::default() };
+            surface.bitmap = CreateDIBSection(Some(dc), &layout, DIB_RGB_COLORS, &mut surface.bits, None, 0).map_err(failed("创建位图"))?;
+            if surface.bits.is_null() || SelectObject(dc, surface.bitmap.into()).is_invalid() {
+                return Err(DeskError::platform("无法选入位图"));
+            }
+            Ok(surface)
+        }
+    }
+
+    pub(super) fn pixels(&mut self) -> Result<&mut [u8]> {
+        unsafe {
+            GdiFlush().ok().map_err(failed("读取位图"))?;
+            Ok(std::slice::from_raw_parts_mut(self.bits.cast(), self.bytes))
+        }
+    }
+}
+
+impl Drop for DibSurface {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteDC(self.dc);
+            if !self.bitmap.is_invalid() {
+                let _ = DeleteObject(self.bitmap.into());
+            }
+        }
+    }
+}
+
+impl Drop for Gdi {
+    fn drop(&mut self) {
+        unsafe { ReleaseDC(None, self.screen) };
+    }
 }
 
 enum Source {
@@ -44,9 +106,10 @@ pub struct ScreenCapture {
     source: Source,
     /// The display's rectangle in virtual-desktop pixels.
     pub bounds: RECT,
-    /// Top-down BGRA rows of `width * 4` bytes. With GDI the pointer is already drawn in.
+    /// Top-down BGRA rows of `width * 4` bytes.
     pub frame: Vec<u8>,
     has_frame: bool,
+    independent: bool,
 }
 
 // The capture thread is the only user of these handles and COM objects.
@@ -71,9 +134,54 @@ impl ScreenCapture {
             Ok(capture) => Ok(capture),
             Err(error) => {
                 log::warn!("desktop duplication is unavailable, capturing with GDI: {error}");
-                Self::open_gdi()
+                Self::open_gdi(false)
             }
         }
+    }
+
+    pub(super) fn for_cursor_mode(independent: bool) -> Result<Self> {
+        let mut screen = Self::open()?;
+        if independent {
+            if matches!(screen.source, Source::Duplication(_)) {
+                screen.grab_source(100, false)?;
+            }
+            screen.set_cursor_mode(true)?;
+        }
+        Ok(screen)
+    }
+
+    /// A mode switch on a still desktop also needs a fresh surface. BitBlt supplies the clean
+    /// opening picture while a duplication that reports a hardware pointer keeps future capture on DXGI.
+    pub(super) fn set_cursor_mode(&mut self, independent: bool) -> Result<()> {
+        if matches!(self.source, Source::Duplication(_))
+            && self.grab_source(0, true)?
+            && matches!(&self.source, Source::Duplication(source) if !independent || source.position.is_some())
+        {
+            self.independent = independent;
+            return Ok(());
+        }
+        let keep_duplication = matches!(&self.source, Source::Duplication(source) if !independent || source.position.is_some());
+        if keep_duplication {
+            let clean = Self::open_gdi(true)?.first_picture(self.bounds)?;
+            self.frame = clean.frame;
+            self.has_frame = true;
+            self.independent = independent;
+        } else {
+            let next = if independent { Self::open_gdi(true)? } else { Self::open()? };
+            *self = next.first_picture(self.bounds)?;
+        }
+        Ok(())
+    }
+
+    fn first_picture(mut self, bounds: RECT) -> Result<Self> {
+        if self.bounds != bounds {
+            return Err(DeskError::platform("共享显示器尺寸已改变"));
+        }
+        self.grab_source(250, true)?;
+        if !self.has_frame {
+            return Err(DeskError::platform("尚未收到光标模式切换后的桌面画面"));
+        }
+        Ok(self)
     }
 
     fn open_duplication() -> Result<Self> {
@@ -127,43 +235,42 @@ impl ScreenCapture {
                     device.CreateTexture2D(&layout, None, Some(&mut staging)).map_err(failed("创建回读纹理"))?;
                     let staging = staging.ok_or_else(|| DeskError::platform("没有回读纹理"))?;
                     let source = Source::Duplication(Duplication { context, duplication, staging, shape: None, position: None });
-                    return Ok(Self { source, bounds, frame: vec![0; (width * height * 4) as usize], has_frame: false });
+                    return Ok(Self { source, bounds, frame: vec![0; (width * height * 4) as usize], has_frame: false, independent: false });
                 }
             }
         }
         Err(DeskError::platform("没有找到主显示器"))
     }
 
-    fn open_gdi() -> Result<Self> {
+    fn open_gdi(independent: bool) -> Result<Self> {
         unsafe {
             let (width, height) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-            if width <= 0 || height <= 0 {
-                return Err(DeskError::platform("无法读取主显示器尺寸"));
-            }
+            let surface = DibSurface::new(width, height)?;
+            let frame = vec![0; surface.bytes];
             let screen = GetDC(None);
-            let memory = CreateCompatibleDC(Some(screen));
-            let header = BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width,
-                biHeight: -height,
-                biPlanes: 1,
-                biBitCount: 32,
-                ..Default::default()
-            };
-            let layout = BITMAPINFO { bmiHeader: header, ..Default::default() };
-            let mut bits: *mut c_void = std::ptr::null_mut();
-            let bitmap = CreateDIBSection(Some(screen), &layout, DIB_RGB_COLORS, &mut bits, None, 0).map_err(failed("创建屏幕位图"))?;
-            SelectObject(memory, bitmap.into());
-            let source = Source::Gdi(Gdi { screen, memory, bitmap, bits: bits as *const u8 });
-            Ok(Self { source, bounds: RECT { left: 0, top: 0, right: width, bottom: height }, frame: vec![0; (width * height * 4) as usize], has_frame: false })
+            if screen.is_invalid() {
+                return Err(DeskError::platform("无法获取桌面设备上下文"));
+            }
+            let source = Source::Gdi(Gdi { screen, surface });
+            Ok(Self { source, bounds: RECT { left: 0, top: 0, right: width, bottom: height }, frame, has_frame: false, independent })
         }
     }
 
     /// Waits up to `wait_milliseconds` for the screen or pointer to change. `Ok(true)` means `frame` or the
     /// pointer differs from the last call; an error means the capture has to be opened again.
     pub fn grab(&mut self, wait_milliseconds: u32) -> Result<bool> {
+        let changed = self.grab_source(wait_milliseconds, false)?;
+        // An adapter can switch from hardware overlay to a pointer baked into its desktop surface.
+        if self.independent && matches!(&self.source, Source::Duplication(source) if source.position.is_none()) {
+            *self = Self::open_gdi(true)?.first_picture(self.bounds)?;
+            return Ok(true);
+        }
+        Ok(changed)
+    }
+
+    fn grab_source(&mut self, wait_milliseconds: u32, refresh_surface: bool) -> Result<bool> {
         let (width, height) = (self.width(), self.height());
-        let first = !self.has_frame;
+        let first = !self.has_frame || refresh_surface;
         match &mut self.source {
             Source::Duplication(source) => unsafe {
                 let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -176,7 +283,7 @@ impl ScreenCapture {
                 let mut changed = false;
                 if info.LastMouseUpdateTime != 0 {
                     source.position = info.PointerPosition.Visible.as_bool().then_some(info.PointerPosition.Position);
-                    changed = true;
+                    changed = !self.independent;
                 }
                 if info.PointerShapeBufferSize > 0 {
                     let mut data = vec![0u8; info.PointerShapeBufferSize as usize];
@@ -216,33 +323,16 @@ impl ScreenCapture {
                         Ok(true)
                     }
                     Some(Err(error)) => Err(failed("读取桌面画面")(error)),
-                    None => Ok(changed),
+                    None => Ok(changed && !refresh_surface),
                 }
             },
             Source::Gdi(source) => unsafe {
                 std::thread::sleep(std::time::Duration::from_millis(u64::from(wait_milliseconds.min(15))));
-                BitBlt(source.memory, 0, 0, width as i32, height as i32, Some(source.screen), 0, 0, SRCCOPY | CAPTUREBLT).map_err(failed("复制屏幕"))?;
-                let mut cursor = CURSORINFO { cbSize: size_of::<CURSORINFO>() as u32, ..Default::default() };
-                if GetCursorInfo(&mut cursor).is_ok() && cursor.flags == CURSOR_SHOWING {
-                    let mut icon = ICONINFO::default();
-                    if GetIconInfo(cursor.hCursor.into(), &mut icon).is_ok() {
-                        let _ = DrawIconEx(
-                            source.memory,
-                            cursor.ptScreenPos.x - icon.xHotspot as i32,
-                            cursor.ptScreenPos.y - icon.yHotspot as i32,
-                            cursor.hCursor.into(),
-                            0,
-                            0,
-                            0,
-                            None,
-                            DI_NORMAL,
-                        );
-                        let _ = DeleteObject(icon.hbmMask.into());
-                        let _ = DeleteObject(icon.hbmColor.into());
-                    }
+                BitBlt(source.surface.dc, 0, 0, width as i32, height as i32, Some(source.screen), 0, 0, SRCCOPY | CAPTUREBLT).map_err(failed("复制屏幕"))?;
+                if !self.independent {
+                    CursorIcon::draw_embedded(source.surface.dc);
                 }
-                let _ = GdiFlush();
-                let captured = std::slice::from_raw_parts(source.bits, width * height * 4);
+                let captured = source.surface.pixels()?;
                 if !first && captured == &self.frame[..] {
                     return Ok(false);
                 }
@@ -255,21 +345,12 @@ impl ScreenCapture {
 
     /// The pointer to draw over `frame`, when the capture delivers it separately.
     pub fn pointer(&self) -> Option<Pointer> {
+        if self.independent {
+            return None;
+        }
         let Source::Duplication(source) = &self.source else { return None };
         // Desktop duplication reports where the shape's top-left corner is, not where its hot spot is.
         let position = source.position?;
         Some(Pointer { shape: source.shape.clone()?, x: position.x, y: position.y })
-    }
-}
-
-impl Drop for ScreenCapture {
-    fn drop(&mut self) {
-        if let Source::Gdi(source) = &self.source {
-            unsafe {
-                let _ = DeleteDC(source.memory);
-                let _ = DeleteObject(source.bitmap.into());
-                ReleaseDC(None, source.screen);
-            }
-        }
     }
 }

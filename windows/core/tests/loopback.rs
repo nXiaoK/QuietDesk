@@ -284,6 +284,17 @@ fn host_options() -> HostOptions {
 }
 
 #[tokio::test]
+async fn losing_the_capture_producer_ends_the_connected_session() {
+    let sessions = run_sessions(StreamSettings::new(1920, 30, 8), None, |fixture| async move {
+        until("the viewer commits a stream", || !fixture.viewer_log.lock().unwrap().commits.is_empty()).await;
+        *fixture.sink.lock().unwrap() = None;
+    });
+    let (reason, viewer, _) = tokio::time::timeout(Duration::from_secs(2), sessions).await.expect("capture loss must wake the host");
+    assert_eq!(reason.to_string(), "屏幕采集已停止");
+    assert!(viewer.retryable && !viewer.host_ended);
+}
+
+#[tokio::test]
 async fn a_session_negotiates_streams_controls_and_ends_as_the_macos_roles_do() {
     let quality = StreamSettings::new(1920, 60, 20);
     let (host_end, viewer_end, fixture) = run_sessions(quality, None, |fixture| async move {

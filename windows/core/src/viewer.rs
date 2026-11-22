@@ -1,6 +1,7 @@
 //! The viewer side of a session: the role of `DeskModel.handleViewer` in the macOS application, for a
 //! viewer that receives video over the control connection and uses only what the host advertised.
 
+use crate::cursor::{CursorControl, CursorOperation, CursorPosition, CursorPresentationState, CursorShape};
 use crate::error::{DeskError, Result};
 use crate::media::{DecodeReceipt, MediaControl, MediaStreamId, ViewerMedia, ViewerMediaEvent};
 use crate::messages::{
@@ -10,6 +11,7 @@ use crate::messages::{
 use crate::peer::{PeerEvent, PeerHandle};
 use crate::video::VideoPacket;
 use crate::wire::{self, Message, MessageKind};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -50,6 +52,7 @@ pub enum ViewerEvent {
     },
     /// The viewer committed this stream after decoding its first keyframe and receiving the host's commit.
     MediaCommitted(MediaStreamId),
+    Cursor(Arc<CursorPresentationState>),
     Control(bool),
     Paused {
         paused: bool,
@@ -86,6 +89,9 @@ struct ViewerSession<'a, P: ViewerPlatform> {
     platform: &'a mut P,
     hello: Option<Hello>,
     media: Option<ViewerMedia>,
+    cursor: CursorPresentationState,
+    cursor_requested: bool,
+    pending_cursor: Option<(Uuid, Instant)>,
     stream: Option<VideoStreamState>,
     desired: StreamSettings,
     /// The request in flight: its identifier, when it was sent and what it asked for.
@@ -110,6 +116,9 @@ pub async fn run<P: ViewerPlatform>(
         platform,
         hello: None,
         media: None,
+        cursor: CursorPresentationState::default(),
+        cursor_requested: false,
+        pending_cursor: None,
         stream: None,
         desired: quality,
         pending_settings: None,
@@ -121,6 +130,7 @@ pub async fn run<P: ViewerPlatform>(
     let end = loop {
         let settings_by = session.pending_settings.map(|(_, sent, _)| sent + SETTINGS_REPLY_TIMEOUT);
         let media_by = session.media.as_ref().and_then(ViewerMedia::deadline);
+        let cursor_by = session.pending_cursor.map(|(_, deadline)| deadline);
         let outcome = tokio::select! {
             event = incoming.recv() => match event {
                 Some(PeerEvent::Message(message)) => session.receive(message),
@@ -144,6 +154,9 @@ pub async fn run<P: ViewerPlatform>(
             }
             _ = tokio::time::sleep_until(media_by.unwrap_or(hello_by)), if media_by.is_some() => {
                 session.update_media(|media| media.tick(Instant::now()))
+            }
+            _ = tokio::time::sleep_until(cursor_by.unwrap_or(hello_by)), if cursor_by.is_some() => {
+                Err(DeskError::Network("光标模式切换超时，重新建立会话".into()))
             }
         };
         if let Err(error) = outcome {
@@ -172,6 +185,11 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             }
             MessageKind::MediaControl => self.update_media(|media| media.control(&MediaControl::read(&message)?, Instant::now()))?,
             MessageKind::MediaFrame => self.update_media(|media| media.frame(&message.payload, Instant::now()))?,
+            MessageKind::CursorControl | MessageKind::CursorPosition | MessageKind::CursorShape
+                if hello.independent_cursor_v1 == Some(true) && self.media.is_some() =>
+            {
+                self.receive_cursor(message)?
+            }
             MessageKind::StreamSettingsResult if hello.live_settings == Some(true) => {
                 let result: StreamSettingsResult = message.read_json()?;
                 // A reply to a request this viewer no longer waits for changes nothing.
@@ -189,6 +207,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 }
                 self.platform.event(ViewerEvent::Stream { stream: result.state, error: result.error });
                 self.request_settings()?;
+                self.request_cursor()?;
             }
             MessageKind::ControlStatus if hello.control_status_updates == Some(true) => {
                 let status: ControlStatus = message.read_json()?;
@@ -260,8 +279,57 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             match event {
                 ViewerMediaEvent::Send(message) => self.peer.send(&message)?,
                 ViewerMediaEvent::Video(packet, stream, first_in_stream) => self.platform.media_video(packet, stream, first_in_stream)?,
-                ViewerMediaEvent::Committed(stream) => self.platform.media_committed(stream)?,
+                ViewerMediaEvent::Committed(stream) => {
+                    if self.cursor.commit(stream) {
+                        self.platform.event(ViewerEvent::Cursor(Arc::new(self.cursor.clone())));
+                    }
+                    self.platform.media_committed(stream)?;
+                }
             }
+        }
+        // The host must receive committed before a request that interrupts capture to change cursor mode.
+        self.request_cursor()
+    }
+
+    fn request_cursor(&mut self) -> Result<()> {
+        if self.cursor_requested
+            || self.hello.as_ref().is_none_or(|hello| hello.independent_cursor_v1 != Some(true))
+            || self.media.as_ref().and_then(ViewerMedia::active).is_none()
+            || self.pending_settings.is_some()
+        {
+            return Ok(());
+        }
+        let id = Uuid::new_v4();
+        self.peer.send(&CursorControl::request(id, true).message()?)?;
+        self.cursor_requested = true;
+        self.pending_cursor = Some((id, Instant::now() + Duration::from_secs(25)));
+        Ok(())
+    }
+
+    fn receive_cursor(&mut self, message: Message) -> Result<()> {
+        let changed = match message.kind {
+            MessageKind::CursorShape => self.cursor.update_shape(&CursorShape::decode(&message.payload)?),
+            MessageKind::CursorPosition => self.cursor.update_position(&CursorPosition::decode(&message.payload)?),
+            _ => {
+                let control = CursorControl::read(&message)?;
+                match control.operation {
+                    CursorOperation::Status => {
+                        if self.pending_cursor.map(|(id, _)| id) != control.request_id {
+                            return Ok(());
+                        }
+                        self.pending_cursor = None;
+                        self.cursor.status(&control)
+                    }
+                    CursorOperation::Binding => self.cursor.bind(&control),
+                    CursorOperation::Request => return Err(DeskError::invalid("光标控制方向无效")),
+                }
+            }
+        };
+        if changed {
+            if let Some(stream) = self.media.as_ref().and_then(ViewerMedia::active) {
+                self.cursor.commit(stream);
+            }
+            self.platform.event(ViewerEvent::Cursor(Arc::new(self.cursor.clone())));
         }
         Ok(())
     }

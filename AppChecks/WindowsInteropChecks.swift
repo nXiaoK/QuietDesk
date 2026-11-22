@@ -186,6 +186,11 @@ private final class MacViewer: @unchecked Sendable {
         var commitPaths: [String] = []
         var mediaFrames: [MediaFrame] = []
         var heldDecodes: [(frameID: UInt64, complete: () -> Void)] = []
+        var cursor = CursorPresentationState()
+        var cursorRequest: UUID?
+        var cursorStatus: CursorControl?
+        var cursorBinding: MediaStreamID?
+        var readyWithCursor: [MediaStreamID] = []
         var tuning: VideoTuningSession?
         var decoded: [(sequence: UInt32, key: Bool, width: Int, height: Int)] = []
         var received: [UInt32] = []
@@ -233,6 +238,14 @@ private final class MacViewer: @unchecked Sendable {
             } else if message.kind == .mediaControl {
                 let control = try MediaControl.read(message.payload)
                 if control.operation == .commit, let path = control.path { state.update { $0.commitPaths.append(path) } }
+                if control.operation == .ready {
+                    state.update { state in
+                        if let binding = state.cursorBinding, control.sessionID == binding.sessionID,
+                           control.transportEpoch == binding.transportEpoch, control.codecEpoch == binding.codecEpoch {
+                            state.readyWithCursor.append(binding)
+                        }
+                    }
+                }
             }
             if media.receive(message) { return }
         }
@@ -249,7 +262,12 @@ private final class MacViewer: @unchecked Sendable {
                 media.onVideo = { [weak self] frame, complete in
                     self?.decode(frame.packet, frameID: frame.header.frameID, completion: complete)
                 }
-                media.onCommitStream = { [state] stream, _ in state.update { $0.commits.append(stream) } }
+                media.onCommitStream = { [state] stream, _ in
+                    state.update { state in
+                        state.commits.append(stream)
+                        state.cursor.commit(stream)
+                    }
+                }
                 state.update { $0.media = media }
                 media.start()
             }
@@ -264,6 +282,23 @@ private final class MacViewer: @unchecked Sendable {
             decode(packet, frameID: nil) { [weak self] success in
                 if success { self?.acknowledge(packet.sequence) }
             }
+        case .cursorControl where state.get().hello?.independentCursorV1 == true:
+            let control = try CursorControl.read(message.payload)
+            try state.update { state in
+                switch control.operation {
+                case .status:
+                    if control.requestID == state.cursorRequest, state.cursor.status(control) { state.cursorStatus = control }
+                case .binding:
+                    if state.cursor.bind(control) { state.cursorBinding = control.stream?.stream }
+                case .request: throw Failure("The host sent a cursor request")
+                }
+            }
+        case .cursorShape where state.get().hello?.independentCursorV1 == true:
+            let shape = try CursorShape.decode(message.payload)
+            state.update { _ = $0.cursor.update(shape) }
+        case .cursorPosition where state.get().hello?.independentCursorV1 == true:
+            let position = try CursorPosition.decode(message.payload)
+            state.update { _ = $0.cursor.update(position) }
         case .streamSettingsResult:
             let result = try Wire.readJSON(StreamSettingsResult.self, message.payload)
             let next = try state.update { state -> StreamSettingsRequest? in
@@ -329,6 +364,22 @@ private final class MacViewer: @unchecked Sendable {
         peer.send(Message(.acknowledgement, data))
     }
 
+    func requestCursor(enabled: Bool) throws -> UUID {
+        let id = UUID()
+        state.update { $0.cursorRequest = id }
+        peer.send(try CursorControl(.request, requestID: id, enabled: enabled).message())
+        return id
+    }
+
+    func releaseHeldDecodes() {
+        let held = state.update { state -> [() -> Void] in
+            state.holdAcknowledgements = false
+            defer { state.heldDecodes.removeAll() }
+            return state.heldDecodes.map(\.complete)
+        }
+        held.forEach { $0() }
+    }
+
     func choose(_ settings: StreamSettings) throws {
         let request = try state.update { state -> StreamSettingsRequest? in
             guard var tuning = state.tuning else { return nil }
@@ -343,6 +394,35 @@ private final class MacViewer: @unchecked Sendable {
     func send(_ input: RemoteInput) throws {
         try input.validate()
         peer.send(try Wire.json(.input, input))
+    }
+}
+
+private enum SyntheticCursor {
+    static let rgba: [UInt8] = [
+        255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 0, 0,
+        0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 0, 255
+    ]
+    static func image() throws -> CursorImage {
+        guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 3, pixelsHigh: 2, bitsPerSample: 8,
+            samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+            bitmapFormat: .alphaNonpremultiplied, bytesPerRow: 12, bitsPerPixel: 32), let data = bitmap.bitmapData else {
+            throw Failure("The synthetic cursor bitmap could not be allocated")
+        }
+        rgba.withUnsafeBufferPointer { data.update(from: $0.baseAddress!, count: $0.count) }
+        guard let png = bitmap.representation(using: .png, properties: [:]) else { throw Failure("Encoding the cursor PNG failed") }
+        return try CursorImage(png: png, pixelWidth: 3, pixelHeight: 2, logicalWidth: 1.5, logicalHeight: 1, hotSpotX: 0.5, hotSpotY: 0.25)
+    }
+
+    static func verify(_ image: CursorImage?) throws {
+        guard let image, let bitmap = NSBitmapImageRep(data: image.png) else { throw Failure("The Windows cursor PNG could not be decoded") }
+        try require(bitmap.pixelsWide == 3 && bitmap.pixelsHigh == 2 && bitmap.samplesPerPixel == 4
+                    && image.logicalWidth == 1.5 && image.logicalHeight == 1 && image.hotSpotX == 0.5 && image.hotSpotY == 0.25,
+                    "The Windows cursor lost its size, alpha or scaled hotspot")
+        var pixel = [Int](repeating: 0, count: 4)
+        for index in 0..<6 {
+            bitmap.getPixel(&pixel, atX: index % 3, y: index / 3)
+            try require(pixel == rgba[index * 4 ..< index * 4 + 4].map(Int.init), "Cursor pixel \(index) arrived with different channels")
+        }
     }
 }
 
@@ -374,6 +454,8 @@ private final class MacHost: @unchecked Sendable {
         var streaming = false
         var prepared = false
         var commits: [MediaControl] = []
+        var cursorRequest: CursorControl?
+        var heldCursorPreparation: (stream: MediaStreamID, complete: (Bool) -> Void)?
         var decodedFeedback = Set<MediaFrameHeader>()
         var recoverySequences: [UInt32] = []
         var requests: [StreamSettingsRequest] = []
@@ -390,6 +472,8 @@ private final class MacHost: @unchecked Sendable {
     let state: Shared<State>
     let port: UInt16
     private let advertiseMedia: Bool
+    private let cursorImage: CursorImage?
+    private let cursorID = UUID()
     private let listener: NWListener
     private let packets: [VideoPacket]
     private let key: PairingKey
@@ -397,8 +481,9 @@ private final class MacHost: @unchecked Sendable {
     private let injector: InputInjector
     private var pump: DispatchSourceTimer?
 
-    init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int), advertiseMedia: Bool) throws {
+    init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int), advertiseMedia: Bool, cursorImage: CursorImage?) throws {
         self.advertiseMedia = advertiseMedia
+        self.cursorImage = cursorImage
         self.key = key
         self.packets = packets
         self.size = size
@@ -443,9 +528,20 @@ private final class MacHost: @unchecked Sendable {
                 try require(role == nil || role == .control, "The viewer opened an auxiliary channel nobody offered")
                 let applied = self.state.get().applied
                 let media = try MediaSession.host(control: peer, key: self.key, port: self.port, settings: applied.settings, relayRouting: true)
-                media.onPrepareStream = { [state = self.state] _, completion in
-                    state.update { $0.prepared = true; $0.waiting.removeAll() }
-                    completion(true)
+                media.onPrepareStream = { [state = self.state, cursorID = self.cursorID, weak peer] stream, completion in
+                    let request = state.update { state in
+                        state.prepared = true; state.waiting.removeAll()
+                        return state.cursorRequest
+                    }
+                    guard let request else { completion(true); return }
+                    guard let peer else { completion(false); return }
+                    do {
+                        peer.send(try CursorControl(.binding, cursorID: cursorID, epoch: 1, enabled: request.enabled, stream: stream).message())
+                        state.update { $0.heldCursorPreparation = (stream, completion) }
+                    } catch {
+                        state.update { $0.failures.append("binding: \(error)") }
+                        completion(false)
+                    }
                 }
                 media.onProduceRecoveryFrame = { [weak self] in self?.produceFrame(recovery: true) }
                 media.onResumeFrames = { [state = self.state] in state.update { $0.prepared = false } }
@@ -457,14 +553,15 @@ private final class MacHost: @unchecked Sendable {
                 peer.send(try Wire.json(.hello, Hello(name: "检查用 Mac", width: applied.width, height: applied.height, settings: applied.settings,
                     canControl: true, preferredSettings: preferred.extendedCompatible, deviceID: UUID(), deviceIdentityExchange: true,
                     highRefreshVideoSettings: true, preferredHighRefreshSettings: preferred.highRefreshCompatible,
-                    sessionEffects: true, sessionPause: true, mediaTransportV1: self.advertiseMedia ? true : nil, independentCursorV1: true,
+                    sessionEffects: true, sessionPause: true, mediaTransportV1: self.advertiseMedia ? true : nil,
+                    independentCursorV1: self.cursorImage == nil ? nil : true,
                     relayTransportV1: true, relayDeviceID: nil, sessionLockV1: true, adaptiveVideoV1: true, sessionUnlockV1: true,
                     screenLocked: false, higherFrameRateVideoV1: true, preferredHigherFrameRateSettings: preferred,
                     displayDimmingV1: true, builtInDisplayDimmable: false, sessionTerminationV1: true, desktopActionsV1: true,
                     hevcVideoV1: true, initialStreamNegotiationV1: true, hevc444VideoV1: true, displaySwitchingV1: true,
                     displays: [RemoteDisplayInfo(id: 1, name: "内建显示器", width: self.size.width, height: self.size.height, isMain: true)],
                     selectedDisplayID: 1, remoteAudioV1: true, relativeMouseV1: true, trackpadGesturesV1: true,
-                    initialCursorNegotiationV1: true, qualityProbeV1: true, typeTextV1: true)))
+                    initialCursorNegotiationV1: self.cursorImage == nil ? nil : true, qualityProbeV1: true, typeTextV1: true)))
                 // The application waits this long for the viewer's first settings before it starts capture.
                 DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in self?.state.update { $0.streaming = true } }
             } catch {
@@ -515,6 +612,24 @@ private final class MacHost: @unchecked Sendable {
             if state.get().media?.receive(message) == true { return }
         }
         switch message.kind {
+        case .cursorControl:
+            let request = try CursorControl.read(message.payload)
+            let current = state.get()
+            guard let cursorImage, let media = current.media, current.commits.count == 1, current.cursorRequest == nil,
+                  request.operation == .request, request.enabled else { throw Failure("Unexpected cursor request or request before the first commit") }
+            media.suspendForConfiguration { [state, cursorID] in
+                do {
+                    state.update { $0.cursorRequest = request; $0.prepared = true }
+                    peer.send(try CursorControl(.status, requestID: request.requestID, cursorID: cursorID, epoch: 1, enabled: true).message())
+                    peer.send(Message(.cursorShape, try CursorShape(cursorID: cursorID, epoch: 1, revision: 1, image: cursorImage).encode()))
+                    let position = try CursorPosition(cursorID: cursorID, epoch: 1, sequence: 1, insideDisplay: true, x: 0.25, y: 0.75)
+                    peer.send(Message(.cursorPosition, position.encode()))
+                    media.resumeAfterConfiguration()
+                } catch {
+                    state.update { $0.failures.append("cursor: \(error)") }
+                    peer.close("\(error)")
+                }
+            }
         case .acknowledgement:
             try require(message.payload.count == 4, "A frame acknowledgement had the wrong size")
             var reader = ByteReader(message.payload)
@@ -733,12 +848,7 @@ private struct WindowsInteropChecks {
                 let state = viewer.state.get()
                 try require(state.mediaFrames.last!.header.frameID == state.heldDecodes.first!.frameID + 2,
                             "A Windows host sent more than three frames without decode feedback")
-                let held = viewer.state.update { state -> [() -> Void] in
-                    state.holdAcknowledgements = false
-                    defer { state.heldDecodes.removeAll() }
-                    return state.heldDecodes.map(\.complete)
-                }
-                held.forEach { $0() }
+                viewer.releaseHeldDecodes()
                 try until("decode feedback reopens the window") { viewer.state.get().mediaFrames.count > state.mediaFrames.count + 6 }
 
                 try viewer.choose(StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 20))
@@ -747,6 +857,48 @@ private struct WindowsInteropChecks {
                 try until("the host is paused") { viewer.state.get().pauses.last?.paused == true }
                 viewer.peer.send(try Wire.json(.sessionPauseRequest, SessionPauseRequest(paused: false)))
                 try verifyStream(3)
+            }
+        }
+
+        run("A Mac viewer switches its synthetic Windows cursor exactly when the bound screen becomes visible") {
+            try withWindowsHost(["--synthetic-cursor"]) { _, viewer in
+                try until("the first shared stream and initial quality are confirmed") {
+                    let state = viewer.state.get()
+                    return state.commits.count == 1 && !state.results.isEmpty && state.mediaFrames.last?.header.frameID ?? 0 > 1
+                }
+                let hello = viewer.state.get().hello
+                try require(hello?.independentCursorV1 == true && hello?.initialCursorNegotiationV1 != true,
+                            "The Windows host advertised a different cursor negotiation")
+                viewer.state.update { $0.holdAcknowledgements = true }
+                let request = try viewer.requestCursor(enabled: true)
+                try until("the cursor-bound keyframe and the synthetic cursor have arrived") {
+                    let s = viewer.state.get()
+                    return s.cursor.position != nil && s.cursor.image != nil && s.cursorBinding != nil && s.heldDecodes.contains { $0.frameID == 1 }
+                }
+                let pending = viewer.state.get()
+                guard let binding = pending.cursorBinding, let status = pending.cursorStatus, let position = pending.cursor.position else {
+                    throw Failure("Missing cursor status, binding or position")
+                }
+                try require(status.requestID == request && status.enabled && status.reason == nil && pending.commits.count == 1
+                            && pending.readyWithCursor == [binding] && !pending.cursor.enabled, "The cursor switched before the bound picture committed")
+                try SyntheticCursor.verify(pending.cursor.image)
+                try require(position.insideDisplay && position.x == 0.25 && position.y == 0.75, "Windows sent another cursor location")
+                viewer.releaseHeldDecodes()
+                try until("both ends have committed the bound stream") {
+                    let state = viewer.state.get()
+                    return state.cursor.enabled && state.commits.last == binding && state.mediaFrames.last?.header.stream == binding
+                        && state.mediaFrames.last?.header.frameID ?? 0 > 1
+                }
+
+                let disable = try viewer.requestCursor(enabled: false)
+                try until("the following stream restores the video cursor") {
+                    let state = viewer.state.get()
+                    return state.cursorStatus?.requestID == disable && state.commits.count == 3 && !state.cursor.enabled
+                }
+                let final = viewer.state.get()
+                try require(final.cursorStatus?.cursorID == status.cursorID && final.cursorStatus?.enabled == false
+                            && final.cursor.epoch > pending.cursor.epoch && final.readyWithCursor == Array(final.commits.dropFirst()),
+                            "Disabling the cursor did not bind the new mode to its own stream")
             }
         }
 
@@ -870,8 +1022,8 @@ private struct WindowsInteropChecks {
             }
         }
 
-        func withMacHost(advertiseMedia: Bool = true, viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
-            let host = try MacHost(key: key, packets: packets, size: size, advertiseMedia: advertiseMedia)
+        func withMacHost(advertiseMedia: Bool = true, cursorImage: CursorImage? = nil, viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
+            let host = try MacHost(key: key, packets: packets, size: size, advertiseMedia: advertiseMedia, cursorImage: cursorImage)
             defer { host.stop() }
             let probe = try Probe(probePath, ["viewer", "--code", (viewerKey ?? key).code, "--port", "\(host.port)", "--quality", quality] + extra)
             defer { probe.stop() }
@@ -968,6 +1120,36 @@ private struct WindowsInteropChecks {
                 try require(try probe.next("paused")["paused"] as? Bool == true, "The Windows viewer did not observe the pause")
                 try probe.send(["command": "pause", "paused": false])
                 try verifyStream(3)
+            }
+        }
+
+        run("A Windows viewer presents the Mac cursor image, hotspot and position only with its bound stream") {
+            try withMacHost(cursorImage: SyntheticCursor.image()) { host, probe in
+                _ = try probe.next("mediaCommitted")
+                try until("the Mac has sent the cursor binding and is holding its ready") { host.state.get().heldCursorPreparation != nil }
+                let initial = host.state.get().requests.first
+                try require(initial != nil && initial?.cursorRequestID == nil && initial?.independentCursor == nil,
+                            "The Windows viewer combined its cursor request with initial video tuning")
+                // This text reply on the ordered control connection establishes that the probe processed the binding.
+                try probe.send(["command": "requestClipboard"])
+                _ = try probe.next("clipboardText")
+                try require(!probe.all("cursor").contains { $0["enabled"] as? Bool == true }, "The Windows viewer enabled a cursor over the old picture")
+                guard let pending = host.state.update({ state in
+                    defer { state.heldCursorPreparation = nil }
+                    return state.heldCursorPreparation
+                }) else { throw Failure("The prepared cursor binding vanished") }
+                pending.complete(true)
+                let commit = try probe.next("mediaCommitted")
+                try require(commit["sessionID"] as? String == pending.stream.sessionID.uuidString.lowercased()
+                            && commit["transportEpoch"] as? UInt32 == pending.stream.transportEpoch
+                            && commit["codecEpoch"] as? UInt32 == pending.stream.codecEpoch, "The viewer committed the wrong cursor stream")
+                let active = try probe.next("cursor") { $0["enabled"] as? Bool == true && $0["position"] is [String: Any] && $0["image"] is [String: Any] }
+                let image = active["image"] as! [String: Any], position = active["position"] as! [String: Any]
+                try require(image["rgba"] as? String == hex(Data(SyntheticCursor.rgba)) && image["width"] as? Int == 3 && image["height"] as? Int == 2
+                            && image["logicalWidth"] as? Double == 1.5 && image["logicalHeight"] as? Double == 1
+                            && image["hotSpotX"] as? Double == 0.5 && image["hotSpotY"] as? Double == 0.25
+                            && position["inside"] as? Bool == true && position["x"] as? Double == 0.25 && position["y"] as? Double == 0.75,
+                            "The Windows presentation lost the Mac's RGBA pixels, hotspot or position")
             }
         }
 

@@ -14,8 +14,10 @@ use std::time::Duration;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MediaStreamId {
+    #[serde(rename = "sessionID")]
     pub session_id: Uuid,
     pub transport_epoch: u32,
     pub codec_epoch: u32,

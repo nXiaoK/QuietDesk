@@ -14,6 +14,7 @@ protocol ClipboardPasteboard: AnyObject {
     var isRelayedFromOtherDevice: Bool { get }
     var isSensitive: Bool { get }
     func inspectCurrentKind() -> ClipboardManifestKind?
+    func discardFilePromise(marker: String)
     func write(_ payload: ClipboardPayload, marker: String) -> Bool
     func writeLazy(
         _ kind: ClipboardManifestKind,
@@ -24,6 +25,7 @@ protocol ClipboardPasteboard: AnyObject {
 }
 
 extension ClipboardPasteboard {
+    func discardFilePromise(marker: String) {}
     var isRelayedFromOtherDevice: Bool { false }
     var tiffData: Data? { nil }
     var isSensitive: Bool { false }
@@ -136,6 +138,12 @@ final class SystemClipboardPasteboard: ClipboardPasteboard {
         return nil
     }
 
+    func discardFilePromise(marker: String) {
+        guard contentMarker == marker, activeLazyProvider != nil else { return }
+        activeLazyProvider = nil
+        _ = pasteboard.prepareForNewContents(with: .currentHostOnly)
+    }
+
     func write(_ payload: ClipboardPayload, marker: String) -> Bool {
         var items: [NSPasteboardItem] = []
         switch payload {
@@ -174,10 +182,14 @@ final class SystemClipboardPasteboard: ClipboardPasteboard {
         fetch: @escaping @MainActor () -> ClipboardPayload?,
         asyncFetch: @escaping @MainActor (@escaping (ClipboardPayload?) -> Void) -> Void
     ) -> Bool {
-        guard kind == .text || kind == .png else { return false }
         let item = NSPasteboardItem()
         guard item.setString(marker, forType: Self.marker) else { return false }
-        let promisedType: NSPasteboard.PasteboardType = (kind == .png) ? .png : .string
+        let promisedType: NSPasteboard.PasteboardType
+        switch kind {
+        case .text: promisedType = .string
+        case .png: promisedType = .png
+        case .files: promisedType = .fileURL
+        }
         let provider = LazyClipboardItemProvider(fetch: fetch)
         provider.onFinished = { [weak self, weak provider] in
             MainActor.assumeIsolated {
@@ -297,6 +309,7 @@ final class ClipboardSync {
     var allowsFileSending: Bool
     private let allowsDecoupledFileTransfer: Bool
     private let allowsOnDemandClipboard: Bool
+    private let allowsPhysicalFilePaste: Bool
     private let deferFileOfferUntilPaste: Bool
     private let sourceGate = OnDemandSourceGate()
     private var localOnDemandCopy: LocalOnDemandCopy?
@@ -333,7 +346,7 @@ final class ClipboardSync {
 
     init(session: UUID, allowsFileSending: Bool, allowsAutomaticSending: Bool = true, allowsChunkWindow: Bool = false,
          allowsDecoupledFileTransfer: Bool = false, allowsOnDemandClipboard: Bool = false,
-         deferFileOfferUntilPaste: Bool = false,
+         deferFileOfferUntilPaste: Bool = false, allowsPhysicalFilePaste: Bool = false,
          controllingRemote: Bool = false, handledChange: Int? = nil, syncInitialLocalClipboard: Bool = false,
          pasteboard: ClipboardPasteboard? = nil, storage: URL? = nil,
          convertTIFF: @escaping (Data) -> Data? = { data in
@@ -345,7 +358,8 @@ final class ClipboardSync {
         self.allowsFileSending = allowsFileSending
         self.allowsDecoupledFileTransfer = allowsDecoupledFileTransfer
         self.allowsOnDemandClipboard = allowsOnDemandClipboard
-        self.deferFileOfferUntilPaste = deferFileOfferUntilPaste && allowsOnDemandClipboard
+        self.allowsPhysicalFilePaste = allowsPhysicalFilePaste && allowsOnDemandClipboard && allowsFileSending
+        self.deferFileOfferUntilPaste = allowsOnDemandClipboard && (deferFileOfferUntilPaste || self.allowsPhysicalFilePaste)
         self.allowsAutomaticSending = allowsAutomaticSending
         self.controllingRemote = controllingRemote
         self.convertTIFF = convertTIFF
@@ -370,7 +384,7 @@ final class ClipboardSync {
         let transfer = ClipboardTransfer(storage: storage ?? Self.storageURL, requireFileApproval: true,
                                          allowsChunkWindow: allowsChunkWindow,
                                          allowsDecoupledFileTransfer: allowsDecoupledFileTransfer,
-                                         allowsOnDemandClipboard: allowsOnDemandClipboard)
+                                         allowsOnDemandClipboard: allowsOnDemandClipboard, allowsPhysicalFilePaste: self.allowsPhysicalFilePaste)
         self.transfer = transfer
         receiveMessage = { [weak transfer] message in transfer?.receive(message) }
         transfer.onSend = send
@@ -386,6 +400,9 @@ final class ClipboardSync {
             gate.clear(matching: revision)
             DispatchQueue.main.async {
                 guard let self, self.running else { return }
+                if let manifest = self.trackedRemoteManifest, manifest.kind == .files, manifest.revision == revision {
+                    self.discardRemoteFilePromise(manifest)
+                }
                 if self.localOnDemandCopy?.revision == revision {
                     self.localOnDemandCopy = nil
                     self.sharedChange = nil
@@ -647,6 +664,11 @@ final class ClipboardSync {
         transfer.respondToFileOffer(id: id, accept: accept)
     }
 
+    private var isOtherSessionCopy: Bool {
+        guard allowsPhysicalFilePaste, let marker = pasteboard.contentMarker else { return false }
+        return !marker.hasPrefix(session.uuidString + ":")
+    }
+
     func prepareForPaste(_ completion: @escaping (Bool) -> Void) {
         guard running, allowsAutomaticSending else { completion(false); return }
         let currentChange = pasteboard.changeCount
@@ -695,9 +717,26 @@ final class ClipboardSync {
             completion(false)
             return
         }
+        if isOtherSessionCopy {
+            forgetLocalCopy()
+            completion(controllingRemote)
+            return
+        }
         if imageApplication != nil { waiters.append(completion); return }
         let change = pasteboard.changeCount
         if change == sharedChange { completion(true); return }
+        if allowsPhysicalFilePaste, pasteboard.inspectCurrentKind() == .files {
+            guard !pasteboard.isRelayedFromOtherDevice, staleFileChange != change, receivingFileChange == nil else {
+                completion(false)
+                return
+            }
+            if let copy = localOnDemandCopy, copy.change == change, copy.kind == .files, copy.revision != nil {
+                completion(true)
+            } else {
+                publishManifest(kind: .files, change: change, completion: completion)
+            }
+            return
+        }
         if let files = pasteboard.fileURLs, !files.isEmpty {
             if receivingFileChange != nil {
                 completion(false)
@@ -727,6 +766,9 @@ final class ClipboardSync {
     }
 
     func stop() {
+        if let manifest = trackedRemoteManifest, manifest.kind == .files {
+            discardRemoteFilePromise(manifest)
+        }
         running = false
         receivingFileID = nil
         receivingFileChange = nil
@@ -753,6 +795,10 @@ final class ClipboardSync {
     private func poll() {
         guard running else { return }
         checkTrackedRemoteManifestInvalidation()
+        if allowsPhysicalFilePaste, let copy = localOnDemandCopy, copy.kind == .files,
+           copy.change != pasteboard.changeCount {
+            forgetLocalCopy()
+        }
         if controllingRemote {
             skipChangesWhileControlling()
             guard pendingLocalChange != nil else { return }
@@ -765,10 +811,27 @@ final class ClipboardSync {
         if initialSeedChange != nil, initialSeedChange != change { initialSeedChange = nil }
         if pendingLocalChange != change { pendingLocalChange = nil }
         if localOnDemandCopy != nil, localOnDemandCopy?.change != change {
-            localOnDemandCopy = nil
-            sourceGate.clear()
+            forgetLocalCopy()
         }
         if change != deferredLocalChange, change != pendingLocalChange { observedChange = change }
+    }
+
+    private func forgetLocalCopy() {
+        if allowsPhysicalFilePaste, let copy = localOnDemandCopy, copy.kind == .files, let revision = copy.revision {
+            transfer.invalidateLocalFileManifest(revision)
+        }
+        localOnDemandCopy = nil
+        sourceGate.clear()
+    }
+
+    private func discardRemoteFilePromise(_ manifest: TrackedRemoteManifest) {
+        trackedRemoteManifest = nil
+        guard allowsPhysicalFilePaste, manifest.installedOnPasteboard,
+              pasteboard.changeCount == manifest.change else { return }
+        pasteboard.discardFilePromise(marker: Self.lazyMarker(for: manifest.revision, kind: .files, session: session))
+        observedChange = pasteboard.changeCount
+        sharedChange = nil
+        lastSharedMarker = nil
     }
 
     private func checkTrackedRemoteManifestInvalidation() {
@@ -811,8 +874,7 @@ final class ClipboardSync {
             imagePreparation = nil
             sendingChange = nil
             cancelImageApplication()
-            localOnDemandCopy = nil
-            sourceGate.clear()
+            forgetLocalCopy()
             if !isInitialSeed, pasteboard.inspectCurrentKind() == .files {
                 onDiagnostic?(.staleFilesSuppressed)
                 onStatus?("剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传")
@@ -832,10 +894,14 @@ final class ClipboardSync {
         cancelImageApplication()
         guard !pasteboard.isSensitive else {
             sendingChange = nil
-            localOnDemandCopy = nil
-            sourceGate.clear()
+            forgetLocalCopy()
             if let replacedRemoteRevision { transfer.invalidateRemoteManifest(replacedRemoteRevision) }
             if !isInitialSeed { onStatus?("剪贴板内容已标记为敏感，未同步到对端") }
+            return
+        }
+        if isOtherSessionCopy {
+            forgetLocalCopy()
+            if let replacedRemoteRevision { transfer.invalidateRemoteManifest(replacedRemoteRevision) }
             return
         }
         if hasSharedState, let marker = pasteboard.contentMarker, marker.hasPrefix(session.uuidString + ":") {
@@ -844,36 +910,36 @@ final class ClipboardSync {
             return
         }
         guard let kind = pasteboard.inspectCurrentKind() else {
-            localOnDemandCopy = nil
-            sourceGate.clear()
+            forgetLocalCopy()
             if let replacedRemoteRevision { transfer.invalidateRemoteManifest(replacedRemoteRevision) }
             if !isInitialSeed { onStatus?("此剪贴板类型暂不能同步") }
             return
         }
         if kind == .files {
             if pasteboard.isRelayedFromOtherDevice {
-                localOnDemandCopy = nil
-                sourceGate.clear()
+                forgetLocalCopy()
                 if let replacedRemoteRevision { transfer.invalidateRemoteManifest(replacedRemoteRevision) }
                 onDiagnostic?(.staleFilesSuppressed)
                 onStatus?("剪贴板文件来自系统通用剪贴板（接力），已跳过 QuietDesk 文件回传")
                 return
             }
             if staleFileChange == change {
-                localOnDemandCopy = nil
-                sourceGate.clear()
+                forgetLocalCopy()
                 if let replacedRemoteRevision { transfer.invalidateRemoteManifest(replacedRemoteRevision) }
                 onDiagnostic?(.staleFilesSuppressed)
                 return
             }
             if !deferFileOfferUntilPaste {
-                localOnDemandCopy = nil
-                sourceGate.clear()
+                forgetLocalCopy()
                 sendCurrentEager()
                 return
             }
         }
         staleFileChange = nil
+        publishManifest(kind: kind, change: change)
+    }
+
+    private func publishManifest(kind: ClipboardManifestKind, change: Int, completion: ((Bool) -> Void)? = nil) {
         let token = UUID()
         localOnDemandCopy = LocalOnDemandCopy(
             token: token,
@@ -887,16 +953,25 @@ final class ClipboardSync {
         lastSharedMarker = nil
         sourceGate.clear()
         let gate = sourceGate
+        let pullable = kind != .files || allowsPhysicalFilePaste
         transfer.announceManifest(kind: kind) { [weak self] revision in
-            if kind == .text || kind == .png {
+            if pullable {
                 gate.setExpected(revision: revision, kind: kind)
             } else {
                 gate.clear()
             }
             DispatchQueue.main.async {
-                guard let self, self.running, self.localOnDemandCopy?.token == token else { return }
+                guard let self, self.running else { completion?(false); return }
+                guard self.localOnDemandCopy?.token == token, self.pasteboard.changeCount == change else {
+                    if self.allowsPhysicalFilePaste, kind == .files, let revision {
+                        gate.clear(matching: revision)
+                        self.transfer.invalidateLocalFileManifest(revision)
+                    }
+                    completion?(false)
+                    return
+                }
                 if let revision {
-                    if (kind == .text || kind == .png) && !gate.matches(revision: revision) {
+                    if pullable && !gate.matches(revision: revision) {
                         self.localOnDemandCopy = nil
                     } else {
                         self.localOnDemandCopy?.revision = revision
@@ -904,6 +979,7 @@ final class ClipboardSync {
                 } else {
                     self.localOnDemandCopy = nil
                 }
+                completion?(self.localOnDemandCopy?.revision != nil)
             }
         }
     }
@@ -931,8 +1007,7 @@ final class ClipboardSync {
                 receivingFileChange = change
             }
             sendingChange = nil
-            localOnDemandCopy = nil
-            sourceGate.clear()
+            forgetLocalCopy()
             if !isInitialSeed {
                 if pasteboard.inspectCurrentKind() == .files {
                     onDiagnostic?(.staleFilesSuppressed)
@@ -946,8 +1021,7 @@ final class ClipboardSync {
         }
         guard !pasteboard.isSensitive else {
             sendingChange = nil
-            localOnDemandCopy = nil
-            sourceGate.clear()
+            forgetLocalCopy()
             if !isInitialSeed { onStatus?("剪贴板内容已标记为敏感，未同步到对端") }
             settleWaiters(false)
             return
@@ -1132,7 +1206,7 @@ final class ClipboardSync {
         localOnDemandCopy = nil
         sourceGate.clear()
 
-        if manifest.kind == .files {
+        if manifest.kind == .files && !allowsPhysicalFilePaste {
             trackedRemoteManifest = TrackedRemoteManifest(
                 revision: manifest.revision,
                 kind: .files,
@@ -1150,6 +1224,10 @@ final class ClipboardSync {
             marker: marker,
             fetch: { [weak self] in
                 guard let self, self.running else { return nil }
+                if kind == .files {
+                    self.requestPromisedFiles(revision: revision)
+                    return nil
+                }
                 return self.pullRemotePayloadSynchronously(revision: revision, kind: kind)
             },
             asyncFetch: { [weak self] completion in
@@ -1157,11 +1235,17 @@ final class ClipboardSync {
                     completion(nil)
                     return
                 }
-                self.pullRemotePayloadAsynchronously(revision: revision, kind: kind, completion: completion)
+                if kind == .files {
+                    self.requestPromisedFiles(revision: revision)
+                    completion(nil)
+                } else {
+                    self.pullRemotePayloadAsynchronously(revision: revision, kind: kind, completion: completion)
+                }
             }
         )
         guard wrote else {
-            onDiagnostic?(.applyFailed(kind == .png ? .png : .text, fileCount: 0))
+            let failedKind: PayloadKind = kind == .files ? .files : kind == .png ? .png : .text
+            onDiagnostic?(.applyFailed(failedKind, fileCount: 0))
             onStatus?("系统剪贴板写入失败")
             transfer.invalidateRemoteManifest(revision)
             return
@@ -1182,6 +1266,13 @@ final class ClipboardSync {
         hasSharedState = true
         lastSharedMarker = marker
         sendingChange = nil
+    }
+
+    private func requestPromisedFiles(revision: ClipboardRevision) {
+        guard running, allowsPhysicalFilePaste,
+              let manifest = trackedRemoteManifest, manifest.revision == revision,
+              manifest.change == pasteboard.changeCount, !pasteboard.isSensitive else { return }
+        transfer.requestFilePaste(revision: revision)
     }
 
     private func pullRemotePayloadSynchronously(revision: ClipboardRevision, kind: ClipboardManifestKind) -> ClipboardPayload? {
@@ -1220,9 +1311,8 @@ final class ClipboardSync {
               copy.kind == request.kind,
               (copy.revision == nil || copy.revision == request.revision),
               pasteboard.changeCount == copy.change,
-              !pasteboard.isSensitive else {
-            localOnDemandCopy = nil
-            sourceGate.clear()
+              !pasteboard.isSensitive, !pasteboard.isRelayedFromOtherDevice else {
+            if localOnDemandCopy?.revision == request.revision { forgetLocalCopy() }
             transfer.rejectPull(request, reason: "对端剪贴板已变化，请重新复制")
             poll()
             return
@@ -1295,17 +1385,22 @@ final class ClipboardSync {
                 }
             }
         case .files:
-            transfer.rejectPull(request, reason: "按需拉取不支持文件")
+            guard allowsPhysicalFilePaste, allowsFileSending, !pasteboard.isRelayedFromOtherDevice,
+                  let files = pasteboard.fileURLs, !files.isEmpty, pasteboard.changeCount == copy.change else {
+                transfer.rejectPull(request, reason: "剪贴板文件已不可用，请重新复制")
+                return
+            }
+            sendPulledPayload(.files(files), request: request, change: copy.change)
         }
     }
 
     private func sendPulledPayload(_ payload: ClipboardPayload, request: ClipboardPullRequest, change: Int) {
         let summary = diagnosticSummary(for: payload)
-        onDiagnostic?(.sending(summary.kind, fileCount: 0))
+        onDiagnostic?(.sending(summary.kind, fileCount: summary.fileCount))
         transfer.sendPulled(payload, requestID: request.requestID) { [weak self] success in
             DispatchQueue.main.async {
                 guard let self, self.running else { return }
-                self.onDiagnostic?(success ? .sent(summary.kind, fileCount: 0) : .sendFailed(summary.kind, fileCount: 0))
+                self.onDiagnostic?(success ? .sent(summary.kind, fileCount: summary.fileCount) : .sendFailed(summary.kind, fileCount: summary.fileCount))
                 if success, self.localOnDemandCopy?.change == change {
                     self.localOnDemandCopy?.materializedOnPeer = true
                     self.sharedChange = change

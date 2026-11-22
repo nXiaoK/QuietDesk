@@ -2,6 +2,210 @@ import Foundation
 import QuietDeskCore
 
 func runFileApprovalChecks() {
+    for independentLane in [false, true] {
+        run("A physical paste requests one multi-root offer and sends no file data before approval (independent lane: \(independentLane))") {
+            try withCheckFolder { folder in
+                func endpoint(_ name: String) -> ClipboardTransfer {
+                    ClipboardTransfer(storage: folder.appendingPathComponent(name), requireFileApproval: true,
+                                      allowsDecoupledFileTransfer: independentLane, allowsOnDemandClipboard: true,
+                                      allowsPhysicalFilePaste: true)
+                }
+                let sender = endpoint("sender"), receiver = endpoint("receiver")
+                let roots = ["first.txt", "second.txt"].map { folder.appendingPathComponent($0) }
+                for url in roots { try Data(url.lastPathComponent.utf8).write(to: url) }
+                let manifest = Box<ClipboardManifest?>(nil), offer = Box<ClipboardFileOffer?>(nil)
+                let sent = Box<[MessageKind]>([]), requested = Box(0), receipts = Box(0), handedOff = Box<[Bool]>([])
+                let published = Box<[String]>([]), success = Box(false)
+                let copied = DispatchSemaphore(value: 0), prompted = DispatchSemaphore(value: 0), done = DispatchSemaphore(value: 0)
+                sender.onSend = { [weak receiver] message in sent.update { $0.append(message.kind) }; receiver?.receive(message) }
+                receiver.onSend = { [weak sender] message in
+                    if message.kind == .clipboardPull { requested.update { $0 += 1 } }
+                    if message.kind == .clipboardReceipt { receipts.update { $0 += 1 } }
+                    sender?.receive(message)
+                }
+                sender.onPullRequested = { [weak sender] request in
+                    sender?.sendPulled(.files(roots), requestID: request.requestID) { success.set($0); done.signal() }
+                }
+                receiver.onManifest = { manifest.set($0); copied.signal() }
+                receiver.onFilePasteRequestEnded = { _, result in handedOff.update { $0.append(result) } }
+                receiver.onFileOffer = { if let value = $0 { offer.set(value); prompted.signal() } }
+                receiver.onReceive = { payload in
+                    if case .files(let files) = payload {
+                        published.set(files.compactMap { try? String(contentsOf: $0, encoding: .utf8) })
+                    }
+                }
+                defer { stopTransfers(sender, receiver) }
+                sender.announceManifest(kind: .files)
+                try wait(copied, "File manifest did not arrive")
+                guard let revision = manifest.read()?.revision else { throw CheckFailure("Missing file manifest") }
+                try check(sent.read() == [.clipboardManifest] && requested.read() == 0, "Copy initiated file transfer")
+                receiver.requestFilePaste(revision: revision)
+                receiver.requestFilePaste(revision: revision)
+                try wait(prompted, "Physical read did not reach approval")
+                guard let offered = offer.read() else { throw CheckFailure("File offer missing") }
+                try check(requested.read() == 1 && sent.read() == [.clipboardManifest, .clipboardBegin] && receipts.read() == 0
+                          && handedOff.read() == [true] && offered.count == 2 && !offered.isExplicitDrop,
+                          "A repeated read downloaded or acknowledged files before approval")
+                receiver.respondToFileOffer(id: offered.id, accept: true)
+                try wait(done, "Approved files did not finish")
+                try check(success.read() && published.read() == roots.map(\.lastPathComponent),
+                          "Approved file roots did not reach normal clipboard application")
+            }
+        }
+    }
+
+    run("A physical file offer can be declined before sending entries, and explicit drops still work without an independent lane") {
+        try withCheckFolder { folder in
+            let sender = ClipboardTransfer(storage: folder.appendingPathComponent("sender"), requireFileApproval: true,
+                                           allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+            let receiver = ClipboardTransfer(storage: folder.appendingPathComponent("receiver"), requireFileApproval: true,
+                                             allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+            let file = folder.appendingPathComponent("example")
+            try Data([1]).write(to: file)
+            let sent = Box<[MessageKind]>([]), results = Box<[Bool]>([]), dropped = Box<[String]>([])
+            let prompts = Box<[Bool]>([]), done = DispatchSemaphore(value: 0)
+            sender.onSend = { [weak receiver] message in sent.update { $0.append(message.kind) }; receiver?.receive(message) }
+            receiver.onSend = { [weak sender] in sender?.receive($0) }
+            receiver.onManifest = { [weak receiver] in receiver?.requestFilePaste(revision: $0.revision) }
+            sender.onPullRequested = { [weak sender] request in
+                sender?.sendPulled(.files([file]), requestID: request.requestID) { value in
+                    results.update { $0.append(value) }; done.signal()
+                }
+            }
+            receiver.onFileOffer = { [weak receiver] value in
+                guard let offer = value else { return }
+                prompts.update { $0.append(offer.isExplicitDrop) }
+                receiver?.respondToFileOffer(id: offer.id, accept: offer.isExplicitDrop)
+            }
+            receiver.onExplicitFilesReceived = { dropped.set($0.map(\.lastPathComponent)) }
+            defer { stopTransfers(sender, receiver) }
+            sender.announceManifest(kind: .files)
+            try wait(done, "Declining the physical paste did not release its sender")
+            try check(sent.read() == [.clipboardManifest, .clipboardBegin] && results.read() == [false], "Decline sent contents")
+            sender.sendExplicitFiles([file]) { value in results.update { $0.append(value) }; done.signal() }
+            try wait(done, "The later explicit drop did not finish")
+            try check(prompts.read() == [false, true] && dropped.read() == ["example"] && results.read() == [false, true],
+                      "Explicit drop required a paste, or was applied to the clipboard")
+        }
+    }
+
+    run("A new receiver-side copy withdraws a physical file approval and ignores a late click to accept") {
+        try withCheckFolder { folder in
+            let sender = ClipboardTransfer(storage: folder.appendingPathComponent("sender"), requireFileApproval: true,
+                                           allowsDecoupledFileTransfer: true, allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+            let receiver = ClipboardTransfer(storage: folder.appendingPathComponent("receiver"), requireFileApproval: true,
+                                             allowsDecoupledFileTransfer: true, allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+            let file = folder.appendingPathComponent("source")
+            try Data([1]).write(to: file)
+            let ready = DispatchSemaphore(value: 0), done = DispatchSemaphore(value: 0)
+            let offered = Box<UUID?>(nil), delivered = Box(true), payloadSeen = Box(false), superseded = Box(false)
+            sender.onSend = { [weak receiver] message in
+                if message.kind == .clipboardEntry || message.kind == .clipboardChunk { payloadSeen.set(true) }
+                receiver?.receive(message)
+            }
+            receiver.onSend = { [weak sender] message in sender?.receive(message) }
+            sender.onPullRequested = { [weak sender] request in
+                sender?.sendPulled(.files([file]), requestID: request.requestID) { delivered.set($0); done.signal() }
+            }
+            receiver.onManifest = { [weak receiver] in receiver?.requestFilePaste(revision: $0.revision) }
+            receiver.onFileOffer = { if let offer = $0 { offered.set(offer.id); ready.signal() } }
+            receiver.onFileOfferEnded = { _, reason in superseded.set(reason == .superseded) }
+            defer { stopTransfers(sender, receiver) }
+            sender.announceManifest(kind: .files)
+            try wait(ready, "File approval did not open")
+            guard let oldID = offered.read() else { throw CheckFailure("Missing approval ID") }
+            receiver.announceManifest(kind: .text)
+            receiver.respondToFileOffer(id: oldID, accept: true)
+            try wait(done, "Replacing the pasteboard did not stop the sending file")
+            try check(superseded.read() && !delivered.read() && !payloadSeen.read(),
+                      "The replaced approval started a download")
+        }
+    }
+
+    run("A file paste accepts only the requested offer from the manifest's origin and a newer revision") {
+        try withCheckFolder { folder in
+            let origin = UUID(), revision = ClipboardRevision(counter: 3, origin: origin)
+            let receiver = ClipboardTransfer(storage: folder, requireFileApproval: true,
+                                             allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+            let read = DispatchSemaphore(value: 0), replied = DispatchSemaphore(value: 0), prompted = DispatchSemaphore(value: 0)
+            let request = Box<ClipboardPullRequest?>(nil), offers = Box(0), receipts = Box(0)
+            receiver.onSend = { message in
+                if message.kind == .clipboardPull {
+                    request.set(try? Wire.readJSON(ClipboardPullRequest.self, message.payload)); read.signal()
+                } else if message.kind == .clipboardCancel { replied.signal() }
+                else if message.kind == .clipboardReceipt { receipts.update { $0 += 1 } }
+            }
+            receiver.onFileOffer = { if $0 != nil { offers.update { $0 += 1 }; prompted.signal() } }
+            defer { receiver.stop() }
+            receiver.receive(try Wire.json(.clipboardManifest, ClipboardManifest(revision: revision, kind: .files)))
+            receiver.requestFilePaste(revision: revision)
+            try wait(read, "No physical read")
+            guard let id = request.read()?.requestID else { throw CheckFailure("Missing pull ID") }
+            func offer(revision: Int, source: UUID, requestID: UUID?) throws -> Message {
+                var body: [String: Any] = ["revision": ["counter": revision, "origin": source.uuidString],
+                                            "type": "files", "sequence": 0, "count": 1, "bytes": 0]
+                if let requestID { body["pullRequestID"] = requestID.uuidString }
+                return Message(.clipboardBegin, try JSONSerialization.data(withJSONObject: body))
+            }
+            for message in try [offer(revision: 4, source: origin, requestID: nil),
+                                offer(revision: 4, source: origin, requestID: UUID()),
+                                offer(revision: 4, source: UUID(), requestID: id),
+                                offer(revision: 3, source: origin, requestID: id)] {
+                receiver.receive(message)
+                try wait(replied, "Unrelated file offer escaped validation")
+            }
+            receiver.receive(try offer(revision: 4, source: origin, requestID: id))
+            try wait(prompted, "Unrelated messages invalidated the requested offer")
+            try check(offers.read() == 1 && receipts.read() == 0, "An unrelated or unapproved offer was acknowledged")
+        }
+    }
+
+    run("Replacing a physical file source cancels the pending read and its late offer cannot open approval") {
+        try withCheckFolder { folder in
+            let source = ClipboardTransfer(storage: folder.appendingPathComponent("source"), requireFileApproval: true,
+                                           allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+            let sink = ClipboardTransfer(storage: folder.appendingPathComponent("sink"), requireFileApproval: true,
+                                         allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+            let file = folder.appendingPathComponent("copied.txt")
+            try Data([1, 2]).write(to: file)
+            let manifest = Box<ClipboardRevision?>(nil), held = Box<Message?>(nil), shown = Box(false), acked = Box(false)
+            let callback = Box<[Bool]>([]), complete = Box<[Bool]>([])
+            let copied = DispatchSemaphore(value: 0), prepared = DispatchSemaphore(value: 0), cancelled = DispatchSemaphore(value: 0)
+            let rejected = DispatchSemaphore(value: 0), finished = DispatchSemaphore(value: 0)
+            source.onSend = { [weak sink] message in
+                if message.kind == .clipboardBegin { held.set(message); prepared.signal() }
+                else { sink?.receive(message) }
+            }
+            sink.onSend = { [weak source] message in
+                if message.kind == .clipboardCancel { rejected.signal() }
+                if message.kind == .clipboardReceipt { acked.set(true) }
+                source?.receive(message)
+            }
+            source.onPullRequested = { [weak source] request in
+                source?.sendPulled(.files([file]), requestID: request.requestID) { result in
+                    complete.update { $0.append(result) }; finished.signal()
+                }
+            }
+            sink.onManifest = { manifest.set($0.revision); copied.signal() }
+            sink.onFilePasteRequestEnded = { _, result in callback.update { $0.append(result) }; cancelled.signal() }
+            sink.onFileOffer = { if $0 != nil { shown.set(true) } }
+            defer { stopTransfers(source, sink) }
+            source.announceManifest(kind: .files)
+            try wait(copied, "Missing file manifest")
+            guard let revision = manifest.read() else { throw CheckFailure("Missing file revision") }
+            sink.requestFilePaste(revision: revision)
+            try wait(prepared, "File offer was not prepared")
+            source.invalidateLocalFileManifest(revision)
+            try wait(cancelled, "Source invalidation did not resolve the pending read")
+            try wait(finished, "Source file transfer did not cancel")
+            guard let late = held.read() else { throw CheckFailure("Missing delayed offer") }
+            sink.receive(late)
+            try wait(rejected, "Late file offer was not rejected")
+            try check(callback.read() == [false] && complete.read() == [false] && !shown.read() && !acked.read(),
+                      "Stale file data prompted or began downloading")
+        }
+    }
+
     run("Cancelling an accepted file reception removes partial data and ignores duplicate cancellation and late chunks") {
         try withCheckFolder { folder in
             let file = folder.appendingPathComponent("cancel.bin")

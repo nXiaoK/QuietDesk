@@ -102,6 +102,11 @@ private final class MemoryPasteboard: ClipboardPasteboard {
         changeCount += 1
     }
 
+    func discardFilePromise(marker: String) {
+        guard hasLazyItem, lazyKind == .files, self.marker == marker else { return }
+        copy(.files([]))
+    }
+
     func republish() {
         marker = nil
         hasLazyItem = false; lazyKind = nil; lazyAsyncFetch = nil
@@ -122,7 +127,7 @@ private final class MemoryPasteboard: ClipboardPasteboard {
         fetch: @escaping @MainActor () -> ClipboardPayload?,
         asyncFetch: @escaping @MainActor (@escaping (ClipboardPayload?) -> Void) -> Void
     ) -> Bool {
-        guard !rejectsWrites, kind == .text || kind == .png else { return false }
+        guard !rejectsWrites else { return false }
         self.payload = .text(Data())
         self.rawTIFF = nil
         self.marker = marker
@@ -177,13 +182,13 @@ private final class ClipboardPair {
 
     init(storage: URL, localAllowed: Bool = false, remoteAllowed: Bool = false, controllingLocal: Bool = false,
          allowsChunkWindow: Bool = false, allowsDecoupledFileTransfer: Bool = false,
-         allowsOnDemandClipboard: Bool = false, deferLocalFileOffer: Bool = false,
+         allowsOnDemandClipboard: Bool = false, deferLocalFileOffer: Bool = false, allowsPhysicalFilePaste: Bool = false,
          convertLocalTIFF: @escaping (Data) -> Data? = { data in NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) },
          validateRemotePNG: ((Data) -> Bool)? = nil) {
         let session = UUID()
         localSync = ClipboardSync(session: session, allowsFileSending: true, allowsAutomaticSending: localAllowed,
             allowsChunkWindow: allowsChunkWindow, allowsDecoupledFileTransfer: allowsDecoupledFileTransfer,
-            allowsOnDemandClipboard: allowsOnDemandClipboard, deferFileOfferUntilPaste: deferLocalFileOffer,
+            allowsOnDemandClipboard: allowsOnDemandClipboard, deferFileOfferUntilPaste: deferLocalFileOffer, allowsPhysicalFilePaste: allowsPhysicalFilePaste,
             controllingRemote: controllingLocal, pasteboard: local, storage: storage.appendingPathComponent("local"),
             convertTIFF: convertLocalTIFF) { [weak self] message in
                 DispatchQueue.main.async {
@@ -194,7 +199,7 @@ private final class ClipboardPair {
             }
         remoteSync = ClipboardSync(session: session, allowsFileSending: true, allowsAutomaticSending: remoteAllowed,
             allowsChunkWindow: allowsChunkWindow, allowsDecoupledFileTransfer: allowsDecoupledFileTransfer,
-            allowsOnDemandClipboard: allowsOnDemandClipboard, deferFileOfferUntilPaste: false,
+            allowsOnDemandClipboard: allowsOnDemandClipboard, deferFileOfferUntilPaste: false, allowsPhysicalFilePaste: allowsPhysicalFilePaste,
             pasteboard: remote, storage: storage.appendingPathComponent("remote"), validatePNG: validateRemotePNG) { [weak self] message in
                 DispatchQueue.main.async {
                     guard let self else { return }
@@ -1911,6 +1916,104 @@ private struct ClipboardFocusChecks {
                   String(data: bytes, encoding: .utf8) == "survives-reconnect" else {
                 throw FocusCheckFailure("Reconnected session failed to pull re-announced copy")
             }
+        }
+
+        run("File paste in either direction advertises only a type, waits for approval and publishes the received files") { folder in
+            for reverse in [false, true] {
+                let storage = folder.appendingPathComponent(reverse ? "host-source" : "viewer-source")
+                let pair = ClipboardPair(storage: storage, localAllowed: !reverse, remoteAllowed: reverse,
+                                         allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+                defer { pair.stop() }
+                let source = reverse ? pair.remote : pair.local, sink = reverse ? pair.local : pair.remote
+                let sender = reverse ? pair.remoteSync! : pair.localSync!, receiver = reverse ? pair.localSync! : pair.remoteSync!
+                let sent = { reverse ? pair.remoteMessages : pair.localMessages }
+                let requests = { reverse ? pair.localMessages : pair.remoteMessages }
+                let originals = ["résumé.txt", "资料.bin"].map { folder.appendingPathComponent($0) }
+                let contents = [Data("first root".utf8), Data(repeating: 0xE2, count: 150_000)]
+                for (url, data) in zip(originals, contents) { try data.write(to: url) }
+                var offer: ClipboardFileOffer?
+                receiver.onFileOffer = { offer = $0 }
+                source.copy(.files(originals))
+                sender.sendLocalCopy()
+                try eventually("No file promise appeared") { sink.inspectCurrentKind() == .files && sink.hasLazyItem }
+                var ready: Bool?
+                sender.prepareForPaste { ready = $0 }
+                try eventually("The viewer could not forward its paste key") { ready == true }
+                try require(sent() == [.clipboardManifest] && requests().isEmpty && offer == nil,
+                            "Copy, format lookup or preparing the paste key started a file transfer")
+                _ = sink.simulatePaste()
+                _ = sink.simulatePaste()
+                try eventually("The first content read did not produce the file offer") { offer != nil }
+                try require(requests().filter { $0 == .clipboardPull }.count == 1 && offer?.count == 2,
+                            "Repeated content reads caused a duplicate request or the offer lost a root")
+                try require(!sent().contains(.clipboardEntry) && !sent().contains(.clipboardChunk),
+                            "File entries or contents were transmitted before approval")
+                receiver.respondToFileOffer(id: offer!.id, accept: true)
+                try eventually("Approved files did not replace the promise") { !sink.hasLazyItem && sink.fileURLs?.count == 2 }
+                let received = sink.fileURLs!
+                try require(received.map(\.lastPathComponent) == originals.map(\.lastPathComponent)
+                            && (try received.map { try Data(contentsOf: $0) }) == contents,
+                            "Received file names, order or bytes differ")
+            }
+        }
+
+        run("Older file promises are removed on decline, withdrawal or disconnect, while newer local copies survive") { folder in
+            for ending in ["decline", "withdraw", "replace", "another session", "stop"] {
+                let pair = ClipboardPair(storage: folder.appendingPathComponent(ending), localAllowed: true,
+                                         allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+                defer { pair.stop() }
+                let source = folder.appendingPathComponent("original.txt")
+                try Data("original".utf8).write(to: source)
+                var offer: ClipboardFileOffer?
+                pair.remoteSync.onFileOffer = { offer = $0 }
+                pair.local.copy(.files([source]))
+                pair.localSync.sendLocalCopy()
+                try eventually("No promise appeared") { pair.remote.hasLazyItem }
+                switch ending {
+                case "decline":
+                    _ = pair.remote.simulatePaste()
+                    try eventually("No offer to decline") { offer != nil }
+                    pair.remoteSync.respondToFileOffer(id: offer!.id, accept: false)
+                case "stop": pair.remoteSync.stop()
+                default:
+                    if ending == "replace" { pair.remote.copy(.text(Data("new local value".utf8))) }
+                    if ending == "another session" {
+                        try require(pair.local.write(.files([source]), marker: UUID().uuidString + ":files:previous-session"),
+                                    "Unable to simulate another paired session's files")
+                    } else {
+                        pair.local.isSensitive = true
+                        pair.local.copy(.text(Data("private".utf8)))
+                    }
+                    pair.localSync.sendLocalCopy()
+                    try eventually("Source did not withdraw its manifest") { pair.localMessages.contains(.clipboardCancel) }
+                }
+                try eventually("Revoked file URL remained available") { !pair.remote.hasLazyItem }
+                try require(!pair.localMessages.contains(.clipboardChunk), "File bytes escaped without approval")
+                if ending == "replace" { try require(pair.remote.copiedText == "new local value", "Withdrawal erased a newer copy") }
+            }
+        }
+
+        run("AppKit file-URL format queries leave the promise idle and content reads request it once") { folder in
+            let board = NSPasteboard.withUniqueName()
+            defer { board.releaseGlobally() }
+            let system = SystemClipboardPasteboard(pasteboard: board)
+            var reads = 0
+            try require(system.writeLazy(.files, marker: "test-revision", fetch: {
+                reads += 1
+                return nil
+            }, asyncFetch: { $0(nil) }), "Could not install file promise")
+            try require(system.inspectCurrentKind() == .files && board.availableType(from: [.fileURL]) == .fileURL
+                        && board.pasteboardItems?.count == 1 && reads == 0, "Inspecting file metadata requested the content")
+            for _ in 0..<2 {
+                _ = board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+            }
+            try require(reads == 1, "File content was requested an unexpected number of times")
+            let urls = ["one", "two"].map { folder.appendingPathComponent($0) }
+            for url in urls { try Data(url.lastPathComponent.utf8).write(to: url) }
+            try require(system.write(.files(urls), marker: "received") && system.fileURLs == urls,
+                        "AppKit could not read the materialized file URLs")
+            system.discardFilePromise(marker: "test-revision")
+            try require(system.fileURLs == urls, "Stale cleanup erased the received files")
         }
 
         run("SystemClipboardPasteboard NSPasteboardItemDataProvider pulls multi-chunk text and PNG synchronously on demand") { folder in

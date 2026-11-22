@@ -8,6 +8,7 @@ use crate::error::{DeskError, Result};
 use crate::messages::VideoCodec;
 use crate::wire::{ByteReader, MAXIMUM_MESSAGE_BYTES};
 
+const H264_HEADER_BYTES: usize = 8;
 const HEVC_FLAG: u16 = 0x8000;
 const MAXIMUM_PARAMETER_SET_BYTES: usize = 4096;
 
@@ -33,8 +34,8 @@ impl VideoPacket {
         !self.sps.is_empty()
     }
 
-    pub(crate) fn encoded_len(&self) -> usize {
-        let header = if self.codec == VideoCodec::Hevc { 10 } else { 8 };
+    pub fn encoded_len(&self) -> usize {
+        let header = H264_HEADER_BYTES + if self.codec == VideoCodec::Hevc { 2 } else { 0 };
         header + self.vps.len() + self.sps.len() + self.pps.len() + self.avcc.len()
     }
 
@@ -153,6 +154,10 @@ pub struct EncodedFrame {
 }
 
 impl EncodedFrame {
+    pub(crate) fn encoded_len(&self) -> usize {
+        H264_HEADER_BYTES + self.sps.len() + self.pps.len() + self.avcc.len()
+    }
+
     pub fn is_key_frame(&self) -> bool {
         !self.sps.is_empty()
     }

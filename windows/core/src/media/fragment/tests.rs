@@ -432,28 +432,35 @@ fn a_decoder_needing_the_next_access_unit_can_confirm_a_continuous_stream() {
 
 #[test]
 fn submitted_frames_stay_in_the_bounded_window_until_the_matching_epoch_decodes_them() {
-    let now = Instant::now();
-    let mut tx = RepairCache::new(stream());
-    let mut rx = Receiver::new(stream());
-    for id in 1..=FRAME_WINDOW as u64 + 2 {
-        let source = frame(id, 32);
-        let parts = originals(&mut tx, &source, now);
-        let events = rx.push(&parts[0].record(), now).unwrap();
-        if id == FRAME_WINDOW as u64 + 2 {
-            assert!(matches!(&events[..],[ReceiveEvent::Feedback(f)] if f.kind==FeedbackKind::Expired));
-            break;
+    for capacity in [STATIC_FRAMES, crate::media::window::MAX_DYNAMIC_FRAMES] {
+        let now = Instant::now();
+        let mut tx = RepairCache::new(stream());
+        tx.set_capacity(capacity);
+        let mut rx = Receiver::with_capacity(stream(), capacity);
+        for id in 1..=capacity as u64 + 2 {
+            let source = frame(id, 32);
+            if id == capacity as u64 + 2 {
+                assert!(tx.insert(&source, now, now + DECODE_TIMEOUT).is_err());
+                tx.feedback(&MediaFeedback::new(FeedbackKind::Decoded, frame(2, 32).header).unwrap(), now, Duration::ZERO);
+            }
+            let parts = originals(&mut tx, &source, now);
+            let events = rx.push(&parts[0].record(), now).unwrap();
+            if id == capacity as u64 + 2 {
+                assert!(matches!(&events[..],[ReceiveEvent::Feedback(f)] if f.kind==FeedbackKind::Expired));
+                break;
+            }
+            assert!(matches!(&events[..],[_, ReceiveEvent::Frame(input)] if input.header==source.header));
+            if id == 1 {
+                rx.decoded(source.header, now);
+                rx.committed(stream(), now);
+                tx.feedback(&MediaFeedback::new(FeedbackKind::Decoded, source.header).unwrap(), now, Duration::ZERO);
+            } else {
+                rx.decoded(MediaFrameHeader { stream: MediaStreamId { codec_epoch: 0, ..stream() }, ..source.header }, now);
+            }
         }
-        assert!(matches!(&events[..],[_, ReceiveEvent::Frame(input)] if input.header==source.header));
-        if id == 1 {
-            rx.decoded(source.header, now);
-            rx.committed(stream(), now);
-        } else {
-            rx.decoded(MediaFrameHeader { stream: MediaStreamId { codec_epoch: 0, ..stream() }, ..source.header }, now);
-        }
-        tx.feedback(&MediaFeedback::new(FeedbackKind::Decoded, source.header).unwrap(), now, Duration::ZERO);
+        assert!(rx.decoded(frame(2, 32).header, now).is_empty());
+        assert!(rx.poll(now + DECODE_TIMEOUT).is_empty());
     }
-    assert!(rx.decoded(frame(2, 32).header, now).is_empty());
-    assert!(rx.poll(now + DECODE_TIMEOUT).is_empty());
 }
 
 #[test]

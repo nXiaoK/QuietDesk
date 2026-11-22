@@ -493,8 +493,10 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             if self.auxiliary.enabled() {
                 media.enable_auxiliary();
             }
-            self.media = Some(media);
             let mut request = ViewerMedia::request();
+            media.request_fast_recovery(&mut request);
+            media.request_dynamic_window(&mut request);
+            self.media = Some(media);
             if self.datagrams.enabled() {
                 request.request_fragment_features();
             }
@@ -619,7 +621,10 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
     fn sync_datagram_receiver(&mut self) {
         let stream = self.media.as_ref().filter(|media| media.frame_path() == MediaPath::Udp).and_then(ViewerMedia::receiving_stream);
         if stream != self.udp_receiver.as_ref().map(|receiver| receiver.stream) {
-            self.udp_receiver = stream.map(|stream| ReceivingDatagrams { frames: Receiver::new(stream), stream, poll_at: Instant::now() });
+            self.udp_receiver = stream.map(|stream| {
+                let capacity = self.media.as_ref().expect("an active datagram stream has a media session").receive_capacity();
+                ReceivingDatagrams { frames: Receiver::with_capacity(stream, capacity), stream, poll_at: Instant::now() }
+            });
         }
     }
 
@@ -639,7 +644,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 ReceiveEvent::Feedback(feedback) => {
                     self.send_datagram_feedback(&feedback);
                     if feedback.kind == FeedbackKind::Expired {
-                        return self.lose_datagrams();
+                        return self.update_media(|media| media.udp_delivery_failed(Instant::now()));
                     }
                 }
             }
@@ -659,6 +664,9 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         for event in events {
             match event {
                 ViewerMediaEvent::Send(message) => self.peer.send(&message)?,
+                ViewerMediaEvent::DatagramPrepare(record) => {
+                    self.datagrams.send(record);
+                }
                 ViewerMediaEvent::DatagramFeedback(feedback) => {
                     self.send_datagram_feedback(&feedback);
                     if feedback.kind == FeedbackKind::Decoded

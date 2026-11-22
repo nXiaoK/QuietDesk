@@ -5,6 +5,9 @@
 //! A stream stays on its negotiated connection until a new keyframe transaction commits.
 
 pub mod fragment;
+mod path_policy;
+use path_policy::UdpTrials;
+pub mod window;
 
 use crate::error::{DeskError, Result};
 use crate::video::{EncodedFrame, VideoPacket, nal_units};
@@ -539,6 +542,8 @@ struct HostTransaction {
     route: RoutedStream,
     stage: HostStage,
     key_frame_sent: bool,
+    fast: bool,
+    needs_fresh_pong: bool,
     deadline: Instant,
 }
 
@@ -583,6 +588,8 @@ pub struct HostMedia {
     video_bound: bool,
     udp_available: bool,
     udp_verified: bool,
+    fast_recovery: bool,
+    pub(crate) capture_limits: window::CaptureLimits,
     /// Frames wait for the viewer to open a new stream.
     hold: bool,
     next_frame: u64,
@@ -639,7 +646,9 @@ impl HostMedia {
         Some(MediaControl {
             session_id: self.session,
             token: Some(token),
+            fast_recovery: self.fast_recovery.then_some(true),
             datagram_key: Some(key),
+            dynamic_frame_window: self.capture_limits.dynamic.then_some(true),
             path: Some(if self.udp_available { "udp" } else { "tcp" }.to_string()),
             ..MediaControl::new(MediaOperation::Offer)
         })
@@ -661,7 +670,9 @@ impl HostMedia {
                         openssl::rand::rand_bytes(secret).map_err(|error| DeskError::platform(format!("无法生成媒体会话凭据：{error}")))?;
                     }
                     self.session = Some(Uuid::new_v4());
+                    self.fast_recovery = control.fast_recovery == Some(true);
                     self.credentials = Some((token, key));
+                    self.capture_limits = window::CaptureLimits::from_request(control);
                 }
                 return Ok(self.offer().map(|offer| HostMediaEvent::Send(Box::new(offer))).into_iter().collect());
             }
@@ -693,6 +704,10 @@ impl HostMedia {
                         _ => return Ok(refuse()),
                     };
                     let awaiting_udp = path == MediaPath::Udp && !self.udp_verified;
+                    let fast = self.fast_recovery && control.fast == Some(true);
+                    if fast && !self.active.iter().chain(self.interrupted_commit.iter().map(|(_, route)| route)).any(|route| route.path == path) {
+                        return Ok(refuse());
+                    }
                     self.epochs = (stream.transport_epoch, stream.codec_epoch);
                     self.interrupted_commit = None;
                     self.hold = true;
@@ -701,6 +716,8 @@ impl HostMedia {
                         route: RoutedStream { stream, path },
                         stage: if awaiting_udp { HostStage::AwaitingUdpVerification } else { HostStage::Preparing },
                         key_frame_sent: false,
+                        fast,
+                        needs_fresh_pong: fast && path == MediaPath::Udp,
                         deadline: Instant::now() + if awaiting_udp { UDP_VERIFICATION_GRACE } else { TRANSACTION_TIMEOUT },
                     });
                     self.next_frame = 1;
@@ -713,14 +730,14 @@ impl HostMedia {
                 }
             },
             Ready => match current {
-                Some(transaction) if transaction.stage == HostStage::Ready => {
+                Some(transaction) if !transaction.fast && transaction.stage == HostStage::Ready => {
                     transaction.stage = HostStage::Producing;
                     vec![HostMediaEvent::ProduceKeyFrame]
                 }
                 _ => Vec::new(),
             },
             DecodedReady => match current {
-                Some(transaction) if transaction.key_frame_sent => {
+                Some(transaction) if !transaction.fast && transaction.key_frame_sent => {
                     transaction.stage = HostStage::Decoded;
                     // This confirmation stands for the keyframe's own feedback, which may still be on its way.
                     let settled = self.unsettled.iter().take_while(|frame| frame.header.frame_id == 1).count();
@@ -730,6 +747,12 @@ impl HostMedia {
                 _ => Vec::new(),
             },
             Committed => match current {
+                Some(transaction)
+                    if transaction.fast && transaction.key_frame_sent && transaction.stage == HostStage::Producing && Instant::now() < transaction.deadline =>
+                {
+                    self.commit_fast();
+                    vec![HostMediaEvent::Settled(std::mem::take(&mut self.unsettled).len())]
+                }
                 Some(transaction) if transaction.stage == HostStage::Decoded => {
                     self.active = Some(transaction.route);
                     self.transaction = None;
@@ -752,6 +775,61 @@ impl HostMedia {
                 Vec::new()
             }
         })
+    }
+
+    pub(crate) fn fast_recovery_negotiated(&self) -> bool {
+        self.fast_recovery
+    }
+
+    pub(crate) fn accepts_fast_copy(&self, control: &MediaControl) -> bool {
+        if control.operation != MediaOperation::Prepare
+            || control.fast != Some(true)
+            || control.path.as_deref() != Some("udp")
+            || control.session_id != self.session
+        {
+            return false;
+        }
+        // An old UDP copy cannot invalidate the control channel's newer transaction.
+        self.transaction.as_ref().is_none_or(|tx| {
+            Some(tx.id) != control.transaction_id
+                || (tx.route.path == MediaPath::Udp
+                    && Some(tx.route.stream.transport_epoch) == control.transport_epoch
+                    && Some(tx.route.stream.codec_epoch) == control.codec_epoch)
+        })
+    }
+
+    pub(crate) fn pending_fast_challenge(&self) -> Option<Uuid> {
+        self.transaction.as_ref().filter(|t| t.needs_fresh_pong).map(|t| t.id)
+    }
+
+    pub(crate) fn answered_fast_challenge(&mut self, id: Uuid) {
+        if let Some(tx) = self.transaction.as_mut().filter(|tx| tx.id == id) {
+            tx.needs_fresh_pong = false;
+        }
+    }
+
+    pub(crate) fn take_fast_keyframe(&mut self) -> bool {
+        let Some(tx) = self.transaction.as_mut().filter(|tx| tx.fast && !tx.needs_fresh_pong && tx.stage == HostStage::Ready && Instant::now() < tx.deadline)
+        else {
+            return false;
+        };
+        tx.stage = HostStage::Producing;
+        true
+    }
+
+    pub(crate) fn fast_opening(&self) -> Option<MediaFrameHeader> {
+        self.transaction.as_ref().filter(|tx| tx.fast && tx.key_frame_sent && tx.stage == HostStage::Producing).map(|tx| MediaFrameHeader {
+            stream: tx.route.stream,
+            frame_id: 1,
+            is_idr: true,
+        })
+    }
+
+    fn commit_fast(&mut self) {
+        let tx = self.transaction.take().expect("confirmed fast recovery");
+        self.active = Some(tx.route);
+        self.hold = false;
+        log::info!("host committed fast {} media stream (transport epoch {})", tx.route.path.name(), tx.route.stream.transport_epoch);
     }
 
     /// The stream asked for can start with a keyframe: tells the viewer so.
@@ -802,6 +880,9 @@ impl HostMedia {
         match feedback.kind {
             FeedbackKind::Decoded if feedback.header == frame.header => {
                 self.unsettled.drain(..=index);
+                if self.fast_opening() == Some(feedback.header) {
+                    self.commit_fast();
+                }
                 (index + 1, Vec::new())
             }
             FeedbackKind::Expired => self.interrupted(),
@@ -839,7 +920,7 @@ impl HostMedia {
 
     fn abort_transaction(&mut self) -> Option<MediaControl> {
         let transaction = self.transaction.take()?;
-        if transaction.stage == HostStage::Decoded {
+        if transaction.stage == HostStage::Decoded || (transaction.fast && transaction.key_frame_sent) {
             self.interrupted_commit = Some((transaction.id, transaction.route));
         }
         Some(transaction.route.transaction(MediaOperation::Abort, transaction.id))
@@ -858,10 +939,21 @@ enum ViewerStage {
     Decoded,
 }
 
+const FAST_REQUEST_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_FAST_REQUESTS: u8 = 20;
+
+struct FastReceive {
+    host_ready: bool,
+    held: Option<VideoPacket>,
+    sends: u8,
+    repeat_at: Option<Instant>,
+}
+
 struct ViewerTransaction {
     id: Uuid,
     route: RoutedStream,
     stage: ViewerStage,
+    fast: Option<FastReceive>,
     started: Instant,
 }
 
@@ -888,10 +980,17 @@ struct ReceivingStream {
     reported_playback: bool,
 }
 
+impl ReceivingStream {
+    fn new(stream: MediaStreamId) -> Self {
+        Self { stream, next_frame: 1, pending: VecDeque::new(), last_decoded: None, reported_playback: false }
+    }
+}
+
 #[derive(Debug)]
 pub enum ViewerMediaEvent {
     Send(Message),
     DatagramFeedback(MediaFeedback),
+    DatagramPrepare(Vec<u8>),
     /// A frame to decode and whether the host needs its decoded receipt before sending another.
     Video(VideoPacket, MediaStreamId, bool),
     /// Frames of this stream are now what the viewer shows.
@@ -908,6 +1007,7 @@ impl ViewerMediaEvent {
 /// The viewer's side of the session. The viewer decides when a stream is opened.
 #[derive(Default)]
 pub struct ViewerMedia {
+    udp_trials: UdpTrials,
     session: Option<Uuid>,
     epochs: (u32, u32),
     transaction: Option<ViewerTransaction>,
@@ -915,6 +1015,8 @@ pub struct ViewerMedia {
     video_bound: bool,
     udp_available: bool,
     fragments: FragmentFeatures,
+    fast_recovery: bool,
+    dynamic_window: bool,
     udp_verified: bool,
     receiving: Option<ReceivingStream>,
     auxiliary_enabled: bool,
@@ -925,13 +1027,20 @@ pub struct ViewerMedia {
 
 impl ViewerMedia {
     const RETRY_DELAY: Duration = Duration::from_millis(500);
-    // Legacy frames may still await acceptance when the first media keyframe arrives.
-    const MAXIMUM_PENDING_FRAMES: usize = 6;
-    const MAXIMUM_PENDING_BYTES: usize = 32 * 1024 * 1024;
 
     /// Asks the host for a session. No optional capability is named, so the host uses none.
     pub fn request() -> MediaControl {
         MediaControl::new(MediaOperation::Request)
+    }
+
+    pub(crate) fn request_dynamic_window(&mut self, request: &mut MediaControl) {
+        self.dynamic_window = true;
+        request.dynamic_frame_window = Some(true);
+        request.receive_frame_window = Some(window::STATIC_FRAMES as i64);
+    }
+
+    pub(crate) fn receive_capacity(&self) -> usize {
+        if self.session.is_some() && self.dynamic_window { window::MAX_DYNAMIC_FRAMES } else { window::STATIC_FRAMES }
     }
 
     pub(crate) fn accepts_fec(&self, kind: u8) -> bool {
@@ -973,6 +1082,7 @@ impl ViewerMedia {
             return Ok(Vec::new());
         }
         self.udp_verified = verified;
+        self.udp_trials = UdpTrials::default();
         if !verified && self.frame_path() == MediaPath::Udp {
             self.restart(now)
         } else if verified && self.transaction.is_none() && self.frame_path() != MediaPath::Udp {
@@ -985,8 +1095,27 @@ impl ViewerMedia {
         }
     }
 
+    pub(crate) fn request_fast_recovery(&mut self, request: &mut MediaControl) {
+        self.fast_recovery = true;
+        request.fast_recovery = Some(true);
+    }
+
     pub fn enable_auxiliary(&mut self) {
         self.auxiliary_enabled = true;
+    }
+
+    /// An expired reference chain may be retried on a live path. Keep the last displayed picture during the retry.
+    pub(crate) fn udp_delivery_failed(&mut self, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
+        if !self.udp_verified || self.frame_path() != MediaPath::Udp || self.receiving.is_none() && self.transaction.is_none() {
+            return Ok(Vec::new());
+        }
+        let retry = if self.transaction.is_some() { self.udp_trials.retry_opener() } else { self.udp_trials.retry_playback(now) };
+        if !retry {
+            return self.set_udp_verified(false, now);
+        }
+        let abort = self.abandon().map(|control| control.message().map(ViewerMediaEvent::Send)).transpose()?;
+        self.retry_at = Some(now + Duration::from_secs(1));
+        Ok(abort.into_iter().collect())
     }
 
     pub fn set_video_bound(&mut self, bound: bool, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
@@ -1023,12 +1152,34 @@ impl ViewerMedia {
         } else {
             MediaPath::Shared
         };
-        let transaction = ViewerTransaction { id: Uuid::new_v4(), route: RoutedStream { stream, path }, stage: ViewerStage::Preparing, started: now };
-        let prepare = MediaControl::transaction(MediaOperation::Prepare, transaction.id, stream, path.name()).message()?;
-        self.receiving = None;
+        let fast = self.fast_recovery && self.active.is_some_and(|active| active.path == path);
+        let transaction = ViewerTransaction {
+            id: Uuid::new_v4(),
+            route: RoutedStream { stream, path },
+            stage: if fast { ViewerStage::Ready } else { ViewerStage::Preparing },
+            fast: fast.then_some(FastReceive { host_ready: false, held: None, sends: 0, repeat_at: (path == MediaPath::Udp).then_some(now) }),
+            started: now,
+        };
+        let mut prepare = transaction.route.transaction(MediaOperation::Prepare, transaction.id);
+        prepare.fast = fast.then_some(true);
+        self.receiving = fast.then(|| ReceivingStream::new(stream));
         self.transaction = Some(transaction);
         self.retry_at = None;
-        Ok(vec![ViewerMediaEvent::Send(prepare)])
+        let mut events = vec![ViewerMediaEvent::Send(prepare.message()?)];
+        events.extend(self.fast_prepare(now)?);
+        Ok(events)
+    }
+
+    fn fast_prepare(&mut self, now: Instant) -> Result<Option<ViewerMediaEvent>> {
+        let Some(tx) = self.transaction.as_mut() else { return Ok(None) };
+        let Some(fast) = tx.fast.as_mut().filter(|f| f.repeat_at.is_some_and(|at| now >= at)) else { return Ok(None) };
+        let mut copy = tx.route.transaction(MediaOperation::Prepare, tx.id);
+        copy.fast = Some(true);
+        let mut record = vec![11];
+        record.extend(copy.message()?.payload);
+        fast.sends += 1;
+        fast.repeat_at = (fast.sends < MAX_FAST_REQUESTS).then_some(now + FAST_REQUEST_INTERVAL);
+        Ok(Some(ViewerMediaEvent::DatagramPrepare(record)))
     }
 
     /// Retires every pending decode of the abandoned transaction.
@@ -1049,6 +1200,8 @@ impl ViewerMedia {
                 }
                 self.session = control.session_id;
                 self.fragments = FragmentFeatures::from_peer(control);
+                self.fast_recovery &= control.fast_recovery == Some(true);
+                self.dynamic_window &= control.dynamic_frame_window == Some(true);
                 self.udp_available &= control.path.as_deref() != Some("tcp");
                 self.udp_verified &= self.udp_available;
                 if !self.udp_verified && (self.udp_available || (self.auxiliary_enabled && !self.video_bound)) {
@@ -1067,7 +1220,7 @@ impl ViewerMedia {
             Recover => {
                 let named = (control.transport_epoch, control.codec_epoch);
                 let current = self.active().map(|stream| (Some(stream.transport_epoch), Some(stream.codec_epoch)));
-                return if current == Some(named) { self.begin(now) } else { Ok(Vec::new()) };
+                return if current == Some(named) && self.retry_at.is_none() { self.begin(now) } else { Ok(Vec::new()) };
             }
             _ => {}
         }
@@ -1078,22 +1231,22 @@ impl ViewerMedia {
             return Ok(Vec::new());
         };
         Ok(match (control.operation, transaction.stage) {
+            (Ready, _) if transaction.fast.is_some() => {
+                let fast = transaction.fast.as_mut().unwrap();
+                fast.host_ready = true;
+                fast.repeat_at = None;
+                fast.held.take().map(|packet| ViewerMediaEvent::Video(packet, stream, true)).into_iter().collect()
+            }
             (Ready, ViewerStage::Preparing) => {
                 transaction.stage = ViewerStage::Ready;
-                self.receiving = Some(ReceivingStream { stream, next_frame: 1, pending: VecDeque::new(), last_decoded: None, reported_playback: false });
+                self.receiving = Some(ReceivingStream::new(stream));
                 vec![ViewerMediaEvent::Send(MediaControl::transaction(Ready, id, stream, path).message()?)]
             }
-            (Commit, ViewerStage::Decoded) => {
-                self.active = Some(transaction.route);
-                self.transaction = None;
-                // A slow first probe may finish during reliable cutover. Show that IDR before trying UDP.
-                if self.udp_verified && path != "udp" {
-                    self.retry_at = Some(now + Self::RETRY_DELAY);
-                }
-                log::info!("viewer committed {path} media stream (transport epoch {}, codec epoch {})", stream.transport_epoch, stream.codec_epoch);
-                vec![ViewerMediaEvent::Committed(stream), ViewerMediaEvent::Send(MediaControl::transaction(Committed, id, stream, path).message()?)]
-            }
+            (Commit, ViewerStage::Decoded) if transaction.fast.is_none() => self.commit(now)?,
             (Abort, _) => {
+                if transaction.route.path == MediaPath::Udp && transaction.stage != ViewerStage::Preparing {
+                    return self.udp_delivery_failed(now);
+                }
                 if transaction.route.path == MediaPath::Udp {
                     self.udp_verified = false;
                 }
@@ -1103,6 +1256,25 @@ impl ViewerMedia {
             }
             _ => Vec::new(),
         })
+    }
+
+    fn commit(&mut self, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
+        let tx = self.transaction.take().expect("decoded opening stream");
+        let route = tx.route;
+        if route.path == MediaPath::Udp {
+            self.udp_trials.opened();
+        }
+        self.active = Some(route);
+        if self.udp_verified && route.path != MediaPath::Udp {
+            self.retry_at = Some(now + Self::RETRY_DELAY);
+        }
+        log::info!(
+            "viewer committed {} media stream (transport epoch {}, codec epoch {})",
+            route.path.name(),
+            route.stream.transport_epoch,
+            route.stream.codec_epoch
+        );
+        Ok(vec![ViewerMediaEvent::Committed(route.stream), ViewerMediaEvent::Send(route.transaction(MediaOperation::Committed, tx.id).message()?)])
     }
 
     pub fn frame(&mut self, payload: &[u8], now: Instant) -> Result<Vec<ViewerMediaEvent>> {
@@ -1116,7 +1288,7 @@ impl ViewerMedia {
         if self.frame_path() != path || path == MediaPath::Udp {
             return Ok(Vec::new());
         }
-        self.accept_frame(MediaFrame::decode(payload)?, payload.len(), true, now)
+        self.accept_frame(MediaFrame::decode(payload)?, true, now)
     }
 
     /// The fragment receiver already validated the stream payload and sent its arrival feedback.
@@ -1124,12 +1296,10 @@ impl ViewerMedia {
         if self.frame_path() != MediaPath::Udp {
             return Ok(Vec::new());
         }
-        let packet = &frame.packet;
-        let bytes = packet.avcc.len() + packet.sps.len() + packet.pps.len() + packet.vps.len();
-        self.accept_frame(frame, bytes, false, now)
+        self.accept_frame(frame, false, now)
     }
 
-    fn accept_frame(&mut self, frame: MediaFrame, bytes: usize, report_arrival: bool, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
+    fn accept_frame(&mut self, frame: MediaFrame, report_arrival: bool, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
         let Some(receiver) = self.receiving.as_ref().filter(|receiver| receiver.stream == frame.header.stream) else { return Ok(Vec::new()) };
         let expected = receiver.next_frame;
         if frame.header.frame_id < expected {
@@ -1148,6 +1318,7 @@ impl ViewerMedia {
         if receiver.pending.iter().any(|pending| pending.sequence == frame.packet.sequence) {
             return Err(DeskError::invalid("待解码的媒体帧序号重复"));
         }
+        let bytes = frame.packet.encoded_len();
         self.check_decode_capacity(bytes)?;
         let receiver = self.receiving.as_mut().expect("the frame belongs to this receiver");
         receiver.pending.push_back(PendingMediaDecode {
@@ -1162,7 +1333,12 @@ impl ViewerMedia {
         if report_arrival {
             events.push(ViewerMediaEvent::feedback(self.frame_path(), FeedbackKind::Reassembled, frame.header));
         }
-        events.push(ViewerMediaEvent::Video(frame.packet, frame.header.stream, frame.header.frame_id == 1));
+        if let Some(fast) = self.transaction.as_mut().and_then(|tx| tx.fast.as_mut()).filter(|f| !f.host_ready) {
+            fast.held = Some(frame.packet);
+            fast.repeat_at = None;
+        } else {
+            events.push(ViewerMediaEvent::Video(frame.packet, frame.header.stream, frame.header.frame_id == 1));
+        }
         Ok(events)
     }
 
@@ -1179,7 +1355,7 @@ impl ViewerMedia {
             .map(|(_, size)| *size)
             .chain(self.receiving.iter().flat_map(|receiver| receiver.pending.iter().map(|frame| frame.bytes)));
         let (count, used) = sizes.fold((0, 0), |(count, used), size| (count + 1, used + size));
-        if count >= Self::MAXIMUM_PENDING_FRAMES || bytes > Self::MAXIMUM_PENDING_BYTES - used {
+        if count >= self.receive_capacity() || bytes > window::MAX_BUFFERED_BYTES - used {
             return Err(DeskError::invalid("媒体解码队列超过上限"));
         }
         Ok(())
@@ -1194,6 +1370,9 @@ impl ViewerMedia {
             }
             DecodeReceipt::Media(stream, sequence) => (stream, sequence),
         };
+        if self.transaction.as_ref().and_then(|tx| tx.fast.as_ref()).is_some_and(|f| f.held.is_some()) {
+            return Ok(Vec::new());
+        }
         let timed_events = self.tick(Instant::now())?;
         if !timed_events.is_empty() {
             return Ok(timed_events);
@@ -1214,7 +1393,11 @@ impl ViewerMedia {
         let mut events = vec![ViewerMediaEvent::feedback(path, FeedbackKind::Decoded, header)];
         if let Some(transaction) = self.transaction.as_mut().filter(|transaction| transaction.stage == ViewerStage::Ready) {
             transaction.stage = ViewerStage::Decoded;
-            events.push(ViewerMediaEvent::Send(transaction.route.transaction(MediaOperation::DecodedReady, transaction.id).message()?));
+            if transaction.fast.is_some() {
+                events.extend(self.commit(Instant::now())?);
+            } else {
+                events.push(ViewerMediaEvent::Send(transaction.route.transaction(MediaOperation::DecodedReady, transaction.id).message()?));
+            }
         }
         Ok(events)
     }
@@ -1227,6 +1410,7 @@ impl ViewerMedia {
             .or(self.retry_at)
             .into_iter()
             .chain(self.awaiting_decode().map(|(_, deadline)| deadline))
+            .chain(self.transaction.as_ref().and_then(|tx| tx.fast.as_ref()?.repeat_at))
             .min()
     }
 
@@ -1239,7 +1423,7 @@ impl ViewerMedia {
         if let Some((header, _)) = self.awaiting_decode().filter(|(_, deadline)| now >= *deadline) {
             events.push(ViewerMediaEvent::feedback(self.frame_path(), FeedbackKind::Expired, header));
             if self.frame_path() == MediaPath::Udp {
-                events.extend(self.set_udp_verified(false, now)?);
+                events.extend(self.udp_delivery_failed(now)?);
             } else if self.transaction.as_ref().is_some_and(|pending| pending.route.stream == header.stream) {
                 events.extend(self.abandon().map(|abort| abort.message().map(ViewerMediaEvent::Send)).transpose()?);
                 self.retry_at = Some(now + Self::RETRY_DELAY);
@@ -1248,13 +1432,15 @@ impl ViewerMedia {
             }
         } else if self.transaction.as_ref().is_some_and(|transaction| now >= transaction.started + TRANSACTION_TIMEOUT) {
             if self.frame_path() == MediaPath::Udp {
-                return self.set_udp_verified(false, now);
+                return self.udp_delivery_failed(now);
             }
             events.extend(self.abandon().map(|abort| abort.message().map(ViewerMediaEvent::Send)).transpose()?);
             self.retry_at = Some(now + Self::RETRY_DELAY);
         } else if self.retry_at.is_some_and(|at| now >= at) {
             self.retry_at = None;
             events.extend(self.begin(now)?);
+        } else {
+            events.extend(self.fast_prepare(now)?);
         }
         Ok(events)
     }
@@ -1265,6 +1451,7 @@ impl ViewerMedia {
             return Ok(Vec::new());
         }
         self.paused = paused;
+        self.udp_trials = UdpTrials::default();
         if !paused {
             return self.begin(now);
         }
@@ -1503,6 +1690,7 @@ mod tests {
                         self.settled += settled;
                         assert!(controls.is_empty());
                     }
+                    ViewerMediaEvent::DatagramPrepare(_) => {}
                     ViewerMediaEvent::DatagramFeedback(feedback) => {
                         let (settled, controls) = self.host.feedback(&feedback);
                         self.settled += settled;
@@ -1767,17 +1955,27 @@ mod tests {
     }
 
     #[test]
-    fn an_unreceived_udp_keyframe_expires_into_a_new_reliable_transaction() {
+    fn unanswered_opening_keyframes_retry_on_verified_udp_twice_before_reliable_video() {
         let mut pair = Pair::new();
         pair.offer_udp();
         pair.verify_udp();
-        let ready = pair.host.prepared().unwrap();
-        pair.viewer_receives(ready);
-        assert!(matches!(pair.host.frame(1, key_frame()).unwrap(), HostFrame::Datagram(_)));
-        let deadline = pair.viewer.deadline().unwrap();
-        let events = pair.viewer.tick(deadline).unwrap();
-        pair.viewer_events(events);
-        assert_eq!(pair.settled, 1);
+        for attempt in 1..=3 {
+            let ready = pair.host.prepared().unwrap();
+            assert_eq!(ready.path.as_deref(), Some("udp"));
+            pair.viewer_receives(ready);
+            assert!(matches!(pair.host.frame(attempt, key_frame()).unwrap(), HostFrame::Datagram(_)));
+            let deadline = pair.viewer.deadline().unwrap();
+            pair.now = deadline;
+            let events = pair.viewer.tick(deadline).unwrap();
+            pair.viewer_events(events);
+            assert_eq!(pair.settled, attempt as usize);
+            if attempt < 3 {
+                assert_eq!(pair.viewer.deadline(), Some(deadline + Duration::from_secs(1)));
+                pair.now = pair.viewer.deadline().unwrap();
+                let retry = pair.viewer.tick(pair.now).unwrap();
+                pair.viewer_events(retry);
+            }
+        }
         assert_eq!((pair.host.frame_path(), pair.viewer.frame_path()), (MediaPath::Shared, MediaPath::Shared));
         let ready = pair.host.prepared().unwrap();
         pair.viewer_receives(ready);
@@ -2065,12 +2263,45 @@ mod tests {
     }
 
     #[test]
+    fn only_the_first_bilateral_offer_opens_the_24_frame_decode_window() {
+        let now = Instant::now();
+        let mut host = HostMedia::default();
+        let mut viewer = ViewerMedia::default();
+        let mut request = ViewerMedia::request();
+        viewer.request_dynamic_window(&mut request);
+        assert_eq!(viewer.receive_capacity(), window::STATIC_FRAMES);
+        let initial = host.control(&request, false).unwrap();
+        let [HostMediaEvent::Send(offer)] = initial.as_slice() else {
+            panic!("expected an offer");
+        };
+        assert_eq!(offer.dynamic_frame_window, Some(true));
+        viewer.control(offer, now).unwrap();
+        let mut older = offer.clone();
+        older.dynamic_frame_window = None;
+        viewer.control(&older, now).unwrap();
+        assert_eq!(viewer.receive_capacity(), window::MAX_DYNAMIC_FRAMES);
+        for seq in 0..window::MAX_DYNAMIC_FRAMES as u32 {
+            viewer.legacy(seq, 1).unwrap();
+        }
+        assert!(viewer.legacy(24, 1).is_err());
+        viewer.decoded(DecodeReceipt::Legacy(19)).unwrap();
+        viewer.legacy(24, 1).unwrap();
+        let mut unsolicited = ViewerMedia::default();
+        unsolicited.control(offer, now).unwrap();
+        assert_eq!(unsolicited.receive_capacity(), window::STATIC_FRAMES);
+        let mut legacy = HostMedia::default();
+        legacy.control(&ViewerMedia::request(), false).unwrap();
+        let events = legacy.control(&request, false).unwrap();
+        assert!(matches!(events.as_slice(),[HostMediaEvent::Send(reply)] if reply.dynamic_frame_window.is_none()));
+    }
+
+    #[test]
     fn pending_decode_limits_bound_work_across_legacy_and_media_streams() {
         let mut viewer = ViewerMedia::default();
-        viewer.legacy(1, ViewerMedia::MAXIMUM_PENDING_BYTES).unwrap();
+        viewer.legacy(1, window::MAX_BUFFERED_BYTES).unwrap();
         assert!(viewer.legacy(2, 1).is_err());
         viewer.decoded(DecodeReceipt::Legacy(1)).unwrap();
-        for sequence in 0..ViewerMedia::MAXIMUM_PENDING_FRAMES as u32 {
+        for sequence in 0..window::STATIC_FRAMES as u32 {
             viewer.legacy(sequence, 10).unwrap();
         }
         assert!(viewer.legacy(10, 10).is_err());
@@ -2098,7 +2329,7 @@ mod tests {
     fn a_missing_decoder_output_expires_without_charging_the_replacement_stream() {
         let mut pair = Pair::new();
         pair.open();
-        for _ in 0..=ViewerMedia::MAXIMUM_PENDING_FRAMES {
+        for _ in 0..=window::STATIC_FRAMES {
             let retired = pair.viewer.active().unwrap();
             assert_eq!(pair.encode(2, dependent_frame()), "media");
             assert_eq!(pair.encode(3, dependent_frame()), "media");
@@ -2197,5 +2428,143 @@ mod tests {
         let repeated = MediaFrame::new(active, 1, VideoPacket::h264(1, key_frame())).unwrap().message().unwrap();
         assert!(pair.viewer.frame(&repeated.payload, pair.now).unwrap().is_empty());
         assert!(ViewerMedia::default().frame(&repeated.payload, pair.now).is_err(), "a frame before any session");
+    }
+
+    fn fast_pair(path: MediaPath) -> Pair {
+        let mut pair = Pair::new();
+        let mut request = ViewerMedia::request();
+        pair.viewer.request_fast_recovery(&mut request);
+        if path == MediaPath::Udp {
+            pair.viewer.set_udp_available(true);
+            pair.host.set_udp_available(true);
+        }
+        pair.host_receives(request);
+        if path == MediaPath::Udp {
+            pair.verify_udp();
+        }
+        let ready = pair.host.prepared().unwrap();
+        pair.viewer_receives(ready);
+        assert_eq!(pair.key_frames_wanted, 1);
+        pair.encode(30, key_frame());
+        pair.decode(30);
+        assert_eq!(pair.committed.len(), 1);
+        pair
+    }
+
+    #[test]
+    fn fast_udp_opens_once_after_its_own_probe_and_holds_early_video_until_ready() {
+        let mut pair = fast_pair(MediaPath::Udp);
+        let old = pair.committed[0];
+        let events = pair.viewer.control(&MediaControl::recover(old), pair.now).unwrap();
+        let [ViewerMediaEvent::Send(tls), ViewerMediaEvent::DatagramPrepare(copy)] = &events[..] else { panic!("expected both copies") };
+        assert_eq!(copy[0], 11);
+        assert_eq!(&copy[1..], tls.payload);
+        let prepare = MediaControl::read(tls).unwrap();
+        assert_eq!(prepare.fast, Some(true));
+        let id = prepare.transaction_id.unwrap();
+        let stream = pair.viewer.receiving_stream().unwrap();
+        pair.host_receives(prepare.clone());
+        assert!(pair.host.control(&prepare, false).unwrap().is_empty());
+        let ready = pair.host.prepared().unwrap();
+        assert_eq!(pair.host.pending_fast_challenge(), Some(id));
+        pair.host.answered_fast_challenge(Uuid::new_v4());
+        assert!(!pair.host.take_fast_keyframe());
+        assert_eq!(pair.host.gate(), Gate::Closed);
+        let repeated = pair.host.control(&prepare, false).unwrap();
+        assert!(matches!(&repeated[..], [HostMediaEvent::Send(replay)] if **replay == ready));
+        assert!(!pair.host.take_fast_keyframe());
+        pair.host.answered_fast_challenge(id);
+        assert!(pair.host.take_fast_keyframe());
+        assert!(!pair.host.take_fast_keyframe());
+        assert_eq!(pair.encode(31, key_frame()), "udp");
+        assert_eq!(pair.video.len(), 1, "Ready is still in flight");
+        assert!(pair.viewer.decoded(DecodeReceipt::Media(stream, 31)).unwrap().is_empty());
+        pair.viewer_receives(ready.clone());
+        pair.viewer_receives(ready);
+        assert_eq!(pair.video.len(), 2);
+        assert_eq!(pair.settled, 1);
+        let events = pair.viewer.decoded(DecodeReceipt::Media(stream, 31)).unwrap();
+        let [ViewerMediaEvent::DatagramFeedback(feedback), ViewerMediaEvent::Committed(local), ViewerMediaEvent::Send(committed)] = &events[..] else {
+            panic!("expected actual decoded receipt and direct committed")
+        };
+        assert_eq!(*local, stream);
+        assert_eq!(feedback.kind, FeedbackKind::Decoded);
+        // The TLS confirmation may precede its UDP receipt.
+        pair.host_receives(MediaControl::read(committed).unwrap());
+        assert_eq!(pair.host.gate(), Gate::Open);
+        assert_eq!(pair.host.feedback(feedback), (0, Vec::new()));
+        assert_eq!(pair.settled, 2);
+    }
+
+    #[test]
+    fn datagram_prepare_retries_are_bounded_and_an_aborted_nonce_cannot_restart_the_encoder() {
+        let mut pair = fast_pair(MediaPath::Udp);
+        let events = pair.viewer.control(&MediaControl::recover(pair.committed[0]), pair.now).unwrap();
+        let [ViewerMediaEvent::Send(tls), ViewerMediaEvent::DatagramPrepare(first)] = &events[..] else { panic!("expected fast recovery") };
+        let prepare = MediaControl::read(tls).unwrap();
+        pair.host_receives(prepare.clone());
+        let stream = *pair.prepared.last().unwrap();
+        let _ = pair.host.prepared().unwrap();
+        for _ in 1..MAX_FAST_REQUESTS {
+            pair.now += FAST_REQUEST_INTERVAL;
+            assert!(matches!(&pair.viewer.tick(pair.now).unwrap()[..], [ViewerMediaEvent::DatagramPrepare(copy)] if copy == first));
+        }
+        assert!(pair.viewer.tick(pair.now + FAST_REQUEST_INTERVAL).unwrap().is_empty());
+        let abort = MediaControl::transaction(MediaOperation::Abort, prepare.transaction_id.unwrap(), stream, "udp");
+        pair.host_receives(abort);
+        pair.host.answered_fast_challenge(prepare.transaction_id.unwrap());
+        assert!(!pair.host.take_fast_keyframe());
+        assert_eq!(pair.host.pending_fast_challenge(), None);
+        assert_ne!(pair.host.gate(), Gate::One);
+    }
+
+    #[test]
+    fn reliable_fast_recovery_finishes_on_decoded_feedback_and_path_changes_keep_the_full_handshake() {
+        let mut pair = fast_pair(MediaPath::Shared);
+        pair.viewer.set_udp_available(true);
+        pair.host.set_udp_available(true);
+        let events = pair.viewer.control(&MediaControl::recover(pair.committed[0]), pair.now).unwrap();
+        let [ViewerMediaEvent::Send(prepare)] = &events[..] else { panic!("reliable recovery has no UDP copies") };
+        let prepare = MediaControl::read(prepare).unwrap();
+        assert_eq!(prepare.fast, Some(true));
+        pair.host_receives(prepare);
+        let ready = pair.host.prepared().unwrap();
+        assert_eq!(pair.host.pending_fast_challenge(), None);
+        assert!(pair.host.take_fast_keyframe());
+        pair.viewer_receives(ready);
+        pair.encode(32, key_frame());
+        pair.decode(32);
+        assert_eq!(pair.committed.len(), 2);
+        assert_eq!(pair.host.gate(), Gate::Open);
+        assert_eq!(pair.settled, 2);
+        let events = pair.viewer.set_udp_verified(true, pair.now).unwrap();
+        let [ViewerMediaEvent::Send(prepare)] = &events[..] else { panic!("expected reliable Prepare only") };
+        let prepare = MediaControl::read(prepare).unwrap();
+        assert_eq!(prepare.path.as_deref(), Some("udp"));
+        assert_eq!(prepare.fast, None);
+        assert_eq!(pair.viewer.receiving_stream(), None);
+    }
+
+    #[test]
+    fn an_unsolicited_fast_offer_and_a_repeated_request_cannot_enable_fast_recovery() {
+        let mut pair = Pair::new();
+        let request = ViewerMedia::request();
+        let [HostMediaEvent::Send(offer)] = &pair.host.control(&request, false).unwrap()[..] else { panic!("expected offer") };
+        assert_eq!(offer.fast_recovery, None);
+        let mut repeated = request;
+        repeated.fast_recovery = Some(true);
+        let [HostMediaEvent::Send(same)] = &pair.host.control(&repeated, false).unwrap()[..] else { panic!("expected same offer") };
+        assert_eq!(offer, same);
+        let mut unsolicited = (**offer).clone();
+        unsolicited.fast_recovery = Some(true);
+        pair.viewer_receives(unsolicited);
+        let ready = pair.host.prepared().unwrap();
+        pair.viewer_receives(ready);
+        pair.encode(40, key_frame());
+        pair.decode(40);
+        let events = pair.viewer.control(&MediaControl::recover(pair.committed[0]), pair.now).unwrap();
+        let [ViewerMediaEvent::Send(prepare)] = &events[..] else { panic!("expected full transaction") };
+        assert_eq!(MediaControl::read(prepare).unwrap().fast, None);
+        assert_eq!(pair.viewer.receiving_stream(), None);
     }
 }

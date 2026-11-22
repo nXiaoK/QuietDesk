@@ -293,8 +293,10 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
                     active.refused_key_frames = 0;
                     let submission = active.sink.try_submit(frame);
                     stats.output(submission);
-                    if submission == FrameSubmission::Closed {
-                        stream = None;
+                    match submission {
+                        FrameSubmission::Queued => {}
+                        FrameSubmission::Dropped => active.restart_from_key_frame(),
+                        FrameSubmission::Closed => stream = None,
                     }
                 } else {
                     // The encoder took the request for a keyframe and still produced a dependent frame.

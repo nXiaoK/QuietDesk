@@ -1,7 +1,9 @@
 //! Authenticated media datagrams and the bidirectional path challenge shared by both desktop roles.
+mod retry;
 use crate::datagram_transport::{self, DatagramEvent, DatagramSender, DatagramTransport};
 use crate::media::{MediaControl, MediaOperation};
 use openssl::rand::rand_bytes;
+use retry::Recovery;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -11,10 +13,12 @@ use tokio::time::Instant;
 const PROBE_SIZE: usize = 1024;
 const PROBE_INTERVAL: Duration = Duration::from_millis(200);
 const NONCE_LIFETIME: Duration = Duration::from_secs(1);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) enum PathEvent {
     Verified,
     Lost,
+    FreshPong(uuid::Uuid),
     Record(u8, Vec<u8>),
 }
 
@@ -58,6 +62,7 @@ struct PathDriver {
     send: DatagramSender,
     events: mpsc::Receiver<PathEvent>,
     paused: watch::Sender<bool>,
+    fresh_probe: watch::Sender<Option<uuid::Uuid>>,
     rtt: watch::Receiver<Duration>,
     task: JoinHandle<()>,
 }
@@ -68,7 +73,19 @@ impl Drop for PathDriver {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Endpoint {
+    addr: SocketAddr,
+    host: bool,
+    key: [u8; 32],
+    session: uuid::Uuid,
+}
+
 pub(crate) struct DatagramPath {
+    credentials: Option<Endpoint>,
+    recovery: Recovery,
+    listen_after: Option<Instant>,
+    probe_by: Option<Instant>,
     endpoint: Option<SocketAddr>,
     driver: Option<PathDriver>,
     started: bool,
@@ -79,13 +96,24 @@ pub(crate) struct DatagramPath {
 
 impl DatagramPath {
     pub fn new(endpoint: Option<SocketAddr>) -> Self {
-        Self { endpoint, driver: None, started: false, paused: false, verified: false, rtt: Duration::from_millis(50) }
+        Self {
+            credentials: None,
+            recovery: Recovery::default(),
+            listen_after: None,
+            probe_by: None,
+            endpoint,
+            driver: None,
+            started: false,
+            paused: false,
+            verified: false,
+            rtt: Duration::from_millis(50),
+        }
     }
 
     /// Called before sending the first host offer or processing the first accepted viewer offer.
     pub fn offer(&mut self, offer: &MediaControl, host: bool) -> bool {
         if self.started || offer.operation != MediaOperation::Offer {
-            return self.driver.is_some();
+            return self.credentials.is_some();
         }
         self.started = true;
         let Some(endpoint) = self.endpoint else { return false };
@@ -95,18 +123,33 @@ impl DatagramPath {
         let (Some(session), Some(key)) = (offer.session_id, offer.datagram_key.as_deref().and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())) else {
             return false;
         };
-        let io = if host { datagram_transport::host(endpoint, key, session) } else { datagram_transport::viewer(endpoint, key, session) };
+        let target = Endpoint { addr: endpoint, host, key, session };
+        if !self.start_driver(target) {
+            return false;
+        }
+        self.credentials = Some(target);
+        true
+    }
+
+    fn start_driver(&mut self, target: Endpoint) -> bool {
+        let Endpoint { addr, host, key, session } = target;
+        let io = if host { datagram_transport::host(addr, key, session) } else { datagram_transport::viewer(addr, key, session) };
         let Ok(io) = io else {
-            log::info!("media DTLS endpoint unavailable");
+            if self.credentials.is_none() {
+                log::info!("media DTLS endpoint unavailable");
+            }
             return false;
         };
+        // The first probe may finish during the initial reliable cutover. Recovery probes have their own budget.
+        self.probe_by = (!host).then(|| Instant::now() + PROBE_TIMEOUT);
         // Screen configuration and keyframe requests may await a slow driver. Keep path probes live throughout.
         let send = io.sender();
         let (events, received) = mpsc::channel(128);
         let (paused, pause_events) = watch::channel(self.paused);
         let (rtt, measured_rtt) = watch::channel(self.rtt);
-        let task = tokio::spawn(drive(io, events, pause_events, rtt));
-        self.driver = Some(PathDriver { send, events: received, paused, rtt: measured_rtt, task });
+        let (fresh_probe, probes) = watch::channel(None);
+        let task = tokio::spawn(drive(io, events, pause_events, probes, rtt));
+        self.driver = Some(PathDriver { send, events: received, paused, fresh_probe, rtt: measured_rtt, task });
         true
     }
 
@@ -123,14 +166,38 @@ impl DatagramPath {
     }
 
     pub fn retire(&mut self) {
-        self.driver = None;
+        if self.driver.take().is_some() {
+            self.schedule_probe(Instant::now());
+        }
+        self.probe_by = None;
         self.verified = false;
     }
 
+    fn schedule_probe(&mut self, now: Instant) {
+        if self.credentials.is_some_and(|endpoint| endpoint.host) {
+            // Dropping the DTLS task releases its socket on the runtime. Re-bind for the viewer's next attempt.
+            self.listen_after = Some(now + PROBE_INTERVAL);
+        } else {
+            self.recovery.failed(now);
+        }
+    }
+
     pub fn pause(&mut self, paused: bool) {
+        self.recovery.pause(paused, Instant::now());
+        if paused {
+            self.probe_by = None;
+        } else if self.driver.is_some() && !self.verified && self.credentials.is_some_and(|endpoint| !endpoint.host) {
+            self.probe_by = Some(Instant::now() + PROBE_TIMEOUT);
+        }
         self.paused = paused;
         if let Some(io) = &self.driver {
             io.paused.send_if_modified(|value| std::mem::replace(value, paused) != paused);
+        }
+    }
+
+    pub fn probe_transaction(&self, id: Option<uuid::Uuid>) {
+        if let Some(io) = &self.driver {
+            io.fresh_probe.send_if_modified(|value| std::mem::replace(value, id) != id);
         }
     }
 
@@ -140,16 +207,41 @@ impl DatagramPath {
 
     pub async fn next(&mut self) -> PathEvent {
         loop {
-            let Some(io) = &mut self.driver else { return std::future::pending().await };
-            let event = io.events.recv().await;
+            if self.driver.is_none() {
+                let Some(target) = self.credentials else { return std::future::pending().await };
+                let deadline = if target.host { self.listen_after } else { self.recovery.deadline() };
+                let Some(at) = deadline.filter(|_| !self.paused) else { return std::future::pending().await };
+                tokio::time::sleep_until(at).await;
+                self.listen_after = None;
+                if !self.start_driver(target) {
+                    if target.host {
+                        self.listen_after = Some(Instant::now() + Duration::from_secs(2));
+                    } else {
+                        self.schedule_probe(Instant::now());
+                    }
+                }
+                continue;
+            }
+            let io = self.driver.as_mut().expect("a datagram driver is running");
+            let event = tokio::select! {
+                event = io.events.recv() => event,
+                _ = async { match self.probe_by {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }} => None,
+            };
             self.rtt = *io.rtt.borrow_and_update();
+            let event =
+                event.filter(|event| !matches!(event, PathEvent::Verified | PathEvent::FreshPong(_)) || (!io.events.is_closed() && io.send.authenticated()));
             match event {
-                Some(PathEvent::Record(_, _)) if self.paused => continue,
-                Some(PathEvent::Verified) if !io.events.is_closed() && io.send.authenticated() => {
+                Some(PathEvent::Record(_, _) | PathEvent::FreshPong(_)) if self.paused => continue,
+                Some(PathEvent::Verified) => {
                     self.verified = true;
+                    self.probe_by = None;
+                    self.recovery.selected(Instant::now());
                     return PathEvent::Verified;
                 }
-                None | Some(PathEvent::Lost | PathEvent::Verified) => {
+                None | Some(PathEvent::Lost) => {
                     self.retire();
                     return PathEvent::Lost;
                 }
@@ -159,16 +251,32 @@ impl DatagramPath {
     }
 }
 
-async fn drive(mut io: DatagramTransport, events: mpsc::Sender<PathEvent>, mut pause_events: watch::Receiver<bool>, measured_rtt: watch::Sender<Duration>) {
+async fn drive(
+    mut io: DatagramTransport,
+    events: mpsc::Sender<PathEvent>,
+    mut pause_events: watch::Receiver<bool>,
+    mut probes: watch::Receiver<Option<uuid::Uuid>>,
+    measured_rtt: watch::Sender<Duration>,
+) {
     let mut challenge = Challenge::default();
     let mut resumed = Instant::now();
     let mut next_ping = resumed;
     let mut ready = false;
     let mut verified = false;
     let mut paused = *pause_events.borrow_and_update();
+    let mut pending_probe = *probes.borrow_and_update();
     loop {
         let incoming = tokio::select! {
             event = io.next() => event,
+            changed = probes.changed() => {
+                if changed.is_err() { return }
+                pending_probe = *probes.borrow_and_update();
+                if pending_probe.is_some() {
+                    challenge.outstanding = None;
+                    next_ping = Instant::now();
+                }
+                continue;
+            }
             changed = pause_events.changed() => {
                 if changed.is_err() { return }
                 paused = *pause_events.borrow_and_update();
@@ -179,10 +287,10 @@ async fn drive(mut io: DatagramTransport, events: mpsc::Sender<PathEvent>, mut p
             }
             _ = tokio::time::sleep_until(next_ping), if ready && !paused => {
                 let now = Instant::now();
-                next_ping = now + PROBE_INTERVAL;
+                next_ping = now + if pending_probe.is_some() { Duration::from_millis(50) } else { PROBE_INTERVAL };
                 if let Some(ping) = challenge.ping(now) { io.try_send(ping); }
                 let last = challenge.last_pong.unwrap_or(resumed).max(resumed);
-                if verified && now.duration_since(last) >= NONCE_LIFETIME {
+                if (verified && now.duration_since(last) >= NONCE_LIFETIME) || (!verified && now.duration_since(resumed) >= PROBE_TIMEOUT) {
                     log::info!("media UDP challenge timed out");
                     break;
                 }
@@ -211,6 +319,12 @@ async fn drive(mut io: DatagramTransport, events: mpsc::Sender<PathEvent>, mut p
                     Some(2) => {
                         if let Some(rtt) = challenge.pong(&bytes, now) {
                             measured_rtt.send_replace(rtt);
+                            if !paused
+                                && let Some(id) = pending_probe
+                                && events.try_send(PathEvent::FreshPong(id)).is_ok()
+                            {
+                                pending_probe = None;
+                            }
                         }
                     }
                     Some(kind) if verified && !paused => {
@@ -318,5 +432,80 @@ mod tests {
         assert!(!challenge.verified(later));
         let late_reply = challenge.ping(later).unwrap();
         assert_eq!(challenge.pong(&late_reply, later + NONCE_LIFETIME), None);
+    }
+
+    #[tokio::test]
+    async fn fast_recovery_accepts_only_the_pong_to_the_new_transaction_challenge() {
+        let address = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let key = [7; 32];
+        let session = uuid::Uuid::new_v4();
+        let offer = MediaControl {
+            operation: MediaOperation::Offer,
+            session_id: Some(session),
+            datagram_key: Some(key.to_vec()),
+            path: Some("udp".into()),
+            ..crate::media::ViewerMedia::request()
+        };
+        let mut host = DatagramPath::new(Some(address));
+        assert!(host.offer(&offer, true));
+        let mut peer = datagram_transport::viewer(address, key, session).unwrap();
+        async fn ping(peer: &mut DatagramTransport) -> Vec<u8> {
+            loop {
+                match peer.next().await {
+                    DatagramEvent::Data(bytes) if bytes.first() == Some(&1) => return bytes,
+                    DatagramEvent::Closed => panic!("authenticated datagram peer closed"),
+                    _ => {}
+                }
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            assert!(matches!(peer.next().await, DatagramEvent::Ready));
+            let mut previous = ping(&mut peer).await;
+            assert!(peer.try_send(previous.clone())); // Other direction of the admission proof.
+            previous[0] = 2;
+            assert!(peer.try_send(previous));
+            assert!(matches!(host.next().await, PathEvent::Verified));
+            let mut old = ping(&mut peer).await;
+            let id = uuid::Uuid::new_v4();
+            host.probe_transaction(Some(id));
+            let mut current = loop {
+                let candidate = ping(&mut peer).await;
+                if candidate != old {
+                    break candidate;
+                }
+            };
+            old[0] = 2;
+            assert!(peer.try_send(old));
+            assert!(tokio::time::timeout(Duration::from_millis(80), host.next()).await.is_err());
+            current[0] = 2;
+            assert!(peer.try_send(current.clone()));
+            assert!(matches!(host.next().await, PathEvent::FreshPong(answer) if answer == id));
+            assert!(peer.try_send(current));
+            assert!(tokio::time::timeout(Duration::from_millis(80), host.next()).await.is_err());
+            // A valid answer still sitting in the session queue cannot authorize an IDR after path loss.
+            host.probe_transaction(Some(uuid::Uuid::new_v4()));
+            loop {
+                let mut next = ping(&mut peer).await;
+                next[0] = 2;
+                assert!(peer.try_send(next));
+                if tokio::time::timeout(Duration::from_millis(30), async {
+                    while host.driver.as_ref().unwrap().events.is_empty() {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                })
+                .await
+                .is_ok()
+                {
+                    break;
+                }
+            }
+            drop(peer);
+            while !host.driver.as_ref().unwrap().events.is_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(matches!(host.next().await, PathEvent::Lost));
+        })
+        .await
+        .unwrap();
     }
 }

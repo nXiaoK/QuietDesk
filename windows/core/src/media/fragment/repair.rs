@@ -38,6 +38,7 @@ impl Cached {
 }
 
 pub struct RepairCache {
+    capacity: usize,
     stream: MediaStreamId,
     frames: BTreeMap<u64, Cached>,
     next_frame: u64,
@@ -49,7 +50,11 @@ pub struct RepairCache {
 
 impl RepairCache {
     pub fn new(stream: MediaStreamId) -> Self {
-        Self { stream, frames: BTreeMap::new(), next_frame: 1, next_packet: 1, opener_submitted: false, buffered: 0, failed: false }
+        Self { capacity: STATIC_FRAMES, stream, frames: BTreeMap::new(), next_frame: 1, next_packet: 1, opener_submitted: false, buffered: 0, failed: false }
+    }
+
+    pub(crate) fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
     }
 
     pub fn insert(&mut self, frame: &MediaFrame, now: Instant, deadline: Instant) -> Result<Vec<OutgoingFragment>> {
@@ -69,7 +74,7 @@ impl RepairCache {
         }
         let count = bytes.len().div_ceil(PAYLOAD) as u16;
         let cost = bytes.len() + usize::from(count) * FRAGMENT_HEADER;
-        if self.frames.len() >= FRAME_WINDOW || cost > BYTE_BUDGET - self.buffered {
+        if self.frames.len() >= self.capacity || cost > BYTE_BUDGET - self.buffered {
             return Err(DeskError::invalid("媒体发送窗口或缓存已满"));
         }
         let base = self.next_packet;

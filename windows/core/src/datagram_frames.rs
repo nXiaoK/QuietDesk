@@ -7,6 +7,7 @@ use crate::media::fragment::fec::{self, ParityBlock};
 use crate::media::fragment::{BYTE_BUDGET, MAX_RECORD_BYTES, OutgoingFragment, PAYLOAD, RepairCache, SendEvent};
 use crate::media::{FeedbackKind, FragmentFeatures, MediaFeedback, MediaFrame, MediaFrameHeader, MediaStreamId};
 use crate::messages::StreamSettings;
+use crate::video_pacing::ByteCredit;
 use fec_policy::{FrameLoad, LossHistory};
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -40,6 +41,7 @@ pub(crate) struct DatagramFrames {
     cache: RepairCache,
     pending: VecDeque<Pending>,
     pending_bytes: usize,
+    pacing: ByteCredit,
     next_send: Instant,
     next_poll: Instant,
     settings: StreamSettings,
@@ -50,7 +52,10 @@ pub(crate) struct DatagramFrames {
 impl DatagramFrames {
     pub fn new(stream: MediaStreamId, settings: StreamSettings, features: FragmentFeatures, now: Instant, previous: Option<Self>) -> Self {
         let settings = StreamSettings { megabits: settings.megabits.max(1), frames_per_second: settings.frames_per_second.max(1), ..settings };
+        let rate = (settings.megabits as f64 * 200_000.0).max(250_000.0);
+        let burst = (rate * 0.008).clamp(((MAX_RECORD_BYTES + 1) * 4) as f64, 32_768.0);
         Self {
+            pacing: ByteCredit::new(rate, burst, now),
             stream,
             cache: RepairCache::new(stream),
             pending: VecDeque::new(),
@@ -61,6 +66,10 @@ impl DatagramFrames {
             features,
             loss: previous.map(|queue| queue.loss).unwrap_or_default(),
         }
+    }
+
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.cache.set_capacity(capacity);
     }
 
     pub fn insert(&mut self, frame: MediaFrame, now: Instant, rtt: Duration) -> Result<()> {
@@ -75,7 +84,7 @@ impl DatagramFrames {
         if bytes > BYTE_BUDGET - self.pending_bytes {
             return Err(DeskError::invalid("媒体数据报发送队列已满"));
         }
-        let wire_time = self.duration(self.pending_bytes + bytes);
+        let wire_time = self.pacing.duration(self.pending_bytes + bytes);
         let minimum = if header.is_idr { Duration::from_secs(1) } else { Duration::from_millis(250) };
         let ttl = (wire_time + rtt * 3 + Duration::from_millis(80)).clamp(minimum, Duration::from_secs(5));
         let fragments = self.cache.insert(&frame, now, now + ttl)?;
@@ -94,10 +103,6 @@ impl DatagramFrames {
         }
         self.pending_bytes += bytes;
         Ok(())
-    }
-
-    fn duration(&self, bytes: usize) -> Duration {
-        Duration::from_secs_f64(bytes as f64 * 8.0 / (self.settings.megabits as f64 * 1_000_000.0))
     }
 
     pub fn deadline(&self) -> Instant {
@@ -160,10 +165,10 @@ impl DatagramFrames {
     }
 
     fn send_batch(&mut self, now: Instant, mut send: impl FnMut(Vec<u8>) -> bool) {
-        let mut sent = 0;
         let mut encoded_block = false;
+        self.next_send = now;
         // Yield to control between bursts; a large key frame computes at most one group per turn.
-        for _ in 0..6 {
+        loop {
             if !encoded_block && let Some(Pending::Block { header, block, .. }) = self.pending.pop_front_if(|item| matches!(item, Pending::Block { .. })) {
                 for shard in block.encode().into_iter().rev() {
                     self.pending.push_front(Pending::Parity { header, datagram: shard.datagram() });
@@ -171,6 +176,15 @@ impl DatagramFrames {
                 encoded_block = true;
             }
             let Some(pending) = self.pending.front() else { break };
+            if matches!(pending, Pending::Block { .. }) {
+                self.next_send = now + Duration::from_micros(200);
+                break;
+            }
+            let size = pending.bytes();
+            if let Some(delay) = self.pacing.wait(size, now) {
+                self.next_send = now + delay.max(Duration::from_micros(200));
+                break;
+            }
             let datagram = match pending {
                 Pending::Fragment { fragment, repair } => {
                     let mut datagram = Vec::with_capacity(fragment.wire_len());
@@ -179,10 +193,10 @@ impl DatagramFrames {
                     datagram
                 }
                 Pending::Parity { datagram, .. } => datagram.clone(),
-                Pending::Block { .. } => break,
+                Pending::Block { .. } => unreachable!("handled before submitting parity"),
             };
-            let size = datagram.len();
             if !send(datagram) {
+                self.next_send = now + Duration::from_millis(1);
                 break;
             }
             if let Pending::Fragment { fragment, repair: false } = pending {
@@ -190,9 +204,8 @@ impl DatagramFrames {
             }
             self.pending.pop_front();
             self.pending_bytes -= size;
-            sent += size;
+            self.pacing.submitted(size);
         }
-        self.next_send = now + self.duration(sent).max(Duration::from_millis(1));
     }
 }
 
@@ -216,7 +229,7 @@ mod tests {
         for marked in [true, false] {
             let mut queue = DatagramFrames::new(
                 stream,
-                StreamSettings::new(1920, 30, 8),
+                StreamSettings::new(1920, 30, 1),
                 FragmentFeatures { marked_repairs: marked, ..FragmentFeatures::default() },
                 now,
                 None,
@@ -227,13 +240,15 @@ mod tests {
             assert_eq!(queue.pending.len(), total);
             assert_eq!(queue.next_send, now + Duration::from_millis(1));
             queue.send_batch(now, |d| d[0] == 3);
-            assert_eq!(queue.pending.len(), total - 6);
-            assert!(queue.next_send > now + Duration::from_millis(6));
+            assert_eq!(queue.pending.len(), total - 4);
+            assert!(queue.next_send >= now + Duration::from_millis(4));
             let ack = MediaFeedback::new(FeedbackKind::Decoded, header).unwrap();
             assert!(queue.feedback(&ack, now, Duration::ZERO));
-            assert_eq!(queue.pending.len(), total - 6);
+            assert_eq!(queue.pending.len(), total - 4);
             assert!(!queue.fully_submitted(header));
-            queue.send_batch(queue.next_send, |_| true);
+            while !queue.pending.is_empty() {
+                queue.send_batch(queue.next_send, |_| true);
+            }
             assert!(queue.fully_submitted(header));
             let later = now + Duration::from_millis(40);
             let nack = MediaFeedback::nack(header, vec![FragmentRange { first: 2, count: 1 }]).unwrap();
@@ -269,10 +284,6 @@ mod tests {
         assert_eq!(queue.pending_bytes, original_bytes + 2 * shard_bytes);
         let mut wire = Vec::new();
         queue.send_batch(now, |d| {
-            wire.push(d);
-            true
-        });
-        queue.send_batch(queue.next_send, |d| {
             if d[0] != 10 {
                 wire.push(d);
                 true
@@ -289,7 +300,7 @@ mod tests {
         });
         assert_eq!(queue.pending_bytes, remaining);
         let mut reject_last = false;
-        for _ in 0..3 {
+        while !queue.fully_submitted(header) {
             queue.send_batch(queue.next_send, |d| {
                 if reject_last && d[0] == 10 {
                     return false;

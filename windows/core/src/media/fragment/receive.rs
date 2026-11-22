@@ -113,6 +113,7 @@ enum Slot {
 }
 
 pub struct Receiver {
+    capacity: usize,
     stream: MediaStreamId,
     /// Oldest frame still charged to the receive window.
     first_unconfirmed: u64,
@@ -129,7 +130,12 @@ pub struct Receiver {
 
 impl Receiver {
     pub fn new(stream: MediaStreamId) -> Self {
+        Self::with_capacity(stream, STATIC_FRAMES)
+    }
+
+    pub(crate) fn with_capacity(stream: MediaStreamId, capacity: usize) -> Self {
         Self {
+            capacity,
             stream,
             first_unconfirmed: 1,
             next_delivery: 1,
@@ -228,7 +234,7 @@ impl Receiver {
                 self.last_decoded.map(|(h, _)| ReceiveEvent::Feedback(MediaFeedback::new(FeedbackKind::Decoded, h).expect("no ranges"))).into_iter().collect(),
             );
         }
-        if id == u64::MAX || id - self.first_unconfirmed >= FRAME_WINDOW as u64 {
+        if id == u64::MAX || id - self.first_unconfirmed >= self.capacity as u64 {
             return Some(self.fail(header));
         }
         if let Some(Slot::Parts(a)) = self.slots.get(&id) {

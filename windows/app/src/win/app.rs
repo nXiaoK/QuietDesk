@@ -8,7 +8,7 @@ use quietdesk_core::clipboard::{Exchange, Role};
 use quietdesk_core::clipboard_session::SessionClipboard;
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::host::{self, HostCommand, HostConnections, HostEvent, HostOptions};
-use quietdesk_core::media::{DecodeReceipt, MediaStreamId};
+use quietdesk_core::media::{DecodeReceipt, MediaStreamId, window};
 use quietdesk_core::messages::{DeviceIdentity, StreamSettings};
 use quietdesk_core::pairing::PairingKey;
 use quietdesk_core::peer::{self, PeerConfig};
@@ -225,17 +225,26 @@ pub trait ViewerSink: Send + Sync + 'static {
 
 struct WindowsViewer<S: ViewerSink> {
     packets: SyncSender<DecodeCommand>,
+    packet_bytes: Arc<tokio::sync::Semaphore>,
     sink: Arc<S>,
     display: Option<DisplayGeometry>,
     media_display: Option<DisplayGeometry>,
 }
 
 enum DecodeCommand {
-    Packet { packet: VideoPacket, receipt: DecodeReceipt, first: bool, display: Option<DisplayGeometry> },
+    Packet { packet: VideoPacket, receipt: DecodeReceipt, first: bool, display: Option<DisplayGeometry>, bytes: tokio::sync::OwnedSemaphorePermit },
     Commit(MediaStreamId),
 }
 
 impl<S: ViewerSink> WindowsViewer<S> {
+    fn packet(&self, packet: VideoPacket, receipt: DecodeReceipt, first: bool, display: Option<DisplayGeometry>) -> Result<()> {
+        let bytes = u32::try_from(packet.encoded_len())
+            .ok()
+            .and_then(|size| self.packet_bytes.clone().try_acquire_many_owned(size).ok())
+            .ok_or_else(|| DeskError::platform("视频解码字节队列已满"))?;
+        self.enqueue(DecodeCommand::Packet { packet, receipt, first, display, bytes })
+    }
+
     fn enqueue(&self, command: DecodeCommand) -> Result<()> {
         self.packets.try_send(command).map_err(|error| match error {
             TrySendError::Full(_) => DeskError::platform("视频解码队列已满"),
@@ -259,7 +268,7 @@ impl<S: ViewerSink> ViewerPlatform for WindowsViewer<S> {
     }
     fn video(&mut self, packet: VideoPacket) -> Result<()> {
         let receipt = DecodeReceipt::Legacy(packet.sequence);
-        self.enqueue(DecodeCommand::Packet { packet, receipt, first: false, display: self.display })
+        self.packet(packet, receipt, false, self.display)
     }
 
     fn media_video(&mut self, packet: VideoPacket, stream: MediaStreamId, first: bool) -> Result<()> {
@@ -267,7 +276,7 @@ impl<S: ViewerSink> ViewerPlatform for WindowsViewer<S> {
         if first {
             self.media_display = self.display;
         }
-        self.enqueue(DecodeCommand::Packet { packet, receipt, first, display: self.media_display })
+        self.packet(packet, receipt, first, self.media_display)
     }
 
     fn media_committed(&mut self, stream: MediaStreamId) -> Result<()> {
@@ -313,8 +322,8 @@ fn decode<S: ViewerSink>(
         if stopped.load(Ordering::Acquire) {
             break;
         }
-        let (packet, receipt, first, display) = match command {
-            DecodeCommand::Packet { packet, receipt, first, display } => (packet, receipt, first, display),
+        let (packet, receipt, first, display, _bytes) = match command {
+            DecodeCommand::Packet { packet, receipt, first, display, bytes } => (packet, receipt, first, display, bytes),
             DecodeCommand::Commit(stream) => {
                 let Some((_, mut opening)) = candidate.take_if(|(id, _)| *id == stream) else {
                     return Err(DeskError::platform("媒体流缺少已解码的首帧"));
@@ -415,8 +424,8 @@ pub async fn run_viewer<S: ViewerSink>(
 }
 
 async fn viewer_session<S: ViewerSink>(stream: tls::SecureStream, attempt: Attempt, frame: Arc<Mutex<Frame>>, sink: Arc<S>) -> ViewerEnd {
-    // Two three-frame windows allow the previous stream to retire while the next one opens.
-    let (packets, queue) = std::sync::mpsc::sync_channel(2 * host::FrameSink::WINDOW + 1);
+    // An opening commit shares the decoder thread with the negotiated frame window.
+    let (packets, queue) = std::sync::mpsc::sync_channel(window::MAX_DYNAMIC_FRAMES + 1);
     let (acknowledgements, acknowledged) = mpsc::unbounded_channel();
     let (finished, decode_result) = tokio::sync::oneshot::channel();
     let stopped = Arc::new(AtomicBool::new(false));
@@ -432,7 +441,8 @@ async fn viewer_session<S: ViewerSink>(stream: tls::SecureStream, attempt: Attem
         return ViewerEnd { reason: format!("无法启动解码线程：{error}"), host_ended: false, retryable: false, local_stop: false };
     }
     let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
-    let mut platform = WindowsViewer { packets, sink, display: None, media_display: None };
+    let mut platform =
+        WindowsViewer { packets, packet_bytes: Arc::new(tokio::sync::Semaphore::new(window::MAX_BUFFERED_BYTES)), sink, display: None, media_display: None };
     let mut end = attempt.run(peer.clone(), incoming, &mut platform, acknowledged).await;
     stopped.store(true, Ordering::Release);
     drop(platform);
@@ -498,9 +508,35 @@ mod display_tests {
     }
 
     #[test]
+    fn native_decode_queue_limits_encoded_bytes_across_replaced_streams_and_returns_them_on_drop() {
+        let (packets, queue) = std::sync::mpsc::sync_channel(window::MAX_DYNAMIC_FRAMES + 1);
+        let packet = |sequence| VideoPacket::h264(sequence, EncodedFrame { sps: vec![], pps: vec![], avcc: vec![0; 9] });
+        let size = packet(1).encoded_len();
+        let packet_bytes = Arc::new(tokio::sync::Semaphore::new(2 * size));
+        let mut viewer = WindowsViewer { packets, packet_bytes: packet_bytes.clone(), sink: Arc::new(Silent), display: None, media_display: None };
+        let stream = MediaStreamId { session_id: Default::default(), transport_epoch: 1, codec_epoch: 1 };
+        viewer.media_video(packet(1), stream, true).unwrap();
+        viewer.media_video(packet(2), stream, false).unwrap();
+        let next = MediaStreamId { codec_epoch: 2, ..stream };
+        assert!(viewer.media_video(packet(3), next, true).is_err());
+        drop(queue.recv().unwrap());
+        viewer.media_video(packet(3), next, true).unwrap();
+        drop(queue);
+        assert_eq!(packet_bytes.available_permits(), 2 * size);
+        assert!(viewer.media_video(packet(4), next, false).is_err());
+        assert_eq!(packet_bytes.available_permits(), 2 * size);
+    }
+
+    #[test]
     fn a_late_packet_keeps_the_screen_that_opened_its_stream() {
         let (packets, queue) = std::sync::mpsc::sync_channel(3);
-        let mut viewer = WindowsViewer { packets, sink: Arc::new(Silent), display: None, media_display: None };
+        let mut viewer = WindowsViewer {
+            packets,
+            packet_bytes: Arc::new(tokio::sync::Semaphore::new(window::MAX_BUFFERED_BYTES)),
+            sink: Arc::new(Silent),
+            display: None,
+            media_display: None,
+        };
         let displays = vec![RemoteDisplayInfo::new(8, "左", 1920, 1080, true), RemoteDisplayInfo::new(9, "右", 1920, 1080, false)];
         let selection = |id, revision| ViewerEvent::Displays { displays: displays.clone(), selected: Some(id), pending: None, error: None, revision };
         let packet = |sequence| VideoPacket::h264(sequence, EncodedFrame { sps: vec![], pps: vec![], avcc: vec![] });

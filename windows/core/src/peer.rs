@@ -2,6 +2,7 @@
 //! `Sources/QuietDeskCore/Transport.swift`.
 
 use crate::error::{DeskError, Result};
+use crate::video_pacing::VideoPacer;
 use crate::wire::{self, MAXIMUM_MESSAGE_BYTES, Message, MessageKind};
 use std::io;
 use std::pin::Pin;
@@ -37,7 +38,10 @@ pub enum PeerEvent {
 }
 
 enum Outgoing {
-    Message(Vec<u8>),
+    Message {
+        bytes: Vec<u8>,
+        video_target: Option<u32>,
+    },
     /// Send what is queued, then close; with a reason when the connection itself gave up.
     Close(Option<DeskError>),
 }
@@ -68,12 +72,22 @@ impl PeerHandle {
     /// Queues a message behind those already queued. An error means the message itself cannot be sent;
     /// a connection that has closed drops it, and `PeerEvent::Closed` tells the session why it closed.
     pub fn send(&self, message: &Message) -> Result<()> {
+        self.enqueue(message, None)
+    }
+
+    /// Dedicated video connections may pace media without delaying input on the control connection.
+    pub(crate) fn send_video(&self, message: &Message, megabits: u32) -> Result<()> {
+        debug_assert_eq!(message.kind, MessageKind::MediaFrame);
+        self.enqueue(message, Some(megabits))
+    }
+
+    fn enqueue(&self, message: &Message, video_target: Option<u32>) -> Result<()> {
         let bytes = message.framed()?;
         // Video is paced by acknowledgements, so a queue this deep means the path has stalled.
         if self.shared.pending_bytes.fetch_add(bytes.len(), Ordering::Relaxed) + bytes.len() > MAXIMUM_MESSAGE_BYTES * 2 {
             let _ = self.outgoing.send(Outgoing::Close(Some(DeskError::Network("网络发送队列已满".to_string()))));
         } else {
-            let _ = self.outgoing.send(Outgoing::Message(bytes));
+            let _ = self.outgoing.send(Outgoing::Message { bytes, video_target });
         }
         Ok(())
     }
@@ -180,11 +194,19 @@ where
         let drive = async {
             let mut heartbeat = tokio::time::interval(config.heartbeat);
             let mut sequence = 0u64;
+            let mut pacer = None;
             let stopped = loop {
                 tokio::select! {
                     next = queued.recv() => match next {
-                        Some(Outgoing::Message(bytes)) => {
-                            let written = writer.write_all(&bytes).await;
+                        Some(Outgoing::Message { bytes, video_target }) => {
+                            let written = if let Some(target) = video_target {
+                                let now = Instant::now();
+                                let pacing = pacer.get_or_insert_with(|| VideoPacer::at(target, now));
+                                pacing.set_target(target, now);
+                                pacing.write(&mut writer, &bytes).await
+                            } else {
+                                writer.write_all(&bytes).await
+                            };
                             shared.pending_bytes.fetch_sub(bytes.len(), Ordering::Relaxed);
                             if let Err(error) = written { break Err(DeskError::from(error)); }
                         }
@@ -284,6 +306,21 @@ mod tests {
             }
         };
         assert!((0.0..1000.0).contains(&round_trip));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_large_dedicated_frame_is_paced_and_reassembled_before_its_successor() {
+        let (left, right) = tokio::io::duplex(256 * 1024);
+        let (sender, _sender_events) = spawn(left, PeerConfig::default());
+        let (_receiver, mut received) = spawn(right, PeerConfig::default());
+        let start = Instant::now();
+        let first = Message::new(MessageKind::MediaFrame, vec![0xab; 192 * 1024]);
+        let second = Message::new(MessageKind::MediaFrame, vec![1, 2]);
+        sender.send_video(&first, 1).unwrap();
+        sender.send_video(&second, 8).unwrap();
+        assert_eq!(next_message(&mut received).await.unwrap().payload, first.payload);
+        assert!(start.elapsed() >= Duration::from_millis(26));
+        assert_eq!(next_message(&mut received).await.unwrap().payload, second.payload);
     }
 
     #[tokio::test]

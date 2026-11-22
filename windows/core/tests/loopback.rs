@@ -437,11 +437,11 @@ async fn a_session_negotiates_streams_controls_and_ends_as_the_macos_roles_do() 
         until("frames keep coming while acknowledged", || fixture.packet_count() > first + 9).await;
         assert!(fixture.viewer_log.lock().unwrap().packets[first + 1..=first + 9].iter().all(|packet| !packet.is_key_frame()));
 
-        let stalled = fixture.hold_decoder() + FrameSink::WINDOW;
+        let stalled = fixture.hold_decoder() + 6;
         until("the entire window reaches the decoder", || fixture.packet_count() == stalled).await;
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert_eq!(fixture.packet_count(), stalled, "receipt of a frame alone does not return credit");
-        assert_eq!(fixture.outstanding(), FrameSink::WINDOW);
+        assert_eq!(fixture.outstanding(), 6);
         fixture.resume_decoder();
         until("frames resume once acknowledged", || fixture.packet_count() > stalled + 3).await;
 
@@ -854,13 +854,13 @@ async fn resume_retires_the_old_window_and_only_encodes_one_new_idr_until_commit
     let (_, viewer_end, _) = run_sessions(StreamSettings::new(1920, 30, 8), None, |fixture| async move {
         until("the first stream commits", || !fixture.viewer_log.lock().unwrap().commits.is_empty()).await;
         fixture.host_log.lock().unwrap().stale_frame_on_key_request = true;
-        let stalled = fixture.hold_decoder() + FrameSink::WINDOW;
+        let stalled = fixture.hold_decoder() + 4;
         until("the previous stream has no credit", || fixture.packet_count() == stalled).await;
 
         fixture.viewer_commands.send(ViewerCommand::Pause(true)).unwrap();
         until("pause is confirmed", || fixture.has_event(&ViewerEvent::Paused { paused: true, error: None })).await;
         fixture.viewer_commands.send(ViewerCommand::Pause(false)).unwrap();
-        until("the new keyframe arrives despite the three outstanding old frames", || fixture.packet_count() == stalled + 1).await;
+        until("the new keyframe arrives despite the four outstanding old frames", || fixture.packet_count() == stalled + 1).await;
         assert!(fixture.viewer_log.lock().unwrap().packets[stalled].is_key_frame());
         let encoded = fixture.sink.lock().unwrap().as_ref().unwrap().produced;
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -874,10 +874,10 @@ async fn resume_retires_the_old_window_and_only_encodes_one_new_idr_until_commit
         fixture.resume_decoder();
         until("the held keyframe commits", || fixture.viewer_log.lock().unwrap().commits.len() == 2).await;
         until("every credit is returned exactly once", || fixture.outstanding() == 0).await;
-        let next = fixture.hold_decoder() + FrameSink::WINDOW;
+        let next = fixture.hold_decoder() + 4;
         fixture.host_log.lock().unwrap().static_desktop = false;
-        until("all three slots are available to the resumed stream", || fixture.packet_count() == next).await;
-        assert_eq!(fixture.outstanding(), FrameSink::WINDOW);
+        until("all four slots are available to the resumed stream", || fixture.packet_count() == next).await;
+        assert_eq!(fixture.outstanding(), 4);
         fixture.viewer_commands.send(ViewerCommand::Disconnect).unwrap();
     })
     .await;

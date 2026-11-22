@@ -28,6 +28,7 @@ pub mod pixel;
 pub mod reliability;
 pub mod tls;
 pub mod video;
+mod video_pacing;
 pub mod viewer;
 pub mod wire;
 

@@ -437,6 +437,7 @@ struct ReportingViewer {
 #[derive(Default)]
 struct ScriptFeedback {
     hold: bool,
+    hold_openers: bool,
     held: Vec<(u32, DecodeReceipt, mpsc::UnboundedSender<DecodeReceipt>)>,
 }
 
@@ -444,11 +445,17 @@ impl ReportingViewer {
     fn report(&mut self, packet: VideoPacket, receipt: DecodeReceipt, first_in_media_stream: Option<bool>) -> Result<()> {
         let stream = packet.annex_b()?;
         let mut feedback = self.feedback.lock().unwrap();
-        emit(json!({
+        let opener = feedback.hold_openers && first_in_media_stream == Some(true);
+        let hold = feedback.hold || opener;
+        let mut event = json!({
             "event": "frame", "sequence": packet.sequence, "key": packet.is_key_frame(),
-            "annexB": hex(&stream), "firstInMediaStream": first_in_media_stream, "held": feedback.hold
-        }));
-        if feedback.hold {
+            "annexB": hex(&stream), "firstInMediaStream": first_in_media_stream, "held": hold
+        });
+        if opener {
+            event["openingPacket"] = json!(packet.encode()?);
+        }
+        emit(event);
+        if hold {
             feedback.held.push((packet.sequence, receipt, self.acknowledgements.clone()));
         } else {
             let _ = self.acknowledgements.send(receipt);
@@ -754,7 +761,7 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
             emit(json!({ "event": "secured" }));
             *input.lock().unwrap() = new_translator();
             press.lock().unwrap().reset();
-            *feedback.lock().unwrap() = ScriptFeedback::default();
+            *feedback.lock().unwrap() = ScriptFeedback { hold_openers: arguments.contains_key("hold-media-openers"), ..ScriptFeedback::default() };
             let feedback = feedback.clone();
             let identity = identity.clone();
             let clipboard = clipboard.clone();

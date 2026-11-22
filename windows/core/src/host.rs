@@ -11,6 +11,7 @@ use crate::display::{DisplayControl, DisplaySwitch, HostDisplays, RemoteDisplayI
 use crate::error::{DeskError, Result};
 use crate::input::{HostInputTranslator, InjectOp};
 use crate::keymap::MacModifierMapping;
+use crate::media::window::{self, RoundTrips};
 use crate::media::{FeedbackKind, FragmentFeatures, MediaFrameHeader, MediaPath};
 use crate::media::{Gate, HostFrame, HostMedia, HostMediaEvent, MediaControl, MediaFeedback, MediaOperation};
 use crate::messages::{
@@ -38,10 +39,26 @@ const INITIAL_SETTINGS_GRACE: Duration = Duration::from_millis(250);
 struct CapturedFrame {
     generation: u64,
     frame: EncodedFrame,
+    credit: FrameCredit,
+}
+
+struct FrameCredit {
+    window: Arc<Mutex<FrameWindow>>,
+    bytes: usize,
+}
+
+impl Drop for FrameCredit {
+    fn drop(&mut self) {
+        let mut window = self.window.lock().unwrap();
+        window.outstanding -= 1;
+        window.bytes -= self.bytes;
+    }
 }
 
 struct FrameWindow {
     outstanding: usize,
+    bytes: usize,
+    limit: usize,
     gate: Gate,
     generation: u64,
     key_submitted: bool,
@@ -49,7 +66,7 @@ struct FrameWindow {
 
 impl FrameWindow {
     fn new(gate: Gate) -> Self {
-        Self { outstanding: 0, gate, generation: 0, key_submitted: false }
+        Self { outstanding: 0, bytes: 0, limit: FrameSink::WINDOW, gate, generation: 0, key_submitted: false }
     }
 
     fn set_gate(&mut self, gate: Gate) {
@@ -61,7 +78,7 @@ impl FrameWindow {
     }
 
     fn has_credit(&self) -> bool {
-        self.outstanding < FrameSink::WINDOW && (self.gate == Gate::Open || (self.gate == Gate::One && !self.key_submitted))
+        self.outstanding < self.limit && self.bytes < window::MAX_BUFFERED_BYTES && (self.gate == Gate::Open || (self.gate == Gate::One && !self.key_submitted))
     }
 }
 
@@ -84,7 +101,7 @@ pub enum FrameSubmission {
 
 impl FrameSink {
     /// Frames a viewer may have received without acknowledging, as released viewers expect.
-    pub const WINDOW: usize = 3;
+    pub const WINDOW: usize = window::LEGACY_FRAMES;
 
     /// Whether another frame may be encoded. A frame produced without credit only adds delay.
     pub fn has_credit(&self) -> bool {
@@ -108,15 +125,17 @@ impl FrameSink {
         }
         // Capture may have started encoding just before a prepare closed the gate. Only an IDR
         // may consume the single permit; a queued frame from an older gate cannot consume it again.
-        if !window.has_credit() || (window.gate == Gate::One && !frame.is_key_frame()) {
+        let bytes = frame.encoded_len();
+        if !window.has_credit() || bytes > window::MAX_BUFFERED_BYTES - window.bytes || (window.gate == Gate::One && !frame.is_key_frame()) {
             return FrameSubmission::Dropped;
         }
-        if self.frames.send(CapturedFrame { generation: window.generation, frame }).is_err() {
-            return FrameSubmission::Closed;
-        }
         window.outstanding += 1;
+        window.bytes += bytes;
         window.key_submitted = window.gate == Gate::One;
-        FrameSubmission::Queued
+        let captured = CapturedFrame { generation: window.generation, frame, credit: FrameCredit { window: self.window.clone(), bytes } };
+        let result = self.frames.send(captured);
+        drop(window);
+        if result.is_ok() { FrameSubmission::Queued } else { FrameSubmission::Closed }
     }
 }
 
@@ -314,7 +333,9 @@ struct HostSession<'a, P: HostPlatform> {
     media_prepared: bool,
     cursor: HostCursor,
     recover_after: Instant,
-    unacknowledged: VecDeque<u32>,
+    unacknowledged: VecDeque<(u32, FrameCredit)>,
+    media_credits: VecDeque<FrameCredit>,
+    round_trips: RoundTrips,
     sequence: u32,
     paused: bool,
     control_subscribed: bool,
@@ -397,6 +418,8 @@ pub async fn run_with_auxiliary<P: HostPlatform>(
         cursor: HostCursor { id: Uuid::new_v4(), epoch: 0, revision: 0, sequence: 0, samples: None, previous: None },
         recover_after: Instant::now(),
         unacknowledged: VecDeque::new(),
+        media_credits: VecDeque::new(),
+        round_trips: RoundTrips::default(),
         sequence: 0,
         paused: false,
         control_subscribed: false,
@@ -422,6 +445,13 @@ impl<P: HostPlatform> HostSession<'_, P> {
         };
         let start_by = Instant::now() + INITIAL_SETTINGS_GRACE;
         loop {
+            self.datagrams.probe_transaction(self.media.pending_fast_challenge());
+            if self.media.take_fast_keyframe() {
+                if let Err(error) = self.request_opening_frame().await {
+                    return error;
+                }
+                self.sync_gate();
+            }
             let media_deadline = self.media.deadline().into_iter().chain(self.media.recovery().map(|_| self.recover_after)).min();
             let gesture_check = self.platform.gesture_check_at();
             if self.media.frame_path() != MediaPath::Udp {
@@ -432,7 +462,11 @@ impl<P: HostPlatform> HostSession<'_, P> {
             let outcome = tokio::select! {
                 event = incoming.recv() => match event {
                     Some(PeerEvent::Message(message)) => self.receive(message, events).await,
-                    Some(PeerEvent::RoundTrip(milliseconds)) => { events(HostEvent::RoundTrip(milliseconds)); Ok(()) }
+                    Some(PeerEvent::RoundTrip(milliseconds)) => {
+                        self.round_trips.record_control(Instant::now(), milliseconds);
+                        self.sync_gate();
+                        events(HostEvent::RoundTrip(milliseconds)); Ok(())
+                    }
                     Some(PeerEvent::Closed(reason)) => Err(reason),
                     None => Err(DeskError::Network("连接已关闭".to_string())),
                 },
@@ -440,10 +474,10 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 _ = tokio::time::sleep_until(media_deadline.unwrap_or(start_by)), if !self.paused && media_deadline.is_some() => self.tick_media(),
                 _ = tokio::time::sleep_until(gesture_check.unwrap_or(start_by)), if gesture_check.is_some() => { self.platform.check_gestures(); Ok(()) }
                 audio = self.audio.next() => self.audio.deliver(audio, self.paused, self.peer),
-                event = self.datagrams.next() => self.datagram_event(event),
+                event = self.datagrams.next() => self.datagram_event(event).await,
                 _ = tokio::time::sleep_until(udp_by.unwrap_or(start_by)), if udp_by.is_some() && !self.paused => {
                     if self.udp_frames.as_mut().is_some_and(|frames| !frames.pump(&self.datagrams, Instant::now())) {
-                        self.lose_datagrams()
+                        self.interrupt_datagram_stream()
                     } else { Ok(()) }
                 }
                 event = self.auxiliary.next() => self.auxiliary_event(event),
@@ -541,6 +575,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
         }
         self.frames = Some(receiver);
         self.state = Some(state);
+        self.sync_gate();
         self.finish_preparation()?;
         events(HostEvent::Streaming(state));
         Ok(state)
@@ -551,38 +586,45 @@ impl<P: HostPlatform> HostSession<'_, P> {
             return Err(DeskError::platform("屏幕采集已停止"));
         };
         if self.paused || captured.generation != self.window.lock().unwrap().generation {
-            self.settle(1);
             return Ok(());
         }
         self.sequence = self.sequence.wrapping_add(1);
         match self.media.frame(self.sequence, captured.frame)? {
             HostFrame::Legacy(packet) => {
-                self.unacknowledged.push_back(self.sequence);
+                self.unacknowledged.push_back((self.sequence, captured.credit));
                 self.peer.send(&Message::new(MessageKind::Video, packet.encode()?))?;
             }
-            HostFrame::Media(message) => match self.media.frame_path() {
-                MediaPath::Shared => self.peer.send(&message)?,
-                MediaPath::Udp => return Err(DeskError::platform("UDP 帧被错误地放入可靠通道")),
-                MediaPath::Tcp => {
-                    if !self.auxiliary.peer(AuxiliaryRole::Video).is_some_and(|video| video.send(&message).is_ok()) {
-                        self.auxiliary.close(AuxiliaryRole::Video);
-                        let update = self.media.set_video_bound(false);
-                        self.apply_media_update(update)?;
+            HostFrame::Media(message) => {
+                self.media_credits.push_back(captured.credit);
+                match self.media.frame_path() {
+                    MediaPath::Shared => self.peer.send(&message)?,
+                    MediaPath::Udp => return Err(DeskError::platform("UDP 帧被错误地放入可靠通道")),
+                    MediaPath::Tcp => {
+                        let settings = self.state.map_or(self.options.preferred, |state| state.settings);
+                        if !self.auxiliary.peer(AuxiliaryRole::Video).is_some_and(|video| video.send_video(&message, settings.megabits as u32).is_ok()) {
+                            self.auxiliary.close(AuxiliaryRole::Video);
+                            let update = self.media.set_video_bound(false);
+                            self.apply_media_update(update)?;
+                        }
                     }
                 }
-            },
+            }
             HostFrame::Datagram(frame) => {
+                self.media_credits.push_back(captured.credit);
                 let now = Instant::now();
                 if self.udp_frames.as_ref().is_none_or(|frames| frames.stream != frame.header.stream) {
                     let settings = self.state.map_or(self.options.preferred, |state| state.settings);
-                    self.udp_frames =
-                        Some(DatagramFrames::new(frame.header.stream, settings, self.fragment_features.unwrap_or_default(), now, self.udp_frames.take()));
+                    let mut queue = DatagramFrames::new(frame.header.stream, settings, self.fragment_features.unwrap_or_default(), now, self.udp_frames.take());
+                    if self.media.capture_limits.dynamic {
+                        queue.set_capacity(window::MAX_DYNAMIC_FRAMES);
+                    }
+                    self.udp_frames = Some(queue);
                 }
                 if self.udp_frames.as_mut().expect("active UDP stream").insert(frame, now, self.datagrams.rtt).is_err() {
-                    self.lose_datagrams()?;
+                    self.interrupt_datagram_stream()?;
                 }
             }
-            HostFrame::Dropped => self.settle(1),
+            HostFrame::Dropped => {}
         }
         self.sync_gate();
         Ok(())
@@ -592,12 +634,22 @@ impl<P: HostPlatform> HostSession<'_, P> {
         if self.paused { Gate::Closed } else { self.media.gate() }
     }
 
-    fn sync_gate(&self) {
-        self.window.lock().unwrap().set_gate(self.capture_gate());
+    fn sync_gate(&mut self) {
+        let rtt =
+            self.round_trips.effective(Instant::now(), self.media.frame_path() == MediaPath::Udp, self.datagrams.verified().then_some(self.datagrams.rtt));
+        let fps = self.state.map_or(self.options.preferred, |state| state.settings).frames_per_second;
+        let mut window = self.window.lock().unwrap();
+        window.limit = self.media.capture_limits.credits(fps, rtt);
+        window.set_gate(self.capture_gate());
     }
 
-    fn settle(&self, count: usize) {
-        self.window.lock().unwrap().outstanding -= count;
+    fn settle(&mut self, count: usize) {
+        self.media_credits.drain(..count);
+    }
+
+    fn interrupt_datagram_stream(&mut self) -> Result<()> {
+        self.udp_frames = None;
+        self.interrupt_media()
     }
 
     fn lose_datagrams(&mut self) -> Result<()> {
@@ -607,7 +659,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
         self.apply_media_update(update)
     }
 
-    fn datagram_event(&mut self, event: PathEvent) -> Result<()> {
+    async fn datagram_event(&mut self, event: PathEvent) -> Result<()> {
         match event {
             PathEvent::Verified => {
                 let update = self.media.set_udp_verified(true);
@@ -617,6 +669,15 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 }
             }
             PathEvent::Lost => return self.lose_datagrams(),
+            PathEvent::FreshPong(id) => self.media.answered_fast_challenge(id),
+            PathEvent::Record(11, mut data) if self.media.fast_recovery_negotiated() => {
+                let message = Message::new(MessageKind::MediaControl, data.split_off(1));
+                if let Ok(control) = MediaControl::read(&message)
+                    && self.media.accepts_fast_copy(&control)
+                {
+                    self.receive_control(control).await?;
+                }
+            }
             PathEvent::Record(4, data) if self.media.frame_path() == MediaPath::Udp => {
                 let Ok(feedback) = MediaFeedback::decode(&data[1..]) else { return Ok(()) };
                 let Some(frames) = &mut self.udp_frames else { return Ok(()) };
@@ -626,7 +687,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                     return Ok(());
                 }
                 if !frames.feedback(&feedback, Instant::now(), self.datagrams.rtt) {
-                    return self.lose_datagrams();
+                    return self.interrupt_datagram_stream();
                 }
                 let update = self.media.feedback(&feedback);
                 self.apply_media_update(update)?;
@@ -837,6 +898,14 @@ impl<P: HostPlatform> HostSession<'_, P> {
         Ok(())
     }
 
+    async fn request_opening_frame(&mut self) -> Result<()> {
+        let deadline = self.media.deadline().expect("an opening stream has a transaction deadline");
+        match tokio::time::timeout_at(deadline, self.platform.request_key_frame()).await {
+            Ok(result) => result,
+            Err(_) => self.tick_media(),
+        }
+    }
+
     async fn receive_control(&mut self, control: MediaControl) -> Result<()> {
         if let (Some(path), Some(epoch)) = (&control.path, control.transport_epoch) {
             log::info!("viewer media {:?} on {path} (epoch {epoch})", control.operation);
@@ -844,7 +913,13 @@ impl<P: HostPlatform> HostSession<'_, P> {
         if control.operation == MediaOperation::Request {
             self.fragment_features.get_or_insert_with(|| FragmentFeatures::from_peer(&control));
         }
-        if control.operation == MediaOperation::DecodedReady && self.media.frame_path() == MediaPath::Udp {
+        let fast_opening = self.media.fast_opening().filter(|header| {
+            control.operation == MediaOperation::Committed
+                && control.session_id == Some(header.stream.session_id)
+                && control.transport_epoch == Some(header.stream.transport_epoch)
+                && control.codec_epoch == Some(header.stream.codec_epoch)
+        });
+        if (control.operation == MediaOperation::DecodedReady || fast_opening.is_some()) && self.media.frame_path() == MediaPath::Udp {
             let ready =
                 self.udp_frames.as_ref().is_some_and(|frames| frames.fully_submitted(MediaFrameHeader { stream: frames.stream, frame_id: 1, is_idr: true }));
             if !ready {
@@ -855,15 +930,15 @@ impl<P: HostPlatform> HostSession<'_, P> {
             match event {
                 HostMediaEvent::Send(reply) => self.send_control(*reply)?,
                 HostMediaEvent::Prepare(_) => self.prepare_media()?,
-                HostMediaEvent::ProduceKeyFrame => {
-                    let deadline = self.media.deadline().expect("an opening stream has a transaction deadline");
-                    match tokio::time::timeout_at(deadline, self.platform.request_key_frame()).await {
-                        Ok(result) => result?,
-                        Err(_) => self.tick_media()?,
-                    }
-                }
+                HostMediaEvent::ProduceKeyFrame => self.request_opening_frame().await?,
                 HostMediaEvent::Settled(count) => self.settle(count),
             }
+        }
+        if self.media.fast_opening().is_none()
+            && let Some(header) = fast_opening
+            && let Some(frames) = &mut self.udp_frames
+        {
+            frames.feedback(&MediaFeedback::new(FeedbackKind::Decoded, header)?, Instant::now(), self.datagrams.rtt);
         }
         self.sync_gate();
         Ok(())
@@ -871,7 +946,6 @@ impl<P: HostPlatform> HostSession<'_, P> {
 
     fn prepare_media(&mut self) -> Result<()> {
         self.sync_gate();
-        self.settle(self.unacknowledged.len());
         self.unacknowledged.clear();
         if self.state.is_some() {
             self.finish_preparation()?;
@@ -1034,9 +1108,8 @@ impl<P: HostPlatform> HostSession<'_, P> {
             }
             MessageKind::Acknowledgement => {
                 let sequence = u32::from_be_bytes(message.payload[..].try_into().map_err(|_| DeskError::invalid("画面确认无效"))?);
-                if let Some(position) = self.unacknowledged.iter().position(|sent| *sent == sequence) {
+                if let Some(position) = self.unacknowledged.iter().position(|(sent, _)| *sent == sequence) {
                     self.unacknowledged.remove(position);
-                    self.settle(1);
                 }
             }
             MessageKind::MediaControl => self.receive_control(MediaControl::read(&message)?).await?,
@@ -1215,6 +1288,32 @@ mod tests {
     }
 
     #[test]
+    fn credits_shrink_without_evicting_frames_and_the_byte_budget_follows_each_receipt() {
+        let (frames, mut queue) = mpsc::unbounded_channel();
+        let window = Arc::new(Mutex::new(FrameWindow::new(Gate::Open)));
+        window.lock().unwrap().limit = window::MAX_DYNAMIC_FRAMES;
+        let sink = FrameSink { frames, window: window.clone() };
+        let sized = |bytes| EncodedFrame { sps: vec![], pps: vec![], avcc: vec![0; bytes - 8] };
+        let cost = window::MAX_BUFFERED_BYTES / 3;
+        for _ in 0..3 {
+            assert_eq!(sink.try_submit(sized(cost)), FrameSubmission::Queued);
+        }
+        assert_eq!(sink.try_submit(sized(12)), FrameSubmission::Dropped);
+        let oldest = queue.try_recv().unwrap();
+        let next = queue.try_recv().unwrap();
+        window.lock().unwrap().limit = 2;
+        drop(next);
+        assert_eq!(sink.outstanding(), 2);
+        assert!(!sink.has_credit());
+        drop(oldest);
+        assert!(sink.has_credit());
+        assert_eq!(window.lock().unwrap().bytes, cost);
+        assert_eq!(sink.try_submit(sized(12)), FrameSubmission::Queued);
+        drop(queue);
+        assert_eq!(window.lock().unwrap().bytes, 0);
+    }
+
+    #[test]
     fn a_full_window_drops_frames_without_consuming_credit_and_a_closed_receiver_stops_capture() {
         let (frames, queue) = mpsc::unbounded_channel();
         let sink = FrameSink { frames, window: Arc::new(Mutex::new(FrameWindow::new(Gate::Open))) };
@@ -1229,6 +1328,6 @@ mod tests {
         drop(queue);
         assert_eq!(sink.try_submit(frame.clone()), FrameSubmission::Closed);
         assert!(!sink.submit(frame));
-        assert_eq!(sink.outstanding(), FrameSink::WINDOW);
+        assert_eq!(sink.outstanding(), 0);
     }
 }

@@ -129,10 +129,13 @@ private final class InteropMediaRoute: @unchecked Sendable {
     private let queue = DispatchQueue(label: "interop.datagram-route")
     private var sizes: [Int: Int] = [:]
     private var loss: FragmentLoss?
+    private let pongDelay: Double
+    private let delayed = DispatchQueue(label: "interop.delayed-probes", attributes: .concurrent)
     private var forwarding: Bool
     private var peers: [NWConnection] = []
 
-    init(target: UInt16, forwardUDP: Bool) throws {
+    init(target: UInt16, forwardUDP: Bool, pongDelay: Double = 0) throws {
+        self.pongDelay = pongDelay
         forwarding = forwardUDP
         tcp = try RelayOpaqueProxy(target: target)
         let ready = DispatchSemaphore(value: 0)
@@ -182,13 +185,18 @@ private final class InteropMediaRoute: @unchecked Sendable {
                     forward = false
                 }
             }
-            if forward { target.send(content: data, completion: .idempotent) }
+            if forward, video, self.pongDelay > 0, data.first == 23, data.count == Self.overhead + 1024 {
+                self.delayed.async {
+                    Thread.sleep(forTimeInterval: self.pongDelay)
+                    target.send(content: data, completion: .idempotent)
+                }
+            } else if forward { target.send(content: data, completion: .idempotent) }
             else { self.dropped.update { $0 += 1 } }
             self.receive(from: source, to: target, video: video)
         }
     }
 
-    func blockUDP() { queue.sync { forwarding = false } }
+    func forwardUDP(_ enabled: Bool) { queue.sync { forwarding = enabled } }
 
     func stop() {
         tcp.stop()
@@ -466,7 +474,6 @@ private final class MacViewer: @unchecked Sendable {
                 state.update { _ = $0.controlFrames.insert(frame.header) }
             } else if message.kind == .mediaControl {
                 let control = try MediaControl.read(message.payload)
-                if control.operation == .commit, let path = control.path { state.update { $0.commitPaths.append(path) } }
                 if control.operation == .ready {
                     state.update { state in
                         if let binding = state.cursorBinding, control.sessionID == binding.sessionID,
@@ -498,6 +505,9 @@ private final class MacViewer: @unchecked Sendable {
                 media.onVideo = { [weak self, state] frame, complete in
                     state.update { $0.mediaFrames.append(frame) }
                     self?.decode(frame.packet, frameID: frame.header.frameID, completion: complete)
+                }
+                media.onDiagnosticVideoPath = { [state] path in
+                    if case .committed(let path, _) = path { state.update { $0.commitPaths.append(path.rawValue) } }
                 }
                 media.onCommitStream = { [state] stream, _ in
                     state.update { state in
@@ -594,10 +604,10 @@ private final class MacViewer: @unchecked Sendable {
         }
     }
 
-    func requestMedia(markedRepairs: Bool? = nil, fec: CheckFEC = .legacy) throws -> MediaControl {
+    func requestMedia(markedRepairs: Bool? = nil, fec: CheckFEC = .legacy, dynamic: Bool? = nil, fast: Bool? = nil) throws -> MediaControl {
         state.update { $0.inspectedControls = [] }
-        peer.send(try MediaControl(.request, markedRepairs: markedRepairs, parityFEC: fec == .xor ? true : nil,
-                                   blockFEC: fec == .block ? true : nil, fecFragmentLimit: fec == .block ? 256 : nil).message())
+        peer.send(try MediaControl(.request, receiveFrameWindow: dynamic == true ? 6 : nil, markedRepairs: markedRepairs, dynamicFrameWindow: dynamic, parityFEC: fec == .xor ? true : nil,
+                                   blockFEC: fec == .block ? true : nil, fecFragmentLimit: fec == .block ? 256 : nil, fastRecovery: fast).message())
         try until("the Windows host offers media") { self.state.get().inspectedControls?.first != nil }
         guard let offer = state.get().inspectedControls?.first, offer.operation == .offer else { throw Failure("Missing media offer") }
         return offer
@@ -635,6 +645,128 @@ private final class MacViewer: @unchecked Sendable {
         }
     }
 
+    private func datagramEndpoint(session: UUID, secret: Data) throws -> BoundedDatagramPeer {
+        let parameters = try MediaSecureTransport.dtlsParameters(sessionKey: secret, identity: Data(session.uuidString.utf8))
+        let connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: auxiliaryPort)!, using: parameters)
+        return try BoundedDatagramPeer(connection: connection, maximumDatagramBytes: MediaFragment.maximumDatagramBytes + 1)
+    }
+
+    // A receiver delays genuine nonce echoes to vary the measured RTT. Holding only decoded receipts
+    // lets the sender finish each UDP frame while measuring how many frames received capture credit.
+    func checkDatagramWindow(_ window: Int, pongDelay: Double, recording: [Data]) throws {
+        let modern = window != MediaBufferLimits.legacyFrameWindow
+        let offer = try requestMedia(dynamic: modern ? true : nil, fast: modern ? true : nil)
+        guard let session = offer.sessionID, let secret = offer.datagramKey, offer.path == "udp" else { throw Failure("Missing datagram endpoint") }
+        try require((offer.dynamicFrameWindow == true) == modern && (offer.fastRecovery == true) == modern, "The offer changed the requested features")
+        let udp = try datagramEndpoint(session: session, secret: secret)
+        defer { udp.close() }
+        var ping = Data([1])
+        withUnsafeBytes(of: UUID().uuid) { ping.append(contentsOf: $0) }
+        ping.append(Data(count: 1024 - ping.count))
+        let nonce = ping
+        let echoes = Shared(0), records = Shared<[Data]>([])
+        let gate = Shared((closed: false, pongs: [Data]()))
+        let response = DispatchQueue(label: "interop.delayed-nonce")
+        udp.onDatagram = { [weak udp] data in
+            if data.first == 1, data.count == 1024 {
+                var bytes = data; bytes[bytes.startIndex] = 2
+                let pong = bytes
+                let hold = gate.update { value in
+                    if value.closed { value.pongs.append(pong) }
+                    return value.closed
+                }
+                if !hold {
+                    response.async { [weak udp] in
+                        if pongDelay > 0 { Thread.sleep(forTimeInterval: pongDelay) }
+                        _ = udp?.send(pong); _ = udp?.send(nonce)
+                    }
+                }
+            } else if data.first == 2, data.dropFirst() == nonce.dropFirst() { echoes.update { $0 += 1 } }
+            else if data.first == 3 || data.first == 5 { records.update { $0.append(data) } }
+        }
+        udp.start()
+        try until("fresh echoes measure the authenticated path") { echoes.get() >= 3 }
+
+        for epoch in UInt32(1)...2 {
+            let fast = modern && epoch == 2
+            let stream = MediaStreamID(sessionID: session, transportEpoch: epoch, codecEpoch: epoch), transaction = UUID()
+            let receiver = try MediaFrameReassembler(stream: stream, limits: MediaBufferLimits(maximumFrames: MediaBufferLimits.maximumDynamicFrameWindow))
+            func message(_ op: MediaControl.Operation) throws -> Message {
+                try MediaControl(op, sessionID: session, transactionID: transaction, transportEpoch: epoch, codecEpoch: epoch,
+                                 path: "udp", fast: op == .prepare && fast ? true : nil).message()
+            }
+            func responses() -> [MediaControl.Operation] {
+                (state.get().inspectedControls ?? []).filter { $0.transactionID == transaction && $0.transportEpoch == epoch
+                    && $0.codecEpoch == epoch && $0.path == "udp" }.map(\.operation)
+            }
+            let prepare = try message(.prepare)
+            if fast {
+                gate.update { $0 = (true, []) }
+                let request = Data([11]) + prepare.payload
+                try require(udp.send(request) && udp.send(request), "The duplicate fast requests did not leave the viewer")
+            } else { peer.send(prepare) }
+            try until("Windows sends the correlated ready") { responses().contains(.ready) }
+            if fast {
+                try until("the fast transaction issues a fresh nonce") { !gate.get().pongs.isEmpty }
+                usleep(45_000)
+                try require(try !records.get().contains { try MediaFragment.decode(Data($0.dropFirst())).header.stream == stream },
+                            "The host released the candidate IDR before the new nonce was returned")
+                let delayed = gate.update { value in defer { value = (false, []) }; return value.pongs }
+                for pong in delayed { _ = udp.send(pong) }
+                peer.send(prepare)
+            } else { peer.send(try message(.ready)) }
+            var frames: [MediaFrameHeader] = []
+            func handle(_ events: [MediaReceiveEvent]) throws {
+                for event in events {
+                    switch event {
+                    case .feedback(let ack):
+                        if ack.kind != .decoded || ack.header.frameID == 1 { _ = udp.send(Data([4]) + ack.encode()) }
+                    case .frameReady(let frame):
+                        let index = frames.count
+                        try require(frame.header.frameID == UInt64(index + 1) && annexB(frame.packet) == recording[index % recording.count],
+                                    "A windowed frame arrived out of order or changed bytes")
+                        let decoded = Shared(false), done = DispatchSemaphore(value: 0)
+                        decode(frame.packet, frameID: frame.header.frameID) { ok in decoded.update { $0 = ok }; done.signal() }
+                        try require(done.wait(timeout: .now() + 2) == .success && decoded.get(), "The windowed frame did not decode")
+                        frames.append(frame.header)
+                        try handle(receiver.decoded(frame.header, success: true))
+                        if index == 0 {
+                            if !fast {
+                                peer.send(try message(.decodedReady))
+                                try until("Windows sends the full protocol commit") { responses().contains(.commit) }
+                            }
+                            peer.send(try message(.committed))
+                        }
+                    case .recoveryRequired: throw Failure("An undamaged frame required another epoch")
+                    }
+                }
+            }
+            func poll() throws {
+                let batch = records.update { value in defer { value.removeAll(keepingCapacity: true) }; return value }
+                for data in batch {
+                    let fragment = try MediaFragment.decode(Data(data.dropFirst()))
+                    if fragment.header.stream == stream { try handle(receiver.receive(fragment)) }
+                }
+            }
+            let needed = epoch == 1 ? window + 1 : 2
+            let by = SessionClock.uptime + 4
+            while frames.count < needed && SessionClock.uptime < by { try poll(); usleep(500) }
+            try require(frames.count >= needed, "The host supplied only \(frames.count - 1) of \(needed - 1) frame credits")
+            if epoch == 1 {
+                let stalled = SessionClock.uptime + 0.09
+                while SessionClock.uptime < stalled { try poll(); usleep(500) }
+                try require(frames.count == needed, "The host exceeded the \(window)-frame window: \(frames.count - 1)")
+                _ = udp.send(Data([4]) + (try MediaFeedback(kind: .decoded, header: frames[1]).encode()))
+                let resumed = SessionClock.uptime + 2
+                while frames.count == needed && SessionClock.uptime < resumed { try poll(); usleep(500) }
+                try require(frames.count == needed + 1, "One decoded receipt did not release exactly one capture credit")
+            }
+            let replies = responses()
+            try require(fast ? !replies.isEmpty && replies.allSatisfy { $0 == .ready } : replies == [.ready, .commit],
+                        "Unexpected replies for the negotiated recovery: \(replies)")
+        }
+    }
+
     func checkDatagramRepair(recording: [Data], fec: CheckFEC = .legacy) throws {
         let offer = try requestMedia(markedRepairs: true, fec: fec)
         try require((offer.parityFEC == true) == (fec == .xor) && (offer.blockFEC == true) == (fec == .block),
@@ -642,16 +774,11 @@ private final class MacViewer: @unchecked Sendable {
         guard offer.path == "udp", let session = offer.sessionID, let secret = offer.datagramKey else {
             throw Failure("The Windows host did not offer its UDP endpoint")
         }
-        func endpoint(secret: Data) throws -> BoundedDatagramPeer {
-            let parameters = try MediaSecureTransport.dtlsParameters(sessionKey: secret, identity: Data(session.uuidString.utf8))
-            let connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: auxiliaryPort)!, using: parameters)
-            return try BoundedDatagramPeer(connection: connection, maximumDatagramBytes: MediaFragment.maximumDatagramBytes + 1)
-        }
 
         if fec == .legacy {
             var wrong = secret
             wrong[wrong.startIndex] ^= 1
-            let rejected = try endpoint(secret: wrong)
+            let rejected = try datagramEndpoint(session: session, secret: wrong)
             let admitted = Shared(false), closed = DispatchSemaphore(value: 0)
             rejected.onReady = { admitted.update { $0 = true } }
             rejected.onClose = { _ in closed.signal() }
@@ -663,7 +790,7 @@ private final class MacViewer: @unchecked Sendable {
             try until("the original control channel answers after the incorrect UDP key") { self.state.get().clipboard.count > oldCount }
         }
 
-        let udp = try endpoint(secret: secret)
+        let udp = try datagramEndpoint(session: session, secret: secret)
         defer { udp.close() }
         var ping = Data([1])
         withUnsafeBytes(of: UUID().uuid) { ping.append(contentsOf: $0) }
@@ -963,6 +1090,7 @@ private final class MacHost: @unchecked Sendable {
         var media: MediaSession?
         var closed: String?
         var failures: [String] = []
+        var receiverLimit: Int?
         var waiting = Set<UInt32>()
         var sequence: UInt32 = 0
         var next = 0
@@ -970,6 +1098,9 @@ private final class MacHost: @unchecked Sendable {
         var streaming = false
         var prepared = false
         var commits: [MediaControl] = []
+        var transactions: [MediaControl] = []
+        var deferredFastPrepare: Message?
+        var holdFastPrepare = false
         var cursorRequest: CursorControl?
         var heldCursorPreparation: (stream: MediaStreamID, complete: (Bool) -> Void)?
         var decodedFeedback = Set<MediaFrameHeader>()
@@ -997,6 +1128,7 @@ private final class MacHost: @unchecked Sendable {
     let port: UInt16
     private let advertiseMedia: Bool
     private let fec: CheckFEC?
+    private let legacyMedia: Bool
     private let cursorImage: CursorImage?
     private let cursorID = UUID()
     private let listener: NWListener
@@ -1019,7 +1151,8 @@ private final class MacHost: @unchecked Sendable {
     init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int), advertiseMedia: Bool, cursorImage: CursorImage?,
          externalPackets: [VideoPacket] = [], inputActions: Bool = true, relativeMouse: Bool = true, trackpadGestures: Bool = true,
          deviceID: UUID? = UUID(), identityExchange: Bool? = true, prepareHello: @escaping (Message) throws -> Message = { $0 },
-         on port: NWEndpoint.Port = .any, clipboard: InteropClipboard? = nil, advertiseAudio: Bool = true, fec: CheckFEC? = nil) throws {
+         on port: NWEndpoint.Port = .any, clipboard: InteropClipboard? = nil, advertiseAudio: Bool = true, fec: CheckFEC? = nil, legacyMedia: Bool = false) throws {
+        self.legacyMedia = legacyMedia
         self.fec = fec
         self.advertiseAudio = advertiseAudio
         self.advertiseMedia = advertiseMedia
@@ -1115,6 +1248,7 @@ private final class MacHost: @unchecked Sendable {
                         completion(false)
                     }
                 }
+                media.onReceiveFrameWindow = { [state = self.state] limit in state.update { $0.receiverLimit = limit } }
                 media.onProduceRecoveryFrame = { [weak self] in self?.produceFrame(recovery: true) }
                 media.onResumeFrames = { [state = self.state] in state.update { $0.prepared = false } }
                 media.onAcknowledged = { [state = self.state] sequence in state.update { _ = $0.waiting.remove(sequence) } }
@@ -1173,7 +1307,7 @@ private final class MacHost: @unchecked Sendable {
         if fec != nil && !recovery { return }
         state.update { state in
             guard state.streaming, !state.paused, state.prepared == recovery, let media = state.media,
-                  state.waiting.count < MediaBufferLimits.legacyFrameWindow else { return }
+                  state.waiting.count < VideoFrameFlow.maximumOutstandingFrames(for: state.applied.settings, receiverLimit: state.receiverLimit) else { return }
             if recovery { state.next = 0 }
             let recording = state.selectedDisplay == SyntheticDisplays.external.id ? externalPackets : packets
             let source = recording[state.next]
@@ -1212,7 +1346,22 @@ private final class MacHost: @unchecked Sendable {
         if advertiseMedia {
             if message.kind == .mediaControl {
                 let control = try MediaControl.read(message.payload)
-                if control.operation == .committed { state.update { $0.commits.append(control) } }
+                if [.prepare, .ready, .decodedReady, .committed].contains(control.operation) {
+                    let deferred = state.update { state in
+                        state.transactions.append(control)
+                        if control.operation == .committed { state.commits.append(control) }
+                        if state.holdFastPrepare, control.operation == .prepare, control.fast == true {
+                            state.deferredFastPrepare = message
+                            return true
+                        }
+                        return false
+                    }
+                    if deferred { return }
+                }
+                if control.operation == .request, legacyMedia {
+                    _ = media?.receive(try MediaControl(.request).message())
+                    return
+                }
                 if control.operation == .request, let fec {
                     let xor = fec == .xor && control.parityFEC == true, block = fec == .block && control.blockFEC == true
                     try require(fec == .legacy || xor || block, "The Windows viewer did not advertise the requested FEC mode")
@@ -1661,7 +1810,7 @@ private struct WindowsInteropChecks {
             }
         }
 
-        run("A Mac decodes Windows UDP video and switches to bound TCP after authenticated datagrams stop") {
+        run("A Mac decodes Windows video across UDP loss, reliable fallback and the first timed UDP reprobe") {
             var route: InteropMediaRoute?
             defer { route?.stop() }
             try withWindowsHost(udp: true, routeAuxiliary: { port in
@@ -1669,8 +1818,8 @@ private struct WindowsInteropChecks {
                 route = relay
                 return relay.port
             }) { _, viewer in
-                func check(_ path: String) throws -> MediaStreamID {
-                    try until("VideoToolbox decodes eight frames on \(path)", seconds: 15) {
+                func check(_ path: String, seconds: Double = 15) throws -> MediaStreamID {
+                    try until("VideoToolbox decodes eight frames on \(path)", seconds: seconds) {
                         let s = viewer.state.get()
                         guard s.commitPaths.last == path, let stream = s.commits.last,
                               let eighth = s.mediaFrames.first(where: { $0.header.stream == stream && $0.header.frameID == 8 }) else { return false }
@@ -1686,10 +1835,25 @@ private struct WindowsInteropChecks {
                     return stream
                 }
                 let original = try check("udp")
-                route?.blockUDP()
+                let cut = SessionClock.uptime
+                route?.forwardUDP(false)
                 let reliable = try check("tcp")
                 try require(route?.dropped.get() ?? 0 > 0 && reliable.sessionID == original.sessionID && reliable.transportEpoch > original.transportEpoch
                             && viewer.state.get().closed == nil, "UDP loss interrupted control or reused the old epoch")
+                route?.forwardUDP(true)
+                let restored = try check("udp", seconds: 43)
+                try require(restored.sessionID == original.sessionID && restored.transportEpoch > reliable.transportEpoch
+                            && restored.codecEpoch > reliable.codecEpoch && SessionClock.uptime - cut >= 30,
+                            "The first scheduled UDP reprobe did not recover the original desktop with a fresh keyframe")
+            }
+        }
+
+        for (window, delay) in [(3, 0.0), (8, 0.046), (24, 0.27)] {
+            run("Windows grants \(window) measured decode credits and uses the negotiated UDP recovery exchange") {
+                try withWindowsHost(useMedia: false, udp: true, preferred: StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 8)) { _, viewer in
+                    try until("Windows applies the requested frame rate") { !viewer.state.get().results.isEmpty && !viewer.state.get().decoded.isEmpty }
+                    try viewer.checkDatagramWindow(window, pongDelay: delay, recording: replayFrames)
+                }
             }
         }
 
@@ -1785,17 +1949,17 @@ private struct WindowsInteropChecks {
                 try verifyStream(1)
                 try require(viewer.state.get().legacyFrames > 0, "No legacy frames decoded before the shared path opened")
                 viewer.state.update { $0.holdAcknowledgements = true }
-                try until("three media frames remain unpaid") {
+                try until("four negotiated 30 fps media frames remain unpaid") {
                     let state = viewer.state.get()
                     guard let held = state.heldDecodes.first, let stream = state.commits.last else { return false }
-                    return state.controlFrames.contains { $0.stream == stream && $0.frameID == held.frameID + 2 }
+                    return state.controlFrames.contains { $0.stream == stream && $0.frameID == held.frameID + 3 }
                 }
                 usleep(100_000)
                 let state = viewer.state.get()
                 let held = state.heldDecodes.first!.frameID
                 let outstanding = state.controlFrames.filter { $0.stream == state.commits.last && $0.frameID >= held }
-                try require(outstanding.map(\.frameID).sorted() == [held, held + 1, held + 2],
-                            "A Windows host sent more than three frames without decode feedback")
+                try require(outstanding.map(\.frameID).sorted() == Array(held ..< held + 4),
+                            "The Windows host did not retain the negotiated four-frame 30 fps window")
                 viewer.releaseHeldDecodes()
                 try until("decode feedback reopens the window") { viewer.state.get().mediaFrames.count > state.mediaFrames.count + 6 }
 
@@ -2209,13 +2373,13 @@ private struct WindowsInteropChecks {
             }
         }
 
-        func withMacHost(advertiseMedia: Bool = true, udp: Bool = false, route: ((UInt16) throws -> UInt16)? = nil, fec: CheckFEC? = nil, cursorImage: CursorImage? = nil, twoDisplays: Bool = false, inputActions: Bool = true, relativeMouse: Bool = true,
+        func withMacHost(advertiseMedia: Bool = true, udp: Bool = false, route: ((UInt16) throws -> UInt16)? = nil, fec: CheckFEC? = nil, legacyMedia: Bool = false, cursorImage: CursorImage? = nil, twoDisplays: Bool = false, inputActions: Bool = true, relativeMouse: Bool = true,
                          trackpadGestures: Bool = true, deviceID: UUID? = UUID(), identityExchange: Bool? = true, prepareHello: @escaping (Message) throws -> Message = { $0 },
                          viewerKey: PairingKey? = nil, quality: String = "1920,60,20", clipboard: InteropClipboard? = nil, advertiseAudio: Bool = true,
                          _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
             let host = try MacHost(key: key, packets: packets, size: size, advertiseMedia: advertiseMedia, cursorImage: cursorImage,
                                    externalPackets: twoDisplays ? externalPackets : [], inputActions: inputActions, relativeMouse: relativeMouse, trackpadGestures: trackpadGestures,
-                                   deviceID: deviceID, identityExchange: identityExchange, prepareHello: prepareHello, clipboard: clipboard, advertiseAudio: advertiseAudio, fec: fec)
+                                   deviceID: deviceID, identityExchange: identityExchange, prepareHello: prepareHello, clipboard: clipboard, advertiseAudio: advertiseAudio, fec: fec, legacyMedia: legacyMedia)
             defer { host.stop() }
             let port = try route?(host.port) ?? host.port
             let probe = try Probe(probePath, ["viewer", "--code", (viewerKey ?? key).code, "--port", "\(port)", "--quality", quality] + (udp ? [] : ["--no-udp"]) + extra)
@@ -2275,9 +2439,12 @@ private struct WindowsInteropChecks {
             }
         }
 
-        func verifyWindowsViewerWindow(_ host: MacHost, _ probe: Probe) throws {
+        func verifyWindowsViewerWindow(_ host: MacHost, _ probe: Probe, expected: Int) throws {
             try probe.send(["command": "holdAcknowledgements", "hold": true])
-            let sequences = try (0..<MediaBufferLimits.legacyFrameWindow).map { _ -> UInt32 in
+            let snapshot = host.state.get()
+            let window = VideoFrameFlow.maximumOutstandingFrames(for: snapshot.applied.settings, receiverLimit: snapshot.receiverLimit)
+            try require(window == expected, "The Mac selected \(window) credits with the Rust receiver, expected \(expected)")
+            let sequences = try (0..<window).map { _ -> UInt32 in
                 let frame = try probe.next("frame") { $0["held"] as? Bool == true }
                 guard let sequence = frame["sequence"] as? UInt32 else { throw Failure("Held frame omitted its sequence") }
                 return sequence
@@ -2291,6 +2458,42 @@ private struct WindowsInteropChecks {
             try probe.send(["command": "holdAcknowledgements", "hold": false])
             for sequence in sequences { try probe.send(["command": "acknowledge", "sequence": Int(sequence)]) }
             try until("decode receipts reopen the Mac capture window") { probe.all("frame").count > frames.count + 6 }
+        }
+
+        for (window, delay) in [(8, 0.046), (24, 0.27)] {
+            run("A Windows viewer receives the Mac's negotiated \(window)-frame window on a delayed UDP route") {
+                var route: InteropMediaRoute?
+                defer { route?.stop() }
+                try withMacHost(udp: true, route: { port in
+                    let relay = try InteropMediaRoute(target: port, forwardUDP: true, pongDelay: delay)
+                    route = relay
+                    return relay.port
+                }) { host, probe in
+                    try until("the measured path selects \(window) credits", seconds: 15) {
+                        let state = host.state.get()
+                        return state.commits.last?.path == "udp" && state.receiverLimit == window
+                    }
+                    try verifyWindowsViewerWindow(host, probe, expected: window)
+                }
+            }
+        }
+
+        run("A Windows viewer preserves the full recovery exchange and three credits with an older Mac host") {
+            try withMacHost(legacyMedia: true, ["--no-auxiliary"]) { host, probe in
+                _ = try probe.next("mediaCommitted")
+                try until("the legacy host commits the initial stream") { host.state.get().commits.count == 1 }
+                try verifyWindowsViewerWindow(host, probe, expected: 3)
+                try probe.send(["command": "quality", "settings": "2560,30,8"])
+                _ = try probe.next("mediaCommitted")
+                try until("the legacy host commits its same-path recovery") { host.state.get().commits.count == 2 }
+                let s = host.state.get()
+                for commit in s.commits {
+                    let stages = s.transactions.filter { $0.transactionID == commit.transactionID }
+                    try require(commit.path == "shared" && stages.first?.fast == nil
+                                && stages.map(\.operation) == [.prepare, .ready, .decodedReady, .committed],
+                                "A viewer shortened an unnegotiated recovery exchange")
+                }
+            }
         }
 
         run("A Windows viewer decodes Mac stereo Opus, discards stale sound and stops on request") {
@@ -2399,7 +2602,7 @@ private struct WindowsInteropChecks {
                                 "Legacy frame \(index + 1) changed path or lost its keyframe marking")
                     try require(frame["annexB"] as? String == hex(annexB(source)), "Frame \(index + 1) reached the decoder with other bytes")
                 }
-                try verifyWindowsViewerWindow(host, probe)
+                try verifyWindowsViewerWindow(host, probe, expected: 3)
             }
         }
 
@@ -2441,38 +2644,90 @@ private struct WindowsInteropChecks {
         }
 
         for reachable in [true, false] {
-            let path = reachable ? "udp" : "tcp"
-            run(reachable ? "A Windows viewer commits exact UDP video from a Mac host"
+            run(reachable ? "A Windows viewer decodes Mac UDP, moves to reliable video and returns on the first timed UDP reprobe"
                           : "A Windows viewer keeps the Mac video on bound TCP when UDP traffic is discarded") {
                 var route: InteropMediaRoute?
                 defer { route?.stop() }
                 try withMacHost(udp: true, route: { port in
-                    guard !reachable else { return port }
-                    let relay = try InteropMediaRoute(target: port, forwardUDP: false)
+                    let relay = try InteropMediaRoute(target: port, forwardUDP: reachable)
                     route = relay
                     return relay.port
-                }) { host, probe in
-                    try until("the Mac receives a Windows \(path) commit", seconds: 15) { host.state.get().commits.last?.path == path }
-                    let s = host.state.get()
-                    guard let commit = s.commits.last, let sequence = s.recoverySequences.last else { throw Failure("The committed stream lacked its recovery frame") }
-                    _ = try probe.next("mediaCommitted") {
-                        $0["sessionID"] as? String == commit.sessionID?.uuidString.lowercased()
-                            && $0["transportEpoch"] as? UInt32 == commit.transportEpoch && $0["codecEpoch"] as? UInt32 == commit.codecEpoch
+                }, ["--hold-media-openers"]) { host, probe in
+                    let decoder = VideoDecoder()
+                    defer { decoder.stop() }
+                    func check(_ path: String, seconds: Double = 15) throws -> MediaControl {
+                        let deadline = SessionClock.uptime + seconds
+                        while SessionClock.uptime < deadline {
+                            let frame = try probe.next("frame", seconds: max(0.1, deadline - SessionClock.uptime)) {
+                                $0["firstInMediaStream"] as? Bool == true
+                            }
+                            guard let sequence = frame["sequence"] as? UInt32 else { throw Failure("Windows omitted the recovery frame sequence") }
+                            try require(frame["held"] as? Bool == true && frame["key"] as? Bool == true
+                                        && frame["annexB"] as? String == hex(annexB(packets[0])), "Windows received a different recovery frame")
+                            guard let encoded = frame["openingPacket"] as? [UInt8] else { throw Failure("Windows did not return its opening packet") }
+                            let opening = try VideoPacket.decode(Data(encoded))
+                            try require(opening.sequence == sequence, "The decoded receipt would refer to a different opening packet")
+                            let ready = DispatchSemaphore(value: 0), decoded = Shared(false)
+                            decoder.decode(opening) { result in
+                                if case .success(let image) = result {
+                                    decoded.update { $0 = CVPixelBufferGetWidth(image) == size.width && CVPixelBufferGetHeight(image) == size.height }
+                                }
+                                ready.signal()
+                            }
+                            try require(ready.wait(timeout: .now() + 2) == .success && decoded.get(), "VideoToolbox rejected the Rust receiver's opening frame")
+                            try probe.send(["command": "acknowledge", "sequence": sequence])
+                            let event = try probe.next("mediaCommitted")
+                            try until("the Mac observes the matching commit") {
+                                host.state.get().commits.contains {
+                                    $0.sessionID?.uuidString.lowercased() == event["sessionID"] as? String
+                                        && $0.transportEpoch == event["transportEpoch"] as? UInt32 && $0.codecEpoch == event["codecEpoch"] as? UInt32
+                                }
+                            }
+                            guard let commit = host.state.get().commits.first(where: { $0.transportEpoch == event["transportEpoch"] as? UInt32 }),
+                                  commit.path == path else { continue }
+                            for index in 1..<8 {
+                                let next = try probe.next("frame") { $0["sequence"] as? UInt32 == sequence + UInt32(index) }
+                                try require(next["annexB"] as? String == hex(annexB(packets[index])) && next["firstInMediaStream"] as? Bool == false,
+                                            "Mac \(path) frame \(index + 1) changed on Windows")
+                            }
+                            let ops = host.state.get().transactions.filter { $0.transactionID == commit.transactionID }
+                            let expected: [MediaControl.Operation] = ops.first?.fast == true ? [.prepare, .committed] : [.prepare, .ready, .decodedReady, .committed]
+                            try require(ops.map(\.operation) == expected, "Unexpected Windows exchange on \(path): \(ops.map(\.operation))")
+                            return commit
+                        }
+                        throw Failure("No decoded Windows commit on \(path)")
                     }
-                    for index in 0..<8 {
-                        let frame = try probe.next("frame") { $0["sequence"] as? UInt32 == sequence + UInt32(index) }
-                        try require(frame["annexB"] as? String == hex(annexB(packets[index])) && frame["key"] as? Bool == (index == 0)
-                                    && frame["firstInMediaStream"] as? Bool == (index == 0), "Mac \(path) frame \(index + 1) changed on Windows")
-                    }
+                    let first = try check(reachable ? "udp" : "tcp")
                     if reachable {
-                        try require(!host.state.get().decodedFeedback.contains { $0.stream.transportEpoch == commit.transportEpoch },
-                                    "Windows sent its UDP decode receipts on control")
+                        try require(!host.state.get().decodedFeedback.contains { $0.stream.transportEpoch == first.transportEpoch }, "Windows returned UDP receipts on control")
+                        // Hold the TLS copy until after commit. The authenticated UDP prepare alone must start this recovery.
+                        host.state.update { $0.holdFastPrepare = true }
+                        try probe.send(["command": "quality", "settings": "2560,30,8"])
+                        let fast = try check("udp")
+                        let snapshot = host.state.get()
+                        guard let held = snapshot.deferredFastPrepare, let media = snapshot.media else { throw Failure("Windows did not send a fast TLS prepare") }
+                        let deferred = try MediaControl.read(held.payload)
+                        try require(deferred.transactionID == fast.transactionID && deferred.fast == true && deferred.path == "udp",
+                                    "UDP and TLS prepared different transactions")
+                        host.state.update { $0.holdFastPrepare = false }
+                        try require(media.receive(held), "Mac rejected the delayed TLS copy")
+                        try probe.send(["command": "requestClipboard"])
+                        _ = try probe.next("clipboardText")
+                        try require(host.state.get().recoverySequences.count == snapshot.recoverySequences.count, "The duplicate prepare restarted encoding")
+                        let cut = SessionClock.uptime
+                        route?.forwardUDP(false)
+                        let tcp = try check("tcp")
+                        route?.forwardUDP(true)
+                        let restored = try check("udp", seconds: 43)
+                        try require([fast, tcp, restored].allSatisfy { $0.sessionID == first.sessionID } && (tcp.transportEpoch ?? 0) > (fast.transportEpoch ?? 0)
+                                    && (restored.transportEpoch ?? 0) > (tcp.transportEpoch ?? 0) && SessionClock.uptime - cut >= 30,
+                                    "Windows recovered outside the original session or before its first reprobe")
                     } else {
-                        try require(route?.dropped.get() ?? 0 > 0 && host.state.get().commits.allSatisfy { $0.path != "udp" },
+                        try require((route?.dropped.get() ?? 0) > 0 && host.state.get().commits.allSatisfy { $0.path != "udp" },
                                     "Windows committed a path whose datagrams were discarded, or did not try UDP")
                     }
                     try probe.send(["command": "requestClipboard"])
-                    try require(try probe.next("clipboardText")["text"] as? String == s.clipboard, "Control stopped answering during \(path) video")
+                    try require(try probe.next("clipboardText")["text"] as? String == host.state.get().clipboard, "Control stopped answering during video")
                 }
             }
         }
@@ -2528,7 +2783,7 @@ private struct WindowsInteropChecks {
                 }
 
                 try verifyStream(1)
-                try verifyWindowsViewerWindow(host, probe)
+                try verifyWindowsViewerWindow(host, probe, expected: 6)
 
                 try probe.send(["command": "quality", "settings": "2560,30,8"])
                 try verifyStream(2)

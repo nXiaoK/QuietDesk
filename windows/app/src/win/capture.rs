@@ -6,6 +6,7 @@ use super::util::failed;
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::pixel::{PointerKind, PointerShape};
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HMODULE, POINT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::*;
@@ -146,7 +147,7 @@ impl ScreenCapture {
         let mut screen = Self::open_display(display)?;
         if independent {
             if matches!(screen.source, Source::Duplication(_)) {
-                screen.grab_source(100, false)?;
+                screen.grab_source(100, false, &mut Duration::default())?;
             }
             screen.set_cursor_mode(true)?;
         }
@@ -157,7 +158,7 @@ impl ScreenCapture {
     /// opening picture while a duplication that reports a hardware pointer keeps future capture on DXGI.
     pub(super) fn set_cursor_mode(&mut self, independent: bool) -> Result<()> {
         if matches!(self.source, Source::Duplication(_))
-            && self.grab_source(0, true)?
+            && self.grab_source(0, true, &mut Duration::default())?
             && matches!(&self.source, Source::Duplication(source) if !independent || source.position.is_some())
         {
             self.independent = independent;
@@ -176,8 +177,12 @@ impl ScreenCapture {
         Ok(())
     }
 
-    fn first_picture(mut self) -> Result<Self> {
-        self.grab_source(250, true)?;
+    fn first_picture(self) -> Result<Self> {
+        self.first_picture_timed(&mut Duration::default())
+    }
+
+    fn first_picture_timed(mut self, waited: &mut Duration) -> Result<Self> {
+        self.grab_source(250, true, waited)?;
         if !self.has_frame {
             return Err(DeskError::platform("尚未收到所选显示器的桌面画面"));
         }
@@ -276,23 +281,37 @@ impl ScreenCapture {
     /// Waits up to `wait_milliseconds` for the screen or pointer to change. `Ok(true)` means `frame` or the
     /// pointer differs from the last call; an error means the capture has to be opened again.
     pub fn grab(&mut self, wait_milliseconds: u32) -> Result<bool> {
-        let changed = self.grab_source(wait_milliseconds, false)?;
+        self.grab_timed(wait_milliseconds, &mut Duration::default())
+    }
+
+    pub(super) fn backend(&self) -> &'static str {
+        match self.source {
+            Source::Duplication(_) => "dxgi",
+            Source::Gdi(_) => "gdi",
+        }
+    }
+
+    pub(super) fn grab_timed(&mut self, wait_milliseconds: u32, waited: &mut Duration) -> Result<bool> {
+        let changed = self.grab_source(wait_milliseconds, false, waited)?;
         // An adapter can switch from hardware overlay to a pointer baked into its desktop surface.
         if self.independent && matches!(&self.source, Source::Duplication(source) if source.position.is_none()) {
-            *self = Self::open_gdi(&self.display, true)?.first_picture()?;
+            *self = Self::open_gdi(&self.display, true)?.first_picture_timed(waited)?;
             return Ok(true);
         }
         Ok(changed)
     }
 
-    fn grab_source(&mut self, wait_milliseconds: u32, refresh_surface: bool) -> Result<bool> {
+    fn grab_source(&mut self, wait_milliseconds: u32, refresh_surface: bool, waited: &mut Duration) -> Result<bool> {
         let (width, height) = (self.width(), self.height());
         let first = !self.has_frame || refresh_surface;
         match &mut self.source {
             Source::Duplication(source) => unsafe {
                 let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
                 let mut resource = None;
-                match source.duplication.AcquireNextFrame(wait_milliseconds, &mut info, &mut resource) {
+                let start = Instant::now();
+                let acquired = source.duplication.AcquireNextFrame(wait_milliseconds, &mut info, &mut resource);
+                *waited += start.elapsed();
+                match acquired {
                     Ok(()) => {}
                     Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
                     Err(error) => return Err(failed("获取桌面画面")(error)),
@@ -344,7 +363,11 @@ impl ScreenCapture {
                 }
             },
             Source::Gdi(source) => unsafe {
-                std::thread::sleep(std::time::Duration::from_millis(u64::from(wait_milliseconds.min(15))));
+                if wait_milliseconds != 0 {
+                    let start = Instant::now();
+                    std::thread::sleep(Duration::from_millis(u64::from(wait_milliseconds.min(15))));
+                    *waited += start.elapsed();
+                }
                 let bounds = self.display.bounds;
                 BitBlt(source.surface.dc, 0, 0, width as i32, height as i32, Some(source.screen), bounds.left, bounds.top, SRCCOPY | CAPTUREBLT)
                     .map_err(failed("复制屏幕"))?;

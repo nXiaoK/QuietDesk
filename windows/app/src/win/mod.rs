@@ -6,6 +6,7 @@ pub mod codec;
 pub mod displays;
 mod gesture_host;
 mod host_cursor;
+mod video_stats;
 mod viewer_cursor;
 mod viewer_gestures;
 pub use viewer_cursor::read_back_cursor;

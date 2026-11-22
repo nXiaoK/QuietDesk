@@ -6,10 +6,11 @@ use super::displays::{self, Display};
 use super::gesture_host::GestureHost;
 use super::host_cursor::CursorSampler;
 use super::util::Com;
+use super::video_stats::VideoStats;
 use super::{clipboard, inject};
 use quietdesk_core::display::{DisplaySwitch, HostDisplays};
 use quietdesk_core::error::{DeskError, Result};
-use quietdesk_core::host::{FrameSink, HostCursorSample, HostPlatform, InputActionOutcome};
+use quietdesk_core::host::{FrameSink, FrameSubmission, HostCursorSample, HostPlatform, InputActionOutcome};
 use quietdesk_core::input::InjectOp;
 use quietdesk_core::messages::{InputAction, StreamSettings, VideoStreamState};
 use quietdesk_core::pixel::{Nv12Converter, draw_pointer};
@@ -29,6 +30,7 @@ enum Command {
 }
 
 struct Stream {
+    stats: Option<VideoStats>,
     converter: Nv12Converter,
     encoder: H264Encoder,
     nv12: Vec<u8>,
@@ -68,7 +70,8 @@ fn open_stream(source: (usize, usize), settings: StreamSettings, sink: FrameSink
                 let converter = Nv12Converter::new(source, (width as usize, height as usize));
                 let nv12 = vec![0; converter.output_bytes()];
                 let interval = Duration::from_secs_f64(1.0 / applied.frames_per_second.clamp(1, 60) as f64);
-                let stream = Stream { converter, encoder, nv12, sink, interval, due: Instant::now(), fresh: true, refused_key_frames: 0, fed: 0, flush: 0 };
+                let stream =
+                    Stream { stats: None, converter, encoder, nv12, sink, interval, due: Instant::now(), fresh: true, refused_key_frames: 0, fed: 0, flush: 0 };
                 return Ok((stream, VideoStreamState { settings: applied, width: i64::from(width), height: i64::from(height) }));
             }
             Err(error) => {
@@ -218,12 +221,24 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
         if !paused && let (Some(sampler), Some(screen)) = (&mut sampler, &capture) {
             sampler.poll(screen.display.bounds);
         }
-        let (Some(active), Some(screen), false) = (&mut stream, &mut capture, paused) else { continue };
-        if !active.sink.has_credit() || Instant::now() < active.due {
+        let (Some(active), Some(screen), false) = (&mut stream, &mut capture, paused) else {
+            if let Some(active) = &mut stream {
+                active.stats = None;
+            }
+            continue;
+        };
+        let now = Instant::now();
+        let stats = active.stats.get_or_insert_with(|| VideoStats::new(now, screen.backend()));
+        stats.report_if_due(now, screen.backend());
+        if !active.sink.has_credit() || now < active.due {
             continue;
         }
         let use_cached = screen.has_frame() && (active.fresh || active.flush > 0);
-        let changed = match screen.grab(if use_cached { 0 } else { 50 }) {
+        let start = Instant::now();
+        let mut waited = Duration::ZERO;
+        let captured = screen.grab_timed(if use_cached { 0 } else { 50 }, &mut waited);
+        stats.captured(screen.backend(), start.elapsed(), waited, matches!(captured, Ok(true)));
+        let changed = match captured {
             Ok(changed) => changed,
             Err(error) => {
                 // The desktop was switched (lock screen, elevation prompt) or the display mode changed.
@@ -246,14 +261,18 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
             continue;
         }
         if current {
+            let start = Instant::now();
             let (width, height) = (screen.width(), screen.height());
             let patch = screen.pointer().and_then(|pointer| draw_pointer(&mut screen.frame, width * 4, (width, height), &pointer.shape, pointer.x, pointer.y));
             active.converter.convert(&screen.frame, width * 4, &mut active.nv12);
             if let Some(patch) = patch {
                 patch.restore(&mut screen.frame, width * 4);
             }
+            stats.convert.record(start.elapsed());
         }
+        let start = Instant::now();
         let encoded = active.encoder.encode(&active.nv12);
+        stats.encoded(start.elapsed(), !current);
         active.fed += 1;
         // A one-in-one-out encoder holds nothing and needs no repeats. One that delays its output would
         // keep the newest picture, and the pointer in it, until the screen changes again.
@@ -272,11 +291,14 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
                     }
                     active.fresh = false;
                     active.refused_key_frames = 0;
-                    if !active.sink.submit(frame) {
+                    let submission = active.sink.try_submit(frame);
+                    stats.output(submission);
+                    if submission == FrameSubmission::Closed {
                         stream = None;
                     }
                 } else {
                     // The encoder took the request for a keyframe and still produced a dependent frame.
+                    stats.output(FrameSubmission::Dropped);
                     active.refused_key_frames += 1;
                     if active.refused_key_frames >= 3
                         && let Err(error) = active.encoder.restart()

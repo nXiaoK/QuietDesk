@@ -65,6 +65,16 @@ pub struct FrameSink {
     window: Arc<Mutex<FrameWindow>>,
 }
 
+/// The outcome at the capture queue, before transport or decoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameSubmission {
+    Queued,
+    /// Capture finished after the window filled or the current gate stopped accepting this frame.
+    Dropped,
+    /// The receiving stream has been replaced or the session has ended.
+    Closed,
+}
+
 impl FrameSink {
     /// Frames a viewer may have received without acknowledging, as released viewers expect.
     pub const WINDOW: usize = 3;
@@ -81,21 +91,25 @@ impl FrameSink {
 
     /// Hands over one frame; false once the stream it belongs to has been replaced or the session ended.
     pub fn submit(&self, frame: EncodedFrame) -> bool {
+        self.try_submit(frame) != FrameSubmission::Closed
+    }
+
+    pub fn try_submit(&self, frame: EncodedFrame) -> FrameSubmission {
         let mut window = self.window.lock().unwrap();
         if self.frames.is_closed() {
-            return false;
+            return FrameSubmission::Closed;
         }
         // Capture may have started encoding just before a prepare closed the gate. Only an IDR
         // may consume the single permit; a queued frame from an older gate cannot consume it again.
         if !window.has_credit() || (window.gate == Gate::One && !frame.is_key_frame()) {
-            return true;
+            return FrameSubmission::Dropped;
         }
         if self.frames.send(CapturedFrame { generation: window.generation, frame }).is_err() {
-            return false;
+            return FrameSubmission::Closed;
         }
         window.outstanding += 1;
         window.key_submitted = window.gate == Gate::One;
-        true
+        FrameSubmission::Queued
     }
 }
 
@@ -970,23 +984,41 @@ mod tests {
         let sink = FrameSink { frames, window: window.clone() };
         let key = EncodedFrame { sps: vec![0x67, 1], pps: vec![0x68, 2], avcc: vec![0, 0, 0, 2, 0x65, 3] };
         let delta = EncodedFrame { sps: vec![], pps: vec![], avcc: vec![0, 0, 0, 2, 0x41, 4] };
-        assert!(sink.submit(key.clone()));
+        assert_eq!(sink.try_submit(key.clone()), FrameSubmission::Queued);
         window.lock().unwrap().set_gate(Gate::Closed);
         assert!(!sink.has_credit());
-        assert!(sink.submit(delta.clone()));
+        assert_eq!(sink.try_submit(delta.clone()), FrameSubmission::Dropped);
         window.lock().unwrap().set_gate(Gate::One);
-        assert!(sink.submit(delta.clone()));
+        assert_eq!(sink.try_submit(delta.clone()), FrameSubmission::Dropped);
         assert!(sink.has_credit(), "a dependent frame was finishing when capture heard the request");
-        assert!(sink.submit(key.clone()));
+        assert_eq!(sink.try_submit(key.clone()), FrameSubmission::Queued);
         window.lock().unwrap().set_gate(Gate::One);
         assert!(!sink.has_credit(), "unrelated messages cannot reopen the permit");
-        assert!(sink.submit(delta));
-        assert!(sink.submit(key));
+        assert_eq!(sink.try_submit(delta), FrameSubmission::Dropped);
+        assert_eq!(sink.try_submit(key), FrameSubmission::Dropped);
         let stale = queue.try_recv().unwrap();
         let current = queue.try_recv().unwrap();
         assert_ne!(stale.generation, current.generation);
         assert_eq!(current.generation, window.lock().unwrap().generation);
         assert!(queue.try_recv().is_err());
         assert_eq!(sink.outstanding(), 2);
+    }
+
+    #[test]
+    fn a_full_window_drops_frames_without_consuming_credit_and_a_closed_receiver_stops_capture() {
+        let (frames, queue) = mpsc::unbounded_channel();
+        let sink = FrameSink { frames, window: Arc::new(Mutex::new(FrameWindow::new(Gate::Open))) };
+        let frame = EncodedFrame { sps: vec![], pps: vec![], avcc: vec![0, 0, 0, 2, 0x41, 1] };
+        for _ in 0..FrameSink::WINDOW {
+            assert_eq!(sink.try_submit(frame.clone()), FrameSubmission::Queued);
+        }
+        assert_eq!(sink.try_submit(frame.clone()), FrameSubmission::Dropped);
+        assert!(sink.submit(frame.clone()));
+        assert_eq!(queue.len(), FrameSink::WINDOW);
+        assert_eq!(sink.outstanding(), FrameSink::WINDOW);
+        drop(queue);
+        assert_eq!(sink.try_submit(frame.clone()), FrameSubmission::Closed);
+        assert!(!sink.submit(frame));
+        assert_eq!(sink.outstanding(), FrameSink::WINDOW);
     }
 }

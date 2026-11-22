@@ -200,12 +200,20 @@ impl<'a> ByteReader<'a> {
         Ok(head)
     }
 
+    pub fn u8(&mut self) -> Result<u8> {
+        Ok(self.bytes(1)?[0])
+    }
+
     pub fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_be_bytes(self.bytes(2)?.try_into().unwrap()))
     }
 
     pub fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_be_bytes(self.bytes(4)?.try_into().unwrap()))
+    }
+
+    pub fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_be_bytes(self.bytes(8)?.try_into().unwrap()))
     }
 }
 

@@ -9,6 +9,7 @@ pub mod error;
 pub mod host;
 pub mod input;
 pub mod keymap;
+pub mod media;
 pub mod messages;
 pub mod pairing;
 pub mod peer;

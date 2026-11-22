@@ -18,7 +18,7 @@
 | WP2 | 独立光标（本地即时光标） | 中 | 已提交 `945008b`。双向协议与 Wine 检查通过，单光标观感、热点和延迟待 Windows 实机确认 |
 | WP3 | 控制端断线自动重连与空闲暂停 | 小 | 已完成 `fcb8215`。回环重启恢复、主动结束、配对失败及隔离 Wine 窗口检查通过 |
 | WP4 | 多显示器 | 中 | 已提交 `3567d16`。双向切屏、失败回滚和 Wine 单屏窗口验收通过。物理双屏热插拔与混合 DPI 待 Windows 实机确认 |
-| WP5 | 输入补全（输入状态回馈、Caps Lock 同步、相对鼠标、手势、设备身份） | 中，可拆分 | 未开始 |
+| WP5 | 输入补全（输入状态回馈、Caps Lock 同步、相对鼠标、手势、设备身份） | 中，可拆分 | 键盘动作与反馈已提交 `22bdedd`。相对鼠标、触控板手势与设备身份待完成 |
 | WP6 | 自动剪贴板，图片与文件 | 大 | 未开始 |
 | WP7 | 视频性能：GPU 缩放与色彩转换、硬件编码、HEVC、60 fps 以上、码率自适应 | 大，可拆分 | 未开始 |
 | WP8 | 远端声音 | 中 | 未开始 |
@@ -77,6 +77,7 @@ scripts/check-cargo-lock-age.py        检查锁定的依赖是否已发布满 7
 
 - 被控端 Hello 声明 `liveSettings`、`controlStatusUpdates`、`extendedVideoSettings`、`preferredSettings`、`highRefreshVideoSettings`、`preferredHighRefreshSettings`、`sessionPause`、`sessionTerminationV1`、`initialStreamNegotiationV1`。WP1 新增 `mediaTransportV1`，WP2 在平台支持光标采样时声明 `independentCursorV1`，在首个媒体流提交后独立协商。
 - 两端支持时使用控制连接上的 `shared` 流，H.264 视频通过 `mediaFrame` 发送并以 `mediaFeedback` 确认。首次切换前和对接旧版本时继续支持 `video` / `acknowledgement`。Windows 被控端最多等待 3 帧确认。
+- 被控端能枚举活动屏幕时声明 `displaySwitchingV1`，能读取当前控制台的键盘大写状态时声明 `inputActions`。两项能力独立协商。
 - 控制端只使用被控端 Hello 里声明且自己已实现的能力；收到未协商的消息类型即断开，与 macOS 一致。
 
 ### 2.2 WP1 开工前的验证基线
@@ -251,7 +252,7 @@ python3 scripts/check-cargo-lock-age.py
 
 各项相互独立，可拆成多个小提交。全部待核实，入口如下。
 
-- **输入状态回馈与 Caps Lock**：`Keyboard.swift` 的 `InputFeedback { message, capsLocked }`（消息 10 `inputStatus`）、`RemoteInput.independentCapsLock`、`Kind.toggleCapsLock` / `switchInputSource`、Hello 的 `inputActions`、`docs/caps-lock-confirmation.md`。Windows 被控端目前忽略这两种输入、不声明 `inputActions`。输入法切换在 Windows 上可映射为 `Win+Space` 或忽略，实现前与用户确认期望。
+- **输入状态回馈与 Caps Lock**：双向支持 `InputFeedback { message, capsLocked }`（消息 10）、`independentCapsLock`、`toggleCapsLock` 和 `switchInputSource`。用户选择用 `Win+空格` 切换 Windows 的下一输入法。被控端只有观察到大写或前台键盘布局变化后才确认成功，无法确认时提示重新点击输入位置。
 - **相对鼠标**（`relativeMouseV1`）：`RemoteInput.pointerDeltaX/Y`、`pointerSequence`、`relativeMouse`；被控端用 `MOUSEEVENTF_MOVE` 相对移动；控制端用 Raw Input 加指针锁定。面向游戏/3D 软件，优先级低。
 - **触控板手势**（`trackpadGesturesV1`）：`magnify` / `rotate` / `smartMagnify`。Windows 被控端可把缩放映射为 `Ctrl+滚轮`；Windows 控制端可把精密触控板的捏合手势发给 Mac。优先级低。
 - **滚动相位**：`scrollPhase` / `momentumPhase` 在 Windows 被控端可继续忽略；Windows 控制端的精密触控板滚动可按像素增量发送（现在按“行”发送）。
@@ -264,7 +265,7 @@ python3 scripts/check-cargo-lock-age.py
 **建议分两步**
 
 1. 文字与图片自动同步：`AddClipboardFormatListener` 监听；文字 `CF_UNICODETEXT`；图片在 PNG 与 `CF_DIBV5` 之间转换；按清单/拉取（on-demand）流程实现，回环抑制（自己写入的内容不再回传）；界面开关沿用现有“允许控制端读写剪贴板文字”并扩展。
-2. 文件：接收端落盘到下载目录下的会话文件夹并提示；发送端读取 `CF_HDROP`。要不要做成“粘贴时才传输”（OLE 延迟渲染）先与用户确认；路径、文件名、大小、条目数全部校验，拒绝越界路径。
+2. 文件：用户已选择在接收端实际粘贴时才开始传输。Windows 接收端使用 OLE 延迟渲染，发送端读取 `CF_HDROP`。保留文件接收确认、会话目录与提示，校验路径、文件名、大小和条目数，拒绝越界路径。
 
 **完成标准**：互通检查用真实的 `ClipboardTransfer` 对接；不读写真实剪贴板（`probe` 用内存里的假剪贴板）。
 
@@ -424,7 +425,7 @@ python3 scripts/check-cargo-lock-age.py
 | --- | --- | --- |
 | 1–6 | hello、video、acknowledgement、input、ping、pong | 已实现 |
 | 7–9 | clipboard、requestClipboard、releaseInput | 已实现（手动文字剪贴板） |
-| 10 | inputStatus | WP5 |
+| 10 | inputStatus | WP5 已接入键盘动作状态回馈 |
 | 11–17 | clipboardSettings、clipboardBegin/Entry/Chunk/End/Receipt/Cancel | WP6 |
 | 18–20 | streamSettingsRequest、streamSettingsResult、controlStatus | 已实现 |
 | 21 | deviceIdentity | WP5 |

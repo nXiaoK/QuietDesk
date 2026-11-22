@@ -34,6 +34,8 @@ struct Stream {
     refused_key_frames: u32,
     /// Frames given to the encoder since the stream last turned fresh, for the log.
     fed: u32,
+    /// Repeats of the current picture still to feed, so an encoder that holds frames back lets it out.
+    flush: u32,
 }
 
 impl Stream {
@@ -42,6 +44,7 @@ impl Stream {
         self.fresh = true;
         self.refused_key_frames = 0;
         self.fed = 0;
+        self.flush = 0;
         self.encoder.request_key_frame();
     }
 }
@@ -58,7 +61,7 @@ fn open_stream(source: (usize, usize), settings: StreamSettings, sink: FrameSink
                 let converter = Nv12Converter::new(source, (width as usize, height as usize));
                 let nv12 = vec![0; converter.output_bytes()];
                 let interval = Duration::from_secs_f64(1.0 / applied.frames_per_second.clamp(1, 60) as f64);
-                let stream = Stream { converter, encoder, nv12, sink, interval, due: Instant::now(), fresh: true, refused_key_frames: 0, fed: 0 };
+                let stream = Stream { converter, encoder, nv12, sink, interval, due: Instant::now(), fresh: true, refused_key_frames: 0, fed: 0, flush: 0 };
                 return Ok((stream, VideoStreamState { settings: applied, width: i64::from(width), height: i64::from(height) }));
             }
             Err(error) => {
@@ -123,7 +126,7 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
         if !active.sink.has_credit() || Instant::now() < active.due {
             continue;
         }
-        let changed = match screen.grab(if active.fresh { 0 } else { 50 }) {
+        let changed = match screen.grab(if active.fresh || active.flush > 0 { 0 } else { 50 }) {
             Ok(changed) => changed,
             Err(error) => {
                 // The desktop was switched (lock screen, elevation prompt) or the display mode changed.
@@ -143,17 +146,23 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
                 continue;
             }
         };
-        if !changed && !active.fresh {
+        let current = changed || active.fresh;
+        if !current && active.flush == 0 {
             continue;
         }
-        let (width, height) = (screen.width(), screen.height());
-        let patch = screen.pointer().and_then(|pointer| draw_pointer(&mut screen.frame, width * 4, (width, height), &pointer.shape, pointer.x, pointer.y));
-        active.converter.convert(&screen.frame, width * 4, &mut active.nv12);
-        if let Some(patch) = patch {
-            patch.restore(&mut screen.frame, width * 4);
+        if current {
+            let (width, height) = (screen.width(), screen.height());
+            let patch = screen.pointer().and_then(|pointer| draw_pointer(&mut screen.frame, width * 4, (width, height), &pointer.shape, pointer.x, pointer.y));
+            active.converter.convert(&screen.frame, width * 4, &mut active.nv12);
+            if let Some(patch) = patch {
+                patch.restore(&mut screen.frame, width * 4);
+            }
         }
         let encoded = active.encoder.encode(&active.nv12);
         active.fed += 1;
+        // A one-in-one-out encoder holds nothing and needs no repeats. One that delays its output would
+        // keep the newest picture, and the pointer in it, until the screen changes again.
+        active.flush = if current { active.encoder.pending() } else { active.flush - 1 };
         // Every attempt uses its frame interval, also one the encoder answers with nothing.
         active.due = Instant::now() + active.interval;
         match encoded {
@@ -162,6 +171,9 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
                 if !active.fresh || frame.is_key_frame() {
                     if active.fresh {
                         log::info!("the stream opens with a keyframe of {} bytes after {} captured frames", frame.avcc.len(), active.fed);
+                        if active.encoder.pending() > 0 {
+                            log::warn!("the encoder holds {} frames back; the picture is repeated after each change to let it out", active.encoder.pending());
+                        }
                     }
                     active.fresh = false;
                     active.refused_key_frames = 0;

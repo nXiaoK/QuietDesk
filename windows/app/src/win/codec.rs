@@ -89,6 +89,8 @@ pub struct H264Encoder {
     frame_duration: i64,
     frames: i64,
     key_frame_wanted: bool,
+    /// Frames taken in that have not come out yet.
+    pending: u32,
     size: (u32, u32),
     settings: StreamSettings,
 }
@@ -102,6 +104,24 @@ impl H264Encoder {
         let bits = (settings.megabits.clamp(1, 100) * 1_000_000) as u32;
         unsafe {
             let transform: IMFTransform = CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER).map_err(failed("创建 H.264 编码器"))?;
+            // The encoder reads these when its output type is set; set later, low-latency mode is ignored and
+            // it holds more than a dozen frames back before the first one comes out.
+            let control = transform.cast::<ICodecAPI>().ok();
+            if let Some(control) = &control {
+                let options: [(&str, &GUID, VARIANT); 5] = [
+                    ("low latency", &CODECAPI_AVLowLatencyMode, VARIANT::from(true)),
+                    ("constant bit rate", &CODECAPI_AVEncCommonRateControlMode, VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32)),
+                    ("bit rate", &CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bits)),
+                    ("no B frames", &CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32)),
+                    // Keyframes are sent when a stream starts or resumes, not on a schedule.
+                    ("keyframe distance", &CODECAPI_AVEncMPVGOPSize, VARIANT::from(rate * 3600)),
+                ];
+                for (label, name, value) in &options {
+                    if let Err(error) = control.SetValue(*name, std::ptr::from_ref(value).cast()) {
+                        log::warn!("encoder option {label} was not accepted: {error}");
+                    }
+                }
+            }
             let configure = || -> windows::core::Result<()> {
                 let output = video_type(&MFVideoFormat_H264)?;
                 output.SetUINT32(&MF_MT_AVG_BITRATE, bits)?;
@@ -123,22 +143,6 @@ impl H264Encoder {
                 transform.SetInputType(0, &input, 0)
             };
             configure().map_err(failed(&format!("配置 H.264 编码器（{width}×{height}）")))?;
-            let control = transform.cast::<ICodecAPI>().ok();
-            if let Some(control) = &control {
-                let options: [(&GUID, VARIANT); 5] = [
-                    (&CODECAPI_AVEncCommonRateControlMode, VARIANT::from(eAVEncCommonRateControlMode_LowDelayVBR.0 as u32)),
-                    (&CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bits)),
-                    (&CODECAPI_AVLowLatencyMode, VARIANT::from(true)),
-                    (&CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32)),
-                    // Keyframes are sent when a stream starts or resumes, not on a schedule.
-                    (&CODECAPI_AVEncMPVGOPSize, VARIANT::from(rate * 3600)),
-                ];
-                for (name, value) in &options {
-                    if let Err(error) = control.SetValue(*name, std::ptr::from_ref(value).cast()) {
-                        log::warn!("encoder option {name:?} was not accepted: {error}");
-                    }
-                }
-            }
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0).map_err(failed("启动 H.264 编码器"))?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0).map_err(failed("启动 H.264 编码器"))?;
             Ok(Self {
@@ -148,6 +152,7 @@ impl H264Encoder {
                 frame_duration: 10_000_000 / i64::from(rate),
                 frames: 0,
                 key_frame_wanted: false,
+                pending: 0,
                 size: (width, height),
                 settings,
             })
@@ -156,6 +161,11 @@ impl H264Encoder {
 
     pub fn request_key_frame(&mut self) {
         self.key_frame_wanted = true;
+    }
+
+    /// Frames the encoder has taken without producing their output yet; none for a low-latency encoder.
+    pub fn pending(&self) -> u32 {
+        self.pending
     }
 
     /// Starts the encoder over. The first frame of a new encoder is a keyframe on every implementation.
@@ -181,6 +191,7 @@ impl H264Encoder {
             let sample = sample_with(nv12, self.frames * self.frame_duration, self.frame_duration).map_err(failed("准备编码输入"))?;
             self.frames += 1;
             self.transform.ProcessInput(0, &sample, 0).map_err(failed("提交编码输入"))?;
+            self.pending += 1;
             let mut frame = None;
             while let Some(output) = take_output(&self.transform).map_err(failed("读取编码输出"))? {
                 let buffer = output.ConvertToContiguousBuffer().map_err(failed("读取编码输出"))?;
@@ -194,6 +205,7 @@ impl H264Encoder {
                 });
                 let _ = buffer.Unlock();
                 if let Some(assembled) = assembled? {
+                    self.pending = self.pending.saturating_sub(1);
                     frame = Some(assembled);
                 }
             }

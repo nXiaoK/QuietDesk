@@ -17,7 +17,7 @@
 | WP1 | 媒体会话接入（控制连接上的 `shared` 路径） | 中 | 已完成 `cc31c4a`，双向互通与 Wine 验收通过。Windows 10/11 实机表现待确认 |
 | WP2 | 独立光标（本地即时光标） | 中 | 已提交 `945008b`。双向协议与 Wine 检查通过，单光标观感、热点和延迟待 Windows 实机确认 |
 | WP3 | 控制端断线自动重连与空闲暂停 | 小 | 已完成 `fcb8215`。回环重启恢复、主动结束、配对失败及隔离 Wine 窗口检查通过 |
-| WP4 | 多显示器 | 中 | 未开始 |
+| WP4 | 多显示器 | 中 | 已提交 `3567d16`。双向切屏、失败回滚和 Wine 单屏窗口验收通过。物理双屏热插拔与混合 DPI 待 Windows 实机确认 |
 | WP5 | 输入补全（输入状态回馈、Caps Lock 同步、相对鼠标、手势、设备身份） | 中，可拆分 | 未开始 |
 | WP6 | 自动剪贴板，图片与文件 | 大 | 未开始 |
 | WP7 | 视频性能：GPU 缩放与色彩转换、硬件编码、HEVC、60 fps 以上、码率自适应 | 大，可拆分 | 未开始 |
@@ -57,7 +57,7 @@ windows/
     tests/loopback.rs    Rust 被控端 ↔ Rust 控制端的回环测试
   probe/    无界面的被控端/控制端，经标准输入输出驱动，供互通检查使用
   app/      Windows 程序（只在 Windows 目标上编译）
-    win/capture.rs   桌面复制，失败时回退 GDI；只采集主显示器
+    win/capture.rs   按所选显示器使用桌面复制或 GDI 采集
     win/codec.rs     Media Foundation H.264 软件编码器与解码器
     win/pipeline.rs  采集线程：采集→光标→NV12→编码→FrameSink
     win/inject.rs    SendInput；win/clipboard.rs 文字剪贴板
@@ -94,7 +94,7 @@ Wine 不等于 Windows：没有桌面复制，编解码来自 GStreamer（编码
 
 - 主窗口与远程窗口的中文排版只在 Wine（无中文字体，显示为方框）里看过控件位置。
 - Windows N/KN 版缺少媒体功能包时没有 H.264 编解码器，目前只会在日志里报错，界面没有专门提示。
-- 被控端只共享主显示器；显示器旋转时回退 GDI。
+- WP4 前只共享主显示器。现在可在主窗口选屏，在支持显示器协商的会话中动态切换。显示器旋转时回退 GDI。
 - 控制端只支持到 60 fps；被控端编码上限由“画质上限”决定，CPU 缩放加软件编码在 4K 屏上达不到 60 fps。
 - WP3 前的控制端窗口会在断线后直接关闭。现在网络故障会进入重连倒计时，并保留已显示的画面。
 
@@ -435,7 +435,7 @@ python3 scripts/check-cargo-lock-age.py
 | 32–33 | sessionUnlockRequest、sessionUnlockResult | WP11（依赖 WP13） |
 | 34 | sessionTermination | 已实现 |
 | 35–36 | desktopActionRequest、desktopActionResult | WP11 |
-| 37 | displayControl | WP4 |
+| 37 | displayControl | WP4 已接入两端的屏幕选择与状态更新 |
 | 38–39 | audioControl、audioFrame | WP8 |
 | 40 | qualityProbeControl | WP11 |
 | 41–42 | clipboardManifest、clipboardPull | WP6 |

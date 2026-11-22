@@ -35,6 +35,8 @@ Windows 能读取当前桌面的键盘大写状态时，可在 Mac 控制端开�
 1. 在被控 Mac 上按原有步骤开启共享并复制配对码。
 2. 在 Windows 的“控制另一台电脑”中填写地址、端口和配对码后点“连接”。连接成功后会记入“最近连接”，配对码用当前 Windows 账户加密保存（DPAPI）。
 
+连接成功后，“最近连接”显示被控端的名称。同一台设备换地址或端口时，Windows 会在设备 UUID 和本次配对码都相同的情况下更新原记录。旧版被控端仍按地址和端口匹配。
+
 被控端支持切屏时，远程窗口的“显示器”菜单会列出可用屏幕、主屏标记和分辨率。切屏期间会释放键鼠控制，等新屏的画面显示后即可继续操作。切换失败时，窗口会显示原因。
 
 PC 键盘的修饰键可在“键盘”中选择：
@@ -83,7 +85,7 @@ Windows 被控端的已知限制：
 
 ## 日志
 
-`%LOCALAPPDATA%\QuietDesk\logs\quietdesk*.log`（按大小轮转，保留 3 份）。日志不记录配对码、地址、剪贴板内容或按键。设置保存在 `%APPDATA%\QuietDesk\settings.json`。
+`%LOCALAPPDATA%\QuietDesk\logs\quietdesk*.log`（按大小轮转，保留 3 份）。日志不记录配对码、地址、剪贴板内容或按键。设置保存在 `%APPDATA%\QuietDesk\settings.json`。本机设备 UUID 独立保存在 `%LOCALAPPDATA%\QuietDesk\device-identity.json`。身份文件不可用时可照常配对和连接。
 
 ## 检查
 

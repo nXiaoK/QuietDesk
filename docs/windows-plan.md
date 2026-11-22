@@ -18,7 +18,7 @@
 | WP2 | 独立光标（本地即时光标） | 中 | 已提交 `945008b`。双向协议与 Wine 检查通过，单光标观感、热点和延迟待 Windows 实机确认 |
 | WP3 | 控制端断线自动重连与空闲暂停 | 小 | 已完成 `fcb8215`。回环重启恢复、主动结束、配对失败及隔离 Wine 窗口检查通过 |
 | WP4 | 多显示器 | 中 | 已提交 `3567d16`。双向切屏、失败回滚和 Wine 单屏窗口验收通过。物理双屏热插拔与混合 DPI 待 Windows 实机确认 |
-| WP5 | 输入补全（输入状态回馈、Caps Lock 同步、相对鼠标、手势、设备身份） | 中，可拆分 | 键盘动作与反馈已提交 `22bdedd`，相对鼠标已提交 `4b32a41`，精密滚动和手势已提交 `a9c4c70`。设备身份待完成 |
+| WP5 | 输入补全（输入状态回馈、Caps Lock 同步、相对鼠标、手势、设备身份） | 中，可拆分 | 键盘动作与反馈已提交 `22bdedd`，相对鼠标已提交 `4b32a41`，精密滚动和手势已提交 `a9c4c70`，设备身份已提交 `4e67c77`。已完成软件验收，物理键鼠及触摸设备待实机确认 |
 | WP6 | 自动剪贴板，图片与文件 | 大 | 未开始 |
 | WP7 | 视频性能：GPU 缩放与色彩转换、硬件编码、HEVC、60 fps 以上、码率自适应 | 大，可拆分 | 未开始 |
 | WP8 | 远端声音 | 中 | 未开始 |
@@ -256,7 +256,7 @@ python3 scripts/check-cargo-lock-age.py
 - **相对鼠标**（`relativeMouseV1`）：`RemoteInput.pointerDeltaX/Y`、`pointerSequence`、`relativeMouse`；被控端用 `MOUSEEVENTF_MOVE` 相对移动；控制端用 Raw Input 加指针锁定。面向游戏/3D 软件，优先级低。
 - **触控板手势**（`trackpadGesturesV1`）：`magnify` / `rotate` / `smartMagnify`。已实现。Windows 被控端在共享屏的前台目标上合成双触点。Windows 控制端通过 Direct Manipulation 读取精密触控板的捏合，在支持相应触摸消息的设备上还可发送旋转和智能缩放。
 - **滚动相位**：`scrollPhase` / `momentumPhase` 已实现。Windows 控制端区分手指滚动、惯性和结束，按像素发送。普通滚轮保留原有行增量。
-- **设备身份**（消息 21 `deviceIdentity`，Hello 的 `deviceID` / `deviceIdentityExchange`）：macOS 用它给连接记录命名与去重。Windows 端生成并保存一个设备 UUID，两端交换。
+- **设备身份**（消息 21 `deviceIdentity`，Hello 的 `deviceID` / `deviceIdentityExchange`）：已实现。主机在 Hello 里带持久 UUID，控制端在协商后回复自己的 UUID 和设备名。同一会话允许改名，UUID 变化会结束连接。Windows 以设备 UUID 和已验证的配对码共同匹配跨地址记录。
 
 ### WP6 自动剪贴板，图片与文件
 
@@ -428,7 +428,7 @@ python3 scripts/check-cargo-lock-age.py
 | 10 | inputStatus | WP5 已接入键盘动作状态回馈 |
 | 11–17 | clipboardSettings、clipboardBegin/Entry/Chunk/End/Receipt/Cancel | WP6 |
 | 18–20 | streamSettingsRequest、streamSettingsResult、controlStatus | 已实现 |
-| 21 | deviceIdentity | WP5 |
+| 21 | deviceIdentity | WP5 已实现，控制端在支持交换的已配对连接中发送 |
 | 22–23 | sessionEffectsRequest、sessionEffectsResult | WP11 |
 | 24–25 | sessionPauseRequest、sessionPauseResult | 已实现 |
 | 26–28 | mediaControl、mediaFrame、mediaFeedback | WP1 已接入两个角色的控制连接 |

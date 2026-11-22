@@ -1,9 +1,11 @@
 //! QuietDesk wire protocol, pairing transport and session logic.
 //!
-//! This crate speaks the baseline protocol of the macOS application (`Sources/QuietDeskCore`):
-//! TLS 1.2 with a pre-shared pairing key, length-prefixed messages, JSON control messages and
-//! H.264 access units acknowledged by sequence number. It has no platform dependencies, so the
-//! same code runs in the Windows application and in the interoperability checks on macOS.
+//! This crate speaks the protocol of the macOS application (`Sources/QuietDeskCore`) for the capabilities
+//! the Windows client announces: TLS 1.2 with a pre-shared pairing key, length-prefixed messages, the
+//! media session over TCP and over DTLS datagrams with repair and forward error correction, the
+//! independent cursor, clipboard and file transfer, remote audio and display switching. It has no
+//! Windows dependencies, so the same code runs in the Windows application and in the
+//! interoperability checks on macOS.
 
 pub mod audio;
 pub mod audio_session;

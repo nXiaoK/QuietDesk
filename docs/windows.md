@@ -87,6 +87,8 @@ Windows 被控端的已知限制：
 
 `%LOCALAPPDATA%\QuietDesk\logs\quietdesk*.log`（按大小轮转，保留 3 份）。日志不记录配对码、地址、剪贴板内容或按键。设置保存在 `%APPDATA%\QuietDesk\settings.json`。本机设备 UUID 独立保存在 `%LOCALAPPDATA%\QuietDesk\device-identity.json`。身份文件不可用时可照常配对和连接。
 
+共享画面时，日志中每秒的 `host video stats` 给出采集方式、等待画面变化的时间、实际抓屏、转换和编码的平均耗时。`output` 是编码器返回给采集线程的帧数，`queued` 是进入发送队列的帧数，`dropped` 是采集线程未能送入队列的编码帧数。`process_cpu_ms_per_s` 是整个进程每秒使用的 CPU 毫秒数，1000 相当于占满一个逻辑核心。某项没有样本时显示 `na`。
+
 ## 检查
 
 ```sh

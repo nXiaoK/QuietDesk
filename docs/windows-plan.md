@@ -22,7 +22,7 @@
 | WP6 | 自动剪贴板，图片与文件 | 大 | 已提交 macOS `fe4ec9c`、Windows `97793b9`。双向配对 TLS、隔离原生剪贴板及窗口检查通过，真实 Finder / 资源管理器组合待验 |
 | WP7 | 视频性能：GPU 缩放与色彩转换、硬件编码、HEVC、60 fps 以上、码率自适应 | 大，可拆分 | 每秒性能统计已提交 `e9002e1`。已按用户决定优先开发双向文件粘贴。GPU、硬件编码及 HEVC 等待 Windows 实机 |
 | WP8 | 远端声音 | 中 | 已提交 `4e57867`。双向配对 TLS、Wine 虚拟声卡、默认输出切换与窗口菜单检查通过，物理声卡和蓝牙耳机待 Windows 实机确认 |
-| WP9 | 辅助 TCP 通道与 UDP 视频（DTLS、分片、补传、FEC、路径策略） | 特大，分 5 步 | 9a 已提交 `1e243d1`，独立加密视频、批量 TCP 和 `shared` 回退通过双向互通。9b–9e 待交付 |
+| WP9 | 辅助 TCP 通道与 UDP 视频（DTLS、分片、补传、FEC、路径策略） | 特大，分 5 步 | 9a 独立视频与批量 TCP 已提交 `1e243d1`。9b 加密 UDP、分片及补传已提交 `c1b892e`，双向互通、丢包、黑洞回退及 Windows 连续解码已验证。9c–9e 待交付 |
 | WP10 | 自托管中继 | 大 | 未开始，依赖 WP9 |
 | WP11 | 会话工具：模拟键入、桌面操作、静音/黑屏遮罩/断开后锁屏、自动解锁、画质探测 | 中，可拆分 | 未开始 |
 | WP12 | 端口映射 | 中 | 未开始 |
@@ -52,6 +52,8 @@ windows/
     host.rs      被控端会话（HostPlatform、FrameSink、HostOptions/HostCommand/HostEvent）
     viewer.rs    控制端会话（ViewerPlatform、ViewerCommand/ViewerEvent/ViewerEnd）
     auxiliary.rs  同一配对控制会话中的视频、批量 TCP 连接与绑定授权
+    datagram_transport.rs datagram_path.rs  DTLS 会话与双向探测
+    datagram_frames.rs media/fragment/  H.264 分片发送、按序重组与补传
     audio.rs audio_session.rs  Opus、抖动缓冲、远端声音开关与设备生命周期
     clipboard.rs  剪贴板能力协商、清单、按需拉取、接收确认与文件传输
     media.rs     媒体会话线格式与双方状态机，供 host.rs / viewer.rs 协商与传输视频
@@ -81,7 +83,7 @@ scripts/check-cargo-lock-age.py        检查锁定的依赖是否已发布满 7
 初版 Windows 端通过 macOS 的旧版兼容路径互通。WP1 在此基础上增加了可选媒体会话。
 
 - 被控端 Hello 声明 `liveSettings`、`controlStatusUpdates`、`extendedVideoSettings`、`preferredSettings`、`highRefreshVideoSettings`、`preferredHighRefreshSettings`、`sessionPause`、`sessionTerminationV1`、`initialStreamNegotiationV1`。WP1 新增 `mediaTransportV1`，WP2 在平台支持光标采样时声明 `independentCursorV1`，在首个媒体流提交后独立协商。
-- 两端支持时优先在视频辅助连接建立 `tcp` 流，绑定不可用时通过控制连接建立 `shared` 流。H.264 视频通过 `mediaFrame` 发送并以 `mediaFeedback` 确认。首次切换前和对接旧版本时继续支持 `video` / `acknowledgement`。Windows 被控端最多等待 3 帧确认。
+- 两端都通过 DTLS 双向探测后优先在 `udp` 上传 H.264 分片。UDP 不通时优先在独立视频连接上传 `mediaFrame`（`tcp`），绑定不可用时使用控制连接（`shared`）。首次切换前和对接旧版本时继续支持 `video` / `acknowledgement`。Windows 被控端最多等待 3 帧确认。
 - 被控端能枚举活动屏幕时声明 `displaySwitchingV1`，能读取当前控制台的键盘大写状态时声明 `inputActions`。两项能力独立协商。
 - Windows 剪贴板监听器启动后，被控端声明 `clipboardSync` 和 `physicalFilePasteV1`。两端通过消息 11 确认可用能力和开关。复制文件只通告类型，首次读取才索取预览，接收端同意后传输内容。
 - Windows 被控端通过 `remoteAudioV1` 声明远端系统声音。控制端可在会话内开启声音，设备启动成功后才确认开启。

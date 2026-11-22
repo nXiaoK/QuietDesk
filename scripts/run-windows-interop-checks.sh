@@ -22,7 +22,7 @@ core_objects=("$build_directory"/QuietDeskCore.build/*.swift.o)
 swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     -module-cache-path "$build_directory/ModuleCache" -I "$build_directory/Modules" \
     "${core_objects[@]}" Sources/QuietDesk/Capture.swift Sources/QuietDesk/CaptureLifecycle.swift Sources/QuietDesk/InputSources.swift Sources/QuietDesk/InputSourceContext.swift \
-    AppChecks/WindowsInteropChecks.swift -o "$build_directory/WindowsInteropChecks"
+    AppChecks/RelayOpaqueProxy.swift AppChecks/WindowsInteropChecks.swift -o "$build_directory/WindowsInteropChecks"
 fixture_directory="$(mktemp -d "$check_root/fixture.XXXXXX")"
 trap 'rm -rf "$fixture_directory"' EXIT
 "$build_directory/WindowsInteropChecks" "$CARGO_TARGET_DIR/debug/quietdesk-probe" "$fixture_directory"

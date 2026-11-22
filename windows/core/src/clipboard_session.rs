@@ -46,11 +46,18 @@ impl SessionClipboard {
         )
     }
 
-    pub(crate) async fn next(session: &mut Option<Self>, peer: &PeerHandle) -> Result<Option<String>> {
+    pub(crate) fn is_bulk(kind: MessageKind) -> bool {
+        kind != MessageKind::ClipboardSettings && Self::accepts(kind)
+    }
+
+    pub(crate) async fn next(session: &mut Option<Self>, control: &PeerHandle, bulk: Option<&PeerHandle>) -> Result<Option<String>> {
         let Some(active) = session else { return std::future::pending().await };
         let output = active.exchange.output.recv().await.ok_or_else(|| DeskError::platform("剪贴板会话已结束"))?;
         match output {
-            Output::Send(message) => peer.send(&message)?,
+            Output::Send(message) => {
+                let peer = if Self::is_bulk(message.kind) { bulk.unwrap_or(control) } else { control };
+                peer.send(&message)?;
+            }
             Output::Native(Action::Status(status)) => return Ok(Some(status.chars().filter(|c| !c.is_control()).take(256).collect())),
             Output::Native(action) => (active.native)(action),
             Output::ProtocolError(reason) => return Err(DeskError::invalid(reason)),

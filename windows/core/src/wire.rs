@@ -161,6 +161,10 @@ impl Message {
 
 /// Reads one message. `Ok(None)` is an orderly end of stream between messages.
 pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Message>> {
+    read_message_limited(reader, MAXIMUM_MESSAGE_BYTES).await
+}
+
+pub(crate) async fn read_message_limited<R: AsyncRead + Unpin>(reader: &mut R, maximum: usize) -> Result<Option<Message>> {
     let mut header = [0u8; 4];
     match reader.read_exact(&mut header).await {
         Ok(_) => {}
@@ -168,7 +172,7 @@ pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option
         Err(error) => return Err(error.into()),
     }
     let size = u32::from_be_bytes(header) as usize;
-    if !(1..=MAXIMUM_MESSAGE_BYTES).contains(&size) {
+    if !(1..=maximum).contains(&size) {
         return Err(DeskError::invalid("无效的消息长度"));
     }
     let kind = MessageKind::from_number(reader.read_u8().await?).ok_or_else(|| DeskError::invalid("无法识别的消息类型"))?;

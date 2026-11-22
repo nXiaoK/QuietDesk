@@ -227,7 +227,7 @@ fn main() {
                     fail("viewer", "displayed a media picture before its stream committed");
                 }
                 if after_commit == 0 {
-                    fail("viewer", "no picture decoded after the shared media stream committed");
+                    fail("viewer", "no picture decoded after the media stream committed");
                 }
             }
             if arguments.iter().any(|argument| argument == "--require-cursor") {

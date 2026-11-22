@@ -1,9 +1,8 @@
-//! Video on the control connection as the macOS `MediaSession` frames it: stream identities, the
+//! Reliable video as the macOS `MediaSession` frames it: stream identities, the
 //! transaction that opens every stream with a keyframe the viewer has decoded, whole-frame envelopes,
 //! and the feedback that takes the place of legacy acknowledgements.
 //!
-//! This is the `shared` path of that session. Datagram transport, auxiliary connections, repair and the
-//! shortened recovery exchange are never offered, so the other side does not use them.
+//! A stream stays on its negotiated connection until a new keyframe transaction commits.
 
 use crate::error::{DeskError, Result};
 use crate::video::{EncodedFrame, VideoPacket, nal_units};
@@ -37,7 +36,33 @@ const FRAME_RECORD: u8 = 1;
 const FEEDBACK_RECORD: u8 = 3;
 /// A feedback record fits one datagram of the macOS implementation, whatever carries it.
 const MAXIMUM_FEEDBACK_BYTES: usize = 1100;
-const PATH: &str = "shared";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReliablePath {
+    Shared,
+    Tcp,
+}
+
+impl ReliablePath {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Tcp => "tcp",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RoutedStream {
+    stream: MediaStreamId,
+    path: ReliablePath,
+}
+
+impl RoutedStream {
+    fn transaction(self, operation: MediaOperation, id: Uuid) -> MediaControl {
+        MediaControl::transaction(operation, id, self.stream, self.path.name())
+    }
+}
+
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -327,14 +352,18 @@ impl MediaControl {
         }
     }
 
+    pub(crate) fn binding(operation: MediaOperation, session: Uuid, token: &[u8; 32], role: &str) -> Self {
+        Self { session_id: Some(session), token: Some(token.to_vec()), role: Some(role.to_owned()), ..Self::new(operation) }
+    }
+
     /// A step of the exchange that opens `stream`.
-    fn transaction(operation: MediaOperation, id: Uuid, stream: MediaStreamId) -> Self {
+    fn transaction(operation: MediaOperation, id: Uuid, stream: MediaStreamId, path: &str) -> Self {
         Self {
             session_id: Some(stream.session_id),
             transaction_id: Some(id),
             transport_epoch: Some(stream.transport_epoch),
             codec_epoch: Some(stream.codec_epoch),
-            path: Some(PATH.to_string()),
+            path: Some(path.to_owned()),
             ..Self::new(operation)
         }
     }
@@ -407,11 +436,10 @@ impl MediaControl {
         Ok(control)
     }
 
-    /// The stream and transaction a step names, when the step belongs to this session's path.
-    fn step(&self, session: Uuid) -> Result<(Uuid, MediaStreamId, bool)> {
+    fn step(&self, session: Uuid) -> Result<(Uuid, MediaStreamId, &str)> {
         match (self.transaction_id, self.transport_epoch, self.codec_epoch, self.path.as_deref()) {
             (Some(id), Some(transport_epoch), Some(codec_epoch), Some(path)) => {
-                Ok((id, MediaStreamId { session_id: session, transport_epoch, codec_epoch }, path == PATH))
+                Ok((id, MediaStreamId { session_id: session, transport_epoch, codec_epoch }, path))
             }
             _ => Err(DeskError::invalid("媒体切换身份缺失")),
         }
@@ -437,7 +465,7 @@ enum HostStage {
 
 struct HostTransaction {
     id: Uuid,
-    stream: MediaStreamId,
+    route: RoutedStream,
     stage: HostStage,
     key_frame_sent: bool,
     deadline: Instant,
@@ -477,7 +505,8 @@ pub struct HostMedia {
     credentials: Option<(Vec<u8>, Vec<u8>)>,
     epochs: (u32, u32),
     transaction: Option<HostTransaction>,
-    active: Option<MediaStreamId>,
+    active: Option<RoutedStream>,
+    video_bound: bool,
     /// Frames wait for the viewer to open a new stream.
     hold: bool,
     next_frame: u64,
@@ -486,6 +515,16 @@ pub struct HostMedia {
 }
 
 impl HostMedia {
+    pub fn frame_path(&self) -> ReliablePath {
+        self.transaction.as_ref().map(|t| t.route).or(self.active).map_or(ReliablePath::Shared, |r| r.path)
+    }
+
+    pub fn set_video_bound(&mut self, bound: bool) -> (usize, Vec<MediaControl>) {
+        let interrupted = self.video_bound && !bound && self.frame_path() == ReliablePath::Tcp;
+        self.video_bound = bound;
+        if interrupted { self.interrupted() } else { (0, Vec::new()) }
+    }
+
     pub fn gate(&self) -> Gate {
         match &self.transaction {
             Some(transaction) if transaction.stage == HostStage::Producing && !transaction.key_frame_sent => Gate::One,
@@ -518,7 +557,7 @@ impl HostMedia {
         match control.operation {
             Request => {
                 if self.session.is_none() {
-                    // The viewer keeps both values for channels this host never accepts; they still have to be unguessable.
+                    // Both credentials are required by the offer, including on hosts which serve only reliable video.
                     let (mut token, mut key) = (vec![0u8; 32], vec![0u8; 32]);
                     for secret in [&mut token, &mut key] {
                         openssl::rand::rand_bytes(secret).map_err(|error| DeskError::platform(format!("无法生成媒体会话凭据：{error}")))?;
@@ -533,24 +572,32 @@ impl HostMedia {
             Prepare | Ready | DecodedReady | Committed | Abort => {}
         }
         let Some(session) = self.session.filter(|session| control.session_id == Some(*session)) else { return Ok(Vec::new()) };
-        let (id, stream, shared) = control.step(session)?;
-        let refuse = || vec![HostMediaEvent::Send(Box::new(MediaControl { path: control.path.clone(), ..MediaControl::transaction(Abort, id, stream) }))];
-        let current = self.transaction.as_mut().filter(|transaction| transaction.id == id && transaction.stream == stream && shared);
+        let (id, stream, path) = control.step(session)?;
+        let refuse = || vec![HostMediaEvent::Send(Box::new(MediaControl::transaction(Abort, id, stream, path)))];
+        let current =
+            self.transaction.as_mut().filter(|transaction| transaction.id == id && transaction.route.stream == stream && transaction.route.path.name() == path);
         Ok(match control.operation {
             Prepare => match &self.transaction {
                 Some(transaction) if transaction.id != id => refuse(),
-                Some(transaction) if transaction.stream != stream || !shared => return Err(DeskError::invalid("媒体事务标识冲突")),
+                Some(transaction) if transaction.route.stream != stream || transaction.route.path.name() != path => {
+                    return Err(DeskError::invalid("媒体事务标识冲突"));
+                }
                 Some(transaction) if transaction.stage != HostStage::Preparing => {
-                    vec![HostMediaEvent::Send(Box::new(MediaControl::transaction(Ready, id, stream)))]
+                    vec![HostMediaEvent::Send(Box::new(MediaControl::transaction(Ready, id, stream, path)))]
                 }
                 Some(_) => Vec::new(),
-                None if !shared || paused || stream.transport_epoch <= self.epochs.0 || stream.codec_epoch <= self.epochs.1 => refuse(),
+                None if paused || stream.transport_epoch <= self.epochs.0 || stream.codec_epoch <= self.epochs.1 => refuse(),
                 None => {
+                    let path = match path {
+                        "shared" => ReliablePath::Shared,
+                        "tcp" if self.video_bound => ReliablePath::Tcp,
+                        _ => return Ok(refuse()),
+                    };
                     self.epochs = (stream.transport_epoch, stream.codec_epoch);
                     self.hold = true;
                     self.transaction = Some(HostTransaction {
                         id,
-                        stream,
+                        route: RoutedStream { stream, path },
                         stage: HostStage::Preparing,
                         key_frame_sent: false,
                         deadline: Instant::now() + TRANSACTION_TIMEOUT,
@@ -573,16 +620,16 @@ impl HostMedia {
                     // This confirmation stands for the keyframe's own feedback, which may still be on its way.
                     let settled = self.unsettled.iter().take_while(|frame| frame.header.frame_id == 1).count();
                     self.unsettled.drain(..settled);
-                    vec![HostMediaEvent::Settled(settled), HostMediaEvent::Send(Box::new(MediaControl::transaction(Commit, id, stream)))]
+                    vec![HostMediaEvent::Settled(settled), HostMediaEvent::Send(Box::new(MediaControl::transaction(Commit, id, stream, path)))]
                 }
                 _ => Vec::new(),
             },
             Committed => match current {
                 Some(transaction) if transaction.stage == HostStage::Decoded => {
-                    self.active = Some(stream);
+                    self.active = Some(transaction.route);
                     self.transaction = None;
                     self.hold = false;
-                    log::info!("host committed shared media stream (transport epoch {}, codec epoch {})", stream.transport_epoch, stream.codec_epoch);
+                    log::info!("host committed {path} media stream (transport epoch {}, codec epoch {})", stream.transport_epoch, stream.codec_epoch);
                     Vec::new()
                 }
                 _ => Vec::new(),
@@ -602,24 +649,24 @@ impl HostMedia {
     pub fn prepared(&mut self) -> Option<MediaControl> {
         let transaction = self.transaction.as_mut().filter(|transaction| transaction.stage == HostStage::Preparing)?;
         transaction.stage = HostStage::Ready;
-        Some(MediaControl::transaction(MediaOperation::Ready, transaction.id, transaction.stream))
+        Some(transaction.route.transaction(MediaOperation::Ready, transaction.id))
     }
 
     /// The stream being prepared, for what has to be said about it before the viewer hears it is ready.
     pub fn preparing(&self) -> Option<MediaStreamId> {
-        self.transaction.as_ref().filter(|transaction| transaction.stage == HostStage::Preparing).map(|transaction| transaction.stream)
+        self.transaction.as_ref().filter(|transaction| transaction.stage == HostStage::Preparing).map(|transaction| transaction.route.stream)
     }
 
     pub fn frame(&mut self, sequence: u32, frame: EncodedFrame) -> Result<HostFrame> {
         let stream = match &mut self.transaction {
             Some(transaction) if transaction.stage == HostStage::Producing && !transaction.key_frame_sent && frame.is_key_frame() => {
                 transaction.key_frame_sent = true;
-                transaction.stream
+                transaction.route.stream
             }
             Some(_) => return Ok(HostFrame::Dropped),
             None if self.hold => return Ok(HostFrame::Dropped),
             None => match self.active {
-                Some(stream) => stream,
+                Some(route) => route.stream,
                 None => return Ok(HostFrame::Legacy(VideoPacket::h264(sequence, frame))),
             },
         };
@@ -669,7 +716,7 @@ impl HostMedia {
     /// Returns how many frames stop counting against the frame window and what to tell the viewer;
     /// frames are held until it has opened a new stream.
     pub fn interrupted(&mut self) -> (usize, Vec<MediaControl>) {
-        let aborted = self.transaction.take().map(|transaction| MediaControl::transaction(MediaOperation::Abort, transaction.id, transaction.stream));
+        let aborted = self.transaction.take().map(|transaction| transaction.route.transaction(MediaOperation::Abort, transaction.id));
         self.hold = self.hold || self.active.is_some() || aborted.is_some();
         let settled = std::mem::take(&mut self.unsettled).len();
         (settled, aborted.into_iter().chain(self.recovery()).collect())
@@ -678,12 +725,12 @@ impl HostMedia {
     /// Stops the exchange in progress; a paused host opens no stream.
     pub fn paused(&mut self) -> Option<MediaControl> {
         let transaction = self.transaction.take()?;
-        Some(MediaControl::transaction(MediaOperation::Abort, transaction.id, transaction.stream))
+        Some(transaction.route.transaction(MediaOperation::Abort, transaction.id))
     }
 
     /// The request for a new stream, while frames are held and the viewer has not asked yet.
     pub fn recovery(&self) -> Option<MediaControl> {
-        self.active.filter(|_| self.hold && self.transaction.is_none()).map(MediaControl::recover)
+        self.active.filter(|_| self.hold && self.transaction.is_none()).map(|route| MediaControl::recover(route.stream))
     }
 }
 
@@ -696,7 +743,7 @@ enum ViewerStage {
 
 struct ViewerTransaction {
     id: Uuid,
-    stream: MediaStreamId,
+    route: RoutedStream,
     stage: ViewerStage,
     started: Instant,
 }
@@ -738,8 +785,10 @@ pub struct ViewerMedia {
     session: Option<Uuid>,
     epochs: (u32, u32),
     transaction: Option<ViewerTransaction>,
-    active: Option<MediaStreamId>,
+    active: Option<RoutedStream>,
+    video_bound: bool,
     receiving: Option<ReceivingStream>,
+    auxiliary_enabled: bool,
     legacy_decodes: VecDeque<(u32, usize)>,
     retry_at: Option<Instant>,
     paused: bool,
@@ -757,7 +806,31 @@ impl ViewerMedia {
     }
 
     pub fn active(&self) -> Option<MediaStreamId> {
-        self.active
+        self.active.map(|route| route.stream)
+    }
+
+    pub fn enable_auxiliary(&mut self) {
+        self.auxiliary_enabled = true;
+    }
+
+    pub fn set_video_bound(&mut self, bound: bool, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
+        if !self.auxiliary_enabled || self.video_bound == bound {
+            return Ok(Vec::new());
+        }
+        self.video_bound = bound;
+        let route = self.transaction.as_ref().map(|t| t.route).or(self.active);
+        match route {
+            None if bound => self.begin(now),
+            Some(route) if !bound && route.path == ReliablePath::Tcp => {
+                let mut events = Vec::new();
+                if let Some(abort) = self.abandon() {
+                    events.push(ViewerMediaEvent::Send(abort.message()?));
+                }
+                events.extend(self.begin(now)?);
+                Ok(events)
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     fn begin(&mut self, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
@@ -767,8 +840,9 @@ impl ViewerMedia {
         }
         self.epochs = (self.epochs.0 + 1, self.epochs.1 + 1);
         let stream = MediaStreamId { session_id, transport_epoch: self.epochs.0, codec_epoch: self.epochs.1 };
-        let transaction = ViewerTransaction { id: Uuid::new_v4(), stream, stage: ViewerStage::Preparing, started: now };
-        let prepare = MediaControl::transaction(MediaOperation::Prepare, transaction.id, stream).message()?;
+        let path = if self.video_bound { ReliablePath::Tcp } else { ReliablePath::Shared };
+        let transaction = ViewerTransaction { id: Uuid::new_v4(), route: RoutedStream { stream, path }, stage: ViewerStage::Preparing, started: now };
+        let prepare = MediaControl::transaction(MediaOperation::Prepare, transaction.id, stream, path.name()).message()?;
         self.receiving = None;
         self.transaction = Some(transaction);
         self.retry_at = None;
@@ -779,7 +853,7 @@ impl ViewerMedia {
     fn abandon(&mut self) -> Option<MediaControl> {
         self.receiving = None;
         let transaction = self.transaction.take()?;
-        Some(MediaControl::transaction(MediaOperation::Abort, transaction.id, transaction.stream))
+        Some(transaction.route.transaction(MediaOperation::Abort, transaction.id))
     }
 
     pub fn control(&mut self, control: &MediaControl, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
@@ -792,6 +866,12 @@ impl ViewerMedia {
                     return Ok(Vec::new());
                 }
                 self.session = control.session_id;
+                if self.auxiliary_enabled && !self.video_bound {
+                    if !self.paused {
+                        self.retry_at = Some(now + Duration::from_millis(1500));
+                    }
+                    return Ok(Vec::new());
+                }
                 return self.begin(now);
             }
             _ => {}
@@ -801,26 +881,28 @@ impl ViewerMedia {
             Stats | DecodedReady | Committed => return Ok(Vec::new()),
             Recover => {
                 let named = (control.transport_epoch, control.codec_epoch);
-                let current = self.active.map(|stream| (Some(stream.transport_epoch), Some(stream.codec_epoch)));
+                let current = self.active().map(|stream| (Some(stream.transport_epoch), Some(stream.codec_epoch)));
                 return if current == Some(named) { self.begin(now) } else { Ok(Vec::new()) };
             }
             _ => {}
         }
-        let (id, stream, shared) = control.step(session)?;
-        let Some(transaction) = self.transaction.as_mut().filter(|transaction| transaction.id == id && transaction.stream == stream && shared) else {
+        let (id, stream, path) = control.step(session)?;
+        let Some(transaction) =
+            self.transaction.as_mut().filter(|transaction| transaction.id == id && transaction.route.stream == stream && transaction.route.path.name() == path)
+        else {
             return Ok(Vec::new());
         };
         Ok(match (control.operation, transaction.stage) {
             (Ready, ViewerStage::Preparing) => {
                 transaction.stage = ViewerStage::Ready;
                 self.receiving = Some(ReceivingStream { stream, next_frame: 1, pending: VecDeque::new(), last_decoded: None });
-                vec![ViewerMediaEvent::Send(MediaControl::transaction(Ready, id, stream).message()?)]
+                vec![ViewerMediaEvent::Send(MediaControl::transaction(Ready, id, stream, path).message()?)]
             }
             (Commit, ViewerStage::Decoded) => {
+                self.active = Some(transaction.route);
                 self.transaction = None;
-                self.active = Some(stream);
-                log::info!("viewer committed shared media stream (transport epoch {}, codec epoch {})", stream.transport_epoch, stream.codec_epoch);
-                vec![ViewerMediaEvent::Committed(stream), ViewerMediaEvent::Send(MediaControl::transaction(Committed, id, stream).message()?)]
+                log::info!("viewer committed {path} media stream (transport epoch {}, codec epoch {})", stream.transport_epoch, stream.codec_epoch);
+                vec![ViewerMediaEvent::Committed(stream), ViewerMediaEvent::Send(MediaControl::transaction(Committed, id, stream, path).message()?)]
             }
             (Abort, _) => {
                 self.abandon();
@@ -832,8 +914,15 @@ impl ViewerMedia {
     }
 
     pub fn frame(&mut self, payload: &[u8], now: Instant) -> Result<Vec<ViewerMediaEvent>> {
+        self.frame_on(ReliablePath::Shared, payload, now)
+    }
+
+    pub fn frame_on(&mut self, path: ReliablePath, payload: &[u8], now: Instant) -> Result<Vec<ViewerMediaEvent>> {
         if self.session.is_none() {
             return Err(DeskError::invalid("媒体帧会话尚未协商"));
+        }
+        if self.transaction.as_ref().map(|t| t.route).or(self.active).is_some_and(|route| route.path != path) {
+            return Ok(Vec::new());
         }
         let frame = MediaFrame::decode(payload)?;
         let Some(receiver) = self.receiving.as_ref().filter(|receiver| receiver.stream == frame.header.stream) else { return Ok(Vec::new()) };
@@ -915,7 +1004,7 @@ impl ViewerMedia {
         let mut events = vec![ViewerMediaEvent::Send(MediaFeedback { kind: FeedbackKind::Decoded, header }.message())];
         if let Some(transaction) = self.transaction.as_mut().filter(|transaction| transaction.stage == ViewerStage::Ready) {
             transaction.stage = ViewerStage::Decoded;
-            events.push(ViewerMediaEvent::Send(MediaControl::transaction(MediaOperation::DecodedReady, transaction.id, transaction.stream).message()?));
+            events.push(ViewerMediaEvent::Send(transaction.route.transaction(MediaOperation::DecodedReady, transaction.id).message()?));
         }
         Ok(events)
     }
@@ -939,7 +1028,7 @@ impl ViewerMedia {
         let mut events = Vec::new();
         if let Some((header, _)) = self.awaiting_decode().filter(|(_, deadline)| now >= *deadline) {
             events.push(ViewerMediaEvent::Send(MediaFeedback { kind: FeedbackKind::Expired, header }.message()));
-            if self.transaction.as_ref().is_some_and(|pending| pending.stream == header.stream) {
+            if self.transaction.as_ref().is_some_and(|pending| pending.route.stream == header.stream) {
                 events.extend(self.abandon().map(|abort| abort.message().map(ViewerMediaEvent::Send)).transpose()?);
                 self.retry_at = Some(now + Self::RETRY_DELAY);
             } else {
@@ -1057,7 +1146,7 @@ mod tests {
     #[test]
     fn controls_use_the_macos_field_names_and_its_validation() {
         let id = Uuid::from_bytes([0x22; 16]);
-        let prepare = MediaControl::transaction(MediaOperation::Prepare, id, stream(1));
+        let prepare = MediaControl::transaction(MediaOperation::Prepare, id, stream(1), "shared");
         assert_eq!(
             serde_json::to_value(&prepare).unwrap(),
             serde_json::json!({
@@ -1184,7 +1273,7 @@ mod tests {
                 HostFrame::Legacy(_) => "legacy",
                 HostFrame::Dropped => "dropped",
                 HostFrame::Media(message) => {
-                    let events = self.viewer.frame(&message.payload, self.now).unwrap();
+                    let events = self.viewer.frame_on(self.host.frame_path(), &message.payload, self.now).unwrap();
                     self.viewer_events(events);
                     "media"
                 }
@@ -1197,6 +1286,14 @@ mod tests {
             self.viewer_events(events);
         }
 
+        fn bind_video(&mut self) {
+            let (settled, controls) = self.host.set_video_bound(true);
+            assert_eq!(settled, 0);
+            assert!(controls.is_empty());
+            let events = self.viewer.set_video_bound(true, self.now).unwrap();
+            self.viewer_events(events);
+        }
+
         /// The exchange up to the first committed stream.
         fn open(&mut self) {
             self.host_receives(ViewerMedia::request());
@@ -1204,6 +1301,116 @@ mod tests {
             self.viewer_receives(ready);
             assert_eq!(self.encode(1, key_frame()), "media");
             self.decode(1);
+        }
+    }
+
+    #[test]
+    fn the_offer_waits_for_a_video_bind_and_a_late_bind_keeps_the_shared_transaction() {
+        let mut pair = Pair::new();
+        pair.viewer.enable_auxiliary();
+        pair.host_receives(ViewerMedia::request());
+        let initial_deadline = pair.now + Duration::from_millis(1500);
+        assert_eq!(pair.viewer.deadline(), Some(initial_deadline));
+        pair.host_receives(ViewerMedia::request());
+        assert_eq!(pair.viewer.deadline(), Some(initial_deadline));
+        assert!(pair.viewer.tick(initial_deadline - Duration::from_millis(1)).unwrap().is_empty());
+        let events = pair.viewer.tick(initial_deadline).unwrap();
+        pair.viewer_events(events);
+        assert_eq!(pair.host.frame_path(), ReliablePath::Shared);
+        pair.bind_video();
+        let ready = pair.host.prepared().unwrap();
+        assert_eq!(ready.path.as_deref(), Some("shared"));
+        pair.viewer_receives(ready);
+        assert_eq!(pair.encode(1, key_frame()), "media");
+        pair.decode(1);
+        assert!(pair.viewer.set_video_bound(false, pair.now).unwrap().is_empty());
+        assert_eq!(pair.host.set_video_bound(false), (0, Vec::new()));
+        assert_eq!(pair.host.gate(), Gate::Open);
+    }
+
+    #[test]
+    fn a_video_disconnect_reported_after_shared_prepare_keeps_that_cutover_and_its_credit() {
+        let mut pair = Pair::new();
+        pair.viewer.enable_auxiliary();
+        pair.host_receives(ViewerMedia::request());
+        pair.bind_video();
+        let ready = pair.host.prepared().unwrap();
+        pair.viewer_receives(ready);
+        pair.encode(1, key_frame());
+        pair.decode(1);
+        let fallback = pair.viewer.set_video_bound(false, pair.now).unwrap();
+        pair.viewer_events(fallback);
+        let ready = pair.host.prepared().unwrap();
+        pair.viewer_receives(ready);
+        pair.encode(2, key_frame());
+        assert_eq!(pair.host.set_video_bound(false), (0, Vec::new()));
+        assert_eq!(pair.host.gate(), Gate::Closed);
+        pair.decode(2);
+        assert_eq!(pair.host.gate(), Gate::Open);
+        assert_eq!(pair.host.frame_path(), ReliablePath::Shared);
+    }
+
+    #[test]
+    fn a_bound_video_path_uses_its_own_frames_and_exact_transaction_messages() {
+        let mut pair = Pair::new();
+        pair.viewer.enable_auxiliary();
+        pair.host_receives(ViewerMedia::request());
+        pair.bind_video();
+        let ready = pair.host.prepared().unwrap();
+        assert_eq!(ready.path.as_deref(), Some("tcp"));
+        let mut wrong = ready.clone();
+        wrong.path = Some("shared".into());
+        assert!(pair.viewer.control(&wrong, pair.now).unwrap().is_empty());
+        assert!(pair.host.control(&wrong, false).unwrap().is_empty());
+        assert_eq!(pair.host.gate(), Gate::Closed);
+        pair.viewer_receives(ready);
+        assert_eq!(pair.host.frame_path(), ReliablePath::Tcp);
+        let HostFrame::Media(frame) = pair.host.frame(1, key_frame()).unwrap() else { panic!("expected TCP keyframe") };
+        assert!(pair.viewer.frame(&frame.payload, pair.now).unwrap().is_empty());
+        let accepted = pair.viewer.frame_on(ReliablePath::Tcp, &frame.payload, pair.now).unwrap();
+        pair.viewer_events(accepted);
+        assert_eq!(pair.host.gate(), Gate::Closed);
+        pair.decode(1);
+        assert_eq!(pair.host.gate(), Gate::Open);
+        assert_eq!(pair.host.frame_path(), ReliablePath::Tcp);
+    }
+
+    #[test]
+    fn losing_the_video_socket_before_during_or_after_commit_opens_a_new_shared_stream() {
+        for stage in 0..3 {
+            let mut pair = Pair::new();
+            pair.viewer.enable_auxiliary();
+            pair.host_receives(ViewerMedia::request());
+            pair.bind_video();
+            let retired = *pair.prepared.last().unwrap();
+            if stage > 0 {
+                let ready = pair.host.prepared().unwrap();
+                pair.viewer_receives(ready);
+                assert_eq!(pair.encode(1, key_frame()), "media");
+                if stage == 2 {
+                    pair.decode(1);
+                    assert_eq!(pair.encode(2, dependent_frame()), "media");
+                }
+            }
+            let (settled, replies) = pair.host.set_video_bound(false);
+            assert_eq!(settled, usize::from(stage > 0));
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0].operation, if stage == 2 { MediaOperation::Recover } else { MediaOperation::Abort });
+            assert_eq!(pair.host.gate(), Gate::Closed);
+            let fallback = pair.viewer.set_video_bound(false, pair.now).unwrap();
+            pair.viewer_events(fallback);
+            for reply in replies {
+                pair.viewer_receives(reply);
+            }
+            assert!(pair.viewer.decoded(DecodeReceipt::Media(retired, if stage == 2 { 2 } else { 1 })).unwrap().is_empty());
+            let ready = pair.host.prepared().unwrap();
+            assert_eq!(ready.path.as_deref(), Some("shared"));
+            assert_ne!(ready.transport_epoch, Some(retired.transport_epoch));
+            pair.viewer_receives(ready);
+            assert_eq!(pair.encode(1, key_frame()), "media");
+            pair.decode(1);
+            assert_eq!(pair.host.gate(), Gate::Open);
+            assert_eq!(pair.host.frame_path(), ReliablePath::Shared);
         }
     }
 
@@ -1388,12 +1595,12 @@ mod tests {
         let mut pair = Pair::new();
         pair.host.control(&ViewerMedia::request(), false).unwrap();
         let session = pair.host.session.unwrap();
-        let named = |operation, transport_epoch, path: &str| MediaControl {
-            path: Some(path.to_string()),
-            ..MediaControl::transaction(
+        let named = |operation, transport_epoch, path: &str| {
+            MediaControl::transaction(
                 operation,
                 Uuid::from_bytes([9; 16]),
                 MediaStreamId { session_id: session, transport_epoch, codec_epoch: transport_epoch },
+                path,
             )
         };
         let aborted = |events: Vec<HostMediaEvent>| matches!(&events[..], [HostMediaEvent::Send(control)] if control.operation == MediaOperation::Abort);

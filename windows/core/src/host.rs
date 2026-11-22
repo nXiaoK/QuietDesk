@@ -2,18 +2,21 @@
 //! for a host that streams over the control connection and advertises only what it implements.
 
 use crate::audio_session::{AudioCapture, HostAudio};
+use crate::auxiliary::{Accepted, Auxiliary, AuxiliaryEvent};
 use crate::clipboard_session::SessionClipboard;
 use crate::cursor::{CursorControl, CursorImage, CursorOperation, CursorPosition, CursorReason, CursorShape};
 use crate::display::{DisplayControl, DisplaySwitch, HostDisplays, RemoteDisplayInfo};
 use crate::error::{DeskError, Result};
 use crate::input::{HostInputTranslator, InjectOp};
 use crate::keymap::MacModifierMapping;
+use crate::media::ReliablePath;
 use crate::media::{Gate, HostFrame, HostMedia, HostMediaEvent, MediaControl, MediaFeedback, MediaOperation};
 use crate::messages::{
     ControlStatus, DeviceIdentity, HOST_ENDED_REASON, Hello, InputAction, InputFeedback, InputKind, RemoteInput, SessionPauseRequest, SessionPauseResult,
     SessionTermination, StreamSettings, StreamSettingsRequest, StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState, device_display_name,
 };
 use crate::peer::{PeerEvent, PeerHandle};
+use crate::tls::AuxiliaryRole;
 use crate::video::EncodedFrame;
 use crate::wire::{self, Message, MessageKind};
 use std::collections::VecDeque;
@@ -287,6 +290,7 @@ struct HostSession<'a, P: HostPlatform> {
     clipboard: Option<SessionClipboard>,
     audio: HostAudio,
     supports_audio: bool,
+    auxiliary: Auxiliary,
     displays: Option<HostDisplays>,
     display_subscribed: bool,
     remote_display: Option<u32>,
@@ -315,11 +319,24 @@ struct HostSession<'a, P: HostPlatform> {
 /// Runs one viewer's session until it ends and returns why. `events` reports state for the user interface.
 pub async fn run<P: HostPlatform>(
     peer: PeerHandle,
+    incoming: mpsc::Receiver<PeerEvent>,
+    platform: &mut P,
+    options: HostOptions,
+    commands: mpsc::UnboundedReceiver<HostCommand>,
+    events: impl Fn(HostEvent),
+) -> DeskError {
+    run_with_auxiliary(peer, incoming, platform, options, commands, events, None).await
+}
+
+/// Accepts additional authenticated media streams during this control session.
+pub async fn run_with_auxiliary<P: HostPlatform>(
+    peer: PeerHandle,
     mut incoming: mpsc::Receiver<PeerEvent>,
     platform: &mut P,
     options: HostOptions,
     mut commands: mpsc::UnboundedReceiver<HostCommand>,
     events: impl Fn(HostEvent),
+    accepted: impl Into<Option<Accepted>>,
 ) -> DeskError {
     let translator = HostInputTranslator::new(options.modifiers);
     let input_actions = platform.supports_input_actions();
@@ -329,6 +346,7 @@ pub async fn run<P: HostPlatform>(
     let mut session = HostSession {
         supports_audio: platform.supports_audio_capture(),
         audio: HostAudio::default(),
+        auxiliary: Auxiliary::host(accepted.into()),
         clipboard,
         peer: &peer,
         platform,
@@ -379,6 +397,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
         loop {
             let media_deadline = self.media.deadline().into_iter().chain(self.media.recovery().map(|_| self.recover_after)).min();
             let gesture_check = self.platform.gesture_check_at();
+            let bulk = self.auxiliary.peer(AuxiliaryRole::Bulk).cloned();
             let outcome = tokio::select! {
                 event = incoming.recv() => match event {
                     Some(PeerEvent::Message(message)) => self.receive(message, events).await,
@@ -390,7 +409,8 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 _ = tokio::time::sleep_until(media_deadline.unwrap_or(start_by)), if !self.paused && media_deadline.is_some() => self.tick_media(),
                 _ = tokio::time::sleep_until(gesture_check.unwrap_or(start_by)), if gesture_check.is_some() => { self.platform.check_gestures(); Ok(()) }
                 audio = self.audio.next() => self.audio.deliver(audio, self.paused, self.peer),
-                status = SessionClipboard::next(&mut self.clipboard, self.peer) => match status {
+                event = self.auxiliary.next() => self.auxiliary_event(event),
+                status = SessionClipboard::next(&mut self.clipboard, self.peer, bulk.as_ref()) => match status {
                     Ok(Some(status)) => { events(HostEvent::ClipboardStatus(status)); Ok(()) }
                     Ok(None) => Ok(()),
                     Err(error) => Err(error),
@@ -503,7 +523,16 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 self.unacknowledged.push_back(self.sequence);
                 self.peer.send(&Message::new(MessageKind::Video, packet.encode()?))?;
             }
-            HostFrame::Media(message) => self.peer.send(&message)?,
+            HostFrame::Media(message) => match self.media.frame_path() {
+                ReliablePath::Shared => self.peer.send(&message)?,
+                ReliablePath::Tcp => {
+                    if !self.auxiliary.peer(AuxiliaryRole::Video).is_some_and(|video| video.send(&message).is_ok()) {
+                        self.auxiliary.close(AuxiliaryRole::Video);
+                        let update = self.media.set_video_bound(false);
+                        self.apply_media_update(update)?;
+                    }
+                }
+            },
             HostFrame::Dropped => self.settle(1),
         }
         self.sync_gate();
@@ -522,7 +551,24 @@ impl<P: HostPlatform> HostSession<'_, P> {
         self.window.lock().unwrap().outstanding -= count;
     }
 
+    fn auxiliary_event(&mut self, event: AuxiliaryEvent) -> Result<()> {
+        match event {
+            AuxiliaryEvent::Bound(AuxiliaryRole::Video) | AuxiliaryEvent::Lost(AuxiliaryRole::Video) => {
+                let update = self.media.set_video_bound(matches!(event, AuxiliaryEvent::Bound(_)));
+                self.apply_media_update(update)?;
+            }
+            AuxiliaryEvent::Message(role, message) => {
+                if !self.clipboard.as_ref().is_some_and(|copy| copy.receive(message).is_ok()) {
+                    self.auxiliary.close(role);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn send_control(&mut self, control: MediaControl) -> Result<()> {
+        self.auxiliary.offer(&control);
         if control.operation == MediaOperation::Recover {
             self.recover_after = Instant::now() + Duration::from_secs(1);
         }

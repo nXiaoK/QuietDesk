@@ -55,6 +55,7 @@ pub struct PeerHandle {
     outgoing: mpsc::UnboundedSender<Outgoing>,
     shared: Arc<Shared>,
     finished: watch::Receiver<bool>,
+    abort: watch::Sender<bool>,
 }
 
 impl PeerHandle {
@@ -84,6 +85,11 @@ impl PeerHandle {
     /// Sends what is queued, then closes the connection.
     pub fn close(&self) {
         let _ = self.outgoing.send(Outgoing::Close(None));
+    }
+
+    /// Discards queued media when its parent connection ends or rejects this channel.
+    pub(crate) fn abort(&self) {
+        self.abort.send_replace(true);
     }
 
     /// Completes once the connection has closed and everything it could still send or receive is done.
@@ -127,13 +133,14 @@ where
     // A full channel stops reading, which lets TCP push back on a peer that sends faster than the session consumes.
     let (events, incoming) = mpsc::channel(32);
     let (finish, finished) = watch::channel(false);
+    let (abort, mut aborted) = watch::channel(false);
     let shared = Arc::new(Shared {
         ordered_ping_kind: AtomicU8::new(0),
         pending_bytes: AtomicUsize::new(0),
         last_received: Mutex::new(Instant::now()),
         ping: Mutex::new(None),
     });
-    let handle = PeerHandle { outgoing, shared: shared.clone(), finished };
+    let handle = PeerHandle { outgoing, shared: shared.clone(), finished, abort };
 
     let read_handle = handle.clone();
     let read_events = events.clone();
@@ -168,50 +175,57 @@ where
         }
     });
 
+    let read_abort = reading.abort_handle();
     tokio::spawn(async move {
-        let mut heartbeat = tokio::time::interval(config.heartbeat);
-        let mut sequence = 0u64;
-        let stopped = loop {
-            tokio::select! {
-                next = queued.recv() => match next {
-                    Some(Outgoing::Message(bytes)) => {
-                        let written = writer.write_all(&bytes).await;
-                        shared.pending_bytes.fetch_sub(bytes.len(), Ordering::Relaxed);
-                        if let Err(error) = written { break Err(DeskError::from(error)); }
+        let drive = async {
+            let mut heartbeat = tokio::time::interval(config.heartbeat);
+            let mut sequence = 0u64;
+            let stopped = loop {
+                tokio::select! {
+                    next = queued.recv() => match next {
+                        Some(Outgoing::Message(bytes)) => {
+                            let written = writer.write_all(&bytes).await;
+                            shared.pending_bytes.fetch_sub(bytes.len(), Ordering::Relaxed);
+                            if let Err(error) = written { break Err(DeskError::from(error)); }
+                        }
+                        Some(Outgoing::Close(reason)) => break Err(reason.unwrap_or_else(|| DeskError::Network("已断开连接".to_string()))),
+                        None => break Err(DeskError::Network("已断开连接".to_string())),
+                    },
+                    ended = &mut reading => break Ok(ended.unwrap_or_else(|_| DeskError::Network("已断开连接".to_string()))),
+                    _ = heartbeat.tick() => {
+                        if shared.last_received.lock().unwrap().elapsed() > config.idle_timeout {
+                            break Err(DeskError::Network(format!("连接超过 {} 秒无数据", config.idle_timeout.as_secs())));
+                        }
+                        sequence += 1;
+                        let payload = {
+                            let mut ping = shared.ping.lock().unwrap();
+                            // An unanswered ping keeps its start time, so a slow answer still measures the real delay.
+                            let (identifier, _) = *ping.get_or_insert((sequence, Instant::now()));
+                            identifier.to_be_bytes().to_vec()
+                        };
+                        let bytes = Message::new(MessageKind::Ping, payload).framed().expect("a ping fits a frame");
+                        if let Err(error) = writer.write_all(&bytes).await { break Err(DeskError::from(error)); }
                     }
-                    Some(Outgoing::Close(reason)) => break Err(reason.unwrap_or_else(|| DeskError::Network("已断开连接".to_string()))),
-                    None => break Err(DeskError::Network("已断开连接".to_string())),
-                },
-                ended = &mut reading => break Ok(ended.unwrap_or_else(|_| DeskError::Network("已断开连接".to_string()))),
-                _ = heartbeat.tick() => {
-                    if shared.last_received.lock().unwrap().elapsed() > config.idle_timeout {
-                        break Err(DeskError::Network(format!("连接超过 {} 秒无数据", config.idle_timeout.as_secs())));
+                }
+            };
+            let _ = writer.shutdown().await;
+            let reason = match stopped {
+                Ok(read_reason) => read_reason,
+                Err(reason) => {
+                    // The other side may still be sending its last messages, such as the notice that it ended the
+                    // session. They reach the session before the closing event; a side that never finishes is cut off.
+                    if tokio::time::timeout(LINGER, &mut reading).await.is_err() {
+                        reading.abort();
                     }
-                    sequence += 1;
-                    let payload = {
-                        let mut ping = shared.ping.lock().unwrap();
-                        // An unanswered ping keeps its start time, so a slow answer still measures the real delay.
-                        let (identifier, _) = *ping.get_or_insert((sequence, Instant::now()));
-                        identifier.to_be_bytes().to_vec()
-                    };
-                    let bytes = Message::new(MessageKind::Ping, payload).framed().expect("a ping fits a frame");
-                    if let Err(error) = writer.write_all(&bytes).await { break Err(DeskError::from(error)); }
+                    reason
                 }
-            }
+            };
+            let _ = events.send(PeerEvent::Closed(reason)).await;
         };
-        let _ = writer.shutdown().await;
-        let reason = match stopped {
-            Ok(read_reason) => read_reason,
-            Err(reason) => {
-                // The other side may still be sending its last messages, such as the notice that it ended the
-                // session. They reach the session before the closing event; a side that never finishes is cut off.
-                if tokio::time::timeout(LINGER, &mut reading).await.is_err() {
-                    reading.abort();
-                }
-                reason
-            }
-        };
-        let _ = events.send(PeerEvent::Closed(reason)).await;
+        tokio::select! {
+            () = drive => {},
+            _ = aborted.wait_for(|stop| *stop) => read_abort.abort(),
+        }
         let _ = finish.send(true);
     });
 
@@ -225,6 +239,20 @@ mod tests {
 
     fn fast() -> PeerConfig {
         PeerConfig { heartbeat: Duration::from_millis(20), idle_timeout: Duration::from_millis(200) }
+    }
+
+    #[tokio::test]
+    async fn retiring_an_auxiliary_channel_interrupts_a_stalled_write() {
+        let (local, mut unread) = tokio::io::duplex(16);
+        let (peer, _events) = spawn(local, fast());
+        peer.send(&Message::new(MessageKind::MediaFrame, vec![0; 8192])).unwrap();
+        let mut header = [0; 4];
+        unread.read_exact(&mut header).await.unwrap();
+        peer.abort();
+        tokio::time::timeout(Duration::from_secs(1), peer.finished()).await.unwrap();
+        let mut remaining = Vec::new();
+        unread.read_to_end(&mut remaining).await.unwrap();
+        assert!(remaining.len() <= 16);
     }
 
     async fn next_message(events: &mut mpsc::Receiver<PeerEvent>) -> Option<Message> {

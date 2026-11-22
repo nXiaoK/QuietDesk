@@ -18,14 +18,11 @@ use quietdesk_core::tls;
 use quietdesk_core::video::VideoPacket;
 use quietdesk_core::viewer::{ViewerEnd, ViewerEvent, ViewerPlatform};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-
-/// Handshakes that may be in progress at once; further connections are dropped until one finishes.
-const PENDING_HANDSHAKES: usize = 4;
 
 #[derive(Clone, Debug)]
 pub enum HostNotice {
@@ -51,65 +48,59 @@ pub async fn serve_host(
         Err(error) => return notify(HostNotice::Failed(format!("无法监听端口 {port}：{error}"))),
     };
     let acceptor = match tls::Acceptor::new(&key) {
-        Ok(acceptor) => Arc::new(acceptor),
+        Ok(acceptor) => acceptor,
         Err(error) => return notify(HostNotice::Failed(error.to_string())),
     };
     notify(HostNotice::Listening(listener.local_addr().map_or(port, |address| address.port())));
-    let (secured, mut ready) = mpsc::channel::<tls::SecureStream>(1);
-    let pending = Arc::new(AtomicUsize::new(0));
-    let handshake = |tcp: tokio::net::TcpStream| {
-        if pending.fetch_add(1, Ordering::AcqRel) >= PENDING_HANDSHAKES {
-            pending.fetch_sub(1, Ordering::AcqRel);
-            return;
-        }
-        let (acceptor, secured, pending) = (acceptor.clone(), secured.clone(), pending.clone());
-        tokio::spawn(async move {
-            match acceptor.accept(tcp).await {
-                Ok(stream) => drop(secured.send(stream).await),
-                Err(error) => log::info!("a connection did not complete the pairing handshake: {error}"),
-            }
-            pending.fetch_sub(1, Ordering::AcqRel);
-        });
-    };
     let remember = |options: &Mutex<HostOptions>, command: &HostCommand| match command {
         HostCommand::AllowControl(allowed) => options.lock().unwrap().allow_control = *allowed,
         HostCommand::Clipboard(enabled) => options.lock().unwrap().clipboard = *enabled,
         HostCommand::End | HostCommand::SelectDisplay(_) | HostCommand::RefreshDisplays => {}
     };
     loop {
-        let stream = tokio::select! {
-            accepted = listener.accept() => { if let Ok((tcp, _)) = accepted { handshake(tcp); } continue }
-            command = commands.recv() => match command {
-                Some(command) => {
-                    if matches!(command, HostCommand::SelectDisplay(_) | HostCommand::RefreshDisplays) {
-                        match super::displays::outputs() {
-                            Ok(outputs) => {
-                                let mut preference = options.lock().unwrap().preferred_display;
-                                let mut error = None;
-                                if let HostCommand::SelectDisplay(requested) = command {
-                                    if requested.is_none_or(|id| outputs.iter().any(|d| d.info.id == id)) {
-                                        preference = requested;
-                                        options.lock().unwrap().preferred_display = requested;
-                                        notify(HostNotice::Session(HostEvent::LocalDisplaySelected(requested)));
-                                    } else {
-                                        error = Some("所选显示器当前不可用".into());
+        let mut waiting = tls::PendingHandshakes::new(&acceptor);
+        let stream = loop {
+            tokio::select! {
+                accepted = listener.accept() => { if let Ok((tcp, _)) = accepted { waiting.start(tcp); } }
+                command = commands.recv() => match command {
+                    Some(command) => {
+                        if matches!(command, HostCommand::SelectDisplay(_) | HostCommand::RefreshDisplays) {
+                            match super::displays::outputs() {
+                                Ok(outputs) => {
+                                    let mut preference = options.lock().unwrap().preferred_display;
+                                    let mut error = None;
+                                    if let HostCommand::SelectDisplay(requested) = command {
+                                        if requested.is_none_or(|id| outputs.iter().any(|d| d.info.id == id)) {
+                                            preference = requested;
+                                            options.lock().unwrap().preferred_display = requested;
+                                            notify(HostNotice::Session(HostEvent::LocalDisplaySelected(requested)));
+                                        } else {
+                                            error = Some("所选显示器当前不可用".into());
+                                        }
                                     }
+                                    let selected = super::displays::preferred(&outputs, preference).info.id;
+                                    let displays = super::displays::directory(outputs, Some(selected));
+                                    notify(HostNotice::Session(HostEvent::Displays { displays, selected, error }));
                                 }
-                                let selected = super::displays::preferred(&outputs, preference).info.id;
-                                let displays = super::displays::directory(outputs, Some(selected));
-                                notify(HostNotice::Session(HostEvent::Displays { displays, selected, error }));
+                                Err(error) => notify(HostNotice::DisplayError(error.to_string())),
                             }
-                            Err(error) => notify(HostNotice::DisplayError(error.to_string())),
+                        } else {
+                            remember(&options, &command);
                         }
-                    } else {
-                        remember(&options, &command);
+                        continue
                     }
-                    continue
-                }
-                None => return,
-            },
-            Some(stream) = ready.recv() => stream,
+                    None => return,
+                },
+                secured = waiting.next() => match secured {
+                    Ok((None, stream)) => break stream,
+                    Ok((Some(_), _)) => {}
+                    Err(error) => log::info!("a connection did not complete the pairing handshake: {error}"),
+                },
+            }
         };
+        drop(waiting);
+        let mut active = tls::PendingHandshakes::new(&acceptor);
+        let (auxiliary, accepted) = mpsc::channel(4);
         notify(HostNotice::Connected);
         let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
         let (session_commands, queue) = mpsc::unbounded_channel();
@@ -118,12 +109,20 @@ pub async fn serve_host(
         let mut platform = WindowsHost::start_notifying(current.preferred_display, move || rescan.send(HostCommand::RefreshDisplays).is_ok());
         let report = notify.clone();
         let saved = options.clone();
-        let session = host::run(peer.clone(), incoming, &mut platform, current, queue, move |event| {
-            if let HostEvent::LocalDisplaySelected(preferred) = &event {
-                saved.lock().unwrap().preferred_display = *preferred;
-            }
-            report(HostNotice::Session(event));
-        });
+        let session = host::run_with_auxiliary(
+            peer.clone(),
+            incoming,
+            &mut platform,
+            current,
+            queue,
+            move |event| {
+                if let HostEvent::LocalDisplaySelected(preferred) = &event {
+                    saved.lock().unwrap().preferred_display = *preferred;
+                }
+                report(HostNotice::Session(event));
+            },
+            accepted,
+        );
         tokio::pin!(session);
         let period = std::time::Duration::from_secs(2);
         let mut display_check = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
@@ -132,9 +131,12 @@ pub async fn serve_host(
         let reason = loop {
             tokio::select! {
                 reason = &mut session => break reason,
-                // This PC is already being controlled: other viewers are turned away.
-                accepted = listener.accept() => drop(accepted),
-                Some(other) = ready.recv() => drop(other),
+                connected = listener.accept(), if !stopping => {
+                    if let Ok((tcp, _)) = connected { active.start(tcp); }
+                }
+                secured = active.next(), if !stopping => {
+                    if let Ok((Some(role), stream)) = secured { let _ = auxiliary.try_send((role, stream)); }
+                }
                 // A headless host has no WM_DISPLAYCHANGE for newly connected, unselected outputs.
                 _ = display_check.tick(), if !stopping => { let _ = session_commands.send(HostCommand::RefreshDisplays); }
                 command = commands.recv(), if !stopping => match command {
@@ -143,6 +145,7 @@ pub async fn serve_host(
                 },
             }
         };
+        drop(active);
         peer.finished().await;
         notify(HostNotice::Ended(reason.to_string()));
         if stopping {
@@ -399,7 +402,13 @@ pub async fn run_viewer<S: ViewerSink>(
         controls,
         |status| sink.retry(status),
         || tls::connect(&target.0, target.1, &key),
-        |stream, attempt| viewer_session(stream, attempt, frame.clone(), sink.clone()),
+        |stream, attempt| {
+            let attempt = match stream.get_ref().peer_addr() {
+                Ok(addr) => attempt.with_auxiliary(addr, key.clone()),
+                Err(_) => attempt,
+            };
+            viewer_session(stream, attempt, frame.clone(), sink.clone())
+        },
     )
     .await
 }

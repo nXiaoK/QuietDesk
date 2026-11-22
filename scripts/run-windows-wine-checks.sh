@@ -15,7 +15,12 @@ binary, = [row["executable"] for row in builds
 print(binary)
 ')"
 image=quietdesk-wine-check:local
-docker build --platform linux/amd64 -t "$image" -f windows/wine-check.Dockerfile windows >/dev/null
+wine_stage=wine
+if [[ "$(docker version --format '{{.Server.Arch}}')" == arm64 ]]; then
+    wine_stage=qemu
+    image=quietdesk-wine-qemu-check:local
+fi
+docker build --platform linux/amd64 --target "$wine_stage" -t "$image" -f windows/wine-check.Dockerfile windows >/dev/null
 export QUIETDESK_WINCHECK_PAIRING_CODE="$(python3 -c 'import os; print(os.urandom(32).hex())')"
 # Limit only this container when testing Wine under a CPU translator.
 container_args=(--rm --init --network none --platform linux/amd64)
@@ -51,6 +56,11 @@ Xvfb :99 -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1 &
 sleep 2
 timeout 120 wineboot -i >/dev/null 2>&1
 check=/app/quietdesk-wincheck.exe
+session_wine=(wine)
+if [[ -x /usr/local/bin/quietdesk-qemu64 ]]; then
+    # Keep Wine's second loader invocation from switching the session back to Rosetta.
+    session_wine=(env WINELOADERNOEXEC=1 /usr/local/bin/quietdesk-qemu64 /usr/lib/wine/wine64)
+fi
 # A moving picture: Wine holds frames back in its codecs, which a still screen would never fill.
 (timeout 150 wine clock >/dev/null 2>&1 &)
 sleep 6
@@ -60,19 +70,25 @@ timeout 45 wine $check displays 2>/dev/null | grep -E "^(PASS|FAIL)" || failed=1
 timeout 30 wine $check cursor 2>/dev/null | grep -E "^(PASS|FAIL)" || failed=1
 timeout 90 wine $check codec --frames 240 2>/dev/null | grep -E "^(codec|PASS|FAIL)" || failed=1
 # Start with a closed port so the packaged viewer must reconnect before it can receive video and a cursor.
-timeout 75 wine $check viewer --port 45990 --seconds 40 --require-media --require-cursor --require-reconnect --require-display >/tmp/viewer.log 2>&1 &
+timeout 90 "${session_wine[@]}" $check viewer --port 45990 --seconds 40 --require-media --require-cursor --require-reconnect --require-display >/tmp/viewer.log 2>&1 &
 viewer_pid=$!
 for tick in {1..20}; do
     grep -q "^viewer waiting for retry" /tmp/viewer.log && break
     kill -0 "$viewer_pid" 2>/dev/null || break
     sleep 1
 done
-(timeout 80 wine $check host --port 45990 --seconds 70 >/tmp/host.log 2>&1 &)
+(timeout 100 "${session_wine[@]}" $check host --port 45990 --seconds 70 >/tmp/host.log 2>&1 &)
 if ! wait "$viewer_pid"; then
     grep -E "^((INFO|WARN|ERROR) \[quietdesk_(core::media|windows::win::(pipeline|codec|app))\]|host Ended|rosetta error:)" /tmp/host.log /tmp/viewer.log | tail -35 >&2
     failed=1
 fi
 grep -E "^(viewer ended|PASS|FAIL)" /tmp/viewer.log
+if grep -q 'viewer committed tcp media stream' /tmp/viewer.log; then
+    echo 'PASS video committed on the dedicated TCP connection'
+else
+    echo 'FAIL viewer did not commit a dedicated TCP media stream'
+    failed=1
+fi
 awk '
 function measured(value, calls) {
     return calls > 0 ? value ~ /^[0-9]+([.][0-9]+)?$/ : value == "na"

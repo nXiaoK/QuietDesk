@@ -307,6 +307,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     emit(json!({ "event": "listening", "port": listener.local_addr()?.port() }));
     let acceptor = tls::Acceptor::new(&key)?;
+    let auxiliary_enabled = !arguments.contains_key("no-auxiliary");
     let mut lines = input_lines();
 
     let replay = Arc::new(Mutex::new(Replay {
@@ -332,14 +333,20 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
     });
 
     loop {
-        let (tcp, _) = listener.accept().await?;
-        let stream = match acceptor.accept(tcp).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                emit(json!({ "event": "rejected", "reason": error.to_string() }));
-                continue;
+        let mut waiting = tls::PendingHandshakes::new(&acceptor);
+        let stream = loop {
+            tokio::select! {
+                connected = listener.accept() => waiting.start(connected?.0),
+                secured = waiting.next() => match secured {
+                    Ok((None, stream)) => break stream,
+                    Ok((Some(_), _)) => {}
+                    Err(error) => emit(json!({ "event": "rejected", "reason": error.to_string() })),
+                },
             }
         };
+        drop(waiting);
+        let mut active = tls::PendingHandshakes::new(&acceptor);
+        let (auxiliary, accepted) = mpsc::channel(4);
         emit(json!({ "event": "accepted" }));
         let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
         let (commands, command_queue) = mpsc::unbounded_channel();
@@ -367,12 +374,19 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
             HostEvent::ClipboardStatus(message) => emit(json!({"event":"clipboardStatus","message":message})),
             _ => {}
         };
-        let session = host::run(peer.clone(), incoming, &mut platform, options.clone(), command_queue, report);
+        let session =
+            host::run_with_auxiliary(peer.clone(), incoming, &mut platform, options.clone(), command_queue, report, auxiliary_enabled.then_some(accepted));
         tokio::pin!(session);
         let (reason, quit) = loop {
             tokio::select! {
                 reason = &mut session => break (reason, false),
-                accepted = listener.accept() => drop(accepted?),
+                connected = listener.accept() => {
+                    let (tcp, _) = connected?;
+                    if auxiliary_enabled { active.start(tcp); }
+                }
+                secured = active.next(), if auxiliary_enabled => {
+                    if let Ok((Some(role), stream)) = secured { let _ = auxiliary.try_send((role, stream)); }
+                }
                 line = lines.recv() => {
                     let Some(line) = line else { let _ = commands.send(HostCommand::End); break ((&mut session).await, true) };
                     if clipboard.as_ref().is_some_and(|copy| copy.command(&line)) { continue; }
@@ -397,6 +411,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
                 }
             }
         };
+        drop(active);
         peer.finished().await;
         emit(json!({ "event": "ended", "reason": reason.to_string() }));
         if quit {
@@ -725,6 +740,10 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
             result
         },
         |stream, attempt| {
+            let attempt = match stream.get_ref().peer_addr() {
+                Ok(addr) if !arguments.contains_key("no-auxiliary") => attempt.with_auxiliary(addr, key.clone()),
+                _ => attempt,
+            };
             emit(json!({ "event": "secured" }));
             *input.lock().unwrap() = new_translator();
             press.lock().unwrap().reset();

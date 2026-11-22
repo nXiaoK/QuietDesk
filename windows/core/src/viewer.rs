@@ -2,17 +2,20 @@
 //! viewer that receives video over the control connection and uses only what the host advertised.
 
 use crate::audio_session::{AudioPlayback, ViewerAudio};
+use crate::auxiliary::{Auxiliary, AuxiliaryEvent};
 use crate::clipboard_session::SessionClipboard;
 use crate::cursor::{CursorControl, CursorOperation, CursorPosition, CursorPresentationState, CursorShape};
 use crate::display::{DisplayControl, RemoteDisplayInfo};
 use crate::error::{DeskError, Result};
 use crate::media::{DecodeReceipt, MediaControl, MediaStreamId, ViewerMedia, ViewerMediaEvent};
+use crate::media::{MediaOperation, ReliablePath};
 use crate::messages::{
     ControlStatus, DeviceIdentity, HOST_ENDED_REASON, Hello, InputFeedback, RemoteInput, SessionPauseRequest, SessionPauseResult, SessionTermination,
     StreamSettings, StreamSettingsRequest, StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState, device_display_name,
 };
 use crate::peer::{PeerEvent, PeerHandle, input_echo};
 use crate::reliability::{Attempt, AttemptProgress};
+use crate::tls::AuxiliaryRole;
 use crate::video::VideoPacket;
 use crate::wire::{self, Message, MessageKind};
 use std::collections::VecDeque;
@@ -176,6 +179,7 @@ struct ViewerSession<'a, P: ViewerPlatform> {
     clipboard_requested: Option<Instant>,
     clipboard: Option<SessionClipboard>,
     audio: ViewerAudio,
+    auxiliary: Auxiliary,
     host_ended: bool,
     progress: &'a AttemptProgress,
 }
@@ -200,7 +204,7 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
     attempt: Attempt,
     mut acknowledgements: mpsc::UnboundedReceiver<DecodeReceipt>,
 ) -> ViewerEnd {
-    let Attempt { quality, mut commands, progress } = attempt;
+    let Attempt { quality, mut commands, progress, auxiliary } = attempt;
     let mut session = ViewerSession {
         peer: &peer,
         platform,
@@ -226,6 +230,7 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
         clipboard_requested: None,
         clipboard: None,
         audio: ViewerAudio::default(),
+        auxiliary: Auxiliary::viewer(auxiliary),
         host_ended: false,
         progress: &progress,
     };
@@ -236,6 +241,7 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
         let cursor_by = session.pending_cursor.map(|(_, deadline)| deadline);
         let display_by = session.display_request.map(|(_, _, deadline)| deadline);
         let input_by = session.input_reply_deadline;
+        let bulk = session.auxiliary.peer(AuxiliaryRole::Bulk).cloned();
         let outcome = tokio::select! {
             event = incoming.recv() => match event {
                 Some(PeerEvent::Message(message)) => session.receive(message),
@@ -244,7 +250,8 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
                 None => Err(DeskError::Network("连接已关闭".to_string())),
             },
             audio = session.audio.next() => session.audio.deliver(audio, &peer, session.platform),
-            status = SessionClipboard::next(&mut session.clipboard, &peer) => match status {
+            event = session.auxiliary.next() => session.auxiliary_event(event),
+            status = SessionClipboard::next(&mut session.clipboard, &peer, bulk.as_ref()) => match status {
                 Ok(Some(status)) => { session.platform.event(ViewerEvent::ClipboardStatus(status)); Ok(()) }
                 Ok(None) => Ok(()),
                 Err(error) => Err(error),
@@ -318,7 +325,13 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 }
                 self.platform.video(packet)?;
             }
-            MessageKind::MediaControl => self.update_media(|media| media.control(&MediaControl::read(&message)?, Instant::now()))?,
+            MessageKind::MediaControl => {
+                let control = MediaControl::read(&message)?;
+                self.update_media(|media| media.control(&control, Instant::now()))?;
+                if control.operation == MediaOperation::Offer {
+                    self.auxiliary.offer(&control);
+                }
+            }
             MessageKind::DisplayControl if hello.display_switching_v1 == Some(true) => self.receive_displays(DisplayControl::read(&message)?)?,
             MessageKind::MediaFrame => self.update_media(|media| media.frame(&message.payload, Instant::now()))?,
             MessageKind::CursorControl | MessageKind::CursorPosition | MessageKind::CursorShape
@@ -456,7 +469,11 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             self.peer.send(&DisplayControl::Subscribe.message()?)?;
         }
         if hello.media_transport_v1 == Some(true) {
-            self.media = Some(ViewerMedia::default());
+            let mut media = ViewerMedia::default();
+            if self.auxiliary.enabled() {
+                media.enable_auxiliary();
+            }
+            self.media = Some(media);
             self.peer.send(&ViewerMedia::request().message()?)?;
         }
         let confirm = live_settings && hello.initial_stream_negotiation_v1 == Some(true);
@@ -512,6 +529,32 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         self.selected_display = Some(selected);
         self.display_event(error);
         Ok(())
+    }
+
+    fn auxiliary_event(&mut self, event: AuxiliaryEvent) -> Result<()> {
+        match event {
+            AuxiliaryEvent::Bound(AuxiliaryRole::Video) | AuxiliaryEvent::Lost(AuxiliaryRole::Video) => {
+                self.update_media(|media| media.set_video_bound(matches!(event, AuxiliaryEvent::Bound(_)), Instant::now()))
+            }
+            AuxiliaryEvent::Message(AuxiliaryRole::Video, message) => {
+                let update =
+                    self.media.as_mut().ok_or_else(|| DeskError::invalid("媒体会话尚未协商"))?.frame_on(ReliablePath::Tcp, &message.payload, Instant::now());
+                match update {
+                    Ok(events) => self.apply_media_events(events),
+                    Err(_) => {
+                        self.auxiliary.close(AuxiliaryRole::Video);
+                        self.update_media(|media| media.set_video_bound(false, Instant::now()))
+                    }
+                }
+            }
+            AuxiliaryEvent::Message(role, message) => {
+                if !self.clipboard.as_ref().is_some_and(|copy| copy.receive(message).is_ok()) {
+                    self.auxiliary.close(role);
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     fn update_media(&mut self, update: impl FnOnce(&mut ViewerMedia) -> Result<Vec<ViewerMediaEvent>>) -> Result<()> {

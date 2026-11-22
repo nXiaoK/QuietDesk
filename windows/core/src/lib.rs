@@ -7,6 +7,7 @@
 
 pub mod audio;
 pub mod audio_session;
+mod auxiliary;
 pub mod clipboard;
 pub mod clipboard_session;
 pub mod cursor;

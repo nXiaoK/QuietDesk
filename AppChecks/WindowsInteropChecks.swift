@@ -192,11 +192,24 @@ private final class InteropClipboard: @unchecked Sendable {
     let sent = Shared<[MessageKind]>([])
     let received = Shared<[MessageKind]>([])
     let completedSends = Shared<[Bool]>([])
+    let bulkReceived = Shared<[MessageKind]>([])
+    private let media = Shared<MediaSession?>(nil)
     private let session = Shared<UUID?>(nil)
 
     init(_ directory: URL, physical: Bool = true) {
         self.directory = directory
         self.physical = physical
+    }
+
+    func attach(_ session: MediaSession, to peer: Peer, failed: @escaping (String) -> Void) {
+        media.update { $0 = session }
+        session.onReliableData = { [weak self, weak peer] message in
+            guard let self, let peer else { return }
+            do {
+                try require(self.receive(message, from: peer), "Unexpected message on bound bulk connection")
+                self.bulkReceived.update { $0.append(message.kind) }
+            } catch { failed("bulk: \(error)") }
+        }
     }
 
     func greet(_ peer: Peer, id: UUID) throws {
@@ -219,7 +232,10 @@ private final class InteropClipboard: @unchecked Sendable {
             let copy = ClipboardTransfer(storage: directory.appendingPathComponent("received-by-mac"), requireFileApproval: true,
                 allowsChunkWindow: preference.chunkWindow == true, allowsDecoupledFileTransfer: preference.decoupledFileTransfer == true,
                 allowsOnDemandClipboard: true, allowsPhysicalFilePaste: physical)
-            copy.onSend = { [weak peer, sent] message in sent.update { $0.append(message.kind) }; peer?.send(message) }
+            copy.onSend = { [weak peer, sent, media] message in
+                sent.update { $0.append(message.kind) }
+                if let session = media.get() { session.sendReliableData(message) } else { peer?.send(message) }
+            }
             copy.onManifest = { [manifest] next in manifest.update { $0 = next } }
             copy.onFileOffer = { [offers] in if let offer = $0 { offers.update { $0.append(offer) } } }
             copy.onReceive = { [applied] payload in applied.update { $0.append(payload) } }
@@ -297,6 +313,10 @@ private final class MacViewer: @unchecked Sendable {
         var commits: [MediaStreamID] = []
         var commitPaths: [String] = []
         var mediaFrames: [MediaFrame] = []
+        var controlFrames = Set<MediaFrameHeader>()
+        var awaitingOffer = false
+        var offer: MediaControl?
+        var controlRole: MediaChannelRole?
         var heldDecodes: [(frameID: UInt64, complete: () -> Void)] = []
         var cursor = CursorPresentationState()
         var cursorRequest: UUID?
@@ -325,15 +345,15 @@ private final class MacViewer: @unchecked Sendable {
     private let decoder = VideoDecoder()
     private let preferred: StreamSettings
 
-    private let port: UInt16
+    private let auxiliaryPort: UInt16
     private let key: PairingKey
     private let useMedia: Bool
     private let identity: DeviceIdentity?
     private let clipboard: InteropClipboard?
 
     init(port: UInt16, key: PairingKey, preferred: StreamSettings, useMedia: Bool, identity: DeviceIdentity? = nil,
-         clipboard: InteropClipboard? = nil) {
-        self.port = port
+         clipboard: InteropClipboard? = nil, auxiliaryPort: UInt16? = nil) {
+        self.auxiliaryPort = auxiliaryPort ?? port
         self.key = key
         self.useMedia = useMedia
         self.identity = identity
@@ -342,7 +362,7 @@ private final class MacViewer: @unchecked Sendable {
         let connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!,
                                       using: SecureTransport.parameters(key: key, responsiveAcknowledgements: true))
         peer = Peer(connection: connection)
-        peer.onReady = { [state] in state.update { $0.ready = true } }
+        peer.onReady = { [state] in state.update { $0.ready = true; $0.controlRole = MediaSecureTransport.negotiatedRole(on: connection) } }
         peer.onClose = { [state, weak peer] reason in state.update { $0.closed = (reason, peer?.closeIsRetryable == true) } }
         peer.onMessage = { [weak self] message in
             guard let self else { return }
@@ -357,7 +377,7 @@ private final class MacViewer: @unchecked Sendable {
         if let media = state.get().media {
             if message.kind == .mediaFrame {
                 let frame = try MediaFrame.decode(message.payload)
-                state.update { $0.mediaFrames.append(frame) }
+                state.update { _ = $0.controlFrames.insert(frame.header) }
             } else if message.kind == .mediaControl {
                 let control = try MediaControl.read(message.payload)
                 if control.operation == .commit, let path = control.path { state.update { $0.commitPaths.append(path) } }
@@ -387,8 +407,10 @@ private final class MacViewer: @unchecked Sendable {
             if hello.controlStatusUpdates == true { peer.send(Message(.controlStatus)) }
             if hello.displaySwitchingV1 == true { peer.send(try DisplayControl.subscribe().message()) }
             if useMedia, hello.mediaTransportV1 == true {
-                let media = try MediaSession.viewer(control: peer, key: key, host: "127.0.0.1", port: port, settings: hello.settings)
-                media.onVideo = { [weak self] frame, complete in
+                let media = try MediaSession.viewer(control: peer, key: key, host: "127.0.0.1", port: auxiliaryPort, settings: hello.settings, udpEnabled: false)
+                clipboard?.attach(media, to: peer) { [state] reason in state.update { $0.failures.append(reason) } }
+                media.onVideo = { [weak self, state] frame, complete in
+                    state.update { $0.mediaFrames.append(frame) }
                     self?.decode(frame.packet, frameID: frame.header.frameID, completion: complete)
                 }
                 media.onCommitStream = { [state] stream, _ in
@@ -411,6 +433,10 @@ private final class MacViewer: @unchecked Sendable {
             decode(packet, frameID: nil) { [weak self] success in
                 if success { self?.acknowledge(packet.sequence) }
             }
+        case .mediaControl where state.get().awaitingOffer:
+            let offer = try MediaControl.read(message.payload)
+            try require(offer.operation == .offer, "Unexpected media transaction before auxiliary binding")
+            state.update { $0.offer = offer; $0.awaitingOffer = false }
         case .displayControl where state.get().hello?.displaySwitchingV1 == true:
             let update = try DisplayControl.read(message.payload)
             try state.update { state in
@@ -480,6 +506,40 @@ private final class MacViewer: @unchecked Sendable {
             state.update { $0.clipboard.append(text) }
         default:
             throw Failure("A released viewer would close the connection on this message")
+        }
+    }
+
+    func checkAuxiliaryAdmission() throws {
+        state.update { $0.awaitingOffer = true }
+        peer.send(try MediaControl(.request).message())
+        try until("the Windows host grants bindings") { self.state.get().offer != nil }
+        guard let offer = state.get().offer, let sessionID = offer.sessionID, let token = offer.token else { throw Failure("Incomplete media offer") }
+        var otherToken = token
+        otherToken[otherToken.startIndex] ^= 1
+        for (claim, candidate, allowed) in [(MediaChannelRole.bulk, token, false), (.video, otherToken, false), (.video, token, true)] {
+            let connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: auxiliaryPort)!,
+                                          using: try MediaSecureTransport.tlsParameters(key: key, roles: [.video]))
+            let auxiliary = Peer(connection: connection, handshakeTimeout: 4)
+            let role = Shared<MediaChannelRole?>(nil), received = Shared<[Message]>([]), closed = Shared(false)
+            let bind = try MediaControl(.bind, sessionID: sessionID, token: candidate, role: claim).message()
+            auxiliary.onReady = { [weak auxiliary] in
+                role.update { $0 = MediaSecureTransport.negotiatedRole(on: connection) }
+                auxiliary?.send(bind)
+            }
+            auxiliary.onMessage = { message in received.update { $0.append(message) } }
+            auxiliary.onClose = { _ in closed.update { $0 = true } }
+            auxiliary.start()
+            defer { auxiliary.close() }
+            try until("Windows completes the binding decision") { closed.get() || !received.get().isEmpty }
+            try require(role.get() == .video, "The test connection did not negotiate video ALPN")
+            if allowed {
+                guard let reply = received.get().first, reply.kind == .mediaControl else { throw Failure("Windows rejected the matching binding") }
+                let bound = try MediaControl.read(reply.payload)
+                try require(bound.operation == .bound && bound.sessionID == sessionID && bound.role == .video && bound.token == token,
+                            "The binding response did not identify this socket's grant")
+            } else {
+                try require(closed.get() && received.get().isEmpty, "The host accepted a binding with a different role or grant")
+            }
         }
     }
 
@@ -663,6 +723,8 @@ private struct PostedEvent {
 private final class MacHost: @unchecked Sendable {
     struct State {
         var accepted: [Peer] = []
+        var auxiliary: [MediaChannelRole: Peer] = [:]
+        var messagesByAuxiliary: [MediaChannelRole: [MessageKind]] = [:]
         var peer: Peer?
         var media: MediaSession?
         var closed: String?
@@ -779,12 +841,27 @@ private final class MacHost: @unchecked Sendable {
     private func accept(_ connection: NWConnection) {
         let peer = Peer(connection: connection)
         state.update { $0.accepted.append(peer) }
-        peer.onClose = { [state] reason in state.update { $0.closed = reason } }
+        peer.onClose = { [state, weak peer] reason in
+            state.update { state in
+                if state.peer === peer || (state.peer == nil && state.accepted.first === peer) { state.closed = reason }
+            }
+        }
         peer.onReady = { [weak self, weak peer] in
             guard let self, let peer else { return }
             do {
                 let role = MediaSecureTransport.negotiatedRole(on: connection)
-                try require(role == nil || role == .control, "The viewer opened an auxiliary channel nobody offered")
+                if let role, role == .video || role == .bulk {
+                    guard self.advertiseMedia, let media = self.state.get().media else { peer.close("No active media session"); return }
+                    media.acceptAuxiliary(peer, role: role)
+                    let handle = peer.onMessageHandled
+                    peer.onMessageHandled = { [state = self.state] message, resume in
+                        state.update { $0.messagesByAuxiliary[role, default: []].append(message.kind) }
+                        handle?(message, resume)
+                    }
+                    self.state.update { $0.auxiliary[role] = peer }
+                    return
+                }
+                guard role == nil || role == .control, self.state.get().peer == nil else { peer.close("Unexpected connection"); return }
                 let applied = self.state.get().applied
                 let media = try MediaSession.host(control: peer, key: self.key, port: self.port, settings: applied.settings, relayRouting: true)
                 media.onPrepareStream = { [state = self.state, cursorID = self.cursorID, weak peer] stream, completion in
@@ -805,8 +882,10 @@ private final class MacHost: @unchecked Sendable {
                 media.onProduceRecoveryFrame = { [weak self] in self?.produceFrame(recovery: true) }
                 media.onResumeFrames = { [state = self.state] in state.update { $0.prepared = false } }
                 media.onAcknowledged = { [state = self.state] sequence in state.update { _ = $0.waiting.remove(sequence) } }
+                self.clipboard?.attach(media, to: peer) { [state = self.state] reason in state.update { $0.failures.append(reason) } }
                 media.start()
                 self.state.update { $0.peer = peer; $0.media = media }
+                self.startPump()
                 // The capability set the application announces, with the fields of this Mac filled in.
                 let preferred = StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 20)
                 let hello = try Wire.json(.hello, Hello(name: "检查用 Mac", width: applied.width, height: applied.height, settings: applied.settings,
@@ -844,6 +923,9 @@ private final class MacHost: @unchecked Sendable {
             }
         }
         peer.start()
+    }
+
+    private func startPump() {
         let pump = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "interop.frames"))
         pump.schedule(deadline: .now(), repeating: .milliseconds(4))
         pump.setEventHandler { [weak self] in self?.produceFrame() }
@@ -1145,6 +1227,16 @@ private func checkPhysicalClipboard(_ board: InteropClipboard, _ probe: Probe) t
             try require(initial == fileMessages(board.received.get()) && board.applied.get().isEmpty, "Declined files were transferred")
         }
     }
+
+    let sentBeforeRefusal = fileMessages(board.sent.get())
+    board.copied.update { $0 = .files([folder, empty]) }
+    transfer.announceManifest(kind: .files)
+    _ = try probe.next("clipboardManifest", matching: { $0["kind"] as? String == "files" })
+    try probe.send(["command": "clipboardPaste"])
+    _ = try probe.next("clipboardOffer")
+    try probe.send(["command": "clipboardDecision", "accept": false])
+    try until("the Mac receives the Windows file refusal") { board.completedSends.get() == [true, true, true, false] }
+    try require(fileMessages(board.sent.get()) == sentBeforeRefusal, "File contents followed the Windows refusal")
 }
 
 @main
@@ -1187,13 +1279,15 @@ private struct WindowsInteropChecks {
         let command = Int(CGEventFlags.maskCommand.rawValue) | 0x08, shift = Int(CGEventFlags.maskShift.rawValue) | 0x02
 
         func withWindowsHost(_ extra: [String] = [], useMedia: Bool = true, viewerKey: PairingKey? = nil, identity: DeviceIdentity? = nil, clipboard: InteropClipboard? = nil,
+                             routeAuxiliary: ((UInt16) throws -> UInt16)? = nil,
                              preferred: StreamSettings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8),
                              _ body: (Probe, MacViewer) throws -> Void) throws {
             let probe = try Probe(probePath, ["host", "--code", key.code, "--recording", recording, "--size", "\(size.width)x\(size.height)",
                                               "--name", "检查用 Windows 电脑"] + extra)
             defer { probe.stop() }
             guard let port = try probe.next("listening")["port"] as? Int else { throw Failure("The probe did not report its port") }
-            let viewer = MacViewer(port: UInt16(port), key: viewerKey ?? key, preferred: preferred, useMedia: useMedia, identity: identity, clipboard: clipboard)
+            let viewer = try MacViewer(port: UInt16(port), key: viewerKey ?? key, preferred: preferred, useMedia: useMedia, identity: identity, clipboard: clipboard,
+                                       auxiliaryPort: routeAuxiliary?(UInt16(port)))
             defer { viewer.stop() }
             try body(probe, viewer)
             let failures = viewer.state.get().failures
@@ -1220,8 +1314,10 @@ private struct WindowsInteropChecks {
                 let result = viewer.state.get().results[0]
                 try require(result.state == VideoStreamState(settings: preferred, width: 640, height: 360) && result.error == nil
                             && result.codec == nil && result.chromaSubsampling == nil, "The first settings were not applied as asked: \(result)")
-                try require(probe.all("configured").count == 1 && settings(try probe.next("configured")) == [2560, 60, 20, 640, 360],
-                            "The Windows host started its stream more than once or with other settings")
+                _ = try probe.next("streaming")
+                try until("the initial video route commits") { !viewer.state.get().commits.isEmpty }
+                let starts = probe.all("configured").map(settings)
+                try require(starts == [[2560, 60, 20, 640, 360]], "Unexpected capture configurations at first commit: \(starts)")
                 try until("control status arrives") { viewer.state.get().control == [true] }
             }
         }
@@ -1299,8 +1395,55 @@ private struct WindowsInteropChecks {
             }
         }
 
+        run("A Mac switches Windows video from a bound TLS socket to control when the auxiliary links close") {
+            var proxy: RelayOpaqueProxy?
+            defer { proxy?.stop() }
+            try withWindowsHost(["--synthetic-audio"], routeAuxiliary: { port in
+                let relay = try RelayOpaqueProxy(target: port)
+                let ready = DispatchSemaphore(value: 0)
+                relay.onReady = { ready.signal() }
+                proxy = relay; relay.start()
+                guard ready.wait(timeout: .now() + 5) == .success, let port = relay.port else { throw Failure("The loopback auxiliary proxy did not start") }
+                return port
+            }) { _, viewer in
+                try until("the Mac presents video on a dedicated TLS socket") { viewer.state.get().commitPaths == ["tcp"] && viewer.state.get().mediaFrames.count >= 8 }
+                let initial = viewer.state.get()
+                guard let first = initial.commits.first else { throw Failure("The first TCP commit did not present a stream") }
+                let tcp = initial.mediaFrames.filter { $0.header.stream == first }
+                try require(tcp.count >= 8 && initial.controlFrames.isDisjoint(with: tcp.map(\.header)), "Dedicated video also arrived on control")
+                try require(tcp.enumerated().prefix(8).allSatisfy { annexB($0.element.packet) == replayFrames[$0.offset] }, "Dedicated video differed from the recording")
+                let sound = RemoteAudioControl.request(enabled: true)
+                viewer.peer.send(try sound.message())
+                try until("audio control and Opus arrive on the control socket alongside dedicated video") {
+                    let s = viewer.state.get()
+                    return s.audioStatuses.contains { $0.requestID == sound.requestID && $0.enabled } && !s.audioPackets.isEmpty
+                }
+                proxy?.stop(); proxy = nil
+                try until("video continues on the shared connection") {
+                    let s = viewer.state.get()
+                    guard s.commitPaths.last == "shared", let stream = s.commits.last, stream != first else { return false }
+                    return s.mediaFrames.filter { $0.header.stream == stream && s.controlFrames.contains($0.header) }.count >= 4
+                }
+                let last = viewer.state.get(), second = last.commits.last!
+                try require(last.commitPaths == ["tcp", "shared"] && first.sessionID == second.sessionID && second.transportEpoch > first.transportEpoch
+                            && last.mediaFrames.first { $0.header.stream == second }?.header.isIDR == true && last.closed == nil,
+                            "The auxiliary loss interrupted control or reused the old video stream")
+            }
+        }
+
+        run("A Windows host rejects mismatched auxiliary bindings while its original Mac control remains active") {
+            try withWindowsHost(useMedia: false) { _, viewer in
+                try until("the no-ALPN control receives legacy video") { !viewer.state.get().decoded.isEmpty }
+                try require(viewer.state.get().controlRole == nil, "This fixture did not exercise a control connection without ALPN")
+                try viewer.checkAuxiliaryAdmission()
+                let count = viewer.state.get().decoded.count
+                try until("the original viewer decodes more screen updates") { viewer.state.get().decoded.count > count + 3 }
+                try require(viewer.state.get().closed == nil, "Auxiliary binding failure closed control")
+            }
+        }
+
         run("A Mac viewer commits shared Windows streams, decodes exact media frames and returns frame credits") {
-            try withWindowsHost { _, viewer in
+            try withWindowsHost(["--no-auxiliary"]) { _, viewer in
                 func verifyStream(_ count: Int) throws {
                     try until("shared stream \(count) delivers dependent frames") {
                         let state = viewer.state.get()
@@ -1330,12 +1473,14 @@ private struct WindowsInteropChecks {
                 viewer.state.update { $0.holdAcknowledgements = true }
                 try until("three media frames remain unpaid") {
                     let state = viewer.state.get()
-                    guard let held = state.heldDecodes.first, let last = state.mediaFrames.last else { return false }
-                    return last.header.frameID >= held.frameID + 2
+                    guard let held = state.heldDecodes.first, let stream = state.commits.last else { return false }
+                    return state.controlFrames.contains { $0.stream == stream && $0.frameID == held.frameID + 2 }
                 }
                 usleep(100_000)
                 let state = viewer.state.get()
-                try require(state.mediaFrames.last!.header.frameID == state.heldDecodes.first!.frameID + 2,
+                let held = state.heldDecodes.first!.frameID
+                let outstanding = state.controlFrames.filter { $0.stream == state.commits.last && $0.frameID >= held }
+                try require(outstanding.map(\.frameID).sorted() == [held, held + 1, held + 2],
                             "A Windows host sent more than three frames without decode feedback")
                 viewer.releaseHeldDecodes()
                 try until("decode feedback reopens the window") { viewer.state.get().mediaFrames.count > state.mediaFrames.count + 6 }
@@ -1351,7 +1496,7 @@ private struct WindowsInteropChecks {
 
         run("A Mac viewer switches its synthetic Windows cursor exactly when the bound screen becomes visible") {
             try withWindowsHost(["--synthetic-cursor"]) { _, viewer in
-                try until("the first shared stream and initial quality are confirmed") {
+                try until("the first media stream and initial quality are confirmed") {
                     let state = viewer.state.get()
                     return state.commits.count == 1 && !state.results.isEmpty && state.mediaFrames.last?.header.frameID ?? 0 > 1
                 }
@@ -1773,9 +1918,24 @@ private struct WindowsInteropChecks {
                 let board = InteropClipboard(directory)
                 let arguments = ["--synthetic-clipboard", directory.path]
                 if windowsHost {
-                    try withWindowsHost(arguments, useMedia: false, clipboard: board) { probe, _ in try checkPhysicalClipboard(board, probe) }
+                    try withWindowsHost(arguments, clipboard: board) { probe, viewer in
+                        try until("the Mac viewer commits dedicated TCP video") { viewer.state.get().commitPaths == ["tcp"] }
+                        try checkPhysicalClipboard(board, probe)
+                    }
                 } else {
-                    try withMacHost(advertiseMedia: false, clipboard: board, arguments) { _, probe in try checkPhysicalClipboard(board, probe) }
+                    try withMacHost(clipboard: board, arguments) { host, probe in
+                        try until("the Mac host receives the bulk bind and TCP commit") {
+                            let s = host.state.get()
+                            return s.messagesByAuxiliary[.bulk]?.first == .mediaControl && s.commits.first?.path == "tcp"
+                        }
+                        try checkPhysicalClipboard(board, probe)
+                    }
+                }
+                let all = board.received.get(), bulk = board.bulkReceived.get()
+                for kind in [MessageKind.clipboardManifest, .clipboardPull, .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd,
+                             .clipboardReceipt, .clipboardCancel] {
+                    try require(all.contains(kind) && all.filter { $0 == kind }.count == bulk.filter { $0 == kind }.count,
+                                "A clipboard transfer record bypassed the authenticated bulk socket: \(kind)")
                 }
             }
         }
@@ -1928,8 +2088,33 @@ private struct WindowsInteropChecks {
             }
         }
 
-        run("A Windows viewer commits shared Mac streams and returns decode receipts for the encoder's exact frames") {
+        run("A Windows viewer binds both Mac TLS roles, acknowledges video on control and recommits after the video link closes") {
             try withMacHost { host, probe in
+                _ = try probe.next("mediaCommitted")
+                try until("the Mac sees both bind requests and a TCP video commit") {
+                    let s = host.state.get()
+                    return s.commits.last?.path == "tcp" && [.video, .bulk].allSatisfy { s.messagesByAuxiliary[$0]?.first == .mediaControl }
+                }
+                let s = host.state.get()
+                guard let first = s.commits.last, let sequence = s.recoverySequences.first, let video = s.auxiliary[.video] else { throw Failure("Missing bound video stream") }
+                let sample = try probe.next("frame") { $0["sequence"] as? UInt32 == sequence }
+                try require(sample["firstInMediaStream"] as? Bool == true && sample["annexB"] as? String == hex(annexB(packets[0])),
+                            "The Windows viewer did not receive the Mac's recovery frame on bound video")
+                try until("the Mac receives decoded frame receipts on control") { host.state.get().decodedFeedback.contains { $0.stream.transportEpoch == first.transportEpoch && $0.frameID >= 5 } }
+                try require(host.state.get().messagesByAuxiliary[.video] == [.mediaControl], "The Windows viewer put transaction or feedback traffic on its video socket")
+                video.close("Synthetic video link ended")
+                _ = try probe.next("mediaCommitted")
+                try until("the Mac and Windows viewer settle a new shared stream") {
+                    let s = host.state.get()
+                    guard let last = s.commits.last, last.path == "shared", first.sessionID == last.sessionID, last.transportEpoch != first.transportEpoch else { return false }
+                    return s.decodedFeedback.contains { $0.stream.transportEpoch == last.transportEpoch && $0.frameID >= 3 }
+                }
+                try require(host.state.get().closed == nil && probe.all("ended").isEmpty, "Closing video ended the desktop session")
+            }
+        }
+
+        run("A Windows viewer commits shared Mac streams and returns decode receipts for the encoder's exact frames") {
+            try withMacHost(["--no-auxiliary"]) { host, probe in
                 func verifyStream(_ count: Int) throws {
                     let event = try probe.next("mediaCommitted")
                     try until("the Mac host sees shared commit \(count)") { host.state.get().commits.count >= count }

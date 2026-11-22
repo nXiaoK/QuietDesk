@@ -66,6 +66,7 @@ pub(crate) struct AttemptProgress {
 
 /// The command queue and negotiated lifetime of one authenticated connection.
 pub struct Attempt {
+    pub(crate) auxiliary: Option<(std::net::SocketAddr, crate::PairingKey)>,
     pub(crate) quality: StreamSettings,
     pub(crate) commands: mpsc::UnboundedReceiver<ViewerCommand>,
     pub(crate) progress: Arc<AttemptProgress>,
@@ -73,7 +74,13 @@ pub struct Attempt {
 
 impl Attempt {
     pub(crate) fn new(quality: StreamSettings, commands: mpsc::UnboundedReceiver<ViewerCommand>) -> Self {
-        Self { quality, commands, progress: Arc::default() }
+        Self { quality, commands, progress: Arc::default(), auxiliary: None }
+    }
+
+    /// Dials media connections back to the endpoint authenticated by this control attempt.
+    pub fn with_auxiliary(mut self, endpoint: std::net::SocketAddr, key: crate::PairingKey) -> Self {
+        self.auxiliary = Some((endpoint, key));
+        self
     }
 
     pub async fn run<P: ViewerPlatform>(

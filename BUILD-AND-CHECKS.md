@@ -1,5 +1,15 @@
 # 构建与检查记录
 
+## 任务 A 复核：全量回归、打包与 Parallels Windows 11 实测（2026-11-22，`ff2806f`）
+
+- **做了什么**：按任务 A 在当前 `main`（`ff2806f`）补跑全量 Swift/Python 检查与 Wine 检查、构建并校验 Universal macOS / Windows x64 测试包（输出至 `outputs/windows/review-fix/`），并在 Parallels Windows 11 ARM64 虚拟机中用独立 bundle ID 实测 Windows → Mac 无辅助功能回退（`758732f`）、有辅助功能 Finder 粘贴及 WP0（`e8b0508`）被控端编码器首帧与每秒统计，不修改产品代码。详见 `outputs/windows/review-fix/实测报告.md`。
+- **跑了什么与结果**：
+  - `./scripts/run-windows-wine-checks.sh`：通过（`90.24s`；39 项原生单元、5 项 OLE、1 项 WASAPI、`capture`/`displays`/`cursor`/`codec` 240 帧、DTLS UDP 视频 582 帧/580 提交后解码、35 个 `host video stats` 窗口；仅代表 Wine）。
+  - `./scripts/run-all-checks.sh`：构建、`python-tests`、`QuietDeskChecks`（尝试 1 即 `437 passed, 0 failed`）、`run-app-checks`（`82/0`）、`run-file-result-checks`（`70/0`）等 42 项检查通过；`run-media-session-checks` 首次因 `"Interactive listener ready"` 失败 1/41，独立重跑 `41/0` 通过；`run-media-blackhole-checks` 连续两次失败 1/5（`Interrupted UDP playback, whole-frame loss false`：`udpPreparations = 7` / `12`，预期 `3...6`），按任务 A 不顺手修改产品行为的约束仅作记录。
+  - `outputs/windows/review-fix/` 产物与内部版本/提交一致：`QuietDesk-0.7.3-macOS-universal.dmg`（`b744608f...`，`hdiutil verify` 有效）、`.zip`（`b4e4925a...`，`run-update-checks.sh --validate-archive` 通过）、`Source.zip`（`fe8a8bc9...`，433 文件一致）、`QuietDesk-0.7.3-Windows-x64.zip`（`a94b5e28...`，PE32+ x64 与许可证完整）。
+  - Parallels Windows 11 实测：无辅助功能时走 `writePromisedFiles` 回退（无 `.noindex` 占位目录，本机后台读取使接收确认先于 `⌘V` 弹出，确认后 1 次 `⌘V` 落盘 3 个文件且 SHA-256 全匹配）；有辅助功能时生成 `.noindex` 占位，等待 103 秒无提前弹窗，Finder `⌘V` 后弹出接收框、确认后一次落盘 3 个文件且 SHA-256 全匹配；WP0 共 589 个 `host video stats`（`source=dxgi`），`was not accepted` 为 0、`the encoder holds` 为 0、6 次开流全部 `after 1 captured frames`（虚拟显卡不代表真机性能）。
+- **没验证什么**：仅在 macOS 26.5.2（arm64）与 Parallels ARM64 虚拟机软编码路径运行，未在 Intel Mac、真实物理 Windows 显卡/真机及公网环境下验证。
+
 ## Windows 版复核：合并 Finder 粘贴、补上无权限回退与安全说明（2026-11-22）
 
 - 复核了 `df8bff1` 之后的 39 个提交（WP1–WP6、WP8、WP9a–e）。在导出副本上重跑：204 项 Rust 单元、19 项回环、57 项 Swift ↔ Rust 互通（连续 3 次）、格式、两个目标的严格 Clippy、`build-windows.sh` 与依赖发布时间检查均通过。细读了 DTLS 通道、独立通道绑定、TLS 接入、文件落盘校验、数据报输入限制、分片重组上限与两端的延迟粘贴；其余代码未逐行阅读。Wine、`run-all-checks.sh` 与实机检查本轮没有重跑。

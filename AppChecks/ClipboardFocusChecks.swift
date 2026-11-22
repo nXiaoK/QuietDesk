@@ -107,6 +107,30 @@ private final class MemoryPasteboard: ClipboardPasteboard {
         copy(.files([]))
     }
 
+    /// What installing a Finder paste fails with, as on a Mac that cannot watch Finder.
+    var finderFilesError: Error?
+    var providesPromisedFiles = false
+    private(set) var promisedCount: Int?
+    private var promisedRequest: (@MainActor () -> Bool)?
+
+    func writeFinderFiles(names: [String], marker: String, onFailure: @escaping @MainActor (String) -> Void,
+                          request: @escaping @MainActor () -> Bool) throws -> ClipboardFilePromise? {
+        if let finderFilesError { throw finderFilesError }
+        return nil
+    }
+
+    func writePromisedFiles(count: Int, marker: String, request: @escaping @MainActor () -> Bool) -> ClipboardFilePromise? {
+        guard providesPromisedFiles, !rejectsWrites else { return nil }
+        payload = .text(Data()); rawTIFF = nil; self.marker = marker
+        hasLazyItem = true; lazyKind = .files; lazyAsyncFetch = nil
+        promisedCount = count; promisedRequest = request
+        changeCount += 1; writes += 1
+        return ClipboardFilePromise(count: count, request: request)
+    }
+
+    /// What reading one of the promised file URLs starts.
+    func readPromisedFiles() -> Bool { promisedRequest?() ?? false }
+
     func republish() {
         marker = nil
         hasLazyItem = false; lazyKind = nil; lazyAsyncFetch = nil
@@ -313,6 +337,51 @@ private struct ClipboardFocusChecks {
             try eventually("The failure was not reported to the receiver") { status.contains("重新复制") }
             try require(board.copiedText == "keep this copy" && board.writes == 0 && !messages.snapshot().contains(.clipboardPull),
                         "Missing names displaced the local clipboard or triggered a file request")
+        }
+
+        run("A Mac that cannot watch Finder still offers the copied files and requests them when they are read") { folder in
+            let board = MemoryPasteboard()
+            board.copy(.text(Data("an earlier local copy".utf8)))
+            board.finderFilesError = FinderPasteUnavailable(reason: "辅助功能权限未生效")
+            board.providesPromisedFiles = true
+            let messages = ChannelSafeBox<[MessageKind]>([])
+            let sync = ClipboardSync(session: UUID(), allowsFileSending: true, allowsAutomaticSending: false,
+                                     allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true, usesFinderFilePaste: true,
+                                     pasteboard: board, storage: folder) { messages.append($0.kind) }
+            defer { sync.stop() }
+            var status = ""
+            sync.onStatus = { status = $0 }
+            let manifest = ClipboardManifest(revision: ClipboardRevision(counter: 1, origin: UUID()), kind: .files,
+                                             fileRootCount: 2, fileRootNames: ["报告.txt", "资料"])
+            sync.receive(try Wire.json(.clipboardManifest, manifest))
+            try eventually("The copied files were not offered on the pasteboard") { board.promisedCount == 2 }
+            try require(board.inspectCurrentKind() == .files && status.contains("辅助功能权限未生效") && !status.contains("重新复制"),
+                        "The receiver was not told why the files arrive on a pasteboard read: \(status)")
+            pump(for: 0.2)
+            try require(!messages.snapshot().contains(.clipboardPull), "Files were requested before anything read the pasteboard")
+            try require(board.readPromisedFiles(), "Reading the offered files did not start a request")
+            try eventually("The files were not requested from the peer") { messages.snapshot().contains(.clipboardPull) }
+        }
+
+        run("A Finder paste that cannot be watched reports why and leaves no placeholder files behind") { _ in
+            let name = "quietdesk-check-\(UUID().uuidString).txt"
+            let temporary = FileManager.default.temporaryDirectory
+            func placeholders() -> [URL] {
+                ((try? FileManager.default.contentsOfDirectory(at: temporary, includingPropertiesForKeys: nil)) ?? [])
+                    .filter { $0.lastPathComponent.hasPrefix("QuietDesk-") && FileManager.default.fileExists(atPath: $0.appendingPathComponent(name).path) }
+            }
+            do {
+                _ = try FinderClipboardPaste(names: [name], promise: ClipboardFilePromise(count: 1) { false }, isTrusted: { false })
+                throw FocusCheckFailure("A Finder paste was offered although Finder cannot be watched")
+            } catch let unavailable as FinderPasteUnavailable {
+                try require(unavailable.reason.contains("辅助功能"), "The reason does not name the missing permission: \(unavailable.reason)")
+            }
+            try require(placeholders().isEmpty, "A placeholder file stayed in the temporary folder")
+            // A name that cannot be a single file is refused before anything is watched, whatever the permission.
+            do {
+                _ = try FinderClipboardPaste(names: ["a/b"], promise: ClipboardFilePromise(count: 1) { false }, isTrusted: { false })
+                throw FocusCheckFailure("An invalid file name was accepted")
+            } catch is DeskError {}
         }
 
         if Array(arguments.dropFirst()) == ["--finder-roots-only"] { exit(failed == 0 ? 0 : 1) }

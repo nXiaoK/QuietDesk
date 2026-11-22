@@ -3,6 +3,12 @@ import ApplicationServices
 import Carbon
 import QuietDeskCore
 
+/// Finder's Paste cannot be recognised on this Mac right now. The copy can still be offered the way it is
+/// to a peer without file names, where the files are requested once something reads the pasteboard.
+struct FinderPasteUnavailable: Error {
+    let reason: String
+}
+
 /// Watches only Finder, and only between publishing a remote file copy and its first paste.
 /// No event is intercepted, retained or replayed.
 @MainActor
@@ -13,9 +19,10 @@ private final class FinderPasteIntent {
     private var tap: CFMachPort?
     private var observer: AXObserver?
 
-    init(paste: @escaping () -> Void) throws {
-        guard AXIsProcessTrusted(), let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first else {
-            throw DeskError.invalid("请在系统设置的“隐私与安全性 → 辅助功能”允许 QuietDesk 识别 Finder 文件粘贴，然后重新复制文件")
+    init(isTrusted: () -> Bool, paste: @escaping () -> Void) throws {
+        guard isTrusted() else { throw FinderPasteUnavailable(reason: "辅助功能权限未生效") }
+        guard let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first else {
+            throw FinderPasteUnavailable(reason: "Finder 未运行")
         }
         self.finder = finder
         self.app = AXUIElementCreateApplication(finder.processIdentifier)
@@ -31,7 +38,7 @@ private final class FinderPasteIntent {
                 }
             }
             return Unmanaged.passUnretained(event)
-        }, userInfo: context) else { throw DeskError.invalid("QuietDesk 无法识别 Finder 粘贴，请检查辅助功能和输入监控权限后重新复制文件") }
+        }, userInfo: context) else { throw FinderPasteUnavailable(reason: "无法监听 Finder 的粘贴操作，请检查辅助功能和输入监控权限") }
         self.tap = tap
         CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
@@ -168,7 +175,9 @@ final class FinderClipboardPaste: @unchecked Sendable {
     private var readers: [PromisedFinderRoot] = []
     @MainActor private var monitor: FinderPasteIntent?
 
-    @MainActor init(names: [String], promise: ClipboardFilePromise, onFailure: @escaping @MainActor (String) -> Void = { _ in }) throws {
+    /// Throws `FinderPasteUnavailable` when Finder's Paste cannot be watched, and leaves nothing behind then.
+    @MainActor init(names: [String], promise: ClipboardFilePromise, isTrusted: () -> Bool = { AXIsProcessTrusted() },
+                    onFailure: @escaping @MainActor (String) -> Void = { _ in }) throws {
         self.onFailure = onFailure
         self.promise = promise
         let staging = FileManager.default.temporaryDirectory.appendingPathComponent("QuietDesk-\(UUID().uuidString).noindex", isDirectory: true)
@@ -183,7 +192,7 @@ final class FinderClipboardPaste: @unchecked Sendable {
                       !name.contains("\0"), name.utf8.count <= 255 else { throw DeskError.invalid("对端文件名无效，请重新复制") }
                 try Data().write(to: url, options: .withoutOverwriting)
             }
-            monitor = try FinderPasteIntent { [weak self] in self?.recordPaste() }
+            monitor = try FinderPasteIntent(isTrusted: isTrusted) { [weak self] in self?.recordPaste() }
             readers = urls.map { url in
                 PromisedFinderRoot(url: url, queue: queue, failed: { [weak self] in
                     self?.reportFailure("Finder 的临时文件不可用，请在对端重新复制")

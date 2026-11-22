@@ -1426,11 +1426,23 @@ final class ClipboardSync {
                 guard let names = manifest.fileRootNames, !names.isEmpty, names.count == manifest.fileRootCount else {
                     throw DeskError.invalid("无法取得待粘贴文件的名称，请在对端重新复制文件")
                 }
-                let promise = try pasteboard.writeFinderFiles(names: names, marker: marker, onFailure: { [weak self] message in
-                    self?.onStatus?(message)
-                    self?.onDiagnostic?(.applyFailed(.files, fileCount: names.count))
-                }) { [weak self] in
-                    self?.requestPromisedFiles(revision: revision) ?? false
+                let promise: ClipboardFilePromise?
+                do {
+                    promise = try pasteboard.writeFinderFiles(names: names, marker: marker, onFailure: { [weak self] message in
+                        self?.onStatus?(message)
+                        self?.onDiagnostic?(.applyFailed(.files, fileCount: names.count))
+                    }) { [weak self] in
+                        self?.requestPromisedFiles(revision: revision) ?? false
+                    }
+                } catch let unavailable as FinderPasteUnavailable {
+                    // Without the permission the copy must stay receivable. This is the offer a peer without
+                    // file names gets: the files are requested as soon as Finder reads the pasteboard.
+                    promise = pasteboard.writePromisedFiles(count: names.count, marker: marker) { [weak self] in
+                        self?.requestPromisedFiles(revision: revision) ?? false
+                    }
+                    if promise != nil {
+                        onStatus?("\(unavailable.reason)，已改为在读取剪贴板时请求文件；确认接收后粘贴即可")
+                    }
                 }
                 announcedFilePromise = promise
                 wrote = promise != nil

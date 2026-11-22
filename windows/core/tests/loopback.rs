@@ -1,6 +1,7 @@
 //! A host session and a viewer session of this crate talking over an in-memory connection, with
 //! stand-ins for capture, decoding, input and the clipboard.
 
+use quietdesk_core::display::{DisplaySwitch, HostDisplays, RemoteDisplayInfo};
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::host::{self, FrameSink, HostCommand, HostEvent, HostOptions, HostPlatform};
 use quietdesk_core::input::InjectOp;
@@ -25,6 +26,10 @@ struct HostLog {
     refuse: Option<StreamSettings>,
     static_desktop: bool,
     stale_frame_on_key_request: bool,
+    displays: Vec<RemoteDisplayInfo>,
+    selected: u32,
+    refused_display: Option<u32>,
+    switched: Vec<u32>,
 }
 
 struct Capture {
@@ -41,7 +46,31 @@ struct FakeHost {
 
 impl HostPlatform for FakeHost {
     fn display_size(&mut self) -> Result<(u32, u32)> {
-        Ok((2560, 1440))
+        let log = self.log.lock().unwrap();
+        Ok(log.displays.iter().find(|screen| screen.id == log.selected).map_or((2560, 1440), |screen| (screen.width, screen.height)))
+    }
+
+    fn displays(&mut self) -> Result<Option<HostDisplays>> {
+        let log = self.log.lock().unwrap();
+        if log.displays.is_empty() {
+            return Ok(None);
+        }
+        let active = log.displays.iter().find(|screen| screen.id == log.selected);
+        Ok(Some(HostDisplays { displays: log.displays.clone(), selected_display_id: active.unwrap_or(&log.displays[0]).id, needs_restart: active.is_none() }))
+    }
+
+    async fn switch_display(&mut self, id: u32, settings: StreamSettings, frames: FrameSink) -> Result<DisplaySwitch> {
+        let mut log = self.log.lock().unwrap();
+        if log.refused_display == Some(id) {
+            return Ok(DisplaySwitch::Retained("无法切换采集源".into()));
+        }
+        let screen = log.displays.iter().find(|screen| screen.id == id).unwrap();
+        let (width, height) = settings.dimensions(screen.width, screen.height);
+        log.selected = id;
+        log.switched.push(id);
+        drop(log);
+        *self.sink.lock().unwrap() = Some(Capture { frames, key: true, stale: false, produced: 0 });
+        Ok(DisplaySwitch::Applied(VideoStreamState { settings, width: width.into(), height: height.into() }))
     }
 
     async fn configure(&mut self, settings: StreamSettings, frames: FrameSink) -> Result<VideoStreamState> {
@@ -55,7 +84,8 @@ impl HostPlatform for FakeHost {
             log.paused = false;
         }
         *self.sink.lock().unwrap() = Some(Capture { frames, key: true, stale: false, produced: 0 });
-        let (width, height) = settings.dimensions(2560, 1440);
+        let (source_width, source_height) = self.display_size()?;
+        let (width, height) = settings.dimensions(source_width, source_height);
         Ok(VideoStreamState { settings, width: i64::from(width), height: i64::from(height) })
     }
 
@@ -241,7 +271,13 @@ where
     let (host_stream, viewer_stream) = tokio::io::duplex(256 * 1024);
     let (host_peer, host_incoming) = peer::spawn(host_stream, config);
     let (viewer_peer, viewer_incoming) = peer::spawn(viewer_stream, config);
-    let host_log = Arc::new(Mutex::new(HostLog { clipboard: Some("来自被控端".to_string()), refuse, ..HostLog::default() }));
+    let host_log = Arc::new(Mutex::new(HostLog {
+        clipboard: Some("来自被控端".to_string()),
+        refuse,
+        displays: vec![RemoteDisplayInfo::new(1, "横屏", 2560, 1440, true), RemoteDisplayInfo::new(2, "竖屏", 1080, 1920, false)],
+        selected: 1,
+        ..HostLog::default()
+    }));
     let sink = Arc::new(Mutex::new(None));
     let mut host_platform = FakeHost { log: host_log.clone(), sink: sink.clone() };
     let viewer_log = Arc::new(Mutex::new(ViewerLog::default()));
@@ -280,6 +316,7 @@ fn host_options() -> HostOptions {
         preferred: StreamSettings::new(1920, 30, 8),
         limit: StreamSettings::new(2560, 60, 30),
         modifiers: MacModifierMapping::Standard,
+        preferred_display: None,
     }
 }
 
@@ -409,6 +446,115 @@ async fn a_failed_quality_change_keeps_the_previous_stream_and_reports_why() {
 }
 
 #[tokio::test]
+async fn updating_the_display_list_or_confirming_the_same_local_screen_keeps_the_active_stream() {
+    run_sessions(StreamSettings::new(1920, 30, 8), None, |fixture| async move {
+        until("the first stream commits", || !fixture.viewer_log.lock().unwrap().commits.is_empty()).await;
+        fixture.host_log.lock().unwrap().displays[1].name = "已更名".into();
+        fixture.host_commands.send(HostCommand::RefreshDisplays).unwrap();
+        until("the viewer receives a topology change", || {
+            fixture
+                .viewer_log
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| matches!(event, ViewerEvent::Displays { displays, revision: 0, .. } if displays[1].name == "已更名"))
+        })
+        .await;
+        fixture.host_commands.send(HostCommand::SelectDisplay(None)).unwrap();
+        until("the local preference is confirmed", || fixture.host_events.lock().unwrap().contains(&HostEvent::LocalDisplaySelected(None))).await;
+        assert!(fixture.host_log.lock().unwrap().switched.is_empty());
+        assert_eq!(fixture.stream_events().len(), 1);
+        assert_eq!(fixture.viewer_log.lock().unwrap().commits.len(), 1);
+        fixture.viewer_commands.send(ViewerCommand::Disconnect).unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_older_viewer_reconnects_for_a_new_screen_size_without_receiving_display_messages() {
+    let (host_stream, viewer_stream) = tokio::io::duplex(64 * 1024);
+    let (host_peer, incoming) = peer::spawn(host_stream, PeerConfig::default());
+    let (_viewer, mut from_host) = peer::spawn(viewer_stream, PeerConfig::default());
+    let log = HostLog {
+        displays: vec![RemoteDisplayInfo::new(1, "主屏", 2560, 1440, true), RemoteDisplayInfo::new(2, "外接屏", 720, 1280, false)],
+        selected: 1,
+        ..HostLog::default()
+    };
+    let mut capture = FakeHost { log: Arc::new(Mutex::new(log)), sink: Arc::default() };
+    let (commands, queue) = mpsc::unbounded_channel();
+    let (notices, mut updates) = mpsc::unbounded_channel();
+    let host = host::run(host_peer, incoming, &mut capture, host_options(), queue, |event| {
+        let _ = notices.send(event);
+    });
+    let client = async {
+        assert!(matches!(from_host.recv().await.unwrap(), PeerEvent::Message(message) if message.kind == MessageKind::Hello));
+        commands.send(HostCommand::SelectDisplay(Some(2))).unwrap();
+        while let Some(event) = from_host.recv().await {
+            if let PeerEvent::Message(message) = event {
+                assert_ne!(message.kind, MessageKind::DisplayControl);
+            }
+        }
+    };
+    let (reason, ()) = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(host, client) }).await.unwrap();
+    assert!(reason.is_retryable());
+    assert_eq!(capture.log.lock().unwrap().switched, [2]);
+    assert!(std::iter::from_fn(|| updates.try_recv().ok()).any(|event| event == HostEvent::LocalDisplaySelected(Some(2))));
+}
+
+#[tokio::test]
+async fn a_paused_display_switch_resumes_on_the_selected_screen_and_rolls_back_a_failed_switch() {
+    run_sessions(StreamSettings::new(1920, 30, 8), None, |fixture| async move {
+        until("the first stream commits", || !fixture.viewer_log.lock().unwrap().commits.is_empty()).await;
+        fixture.viewer_commands.send(ViewerCommand::Pause(true)).unwrap();
+        until("the viewer pauses", || fixture.has_event(&ViewerEvent::Paused { paused: true, error: None })).await;
+        fixture.viewer_commands.send(ViewerCommand::SelectDisplay(2)).unwrap();
+        until("the second display is selected", || {
+            fixture
+                .viewer_log
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| matches!(event, ViewerEvent::Displays { selected: Some(2), pending: None, error: None, revision: 1, .. }))
+        })
+        .await;
+        assert_eq!(fixture.stream_events().last().unwrap().1, (1080, 1920));
+        assert!(fixture.host_log.lock().unwrap().paused);
+        assert_eq!(fixture.viewer_log.lock().unwrap().commits.len(), 1);
+        fixture.viewer_commands.send(ViewerCommand::Pause(false)).unwrap();
+        until("the new screen commits its keyframe", || fixture.viewer_log.lock().unwrap().commits.len() == 2).await;
+        fixture.host_log.lock().unwrap().refused_display = Some(1);
+        fixture.viewer_commands.send(ViewerCommand::SelectDisplay(1)).unwrap();
+        until("the failed selection reports the live screen", || {
+            fixture
+                .viewer_log
+                .lock()
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| matches!(event, ViewerEvent::Displays { selected: Some(2), pending: None, error: Some(reason), revision: 1, .. } if reason == "无法切换采集源"))
+        })
+        .await;
+        until("the retained source resumes", || fixture.viewer_log.lock().unwrap().commits.len() == 3).await;
+        assert_eq!(fixture.stream_events().last().unwrap().1, (1080, 1920));
+        {
+            let mut log = fixture.host_log.lock().unwrap();
+            log.refused_display = None;
+            log.displays.retain(|screen| screen.id != 2);
+        }
+        fixture.host_commands.send(HostCommand::RefreshDisplays).unwrap();
+        until("removal commits the remaining screen", || fixture.viewer_log.lock().unwrap().commits.len() == 4).await;
+        assert_eq!(fixture.stream_events().last().unwrap().1, (1920, 1080));
+        assert_eq!(fixture.host_log.lock().unwrap().switched, [2, 1]);
+        assert!(fixture.viewer_log.lock().unwrap().events.iter().any(|event| matches!(event, ViewerEvent::Displays { selected: Some(1), revision: 2, .. })));
+        assert!(!fixture.host_events.lock().unwrap().iter().any(|event| matches!(event, HostEvent::LocalDisplaySelected(_))));
+        fixture.viewer_commands.send(ViewerCommand::Disconnect).unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn resume_retires_the_old_window_and_only_encodes_one_new_idr_until_commit() {
     let (_, viewer_end, _) = run_sessions(StreamSettings::new(1920, 30, 8), None, |fixture| async move {
         until("the first stream commits", || !fixture.viewer_log.lock().unwrap().commits.is_empty()).await;
@@ -489,19 +635,28 @@ async fn an_old_host_gets_legacy_acknowledgements_and_cannot_send_unnegotiated_m
         let (viewer, incoming) = peer::spawn(viewer_stream, PeerConfig::default());
         let log = Arc::new(Mutex::new(ViewerLog::default()));
         let (acknowledgements, decoded) = mpsc::unbounded_channel();
-        let (_commands, command_queue) = mpsc::unbounded_channel();
+        let (commands, command_queue) = mpsc::unbounded_channel();
         let mut platform = FakeViewer { log: log.clone(), acknowledgements };
         let settings = StreamSettings::new(1920, 30, 8);
         let packet = VideoPacket::h264(19, key_frame());
         let old_host = async {
             let mut hello = serde_json::json!({"version":1, "name":"Old host", "width":1920, "height":1080, "settings":settings, "canControl":false});
+            hello["displays"] = serde_json::json!([RemoteDisplayInfo::new(1, "主屏", 1920, 1080, true), RemoteDisplayInfo::new(2, "外接屏", 1280, 720, false)]);
             if let Some(value) = capability {
                 hello["mediaTransportV1"] = serde_json::json!(value);
+                hello["displaySwitchingV1"] = serde_json::json!(value);
             }
             host.send(&Message::json(MessageKind::Hello, &hello).unwrap()).unwrap();
             host.send(&Message::new(MessageKind::Video, packet.encode().unwrap())).unwrap();
             let reply = next_message(&mut messages).await;
             assert_eq!(reply, Message::new(MessageKind::Acknowledgement, packet.sequence.to_be_bytes().to_vec()));
+            commands.send(ViewerCommand::SelectDisplay(2)).unwrap();
+            until("a local selection learns that display switching is unavailable", || {
+                log.lock().unwrap().events.iter().any(|event| matches!(event, ViewerEvent::Displays { selected: None, pending: None, error: Some(_), .. }))
+            })
+            .await;
+            commands.send(ViewerCommand::ReleaseInput).unwrap();
+            assert_eq!(next_message(&mut messages).await.kind, MessageKind::ReleaseInput);
             let stream = MediaStreamId { session_id: uuid::Uuid::new_v4(), transport_epoch: 1, codec_epoch: 1 };
             host.send(&MediaFrame::new(stream, 1, packet.clone()).unwrap().message().unwrap()).unwrap();
         };

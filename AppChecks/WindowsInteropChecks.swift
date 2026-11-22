@@ -196,6 +196,8 @@ private final class MacViewer: @unchecked Sendable {
         var cursorStatus: CursorControl?
         var cursorBinding: MediaStreamID?
         var readyWithCursor: [MediaStreamID] = []
+        var displayRequest: UUID?
+        var displayUpdates: [DisplayControl] = []
         var tuning: VideoTuningSession?
         var decoded: [(sequence: UInt32, key: Bool, width: Int, height: Int)] = []
         var received: [UInt32] = []
@@ -262,6 +264,7 @@ private final class MacViewer: @unchecked Sendable {
             var tuning = try VideoTuningSession(applied: applied, preferred: preferred)
             if hello.sessionTerminationV1 == true { peer.send(try SessionTermination(.subscribe).message()) }
             if hello.controlStatusUpdates == true { peer.send(Message(.controlStatus)) }
+            if hello.displaySwitchingV1 == true { peer.send(try DisplayControl.subscribe().message()) }
             if useMedia, hello.mediaTransportV1 == true {
                 let media = try MediaSession.viewer(control: peer, key: key, host: "127.0.0.1", port: port, settings: hello.settings)
                 media.onVideo = { [weak self] frame, complete in
@@ -286,6 +289,22 @@ private final class MacViewer: @unchecked Sendable {
             state.update { $0.legacyFrames += 1 }
             decode(packet, frameID: nil) { [weak self] success in
                 if success { self?.acknowledge(packet.sequence) }
+            }
+        case .displayControl where state.get().hello?.displaySwitchingV1 == true:
+            let update = try DisplayControl.read(message.payload)
+            try state.update { state in
+                switch update.operation {
+                case .state: break
+                case .result:
+                    guard state.displayRequest == update.id else { return }
+                    state.displayRequest = nil
+                default: throw Failure("The Windows host sent a display request")
+                }
+                if update.error == nil, let video = update.videoState {
+                    try state.tuning?.synchronizeHostState(video)
+                    state.media?.updateSettings(video.settings)
+                }
+                state.displayUpdates.append(update)
             }
         case .cursorControl where state.get().hello?.independentCursorV1 == true:
             let control = try CursorControl.read(message.payload)
@@ -376,6 +395,18 @@ private final class MacViewer: @unchecked Sendable {
         return id
     }
 
+    func selectDisplay(_ display: UInt32) throws -> DisplayControl {
+        let request = DisplayControl.select(displayID: display)
+        state.update { $0.displayRequest = request.id }
+        peer.send(try request.message())
+        var result: DisplayControl?
+        try until("the Windows host returns its actual display") {
+            result = self.state.get().displayUpdates.first { $0.operation == .result && $0.id == request.id }
+            return result != nil
+        }
+        return result!
+    }
+
     func releaseHeldDecodes() {
         let held = state.update { state -> [() -> Void] in
             state.holdAcknowledgements = false
@@ -431,6 +462,11 @@ private enum SyntheticCursor {
     }
 }
 
+private enum SyntheticDisplays {
+    static let primary = RemoteDisplayInfo(id: 1, name: "Synthetic primary", width: 640, height: 360, isMain: true)
+    static let external = RemoteDisplayInfo(id: 2, name: "Synthetic external", width: 320, height: 240, isMain: false)
+}
+
 private struct PostedEvent {
     let type: CGEventType
     let keyCode: Int64
@@ -467,6 +503,11 @@ private final class MacHost: @unchecked Sendable {
         var applied: VideoStreamState
         var subscribedTermination = false
         var subscribedControl = false
+        var subscribedDisplays = false
+        var displays: [RemoteDisplayInfo] = []
+        var selectedDisplay = SyntheticDisplays.primary.id
+        var rejectNextDisplay = false
+        var displaySelections: [UInt32] = []
         var pauseRequests: [Bool] = []
         var clipboard = "Mac 主机剪贴板"
         var received: [MessageKind] = []
@@ -481,21 +522,24 @@ private final class MacHost: @unchecked Sendable {
     private let cursorID = UUID()
     private let listener: NWListener
     private let packets: [VideoPacket]
+    private let externalPackets: [VideoPacket]
     private let key: PairingKey
     private let size: (width: Int, height: Int)
     private let injector: InputInjector
     private var pump: DispatchSourceTimer?
 
     init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int), advertiseMedia: Bool, cursorImage: CursorImage?,
-         on port: NWEndpoint.Port = .any) throws {
+         externalPackets: [VideoPacket] = [], on port: NWEndpoint.Port = .any) throws {
         self.advertiseMedia = advertiseMedia
         self.cursorImage = cursorImage
         self.key = key
         self.packets = packets
+        self.externalPackets = externalPackets
         self.size = size
         let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8)
         let state = Shared(State(applied: VideoStreamState(settings: settings, width: size.width, height: size.height)))
         self.state = state
+        if !externalPackets.isEmpty { state.update { $0.displays = [SyntheticDisplays.primary, SyntheticDisplays.external] } }
         injector = InputInjector(concurrentBounds: CGRect(x: 0, y: 0, width: 1600, height: 900), isTrusted: { true },
             postEvent: { event in
                 let posted = PostedEvent(type: event.type, keyCode: event.getIntegerValueField(.keyboardEventKeycode), flags: event.flags,
@@ -565,9 +609,11 @@ private final class MacHost: @unchecked Sendable {
                     relayTransportV1: true, relayDeviceID: nil, sessionLockV1: true, adaptiveVideoV1: true, sessionUnlockV1: true,
                     screenLocked: false, higherFrameRateVideoV1: true, preferredHigherFrameRateSettings: preferred,
                     displayDimmingV1: true, builtInDisplayDimmable: false, sessionTerminationV1: true, desktopActionsV1: true,
-                    hevcVideoV1: true, initialStreamNegotiationV1: true, hevc444VideoV1: true, displaySwitchingV1: true,
-                    displays: [RemoteDisplayInfo(id: 1, name: "内建显示器", width: self.size.width, height: self.size.height, isMain: true)],
-                    selectedDisplayID: 1, remoteAudioV1: true, relativeMouseV1: true, trackpadGesturesV1: true,
+                    hevcVideoV1: true, initialStreamNegotiationV1: true, hevc444VideoV1: true,
+                    displaySwitchingV1: self.externalPackets.isEmpty ? nil : true,
+                    displays: self.externalPackets.isEmpty ? nil : self.state.get().displays,
+                    selectedDisplayID: self.externalPackets.isEmpty ? nil : self.state.get().selectedDisplay,
+                    remoteAudioV1: true, relativeMouseV1: true, trackpadGesturesV1: true,
                     initialCursorNegotiationV1: self.cursorImage == nil ? nil : true, qualityProbeV1: true, typeTextV1: true)))
                 // The application waits this long for the viewer's first settings before it starts capture.
                 DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in self?.state.update { $0.streaming = true } }
@@ -597,8 +643,9 @@ private final class MacHost: @unchecked Sendable {
             guard state.streaming, !state.paused, state.prepared == recovery, let media = state.media,
                   state.waiting.count < MediaBufferLimits.legacyFrameWindow else { return }
             if recovery { state.next = 0 }
-            let source = packets[state.next]
-            state.next = (state.next + 1) % packets.count
+            let recording = state.selectedDisplay == SyntheticDisplays.external.id ? externalPackets : packets
+            let source = recording[state.next]
+            state.next = (state.next + 1) % recording.count
             state.sequence &+= 1
             if recovery { state.recoverySequences.append(state.sequence) }
             state.waiting.insert(state.sequence)
@@ -619,6 +666,21 @@ private final class MacHost: @unchecked Sendable {
             if state.get().media?.receive(message) == true { return }
         }
         switch message.kind {
+        case .displayControl where !externalPackets.isEmpty:
+            let control = try DisplayControl.read(message.payload)
+            switch control.operation {
+            case .subscribe:
+                let current = state.update { state in state.subscribedDisplays = true; return state }
+                peer.send(try DisplayControl.state(displays: current.displays, selectedDisplayID: current.selectedDisplay).message())
+            case .select:
+                guard let id = control.id, let target = control.displayID else { throw Failure("Missing display selection") }
+                state.update { state in
+                    state.subscribedDisplays = true
+                    state.displaySelections.append(target)
+                }
+                try changeDisplay(to: target, available: state.get().displays, request: id)
+            default: throw Failure("The viewer sent a display update")
+            }
         case .cursorControl:
             let request = try CursorControl.read(message.payload)
             let current = state.get()
@@ -652,7 +714,9 @@ private final class MacHost: @unchecked Sendable {
         case .streamSettingsRequest:
             let request = try Wire.readJSON(StreamSettingsRequest.self, message.payload)
             try request.validate()
-            let dimensions = request.settings.dimensions(width: size.width, height: size.height)
+            let current = state.get()
+            let display = current.displays.first { $0.id == current.selectedDisplay }
+            let dimensions = request.settings.dimensions(width: display?.width ?? size.width, height: display?.height ?? size.height)
             let applied = VideoStreamState(settings: request.settings, width: dimensions.0, height: dimensions.1)
             let restart = state.update { state -> Bool in
                 state.requests.append(request)
@@ -704,6 +768,41 @@ private final class MacHost: @unchecked Sendable {
         }
     }
 
+    func changeDisplay(to target: UInt32, available: [RemoteDisplayInfo], request: UUID? = nil) throws {
+        let current = state.get()
+        guard let peer = current.peer, let media = current.media, current.subscribedDisplays else { throw Failure("No display subscription") }
+        let refused = state.update { current in defer { current.rejectNextDisplay = false }; return current.rejectNextDisplay }
+        guard let next = available.first(where: { $0.id == target }), !refused, target != current.selectedDisplay else {
+            if let request {
+                let error = target == current.selectedDisplay ? nil : "Synthetic display is unavailable"
+                peer.send(try DisplayControl.result(id: request, selectedDisplayID: current.selectedDisplay, displays: current.displays,
+                                                    videoState: current.applied, error: error).message())
+            }
+            return
+        }
+        media.suspendForConfiguration { [state] in
+            let video = state.update { state in
+                state.prepared = true
+                state.waiting.removeAll()
+                state.next = 0
+                state.selectedDisplay = target
+                state.displays = available
+                let size = state.applied.settings.dimensions(width: next.width, height: next.height)
+                state.applied = VideoStreamState(settings: state.applied.settings, width: size.0, height: size.1)
+                return state.applied
+            }
+            do {
+                let update = request.map { DisplayControl.result(id: $0, selectedDisplayID: target, displays: available, videoState: video) }
+                    ?? DisplayControl.state(displays: available, selectedDisplayID: target, videoState: video)
+                peer.send(try update.message())
+                media.resumeAfterConfiguration()
+            } catch {
+                state.update { $0.failures.append("display update: \(error)") }
+                peer.close("\(error)")
+            }
+        }
+    }
+
     func end() {
         pump?.cancel()
         let current = state.get()
@@ -744,11 +843,15 @@ private struct WindowsInteropChecks {
 
         let size = (width: 640, height: 360)
         let packets: [VideoPacket]
+        let externalPackets: [VideoPacket]
         let recording = work + "/recording.h264"
+        let externalRecording = work + "/external.h264"
         let replayFrames: [Data]
         do {
             packets = try encodeFrames(width: size.width, height: size.height, count: 24)
             replayFrames = try writeRecording(packets, to: recording)
+            externalPackets = try encodeFrames(width: SyntheticDisplays.external.width, height: SyntheticDisplays.external.height, count: 8)
+            _ = try writeRecording(externalPackets, to: externalRecording)
         } catch {
             print("FAIL Encoding the synthetic stream: \(error)")
             exit(1)
@@ -909,6 +1012,57 @@ private struct WindowsInteropChecks {
             }
         }
 
+        run("A Mac viewer selects Windows displays, decodes the chosen screen and follows its removal") {
+            try withWindowsHost(["--second-recording", externalRecording]) { probe, viewer in
+                let main = SyntheticDisplays.primary, external = SyntheticDisplays.external
+                func picture(_ display: RemoteDisplayInfo, after old: MediaStreamID? = nil, newerThan sequence: UInt32 = 0) throws -> MediaStreamID {
+                    try until("the selected display supplies committed, decodable pictures") {
+                        let s = viewer.state.get()
+                        guard let stream = s.commits.last, stream != old,
+                              let frame = s.mediaFrames.first(where: { $0.header.stream == stream && $0.header.frameID > 1 && $0.packet.sequence > sequence }) else { return false }
+                        return s.decoded.contains { $0.sequence == frame.packet.sequence && $0.width == display.width && $0.height == display.height }
+                    }
+                    return viewer.state.get().commits.last!
+                }
+
+                let first = try picture(main)
+                try until("Windows sends the display subscription state") { viewer.state.get().displayUpdates.first?.operation == .state }
+                let initial = viewer.state.get()
+                try require(initial.hello?.displaySwitchingV1 == true && initial.hello?.displays == [main, external]
+                            && initial.hello?.selectedDisplayID == main.id && initial.displayUpdates[0].displays == [main, external]
+                            && initial.displayUpdates[0].selectedDisplayID == main.id, "The Windows display list or selected screen was incorrect")
+                let captures = probe.all("switchCapture").count
+                let same = try viewer.selectDisplay(main.id)
+                let baseline = viewer.state.get().mediaFrames.count
+                try until("the unchanged capture continues") { viewer.state.get().mediaFrames.count > baseline + 5 }
+                try require(same.selectedDisplayID == main.id && same.error == nil && viewer.state.get().commits == [first]
+                            && probe.all("switchCapture").count == captures,
+                            "Selecting the current Windows display restarted capture")
+                let missing = try viewer.selectDisplay(99)
+                try require(missing.selectedDisplayID == main.id && missing.displays == [main, external] && missing.error != nil
+                            && probe.all("switchCapture").count == captures, "An unknown display reached Windows capture")
+                try probe.send(["command": "rejectNextDisplay"])
+                _ = try probe.next("displayFailureArmed")
+                let refused = try viewer.selectDisplay(external.id)
+                try require(refused.selectedDisplayID == main.id && refused.error != nil && refused.videoState?.width == main.width,
+                            "A failed selection replaced the actual Windows capture")
+                let previous = try picture(main, newerThan: viewer.state.get().received.last ?? 0)
+                let switched = try viewer.selectDisplay(external.id)
+                try require(switched.error == nil && switched.selectedDisplayID == external.id && switched.videoState?.width == external.width
+                            && switched.videoState?.height == external.height, "The Windows result did not describe the external display")
+                let externalStream = try picture(external, after: previous)
+                try probe.send(["command": "detachExternal"])
+                try until("Windows reports the hotplug fallback") {
+                    let update = viewer.state.get().displayUpdates.last
+                    return update?.operation == .state && update?.displays == [main] && update?.selectedDisplayID == main.id
+                }
+                _ = try picture(main, after: externalStream)
+                viewer.peer.send(try DisplayControl.state(displays: [main], selectedDisplayID: main.id).message())
+                let rejected = try probe.next("ended")
+                try require((rejected["reason"] as? String)?.contains("显示器") == true, "The Windows host accepted a viewer's display state")
+            }
+        }
+
         run("A Windows host lowers a request to its limit, restarts from a keyframe and survives a setting its encoder refuses") {
             try withWindowsHost(["--limit", "2560,60,30", "--refuse-edge", "1280"], useMedia: false) { probe, viewer in
                 try until("frames flow") { viewer.state.get().decoded.count >= 5 }
@@ -1029,8 +1183,9 @@ private struct WindowsInteropChecks {
             }
         }
 
-        func withMacHost(advertiseMedia: Bool = true, cursorImage: CursorImage? = nil, viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
-            let host = try MacHost(key: key, packets: packets, size: size, advertiseMedia: advertiseMedia, cursorImage: cursorImage)
+        func withMacHost(advertiseMedia: Bool = true, cursorImage: CursorImage? = nil, twoDisplays: Bool = false, viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
+            let host = try MacHost(key: key, packets: packets, size: size, advertiseMedia: advertiseMedia, cursorImage: cursorImage,
+                                   externalPackets: twoDisplays ? externalPackets : [])
             defer { host.stop() }
             let probe = try Probe(probePath, ["viewer", "--code", (viewerKey ?? key).code, "--port", "\(host.port)", "--quality", quality] + extra)
             defer { probe.stop() }
@@ -1157,6 +1312,60 @@ private struct WindowsInteropChecks {
                             && image["hotSpotX"] as? Double == 0.5 && image["hotSpotY"] as? Double == 0.25
                             && position["inside"] as? Bool == true && position["x"] as? Double == 0.25 && position["y"] as? Double == 0.75,
                             "The Windows presentation lost the Mac's RGBA pixels, hotspot or position")
+            }
+        }
+
+        run("A Windows viewer subscribes to Mac displays, preserves a rejected selection and follows the next committed pictures") {
+            try withMacHost(twoDisplays: true) { host, probe in
+                let main = SyntheticDisplays.primary, external = SyntheticDisplays.external
+                func verifyStream(_ source: [VideoPacket]) throws {
+                    let stream = try probe.next("mediaCommitted")
+                    try until("the Mac observes the selected stream's commit") {
+                        let s = host.state.get()
+                        return s.commits.last?.transportEpoch == stream["transportEpoch"] as? UInt32 && !s.recoverySequences.isEmpty
+                    }
+                    let first = Int(host.state.get().recoverySequences.last!)
+                    for index in 0..<2 {
+                        let frame = try probe.next("frame") { $0["sequence"] as? Int == first + index }
+                        try require(frame["annexB"] as? String == hex(annexB(source[index])) && frame["key"] as? Bool == (index == 0),
+                                    "The committed Mac screen supplied a different picture")
+                    }
+                }
+
+                try verifyStream(packets)
+                try until("the Mac accepts a display subscription") { host.state.get().subscribedDisplays }
+                let initial = try probe.next("displays") { $0["selected"] as? UInt32 == main.id }
+                let list = try Wire.readJSON([RemoteDisplayInfo].self, JSONSerialization.data(withJSONObject: initial["displays"] ?? []))
+                try require(list == [main, external], "Windows did not expose the Mac's actual two displays")
+                try probe.send(["command": "selectDisplay", "id": main.id])
+                try probe.send(["command": "requestClipboard"])
+                _ = try probe.next("clipboardText")
+                try require(host.state.get().displaySelections.isEmpty && host.state.get().commits.count == 1, "A redundant local selection restarted capture")
+
+                host.state.update { $0.rejectNextDisplay = true }
+                try probe.send(["command": "selectDisplay", "id": external.id])
+                let pending = try probe.next("displays") { $0["pending"] as? UInt32 == external.id }
+                try require(pending["selected"] as? UInt32 == main.id, "The requested display was presented as active before the Mac confirmed it")
+                let rejected = try probe.next("displays") { $0["error"] is String }
+                try require(rejected["selected"] as? UInt32 == main.id && rejected["pending"] is NSNull, "A refused display remained pending or selected")
+                try probe.send(["command": "selectDisplay", "id": external.id])
+                _ = try probe.next("displays") { $0["selected"] as? UInt32 == external.id && $0["pending"] is NSNull }
+                try verifyStream(externalPackets)
+
+                // A valid result for an obsolete request cannot select another display.
+                let current = host.state.get()
+                current.peer?.send(try DisplayControl.result(id: UUID(), selectedDisplayID: main.id, displays: current.displays,
+                                                            videoState: current.applied).message())
+                try probe.send(["command": "requestClipboard"])
+                _ = try probe.next("clipboardText")
+                try require(probe.all("displays").last?["selected"] as? UInt32 == external.id, "A stale Mac result changed the Windows selection")
+                try host.changeDisplay(to: main.id, available: [main])
+                _ = try probe.next("displays") { $0["selected"] as? UInt32 == main.id && ($0["displays"] as? [Any])?.count == 1 }
+                try verifyStream(packets)
+                current.peer?.send(try DisplayControl.subscribe().message())
+                let end = try probe.next("ended")
+                try require(end["retryable"] as? Bool == false && end["hostEnded"] as? Bool == false,
+                            "Windows accepted a display request sent in the host direction")
             }
         }
 

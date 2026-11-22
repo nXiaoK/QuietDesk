@@ -2,6 +2,7 @@
 //! for a host that streams over the control connection and advertises only what it implements.
 
 use crate::cursor::{CursorControl, CursorImage, CursorOperation, CursorPosition, CursorReason, CursorShape};
+use crate::display::{DisplayControl, DisplaySwitch, HostDisplays, RemoteDisplayInfo};
 use crate::error::{DeskError, Result};
 use crate::input::{HostInputTranslator, InjectOp};
 use crate::keymap::MacModifierMapping;
@@ -19,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 /// How long a host that announced `initialStreamNegotiationV1` waits for the viewer's first settings
@@ -153,6 +155,14 @@ impl HostCursor {
 pub trait HostPlatform {
     /// Pixel size of the display that will be shared.
     fn display_size(&mut self) -> Result<(u32, u32)>;
+    /// Current topology and the actual source (or the available replacement after removal).
+    fn displays(&mut self) -> Result<Option<HostDisplays>> {
+        Ok(None)
+    }
+    /// Atomically replaces the frame sink, capture and input bounds, preserving the current pause and cursor modes.
+    fn switch_display(&mut self, _id: u32, _settings: StreamSettings, _frames: FrameSink) -> impl Future<Output = Result<DisplaySwitch>> + Send {
+        std::future::ready(Err(DeskError::platform("当前采集方式不支持切换显示器")))
+    }
     /// Starts or restarts capture and encoding with these settings, delivering to `frames` from a keyframe on.
     /// Returns the size actually encoded and the settings actually in effect.
     fn configure(&mut self, settings: StreamSettings, frames: FrameSink) -> impl Future<Output = Result<VideoStreamState>> + Send;
@@ -184,6 +194,7 @@ pub struct HostOptions {
     /// The most this host encodes, whatever a viewer asks for.
     pub limit: StreamSettings,
     pub modifiers: MacModifierMapping,
+    pub preferred_display: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -192,6 +203,8 @@ pub enum HostCommand {
     End,
     AllowControl(bool),
     Clipboard(bool),
+    SelectDisplay(Option<u32>),
+    RefreshDisplays,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -199,13 +212,23 @@ pub enum HostEvent {
     Streaming(VideoStreamState),
     Paused(bool),
     RoundTrip(f64),
+    Displays { displays: Vec<RemoteDisplayInfo>, selected: u32, error: Option<String> },
+    LocalDisplaySelected(Option<u32>),
+}
+
+enum DisplayChange {
+    Refresh,
+    Local(Option<u32>),
+    Remote(Uuid, u32),
 }
 
 struct HostSession<'a, P: HostPlatform> {
     peer: &'a PeerHandle,
     platform: &'a mut P,
     options: HostOptions,
-    display: (u32, u32),
+    displays: Option<HostDisplays>,
+    display_subscribed: bool,
+    remote_display: Option<u32>,
     translator: HostInputTranslator,
     /// `None` until the stream has started.
     state: Option<VideoStreamState>,
@@ -236,7 +259,9 @@ pub async fn run<P: HostPlatform>(
         peer: &peer,
         platform,
         options,
-        display: (0, 0),
+        displays: None,
+        display_subscribed: false,
+        remote_display: None,
         translator,
         state: None,
         frames: None,
@@ -266,7 +291,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
         commands: &mut mpsc::UnboundedReceiver<HostCommand>,
         events: &impl Fn(HostEvent),
     ) -> DeskError {
-        let initial = match self.announce() {
+        let initial = match self.announce(events) {
             Ok(settings) => settings,
             Err(error) => return error,
         };
@@ -292,6 +317,8 @@ impl<P: HostPlatform> HostSession<'_, P> {
                     Some(HostCommand::End) | None => Err(self.end()),
                     Some(HostCommand::AllowControl(allowed)) => self.allow_control(allowed),
                     Some(HostCommand::Clipboard(enabled)) => { self.options.clipboard = enabled; Ok(()) }
+                    Some(HostCommand::RefreshDisplays) => self.change_display(DisplayChange::Refresh, events).await,
+                    Some(HostCommand::SelectDisplay(id)) => self.change_display(DisplayChange::Local(id), events).await,
                 },
             };
             if let Err(reason) = outcome {
@@ -301,11 +328,16 @@ impl<P: HostPlatform> HostSession<'_, P> {
     }
 
     /// Sends the hello. Its settings are the ones the stream starts with unless the viewer asks first.
-    fn announce(&mut self) -> Result<StreamSettings> {
-        self.display = self.platform.display_size()?;
+    fn announce(&mut self, events: &impl Fn(HostEvent)) -> Result<StreamSettings> {
+        let (pixel_width, pixel_height) = self.platform.display_size()?;
+        self.displays = self.platform.displays()?;
+        if let Some(layout) = &self.displays {
+            layout.validate()?;
+            events(HostEvent::Displays { displays: layout.displays.clone(), selected: layout.selected_display_id, error: None });
+        }
         let preferred = self.options.preferred.limited_to(&self.options.limit);
         let initial = preferred.legacy_compatible();
-        let (width, height) = initial.dimensions(self.display.0, self.display.1);
+        let (width, height) = initial.dimensions(pixel_width, pixel_height);
         self.peer.send(&Message::json(
             MessageKind::Hello,
             &Hello {
@@ -326,6 +358,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 independent_cursor_v1: self.platform.supports_independent_cursor().then_some(true),
                 session_termination_v1: Some(true),
                 initial_stream_negotiation_v1: Some(true),
+                display_switching_v1: self.displays.as_ref().map(|_| true),
+                displays: self.displays.as_ref().map(|layout| layout.displays.clone()),
+                selected_display_id: self.displays.as_ref().map(|layout| layout.selected_display_id),
             },
         )?)?;
         Ok(initial)
@@ -407,12 +442,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
             return Err(DeskError::invalid("光标功能未协商"));
         }
         let epoch = self.cursor.epoch.checked_add(1).ok_or_else(|| DeskError::Network("光标模式代次已耗尽，请重新连接".into()))?;
-        let (settled, controls) = self.media.interrupted();
-        self.sync_gate();
-        self.settle(settled);
-        for control in controls.into_iter().filter(|c| c.operation == MediaOperation::Abort) {
-            self.send_control(control)?;
-        }
+        self.hold_for_configuration()?;
         let (sender, receiver) = watch::channel(None);
         let reason = match self.platform.configure_cursor(request.enabled.then_some(sender)).await {
             Ok(()) => {
@@ -437,6 +467,114 @@ impl<P: HostPlatform> HostSession<'_, P> {
             }
         }
         Ok(())
+    }
+
+    fn hold_for_configuration(&mut self) -> Result<()> {
+        let (settled, controls) = self.media.interrupted();
+        self.window.lock().unwrap().set_gate(Gate::Closed);
+        self.settle(settled);
+        for control in controls.into_iter().filter(|control| control.operation == MediaOperation::Abort) {
+            self.send_control(control)?;
+        }
+        Ok(())
+    }
+
+    async fn change_display(&mut self, change: DisplayChange, events: &impl Fn(HostEvent)) -> Result<()> {
+        let Some(previous) = &self.displays else { return Ok(()) };
+        let previous_id = previous.selected_display_id;
+        let mut next = self.platform.displays()?.ok_or_else(|| DeskError::platform("当前没有可共享的显示器"))?;
+        next.validate()?;
+        let main = next.displays.iter().find(|screen| screen.is_main).map(|screen| screen.id).unwrap_or(next.selected_display_id);
+        let available = |id: u32| next.displays.iter().any(|display| display.id == id);
+        let target = match change {
+            DisplayChange::Refresh if !available(previous_id) => self.options.preferred_display.filter(|id| available(*id)).unwrap_or(main),
+            DisplayChange::Refresh if self.options.preferred_display.is_none() && self.remote_display.is_none() => main,
+            DisplayChange::Refresh => next.selected_display_id,
+            DisplayChange::Local(None) => main,
+            DisplayChange::Local(Some(id)) | DisplayChange::Remote(_, id) => id,
+        };
+        let changed = target != previous_id || next.needs_restart;
+        if matches!(change, DisplayChange::Refresh) && !changed && previous.displays == next.displays {
+            return Ok(());
+        }
+        let before = match self.state {
+            Some(state) => state,
+            None => self.start(self.options.preferred.limited_to(&self.options.limit).legacy_compatible(), events).await?,
+        };
+        let present = available(target);
+        let held = present && changed;
+        let error = if !present {
+            Some("所选显示器当前不可用".into())
+        } else if held {
+            match self.replace_display(target, before.settings, events).await? {
+                Some(reason) if matches!(change, DisplayChange::Refresh) => return Err(DeskError::platform(reason)),
+                other => other,
+            }
+        } else {
+            None
+        };
+        let applied = held && error.is_none();
+        let state = self.state.expect("capture started before selecting a display");
+        next.selected_display_id = if error.is_some() { previous_id } else { target };
+        if error.is_some() && !available(previous_id) {
+            return Err(DeskError::platform("显示器切换失败，原共享显示器已断开"));
+        }
+        next.needs_restart = false;
+        let selected = next.selected_display_id;
+        events(HostEvent::Displays { displays: next.displays.clone(), selected, error: error.clone() });
+        match change {
+            DisplayChange::Local(preference) if error.is_none() => {
+                self.options.preferred_display = preference;
+                self.remote_display = None;
+                events(HostEvent::LocalDisplaySelected(preference));
+            }
+            DisplayChange::Remote(_, _) if error.is_none() => self.remote_display = Some(selected),
+            DisplayChange::Refresh if self.remote_display != Some(selected) => self.remote_display = None,
+            _ => {}
+        }
+        let notice = match change {
+            DisplayChange::Remote(id, _) => Some(DisplayControl::Result { id, selected, displays: next.displays.clone(), video_state: state, error }),
+            _ if self.display_subscribed => Some(DisplayControl::State { displays: next.displays.clone(), selected, video_state: applied.then_some(state) }),
+            _ => None,
+        };
+        self.displays = Some(next);
+        if let Some(notice) = notice {
+            self.peer.send(&notice.message()?)?;
+        } else if applied && (matches!(change, DisplayChange::Local(_)) || (before.width, before.height) != (state.width, state.height)) {
+            return Err(DeskError::Network("共享显示器已变化，请重新连接以更新画面尺寸".into()));
+        }
+        if held {
+            if !self.paused {
+                if let Some(recover) = self.media.recovery() {
+                    self.send_control(recover)?;
+                } else if !applied && !self.media.has_stream() {
+                    self.platform.request_key_frame().await?;
+                }
+            }
+            self.sync_gate();
+        }
+        Ok(())
+    }
+
+    async fn replace_display(&mut self, target: u32, quality: StreamSettings, events: &impl Fn(HostEvent)) -> Result<Option<String>> {
+        let released = self.translator.release_all();
+        self.platform.inject(&released);
+        self.hold_for_configuration()?;
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let window = Arc::new(Mutex::new(FrameWindow::new(Gate::Closed)));
+        let sink = FrameSink { frames: sender, window: window.clone() };
+        match self.platform.switch_display(target, quality, sink).await? {
+            DisplaySwitch::Applied(state) => {
+                self.window = window;
+                self.frames = Some(receiver);
+                self.unacknowledged.clear();
+                self.state = Some(state);
+                self.cursor.previous = None;
+                events(HostEvent::Streaming(state));
+                Ok(None)
+            }
+            DisplaySwitch::Retained(reason) => Ok(Some(reason.graphemes(true).take(512).collect())),
+        }
     }
 
     fn send_current_cursor(&mut self) -> Result<()> {
@@ -545,6 +683,20 @@ impl<P: HostPlatform> HostSession<'_, P> {
             }
             MessageKind::MediaControl => self.receive_control(MediaControl::read(&message)?).await?,
             MessageKind::CursorControl => self.configure_cursor(CursorControl::read(&message)?).await?,
+            MessageKind::DisplayControl if self.displays.is_some() => match DisplayControl::read(&message)? {
+                DisplayControl::Subscribe => {
+                    self.display_subscribed = true;
+                    let layout = self.displays.as_ref().unwrap();
+                    self.peer.send(
+                        &DisplayControl::State { displays: layout.displays.clone(), selected: layout.selected_display_id, video_state: None }.message()?,
+                    )?;
+                }
+                DisplayControl::Select { id, display_id } => {
+                    self.display_subscribed = true;
+                    self.change_display(DisplayChange::Remote(id, display_id), events).await?;
+                }
+                _ => return Err(DeskError::invalid("显示器控制消息方向无效")),
+            },
             MessageKind::MediaFeedback => {
                 let feedback = MediaFeedback::decode(&message.payload)?;
                 let update = self.media.feedback(&feedback);
@@ -617,6 +769,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
     }
 
     async fn apply_settings(&mut self, request: StreamSettingsRequest, events: &impl Fn(HostEvent)) -> Result<()> {
+        if self.state.is_some() {
+            self.change_display(DisplayChange::Refresh, events).await?;
+        }
         let reply = |state: VideoStreamState, error: Option<String>| StreamSettingsResult {
             id: request.id,
             state,

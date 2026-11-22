@@ -3,8 +3,10 @@
 use super::app::{HostNotice, computer_name, network_runtime, serve_host, start_logging};
 use super::canvas::{self, WM_CANVAS_CLOSED, WM_CANVAS_CONNECTED};
 use super::clipboard;
+use super::displays;
 use super::settings::{Connection, QUALITY_LIMITS, Settings, VIEWER_QUALITIES, protect, unprotect};
-use super::util::{from_wide, wide};
+use super::util::{display_label, from_wide, wide};
+use quietdesk_core::display::RemoteDisplayInfo;
 use quietdesk_core::host::{HostCommand, HostEvent, HostOptions};
 use quietdesk_core::keymap::{MacModifierMapping, PcModifierMapping};
 use quietdesk_core::pairing::PairingKey;
@@ -39,10 +41,13 @@ const ALLOW_CONTROL: usize = 1107;
 const ALLOW_CLIPBOARD: usize = 1108;
 const QUALITY_LIMIT: usize = 1109;
 const MAC_MODIFIERS: usize = 1110;
+const SHARED_DISPLAY: usize = 1111;
 
 struct Main {
     window: HWND,
     settings: Settings,
+    displays: Vec<RemoteDisplayInfo>,
+    active_display: Option<u32>,
     auto_reconnect: watch::Sender<bool>,
     runtime: tokio::runtime::Handle,
     /// Present while this PC is shared; closing it stops the listener and ends the session.
@@ -78,6 +83,35 @@ impl Main {
     fn save(&self) {
         if let Err(error) = self.settings.save() {
             self.alert(&error.to_string());
+        }
+    }
+
+    fn show_displays(&mut self, displays: Vec<RemoteDisplayInfo>, selected: Option<u32>) {
+        self.displays = displays;
+        self.active_display = selected;
+        self.message(SHARED_DISPLAY, CB_RESETCONTENT, 0, 0);
+        if self.displays.is_empty() {
+            return;
+        }
+        self.message(SHARED_DISPLAY, CB_ADDSTRING, 0, wide("跟随主显示器").as_ptr() as isize);
+        let mut choice = selected.or(self.settings.shared_display);
+        if self.settings.shared_display.is_none() && selected.is_some_and(|id| self.displays.iter().any(|d| d.id == id && d.is_main)) {
+            choice = None;
+        }
+        for display in &self.displays {
+            self.message(SHARED_DISPLAY, CB_ADDSTRING, 0, wide(&display_label(display)).as_ptr() as isize);
+        }
+        let index = self.displays.iter().position(|display| Some(display.id) == choice).map_or(0, |index| index + 1);
+        self.message(SHARED_DISPLAY, CB_SETCURSEL, index, 0);
+    }
+
+    fn refresh_displays(&mut self) {
+        match displays::available(self.active_display.or(self.settings.shared_display)) {
+            Ok(displays) => self.show_displays(displays, self.active_display),
+            Err(error) => {
+                self.show_displays(Vec::new(), None);
+                self.set_text(HOST_STATUS, &format!("无法读取显示器：{error}"));
+            }
         }
     }
 
@@ -143,6 +177,8 @@ impl Main {
 
     fn toggle_sharing(&mut self) {
         if self.sharing.take().is_some() {
+            self.active_display = None;
+            self.refresh_displays();
             self.set_text(SHARE, "开始共享");
             self.set_text(HOST_STATUS, "未共享");
             return;
@@ -158,8 +194,10 @@ impl Main {
             preferred: self.settings.quality_limit(),
             limit: self.settings.quality_limit(),
             modifiers: self.settings.mac_modifiers,
+            preferred_display: self.settings.shared_display,
         };
         let (commands, queue) = unbounded_channel();
+        self.notices = Arc::default();
         let (notices, window) = (self.notices.clone(), self.window.0 as isize);
         let notify = move |notice: HostNotice| {
             notices.lock().unwrap().push_back(notice);
@@ -183,12 +221,28 @@ impl Main {
                 self.set_text(HOST_STATUS, &format!("共享未开启：{reason}"));
             }
             HostNotice::Connected => self.set_text(HOST_STATUS, "控制端已连接，正在准备画面…"),
+            HostNotice::DisplayError(reason) => self.set_text(HOST_STATUS, &format!("无法读取显示器：{reason}")),
             HostNotice::Session(HostEvent::Streaming(stream)) => {
                 self.set_text(HOST_STATUS, &format!("正在共享 · {} × {} · {}", stream.width, stream.height, stream.settings.summary()));
             }
+            HostNotice::Session(HostEvent::Displays { displays, selected, error }) => {
+                self.show_displays(displays, Some(selected));
+                if let Some(error) = error {
+                    self.set_text(HOST_STATUS, &format!("显示器切换失败：{error}"));
+                }
+            }
+            HostNotice::Session(HostEvent::LocalDisplaySelected(preference)) => {
+                self.settings.shared_display = preference;
+                self.save();
+                self.refresh_displays();
+            }
             HostNotice::Session(HostEvent::Paused(true)) => self.set_text(HOST_STATUS, "控制端已暂停画面，连接保持"),
             HostNotice::Session(_) => {}
-            HostNotice::Ended(reason) => self.set_text(HOST_STATUS, &format!("等待重新连接 · {reason}")),
+            HostNotice::Ended(reason) => {
+                self.active_display = None;
+                self.refresh_displays();
+                self.set_text(HOST_STATUS, &format!("等待重新连接 · {reason}"));
+            }
         }
     }
 
@@ -197,6 +251,24 @@ impl Main {
         let chosen = |main: &Self, id: usize| main.message(id, CB_GETCURSEL, 0, 0).max(0) as usize;
         match (id, notification) {
             (CONNECT, BN_CLICKED) => self.connect(),
+            (SHARED_DISPLAY, CBN_SELCHANGE) => {
+                let choice = self.message(id, CB_GETCURSEL, 0, 0);
+                let selected = match choice {
+                    0 => None,
+                    index if index > 0 => {
+                        let Some(display) = self.displays.get(index as usize - 1) else { return };
+                        Some(display.id)
+                    }
+                    _ => return,
+                };
+                if let Some(sharing) = &self.sharing {
+                    let _ = sharing.send(HostCommand::SelectDisplay(selected));
+                    self.refresh_displays();
+                } else {
+                    self.settings.shared_display = selected;
+                    self.save();
+                }
+            }
             (AUTO_RECONNECT, BN_CLICKED) => {
                 let enabled = checked(self, id);
                 self.settings.auto_reconnect = enabled;
@@ -328,8 +400,10 @@ impl Main {
             add(edit, "", field | ES_READONLY as u32, true, 70, 344, 468, 24, HOST_CODE)?;
             add(button, "复制", push, false, 70, 374, 80, 26, COPY_CODE)?;
             add(button, "重新生成", push, false, 158, 374, 90, 26, NEW_CODE)?;
-            add(button, "允许控制端操作键盘和鼠标", check, false, 24, 410, 400, 22, ALLOW_CONTROL)?;
-            add(button, "允许控制端读写剪贴板文字", check, false, 24, 434, 400, 22, ALLOW_CLIPBOARD)?;
+            add(button, "允许控制端操作键盘和鼠标", check, false, 24, 408, 236, 22, ALLOW_CONTROL)?;
+            add(button, "允许控制端读写剪贴板文字", check, false, 264, 408, 274, 22, ALLOW_CLIPBOARD)?;
+            add(label, "共享屏幕", 0, false, 24, 438, 64, 20, 0)?;
+            add(combo, "", drop, false, 92, 434, 446, 240, SHARED_DISPLAY)?;
             add(label, "画质上限", 0, false, 24, 468, 64, 20, 0)?;
             add(combo, "", drop, false, 92, 464, 250, 240, QUALITY_LIMIT)?;
             add(label, "Mac 键盘", 0, false, 24, 500, 64, 20, 0)?;
@@ -354,6 +428,7 @@ impl Main {
                 usize::from(self.settings.mac_modifiers != MacModifierMapping::CommandAsControl),
             );
             self.message(ALLOW_CONTROL, BM_SETCHECK, usize::from(self.settings.allow_control), 0);
+            self.refresh_displays();
             self.message(AUTO_RECONNECT, BM_SETCHECK, usize::from(self.settings.auto_reconnect), 0);
             self.message(ALLOW_CLIPBOARD, BM_SETCHECK, usize::from(self.settings.clipboard), 0);
             if let Some(code) = self.settings.host_code.as_deref().and_then(unprotect) {
@@ -377,8 +452,15 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
         match message {
             WM_COMMAND => main.command(wparam.0 & 0xFFFF, ((wparam.0 >> 16) & 0xFFFF) as u32),
             WM_HOST_NOTICE => {
-                while let Some(notice) = { main.notices.lock().unwrap().pop_front() } {
+                let notices = std::mem::take(&mut *main.notices.lock().unwrap());
+                for notice in notices {
                     main.host_notice(notice);
+                }
+            }
+            WM_DISPLAYCHANGE => {
+                main.refresh_displays();
+                if let Some(sharing) = &main.sharing {
+                    let _ = sharing.send(HostCommand::RefreshDisplays);
                 }
             }
             WM_CANVAS_CONNECTED => {
@@ -454,6 +536,8 @@ unsafe fn run_window() -> windows::core::Result<()> {
             window,
             auto_reconnect: watch::Sender::new(settings.auto_reconnect),
             settings,
+            displays: Vec::new(),
+            active_display: None,
             runtime: network_runtime(),
             sharing: None,
             notices: Arc::new(Mutex::new(VecDeque::new())),

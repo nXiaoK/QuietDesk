@@ -1,11 +1,12 @@
 //! The viewer's window: draws the host's picture and sends this PC's keyboard and mouse to it.
 
-use super::app::{Frame, ViewerSink, run_viewer};
+use super::app::{DisplayGeometry, Frame, ViewerSink, run_viewer};
 use super::clipboard;
 use super::settings::{Settings, VIEWER_QUALITIES};
-use super::util::wide;
+use super::util::{display_label, wide};
 use super::viewer_cursor::ViewerCursor;
 use quietdesk_core::cursor::CursorPresentationState;
+use quietdesk_core::display::RemoteDisplayInfo;
 use quietdesk_core::input::{DoubleClick, PcKeyEvent, ViewerInputTranslator};
 use quietdesk_core::media::MediaStreamId;
 use quietdesk_core::pairing::PairingKey;
@@ -52,6 +53,7 @@ const MENU_DISCONNECT: usize = 103;
 const RETRY_NOW: usize = 104;
 const CANCEL_RETRY: usize = 105;
 const MENU_QUALITY: usize = 200;
+const MENU_DISPLAY: usize = 300;
 
 /// What the session threads leave for the window thread.
 enum Notice {
@@ -115,6 +117,9 @@ struct Canvas {
     target: Option<ID2D1HwndRenderTarget>,
     bitmap: Option<(ID2D1Bitmap, usize, usize)>,
     uploaded_serial: Option<u64>,
+    uploaded_display: Option<DisplayGeometry>,
+    presented_display: Option<DisplayGeometry>,
+    displays: DisplayMenu,
     drawn_stream: Option<MediaStreamId>,
     latest_cursor: Arc<CursorPresentationState>,
     shown_cursor: Option<Arc<CursorPresentationState>>,
@@ -187,6 +192,7 @@ pub fn open(
             AppendMenuW(qualities, MF_STRING, MENU_QUALITY + index, PCWSTR(wide(label).as_ptr()))?;
         }
         AppendMenuW(menu, MF_POPUP, qualities.0 as usize, w!("画质"))?;
+        let displays = DisplayMenu::new(menu)?;
         let title = wide(&format!("QuietDesk · 正在连接 {address}…"));
         let window = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -232,6 +238,9 @@ pub fn open(
             target: None,
             bitmap: None,
             uploaded_serial: None,
+            uploaded_display: None,
+            presented_display: None,
+            displays,
             drawn_stream: None,
             latest_cursor: Arc::default(),
             shown_cursor: None,
@@ -305,6 +314,53 @@ impl Attention {
         } else {
             let since = self.away_since.get_or_insert(now);
             self.idle |= minimized || now.duration_since(*since) >= IDLE_TIMEOUT;
+        }
+    }
+}
+
+struct DisplayMenu {
+    parent: HMENU,
+    popup: HMENU,
+    position: u32,
+    ids: Vec<u32>,
+    selected: Option<DisplayGeometry>,
+    pending: bool,
+}
+
+impl DisplayMenu {
+    fn shows(&self, display: Option<DisplayGeometry>) -> bool {
+        // The first topology can arrive after an older host already sent its opening picture.
+        !self.pending && (display == self.selected || (display.is_none() && self.selected.is_some_and(|selected| selected.revision == 0)))
+    }
+
+    unsafe fn new(parent: HMENU) -> windows::core::Result<Self> {
+        unsafe {
+            let position = GetMenuItemCount(Some(parent)) as u32;
+            let popup = CreatePopupMenu()?;
+            AppendMenuW(parent, MF_POPUP | MF_GRAYED, popup.0 as usize, w!("显示器"))?;
+            Ok(Self { parent, popup, position, ids: Vec::new(), selected: None, pending: false })
+        }
+    }
+
+    unsafe fn update(&mut self, window: HWND, displays: &[RemoteDisplayInfo], selected: Option<DisplayGeometry>, pending: bool) -> windows::core::Result<()> {
+        self.selected = selected;
+        self.pending = pending;
+        self.ids.clear();
+        unsafe {
+            let _ = EnableMenuItem(self.parent, self.position, MF_BYPOSITION | MF_GRAYED);
+            for index in (0..GetMenuItemCount(Some(self.popup))).rev() {
+                DeleteMenu(self.popup, index as u32, MF_BYPOSITION)?;
+            }
+            for display in displays {
+                let flags = if Some(display.id) == selected.map(|s| s.id) { MF_STRING | MF_CHECKED } else { MF_STRING };
+                let label = wide(&display_label(display).replace('&', "&&"));
+                AppendMenuW(self.popup, flags, MENU_DISPLAY + self.ids.len(), PCWSTR(label.as_ptr()))?;
+                self.ids.push(display.id);
+            }
+            if !self.ids.is_empty() && !pending {
+                let _ = EnableMenuItem(self.parent, self.position, MF_BYPOSITION | MF_ENABLED);
+            }
+            DrawMenuBar(window)
         }
     }
 }
@@ -416,6 +472,7 @@ impl Canvas {
             && !self.paused
             && self.pending_pause.is_none()
             && self.fresh_after.is_none()
+            && self.displays.shows(self.presented_display)
     }
 
     fn independent(&self) -> bool {
@@ -513,6 +570,7 @@ impl Canvas {
                     };
                     if copied {
                         self.uploaded_serial = Some(frame.serial);
+                        self.uploaded_display = frame.display;
                         self.drawn_stream = frame.stream;
                     }
                 }
@@ -528,7 +586,7 @@ impl Canvas {
                 false
             };
             let fresh = painted && self.fresh_after.zip(self.uploaded_serial).is_some_and(|(old, serial)| serial > old);
-            if !self.connected || (self.fresh_after.is_some() && !fresh) {
+            if !self.connected || !self.displays.shows(self.uploaded_display) || (self.fresh_after.is_some() && !fresh) {
                 self.shown_cursor = None;
             } else if self.latest_cursor.committed_stream() == self.drawn_stream {
                 self.shown_cursor = Some(self.latest_cursor.clone());
@@ -548,9 +606,15 @@ impl Canvas {
             if target.EndDraw(None, None).is_err() {
                 self.target = None;
                 self.bitmap = None;
-            } else if self.connected && fresh {
-                self.fresh_after = None;
-                self.update_pointer();
+            } else if painted {
+                let changed_display = self.presented_display != self.uploaded_display;
+                self.presented_display = self.uploaded_display;
+                if self.connected && fresh {
+                    self.fresh_after = None;
+                }
+                if changed_display || fresh {
+                    self.update_pointer();
+                }
             }
         }
     }
@@ -673,6 +737,7 @@ impl Canvas {
     unsafe fn retry_event(&mut self, status: RetryStatus, serial: u64) {
         unsafe {
             self.connected = false;
+            let _ = self.displays.update(self.window, &[], None, false);
             self.can_control = false;
             self.release();
             self.paused = false;
@@ -760,6 +825,23 @@ impl Canvas {
             ViewerEvent::Stream { stream, error } => match error {
                 Some(error) => self.set_title(&format!("画质调整失败：{error}")),
                 None => self.set_title(&format!("{} × {} · {}", stream.width, stream.height, stream.settings.summary())),
+            },
+            ViewerEvent::Displays { displays, selected, pending, error, revision } => unsafe {
+                let next = DisplayGeometry::selected(&displays, selected, revision);
+                if self.displays.selected != next || pending.is_some() {
+                    self.release();
+                }
+                if let Err(cause) = self.displays.update(self.window, &displays, next, pending.is_some()) {
+                    log::warn!("could not update the display menu: {cause}");
+                }
+                if let Some(error) = error {
+                    self.set_title(&format!("显示器切换失败：{error}"));
+                } else if pending.is_some() {
+                    self.set_title("正在切换显示器…");
+                } else if let Some(display) = displays.iter().find(|display| Some(display.id) == selected) {
+                    self.set_title(&format!("正在查看 {}", display_label(display)));
+                }
+                self.draw();
             },
             ViewerEvent::Control(can_control) => {
                 self.can_control = can_control;
@@ -1003,6 +1085,15 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                     let _ = canvas.commands.send(ViewerControl::RetryNow);
                 }
                 CANCEL_RETRY | MENU_DISCONNECT => canvas.disconnect(),
+                id if id >= MENU_DISPLAY && canvas.connected && canvas.current_generation() && !canvas.closing && !canvas.displays.pending => {
+                    if let Some(&target) = canvas.displays.ids.get(id - MENU_DISPLAY)
+                        && Some(target) != canvas.displays.selected.map(|display| display.id)
+                    {
+                        canvas.release();
+                        canvas.displays.pending = true;
+                        canvas.send(ViewerCommand::SelectDisplay(target));
+                    }
+                }
                 id if canvas.connected && !canvas.closing && (MENU_QUALITY..MENU_QUALITY + VIEWER_QUALITIES.len()).contains(&id) => {
                     canvas.send(ViewerCommand::Quality(VIEWER_QUALITIES[id - MENU_QUALITY].1))
                 }
@@ -1019,6 +1110,9 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
             WM_NCDESTROY => {
                 canvas.disconnect();
                 canvas.release();
+                if let Some((_, _, menu)) = canvas.full_screen.take() {
+                    let _ = DestroyMenu(menu);
+                }
                 SetWindowLongPtrW(window, GWLP_USERDATA, 0);
                 SendMessageW(canvas.owner, WM_CANVAS_CLOSED, Some(WPARAM(window.0 as usize)), None);
                 drop(Box::from_raw(std::ptr::from_mut(canvas)));

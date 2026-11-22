@@ -2,9 +2,11 @@
 
 use super::capture::ScreenCapture;
 use super::codec::{H264Encoder, MediaFoundation};
+use super::displays::{self, Display};
 use super::host_cursor::CursorSampler;
 use super::util::Com;
 use super::{clipboard, inject};
+use quietdesk_core::display::{DisplaySwitch, HostDisplays};
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::host::{FrameSink, HostCursorSample, HostPlatform};
 use quietdesk_core::input::InjectOp;
@@ -18,6 +20,8 @@ use windows::Win32::Foundation::RECT;
 
 enum Command {
     Size(Sender<Result<(u32, u32)>>),
+    Displays(Sender<Result<HostDisplays>>),
+    SwitchDisplay(u32, StreamSettings, FrameSink, oneshot::Sender<Result<DisplaySwitch>>),
     Configure(StreamSettings, FrameSink, oneshot::Sender<Result<VideoStreamState>>),
     Pause(bool, oneshot::Sender<Result<()>>),
     KeyFrame(oneshot::Sender<Result<()>>),
@@ -76,24 +80,31 @@ fn open_stream(source: (usize, usize), settings: StreamSettings, sink: FrameSink
     Err(failure.unwrap_or_else(|| DeskError::platform("没有可用的 H.264 编码尺寸")))
 }
 
-fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
+fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, preferred: Option<u32>, capture_lost: impl Fn() -> bool) {
     let _com = Com::enter();
     let media = MediaFoundation::start();
     let mut capture: Option<ScreenCapture> = None;
     let mut stream: Option<Stream> = None;
     let mut sampler: Option<CursorSampler> = None;
     let mut paused = false;
-    let open = |capture: &mut Option<ScreenCapture>, independent| -> Result<(usize, usize)> {
+    let mut selected = None;
+    let open = |capture: &mut Option<ScreenCapture>, selected: &mut Option<u32>, independent| -> Result<(usize, usize)> {
         if capture.is_none() {
-            let opened = ScreenCapture::for_cursor_mode(independent)?;
-            *bounds.lock().unwrap() = opened.bounds;
+            let outputs = displays::outputs()?;
+            let target = displays::preferred(&outputs, selected.or(preferred));
+            if selected.is_some_and(|id| id != target.info.id) {
+                return Err(DeskError::platform("原共享显示器已断开，正在重新选择"));
+            }
+            let opened = ScreenCapture::for_cursor_mode(target, independent)?;
+            *selected = Some(target.info.id);
+            *input_display.lock().unwrap() = Some(opened.display.clone());
             *capture = Some(opened);
         }
         let capture = capture.as_ref().expect("capture was opened above");
         Ok((capture.width(), capture.height()))
     };
     loop {
-        let active = stream.as_ref().filter(|_| !paused);
+        let active = stream.as_ref().filter(|_| !paused && capture.is_some());
         let now = Instant::now();
         let video_wait = active.map(|active| if active.sink.has_credit() { active.due.saturating_duration_since(now) } else { Duration::from_millis(2) });
         let cursor_wait = sampler.as_ref().filter(|_| !paused && capture.is_some()).map(|cursor| cursor.next_poll.saturating_duration_since(now));
@@ -103,17 +114,67 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
         };
         match command {
             Ok(Command::Size(reply)) => {
-                let _ = reply.send(open(&mut capture, sampler.is_some()).map(|(width, height)| (width as u32, height as u32)));
+                let _ = reply.send(open(&mut capture, &mut selected, sampler.is_some()).map(|(width, height)| (width as u32, height as u32)));
+            }
+            Ok(Command::Displays(reply)) => {
+                let snapshot = displays::outputs().map(|outputs| {
+                    let target = displays::preferred(&outputs, selected.or(preferred));
+                    let selected_display_id = target.info.id;
+                    let needs_restart = match &capture {
+                        Some(current) => !current.display.same_surface(target),
+                        None => stream.is_some(),
+                    };
+                    HostDisplays { selected_display_id, needs_restart, displays: displays::directory(outputs, Some(selected_display_id)) }
+                });
+                let _ = reply.send(snapshot);
+            }
+            Ok(Command::SwitchDisplay(id, settings, sink, reply)) => {
+                let result = (|| {
+                    let outputs = displays::outputs()?;
+                    let opened: Result<_> = (|| {
+                        let display = outputs.iter().find(|d| d.info.id == id).ok_or_else(|| DeskError::platform("所选显示器已断开"))?;
+                        let replacement = if capture.as_ref().is_some_and(|s| s.display.same_surface(display)) {
+                            None
+                        } else {
+                            Some(ScreenCapture::for_cursor_mode(display, sampler.is_some())?.ready()?)
+                        };
+                        let area = display.bounds;
+                        let new_stream = open_stream(((area.right - area.left) as usize, (area.bottom - area.top) as usize), settings, sink)?;
+                        if !display.still_at_bounds() {
+                            return Err(DeskError::platform("准备采集期间显示器布局已改变"));
+                        }
+                        Ok((replacement, new_stream, display.clone()))
+                    })();
+                    match opened {
+                        Ok((replacement, (new_stream, state), display)) => {
+                            if let Some(replacement) = replacement {
+                                capture = Some(replacement);
+                            }
+                            selected = Some(id);
+                            stream = Some(new_stream);
+                            let area = display.bounds;
+                            *input_display.lock().unwrap() = Some(display);
+                            if let Some(sampler) = &mut sampler {
+                                sampler.display_changed(area, paused);
+                            }
+                            Ok(DisplaySwitch::Applied(state))
+                        }
+                        Err(error) if capture.as_ref().is_some_and(|s| s.display.still_at_bounds() && outputs.iter().any(|d| d.same_surface(&s.display))) => {
+                            Ok(DisplaySwitch::Retained(error.to_string()))
+                        }
+                        Err(error) => Err(error),
+                    }
+                })();
+                let _ = reply.send(result);
             }
             Ok(Command::Configure(settings, sink, reply)) => {
                 stream = None;
                 let opened = match &media {
-                    Ok(_) => open(&mut capture, sampler.is_some()).and_then(|source| open_stream(source, settings, sink)),
+                    Ok(_) => open(&mut capture, &mut selected, sampler.is_some()).and_then(|source| open_stream(source, settings, sink)),
                     Err(error) => Err(DeskError::platform(error.to_string())),
                 };
                 let _ = reply.send(opened.map(|(opened, state)| {
                     stream = Some(opened);
-                    paused = false;
                     state
                 }));
             }
@@ -139,7 +200,7 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
                 let result = (|| {
                     let independent = output.is_some();
                     let screen = capture.as_mut().ok_or_else(stopped)?;
-                    let next_sampler = output.map(|tx| CursorSampler::new(tx, screen.bounds, paused)).transpose()?;
+                    let next_sampler = output.map(|tx| CursorSampler::new(tx, screen.display.bounds, paused)).transpose()?;
                     if independent != sampler.is_some() {
                         screen.set_cursor_mode(independent)?;
                         if let Some(stream) = &mut stream {
@@ -155,7 +216,7 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
             Err(RecvTimeoutError::Timeout) => {}
         }
         if !paused && let (Some(sampler), Some(screen)) = (&mut sampler, &capture) {
-            sampler.poll(screen.bounds);
+            sampler.poll(screen.display.bounds);
         }
         let (Some(active), Some(screen), false) = (&mut stream, &mut capture, paused) else { continue };
         if !active.sink.has_credit() || Instant::now() < active.due {
@@ -167,20 +228,11 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
             Err(error) => {
                 // The desktop was switched (lock screen, elevation prompt) or the display mode changed.
                 log::warn!("screen capture was interrupted: {error}");
-                let size = (screen.width(), screen.height());
                 capture = None;
-                std::thread::sleep(Duration::from_millis(300));
-                match open(&mut capture, sampler.is_some()) {
-                    Ok(reopened) if reopened == size => active.restart_from_key_frame(),
-                    Ok(_) => {
-                        // The session announced another size; ending it lets the viewer connect again.
-                        log::warn!("the shared display changed its size, ending the stream");
-                        stream = None;
-                    }
-                    Err(error) => {
-                        log::warn!("screen capture could not be reopened, ending the stream: {error}");
-                        stream = None;
-                    }
+                *input_display.lock().unwrap() = None;
+                // Keep the sink alive while the session reconciles the current display topology.
+                if !capture_lost() {
+                    stream = None;
                 }
                 continue;
             }
@@ -246,16 +298,20 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
 /// What a host session needs from this PC. Dropping it ends the capture thread.
 pub struct WindowsHost {
     commands: Sender<Command>,
-    bounds: Arc<Mutex<RECT>>,
+    input_display: Arc<Mutex<Option<Display>>>,
 }
 
 impl WindowsHost {
-    pub fn start() -> Self {
+    pub fn start(preferred: Option<u32>) -> Self {
+        Self::start_notifying(preferred, || false)
+    }
+
+    pub(super) fn start_notifying(preferred: Option<u32>, capture_lost: impl Fn() -> bool + Send + 'static) -> Self {
         let (commands, queue) = channel();
-        let bounds = Arc::new(Mutex::new(RECT::default()));
-        let shared = bounds.clone();
-        std::thread::Builder::new().name("capture".to_string()).spawn(move || run(queue, shared)).expect("the capture thread starts");
-        Self { commands, bounds }
+        let input_display = Arc::new(Mutex::new(None));
+        let shared = input_display.clone();
+        std::thread::Builder::new().name("capture".to_string()).spawn(move || run(queue, shared, preferred, capture_lost)).expect("the capture thread starts");
+        Self { commands, input_display }
     }
 }
 
@@ -264,6 +320,18 @@ fn stopped() -> DeskError {
 }
 
 impl HostPlatform for WindowsHost {
+    fn displays(&mut self) -> Result<Option<HostDisplays>> {
+        let (reply, answer) = channel();
+        self.commands.send(Command::Displays(reply)).map_err(|_| stopped())?;
+        answer.recv_timeout(Duration::from_secs(10)).map_err(|_| stopped())?.map(Some)
+    }
+
+    async fn switch_display(&mut self, id: u32, settings: StreamSettings, sink: FrameSink) -> Result<DisplaySwitch> {
+        let (reply, answer) = oneshot::channel();
+        self.commands.send(Command::SwitchDisplay(id, settings, sink, reply)).map_err(|_| stopped())?;
+        answer.await.map_err(|_| stopped())?
+    }
+
     fn supports_independent_cursor(&self) -> bool {
         true
     }
@@ -299,7 +367,14 @@ impl HostPlatform for WindowsHost {
     }
 
     fn inject(&mut self, operations: &[InjectOp]) {
-        inject::inject(operations, *self.bounds.lock().unwrap());
+        let area = self.input_display.lock().unwrap().as_ref().filter(|d| d.still_at_bounds()).map(|d| d.bounds);
+        if let Some(area) = area {
+            inject::inject(operations, area);
+        } else {
+            for op in operations.iter().filter(|op| matches!(op, InjectOp::Key { down: false, .. } | InjectOp::Button { down: false, .. })) {
+                inject::inject(std::slice::from_ref(op), RECT::default());
+            }
+        }
     }
 
     fn clipboard_text(&mut self) -> Option<String> {

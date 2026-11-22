@@ -5,6 +5,7 @@
 //! receives where the application would decode and draw. Everything in between is the code that ships.
 
 use quietdesk_core::cursor::CursorImage;
+use quietdesk_core::display::{DisplaySwitch, HostDisplays, RemoteDisplayInfo};
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::host::{self, FrameSink, HostCommand, HostCursorSample, HostEvent, HostOptions, HostPlatform};
 use quietdesk_core::input::{DoubleClick, InjectOp, PcKeyEvent, ViewerInputTranslator};
@@ -75,7 +76,12 @@ struct Replay {
     sink: Option<FrameSink>,
     next: usize,
     paused: bool,
+    display_id: u32,
+    external_attached: bool,
+    reject_next_switch: bool,
 }
+
+const EXTERNAL_SIZE: (u32, u32) = (320, 240);
 
 /// Stands in for capture and encoding: replays recorded encoder output from its first keyframe.
 struct ReplayHost {
@@ -85,11 +91,43 @@ struct ReplayHost {
     refuse_edge: Option<i64>,
     synthetic_cursor: bool,
     cursor_samples: Option<watch::Sender<Option<HostCursorSample>>>,
+    synthetic_displays: bool,
 }
 
 impl HostPlatform for ReplayHost {
     fn display_size(&mut self) -> Result<(u32, u32)> {
-        Ok(self.size)
+        Ok(if self.replay.lock().unwrap().display_id == 2 { EXTERNAL_SIZE } else { self.size })
+    }
+
+    fn displays(&mut self) -> Result<Option<HostDisplays>> {
+        if !self.synthetic_displays {
+            return Ok(None);
+        }
+        let replay = self.replay.lock().unwrap();
+        let mut displays = vec![RemoteDisplayInfo::new(1, "Synthetic primary", self.size.0, self.size.1, true)];
+        if replay.external_attached {
+            displays.push(RemoteDisplayInfo::new(2, "Synthetic external", EXTERNAL_SIZE.0, EXTERNAL_SIZE.1, false));
+        }
+        let needs_restart = replay.display_id == 2 && !replay.external_attached;
+        Ok(Some(HostDisplays { displays, selected_display_id: if needs_restart { 1 } else { replay.display_id }, needs_restart }))
+    }
+
+    async fn switch_display(&mut self, id: u32, settings: StreamSettings, frames: FrameSink) -> Result<DisplaySwitch> {
+        emit(json!({ "event": "switchCapture", "display": id }));
+        let mut replay = self.replay.lock().unwrap();
+        if std::mem::take(&mut replay.reject_next_switch) {
+            return Ok(DisplaySwitch::Retained("Synthetic display is busy".into()));
+        }
+        let size = match id {
+            1 => self.size,
+            2 if replay.external_attached => EXTERNAL_SIZE,
+            _ => return Ok(DisplaySwitch::Retained("Synthetic display is unavailable".into())),
+        };
+        replay.display_id = id;
+        replay.sink = Some(frames);
+        replay.next = 0;
+        let (width, height) = settings.dimensions(size.0, size.1);
+        Ok(DisplaySwitch::Applied(VideoStreamState { settings, width: i64::from(width), height: i64::from(height) }))
     }
 
     async fn configure(&mut self, settings: StreamSettings, frames: FrameSink) -> Result<VideoStreamState> {
@@ -97,9 +135,13 @@ impl HostPlatform for ReplayHost {
         if self.refuse_edge == Some(settings.longest_edge) {
             return Err(DeskError::platform("编码器不支持该尺寸"));
         }
-        let (width, height) = settings.dimensions(self.size.0, self.size.1);
+        let size = self.display_size()?;
+        let (width, height) = settings.dimensions(size.0, size.1);
         let stream = VideoStreamState { settings, width: i64::from(width), height: i64::from(height) };
-        *self.replay.lock().unwrap() = Replay { sink: Some(frames), next: 0, paused: false };
+        let mut replay = self.replay.lock().unwrap();
+        replay.sink = Some(frames);
+        replay.next = 0;
+        replay.paused = false;
         emit(json!({ "event": "configured", "stream": stream_json(stream) }));
         Ok(stream)
     }
@@ -174,13 +216,16 @@ fn read_recording(path: &str) -> Result<Vec<EncodedFrame>> {
 async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
     let required = |name: &str| arguments.get(name).ok_or_else(|| DeskError::invalid(format!("缺少参数 --{name}")));
     let key = PairingKey::parse(required("code")?)?;
-    let frames = Arc::new(read_recording(required("recording")?)?);
+    let frames = read_recording(required("recording")?)?;
+    let external = arguments.get("second-recording").map(|path| read_recording(path)).transpose()?;
+    let synthetic_displays = external.is_some();
     let size: Vec<u32> = required("size")?.split('x').filter_map(|value| value.parse().ok()).collect();
     let [width, height] = size[..] else { return Err(DeskError::invalid("--size 应为 宽x高")) };
     let options = HostOptions {
         name: arguments.get("name").cloned().unwrap_or_else(|| "QuietDesk Probe".to_string()),
         allow_control: true,
         clipboard: true,
+        preferred_display: None,
         preferred: parse_settings(arguments.get("preferred").map_or("1920,30,8", String::as_str))?,
         limit: parse_settings(arguments.get("limit").map_or("2560,60,30", String::as_str))?,
         modifiers: if arguments.contains_key("standard-modifiers") { MacModifierMapping::Standard } else { MacModifierMapping::CommandAsControl },
@@ -191,13 +236,15 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
     let acceptor = tls::Acceptor::new(&key)?;
     let mut lines = input_lines();
 
-    let replay = Arc::new(Mutex::new(Replay { sink: None, next: 0, paused: false }));
+    let replay =
+        Arc::new(Mutex::new(Replay { sink: None, next: 0, paused: false, display_id: 1, external_attached: synthetic_displays, reject_next_switch: false }));
     let producer = replay.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_millis(4)).await;
             let mut replay = producer.lock().unwrap();
             let Some(sink) = replay.sink.clone().filter(|sink| !replay.paused && sink.has_credit()) else { continue };
+            let frames = if replay.display_id == 2 { external.as_ref().expect("the selected display has a recording") } else { &frames };
             if sink.submit(frames[replay.next].clone()) {
                 replay.next = (replay.next + 1) % frames.len();
             }
@@ -223,6 +270,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
             refuse_edge,
             synthetic_cursor: arguments.contains_key("synthetic-cursor"),
             cursor_samples: None,
+            synthetic_displays,
         };
         let report = |event: HostEvent| {
             if let HostEvent::Streaming(stream) = event {
@@ -239,6 +287,14 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
                     let Some(line) = line else { let _ = commands.send(HostCommand::End); break ((&mut session).await, true) };
                     match line["command"].as_str() {
                         Some("allowControl") => { let _ = commands.send(HostCommand::AllowControl(line["value"].as_bool() == Some(true))); }
+                        Some("detachExternal") => {
+                            replay.lock().unwrap().external_attached = false;
+                            let _ = commands.send(HostCommand::RefreshDisplays);
+                        }
+                        Some("rejectNextDisplay") => {
+                            replay.lock().unwrap().reject_next_switch = true;
+                            emit(json!({ "event": "displayFailureArmed" }));
+                        }
                         Some("end") => { let _ = commands.send(HostCommand::End); }
                         Some("quit") => { let _ = commands.send(HostCommand::End); break ((&mut session).await, true) }
                         _ => emit(json!({ "event": "invalidCommand", "command": line })),
@@ -313,6 +369,9 @@ impl ViewerPlatform for ReportingViewer {
                 let position = cursor.position.as_ref().map(|p| json!({ "inside": p.inside_display, "x": p.x, "y": p.y }));
                 json!({ "event": "cursor", "enabled": cursor.enabled, "image": image, "position": position })
             }
+            ViewerEvent::Displays { displays, selected, pending, error, .. } => json!({
+                "event": "displays", "displays": displays, "selected": selected, "pending": pending, "error": error
+            }),
             ViewerEvent::Control(can_control) => json!({ "event": "control", "canControl": can_control }),
             ViewerEvent::Paused { paused, error } => json!({ "event": "paused", "paused": paused, "error": error }),
             ViewerEvent::RoundTrip(milliseconds) => json!({ "event": "roundTrip", "milliseconds": milliseconds }),
@@ -364,6 +423,9 @@ enum Script {
         text: String,
     },
     RequestClipboard,
+    SelectDisplay {
+        id: u32,
+    },
     Pause {
         paused: bool,
     },
@@ -415,6 +477,7 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
                 },
                 Ok(Script::SendClipboard { text }) => ViewerCommand::SendClipboard(text),
                 Ok(Script::RequestClipboard) => ViewerCommand::RequestClipboard,
+                Ok(Script::SelectDisplay { id }) => ViewerCommand::SelectDisplay(id),
                 Ok(Script::Pause { paused }) => ViewerCommand::Pause(paused),
                 Ok(Script::HoldAcknowledgements { hold }) => {
                     feedback.lock().unwrap().hold = hold;

@@ -15,7 +15,7 @@ fn main() {
     use quietdesk_core::pixel::Nv12Converter;
     use quietdesk_core::reliability::RetryStatus;
     use quietdesk_core::viewer::ViewerEvent;
-    use quietdesk_windows::win::app::{Frame, ViewerSink, network_runtime, run_viewer, serve_host};
+    use quietdesk_windows::win::app::{DisplayGeometry, Frame, ViewerSink, network_runtime, run_viewer, serve_host};
     use quietdesk_windows::win::capture::ScreenCapture;
     use quietdesk_windows::win::codec::{H264Decoder, H264Encoder, MediaFoundation};
     use quietdesk_windows::win::util::Com;
@@ -36,6 +36,20 @@ fn main() {
     let _logger = flexi_logger::Logger::try_with_str("info").and_then(|logger| logger.log_to_stderr().start());
     let _com = Com::enter();
     match arguments.first().map(String::as_str) {
+        Some("displays") => {
+            use quietdesk_core::host::HostPlatform;
+            use quietdesk_windows::win::{displays, pipeline::WindowsHost};
+            let outputs = displays::available(None).unwrap_or_else(|error| fail("displays", error));
+            for output in &outputs {
+                let mut host = WindowsHost::start(Some(output.id));
+                let size = host.display_size().unwrap_or_else(|error| fail("selected display capture", error));
+                let actual = host.displays().unwrap_or_else(|error| fail("display topology", error)).unwrap_or_else(|| fail("displays", "no topology"));
+                if actual.needs_restart || actual.selected_display_id != output.id || size != (output.width, output.height) {
+                    fail("displays", "selected capture disagrees with monitor topology");
+                }
+            }
+            println!("PASS selected capture on {} desktop output(s)", outputs.len());
+        }
         Some("capture") => {
             let mut capture = ScreenCapture::open().unwrap_or_else(|error| fail("open capture", error));
             let changed = capture.grab(500).unwrap_or_else(|error| fail("grab", error));
@@ -118,6 +132,7 @@ fn main() {
                 preferred: limit,
                 limit,
                 modifiers: MacModifierMapping::CommandAsControl,
+                preferred_display: None,
             };
             let (_commands, queue) = tokio::sync::mpsc::unbounded_channel::<HostCommand>();
             network_runtime().spawn(serve_host(port, key, Arc::new(Mutex::new(options)), queue, |notice| println!("host {notice:?}")));
@@ -132,6 +147,7 @@ fn main() {
                 showed_candidate: bool,
                 cursor_stream: Option<MediaStreamId>,
                 retries: u32,
+                display: Option<DisplayGeometry>,
             }
             #[derive(Default)]
             struct Report(Mutex<Counts>);
@@ -144,6 +160,9 @@ fn main() {
                 }
 
                 fn event(&self, event: ViewerEvent) {
+                    if let ViewerEvent::Displays { displays, selected, pending: None, error: None, revision } = &event {
+                        self.0.lock().unwrap().display = DisplayGeometry::selected(displays, *selected, *revision);
+                    }
                     if let ViewerEvent::Cursor(cursor) = &event {
                         if cursor.enabled && cursor.position.is_some() {
                             self.0.lock().unwrap().cursor_stream = cursor.committed_stream();
@@ -222,11 +241,17 @@ fn main() {
                 }
                 println!("PASS reconnect after the host became available");
             }
+            if arguments.iter().any(|argument| argument == "--require-display") {
+                if counts.display.is_none() || counts.display != frame.display {
+                    fail("display", "the decoded picture does not match the selected monitor");
+                }
+                println!("PASS picture from the negotiated display");
+            }
             if pictures > 0 && frame.width > 0 { println!("PASS viewer") } else { fail("viewer", "no picture was decoded") }
         }
         _ => {
             println!(
-                "usage: quietdesk-wincheck capture | cursor | codec | host --code C [--port P] [--seconds S] | viewer --code C [--host H] [--port P] [--seconds S] [--require-media] [--require-cursor] [--require-reconnect]"
+                "usage: quietdesk-wincheck capture | displays | cursor | codec | host --code C [--port P] [--seconds S] | viewer --code C [--host H] [--port P] [--seconds S] [--require-media] [--require-cursor] [--require-reconnect] [--require-display]"
             )
         }
     }
@@ -259,8 +284,14 @@ fn cursor_check() -> quietdesk_core::error::Result<()> {
         }
     }
 
-    let mut host = WindowsHost::start();
+    let mut host = WindowsHost::start(None);
     let (w, h) = host.display_size()?;
+    let topology = host.displays()?.ok_or_else(|| DeskError::platform("missing display list"))?;
+    topology.validate()?;
+    let main = topology.displays.iter().find(|d| d.is_main).ok_or_else(|| DeskError::platform("missing primary display"))?;
+    if topology.selected_display_id != main.id || (main.width, main.height) != (w, h) {
+        return Err(DeskError::platform("default capture disagrees with the primary monitor"));
+    }
     let runtime = tokio::runtime::Builder::new_current_thread().build().map_err(|error| DeskError::platform(error.to_string()))?;
     let (updates, mut samples) = tokio::sync::watch::channel(None);
     runtime.block_on(host.configure_cursor(Some(updates)))?;

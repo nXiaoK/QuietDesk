@@ -1,4 +1,5 @@
 use quietdesk_core::DeskError;
+use quietdesk_core::display::RemoteDisplayInfo;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 
 /// A NUL-terminated UTF-16 copy for Win32 calls.
@@ -8,6 +9,12 @@ pub fn wide(text: &str) -> Vec<u16> {
 
 pub fn from_wide(text: &[u16]) -> String {
     String::from_utf16_lossy(&text[..text.iter().position(|unit| *unit == 0).unwrap_or(text.len())])
+}
+
+pub fn display_label(display: &RemoteDisplayInfo) -> String {
+    let name = display.name.replace(char::is_control, " ");
+    let main = if display.is_main { "（主屏）" } else { "" };
+    format!("{name}{main} · {} × {}", display.width, display.height)
 }
 
 /// A system failure with the step that hit it, for the user and the log.

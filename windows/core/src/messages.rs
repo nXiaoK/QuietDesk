@@ -1,6 +1,7 @@
 //! JSON control messages. Field names and optionality follow `Sources/QuietDeskCore`; a field the other
 //! side does not know is ignored there, and a field missing here keeps the older behaviour.
 
+use crate::display::{self, RemoteDisplayInfo};
 use crate::error::{DeskError, Result};
 use crate::wire;
 use serde::{Deserialize, Serialize};
@@ -111,6 +112,12 @@ pub struct Hello {
     pub session_termination_v1: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_stream_negotiation_v1: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_switching_v1: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub displays: Option<Vec<RemoteDisplayInfo>>,
+    #[serde(rename = "selectedDisplayID", skip_serializing_if = "Option::is_none")]
+    pub selected_display_id: Option<u32>,
 }
 
 impl Hello {
@@ -130,6 +137,11 @@ impl Hello {
             if preferred.frames_per_second > 60 {
                 return Err(DeskError::invalid("兼容画质字段的帧率不能超过 60 fps"));
             }
+        }
+        if let Some(displays) = &self.displays {
+            display::validate_list(displays, self.selected_display_id)?;
+        } else if self.selected_display_id == Some(0) {
+            return Err(DeskError::invalid("远端当前共享显示器标识无效"));
         }
         Ok(())
     }
@@ -383,6 +395,9 @@ mod tests {
             independent_cursor_v1: None,
             session_termination_v1: None,
             initial_stream_negotiation_v1: None,
+            display_switching_v1: None,
+            displays: None,
+            selected_display_id: None,
         };
         let json = serde_json::to_string(&hello).unwrap();
         assert_eq!(
@@ -390,7 +405,7 @@ mod tests {
             r#"{"version":1,"name":"PC","width":1920,"height":1080,"settings":{"longestEdge":1920,"framesPerSecond":30,"megabits":8},"canControl":true,"liveSettings":true}"#
         );
         let from_mac = r#"{"version":1,"name":"Mac","width":2,"height":2,"canControl":false,"mediaTransportV1":true,
-            "settings":{"megabits":3,"longestEdge":1920,"framesPerSecond":15},"displays":[{"id":1}],"sessionTerminationV1":true}"#;
+            "settings":{"megabits":3,"longestEdge":1920,"framesPerSecond":15},"displays":[{"id":1,"name":"外接屏","width":1920,"height":1080,"isMain":true}],"sessionTerminationV1":true}"#;
         let parsed: Hello = serde_json::from_str(from_mac).unwrap();
         assert_eq!(parsed.media_transport_v1, Some(true));
         assert_eq!(parsed.session_termination_v1, Some(true));

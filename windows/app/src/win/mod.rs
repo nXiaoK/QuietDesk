@@ -3,6 +3,7 @@ pub mod canvas;
 pub mod capture;
 pub mod clipboard;
 pub mod codec;
+pub mod displays;
 mod host_cursor;
 mod viewer_cursor;
 pub use viewer_cursor::read_back_cursor;

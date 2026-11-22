@@ -1,17 +1,17 @@
 //! The pixels of one display: desktop duplication where the system offers it, GDI otherwise.
 
+use super::displays::{self, Display};
 use super::host_cursor::CursorIcon;
 use super::util::failed;
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::pixel::{PointerKind, PointerShape};
 use std::ffi::c_void;
-use windows::Win32::Foundation::{HMODULE, POINT, RECT};
+use windows::Win32::Foundation::{HMODULE, POINT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_UNSPECIFIED, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::Interface;
 
 /// A pointer image and where its top-left corner is on the display.
@@ -104,8 +104,7 @@ enum Source {
 
 pub struct ScreenCapture {
     source: Source,
-    /// The display's rectangle in virtual-desktop pixels.
-    pub bounds: RECT,
+    pub(super) display: Display,
     /// Top-down BGRA rows of `width * 4` bytes.
     pub frame: Vec<u8>,
     has_frame: bool,
@@ -117,11 +116,11 @@ unsafe impl Send for ScreenCapture {}
 
 impl ScreenCapture {
     pub fn width(&self) -> usize {
-        (self.bounds.right - self.bounds.left) as usize
+        (self.display.bounds.right - self.display.bounds.left) as usize
     }
 
     pub fn height(&self) -> usize {
-        (self.bounds.bottom - self.bounds.top) as usize
+        (self.display.bounds.bottom - self.display.bounds.top) as usize
     }
 
     pub fn has_frame(&self) -> bool {
@@ -130,17 +129,21 @@ impl ScreenCapture {
 
     /// Opens the primary display.
     pub fn open() -> Result<Self> {
-        match Self::open_duplication() {
+        Self::open_display(displays::preferred(&displays::outputs()?, None))
+    }
+
+    fn open_display(display: &Display) -> Result<Self> {
+        match Self::open_duplication(display) {
             Ok(capture) => Ok(capture),
             Err(error) => {
                 log::warn!("desktop duplication is unavailable, capturing with GDI: {error}");
-                Self::open_gdi(false)
+                Self::open_gdi(display, false)
             }
         }
     }
 
-    pub(super) fn for_cursor_mode(independent: bool) -> Result<Self> {
-        let mut screen = Self::open()?;
+    pub(super) fn for_cursor_mode(display: &Display, independent: bool) -> Result<Self> {
+        let mut screen = Self::open_display(display)?;
         if independent {
             if matches!(screen.source, Source::Duplication(_)) {
                 screen.grab_source(100, false)?;
@@ -162,29 +165,40 @@ impl ScreenCapture {
         }
         let keep_duplication = matches!(&self.source, Source::Duplication(source) if !independent || source.position.is_some());
         if keep_duplication {
-            let clean = Self::open_gdi(true)?.first_picture(self.bounds)?;
+            let clean = Self::open_gdi(&self.display, true)?.first_picture()?;
             self.frame = clean.frame;
             self.has_frame = true;
             self.independent = independent;
         } else {
-            let next = if independent { Self::open_gdi(true)? } else { Self::open()? };
-            *self = next.first_picture(self.bounds)?;
+            let next = if independent { Self::open_gdi(&self.display, true)? } else { Self::open_display(&self.display)? };
+            *self = next.first_picture()?;
         }
         Ok(())
     }
 
-    fn first_picture(mut self, bounds: RECT) -> Result<Self> {
-        if self.bounds != bounds {
-            return Err(DeskError::platform("共享显示器尺寸已改变"));
-        }
+    fn first_picture(mut self) -> Result<Self> {
         self.grab_source(250, true)?;
         if !self.has_frame {
-            return Err(DeskError::platform("尚未收到光标模式切换后的桌面画面"));
+            return Err(DeskError::platform("尚未收到所选显示器的桌面画面"));
         }
         Ok(self)
     }
 
-    fn open_duplication() -> Result<Self> {
+    pub(super) fn ready(self) -> Result<Self> {
+        if self.has_frame {
+            return Ok(self);
+        }
+        let fallback = matches!(self.source, Source::Duplication(_)).then(|| (self.display.clone(), self.independent));
+        match self.first_picture() {
+            Err(error) if let Some((display, independent)) = fallback => {
+                log::warn!("desktop duplication did not produce an opening picture, trying GDI: {error}");
+                Self::open_gdi(&display, independent)?.first_picture()
+            }
+            result => result,
+        }
+    }
+
+    fn open_duplication(display: &Display) -> Result<Self> {
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(failed("创建 DXGI 工厂"))?;
             let mut adapter_index = 0;
@@ -195,8 +209,7 @@ impl ScreenCapture {
                     output_index += 1;
                     let description = output.GetDesc().map_err(failed("读取显示器信息"))?;
                     let bounds = description.DesktopCoordinates;
-                    // The primary display is the one at the origin of the virtual desktop.
-                    if !description.AttachedToDesktop.as_bool() || bounds.left != 0 || bounds.top != 0 {
+                    if !description.AttachedToDesktop.as_bool() || description.Monitor != display.monitor() || bounds != display.bounds {
                         continue;
                     }
                     let (mut device, mut context) = (None, None);
@@ -220,6 +233,9 @@ impl ScreenCapture {
                         return Err(DeskError::platform("显示器已旋转，改用 GDI 采集"));
                     }
                     let (width, height) = ((bounds.right - bounds.left) as u32, (bounds.bottom - bounds.top) as u32);
+                    if (mode.ModeDesc.Width, mode.ModeDesc.Height) != (width, height) {
+                        return Err(DeskError::platform("DXGI 桌面帧尺寸与显示器不符"));
+                    }
                     let layout = D3D11_TEXTURE2D_DESC {
                         Width: width,
                         Height: height,
@@ -235,16 +251,17 @@ impl ScreenCapture {
                     device.CreateTexture2D(&layout, None, Some(&mut staging)).map_err(failed("创建回读纹理"))?;
                     let staging = staging.ok_or_else(|| DeskError::platform("没有回读纹理"))?;
                     let source = Source::Duplication(Duplication { context, duplication, staging, shape: None, position: None });
-                    return Ok(Self { source, bounds, frame: vec![0; (width * height * 4) as usize], has_frame: false, independent: false });
+                    return Ok(Self { source, display: display.clone(), frame: vec![0; (width * height * 4) as usize], has_frame: false, independent: false });
                 }
             }
         }
-        Err(DeskError::platform("没有找到主显示器"))
+        Err(DeskError::platform("没有找到所选显示器的 DXGI 输出"))
     }
 
-    fn open_gdi(independent: bool) -> Result<Self> {
+    fn open_gdi(display: &Display, independent: bool) -> Result<Self> {
         unsafe {
-            let (width, height) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+            let bounds = display.bounds;
+            let (width, height) = (bounds.right - bounds.left, bounds.bottom - bounds.top);
             let surface = DibSurface::new(width, height)?;
             let frame = vec![0; surface.bytes];
             let screen = GetDC(None);
@@ -252,7 +269,7 @@ impl ScreenCapture {
                 return Err(DeskError::platform("无法获取桌面设备上下文"));
             }
             let source = Source::Gdi(Gdi { screen, surface });
-            Ok(Self { source, bounds: RECT { left: 0, top: 0, right: width, bottom: height }, frame, has_frame: false, independent })
+            Ok(Self { source, display: display.clone(), frame, has_frame: false, independent })
         }
     }
 
@@ -262,7 +279,7 @@ impl ScreenCapture {
         let changed = self.grab_source(wait_milliseconds, false)?;
         // An adapter can switch from hardware overlay to a pointer baked into its desktop surface.
         if self.independent && matches!(&self.source, Source::Duplication(source) if source.position.is_none()) {
-            *self = Self::open_gdi(true)?.first_picture(self.bounds)?;
+            *self = Self::open_gdi(&self.display, true)?.first_picture()?;
             return Ok(true);
         }
         Ok(changed)
@@ -328,9 +345,14 @@ impl ScreenCapture {
             },
             Source::Gdi(source) => unsafe {
                 std::thread::sleep(std::time::Duration::from_millis(u64::from(wait_milliseconds.min(15))));
-                BitBlt(source.surface.dc, 0, 0, width as i32, height as i32, Some(source.screen), 0, 0, SRCCOPY | CAPTUREBLT).map_err(failed("复制屏幕"))?;
+                let bounds = self.display.bounds;
+                BitBlt(source.surface.dc, 0, 0, width as i32, height as i32, Some(source.screen), bounds.left, bounds.top, SRCCOPY | CAPTUREBLT)
+                    .map_err(failed("复制屏幕"))?;
+                if !self.display.still_at_bounds() {
+                    return Err(DeskError::platform("共享显示器的位置或尺寸已改变"));
+                }
                 if !self.independent {
-                    CursorIcon::draw_embedded(source.surface.dc);
+                    CursorIcon::draw_embedded(source.surface.dc, bounds);
                 }
                 let captured = source.surface.pixels()?;
                 if !first && captured == &self.frame[..] {

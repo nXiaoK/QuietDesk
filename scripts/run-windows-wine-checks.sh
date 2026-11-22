@@ -24,10 +24,11 @@ check=/app/quietdesk-wincheck.exe
 sleep 6
 failed=0
 timeout 60 wine $check capture 2>/dev/null | grep -E "^(PASS|FAIL)" || failed=1
+timeout 45 wine $check displays 2>/dev/null | grep -E "^(PASS|FAIL)" || failed=1
 timeout 30 wine $check cursor 2>/dev/null | grep -E "^(PASS|FAIL)" || failed=1
 timeout 90 wine $check codec --frames 240 2>/dev/null | grep -E "^(codec|PASS|FAIL)" || failed=1
 # Start with a closed port so the packaged viewer must reconnect before it can receive video and a cursor.
-timeout 75 wine $check viewer --port 45990 --seconds 40 --require-media --require-cursor --require-reconnect >/tmp/viewer.log 2>&1 &
+timeout 75 wine $check viewer --port 45990 --seconds 40 --require-media --require-cursor --require-reconnect --require-display >/tmp/viewer.log 2>&1 &
 viewer_pid=$!
 for tick in {1..20}; do
     grep -q "^viewer waiting for retry" /tmp/viewer.log && break

@@ -7,6 +7,7 @@
 
 pub mod cursor;
 pub mod cursor_pixels;
+pub mod display;
 pub mod error;
 pub mod host;
 pub mod input;

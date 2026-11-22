@@ -2,6 +2,7 @@
 //! viewer that receives video over the control connection and uses only what the host advertised.
 
 use crate::cursor::{CursorControl, CursorOperation, CursorPosition, CursorPresentationState, CursorShape};
+use crate::display::{DisplayControl, RemoteDisplayInfo};
 use crate::error::{DeskError, Result};
 use crate::media::{DecodeReceipt, MediaControl, MediaStreamId, ViewerMedia, ViewerMediaEvent};
 use crate::messages::{
@@ -31,6 +32,7 @@ pub enum ViewerCommand {
     /// The window lost the keyboard: the host lets go of every key and button.
     ReleaseInput,
     Quality(StreamSettings),
+    SelectDisplay(u32),
     SendClipboard(String),
     RequestClipboard,
     /// Stops or resumes the picture while keeping the session, when the host supports it.
@@ -56,6 +58,14 @@ pub enum ViewerEvent {
     MediaCommitted(MediaStreamId),
     Cursor(Arc<CursorPresentationState>),
     Control(bool),
+    Displays {
+        displays: Vec<RemoteDisplayInfo>,
+        selected: Option<u32>,
+        pending: Option<u32>,
+        error: Option<String>,
+        /// Local capture geometry that subsequently received pictures belong to.
+        revision: u64,
+    },
     Paused {
         paused: bool,
         error: Option<String>,
@@ -114,6 +124,10 @@ struct ViewerSession<'a, P: ViewerPlatform> {
     pending_cursor: Option<(Uuid, Instant)>,
     stream: Option<VideoStreamState>,
     desired: StreamSettings,
+    displays: Vec<RemoteDisplayInfo>,
+    selected_display: Option<u32>,
+    display_revision: u64,
+    display_request: Option<(Uuid, u32, Instant)>,
     /// The request in flight: its identifier, when it was sent and what it asked for.
     pending_settings: Option<(Uuid, Instant, StreamSettings)>,
     pending_pause: Option<Uuid>,
@@ -153,6 +167,10 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
         pending_cursor: None,
         stream: None,
         desired: quality,
+        displays: Vec::new(),
+        selected_display: None,
+        display_revision: 0,
+        display_request: None,
         pending_settings: None,
         pending_pause: None,
         clipboard_requested: None,
@@ -164,6 +182,7 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
         let settings_by = session.pending_settings.map(|(_, sent, _)| sent + SETTINGS_REPLY_TIMEOUT);
         let media_by = session.media.as_ref().and_then(ViewerMedia::deadline);
         let cursor_by = session.pending_cursor.map(|(_, deadline)| deadline);
+        let display_by = session.display_request.map(|(_, _, deadline)| deadline);
         let outcome = tokio::select! {
             event = incoming.recv() => match event {
                 Some(PeerEvent::Message(message)) => session.receive(message),
@@ -190,6 +209,11 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
             }
             _ = tokio::time::sleep_until(cursor_by.unwrap_or(hello_by)), if cursor_by.is_some() => {
                 Err(DeskError::Network("光标模式切换超时，重新建立会话".into()))
+            }
+            _ = tokio::time::sleep_until(display_by.unwrap_or(hello_by)), if display_by.is_some() => {
+                session.display_request = None;
+                session.display_event(Some("切换显示器超时，请稍后重试".into()));
+                Ok(())
             }
         };
         if let Err(error) = outcome {
@@ -235,6 +259,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 self.platform.video(packet)?;
             }
             MessageKind::MediaControl => self.update_media(|media| media.control(&MediaControl::read(&message)?, Instant::now()))?,
+            MessageKind::DisplayControl if hello.display_switching_v1 == Some(true) => self.receive_displays(DisplayControl::read(&message)?)?,
             MessageKind::MediaFrame => self.update_media(|media| media.frame(&message.payload, Instant::now()))?,
             MessageKind::CursorControl | MessageKind::CursorPosition | MessageKind::CursorShape
                 if hello.independent_cursor_v1 == Some(true) && self.media.is_some() =>
@@ -294,7 +319,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         Ok(())
     }
 
-    fn connected(&mut self, hello: Hello) -> Result<()> {
+    fn connected(&mut self, mut hello: Hello) -> Result<()> {
         hello.validate()?;
         let stream = VideoStreamState { settings: hello.settings, width: hello.width, height: hello.height };
         self.stream = Some(stream);
@@ -313,6 +338,12 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         if hello.control_status_updates == Some(true) {
             self.peer.send(&Message::empty(MessageKind::ControlStatus))?;
         }
+        if hello.display_switching_v1 == Some(true) {
+            self.displays = hello.displays.take().unwrap_or_default();
+            self.selected_display = hello.selected_display_id.or_else(|| self.displays.first().map(|display| display.id));
+            self.display_event(None);
+            self.peer.send(&DisplayControl::Subscribe.message()?)?;
+        }
         if hello.media_transport_v1 == Some(true) {
             self.media = Some(ViewerMedia::default());
             self.peer.send(&ViewerMedia::request().message()?)?;
@@ -324,6 +355,51 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             return self.send_settings(stream.settings);
         }
         self.request_settings()
+    }
+
+    fn display_event(&mut self, error: Option<String>) {
+        self.platform.event(ViewerEvent::Displays {
+            displays: self.displays.clone(),
+            selected: self.selected_display,
+            pending: self.display_request.map(|(_, target, _)| target),
+            error,
+            revision: self.display_revision,
+        });
+    }
+
+    fn receive_displays(&mut self, control: DisplayControl) -> Result<()> {
+        let restarted = matches!(control, DisplayControl::State { video_state: Some(_), .. });
+        let (displays, selected, state, error) = match control {
+            DisplayControl::State { displays, selected, video_state } => (displays, selected, video_state, None),
+            DisplayControl::Result { id, displays, selected, video_state, error } => {
+                if self.display_request.is_none_or(|(pending, _, _)| pending != id) {
+                    return Ok(());
+                }
+                self.display_request = None;
+                (displays, selected, error.is_none().then_some(video_state), error)
+            }
+            _ => return Err(DeskError::invalid("显示器控制消息方向无效")),
+        };
+        if let Some(previous) = self.displays.iter().find(|screen| Some(screen.id) == self.selected_display)
+            && error.is_none()
+            && (restarted
+                || previous.id != selected
+                || state.zip(self.stream).is_some_and(|(next, old)| (next.width, next.height) != (old.width, old.height))
+                || displays.iter().any(|screen| screen.id == selected && (screen.width, screen.height) != (previous.width, previous.height)))
+        {
+            self.display_revision += 1;
+        }
+        if let Some(stream) = state {
+            if stream.settings.frames_per_second > 60 {
+                return Err(DeskError::invalid("显示器画质超出已协商的范围"));
+            }
+            self.stream = Some(stream);
+            self.platform.event(ViewerEvent::Stream { stream, error: None });
+        }
+        self.displays = displays;
+        self.selected_display = Some(selected);
+        self.display_event(error);
+        Ok(())
     }
 
     fn update_media(&mut self, update: impl FnOnce(&mut ViewerMedia) -> Result<Vec<ViewerMediaEvent>>) -> Result<()> {
@@ -444,6 +520,21 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             _ if self.hello.is_none() => Ok(()),
             ViewerCommand::Input(input) => self.peer.send(&Message::json(MessageKind::Input, &input)?),
             ViewerCommand::ReleaseInput => self.peer.send(&Message::empty(MessageKind::ReleaseInput)),
+            ViewerCommand::SelectDisplay(id) => {
+                if self.display_request.is_some() || self.selected_display == Some(id) {
+                    self.display_event(None);
+                    return Ok(());
+                }
+                if !self.displays.iter().any(|display| display.id == id) {
+                    self.display_event(Some("所选显示器当前不可用".into()));
+                    return Ok(());
+                }
+                let request = Uuid::new_v4();
+                self.peer.send(&DisplayControl::Select { id: request, display_id: id }.message()?)?;
+                self.display_request = Some((request, id, Instant::now() + Duration::from_secs(15)));
+                self.display_event(None);
+                Ok(())
+            }
             ViewerCommand::SendClipboard(text) => {
                 if text.len() > wire::MAXIMUM_CLIPBOARD_BYTES {
                     return Err(DeskError::invalid("文字剪贴板最大支持 1 MB"));
@@ -494,6 +585,82 @@ mod tests {
                 PeerEvent::Closed(error) => panic!("session ended before expected message: {error}"),
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_display_timeout_keeps_the_session_and_ignores_the_late_result() {
+        struct Observer(mpsc::UnboundedSender<ViewerEvent>);
+        impl ViewerPlatform for Observer {
+            fn video(&mut self, _: VideoPacket) -> Result<()> {
+                unreachable!()
+            }
+            fn media_video(&mut self, _: VideoPacket, _: MediaStreamId, _: bool) -> Result<()> {
+                unreachable!()
+            }
+            fn event(&mut self, event: ViewerEvent) {
+                self.0.send(event).unwrap();
+            }
+        }
+        let (left, right) = tokio::io::duplex(64 * 1024);
+        let (host, mut from_viewer) = peer::spawn(left, PeerConfig::default());
+        let (viewer, incoming) = peer::spawn(right, PeerConfig::default());
+        let (input, commands) = mpsc::unbounded_channel();
+        let (_decoder, acks) = mpsc::unbounded_channel();
+        let (notices, mut events) = mpsc::unbounded_channel();
+        let mut observer = Observer(notices);
+        let quality = StreamSettings::new(1920, 30, 8);
+        let session = run(viewer, incoming, &mut observer, quality, commands, acks);
+        let exchange = async {
+            let screens = vec![RemoteDisplayInfo::new(1, "主屏", 1280, 720, true), RemoteDisplayInfo::new(2, "副屏", 720, 1280, false)];
+            let hello = serde_json::json!({"version":1,"name":"host","width":1280,"height":720,"settings":quality,
+                "canControl":false,"displaySwitchingV1":true});
+            host.send(&Message::json(MessageKind::Hello, &hello).unwrap()).unwrap();
+            assert_eq!(DisplayControl::read(&next(&mut from_viewer).await).unwrap(), DisplayControl::Subscribe);
+            let updated = DisplayControl::State {
+                displays: screens.clone(),
+                selected: 1,
+                video_state: Some(VideoStreamState { settings: quality, width: 1280, height: 720 }),
+            }
+            .message()
+            .unwrap();
+            host.send(&updated).unwrap();
+            while !matches!(events.recv().await.unwrap(), ViewerEvent::Displays { selected: Some(1), revision: 0, .. }) {}
+            host.send(&updated).unwrap();
+            while !matches!(events.recv().await.unwrap(), ViewerEvent::Displays { selected: Some(1), revision: 1, .. }) {}
+            input.send(ViewerCommand::SelectDisplay(2)).unwrap();
+            let DisplayControl::Select { id, .. } = DisplayControl::read(&next(&mut from_viewer).await).unwrap() else { panic!("expected a display request") };
+            while !matches!(events.recv().await.unwrap(), ViewerEvent::Displays { pending: Some(2), .. }) {}
+            tokio::time::advance(Duration::from_secs(15)).await;
+            while !matches!(events.recv().await.unwrap(), ViewerEvent::Displays { selected: Some(1), pending: None, error: Some(_), .. }) {}
+            host.send(
+                &DisplayControl::Result {
+                    id,
+                    selected: 2,
+                    displays: screens.clone(),
+                    video_state: VideoStreamState { settings: quality, width: 720, height: 1280 },
+                    error: None,
+                }
+                .message()
+                .unwrap(),
+            )
+            .unwrap();
+            host.send(&DisplayControl::State { displays: screens, selected: 1, video_state: None }.message().unwrap()).unwrap();
+            loop {
+                match events.recv().await.unwrap() {
+                    ViewerEvent::Displays { selected: Some(1), revision: 1, .. } => break,
+                    ViewerEvent::RoundTrip(_) => {}
+                    unexpected => panic!("late display result changed the viewer: {unexpected:?}"),
+                }
+            }
+            input.send(ViewerCommand::SelectDisplay(2)).unwrap();
+            let DisplayControl::Select { id: retry, .. } = DisplayControl::read(&next(&mut from_viewer).await).unwrap() else {
+                panic!("expected a second request")
+            };
+            assert_ne!(id, retry);
+            input.send(ViewerCommand::Disconnect).unwrap();
+        };
+        let (end, ()) = tokio::time::timeout(Duration::from_secs(40), async { tokio::join!(session, exchange) }).await.unwrap();
+        assert!(end.local_stop);
     }
 
     #[tokio::test]

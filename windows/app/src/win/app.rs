@@ -30,6 +30,7 @@ pub enum HostNotice {
     Listening(u16),
     /// Sharing could not start or had to stop.
     Failed(String),
+    DisplayError(String),
     Connected,
     Session(HostEvent),
     Ended(String),
@@ -71,13 +72,38 @@ pub async fn serve_host(
     let remember = |options: &Mutex<HostOptions>, command: &HostCommand| match command {
         HostCommand::AllowControl(allowed) => options.lock().unwrap().allow_control = *allowed,
         HostCommand::Clipboard(enabled) => options.lock().unwrap().clipboard = *enabled,
-        HostCommand::End => {}
+        HostCommand::End | HostCommand::SelectDisplay(_) | HostCommand::RefreshDisplays => {}
     };
     loop {
         let stream = tokio::select! {
             accepted = listener.accept() => { if let Ok((tcp, _)) = accepted { handshake(tcp); } continue }
             command = commands.recv() => match command {
-                Some(command) => { remember(&options, &command); continue }
+                Some(command) => {
+                    if matches!(command, HostCommand::SelectDisplay(_) | HostCommand::RefreshDisplays) {
+                        match super::displays::outputs() {
+                            Ok(outputs) => {
+                                let mut preference = options.lock().unwrap().preferred_display;
+                                let mut error = None;
+                                if let HostCommand::SelectDisplay(requested) = command {
+                                    if requested.is_none_or(|id| outputs.iter().any(|d| d.info.id == id)) {
+                                        preference = requested;
+                                        options.lock().unwrap().preferred_display = requested;
+                                        notify(HostNotice::Session(HostEvent::LocalDisplaySelected(requested)));
+                                    } else {
+                                        error = Some("所选显示器当前不可用".into());
+                                    }
+                                }
+                                let selected = super::displays::preferred(&outputs, preference).info.id;
+                                let displays = super::displays::directory(outputs, Some(selected));
+                                notify(HostNotice::Session(HostEvent::Displays { displays, selected, error }));
+                            }
+                            Err(error) => notify(HostNotice::DisplayError(error.to_string())),
+                        }
+                    } else {
+                        remember(&options, &command);
+                    }
+                    continue
+                }
                 None => return,
             },
             Some(stream) = ready.recv() => stream,
@@ -85,11 +111,21 @@ pub async fn serve_host(
         notify(HostNotice::Connected);
         let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
         let (session_commands, queue) = mpsc::unbounded_channel();
-        let mut platform = WindowsHost::start();
         let current = options.lock().unwrap().clone();
+        let rescan = session_commands.clone();
+        let mut platform = WindowsHost::start_notifying(current.preferred_display, move || rescan.send(HostCommand::RefreshDisplays).is_ok());
         let report = notify.clone();
-        let session = host::run(peer.clone(), incoming, &mut platform, current, queue, move |event| report(HostNotice::Session(event)));
+        let saved = options.clone();
+        let session = host::run(peer.clone(), incoming, &mut platform, current, queue, move |event| {
+            if let HostEvent::LocalDisplaySelected(preferred) = &event {
+                saved.lock().unwrap().preferred_display = *preferred;
+            }
+            report(HostNotice::Session(event));
+        });
         tokio::pin!(session);
+        let period = std::time::Duration::from_secs(2);
+        let mut display_check = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        display_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut stopping = false;
         let reason = loop {
             tokio::select! {
@@ -97,6 +133,8 @@ pub async fn serve_host(
                 // This PC is already being controlled: other viewers are turned away.
                 accepted = listener.accept() => drop(accepted),
                 Some(other) = ready.recv() => drop(other),
+                // A headless host has no WM_DISPLAYCHANGE for newly connected, unselected outputs.
+                _ = display_check.tick(), if !stopping => { let _ = session_commands.send(HostCommand::RefreshDisplays); }
                 command = commands.recv(), if !stopping => match command {
                     Some(command) => { remember(&options, &command); let _ = session_commands.send(command); }
                     None => { stopping = true; let _ = session_commands.send(HostCommand::End); }
@@ -115,12 +153,33 @@ pub async fn serve_host(
 #[derive(Default)]
 pub struct Frame {
     pub stream: Option<MediaStreamId>,
+    pub display: Option<DisplayGeometry>,
     pub width: usize,
     pub height: usize,
     /// Rows of `width * 4` bytes, top down.
     pub bgra: Vec<u8>,
     /// Counts pictures, so a reader can tell whether it has drawn this one.
     pub serial: u64,
+}
+
+/// Identifies the displayed coordinate space even when two monitors encode to the same video size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayGeometry {
+    pub id: u32,
+    pub revision: u64,
+    width: u32,
+    height: u32,
+}
+
+impl DisplayGeometry {
+    pub fn selected(displays: &[quietdesk_core::display::RemoteDisplayInfo], selected: Option<u32>, revision: u64) -> Option<Self> {
+        displays.iter().find(|display| Some(display.id) == selected).map(|display| Self {
+            id: display.id,
+            width: display.width,
+            height: display.height,
+            revision,
+        })
+    }
 }
 
 impl Frame {
@@ -143,10 +202,12 @@ pub trait ViewerSink: Send + Sync + 'static {
 struct WindowsViewer<S: ViewerSink> {
     packets: SyncSender<DecodeCommand>,
     sink: Arc<S>,
+    display: Option<DisplayGeometry>,
+    media_display: Option<DisplayGeometry>,
 }
 
 enum DecodeCommand {
-    Packet { packet: VideoPacket, receipt: DecodeReceipt, first: bool },
+    Packet { packet: VideoPacket, receipt: DecodeReceipt, first: bool, display: Option<DisplayGeometry> },
     Commit(MediaStreamId),
 }
 
@@ -162,12 +223,15 @@ impl<S: ViewerSink> WindowsViewer<S> {
 impl<S: ViewerSink> ViewerPlatform for WindowsViewer<S> {
     fn video(&mut self, packet: VideoPacket) -> Result<()> {
         let receipt = DecodeReceipt::Legacy(packet.sequence);
-        self.enqueue(DecodeCommand::Packet { packet, receipt, first: false })
+        self.enqueue(DecodeCommand::Packet { packet, receipt, first: false, display: self.display })
     }
 
     fn media_video(&mut self, packet: VideoPacket, stream: MediaStreamId, first: bool) -> Result<()> {
         let receipt = DecodeReceipt::Media(stream, packet.sequence);
-        self.enqueue(DecodeCommand::Packet { packet, receipt, first })
+        if first {
+            self.media_display = self.display;
+        }
+        self.enqueue(DecodeCommand::Packet { packet, receipt, first, display: self.media_display })
     }
 
     fn media_committed(&mut self, stream: MediaStreamId) -> Result<()> {
@@ -175,6 +239,12 @@ impl<S: ViewerSink> ViewerPlatform for WindowsViewer<S> {
     }
 
     fn event(&mut self, event: ViewerEvent) {
+        if let ViewerEvent::Displays { displays, selected, revision, .. } = &event {
+            self.display = DisplayGeometry::selected(displays, *selected, *revision);
+            if *revision == 0 && self.media_display.is_none() {
+                self.media_display = self.display;
+            }
+        }
         self.sink.event(event);
     }
 }
@@ -189,12 +259,14 @@ fn decode<S: ViewerSink>(
     let _com = Com::enter();
     let _media = MediaFoundation::start()?;
     let mut legacy_decoder = None;
+    let mut legacy_display = None;
     let mut media_decoder = None;
     let mut pending = VecDeque::new();
-    let publish = |picture: Picture<'_>, stream| {
+    let publish = |picture: Picture<'_>, stream, display| {
         {
             let mut visible = frame.lock().unwrap();
             visible.stream = stream;
+            visible.display = display;
             visible.update(picture);
             visible.serial += 1;
         }
@@ -205,8 +277,8 @@ fn decode<S: ViewerSink>(
         if stopped.load(Ordering::Acquire) {
             break;
         }
-        let (packet, receipt, first) = match command {
-            DecodeCommand::Packet { packet, receipt, first } => (packet, receipt, first),
+        let (packet, receipt, first, display) = match command {
+            DecodeCommand::Packet { packet, receipt, first, display } => (packet, receipt, first, display),
             DecodeCommand::Commit(stream) => {
                 let Some((_, mut opening)) = candidate.take_if(|(id, _)| *id == stream) else {
                     return Err(DeskError::platform("媒体流缺少已解码的首帧"));
@@ -225,11 +297,15 @@ fn decode<S: ViewerSink>(
         let annex_b = packet.annex_b()?;
         let stream = match receipt {
             DecodeReceipt::Legacy(_) => {
+                if display != legacy_display {
+                    legacy_decoder = None;
+                    legacy_display = display;
+                }
                 let decoder = match &mut legacy_decoder {
                     Some(decoder) => decoder,
                     None => legacy_decoder.insert(H264Decoder::new()?),
                 };
-                decoder.decode(&annex_b, |picture| publish(picture, None))?;
+                decoder.decode(&annex_b, |picture| publish(picture, None, display))?;
                 if acknowledgements.send(receipt).is_err() {
                     break;
                 }
@@ -254,13 +330,13 @@ fn decode<S: ViewerSink>(
                 let Some(position) = pending.iter().position(|(tag, _)| *tag == time) else { return };
                 let (_, completed) = pending.remove(position).expect("a picture with this sample time is pending");
                 if first {
-                    let mut opening = Frame::default();
+                    let mut opening = Frame { display, ..Frame::default() };
                     opening.update(picture);
                     candidate = Some((stream, opening));
                     // Later outputs for the same IDR copy have no separate receipt or visible frame.
                     pending.clear();
                 } else {
-                    publish(picture, Some(stream));
+                    publish(picture, Some(stream), display);
                 }
                 let _ = acknowledgements.send(completed);
             })?;
@@ -314,7 +390,7 @@ async fn viewer_session<S: ViewerSink>(stream: tls::SecureStream, attempt: Attem
         return ViewerEnd { reason: format!("无法启动解码线程：{error}"), host_ended: false, retryable: false, local_stop: false };
     }
     let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
-    let mut platform = WindowsViewer { packets, sink };
+    let mut platform = WindowsViewer { packets, sink, display: None, media_display: None };
     let mut end = attempt.run(peer.clone(), incoming, &mut platform, acknowledged).await;
     stopped.store(true, Ordering::Release);
     drop(platform);
@@ -364,4 +440,37 @@ pub fn start_logging() {
     }
     std::panic::set_hook(Box::new(|panic| log::error!("unexpected failure: {panic}")));
     log::info!("QuietDesk for Windows {} (build {})", env!("QUIETDESK_VERSION"), env!("QUIETDESK_BUILD_NUMBER"));
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    use quietdesk_core::display::RemoteDisplayInfo;
+    use quietdesk_core::video::EncodedFrame;
+
+    struct Silent;
+    impl ViewerSink for Silent {
+        fn event(&self, _: ViewerEvent) {}
+        fn retry(&self, _: RetryStatus) {}
+        fn frame_ready(&self, _: Option<MediaStreamId>) {}
+    }
+
+    #[test]
+    fn a_late_packet_keeps_the_screen_that_opened_its_stream() {
+        let (packets, queue) = std::sync::mpsc::sync_channel(3);
+        let mut viewer = WindowsViewer { packets, sink: Arc::new(Silent), display: None, media_display: None };
+        let displays = vec![RemoteDisplayInfo::new(8, "左", 1920, 1080, true), RemoteDisplayInfo::new(9, "右", 1920, 1080, false)];
+        let selection = |id, revision| ViewerEvent::Displays { displays: displays.clone(), selected: Some(id), pending: None, error: None, revision };
+        let packet = |sequence| VideoPacket::h264(sequence, EncodedFrame { sps: vec![], pps: vec![], avcc: vec![] });
+        let first = MediaStreamId { session_id: Default::default(), transport_epoch: 1, codec_epoch: 1 };
+        viewer.event(selection(8, 0));
+        viewer.media_video(packet(1), first, true).unwrap();
+        viewer.event(selection(9, 1));
+        viewer.media_video(packet(2), first, false).unwrap();
+        viewer.media_video(packet(3), MediaStreamId { codec_epoch: 2, ..first }, true).unwrap();
+        for expected in [8, 8, 9] {
+            let DecodeCommand::Packet { display, .. } = queue.recv().unwrap() else { panic!("expected a packet") };
+            assert_eq!(display.unwrap().id, expected);
+        }
+    }
 }

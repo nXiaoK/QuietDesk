@@ -1,5 +1,6 @@
 //! Keyboard and mouse input for the shared display, through `SendInput`.
 
+use super::gesture_host::GestureHost;
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::host::InputActionOutcome;
 use quietdesk_core::input::{InjectOp, MouseButton};
@@ -263,8 +264,15 @@ fn mouse(flags: MOUSE_EVENT_FLAGS, data: i32, position: (i32, i32)) -> INPUT {
     }
 }
 
-fn contains(display: RECT, p: POINT) -> bool {
+pub(super) fn contains(display: RECT, p: POINT) -> bool {
     (display.left..display.right).contains(&p.x) && (display.top..display.bottom).contains(&p.y)
+}
+
+pub(super) fn display_point(rect: RECT, x: f64, y: f64) -> POINT {
+    POINT {
+        x: rect.left + (x * f64::from(rect.right - rect.left - 1)).round() as i32,
+        y: rect.top + (y * f64::from(rect.bottom - rect.top - 1)).round() as i32,
+    }
 }
 
 fn normalized_pixel(pixel: i32, min: i32, end: i32, origin: i32, extent: i32) -> Option<i32> {
@@ -405,7 +413,7 @@ fn button_input(button: MouseButton, down: bool) -> INPUT {
 }
 
 /// Injects operations in order. A missing display still permits releasing held input.
-pub(super) fn inject(operations: &[InjectOp], display: Option<RECT>, buttons: &mut MouseButtons) -> bool {
+pub(super) fn inject(operations: &[InjectOp], display: Option<RECT>, buttons: &mut MouseButtons, gestures: &mut GestureHost) -> bool {
     // Revocation can arrive with an empty batch after the peer's previous button-up failed.
     buttons.retry_releases();
     let mut inputs = Vec::with_capacity(operations.len() + 1);
@@ -414,16 +422,18 @@ pub(super) fn inject(operations: &[InjectOp], display: Option<RECT>, buttons: &m
     let mut complete = on_target;
     let rect = display.unwrap_or_default();
     for operation in operations {
-        if display.is_none() && !matches!(operation, InjectOp::Key { down: false, .. } | InjectOp::Button { down: false, .. }) {
+        if display.is_none()
+            && !matches!(
+                operation,
+                InjectOp::Key { down: false, .. } | InjectOp::Button { down: false, .. } | InjectOp::CancelGestures | InjectOp::Gesture { .. }
+            )
+        {
             continue;
         }
         match *operation {
             InjectOp::Key { key: pressed, down } => inputs.push(key(pressed, down)),
             InjectOp::Move { x, y } => {
-                let point = POINT {
-                    x: rect.left + (x * f64::from(rect.right - rect.left - 1)).round() as i32,
-                    y: rect.top + (y * f64::from(rect.bottom - rect.top - 1)).round() as i32,
-                };
+                let point = display_point(rect, x, y);
                 let moved = cursor_clip().and_then(|clip| absolute_move(point, rect, clip));
                 on_target = moved.is_some();
                 complete &= on_target;
@@ -464,6 +474,13 @@ pub(super) fn inject(operations: &[InjectOp], display: Option<RECT>, buttons: &m
                 }
             }
             InjectOp::Wheel { .. } => {}
+            InjectOp::Gesture { gesture, phase, x, y, relative } => {
+                complete &= send(&mut inputs);
+                complete &= gestures.gesture(gesture, phase, x, y, relative, display);
+            }
+            InjectOp::CancelGestures => {
+                complete &= gestures.cancel();
+            }
             InjectOp::CapsLock(wanted) => {
                 // The lock state is read when the events before it have been delivered.
                 complete &= send(&mut inputs);

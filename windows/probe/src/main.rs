@@ -11,7 +11,7 @@ use quietdesk_core::host::{self, FrameSink, HostCommand, HostCursorSample, HostE
 use quietdesk_core::input::{CapsLockPress, DoubleClick, InjectOp, PcKeyEvent, ViewerInputTranslator};
 use quietdesk_core::keymap::{MacModifierMapping, PcModifierMapping};
 use quietdesk_core::media::{DecodeReceipt, MediaStreamId};
-use quietdesk_core::messages::{InputAction, InputFeedback, StreamSettings, VideoStreamState};
+use quietdesk_core::messages::{InputAction, InputFeedback, MomentumPhase, ScrollPhase, StreamSettings, TrackpadGesture, VideoStreamState};
 use quietdesk_core::pairing::PairingKey;
 use quietdesk_core::peer::{self, PeerConfig};
 use quietdesk_core::reliability::{self, RetryStatus};
@@ -95,6 +95,7 @@ struct ReplayHost {
     synthetic_displays: bool,
     synthetic_keyboard: bool,
     synthetic_relative_mouse: bool,
+    synthetic_trackpad: bool,
     caps_locked: bool,
     alternate_layout: bool,
 }
@@ -184,6 +185,10 @@ impl HostPlatform for ReplayHost {
 
     fn supports_relative_mouse(&self) -> bool {
         self.synthetic_relative_mouse
+    }
+
+    fn supports_trackpad_gestures(&self) -> bool {
+        self.synthetic_trackpad
     }
 
     fn input_action(&mut self, action: InputAction) -> impl Future<Output = Result<InputActionOutcome>> + Send + 'static {
@@ -319,6 +324,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
             synthetic_displays,
             synthetic_keyboard: arguments.contains_key("synthetic-keyboard"),
             synthetic_relative_mouse: arguments.contains_key("synthetic-relative-mouse"),
+            synthetic_trackpad: arguments.contains_key("synthetic-trackpad"),
             caps_locked: false,
             alternate_layout: false,
         };
@@ -406,8 +412,9 @@ impl ViewerPlatform for ReportingViewer {
 
     fn event(&mut self, event: ViewerEvent) {
         emit(match event {
-            ViewerEvent::Connected { name, can_control, stream, live_settings, input_actions, relative_mouse, .. } => {
-                json!({ "event": "connected", "name": name, "canControl": can_control, "stream": stream_json(stream), "liveSettings": live_settings, "inputActions":input_actions, "relativeMouse":relative_mouse })
+            ViewerEvent::Connected { name, can_control, stream, live_settings, input_actions, relative_mouse, trackpad_gestures, .. } => {
+                json!({ "event": "connected", "name": name, "canControl": can_control, "stream": stream_json(stream), "liveSettings": live_settings,
+                    "inputActions": input_actions, "relativeMouse": relative_mouse, "trackpadGestures": trackpad_gestures })
             }
             ViewerEvent::InputStatus(feedback) => json!({ "event": "inputStatus", "message": feedback.message, "capsLocked": feedback.caps_locked }),
             ViewerEvent::InputActionTimeout => json!({ "event": "inputActionTimeout" }),
@@ -434,6 +441,14 @@ impl ViewerPlatform for ReportingViewer {
             ViewerEvent::ClipboardText(text) => json!({ "event": "clipboardText", "text": text }),
         });
     }
+}
+
+#[derive(Deserialize)]
+#[serde(remote = "TrackpadGesture", rename_all = "camelCase")]
+enum ScriptGesture {
+    Magnify(f64),
+    Rotate(f64),
+    SmartMagnify,
 }
 
 #[derive(Deserialize)]
@@ -479,6 +494,23 @@ enum Script {
     Wheel {
         vertical: f64,
         horizontal: f64,
+        x: f64,
+        y: f64,
+        #[serde(default)]
+        relative: bool,
+    },
+    PreciseScroll {
+        dx: f64,
+        dy: f64,
+        phase: Option<ScrollPhase>,
+        momentum: Option<MomentumPhase>,
+        x: f64,
+        y: f64,
+    },
+    Gesture {
+        #[serde(with = "ScriptGesture")]
+        gesture: TrackpadGesture,
+        phase: Option<ScrollPhase>,
         x: f64,
         y: f64,
         #[serde(default)]
@@ -546,6 +578,14 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
                 }
                 Ok(Script::Wheel { vertical, horizontal, x, y, relative }) => {
                     let input = translator.wheel(vertical, horizontal, x, y);
+                    ViewerCommand::Input(if relative { input.at_current_pointer() } else { input })
+                }
+                Ok(Script::PreciseScroll { dx, dy, phase, momentum, x, y }) => {
+                    let Some(input) = translator.precise_scroll(dx, dy, phase, momentum, x, y) else { continue };
+                    ViewerCommand::Input(input)
+                }
+                Ok(Script::Gesture { gesture, phase, x, y, relative }) => {
+                    let Some(input) = translator.gesture(gesture, phase, x, y) else { continue };
                     ViewerCommand::Input(if relative { input.at_current_pointer() } else { input })
                 }
                 Ok(Script::Release) => {

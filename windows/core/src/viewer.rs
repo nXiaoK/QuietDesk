@@ -52,6 +52,7 @@ pub enum ViewerEvent {
         session_pause: bool,
         input_actions: bool,
         relative_mouse: bool,
+        trackpad_gestures: bool,
     },
     /// The stream now has this size and quality; `error` says why a requested change was not applied.
     Stream {
@@ -380,6 +381,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             session_pause: hello.session_pause == Some(true),
             input_actions: hello.input_actions == Some(true),
             relative_mouse: hello.relative_mouse_v1 == Some(true),
+            trackpad_gestures: hello.trackpad_gestures_v1 == Some(true),
         });
         if hello.input_actions == Some(true) {
             self.peer.order_input_echoes(MessageKind::Pong);
@@ -579,6 +581,9 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 if input.relative_mouse == Some(true) && hello.relative_mouse_v1 != Some(true) {
                     return Ok(());
                 }
+                if input.kind.is_gesture() && hello.trackpad_gestures_v1 != Some(true) {
+                    return Ok(());
+                }
                 if hello.input_actions != Some(true) {
                     if input.kind.action().is_some() {
                         return Ok(());
@@ -715,9 +720,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_a_capable_host_receives_locked_motion_and_sequence_numbers_follow_wire_order() {
-        use crate::messages::InputKind;
-        for supported in [false, true] {
+    async fn pointer_capabilities_are_independent_and_sequence_numbers_follow_wire_order() {
+        use crate::messages::{InputKind, ScrollPhase};
+        for (supported, gestures) in [(false, false), (false, true), (true, false), (true, true)] {
             let (left, right) = tokio::io::duplex(8192);
             let (host, mut from_viewer) = peer::spawn(left, PeerConfig::default());
             let (viewer, incoming) = peer::spawn(right, PeerConfig::default());
@@ -731,8 +736,13 @@ mod tests {
                 if supported {
                     hello["relativeMouseV1"] = serde_json::Value::Bool(true);
                 }
+                if gestures {
+                    hello["trackpadGesturesV1"] = serde_json::Value::Bool(true);
+                }
                 host.send(&Message::json(MessageKind::Hello, &hello).unwrap()).unwrap();
-                assert!(matches!(events.recv().await.unwrap(), ViewerEvent::Connected{relative_mouse,..} if relative_mouse==supported));
+                assert!(
+                    matches!(events.recv().await.unwrap(), ViewerEvent::Connected{relative_mouse,trackpad_gestures,..} if relative_mouse==supported && trackpad_gestures==gestures)
+                );
                 let mut relative = RemoteInput::new(InputKind::Move).at_current_pointer();
                 relative.pointer_delta_x = Some(3.0);
                 relative.pointer_delta_y = Some(-4.0);
@@ -746,6 +756,17 @@ mod tests {
                 assert_eq!(next(&mut from_viewer).await.kind, MessageKind::ReleaseInput);
                 let absolute: RemoteInput = next(&mut from_viewer).await.read_json().unwrap();
                 assert_eq!((absolute.kind, absolute.relative_mouse, absolute.pointer_sequence), (InputKind::Down, None, Some(if supported { 2 } else { 1 })));
+                input.send(ViewerCommand::Input(RemoteInput::new(InputKind::SmartMagnify))).unwrap();
+                let mut scroll = RemoteInput::new(InputKind::Scroll);
+                scroll.delta_y = -0.75;
+                scroll.scroll_phase = Some(ScrollPhase::Changed);
+                input.send(ViewerCommand::Input(scroll)).unwrap();
+                if gestures {
+                    let smart: RemoteInput = next(&mut from_viewer).await.read_json().unwrap();
+                    assert_eq!(smart.kind, InputKind::SmartMagnify);
+                }
+                let scroll: RemoteInput = next(&mut from_viewer).await.read_json().unwrap();
+                assert_eq!((scroll.kind, scroll.delta_y, scroll.scroll_phase), (InputKind::Scroll, -0.75, Some(ScrollPhase::Changed)));
                 input.send(ViewerCommand::Disconnect).unwrap();
             };
             let (end, ()) =

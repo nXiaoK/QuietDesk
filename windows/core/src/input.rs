@@ -5,7 +5,7 @@
 //! Mac host means macOS key codes and `NSEvent` modifier flags.
 
 use crate::keymap::{self, MacModifierMapping, PcKey, PcModifierMapping, mac, pc};
-use crate::messages::{InputAction, InputKind, RemoteInput};
+use crate::messages::{InputAction, InputKind, MomentumPhase, RemoteInput, ScrollPhase, TrackpadGesture};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -67,6 +67,14 @@ pub enum InjectOp {
     },
     /// Target a button or wheel event at the current pointer on the shared display.
     CurrentPointer,
+    Gesture {
+        gesture: TrackpadGesture,
+        phase: Option<ScrollPhase>,
+        x: f64,
+        y: f64,
+        relative: bool,
+    },
+    CancelGestures,
     Button {
         button: MouseButton,
         down: bool,
@@ -85,6 +93,12 @@ const WHEEL_UNITS_PER_LINE: f64 = 40.0;
 /// Wheel units for one pixel of a trackpad gesture, taking a notch as roughly 80 pixels of content.
 const WHEEL_UNITS_PER_PIXEL: f64 = 1.5;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScrollSource {
+    Fingers,
+    Momentum,
+}
+
 /// State a Windows host keeps for one viewer.
 pub struct HostInputTranslator {
     mapping: MacModifierMapping,
@@ -95,8 +109,11 @@ pub struct HostInputTranslator {
     keys: BTreeSet<PcKey>,
     buttons: BTreeSet<MouseButton>,
     wheel_remainder: (f64, f64),
+    scroll_source: Option<ScrollSource>,
     pointer_remainder: (f64, f64),
     highest_pointer_sequence: u64,
+    magnify_phase: Option<ScrollPhase>,
+    rotate_phase: Option<ScrollPhase>,
 }
 
 impl HostInputTranslator {
@@ -108,8 +125,11 @@ impl HostInputTranslator {
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
             wheel_remainder: (0.0, 0.0),
+            scroll_source: None,
             pointer_remainder: (0.0, 0.0),
             highest_pointer_sequence: 0,
+            magnify_phase: None,
+            rotate_phase: None,
         }
     }
 
@@ -180,25 +200,89 @@ impl HostInputTranslator {
                     ops.push(InjectOp::Button { button, down });
                 }
             }
-            InputKind::Scroll => {
-                // The wheel goes to the window under the pointer.
+            InputKind::Scroll => self.scroll(input, target, &mut ops),
+            InputKind::Magnify | InputKind::Rotate | InputKind::SmartMagnify => {
                 self.pointer_remainder = (0.0, 0.0);
-                ops.push(target);
-                let (x, y) = match (input.line_delta_x, input.line_delta_y) {
-                    (Some(x), Some(y)) => (x * WHEEL_UNITS_PER_LINE, y * WHEEL_UNITS_PER_LINE),
-                    _ => (input.delta_x * WHEEL_UNITS_PER_PIXEL, input.delta_y * WHEEL_UNITS_PER_PIXEL),
-                };
-                // macOS counts a horizontal delta as positive towards the left, Windows towards the right.
-                let (horizontal, vertical) = (self.wheel_remainder.0 - x, self.wheel_remainder.1 + y);
-                self.wheel_remainder = (horizontal.fract(), vertical.fract());
-                let (horizontal, vertical) = (horizontal.trunc() as i32, vertical.trunc() as i32);
-                if horizontal != 0 || vertical != 0 {
-                    ops.push(InjectOp::Wheel { vertical, horizontal });
-                }
+                self.gesture(input, &mut ops);
             }
-            InputKind::Magnify | InputKind::Rotate | InputKind::SmartMagnify | InputKind::SwitchInputSource | InputKind::ToggleCapsLock => {}
+            InputKind::SwitchInputSource | InputKind::ToggleCapsLock => {}
         }
         ops
+    }
+
+    fn scroll(&mut self, input: &RemoteInput, target: InjectOp, ops: &mut Vec<InjectOp>) {
+        self.pointer_remainder = (0.0, 0.0);
+        let stage = input.scroll_phase.map(|p| (ScrollSource::Fingers, p)).or_else(|| {
+            input.momentum_phase.map(|p| {
+                (
+                    ScrollSource::Momentum,
+                    match p {
+                        MomentumPhase::Began => ScrollPhase::Began,
+                        MomentumPhase::Changed => ScrollPhase::Changed,
+                        MomentumPhase::Ended => ScrollPhase::Ended,
+                    },
+                )
+            })
+        });
+        let ended = stage.is_some_and(|(_, p)| matches!(p, ScrollPhase::Ended | ScrollPhase::Cancelled));
+        if let Some((source, phase)) = stage {
+            let active = self.scroll_source == Some(source);
+            if !active || matches!(phase, ScrollPhase::MayBegin | ScrollPhase::Began) {
+                self.wheel_remainder = (0.0, 0.0);
+            }
+            self.scroll_source = (!ended).then_some(source);
+            if ended && !active {
+                return;
+            }
+        } else if self.scroll_source.take().is_some() {
+            self.wheel_remainder = (0.0, 0.0);
+        }
+        ops.push(target);
+        let (x, y) = match (input.line_delta_x, input.line_delta_y) {
+            (Some(x), Some(y)) => (x * WHEEL_UNITS_PER_LINE, y * WHEEL_UNITS_PER_LINE),
+            _ => (input.delta_x * WHEEL_UNITS_PER_PIXEL, input.delta_y * WHEEL_UNITS_PER_PIXEL),
+        };
+        // macOS counts a horizontal delta as positive towards the left, Windows towards the right.
+        let (horizontal, vertical) = (self.wheel_remainder.0 - x, self.wheel_remainder.1 + y);
+        self.wheel_remainder = (horizontal.fract(), vertical.fract());
+        let (horizontal, vertical) = (horizontal.trunc() as i32, vertical.trunc() as i32);
+        if horizontal != 0 || vertical != 0 {
+            ops.push(InjectOp::Wheel { vertical, horizontal });
+        }
+        if ended {
+            self.wheel_remainder = (0.0, 0.0);
+        }
+    }
+
+    fn gesture(&mut self, input: &RemoteInput, ops: &mut Vec<InjectOp>) {
+        let event = |gesture, phase| InjectOp::Gesture { gesture, phase, x: input.x, y: input.y, relative: input.relative_mouse == Some(true) };
+        let (gesture, neutral, open) = match input.kind {
+            InputKind::Magnify => (TrackpadGesture::Magnify(input.magnification.unwrap()), TrackpadGesture::Magnify(0.0), &mut self.magnify_phase),
+            InputKind::Rotate => (TrackpadGesture::Rotate(input.rotation.unwrap()), TrackpadGesture::Rotate(0.0), &mut self.rotate_phase),
+            InputKind::SmartMagnify => {
+                ops.push(event(TrackpadGesture::SmartMagnify, input.gesture_phase));
+                return;
+            }
+            _ => unreachable!(),
+        };
+        match input.gesture_phase {
+            None if gesture == neutral => return,
+            Some(ScrollPhase::MayBegin | ScrollPhase::Began) => {
+                if open.is_some_and(|phase| phase != ScrollPhase::MayBegin) {
+                    ops.push(event(neutral, Some(ScrollPhase::Ended)));
+                }
+                *open = input.gesture_phase;
+            }
+            Some(ScrollPhase::Changed) => {
+                if matches!(*open, None | Some(ScrollPhase::MayBegin)) {
+                    ops.push(event(neutral, Some(ScrollPhase::Began)));
+                }
+                *open = input.gesture_phase;
+            }
+            Some(ScrollPhase::Ended | ScrollPhase::Cancelled) if open.take().is_none() => return,
+            _ => {}
+        }
+        ops.push(event(gesture, input.gesture_phase));
     }
 
     /// Keys the host's Caps or Win+Space shortcut would press or combine with.
@@ -214,7 +298,10 @@ impl HostInputTranslator {
         self.apply_modifiers(&mut ops);
         ops.extend(std::mem::take(&mut self.buttons).into_iter().map(|button| InjectOp::Button { button, down: false }));
         self.wheel_remainder = (0.0, 0.0);
+        self.scroll_source = None;
         self.pointer_remainder = (0.0, 0.0);
+        self.magnify_phase = None;
+        self.rotate_phase = None;
         ops
     }
 
@@ -398,6 +485,42 @@ impl ViewerInputTranslator {
         input.delta_x = lines_x * PIXELS_PER_LINE;
         input.delta_y = lines_y * PIXELS_PER_LINE;
         input
+    }
+
+    /// Pixel deltas already expressed in the protocol's horizontal and vertical directions.
+    pub fn precise_scroll(&self, dx: f64, dy: f64, phase: Option<ScrollPhase>, momentum: Option<MomentumPhase>, x: f64, y: f64) -> Option<RemoteInput> {
+        if !dx.is_finite() || !dy.is_finite() || !x.is_finite() || !y.is_finite() || (dx == 0.0 && dy == 0.0 && phase.is_none() && momentum.is_none()) {
+            return None;
+        }
+        let mut input = self.pointer(InputKind::Scroll, x, y);
+        let limit = RemoteInput::MAXIMUM_PIXEL_DELTA;
+        input.delta_x = dx.clamp(-limit, limit);
+        input.delta_y = dy.clamp(-limit, limit);
+        input.scroll_phase = phase;
+        input.momentum_phase = momentum;
+        Some(input)
+    }
+
+    pub fn gesture(&self, gesture: TrackpadGesture, phase: Option<ScrollPhase>, x: f64, y: f64) -> Option<RemoteInput> {
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        let mut input = match gesture {
+            TrackpadGesture::Magnify(v) if v.is_finite() => {
+                let mut input = self.pointer(InputKind::Magnify, x, y);
+                input.magnification = Some(v.clamp(-RemoteInput::MAXIMUM_MAGNIFICATION, RemoteInput::MAXIMUM_MAGNIFICATION));
+                input
+            }
+            TrackpadGesture::Rotate(v) if v.is_finite() => {
+                let mut input = self.pointer(InputKind::Rotate, x, y);
+                input.rotation = Some(v.clamp(-RemoteInput::MAXIMUM_ROTATION, RemoteInput::MAXIMUM_ROTATION));
+                input
+            }
+            TrackpadGesture::SmartMagnify => self.pointer(InputKind::SmartMagnify, x, y),
+            _ => return None,
+        };
+        input.gesture_phase = phase;
+        Some(input)
     }
 
     /// Forgets held keys and buttons after the host was told to release them.
@@ -590,6 +713,45 @@ mod tests {
         assert_eq!(host.translate(&absolute), [InjectOp::Move { x: 0.0, y: 0.0 }]);
         assert!(viewer.relative_pointer_move(f64::NAN, 1.0).is_none());
         assert!(viewer.relative_pointer_move(0.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn magnification_and_rotation_have_independent_lifetimes_and_smart_zoom_is_one_event() {
+        use ScrollPhase::{Began, Changed, Ended};
+        use TrackpadGesture::{Magnify, Rotate, SmartMagnify};
+        let viewer = viewer(PcModifierMapping::Standard);
+        let mut host = HostInputTranslator::new(MacModifierMapping::Standard);
+        let input = |gesture, phase| viewer.gesture(gesture, phase, 0.2, 0.8).unwrap().at_current_pointer();
+        let event = |gesture, phase| InjectOp::Gesture { gesture, phase, x: 0.5, y: 0.5, relative: true };
+        assert_eq!(host.translate(&input(Magnify(0.25), Some(Changed))), [event(Magnify(0.0), Some(Began)), event(Magnify(0.25), Some(Changed))]);
+        assert_eq!(host.translate(&input(Rotate(-2.5), Some(Began))), [event(Rotate(-2.5), Some(Began))]);
+        assert_eq!(host.translate(&input(Magnify(0.0), Some(Began))), [event(Magnify(0.0), Some(Ended)), event(Magnify(0.0), Some(Began))]);
+        assert_eq!(host.translate(&input(Rotate(-0.5), Some(Ended))), [event(Rotate(-0.5), Some(Ended))]);
+        assert!(host.translate(&input(Rotate(0.0), Some(Ended))).is_empty());
+        assert_eq!(host.translate(&input(SmartMagnify, Some(Ended))), [event(SmartMagnify, Some(Ended))]);
+        assert_eq!(host.translate(&input(Rotate(12.0), None)), [event(Rotate(12.0), None)]);
+        host.release_all();
+        assert!(host.translate(&input(Magnify(0.0), Some(Ended))).is_empty());
+    }
+
+    #[test]
+    fn precision_scroll_carries_only_pixel_deltas_and_ends_fractional_motion_with_its_source() {
+        let viewer = viewer(PcModifierMapping::Standard);
+        let mut host = HostInputTranslator::new(MacModifierMapping::Standard);
+        let scroll = |phase, momentum| viewer.precise_scroll(0.0, 0.5, phase, momentum, 0.3, 0.7).unwrap();
+        let anchor = InjectOp::Move { x: 0.3, y: 0.7 };
+        let wheel = InjectOp::Wheel { vertical: 1, horizontal: 0 };
+        let begin = scroll(Some(ScrollPhase::Began), None);
+        assert_eq!((begin.line_delta_x, begin.line_delta_y), (None, None));
+        assert_eq!(host.translate(&begin), [anchor]);
+        assert_eq!(host.translate(&scroll(Some(ScrollPhase::Changed), None)), [anchor, wheel]);
+        assert_eq!(host.translate(&scroll(Some(ScrollPhase::Ended), None)), [anchor, wheel]);
+        assert_eq!(host.translate(&scroll(None, Some(MomentumPhase::Changed))), [anchor]);
+        assert_eq!(host.translate(&scroll(None, Some(MomentumPhase::Ended))), [anchor, wheel]);
+        assert!(host.translate(&scroll(None, Some(MomentumPhase::Ended))).is_empty());
+        assert_eq!(host.translate(&scroll(None, None)), [anchor]);
+        assert!(viewer.precise_scroll(f64::NAN, 1.0, None, None, 0.5, 0.5).is_none());
+        assert!(viewer.gesture(TrackpadGesture::Rotate(f64::INFINITY), None, 0.5, 0.5).is_none());
     }
 
     fn pc_event(key: PcKey, down: bool) -> PcKeyEvent {

@@ -6,6 +6,7 @@ use super::relative_mouse::RelativeMouse;
 use super::settings::{Settings, VIEWER_QUALITIES};
 use super::util::{display_label, wide};
 use super::viewer_cursor::ViewerCursor;
+use super::viewer_gestures::{TouchGestures, Touchpad};
 use quietdesk_core::cursor::CursorPresentationState;
 use quietdesk_core::display::RemoteDisplayInfo;
 use quietdesk_core::input::{CapsLockPress, DoubleClick, PcKeyEvent, ViewerInputTranslator};
@@ -48,6 +49,7 @@ pub const WM_CAPS_PREFERENCE: u32 = WM_APP + 22;
 const MOVE_TIMER: usize = 1;
 const RETRY_TIMER: usize = 2;
 const IDLE_TIMER: usize = 3;
+const TOUCHPAD_TIMER: usize = 4;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const MOVE_INTERVAL: Duration = Duration::from_millis(8);
 const MENU_FULL_SCREEN: usize = 100;
@@ -172,6 +174,9 @@ struct Canvas {
     relative_supported: bool,
     relative_enabled: bool,
     relative_mouse: Option<RelativeMouse>,
+    supports_gestures: bool,
+    touchpad: Option<Touchpad>,
+    touch_gestures: TouchGestures,
     pending_move: Option<PendingMove>,
     last_move: Instant,
     full_screen: Option<(WINDOW_STYLE, WINDOWPLACEMENT, HMENU)>,
@@ -303,6 +308,9 @@ pub fn open(
             relative_supported: false,
             relative_enabled: false,
             relative_mouse: None,
+            supports_gestures: false,
+            touchpad: None,
+            touch_gestures: TouchGestures::default(),
             last_move: Instant::now(),
             full_screen: None,
             paused: false,
@@ -475,7 +483,9 @@ impl Canvas {
             if self.uses_caps_actions() {
                 input.independent_caps_lock = Some(true);
             }
-            if self.relative_mouse.is_some() && matches!(input.kind, InputKind::Down | InputKind::Up | InputKind::Scroll) {
+            if self.relative_mouse.is_some()
+                && matches!(input.kind, InputKind::Down | InputKind::Up | InputKind::Scroll | InputKind::Magnify | InputKind::Rotate | InputKind::SmartMagnify)
+            {
                 input = input.at_current_pointer();
             }
             command = ViewerCommand::Input(input);
@@ -765,6 +775,11 @@ impl Canvas {
     /// Stops forwarding keys and tells the host to let go of everything.
     unsafe fn release(&mut self) {
         self.caps_press.reset();
+        if let Some(pad) = &mut self.touchpad {
+            pad.reset();
+        }
+        self.touch_gestures = TouchGestures::default();
+        let _ = unsafe { KillTimer(Some(self.window), TOUCHPAD_TIMER) };
         self.relative_mouse.take();
         if let Some(hook) = self.hook.take() {
             let _ = unsafe { UnhookWindowsHookEx(hook) };
@@ -864,6 +879,8 @@ impl Canvas {
         unsafe {
             self.connected = false;
             self.supports_input_actions = false;
+            self.supports_gestures = false;
+            self.touchpad = None;
             self.relative_enabled = false;
             self.relative_supported = false;
             self.update_input_menu();
@@ -932,7 +949,7 @@ impl Canvas {
 
     unsafe fn session_event(&mut self, event: ViewerEvent) {
         match event {
-            ViewerEvent::Connected { name, can_control, session_pause, input_actions, relative_mouse, .. } => {
+            ViewerEvent::Connected { name, can_control, session_pause, input_actions, relative_mouse, trackpad_gestures, .. } => {
                 if self.retry.take().is_some() {
                     unsafe {
                         let _ = KillTimer(Some(self.window), RETRY_TIMER);
@@ -944,6 +961,8 @@ impl Canvas {
                 self.can_control = can_control;
                 self.supports_pause = session_pause;
                 self.supports_input_actions = input_actions;
+                self.supports_gestures = trackpad_gestures;
+                self.touchpad = Touchpad::open(self.window, trackpad_gestures).ok();
                 self.relative_supported = relative_mouse;
                 self.update_input_menu();
                 self.reconcile_pause();
@@ -1088,10 +1107,13 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 let _ = DestroyWindow(window);
             }
             WM_SIZE => {
-                if canvas.relative_mouse.is_some() {
+                if canvas.relative_mouse.is_some() || canvas.touchpad.as_ref().is_some_and(Touchpad::active) || canvas.touch_gestures.active() {
                     canvas.release();
                 }
                 canvas.update_attention(GetForegroundWindow() == window, IsWindowVisible(window).as_bool(), wparam.0 as u32 == SIZE_MINIMIZED);
+                if let Some(pad) = &canvas.touchpad {
+                    let _ = pad.resize();
+                }
                 if canvas.retry.is_some() {
                     canvas.retry_panel.layout(window);
                 }
@@ -1129,6 +1151,61 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 return LRESULT(1);
             }
             WM_MOUSELEAVE => canvas.draw(),
+            DM_POINTERHITTEST if canvas.controlling() && canvas.owns_input() => {
+                if let Some(anchor) = canvas.pointer_in_client().and_then(|(x, y)| canvas.fraction(x, y)).filter(|p| Canvas::inside_picture(*p))
+                    && let Some(pad) = &mut canvas.touchpad
+                    && pad.hit(wparam.0 as u16 as u32, anchor)
+                {
+                    if SetTimer(Some(window), TOUCHPAD_TIMER, 12, None) == 0 {
+                        pad.reset();
+                        return DefWindowProcW(window, message, wparam, lparam);
+                    }
+                } else {
+                    return DefWindowProcW(window, message, wparam, lparam);
+                }
+            }
+            WM_TIMER if wparam.0 == TOUCHPAD_TIMER => {
+                if !canvas.controlling() || !canvas.owns_input() {
+                    canvas.release();
+                    return LRESULT(0);
+                }
+                let Some(pad) = &mut canvas.touchpad else { return LRESULT(0) };
+                let anchor = pad.anchor;
+                match pad.poll(GetDpiForWindow(window)) {
+                    Ok((motions, active)) => {
+                        if !active {
+                            let _ = KillTimer(Some(window), TOUCHPAD_TIMER);
+                        }
+                        for motion in motions {
+                            if let Some(input) = motion.input(&canvas.translator, anchor) {
+                                canvas.flush_move();
+                                canvas.send(ViewerCommand::Input(input));
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        canvas.release();
+                        canvas.touchpad = None;
+                    }
+                }
+            }
+            WM_GESTURENOTIFY if canvas.supports_gestures && canvas.controlling() && canvas.owns_input() => {
+                TouchGestures::configure(window);
+                return DefWindowProcW(window, message, wparam, lparam);
+            }
+            WM_GESTURE if canvas.supports_gestures && canvas.controlling() && canvas.owns_input() => {
+                let handle = windows::Win32::UI::Input::Touch::HGESTUREINFO(lparam.0 as _);
+                let Some((motion, mut point)) = canvas.touch_gestures.read(handle) else { return DefWindowProcW(window, message, wparam, lparam) };
+                if ScreenToClient(window, &mut point).as_bool()
+                    && let Some(anchor) = canvas.fraction(point.x, point.y).filter(|p| Canvas::inside_picture(*p))
+                    && let Some(input) = motion.input(&canvas.translator, anchor)
+                {
+                    canvas.flush_move();
+                    canvas.send(ViewerCommand::Input(input));
+                } else {
+                    canvas.release();
+                }
+            }
             WM_INPUT => {
                 if canvas.controlling()
                     && canvas.owns_input()

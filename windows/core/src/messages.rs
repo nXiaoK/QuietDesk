@@ -94,6 +94,8 @@ pub struct Hello {
     pub input_actions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relative_mouse_v1: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trackpad_gestures_v1: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_settings: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -287,8 +289,12 @@ impl InputAction {
 }
 
 impl InputKind {
+    pub(crate) fn is_gesture(self) -> bool {
+        matches!(self, Self::Magnify | Self::Rotate | Self::SmartMagnify)
+    }
+
     pub(crate) fn is_pointer(self) -> bool {
-        matches!(self, Self::Move | Self::Drag | Self::Down | Self::Up | Self::Scroll | Self::Magnify | Self::Rotate | Self::SmartMagnify)
+        matches!(self, Self::Move | Self::Drag | Self::Down | Self::Up | Self::Scroll) || self.is_gesture()
     }
 
     pub fn action(self) -> Option<InputAction> {
@@ -298,6 +304,39 @@ impl InputKind {
             _ => None,
         }
     }
+}
+
+macro_rules! wire_phase {
+    ($name:ident { $($variant:ident = $code:literal),+ }) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(try_from = "u8", into = "u8")]
+        #[repr(u8)]
+        pub enum $name { $($variant = $code),+ }
+
+        impl From<$name> for u8 {
+            fn from(phase: $name) -> Self { phase as u8 }
+        }
+
+        impl TryFrom<u8> for $name {
+            type Error = &'static str;
+            fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+                match value {
+                    $($code => Ok(Self::$variant),)+
+                    _ => Err("远端触控板阶段无效"),
+                }
+            }
+        }
+    };
+}
+
+wire_phase!(ScrollPhase { Began = 1, Changed = 2, Ended = 4, Cancelled = 8, MayBegin = 128 });
+wire_phase!(MomentumPhase { Began = 1, Changed = 2, Ended = 3 });
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TrackpadGesture {
+    Magnify(f64),
+    Rotate(f64),
+    SmartMagnify,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,12 +376,24 @@ pub struct RemoteInput {
     pub line_delta_x: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_delta_y: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scroll_phase: Option<ScrollPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub momentum_phase: Option<MomentumPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub magnification: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gesture_phase: Option<ScrollPhase>,
 }
 
 impl RemoteInput {
     pub const MAXIMUM_LINE_DELTA: f64 = 250.0;
     pub const MAXIMUM_PIXEL_DELTA: f64 = 3000.0;
     pub const MAXIMUM_POINTER_DELTA: f64 = 10_000.0;
+    pub const MAXIMUM_MAGNIFICATION: f64 = 10.0;
+    pub const MAXIMUM_ROTATION: f64 = 3600.0;
     pub const MAXIMUM_BUTTON: i64 = 31;
     pub const MAXIMUM_KEY_CODE: u16 = 127;
 
@@ -365,6 +416,11 @@ impl RemoteInput {
             pointer_sequence: None,
             line_delta_x: None,
             line_delta_y: None,
+            scroll_phase: None,
+            momentum_phase: None,
+            magnification: None,
+            rotation: None,
+            gesture_phase: None,
         }
     }
 
@@ -391,9 +447,19 @@ impl RemoteInput {
         if !valid_delta {
             return Err(DeskError::invalid("远端指针增量参数无效"));
         }
-        let lines = match (self.line_delta_x, self.line_delta_y) {
-            (None, None) => true,
-            (Some(x), Some(y)) => self.kind == InputKind::Scroll && bounded(x, Self::MAXIMUM_LINE_DELTA) && bounded(y, Self::MAXIMUM_LINE_DELTA),
+        let phased_scroll = self.scroll_phase.is_some() || self.momentum_phase.is_some();
+        let scroll = match (self.line_delta_x, self.line_delta_y) {
+            (None, None) => !phased_scroll || self.kind == InputKind::Scroll,
+            (Some(x), Some(y)) => {
+                self.kind == InputKind::Scroll && !phased_scroll && bounded(x, Self::MAXIMUM_LINE_DELTA) && bounded(y, Self::MAXIMUM_LINE_DELTA)
+            }
+            _ => false,
+        };
+        let gesture = match (self.kind, self.magnification, self.rotation) {
+            (InputKind::Magnify, Some(v), None) => bounded(v, Self::MAXIMUM_MAGNIFICATION),
+            (InputKind::Rotate, None, Some(v)) => bounded(v, Self::MAXIMUM_ROTATION),
+            (InputKind::SmartMagnify, None, None) => true,
+            (kind, None, None) => !kind.is_gesture() && self.gesture_phase.is_none(),
             _ => false,
         };
         if unit(self.x)
@@ -403,7 +469,8 @@ impl RemoteInput {
             && (0..=3).contains(&self.clicks)
             && bounded(self.delta_x, Self::MAXIMUM_PIXEL_DELTA)
             && bounded(self.delta_y, Self::MAXIMUM_PIXEL_DELTA)
-            && lines
+            && scroll
+            && gesture
         {
             Ok(())
         } else {
@@ -464,6 +531,7 @@ mod tests {
             can_control: true,
             input_actions: None,
             relative_mouse_v1: None,
+            trackpad_gestures_v1: None,
             live_settings: Some(true),
             control_status_updates: None,
             extended_video_settings: None,
@@ -570,6 +638,43 @@ mod tests {
         input.pointer_sequence = None;
         input.relative_mouse = Some(false);
         assert!(input.validate().is_err());
+    }
+
+    #[test]
+    fn phase_numbers_and_gesture_payloads_match_swift() {
+        let mut gesture = RemoteInput::new(InputKind::Rotate);
+        gesture.rotation = Some(-18.5);
+        gesture.gesture_phase = Some(ScrollPhase::MayBegin);
+        gesture.validate().unwrap();
+        let mut json = serde_json::to_value(&gesture).unwrap();
+        assert_eq!(json["gesturePhase"], 128);
+        assert_eq!(json["rotation"], -18.5);
+        json["gesturePhase"] = serde_json::json!(3);
+        assert!(serde_json::from_value::<RemoteInput>(json).is_err());
+        gesture.magnification = Some(0.0);
+        assert!(gesture.validate().is_err());
+        gesture.rotation = None;
+        gesture.kind = InputKind::Magnify;
+        for value in [f64::NAN, RemoteInput::MAXIMUM_MAGNIFICATION + 0.01] {
+            gesture.magnification = Some(value);
+            assert!(gesture.validate().is_err());
+        }
+        gesture.magnification = None;
+        assert!(gesture.validate().is_err());
+        gesture.kind = InputKind::SmartMagnify;
+        assert!(gesture.validate().is_ok());
+        gesture.kind = InputKind::KeyDown;
+        assert!(gesture.validate().is_err());
+        let mut scroll = RemoteInput::new(InputKind::Scroll);
+        scroll.momentum_phase = Some(MomentumPhase::Ended);
+        assert_eq!(serde_json::to_value(&scroll).unwrap()["momentumPhase"], 3);
+        scroll.line_delta_x = Some(0.0);
+        scroll.line_delta_y = Some(1.0);
+        assert!(scroll.validate().is_err());
+        scroll.line_delta_x = None;
+        scroll.line_delta_y = None;
+        scroll.kind = InputKind::Move;
+        assert!(scroll.validate().is_err());
     }
 
     #[test]

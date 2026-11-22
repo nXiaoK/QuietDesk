@@ -492,9 +492,13 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
 /// Runs the application until its main window closes.
 pub fn run() {
     start_logging();
+    let apartment = unsafe { windows::Win32::System::Ole::OleInitialize(None) };
     if let Err(error) = unsafe { run_window() } {
         log::error!("the main window could not be created: {error}");
         unsafe { MessageBoxW(None, PCWSTR(wide(&format!("QuietDesk 无法启动：{error}")).as_ptr()), w!("QuietDesk"), MB_OK | MB_ICONERROR) };
+    }
+    if apartment.is_ok() {
+        unsafe { windows::Win32::System::Ole::OleUninitialize() };
     }
 }
 

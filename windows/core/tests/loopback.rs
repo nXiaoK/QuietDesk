@@ -32,6 +32,9 @@ struct HostLog {
     switched: Vec<u32>,
     actions: Vec<(InputAction, tokio::sync::oneshot::Sender<Result<InputActionOutcome>>)>,
     supports_actions: bool,
+    supports_gestures: bool,
+    gesture_check: Option<tokio::time::Instant>,
+    checked_gesture: bool,
     refuse_next_button_down: bool,
 }
 
@@ -48,6 +51,19 @@ struct FakeHost {
 }
 
 impl HostPlatform for FakeHost {
+    fn supports_trackpad_gestures(&self) -> bool {
+        self.log.lock().unwrap().supports_gestures
+    }
+
+    fn gesture_check_at(&self) -> Option<tokio::time::Instant> {
+        self.log.lock().unwrap().gesture_check
+    }
+
+    fn check_gestures(&mut self) {
+        let mut log = self.log.lock().unwrap();
+        log.checked_gesture = true;
+        log.gesture_check = None;
+    }
     fn supports_input_actions(&self) -> bool {
         self.log.lock().unwrap().supports_actions
     }
@@ -126,6 +142,12 @@ impl HostPlatform for FakeHost {
             return false;
         }
         log.injected.extend_from_slice(operations);
+        if operations.iter().any(|op| matches!(op, InjectOp::Gesture { .. })) {
+            log.gesture_check = Some(tokio::time::Instant::now() + Duration::from_millis(5));
+        }
+        if operations.contains(&InjectOp::CancelGestures) {
+            log.gesture_check = None;
+        }
         true
     }
 
@@ -371,6 +393,7 @@ async fn a_session_negotiates_streams_controls_and_ends_as_the_macos_roles_do() 
                     session_pause: true,
                     input_actions: true,
                     relative_mouse: false,
+                    trackpad_gestures: false,
                 }
             );
             assert!(log.events.contains(&ViewerEvent::Control(true)), "the viewer subscribed to control changes");
@@ -597,6 +620,53 @@ async fn a_forwarded_modifier_cannot_combine_with_the_platform_shortcut() {
         fixture.viewer_commands.send(ViewerCommand::Disconnect).unwrap();
     })
     .await;
+}
+
+#[tokio::test]
+async fn only_a_capable_host_starts_gestures_and_cancels_its_contacts_on_release() {
+    use quietdesk_core::messages::{Hello, ScrollPhase, TrackpadGesture};
+    for supported in [false, true] {
+        let (left, right) = tokio::io::duplex(8192);
+        let (host, incoming) = peer::spawn(left, PeerConfig::default());
+        let (viewer, mut messages) = peer::spawn(right, PeerConfig::default());
+        let log = Arc::new(Mutex::new(HostLog { supports_gestures: supported, ..Default::default() }));
+        let mut platform = FakeHost { log: log.clone(), sink: Arc::default() };
+        let (commands, queue) = mpsc::unbounded_channel();
+        let exchange = async {
+            let hello: Hello = next_message(&mut messages).await.read_json().unwrap();
+            assert_eq!(hello.trackpad_gestures_v1, supported.then_some(true));
+            until("capture starts", || !log.lock().unwrap().configured.is_empty()).await;
+            let mut input = RemoteInput::new(InputKind::Magnify);
+            (input.x, input.y) = (0.5, 0.2);
+            input.magnification = Some(0.15);
+            input.gesture_phase = Some(ScrollPhase::Began);
+            viewer.send(&Message::json(MessageKind::Input, &input).unwrap()).unwrap();
+            if supported {
+                until("the platform can check its contacts without another input", || log.lock().unwrap().checked_gesture).await;
+            }
+            viewer.send(&Message::empty(MessageKind::ReleaseInput)).unwrap();
+            viewer.send(&Message::new(MessageKind::Clipboard, b"received".to_vec())).unwrap();
+            until("the host passed the release", || log.lock().unwrap().clipboard.as_deref() == Some("received")).await;
+            {
+                let log = log.lock().unwrap();
+                if supported {
+                    assert_eq!(
+                        log.injected,
+                        [
+                            InjectOp::Gesture { gesture: TrackpadGesture::Magnify(0.15), phase: Some(ScrollPhase::Began), x: 0.5, y: 0.2, relative: false },
+                            InjectOp::CancelGestures
+                        ]
+                    );
+                } else {
+                    assert!(log.injected.is_empty());
+                }
+            }
+            commands.send(HostCommand::End).unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(host::run(host, incoming, &mut platform, host_options(), queue, |_| {}), exchange) })
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]

@@ -494,6 +494,27 @@ private final class SyntheticInputSources: InputSourceAccess {
     }
 }
 
+private struct TrackpadEvent {
+    let type: NSEvent.EventType
+    let phase: NSEvent.Phase
+    let momentum: NSEvent.Phase
+    let value: Double
+    let precise: Bool
+
+    init?(_ event: CGEvent) {
+        guard event.type == .scrollWheel || event.type.rawValue == 29, let native = NSEvent(cgEvent: event) else { return nil }
+        type = native.type
+        phase = native.phase
+        momentum = type == .scrollWheel ? native.momentumPhase : []
+        precise = type == .scrollWheel && native.hasPreciseScrollingDeltas
+        switch type {
+        case .magnify: value = native.magnification
+        case .rotate: value = Double(native.rotation)
+        default: value = 0
+        }
+    }
+}
+
 private struct PostedEvent {
     let type: CGEventType
     let keyCode: Int64
@@ -501,6 +522,7 @@ private struct PostedEvent {
     let sourceID: String
     let location: CGPoint
     let motion: (x: Int64, y: Int64)
+    let trackpad: TrackpadEvent?
     let clicks: Int64
     let button: Int64
     let repeated: Bool
@@ -559,10 +581,12 @@ private final class MacHost: @unchecked Sendable {
     let keyboard = SyntheticInputSources()
     private let inputActions: Bool
     private let relativeMouse: Bool
+    private let trackpadGestures: Bool
     private var pump: DispatchSourceTimer?
 
     init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int), advertiseMedia: Bool, cursorImage: CursorImage?,
-         externalPackets: [VideoPacket] = [], inputActions: Bool = true, relativeMouse: Bool = true, on port: NWEndpoint.Port = .any) throws {
+         externalPackets: [VideoPacket] = [], inputActions: Bool = true, relativeMouse: Bool = true, trackpadGestures: Bool = true,
+         on port: NWEndpoint.Port = .any) throws {
         self.advertiseMedia = advertiseMedia
         self.cursorImage = cursorImage
         self.key = key
@@ -570,6 +594,7 @@ private final class MacHost: @unchecked Sendable {
         self.externalPackets = externalPackets
         self.inputActions = inputActions
         self.relativeMouse = relativeMouse
+        self.trackpadGestures = trackpadGestures
         self.size = size
         let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8)
         let state = Shared(State(applied: VideoStreamState(settings: settings, width: size.width, height: size.height)))
@@ -584,6 +609,7 @@ private final class MacHost: @unchecked Sendable {
             postEvent: { event in
                 let posted = PostedEvent(type: event.type, keyCode: event.getIntegerValueField(.keyboardEventKeycode), flags: event.flags, sourceID: keyboard.active.get(),
                     location: event.location, motion: (event.getIntegerValueField(.mouseEventDeltaX), event.getIntegerValueField(.mouseEventDeltaY)),
+                    trackpad: TrackpadEvent(event),
                     clicks: event.getIntegerValueField(.mouseEventClickState),
                     button: event.getIntegerValueField(.mouseEventButtonNumber),
                     repeated: event.getIntegerValueField(.keyboardEventAutorepeat) != 0,
@@ -654,7 +680,7 @@ private final class MacHost: @unchecked Sendable {
                     displaySwitchingV1: self.externalPackets.isEmpty ? nil : true,
                     displays: self.externalPackets.isEmpty ? nil : self.state.get().displays,
                     selectedDisplayID: self.externalPackets.isEmpty ? nil : self.state.get().selectedDisplay,
-                    remoteAudioV1: true, relativeMouseV1: self.relativeMouse ? true : nil, trackpadGesturesV1: true,
+                    remoteAudioV1: true, relativeMouseV1: self.relativeMouse ? true : nil, trackpadGesturesV1: self.trackpadGestures ? true : nil,
                     initialCursorNegotiationV1: self.cursorImage == nil ? nil : true, qualityProbeV1: true, typeTextV1: true)))
                 // The application waits this long for the viewer's first settings before it starts capture.
                 DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in self?.state.update { $0.streaming = true } }
@@ -1235,6 +1261,57 @@ private struct WindowsInteropChecks {
             }
         }
 
+        run("Windows receives Mac trackpad gestures and pixel scrolling at the intended target") {
+            try withWindowsHost(["--synthetic-trackpad"]) { probe, viewer in
+                try until("the Mac receives the trackpad capability and a Windows picture") {
+                    let state = viewer.state.get()
+                    return state.hello?.trackpadGesturesV1 == true && !state.decoded.isEmpty
+                }
+                func next() throws -> [String] { try probe.next("inject")["operations"] as? [String] ?? [] }
+                func gesture(_ operation: String, _ phase: String) -> String {
+                    "Gesture { gesture: \(operation), phase: Some(\(phase)), x: 0.25, y: 0.5, relative: false }"
+                }
+                var pinch = RemoteInput(kind: .magnify)
+                pinch.x = 0.25; pinch.y = 0.5; pinch.magnification = 0.375; pinch.gesturePhase = .changed
+                try viewer.send(pinch)
+                let opening = try probe.next("inject") { event in
+                    (event["operations"] as? [String])?.first?.hasPrefix("Gesture {") == true
+                }
+                try require(opening["operations"] as? [String] == [gesture("Magnify(0.0)", "Began"), gesture("Magnify(0.375)", "Changed")],
+                            "Windows lost the zoom, target or missing beginning of the Mac pinch")
+                var rotate = RemoteInput(kind: .rotate)
+                rotate.x = 0.25; rotate.y = 0.5; rotate.rotation = -18.5; rotate.gesturePhase = .began
+                try viewer.send(rotate)
+                try require(try next() == [gesture("Rotate(-18.5)", "Began")], "The Mac rotation lost its degree value or its phase")
+                var smart = RemoteInput(kind: .smartMagnify)
+                smart.x = 0.25; smart.y = 0.5; smart.gesturePhase = .ended
+                try viewer.send(smart)
+                try require(try next() == [gesture("SmartMagnify", "Ended")], "A discrete Mac smart zoom did not reach Windows exactly once")
+                viewer.peer.send(Message(.releaseInput))
+                try require(try next() == ["CancelGestures"], "Releasing control left the Windows gesture open")
+                var wheel = RemoteInput(kind: .scroll)
+                wheel.x = 0.25; wheel.y = 0.5; wheel.scrollPhase = .changed; wheel.deltaX = 20; wheel.deltaY = -8
+                try viewer.send(wheel)
+                try require(try next() == ["Move { x: 0.25, y: 0.5 }", "Wheel { vertical: -12, horizontal: -30 }"],
+                            "Windows interpreted precise Mac pixel scrolling as wheel notches")
+                wheel.lineDeltaX = 0; wheel.lineDeltaY = -3
+                viewer.peer.send(try Wire.json(.input, wheel))
+                let rejected = try probe.next("ended")
+                try require((rejected["reason"] as? String)?.contains("无效") == true, "Windows accepted a line wheel carrying trackpad phases")
+            }
+            try withWindowsHost { probe, viewer in
+                try until("the Mac has a picture from the Windows host without trackpad gestures") { !viewer.state.get().decoded.isEmpty }
+                var smart = RemoteInput(kind: .smartMagnify)
+                smart.x = 0.2; smart.y = 0.8; smart.gesturePhase = .ended
+                try viewer.send(smart)
+                var wheel = RemoteInput(kind: .scroll)
+                wheel.x = 0.25; wheel.y = 0.5; wheel.deltaY = 36; wheel.lineDeltaX = 0; wheel.lineDeltaY = 3
+                try viewer.send(wheel)
+                try require(try probe.next("inject")["operations"] as? [String] == ["Move { x: 0.25, y: 0.5 }", "Wheel { vertical: 120, horizontal: 0 }"],
+                            "An older Windows host acted on a new gesture or lost the legacy line wheel")
+            }
+        }
+
         run("Mac keys, modifiers, clicks and scrolling reach a Windows host as the keys at the same positions") {
             func operations(_ probe: Probe) throws -> [String] { (try probe.next("inject")["operations"] as? [String]) ?? [] }
             try withWindowsHost { probe, viewer in
@@ -1327,9 +1404,10 @@ private struct WindowsInteropChecks {
             }
         }
 
-        func withMacHost(advertiseMedia: Bool = true, cursorImage: CursorImage? = nil, twoDisplays: Bool = false, inputActions: Bool = true, relativeMouse: Bool = true, viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
+        func withMacHost(advertiseMedia: Bool = true, cursorImage: CursorImage? = nil, twoDisplays: Bool = false, inputActions: Bool = true, relativeMouse: Bool = true,
+                         trackpadGestures: Bool = true, viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
             let host = try MacHost(key: key, packets: packets, size: size, advertiseMedia: advertiseMedia, cursorImage: cursorImage,
-                                   externalPackets: twoDisplays ? externalPackets : [], inputActions: inputActions, relativeMouse: relativeMouse)
+                                   externalPackets: twoDisplays ? externalPackets : [], inputActions: inputActions, relativeMouse: relativeMouse, trackpadGestures: trackpadGestures)
             defer { host.stop() }
             let probe = try Probe(probePath, ["viewer", "--code", (viewerKey ?? key).code, "--port", "\(host.port)", "--quality", quality] + extra)
             defer { probe.stop() }
@@ -1600,6 +1678,62 @@ private struct WindowsInteropChecks {
                 let inputs = host.state.get().inputs
                 try require(inputs.count == 1 && inputs[0].kind == .move && inputs[0].relativeMouse == nil && inputs[0].pointerDeltaX == nil
                             && inputs[0].x == 0.25 && inputs[0].y == 0.75, "An old Mac received a locked movement or lost its absolute move")
+            }
+        }
+
+        run("Windows pixel scrolling, momentum and trackpad gestures become native phased Mac events") {
+            func scroll(_ probe: Probe, phase: RemoteInput.ScrollPhase? = nil, momentum: RemoteInput.MomentumPhase? = nil, dx: Double = 0, dy: Double = 0) throws {
+                var command: [String: Any] = ["command": "preciseScroll", "dx": dx, "dy": dy, "x": 0.25, "y": 0.5]
+                command["phase"] = phase?.rawValue
+                command["momentum"] = momentum?.rawValue
+                try probe.send(command)
+            }
+            func smart(_ probe: Probe) throws {
+                try probe.send(["command": "gesture", "gesture": "smartMagnify", "phase": 4, "x": 0.1, "y": 0.9, "relative": true])
+            }
+            try withMacHost { host, probe in
+                try require(try probe.next("connected")["trackpadGestures"] as? Bool == true, "Windows missed the Mac gesture capability")
+                _ = try probe.next("frame")
+                try scroll(probe, phase: .began)
+                try scroll(probe, phase: .changed, dx: 0.25, dy: -0.5)
+                try scroll(probe, phase: .changed, dx: 1.75, dy: -2.5)
+                try scroll(probe, phase: .ended)
+                try scroll(probe, momentum: .began, dx: 1, dy: -4)
+                try scroll(probe, momentum: .changed, dx: 2, dy: -1)
+                try scroll(probe, momentum: .ended)
+                try probe.send(["command": "gesture", "gesture": ["magnify": 0.375], "phase": 2, "x": 0.25, "y": 0.5])
+                try probe.send(["command": "gesture", "gesture": ["rotate": -18.5], "phase": 1, "x": 0.25, "y": 0.5])
+                try smart(probe)
+                try probe.send(["command": "release"])
+                try probe.send(["command": "requestClipboard"])
+                _ = try probe.next("clipboardText")
+                let state = host.state.get(), target = CGPoint(x: 399.75, y: 449.5)
+                let wheels = state.posted.filter { $0.type == .scrollWheel }
+                let native = wheels.compactMap(\.trackpad)
+                try require(native.map(\.phase) == [.began, .changed, .ended, [], [], []] && native.map(\.momentum) == [[], [], [], .began, .changed, .ended]
+                            && native.allSatisfy(\.precise), "A Windows touch or inertia phase was lost or became a line wheel on the Mac")
+                try require(wheels.map { $0.pixels.x } == [0, 2, 0, 1, 2, 0] && wheels.map { $0.pixels.y } == [0, -3, 0, -4, -1, 0]
+                            && wheels.allSatisfy { $0.location == target }, "Precise scroll lost the Windows subpixel totals or the target")
+                let gestures = state.posted.compactMap(\.trackpad).filter { $0.type != .scrollWheel }
+                try require(gestures.map(\.type) == [.magnify, .magnify, .rotate, .smartMagnify, .magnify, .rotate],
+                            "Windows gestures arrived as different native Mac events")
+                try require(gestures[0].phase == .began && gestures[1].phase == .changed && abs(gestures[1].value - 0.375) < 0.001
+                            && gestures[2].phase == .began && abs(gestures[2].value + 18.5) < 0.001 && gestures.suffix(2).allSatisfy { $0.phase == .ended },
+                            "A native gesture lost its scale, rotation, or release phase")
+                try require(state.inputs.last?.kind == .smartMagnify && state.inputs.last?.relativeMouse == true
+                            && state.posted.filter { $0.trackpad != nil }.allSatisfy { $0.location == target },
+                            "Locked smart zoom did not stay on the current remote target")
+            }
+            try withMacHost(trackpadGestures: false) { host, probe in
+                try require(try probe.next("connected")["trackpadGestures"] as? Bool == false, "Windows enabled gestures for an old Mac")
+                try smart(probe)
+                try scroll(probe, dx: 3, dy: -7)
+                try probe.send(["command": "wheel", "vertical": 1, "horizontal": 0, "x": 0.25, "y": 0.5])
+                try probe.send(["command": "requestClipboard"])
+                _ = try probe.next("clipboardText")
+                let state = host.state.get(), wheels = state.posted.filter { $0.type == .scrollWheel }
+                try require(state.inputs.map(\.kind) == [.scroll, .scroll] && wheels.compactMap { $0.trackpad?.precise } == [true, false]
+                            && wheels[0].pixels == (3, -7) && wheels[1].lines.y == 3, "Gesture negotiation disabled pixel scrolling or changed the older Mac's line wheel")
             }
         }
 

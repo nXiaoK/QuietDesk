@@ -3,6 +3,7 @@
 use super::capture::ScreenCapture;
 use super::codec::{H264Encoder, MediaFoundation};
 use super::displays::{self, Display};
+use super::gesture_host::GestureHost;
 use super::host_cursor::CursorSampler;
 use super::util::Com;
 use super::{clipboard, inject};
@@ -298,10 +299,15 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
 pub struct WindowsHost {
     commands: Sender<Command>,
     buttons: inject::MouseButtons,
+    gestures: GestureHost,
     input_display: Arc<Mutex<Option<Display>>>,
 }
 
 impl WindowsHost {
+    fn input_bounds(&self) -> Option<windows::Win32::Foundation::RECT> {
+        self.input_display.lock().unwrap().as_ref().filter(|d| d.still_at_bounds()).map(|d| d.bounds)
+    }
+
     pub fn start(preferred: Option<u32>) -> Self {
         Self::start_notifying(preferred, || false)
     }
@@ -311,7 +317,7 @@ impl WindowsHost {
         let input_display = Arc::new(Mutex::new(None));
         let shared = input_display.clone();
         std::thread::Builder::new().name("capture".to_string()).spawn(move || run(queue, shared, preferred, capture_lost)).expect("the capture thread starts");
-        Self { commands, buttons: inject::MouseButtons::default(), input_display }
+        Self { commands, buttons: inject::MouseButtons::default(), gestures: GestureHost::new(), input_display }
     }
 }
 
@@ -320,6 +326,18 @@ fn stopped() -> DeskError {
 }
 
 impl HostPlatform for WindowsHost {
+    fn supports_trackpad_gestures(&self) -> bool {
+        self.gestures.available()
+    }
+
+    fn gesture_check_at(&self) -> Option<tokio::time::Instant> {
+        self.gestures.check_at()
+    }
+
+    fn check_gestures(&mut self) {
+        self.gestures.check(self.input_bounds());
+    }
+
     fn supports_relative_mouse(&self) -> bool {
         true
     }
@@ -380,8 +398,7 @@ impl HostPlatform for WindowsHost {
     }
 
     fn inject(&mut self, operations: &[InjectOp]) -> bool {
-        let area = self.input_display.lock().unwrap().as_ref().filter(|d| d.still_at_bounds()).map(|d| d.bounds);
-        inject::inject(operations, area, &mut self.buttons)
+        inject::inject(operations, self.input_bounds(), &mut self.buttons, &mut self.gestures)
     }
 
     fn clipboard_text(&mut self) -> Option<String> {
@@ -393,6 +410,7 @@ impl HostPlatform for WindowsHost {
     }
 
     fn stop(&mut self) {
+        self.gestures.cancel();
         self.buttons.release_all();
     }
 }

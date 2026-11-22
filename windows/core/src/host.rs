@@ -186,6 +186,14 @@ pub trait HostPlatform {
     fn supports_relative_mouse(&self) -> bool {
         false
     }
+    fn supports_trackpad_gestures(&self) -> bool {
+        false
+    }
+    /// A stable deadline while injected contacts require a target or driver check.
+    fn gesture_check_at(&self) -> Option<Instant> {
+        None
+    }
+    fn check_gestures(&mut self) {}
     /// Dropping the future cancels remaining work. Feedback describes the host's observed lock state.
     fn input_action(&mut self, _action: InputAction) -> impl Future<Output = Result<InputActionOutcome>> + Send + 'static {
         std::future::ready(Err(DeskError::platform("当前系统不支持远端键盘动作")))
@@ -253,6 +261,7 @@ struct HostSession<'a, P: HostPlatform> {
     translator: HostInputTranslator,
     input_actions: bool,
     relative_mouse: bool,
+    trackpad_gestures: bool,
     input_action: Option<PendingInputAction>,
     queued_input: VecDeque<RemoteInput>,
     keyboard_needs_click: bool,
@@ -283,6 +292,7 @@ pub async fn run<P: HostPlatform>(
     let translator = HostInputTranslator::new(options.modifiers);
     let input_actions = platform.supports_input_actions();
     let relative_mouse = platform.supports_relative_mouse();
+    let trackpad_gestures = platform.supports_trackpad_gestures();
     let mut session = HostSession {
         peer: &peer,
         platform,
@@ -293,6 +303,7 @@ pub async fn run<P: HostPlatform>(
         translator,
         input_actions,
         relative_mouse,
+        trackpad_gestures,
         input_action: None,
         queued_input: VecDeque::new(),
         keyboard_needs_click: false,
@@ -330,6 +341,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
         let start_by = Instant::now() + INITIAL_SETTINGS_GRACE;
         loop {
             let media_deadline = self.media.deadline().into_iter().chain(self.media.recovery().map(|_| self.recover_after)).min();
+            let gesture_check = self.platform.gesture_check_at();
             let outcome = tokio::select! {
                 event = incoming.recv() => match event {
                     Some(PeerEvent::Message(message)) => self.receive(message, events).await,
@@ -339,6 +351,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 },
                 _ = tokio::time::sleep_until(start_by), if self.state.is_none() => self.start(initial, events).await.map(drop),
                 _ = tokio::time::sleep_until(media_deadline.unwrap_or(start_by)), if !self.paused && media_deadline.is_some() => self.tick_media(),
+                _ = tokio::time::sleep_until(gesture_check.unwrap_or(start_by)), if gesture_check.is_some() => { self.platform.check_gestures(); Ok(()) }
                 frame = next_frame(&mut self.frames) => self.send_frame(frame),
                 feedback = async { self.input_action.as_mut().expect("active input action").await }, if self.input_action.is_some() => self.finish_input_action(feedback),
                 sample = self.cursor.changed(), if !self.paused => match sample {
@@ -385,6 +398,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 can_control: self.options.allow_control,
                 input_actions: self.input_actions.then_some(true),
                 relative_mouse_v1: self.relative_mouse.then_some(true),
+                trackpad_gestures_v1: self.trackpad_gestures.then_some(true),
                 live_settings: Some(true),
                 control_status_updates: Some(true),
                 extended_video_settings: Some(true),
@@ -699,7 +713,11 @@ impl<P: HostPlatform> HostSession<'_, P> {
     fn release_input(&mut self) {
         self.input_action = None;
         self.queued_input.clear();
-        let released = self.translator.release_all();
+        let mut released = self.translator.release_all();
+        if self.trackpad_gestures {
+            // The platform may still own contacts if a preceding final frame failed.
+            released.push(InjectOp::CancelGestures);
+        }
         self.platform.inject(&released);
     }
 
@@ -764,6 +782,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 let mut input: RemoteInput = message.read_json()?;
                 input.validate()?;
                 if input.relative_mouse == Some(true) && !self.relative_mouse {
+                    return Ok(());
+                }
+                if input.kind.is_gesture() && !self.trackpad_gestures {
                     return Ok(());
                 }
                 if !self.input_actions {

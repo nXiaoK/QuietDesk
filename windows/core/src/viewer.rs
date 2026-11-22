@@ -1,14 +1,16 @@
 //! The viewer side of a session: the role of `DeskModel.handleViewer` in the macOS application, for a
-//! viewer that receives video over the control connection and uses only what the host advertised.
+//! viewer that negotiates its media paths and platform capabilities with the host.
 
 use crate::audio_session::{AudioPlayback, ViewerAudio};
 use crate::auxiliary::{Auxiliary, AuxiliaryEvent};
 use crate::clipboard_session::SessionClipboard;
 use crate::cursor::{CursorControl, CursorOperation, CursorPosition, CursorPresentationState, CursorShape};
+use crate::datagram_path::{DatagramPath, PathEvent};
 use crate::display::{DisplayControl, RemoteDisplayInfo};
 use crate::error::{DeskError, Result};
+use crate::media::fragment::{ReceiveEvent, Receiver};
 use crate::media::{DecodeReceipt, MediaControl, MediaStreamId, ViewerMedia, ViewerMediaEvent};
-use crate::media::{MediaOperation, ReliablePath};
+use crate::media::{FeedbackKind, MediaFeedback, MediaOperation, MediaPath};
 use crate::messages::{
     ControlStatus, DeviceIdentity, HOST_ENDED_REASON, Hello, InputFeedback, RemoteInput, SessionPauseRequest, SessionPauseResult, SessionTermination,
     StreamSettings, StreamSettingsRequest, StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState, device_display_name,
@@ -153,6 +155,12 @@ pub trait ViewerPlatform {
     fn event(&mut self, event: ViewerEvent);
 }
 
+struct ReceivingDatagrams {
+    frames: Receiver,
+    stream: MediaStreamId,
+    poll_at: Instant,
+}
+
 struct ViewerSession<'a, P: ViewerPlatform> {
     peer: &'a PeerHandle,
     platform: &'a mut P,
@@ -180,6 +188,8 @@ struct ViewerSession<'a, P: ViewerPlatform> {
     clipboard: Option<SessionClipboard>,
     audio: ViewerAudio,
     auxiliary: Auxiliary,
+    datagrams: DatagramPath,
+    udp_receiver: Option<ReceivingDatagrams>,
     host_ended: bool,
     progress: &'a AttemptProgress,
 }
@@ -204,7 +214,7 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
     attempt: Attempt,
     mut acknowledgements: mpsc::UnboundedReceiver<DecodeReceipt>,
 ) -> ViewerEnd {
-    let Attempt { quality, mut commands, progress, auxiliary } = attempt;
+    let Attempt { quality, mut commands, progress, auxiliary, datagram } = attempt;
     let mut session = ViewerSession {
         peer: &peer,
         platform,
@@ -231,6 +241,8 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
         clipboard: None,
         audio: ViewerAudio::default(),
         auxiliary: Auxiliary::viewer(auxiliary),
+        datagrams: DatagramPath::new(datagram),
+        udp_receiver: None,
         host_ended: false,
         progress: &progress,
     };
@@ -241,6 +253,7 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
         let cursor_by = session.pending_cursor.map(|(_, deadline)| deadline);
         let display_by = session.display_request.map(|(_, _, deadline)| deadline);
         let input_by = session.input_reply_deadline;
+        let fragment_by = session.udp_receiver.as_ref().map(|receiver| receiver.poll_at);
         let bulk = session.auxiliary.peer(AuxiliaryRole::Bulk).cloned();
         let outcome = tokio::select! {
             event = incoming.recv() => match event {
@@ -250,6 +263,8 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
                 None => Err(DeskError::Network("连接已关闭".to_string())),
             },
             audio = session.audio.next() => session.audio.deliver(audio, &peer, session.platform),
+            event = session.datagrams.next() => session.datagram_event(event),
+            _ = tokio::time::sleep_until(fragment_by.unwrap_or(hello_by)), if fragment_by.is_some() => session.poll_datagrams(),
             event = session.auxiliary.next() => session.auxiliary_event(event),
             status = SessionClipboard::next(&mut session.clipboard, &peer, bulk.as_ref()) => match status {
                 Ok(Some(status)) => { session.platform.event(ViewerEvent::ClipboardStatus(status)); Ok(()) }
@@ -327,10 +342,14 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             }
             MessageKind::MediaControl => {
                 let control = MediaControl::read(&message)?;
-                self.update_media(|media| media.control(&control, Instant::now()))?;
                 if control.operation == MediaOperation::Offer {
-                    self.auxiliary.offer(&control);
+                    let media = self.media.as_mut().ok_or_else(|| DeskError::invalid("当前连接未协商媒体会话"))?;
+                    if !media.has_offer() {
+                        media.set_udp_available(self.datagrams.offer(&control, false));
+                        self.auxiliary.offer(&control);
+                    }
                 }
+                self.update_media(|media| media.control(&control, Instant::now()))?;
             }
             MessageKind::DisplayControl if hello.display_switching_v1 == Some(true) => self.receive_displays(DisplayControl::read(&message)?)?,
             MessageKind::MediaFrame => self.update_media(|media| media.frame(&message.payload, Instant::now()))?,
@@ -394,6 +413,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                     self.pending_pause = None;
                     self.paused = result.paused;
                     self.audio.pause(self.paused);
+                    self.datagrams.pause(self.paused);
                     if self.media.is_some() {
                         self.update_media(|media| media.set_paused(result.paused, Instant::now()))?;
                     }
@@ -474,7 +494,9 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 media.enable_auxiliary();
             }
             self.media = Some(media);
-            self.peer.send(&ViewerMedia::request().message()?)?;
+            let mut request = ViewerMedia::request();
+            request.marked_repairs = self.datagrams.enabled().then_some(true);
+            self.peer.send(&request.message()?)?;
         }
         let confirm = live_settings && hello.initial_stream_negotiation_v1 == Some(true);
         self.hello = Some(hello);
@@ -538,7 +560,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             }
             AuxiliaryEvent::Message(AuxiliaryRole::Video, message) => {
                 let update =
-                    self.media.as_mut().ok_or_else(|| DeskError::invalid("媒体会话尚未协商"))?.frame_on(ReliablePath::Tcp, &message.payload, Instant::now());
+                    self.media.as_mut().ok_or_else(|| DeskError::invalid("媒体会话尚未协商"))?.frame_on(MediaPath::Tcp, &message.payload, Instant::now());
                 match update {
                     Ok(events) => self.apply_media_events(events),
                     Err(_) => {
@@ -557,6 +579,66 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         }
     }
 
+    fn datagram_event(&mut self, event: PathEvent) -> Result<()> {
+        match event {
+            PathEvent::Verified => self.update_media(|media| media.set_udp_verified(true, Instant::now())),
+            PathEvent::Lost => self.lose_datagrams(),
+            PathEvent::Record(3 | 5, data) => {
+                let Some(receiver) = &mut self.udp_receiver else { return Ok(()) };
+                match receiver.frames.push(&data[1..], Instant::now()) {
+                    Ok(events) => self.receive_datagrams(events),
+                    Err(_) => self.lose_datagrams(),
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn lose_datagrams(&mut self) -> Result<()> {
+        self.datagrams.retire();
+        self.update_media(|media| media.set_udp_verified(false, Instant::now()))
+    }
+
+    fn poll_datagrams(&mut self) -> Result<()> {
+        let Some(receiver) = &mut self.udp_receiver else { return Ok(()) };
+        let now = Instant::now();
+        receiver.poll_at = now + Duration::from_millis(10);
+        receiver.frames.set_round_trip(self.datagrams.rtt);
+        let events = receiver.frames.poll(now);
+        self.receive_datagrams(events)
+    }
+
+    fn sync_datagram_receiver(&mut self) {
+        let stream = self.media.as_ref().filter(|media| media.frame_path() == MediaPath::Udp).and_then(ViewerMedia::receiving_stream);
+        if stream != self.udp_receiver.as_ref().map(|receiver| receiver.stream) {
+            self.udp_receiver = stream.map(|stream| ReceivingDatagrams { frames: Receiver::new(stream), stream, poll_at: Instant::now() });
+        }
+    }
+
+    fn send_datagram_feedback(&self, feedback: &MediaFeedback) {
+        let payload = feedback.message().payload;
+        let mut datagram = Vec::with_capacity(1 + payload.len());
+        datagram.push(4);
+        datagram.extend_from_slice(&payload);
+        // NACK and cumulative decode status are repeated by the receiver if the send queue is full.
+        self.datagrams.send(datagram);
+    }
+
+    fn receive_datagrams(&mut self, events: Vec<ReceiveEvent>) -> Result<()> {
+        for event in events {
+            match event {
+                ReceiveEvent::Frame(frame) => self.update_media(|media| media.assembled_frame(frame, Instant::now()))?,
+                ReceiveEvent::Feedback(feedback) => {
+                    self.send_datagram_feedback(&feedback);
+                    if feedback.kind == FeedbackKind::Expired {
+                        return self.lose_datagrams();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn update_media(&mut self, update: impl FnOnce(&mut ViewerMedia) -> Result<Vec<ViewerMediaEvent>>) -> Result<()> {
         let media = self.media.as_mut().ok_or_else(|| DeskError::invalid("当前连接未协商媒体会话"))?;
         let events = update(media)?;
@@ -564,18 +646,36 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
     }
 
     fn apply_media_events(&mut self, events: Vec<ViewerMediaEvent>) -> Result<()> {
+        self.sync_datagram_receiver();
+        let mut after_commit = Vec::new();
         for event in events {
             match event {
                 ViewerMediaEvent::Send(message) => self.peer.send(&message)?,
+                ViewerMediaEvent::DatagramFeedback(feedback) => {
+                    self.send_datagram_feedback(&feedback);
+                    if feedback.kind == FeedbackKind::Decoded
+                        && let Some(receiver) = &mut self.udp_receiver
+                    {
+                        let ready = receiver.frames.decoded(feedback.header, Instant::now());
+                        self.receive_datagrams(ready)?;
+                    }
+                }
                 ViewerMediaEvent::Video(packet, stream, first_in_stream) => self.platform.media_video(packet, stream, first_in_stream)?,
                 ViewerMediaEvent::Committed(stream) => {
                     if self.cursor.commit(stream) {
                         self.platform.event(ViewerEvent::Cursor(Arc::new(self.cursor.clone())));
                     }
                     self.platform.media_committed(stream)?;
+                    if let Some(receiver) = &mut self.udp_receiver {
+                        after_commit = receiver.frames.committed(stream, Instant::now());
+                    }
                 }
             }
         }
+        if self.datagrams.verified() && self.media.as_ref().is_some_and(|media| !media.udp_verified()) {
+            self.datagrams.retire();
+        }
+        self.receive_datagrams(after_commit)?;
         // The host must receive committed before a request that interrupts capture to change cursor mode.
         self.request_cursor()
     }
@@ -1047,6 +1147,151 @@ mod tests {
         assert!(end.host_ended);
         assert!(!end.retryable);
         assert_eq!(end.reason, HOST_ENDED_REASON);
+    }
+
+    #[tokio::test]
+    async fn the_viewer_repairs_a_missing_keyframe_fragment_and_falls_back_when_dtls_stops() {
+        use crate::media::HostFrame;
+        use crate::media::fragment::RepairCache;
+
+        struct Output(mpsc::UnboundedSender<VideoPacket>);
+        impl ViewerPlatform for Output {
+            fn video(&mut self, _: VideoPacket) -> Result<()> {
+                unreachable!()
+            }
+            fn media_video(&mut self, packet: VideoPacket, _: MediaStreamId, _: bool) -> Result<()> {
+                self.0.send(packet).unwrap();
+                Ok(())
+            }
+            fn event(&mut self, _: ViewerEvent) {}
+        }
+
+        async fn feedback(path: &mut DatagramPath, kind: FeedbackKind, frame_id: u64) -> MediaFeedback {
+            loop {
+                let PathEvent::Record(4, bytes) = path.next().await else { panic!("the verified datagram path closed") };
+                let feedback = MediaFeedback::decode(&bytes[1..]).unwrap();
+                if feedback.kind == kind && feedback.header.frame_id == frame_id {
+                    return feedback;
+                }
+            }
+        }
+
+        let address = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let mut path = DatagramPath::new(Some(address));
+        let (left, right) = tokio::io::duplex(64 * 1024);
+        let (host, mut messages) = peer::spawn(left, PeerConfig::default());
+        let (viewer, incoming) = peer::spawn(right, PeerConfig::default());
+        let (commands, queue) = mpsc::unbounded_channel();
+        let (decoder, acknowledgements) = mpsc::unbounded_channel();
+        let (output, mut pictures) = mpsc::unbounded_channel();
+        let mut platform = Output(output);
+        let quality = StreamSettings::new(1920, 30, 8);
+        let session = Attempt::new(quality, queue).with_datagrams(address).run(viewer, incoming, &mut platform, acknowledgements);
+        let exchange = async {
+            let hello =
+                serde_json::json!({"version":1, "name":"host", "width":640, "height":360, "settings":quality, "canControl":false, "mediaTransportV1":true});
+            host.send(&Message::json(MessageKind::Hello, &hello).unwrap()).unwrap();
+            let request = MediaControl::read(&next(&mut messages).await).unwrap();
+            assert_eq!(request.marked_repairs, Some(true));
+            let mut media = HostMedia::default();
+            media.set_udp_available(true);
+            let Some(HostMediaEvent::Send(offer)) = media.control(&request, false).unwrap().pop() else { panic!("expected offer") };
+            assert!(path.offer(&offer, true));
+            host.send(&offer.message().unwrap()).unwrap();
+            assert!(matches!(path.next().await, PathEvent::Verified));
+            media.set_udp_verified(true);
+            let prepare = MediaControl::read(&next(&mut messages).await).unwrap();
+            assert_eq!(prepare.path.as_deref(), Some("udp"));
+            media.control(&prepare, false).unwrap();
+            let stream = media.preparing().unwrap();
+            host.send(&media.prepared().unwrap().message().unwrap()).unwrap();
+            let ready = MediaControl::read(&next(&mut messages).await).unwrap();
+            media.control(&ready, false).unwrap();
+            let mut avcc = 1500u32.to_be_bytes().to_vec();
+            avcc.push(0x65);
+            avcc.resize(1504, 7);
+            let encoded = EncodedFrame { sps: vec![0x67], pps: vec![0x68], avcc };
+            let HostFrame::Datagram(frame) = media.frame(3, encoded).unwrap() else { panic!("expected UDP IDR") };
+            let now = Instant::now();
+            let mut cache = RepairCache::new(stream);
+            let parts = cache.insert(&frame, now, now + Duration::from_secs(2)).unwrap();
+            assert_eq!(parts.len(), 2);
+            let record = |kind: u8, index: usize| [vec![kind], parts[index].record()].concat();
+            assert!(path.send(record(3, 1)));
+            let missing = feedback(&mut path, FeedbackKind::Nack, 1).await;
+            assert_eq!(missing.missing_ranges(), [crate::media::FragmentRange { first: 0, count: 1 }]);
+            assert!(path.send(record(5, 0)));
+            assert_eq!(feedback(&mut path, FeedbackKind::Reassembled, 1).await.header, frame.header);
+            assert_eq!(pictures.recv().await.unwrap(), frame.packet);
+            decoder.send(DecodeReceipt::Media(stream, 3)).unwrap();
+            assert_eq!(feedback(&mut path, FeedbackKind::Decoded, 1).await.header, frame.header);
+            let decoded_ready = MediaControl::read(&next(&mut messages).await).unwrap();
+            assert_eq!(decoded_ready.operation, MediaOperation::DecodedReady);
+            let Some(HostMediaEvent::Send(commit)) = media.control(&decoded_ready, false).unwrap().pop() else { panic!("expected commit") };
+            host.send(&commit.message().unwrap()).unwrap();
+            let committed = MediaControl::read(&next(&mut messages).await).unwrap();
+            assert_eq!(committed.operation, MediaOperation::Committed);
+            media.control(&committed, false).unwrap();
+            let mut buffered = None;
+            for sequence in 4..=12 {
+                let delta = EncodedFrame { sps: vec![], pps: vec![], avcc: vec![0, 0, 0, 2, 0x41, sequence as u8] };
+                let HostFrame::Datagram(source) = media.frame(sequence, delta).unwrap() else { panic!("expected UDP P frame") };
+                let now = Instant::now();
+                let parts = cache.insert(&source, now, now + Duration::from_secs(2)).unwrap();
+                assert!(path.send([vec![3], parts[0].record()].concat()));
+                cache.submitted(source.header, 0, now);
+                assert_eq!(pictures.recv().await.unwrap(), source.packet);
+                // This decoder produces the buffered picture only after receiving the following access unit.
+                if let Some(previous) = buffered.replace(sequence) {
+                    decoder.send(DecodeReceipt::Media(stream, previous)).unwrap();
+                    let ack = feedback(&mut path, FeedbackKind::Decoded, source.header.frame_id - 1).await;
+                    cache.feedback(&ack, Instant::now(), path.rtt);
+                    assert_eq!(media.feedback(&ack), (1, vec![]));
+                }
+            }
+            path.retire();
+            let fallback = MediaControl::read(&next(&mut messages).await).unwrap();
+            assert_eq!((fallback.operation, fallback.path.as_deref()), (MediaOperation::Prepare, Some("shared")));
+            assert!(fallback.transport_epoch.unwrap() > stream.transport_epoch);
+            commands.send(ViewerCommand::Disconnect).unwrap();
+        };
+        let (end, ()) = tokio::time::timeout(Duration::from_secs(15), async { tokio::join!(session, exchange) }).await.unwrap();
+        assert!(end.local_stop);
+    }
+
+    #[tokio::test]
+    async fn a_refused_udp_transaction_releases_its_probe_while_reliable_video_continues() {
+        let address = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let (left, right) = tokio::io::duplex(64 * 1024);
+        let (host, mut messages) = peer::spawn(left, PeerConfig::default());
+        let (viewer, incoming) = peer::spawn(right, PeerConfig::default());
+        let (commands, queue) = mpsc::unbounded_channel();
+        let (_decoder, acknowledgements) = mpsc::unbounded_channel();
+        let quality = StreamSettings::new(1920, 30, 8);
+        let mut decoder = Decoder;
+        let session = Attempt::new(quality, queue).with_datagrams(address).run(viewer, incoming, &mut decoder, acknowledgements);
+        let exchange = async {
+            let hello =
+                serde_json::json!({"version":1, "name":"host", "width":640, "height":360, "settings":quality, "canControl":false, "mediaTransportV1":true});
+            host.send(&Message::json(MessageKind::Hello, &hello).unwrap()).unwrap();
+            let request = MediaControl::read(&next(&mut messages).await).unwrap();
+            let mut media = HostMedia::default();
+            media.set_udp_available(true);
+            let Some(HostMediaEvent::Send(offer)) = media.control(&request, false).unwrap().pop() else { panic!("expected offer") };
+            let mut path = DatagramPath::new(Some(address));
+            assert!(path.offer(&offer, true));
+            host.send(&offer.message().unwrap()).unwrap();
+            assert!(matches!(path.next().await, PathEvent::Verified));
+            let prepare = MediaControl::read(&next(&mut messages).await).unwrap();
+            assert_eq!(prepare.path.as_deref(), Some("udp"));
+            host.send(&MediaControl { operation: MediaOperation::Abort, ..prepare }.message().unwrap()).unwrap();
+            let fallback = MediaControl::read(&next(&mut messages).await).unwrap();
+            assert_eq!((fallback.operation, fallback.path.as_deref()), (MediaOperation::Prepare, Some("shared")));
+            assert!(matches!(path.next().await, PathEvent::Lost));
+            commands.send(ViewerCommand::Disconnect).unwrap();
+        };
+        let (end, ()) = tokio::time::timeout(Duration::from_secs(6), async { tokio::join!(session, exchange) }).await.unwrap();
+        assert!(end.local_stop);
     }
 
     #[tokio::test]

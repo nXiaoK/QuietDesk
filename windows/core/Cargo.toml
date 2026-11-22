@@ -8,8 +8,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+foreign-types = "0.3.2"
 log.workspace = true
 openssl.workspace = true
+openssl-sys = "0.9.118"
 opus = "0.4.0"
 png = "0.18.1"
 serde.workspace = true

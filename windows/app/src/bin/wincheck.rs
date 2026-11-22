@@ -39,11 +39,15 @@ fn main() {
         Some("displays") => {
             use quietdesk_core::host::HostPlatform;
             use quietdesk_windows::win::{displays, pipeline::WindowsHost};
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap_or_else(|error| fail("runtime", error));
             let outputs = displays::available(None).unwrap_or_else(|error| fail("displays", error));
             for output in &outputs {
                 let mut host = WindowsHost::start(Some(output.id));
                 let size = host.display_size().unwrap_or_else(|error| fail("selected display capture", error));
-                let actual = host.displays().unwrap_or_else(|error| fail("display topology", error)).unwrap_or_else(|| fail("displays", "no topology"));
+                let actual = runtime
+                    .block_on(host.displays())
+                    .unwrap_or_else(|error| fail("display topology", error))
+                    .unwrap_or_else(|| fail("displays", "no topology"));
                 if actual.needs_restart || actual.selected_display_id != output.id || size != (output.width, output.height) {
                     fail("displays", "selected capture disagrees with monitor topology");
                 }
@@ -287,13 +291,13 @@ fn cursor_check() -> quietdesk_core::error::Result<()> {
 
     let mut host = WindowsHost::start(None);
     let (w, h) = host.display_size()?;
-    let topology = host.displays()?.ok_or_else(|| DeskError::platform("missing display list"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().map_err(|error| DeskError::platform(error.to_string()))?;
+    let topology = runtime.block_on(host.displays())?.ok_or_else(|| DeskError::platform("missing display list"))?;
     topology.validate()?;
     let main = topology.displays.iter().find(|d| d.is_main).ok_or_else(|| DeskError::platform("missing primary display"))?;
     if topology.selected_display_id != main.id || (main.width, main.height) != (w, h) {
         return Err(DeskError::platform("default capture disagrees with the primary monitor"));
     }
-    let runtime = tokio::runtime::Builder::new_current_thread().build().map_err(|error| DeskError::platform(error.to_string()))?;
     let (updates, mut samples) = tokio::sync::watch::channel(None);
     runtime.block_on(host.configure_cursor(Some(updates)))?;
     let sample = samples.borrow_and_update().clone().ok_or_else(|| DeskError::platform("missing initial system cursor sample"))?;

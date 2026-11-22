@@ -83,10 +83,11 @@ if ! wait "$viewer_pid"; then
     failed=1
 fi
 grep -E "^(viewer ended|PASS|FAIL)" /tmp/viewer.log
-if grep -q 'viewer committed tcp media stream' /tmp/viewer.log; then
-    echo 'PASS video committed on the dedicated TCP connection'
+if grep -q 'viewer committed udp media stream' /tmp/viewer.log && grep -q 'viewer decoded continuous udp video' /tmp/viewer.log; then
+    echo 'PASS viewer committed and decoded a continuing H.264 stream over verified DTLS datagrams'
 else
-    echo 'FAIL viewer did not commit a dedicated TCP media stream'
+    grep -E 'media (DTLS|UDP)|committed .* media stream|decoded continuous' /tmp/viewer.log | tail -12
+    echo 'FAIL viewer did not confirm continuing UDP video after the opening keyframe'
     failed=1
 fi
 awk '

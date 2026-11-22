@@ -14,7 +14,7 @@ use quietdesk_core::clipboard_session::SessionClipboard;
 use quietdesk_core::cursor::CursorImage;
 use quietdesk_core::display::{DisplaySwitch, HostDisplays, RemoteDisplayInfo};
 use quietdesk_core::error::{DeskError, Result};
-use quietdesk_core::host::{self, FrameSink, HostCommand, HostCursorSample, HostEvent, HostOptions, HostPlatform, InputActionOutcome};
+use quietdesk_core::host::{self, FrameSink, HostCommand, HostConnections, HostCursorSample, HostEvent, HostOptions, HostPlatform, InputActionOutcome};
 use quietdesk_core::input::{CapsLockPress, DoubleClick, InjectOp, PcKeyEvent, ViewerInputTranslator};
 use quietdesk_core::keymap::{MacModifierMapping, PcModifierMapping};
 use quietdesk_core::media::{DecodeReceipt, MediaStreamId};
@@ -125,7 +125,7 @@ impl HostPlatform for ReplayHost {
         Ok(if self.replay.lock().unwrap().display_id == 2 { EXTERNAL_SIZE } else { self.size })
     }
 
-    fn displays(&mut self) -> Result<Option<HostDisplays>> {
+    async fn displays(&mut self) -> Result<Option<HostDisplays>> {
         if !self.synthetic_displays {
             return Ok(None);
         }
@@ -308,6 +308,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
     emit(json!({ "event": "listening", "port": listener.local_addr()?.port() }));
     let acceptor = tls::Acceptor::new(&key)?;
     let auxiliary_enabled = !arguments.contains_key("no-auxiliary");
+    let datagrams_enabled = auxiliary_enabled && !arguments.contains_key("no-udp");
     let mut lines = input_lines();
 
     let replay = Arc::new(Mutex::new(Replay {
@@ -347,6 +348,10 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
         drop(waiting);
         let mut active = tls::PendingHandshakes::new(&acceptor);
         let (auxiliary, accepted) = mpsc::channel(4);
+        let connections = HostConnections {
+            auxiliary: auxiliary_enabled.then_some(accepted),
+            datagram: if datagrams_enabled { stream.get_ref().local_addr().ok() } else { None },
+        };
         emit(json!({ "event": "accepted" }));
         let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
         let (commands, command_queue) = mpsc::unbounded_channel();
@@ -374,8 +379,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
             HostEvent::ClipboardStatus(message) => emit(json!({"event":"clipboardStatus","message":message})),
             _ => {}
         };
-        let session =
-            host::run_with_auxiliary(peer.clone(), incoming, &mut platform, options.clone(), command_queue, report, auxiliary_enabled.then_some(accepted));
+        let session = host::run_with_auxiliary(peer.clone(), incoming, &mut platform, options.clone(), command_queue, report, connections);
         tokio::pin!(session);
         let (reason, quit) = loop {
             tokio::select! {
@@ -741,7 +745,10 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
         },
         |stream, attempt| {
             let attempt = match stream.get_ref().peer_addr() {
-                Ok(addr) if !arguments.contains_key("no-auxiliary") => attempt.with_auxiliary(addr, key.clone()),
+                Ok(addr) if !arguments.contains_key("no-auxiliary") => {
+                    let attempt = attempt.with_auxiliary(addr, key.clone());
+                    if arguments.contains_key("no-udp") { attempt } else { attempt.with_datagrams(addr) }
+                }
                 _ => attempt,
             };
             emit(json!({ "event": "secured" }));

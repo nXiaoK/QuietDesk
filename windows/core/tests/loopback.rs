@@ -92,7 +92,7 @@ impl HostPlatform for FakeHost {
         Ok(log.displays.iter().find(|screen| screen.id == log.selected).map_or((2560, 1440), |screen| (screen.width, screen.height)))
     }
 
-    fn displays(&mut self) -> Result<Option<HostDisplays>> {
+    async fn displays(&mut self) -> Result<Option<HostDisplays>> {
         let log = self.log.lock().unwrap();
         if log.displays.is_empty() {
             return Ok(None);

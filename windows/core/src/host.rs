@@ -5,11 +5,13 @@ use crate::audio_session::{AudioCapture, HostAudio};
 use crate::auxiliary::{Accepted, Auxiliary, AuxiliaryEvent};
 use crate::clipboard_session::SessionClipboard;
 use crate::cursor::{CursorControl, CursorImage, CursorOperation, CursorPosition, CursorReason, CursorShape};
+use crate::datagram_frames::DatagramFrames;
+use crate::datagram_path::{DatagramPath, PathEvent};
 use crate::display::{DisplayControl, DisplaySwitch, HostDisplays, RemoteDisplayInfo};
 use crate::error::{DeskError, Result};
 use crate::input::{HostInputTranslator, InjectOp};
 use crate::keymap::MacModifierMapping;
-use crate::media::ReliablePath;
+use crate::media::{FeedbackKind, MediaFrameHeader, MediaPath};
 use crate::media::{Gate, HostFrame, HostMedia, HostMediaEvent, MediaControl, MediaFeedback, MediaOperation};
 use crate::messages::{
     ControlStatus, DeviceIdentity, HOST_ENDED_REASON, Hello, InputAction, InputFeedback, InputKind, RemoteInput, SessionPauseRequest, SessionPauseResult,
@@ -176,8 +178,8 @@ pub trait HostPlatform {
     /// Pixel size of the display that will be shared.
     fn display_size(&mut self) -> Result<(u32, u32)>;
     /// Current topology and the actual source (or the available replacement after removal).
-    fn displays(&mut self) -> Result<Option<HostDisplays>> {
-        Ok(None)
+    fn displays(&mut self) -> impl Future<Output = Result<Option<HostDisplays>>> + Send {
+        std::future::ready(Ok(None))
     }
     /// Atomically replaces the frame sink, capture and input bounds, preserving the current pause and cursor modes.
     fn switch_display(&mut self, _id: u32, _settings: StreamSettings, _frames: FrameSink) -> impl Future<Output = Result<DisplaySwitch>> + Send {
@@ -291,6 +293,9 @@ struct HostSession<'a, P: HostPlatform> {
     audio: HostAudio,
     supports_audio: bool,
     auxiliary: Auxiliary,
+    datagrams: DatagramPath,
+    udp_frames: Option<DatagramFrames>,
+    marked_repairs: Option<bool>,
     displays: Option<HostDisplays>,
     display_subscribed: bool,
     remote_display: Option<u32>,
@@ -316,6 +321,24 @@ struct HostSession<'a, P: HostPlatform> {
     termination_subscribed: bool,
 }
 
+#[derive(Default)]
+pub struct HostConnections {
+    pub auxiliary: Option<Accepted>,
+    pub datagram: Option<std::net::SocketAddr>,
+}
+
+impl From<Option<Accepted>> for HostConnections {
+    fn from(auxiliary: Option<Accepted>) -> Self {
+        Self { auxiliary, datagram: None }
+    }
+}
+
+impl From<Accepted> for HostConnections {
+    fn from(auxiliary: Accepted) -> Self {
+        Some(auxiliary).into()
+    }
+}
+
 /// Runs one viewer's session until it ends and returns why. `events` reports state for the user interface.
 pub async fn run<P: HostPlatform>(
     peer: PeerHandle,
@@ -336,8 +359,9 @@ pub async fn run_with_auxiliary<P: HostPlatform>(
     options: HostOptions,
     mut commands: mpsc::UnboundedReceiver<HostCommand>,
     events: impl Fn(HostEvent),
-    accepted: impl Into<Option<Accepted>>,
+    connections: impl Into<HostConnections>,
 ) -> DeskError {
+    let connections = connections.into();
     let translator = HostInputTranslator::new(options.modifiers);
     let input_actions = platform.supports_input_actions();
     let relative_mouse = platform.supports_relative_mouse();
@@ -346,7 +370,10 @@ pub async fn run_with_auxiliary<P: HostPlatform>(
     let mut session = HostSession {
         supports_audio: platform.supports_audio_capture(),
         audio: HostAudio::default(),
-        auxiliary: Auxiliary::host(accepted.into()),
+        auxiliary: Auxiliary::host(connections.auxiliary),
+        datagrams: DatagramPath::new(connections.datagram),
+        udp_frames: None,
+        marked_repairs: None,
         clipboard,
         peer: &peer,
         platform,
@@ -389,7 +416,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
         commands: &mut mpsc::UnboundedReceiver<HostCommand>,
         events: &impl Fn(HostEvent),
     ) -> DeskError {
-        let initial = match self.announce(events) {
+        let initial = match self.announce(events).await {
             Ok(settings) => settings,
             Err(error) => return error,
         };
@@ -397,6 +424,10 @@ impl<P: HostPlatform> HostSession<'_, P> {
         loop {
             let media_deadline = self.media.deadline().into_iter().chain(self.media.recovery().map(|_| self.recover_after)).min();
             let gesture_check = self.platform.gesture_check_at();
+            if self.media.frame_path() != MediaPath::Udp {
+                self.udp_frames = None;
+            }
+            let udp_by = self.udp_frames.as_ref().map(DatagramFrames::deadline);
             let bulk = self.auxiliary.peer(AuxiliaryRole::Bulk).cloned();
             let outcome = tokio::select! {
                 event = incoming.recv() => match event {
@@ -409,6 +440,12 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 _ = tokio::time::sleep_until(media_deadline.unwrap_or(start_by)), if !self.paused && media_deadline.is_some() => self.tick_media(),
                 _ = tokio::time::sleep_until(gesture_check.unwrap_or(start_by)), if gesture_check.is_some() => { self.platform.check_gestures(); Ok(()) }
                 audio = self.audio.next() => self.audio.deliver(audio, self.paused, self.peer),
+                event = self.datagrams.next() => self.datagram_event(event),
+                _ = tokio::time::sleep_until(udp_by.unwrap_or(start_by)), if udp_by.is_some() && !self.paused => {
+                    if self.udp_frames.as_mut().is_some_and(|frames| !frames.pump(&self.datagrams, Instant::now())) {
+                        self.lose_datagrams()
+                    } else { Ok(()) }
+                }
                 event = self.auxiliary.next() => self.auxiliary_event(event),
                 status = SessionClipboard::next(&mut self.clipboard, self.peer, bulk.as_ref()) => match status {
                     Ok(Some(status)) => { events(HostEvent::ClipboardStatus(status)); Ok(()) }
@@ -440,12 +477,12 @@ impl<P: HostPlatform> HostSession<'_, P> {
     }
 
     /// Sends the hello. Its settings are the ones the stream starts with unless the viewer asks first.
-    fn announce(&mut self, events: &impl Fn(HostEvent)) -> Result<StreamSettings> {
+    async fn announce(&mut self, events: &impl Fn(HostEvent)) -> Result<StreamSettings> {
         if self.input_actions {
             self.peer.order_input_echoes(MessageKind::Ping);
         }
         let (pixel_width, pixel_height) = self.platform.display_size()?;
-        self.displays = self.platform.displays()?;
+        self.displays = self.platform.displays().await?;
         if let Some(layout) = &self.displays {
             layout.validate()?;
             events(HostEvent::Displays { displays: layout.displays.clone(), selected: layout.selected_display_id, error: None });
@@ -524,8 +561,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 self.peer.send(&Message::new(MessageKind::Video, packet.encode()?))?;
             }
             HostFrame::Media(message) => match self.media.frame_path() {
-                ReliablePath::Shared => self.peer.send(&message)?,
-                ReliablePath::Tcp => {
+                MediaPath::Shared => self.peer.send(&message)?,
+                MediaPath::Udp => return Err(DeskError::platform("UDP 帧被错误地放入可靠通道")),
+                MediaPath::Tcp => {
                     if !self.auxiliary.peer(AuxiliaryRole::Video).is_some_and(|video| video.send(&message).is_ok()) {
                         self.auxiliary.close(AuxiliaryRole::Video);
                         let update = self.media.set_video_bound(false);
@@ -533,6 +571,16 @@ impl<P: HostPlatform> HostSession<'_, P> {
                     }
                 }
             },
+            HostFrame::Datagram(frame) => {
+                let now = Instant::now();
+                if self.udp_frames.as_ref().is_none_or(|frames| frames.stream != frame.header.stream) {
+                    let settings = self.state.map_or(self.options.preferred, |state| state.settings);
+                    self.udp_frames = Some(DatagramFrames::new(frame.header.stream, settings.megabits as u32, self.marked_repairs.unwrap_or(false), now));
+                }
+                if self.udp_frames.as_mut().expect("active UDP stream").insert(frame, now, self.datagrams.rtt).is_err() {
+                    self.lose_datagrams()?;
+                }
+            }
             HostFrame::Dropped => self.settle(1),
         }
         self.sync_gate();
@@ -551,6 +599,42 @@ impl<P: HostPlatform> HostSession<'_, P> {
         self.window.lock().unwrap().outstanding -= count;
     }
 
+    fn lose_datagrams(&mut self) -> Result<()> {
+        self.datagrams.retire();
+        self.udp_frames = None;
+        let update = self.media.set_udp_verified(false);
+        self.apply_media_update(update)
+    }
+
+    fn datagram_event(&mut self, event: PathEvent) -> Result<()> {
+        match event {
+            PathEvent::Verified => {
+                let update = self.media.set_udp_verified(true);
+                self.apply_media_update(update)?;
+                if self.media.frame_path() == MediaPath::Udp && self.media.preparing().is_some() {
+                    self.prepare_media()?;
+                }
+            }
+            PathEvent::Lost => return self.lose_datagrams(),
+            PathEvent::Record(4, data) if self.media.frame_path() == MediaPath::Udp => {
+                let Ok(feedback) = MediaFeedback::decode(&data[1..]) else { return Ok(()) };
+                let Some(frames) = &mut self.udp_frames else { return Ok(()) };
+                if feedback.header.stream != frames.stream
+                    || (matches!(feedback.kind, FeedbackKind::Reassembled | FeedbackKind::Decoded) && !frames.fully_submitted(feedback.header))
+                {
+                    return Ok(());
+                }
+                if !frames.feedback(&feedback, Instant::now(), self.datagrams.rtt) {
+                    return self.lose_datagrams();
+                }
+                let update = self.media.feedback(&feedback);
+                self.apply_media_update(update)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn auxiliary_event(&mut self, event: AuxiliaryEvent) -> Result<()> {
         match event {
             AuxiliaryEvent::Bound(AuxiliaryRole::Video) | AuxiliaryEvent::Lost(AuxiliaryRole::Video) => {
@@ -567,8 +651,25 @@ impl<P: HostPlatform> HostSession<'_, P> {
         Ok(())
     }
 
-    fn send_control(&mut self, control: MediaControl) -> Result<()> {
-        self.auxiliary.offer(&control);
+    fn send_control(&mut self, mut control: MediaControl) -> Result<()> {
+        if let (Some(path), Some(epoch)) = (&control.path, control.transport_epoch) {
+            log::info!("host media {:?} on {path} (epoch {epoch})", control.operation);
+        }
+        if control.operation == MediaOperation::Offer {
+            let udp = self.datagrams.offer(&control, true);
+            self.media.set_udp_available(udp);
+            control.path = Some(if udp { "udp" } else { "tcp" }.into());
+            self.auxiliary.offer(&control);
+        }
+        if control.operation == MediaOperation::Commit
+            && control.path.as_deref() == Some("udp")
+            && let Some(frames) = &mut self.udp_frames
+        {
+            // The reliable opening handshake also proves that the first frame was decoded.
+            let header = MediaFrameHeader { stream: frames.stream, frame_id: 1, is_idr: true };
+            let ack = MediaFeedback::new(FeedbackKind::Decoded, header)?;
+            frames.feedback(&ack, Instant::now(), self.datagrams.rtt);
+        }
         if control.operation == MediaOperation::Recover {
             self.recover_after = Instant::now() + Duration::from_secs(1);
         }
@@ -631,7 +732,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
     async fn change_display(&mut self, change: DisplayChange, events: &impl Fn(HostEvent)) -> Result<()> {
         let Some(previous) = &self.displays else { return Ok(()) };
         let previous_id = previous.selected_display_id;
-        let mut next = self.platform.displays()?.ok_or_else(|| DeskError::platform("当前没有可共享的显示器"))?;
+        let mut next = self.platform.displays().await?.ok_or_else(|| DeskError::platform("当前没有可共享的显示器"))?;
         next.validate()?;
         let main = next.displays.iter().find(|screen| screen.is_main).map(|screen| screen.id).unwrap_or(next.selected_display_id);
         let available = |id: u32| next.displays.iter().any(|display| display.id == id);
@@ -733,17 +834,23 @@ impl<P: HostPlatform> HostSession<'_, P> {
     }
 
     async fn receive_control(&mut self, control: MediaControl) -> Result<()> {
-        for event in self.media.control(&control, self.paused)? {
+        if let (Some(path), Some(epoch)) = (&control.path, control.transport_epoch) {
+            log::info!("viewer media {:?} on {path} (epoch {epoch})", control.operation);
+        }
+        if control.operation == MediaOperation::Request {
+            self.marked_repairs.get_or_insert(control.marked_repairs == Some(true));
+        }
+        if control.operation == MediaOperation::DecodedReady && self.media.frame_path() == MediaPath::Udp {
+            let ready =
+                self.udp_frames.as_ref().is_some_and(|frames| frames.fully_submitted(MediaFrameHeader { stream: frames.stream, frame_id: 1, is_idr: true }));
+            if !ready {
+                return Ok(());
+            }
+        }
+        for event in self.media.control_with_datagram(&control, self.paused, self.datagrams.authenticated())? {
             match event {
                 HostMediaEvent::Send(reply) => self.send_control(*reply)?,
-                HostMediaEvent::Prepare(_) => {
-                    self.sync_gate();
-                    self.settle(self.unacknowledged.len());
-                    self.unacknowledged.clear();
-                    if self.state.is_some() {
-                        self.finish_preparation()?;
-                    }
-                }
+                HostMediaEvent::Prepare(_) => self.prepare_media()?,
                 HostMediaEvent::ProduceKeyFrame => {
                     let deadline = self.media.deadline().expect("an opening stream has a transaction deadline");
                     match tokio::time::timeout_at(deadline, self.platform.request_key_frame()).await {
@@ -755,6 +862,16 @@ impl<P: HostPlatform> HostSession<'_, P> {
             }
         }
         self.sync_gate();
+        Ok(())
+    }
+
+    fn prepare_media(&mut self) -> Result<()> {
+        self.sync_gate();
+        self.settle(self.unacknowledged.len());
+        self.unacknowledged.clear();
+        if self.state.is_some() {
+            self.finish_preparation()?;
+        }
         Ok(())
     }
 
@@ -936,6 +1053,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
             },
             MessageKind::MediaFeedback => {
                 let feedback = MediaFeedback::decode(&message.payload)?;
+                if self.media.frame_path() == MediaPath::Udp {
+                    return Ok(());
+                }
                 let update = self.media.feedback(&feedback);
                 self.apply_media_update(update)?;
             }
@@ -953,6 +1073,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                     Ok(()) => {
                         self.paused = request.paused;
                         self.audio.pause(self.paused);
+                        self.datagrams.pause(self.paused);
                         if let Some(clipboard) = &self.clipboard {
                             clipboard.preferences(self.options.clipboard, !self.paused)?;
                         }

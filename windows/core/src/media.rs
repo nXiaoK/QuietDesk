@@ -1,8 +1,10 @@
-//! Reliable video as the macOS `MediaSession` frames it: stream identities, the
-//! transaction that opens every stream with a keyframe the viewer has decoded, whole-frame envelopes,
+//! Video as the macOS `MediaSession` frames it: stream identities, the
+//! transaction that opens every stream with a keyframe the viewer has decoded, reliable frames, datagram fragments,
 //! and the feedback that takes the place of legacy acknowledgements.
 //!
 //! A stream stays on its negotiated connection until a new keyframe transaction commits.
+
+pub mod fragment;
 
 use crate::error::{DeskError, Result};
 use crate::video::{EncodedFrame, VideoPacket, nal_units};
@@ -35,18 +37,22 @@ const HEADER_BYTES: usize = 37;
 const FRAME_RECORD: u8 = 1;
 const FEEDBACK_RECORD: u8 = 3;
 /// A feedback record fits one datagram of the macOS implementation, whatever carries it.
-const MAXIMUM_FEEDBACK_BYTES: usize = 1100;
+const MAXIMUM_FEEDBACK_BYTES: usize = fragment::MAX_RECORD_BYTES;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReliablePath {
+pub enum MediaPath {
     Shared,
     Tcp,
+    Udp,
 }
 
-impl ReliablePath {
+pub type ReliablePath = MediaPath;
+
+impl MediaPath {
     fn name(self) -> &'static str {
         match self {
             Self::Shared => "shared",
             Self::Tcp => "tcp",
+            Self::Udp => "udp",
         }
     }
 }
@@ -54,7 +60,7 @@ impl ReliablePath {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RoutedStream {
     stream: MediaStreamId,
-    path: ReliablePath,
+    path: MediaPath,
 }
 
 impl RoutedStream {
@@ -65,6 +71,7 @@ impl RoutedStream {
 
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(8);
+const UDP_VERIFICATION_GRACE: Duration = Duration::from_millis(350);
 
 fn begin(record: u8, header: &MediaFrameHeader, capacity: usize) -> Vec<u8> {
     let mut data = Vec::with_capacity(HEADER_BYTES + capacity);
@@ -160,7 +167,11 @@ impl MediaFrame {
         if length == 0 || length > Self::MAXIMUM_PACKET_BYTES || length != reader.remaining() {
             return Err(DeskError::invalid("媒体帧长度无效"));
         }
-        let packet = VideoPacket::decode(reader.bytes(length)?)?;
+        Self::from_packet_bytes(header, reader.bytes(length)?)
+    }
+
+    fn from_packet_bytes(header: MediaFrameHeader, bytes: &[u8]) -> Result<Self> {
+        let packet = VideoPacket::decode(bytes)?;
         if Self::check(&packet)? != header.is_idr {
             return Err(DeskError::invalid("媒体关键帧标志与视频内容不符"));
         }
@@ -178,18 +189,55 @@ pub enum FeedbackKind {
     Nack = 4,
 }
 
-/// What a viewer reports about a frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FragmentRange {
+    pub first: u16,
+    pub count: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaFeedback {
     pub kind: FeedbackKind,
     pub header: MediaFrameHeader,
+    missing: Vec<FragmentRange>,
 }
 
 impl MediaFeedback {
+    pub fn new(kind: FeedbackKind, header: MediaFrameHeader) -> Result<Self> {
+        Self::from_ranges(kind, header, Vec::new())
+    }
+
+    pub fn nack(header: MediaFrameHeader, ranges: Vec<FragmentRange>) -> Result<Self> {
+        Self::from_ranges(FeedbackKind::Nack, header, ranges)
+    }
+
+    fn from_ranges(kind: FeedbackKind, header: MediaFrameHeader, ranges: Vec<FragmentRange>) -> Result<Self> {
+        if ranges.len() > 64 || (kind == FeedbackKind::Nack) == ranges.is_empty() {
+            return Err(DeskError::invalid("媒体反馈范围无效"));
+        }
+        let mut previous_end = 0;
+        for range in &ranges {
+            let first = u32::from(range.first);
+            let end = first + u32::from(range.count);
+            if range.count == 0 || first < previous_end || end > u32::from(u16::MAX) + 1 {
+                return Err(DeskError::invalid("媒体缺片范围重复或溢出"));
+            }
+            previous_end = end;
+        }
+        Ok(Self { kind, header, missing: ranges })
+    }
+
+    pub fn missing_ranges(&self) -> &[FragmentRange] {
+        &self.missing
+    }
+
     pub fn message(&self) -> Message {
-        let mut data = begin(FEEDBACK_RECORD, &self.header, 2);
-        // No missing ranges: those belong to datagram repair.
-        data.extend_from_slice(&[self.kind as u8, 0]);
+        let mut data = begin(FEEDBACK_RECORD, &self.header, 2 + self.missing.len() * 4);
+        data.extend_from_slice(&[self.kind as u8, self.missing.len() as u8]);
+        for range in &self.missing {
+            data.extend_from_slice(&range.first.to_be_bytes());
+            data.extend_from_slice(&range.count.to_be_bytes());
+        }
         Message::new(MessageKind::MediaFeedback, data)
     }
 
@@ -206,21 +254,12 @@ impl MediaFeedback {
             4 => FeedbackKind::Nack,
             _ => return Err(DeskError::invalid("媒体反馈类型或长度无效")),
         };
-        let ranges = usize::from(reader.u8()?);
-        if ranges > 64 || reader.remaining() != ranges * 4 || (kind == FeedbackKind::Nack) != (ranges > 0) {
-            return Err(DeskError::invalid("媒体反馈类型或长度无效"));
+        let count = usize::from(reader.u8()?);
+        if count > 64 || reader.remaining() != count * 4 {
+            return Err(DeskError::invalid("媒体反馈长度无效"));
         }
-        let mut previous_end = 0;
-        for _ in 0..ranges {
-            let first = u32::from(reader.u16()?);
-            let count = u32::from(reader.u16()?);
-            let end = first + count;
-            if count == 0 || first < previous_end || end > u32::from(u16::MAX) + 1 {
-                return Err(DeskError::invalid("媒体缺片范围重复或溢出"));
-            }
-            previous_end = end;
-        }
-        Ok(Self { kind, header })
+        let ranges = (0..count).map(|_| Ok(FragmentRange { first: reader.u16()?, count: reader.u16()? })).collect::<Result<_>>()?;
+        Self::from_ranges(kind, header, ranges)
     }
 }
 
@@ -457,6 +496,7 @@ pub enum Gate {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HostStage {
+    AwaitingUdpVerification,
     Preparing,
     Ready,
     Producing,
@@ -494,6 +534,7 @@ pub enum HostFrame {
     /// No stream has been opened yet: the frame travels as a legacy video message.
     Legacy(VideoPacket),
     Media(Message),
+    Datagram(MediaFrame),
     /// The frame belongs to no stream the viewer is receiving.
     Dropped,
 }
@@ -509,6 +550,8 @@ pub struct HostMedia {
     interrupted_commit: Option<(Uuid, RoutedStream)>,
     active: Option<RoutedStream>,
     video_bound: bool,
+    udp_available: bool,
+    udp_verified: bool,
     /// Frames wait for the viewer to open a new stream.
     hold: bool,
     next_frame: u64,
@@ -517,13 +560,32 @@ pub struct HostMedia {
 }
 
 impl HostMedia {
-    pub fn frame_path(&self) -> ReliablePath {
-        self.transaction.as_ref().map(|t| t.route).or(self.active).map_or(ReliablePath::Shared, |r| r.path)
+    pub fn frame_path(&self) -> MediaPath {
+        self.transaction.as_ref().map(|t| t.route).or(self.active).map_or(MediaPath::Shared, |r| r.path)
     }
 
     pub fn set_video_bound(&mut self, bound: bool) -> (usize, Vec<MediaControl>) {
-        let interrupted = self.video_bound && !bound && self.frame_path() == ReliablePath::Tcp;
+        let interrupted = self.video_bound && !bound && self.frame_path() == MediaPath::Tcp;
         self.video_bound = bound;
+        if interrupted { self.interrupted() } else { (0, Vec::new()) }
+    }
+
+    /// Set before answering the first request, once the datagram listener can serve this session.
+    pub fn set_udp_available(&mut self, available: bool) {
+        self.udp_available = available;
+    }
+
+    pub fn set_udp_verified(&mut self, verified: bool) -> (usize, Vec<MediaControl>) {
+        let interrupted = self.udp_verified && !verified && self.frame_path() == MediaPath::Udp;
+        self.udp_verified = self.udp_available && verified;
+        if let Some(transaction) = self.transaction.as_mut().filter(|tx| tx.stage == HostStage::AwaitingUdpVerification) {
+            let now = Instant::now();
+            if !self.udp_verified || now >= transaction.deadline {
+                return self.interrupted();
+            }
+            transaction.stage = HostStage::Preparing;
+            transaction.deadline = now + TRANSACTION_TIMEOUT;
+        }
         if interrupted { self.interrupted() } else { (0, Vec::new()) }
     }
 
@@ -543,18 +605,21 @@ impl HostMedia {
 
     fn offer(&self) -> Option<MediaControl> {
         let (token, key) = self.credentials.clone()?;
-        // "tcp" tells the viewer not to try datagrams. No optional capability is repeated, so none is negotiated.
         Some(MediaControl {
             session_id: self.session,
             token: Some(token),
             datagram_key: Some(key),
-            path: Some("tcp".to_string()),
+            path: Some(if self.udp_available { "udp" } else { "tcp" }.to_string()),
             ..MediaControl::new(MediaOperation::Offer)
         })
     }
 
     /// `paused` refuses new streams, as a paused macOS host does.
     pub fn control(&mut self, control: &MediaControl, paused: bool) -> Result<Vec<HostMediaEvent>> {
+        self.control_with_datagram(control, paused, self.udp_verified)
+    }
+
+    pub(crate) fn control_with_datagram(&mut self, control: &MediaControl, paused: bool, udp_authenticated: bool) -> Result<Vec<HostMediaEvent>> {
         use MediaOperation::*;
         match control.operation {
             Request => {
@@ -584,30 +649,36 @@ impl HostMedia {
                 Some(transaction) if transaction.route.stream != stream || transaction.route.path.name() != path => {
                     return Err(DeskError::invalid("媒体事务标识冲突"));
                 }
-                Some(transaction) if transaction.stage != HostStage::Preparing => {
+                Some(transaction) if matches!(transaction.stage, HostStage::Ready | HostStage::Producing | HostStage::Decoded) => {
                     vec![HostMediaEvent::Send(Box::new(MediaControl::transaction(Ready, id, stream, path)))]
                 }
                 Some(_) => Vec::new(),
                 None if paused || stream.transport_epoch <= self.epochs.0 || stream.codec_epoch <= self.epochs.1 => refuse(),
                 None => {
                     let path = match path {
-                        "shared" => ReliablePath::Shared,
-                        "tcp" if self.video_bound => ReliablePath::Tcp,
+                        "shared" => MediaPath::Shared,
+                        "tcp" if self.video_bound => MediaPath::Tcp,
+                        "udp" if self.udp_available && udp_authenticated => MediaPath::Udp,
                         _ => return Ok(refuse()),
                     };
+                    let awaiting_udp = path == MediaPath::Udp && !self.udp_verified;
                     self.epochs = (stream.transport_epoch, stream.codec_epoch);
                     self.interrupted_commit = None;
                     self.hold = true;
                     self.transaction = Some(HostTransaction {
                         id,
                         route: RoutedStream { stream, path },
-                        stage: HostStage::Preparing,
+                        stage: if awaiting_udp { HostStage::AwaitingUdpVerification } else { HostStage::Preparing },
                         key_frame_sent: false,
-                        deadline: Instant::now() + TRANSACTION_TIMEOUT,
+                        deadline: Instant::now() + if awaiting_udp { UDP_VERIFICATION_GRACE } else { TRANSACTION_TIMEOUT },
                     });
                     self.next_frame = 1;
                     let settled = std::mem::take(&mut self.unsettled).len();
-                    vec![HostMediaEvent::Settled(settled), HostMediaEvent::Prepare(stream)]
+                    let mut events = vec![HostMediaEvent::Settled(settled)];
+                    if !awaiting_udp {
+                        events.push(HostMediaEvent::Prepare(stream));
+                    }
+                    events
                 }
             },
             Ready => match current {
@@ -665,23 +736,24 @@ impl HostMedia {
     }
 
     pub fn frame(&mut self, sequence: u32, frame: EncodedFrame) -> Result<HostFrame> {
-        let stream = match &mut self.transaction {
-            Some(transaction) if transaction.stage == HostStage::Producing && !transaction.key_frame_sent && frame.is_key_frame() => {
-                transaction.key_frame_sent = true;
-                transaction.route.stream
-            }
+        let route = match &self.transaction {
+            Some(transaction) if transaction.stage == HostStage::Producing && !transaction.key_frame_sent && frame.is_key_frame() => transaction.route,
             Some(_) => return Ok(HostFrame::Dropped),
             None if self.hold => return Ok(HostFrame::Dropped),
             None => match self.active {
-                Some(route) => route.stream,
+                Some(route) => route,
                 None => return Ok(HostFrame::Legacy(VideoPacket::h264(sequence, frame))),
             },
         };
-        let frame = MediaFrame::new(stream, self.next_frame, VideoPacket::h264(sequence, frame))?;
+        let frame = MediaFrame::new(route.stream, self.next_frame, VideoPacket::h264(sequence, frame))?;
+        let header = frame.header;
+        let output = if route.path == MediaPath::Udp { HostFrame::Datagram(frame) } else { HostFrame::Media(frame.message()?) };
         self.next_frame = self.next_frame.checked_add(1).ok_or_else(|| DeskError::Network("媒体帧序号已耗尽，需要重新连接".to_string()))?;
-        let message = frame.message()?;
-        self.unsettled.push_back(OutstandingFrame { header: frame.header, deadline: Instant::now() + FRAME_TIMEOUT, reassembled: false });
-        Ok(HostFrame::Media(message))
+        if let Some(transaction) = &mut self.transaction {
+            transaction.key_frame_sent = true;
+        }
+        self.unsettled.push_back(OutstandingFrame { header, deadline: Instant::now() + FRAME_TIMEOUT, reassembled: false });
+        Ok(output)
     }
 
     /// How many frames a viewer's report settles, and what to tell the viewer. A frame it gave up on
@@ -782,15 +854,24 @@ struct ReceivingStream {
     next_frame: u64,
     pending: VecDeque<PendingMediaDecode>,
     last_decoded: Option<MediaFrameHeader>,
+    reported_playback: bool,
 }
 
 #[derive(Debug)]
 pub enum ViewerMediaEvent {
     Send(Message),
+    DatagramFeedback(MediaFeedback),
     /// A frame to decode and whether the host needs its decoded receipt before sending another.
     Video(VideoPacket, MediaStreamId, bool),
     /// Frames of this stream are now what the viewer shows.
     Committed(MediaStreamId),
+}
+
+impl ViewerMediaEvent {
+    fn feedback(path: MediaPath, kind: FeedbackKind, header: MediaFrameHeader) -> Self {
+        let feedback = MediaFeedback { kind, header, missing: Vec::new() };
+        if path == MediaPath::Udp { Self::DatagramFeedback(feedback) } else { Self::Send(feedback.message()) }
+    }
 }
 
 /// The viewer's side of the session. The viewer decides when a stream is opened.
@@ -801,6 +882,8 @@ pub struct ViewerMedia {
     transaction: Option<ViewerTransaction>,
     active: Option<RoutedStream>,
     video_bound: bool,
+    udp_available: bool,
+    udp_verified: bool,
     receiving: Option<ReceivingStream>,
     auxiliary_enabled: bool,
     legacy_decodes: VecDeque<(u32, usize)>,
@@ -819,8 +902,46 @@ impl ViewerMedia {
         MediaControl::new(MediaOperation::Request)
     }
 
+    pub(crate) fn has_offer(&self) -> bool {
+        self.session.is_some()
+    }
+
     pub fn active(&self) -> Option<MediaStreamId> {
         self.active.map(|route| route.stream)
+    }
+
+    pub(crate) fn udp_verified(&self) -> bool {
+        self.udp_verified
+    }
+
+    pub fn frame_path(&self) -> MediaPath {
+        self.transaction.as_ref().map(|t| t.route).or(self.active).map_or(MediaPath::Shared, |r| r.path)
+    }
+
+    pub fn receiving_stream(&self) -> Option<MediaStreamId> {
+        self.receiving.as_ref().map(|receiver| receiver.stream)
+    }
+
+    /// Set before consuming the offer, once the endpoint and the local transport are available.
+    pub fn set_udp_available(&mut self, available: bool) {
+        self.udp_available = available;
+    }
+
+    pub fn set_udp_verified(&mut self, verified: bool, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
+        if !self.udp_available || self.udp_verified == verified {
+            return Ok(Vec::new());
+        }
+        self.udp_verified = verified;
+        if !verified && self.frame_path() == MediaPath::Udp {
+            self.restart(now)
+        } else if verified && self.transaction.is_none() && self.frame_path() != MediaPath::Udp {
+            self.begin(now)
+        } else {
+            if !verified && self.receiving.is_some() && self.transaction.is_none() {
+                self.retry_at = None;
+            }
+            Ok(Vec::new())
+        }
     }
 
     pub fn enable_auxiliary(&mut self) {
@@ -832,19 +953,19 @@ impl ViewerMedia {
             return Ok(Vec::new());
         }
         self.video_bound = bound;
-        let route = self.transaction.as_ref().map(|t| t.route).or(self.active);
-        match route {
-            None if bound => self.begin(now),
-            Some(route) if !bound && route.path == ReliablePath::Tcp => {
-                let mut events = Vec::new();
-                if let Some(abort) = self.abandon() {
-                    events.push(ViewerMediaEvent::Send(abort.message()?));
-                }
-                events.extend(self.begin(now)?);
-                Ok(events)
-            }
-            _ => Ok(Vec::new()),
+        if !bound && self.frame_path() == MediaPath::Tcp {
+            self.restart(now)
+        } else if bound && !self.udp_available && self.active.is_none() && self.transaction.is_none() {
+            self.begin(now)
+        } else {
+            Ok(Vec::new())
         }
+    }
+
+    fn restart(&mut self, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
+        let mut events: Vec<_> = self.abandon().map(|abort| abort.message().map(ViewerMediaEvent::Send)).transpose()?.into_iter().collect();
+        events.extend(self.begin(now)?);
+        Ok(events)
     }
 
     fn begin(&mut self, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
@@ -854,7 +975,13 @@ impl ViewerMedia {
         }
         self.epochs = (self.epochs.0 + 1, self.epochs.1 + 1);
         let stream = MediaStreamId { session_id, transport_epoch: self.epochs.0, codec_epoch: self.epochs.1 };
-        let path = if self.video_bound { ReliablePath::Tcp } else { ReliablePath::Shared };
+        let path = if self.udp_verified {
+            MediaPath::Udp
+        } else if self.video_bound {
+            MediaPath::Tcp
+        } else {
+            MediaPath::Shared
+        };
         let transaction = ViewerTransaction { id: Uuid::new_v4(), route: RoutedStream { stream, path }, stage: ViewerStage::Preparing, started: now };
         let prepare = MediaControl::transaction(MediaOperation::Prepare, transaction.id, stream, path.name()).message()?;
         self.receiving = None;
@@ -880,7 +1007,9 @@ impl ViewerMedia {
                     return Ok(Vec::new());
                 }
                 self.session = control.session_id;
-                if self.auxiliary_enabled && !self.video_bound {
+                self.udp_available &= control.path.as_deref() != Some("tcp");
+                self.udp_verified &= self.udp_available;
+                if !self.udp_verified && (self.udp_available || (self.auxiliary_enabled && !self.video_bound)) {
                     if !self.paused {
                         self.retry_at = Some(now + Duration::from_millis(1500));
                     }
@@ -909,16 +1038,23 @@ impl ViewerMedia {
         Ok(match (control.operation, transaction.stage) {
             (Ready, ViewerStage::Preparing) => {
                 transaction.stage = ViewerStage::Ready;
-                self.receiving = Some(ReceivingStream { stream, next_frame: 1, pending: VecDeque::new(), last_decoded: None });
+                self.receiving = Some(ReceivingStream { stream, next_frame: 1, pending: VecDeque::new(), last_decoded: None, reported_playback: false });
                 vec![ViewerMediaEvent::Send(MediaControl::transaction(Ready, id, stream, path).message()?)]
             }
             (Commit, ViewerStage::Decoded) => {
                 self.active = Some(transaction.route);
                 self.transaction = None;
+                // A slow first probe may finish during reliable cutover. Show that IDR before trying UDP.
+                if self.udp_verified && path != "udp" {
+                    self.retry_at = Some(now + Self::RETRY_DELAY);
+                }
                 log::info!("viewer committed {path} media stream (transport epoch {}, codec epoch {})", stream.transport_epoch, stream.codec_epoch);
                 vec![ViewerMediaEvent::Committed(stream), ViewerMediaEvent::Send(MediaControl::transaction(Committed, id, stream, path).message()?)]
             }
             (Abort, _) => {
+                if transaction.route.path == MediaPath::Udp {
+                    self.udp_verified = false;
+                }
                 self.abandon();
                 self.retry_at = Some(now + Self::RETRY_DELAY);
                 Vec::new()
@@ -928,25 +1064,34 @@ impl ViewerMedia {
     }
 
     pub fn frame(&mut self, payload: &[u8], now: Instant) -> Result<Vec<ViewerMediaEvent>> {
-        self.frame_on(ReliablePath::Shared, payload, now)
+        self.frame_on(MediaPath::Shared, payload, now)
     }
 
-    pub fn frame_on(&mut self, path: ReliablePath, payload: &[u8], now: Instant) -> Result<Vec<ViewerMediaEvent>> {
+    pub fn frame_on(&mut self, path: MediaPath, payload: &[u8], now: Instant) -> Result<Vec<ViewerMediaEvent>> {
         if self.session.is_none() {
             return Err(DeskError::invalid("媒体帧会话尚未协商"));
         }
-        if self.transaction.as_ref().map(|t| t.route).or(self.active).is_some_and(|route| route.path != path) {
+        if self.frame_path() != path || path == MediaPath::Udp {
             return Ok(Vec::new());
         }
-        let frame = MediaFrame::decode(payload)?;
+        self.accept_frame(MediaFrame::decode(payload)?, payload.len(), true, now)
+    }
+
+    /// The fragment receiver already validated the stream payload and sent its arrival feedback.
+    pub fn assembled_frame(&mut self, frame: MediaFrame, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
+        if self.frame_path() != MediaPath::Udp {
+            return Ok(Vec::new());
+        }
+        let packet = &frame.packet;
+        let bytes = packet.avcc.len() + packet.sps.len() + packet.pps.len() + packet.vps.len();
+        self.accept_frame(frame, bytes, false, now)
+    }
+
+    fn accept_frame(&mut self, frame: MediaFrame, bytes: usize, report_arrival: bool, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
         let Some(receiver) = self.receiving.as_ref().filter(|receiver| receiver.stream == frame.header.stream) else { return Ok(Vec::new()) };
         let expected = receiver.next_frame;
         if frame.header.frame_id < expected {
-            return Ok(receiver
-                .last_decoded
-                .map(|header| ViewerMediaEvent::Send(MediaFeedback { kind: FeedbackKind::Decoded, header }.message()))
-                .into_iter()
-                .collect());
+            return Ok(receiver.last_decoded.map(|header| ViewerMediaEvent::feedback(self.frame_path(), FeedbackKind::Decoded, header)).into_iter().collect());
         }
         // Frames of a stream arrive in order on this path, and a stream begins with a keyframe.
         if frame.header.frame_id > expected || expected == u64::MAX || (expected == 1 && !frame.header.is_idr) {
@@ -961,18 +1106,22 @@ impl ViewerMedia {
         if receiver.pending.iter().any(|pending| pending.sequence == frame.packet.sequence) {
             return Err(DeskError::invalid("待解码的媒体帧序号重复"));
         }
-        self.check_decode_capacity(payload.len())?;
+        self.check_decode_capacity(bytes)?;
         let receiver = self.receiving.as_mut().expect("the frame belongs to this receiver");
         receiver.pending.push_back(PendingMediaDecode {
             sequence: frame.packet.sequence,
             header: frame.header,
             deadline: now + FRAME_TIMEOUT,
             decoded: false,
-            bytes: payload.len(),
+            bytes,
         });
         receiver.next_frame += 1;
-        let arrived = MediaFeedback { kind: FeedbackKind::Reassembled, header: frame.header };
-        Ok(vec![ViewerMediaEvent::Send(arrived.message()), ViewerMediaEvent::Video(frame.packet, frame.header.stream, frame.header.frame_id == 1)])
+        let mut events = Vec::new();
+        if report_arrival {
+            events.push(ViewerMediaEvent::feedback(self.frame_path(), FeedbackKind::Reassembled, frame.header));
+        }
+        events.push(ViewerMediaEvent::Video(frame.packet, frame.header.stream, frame.header.frame_id == 1));
+        Ok(events)
     }
 
     pub fn legacy(&mut self, sequence: u32, bytes: usize) -> Result<()> {
@@ -1007,6 +1156,7 @@ impl ViewerMedia {
         if !timed_events.is_empty() {
             return Ok(timed_events);
         }
+        let path = self.frame_path();
         let Some(receiver) = self.receiving.as_mut().filter(|receiver| receiver.stream == stream) else { return Ok(Vec::new()) };
         let Some(frame) = receiver.pending.iter_mut().find(|pending| pending.sequence == sequence) else { return Ok(Vec::new()) };
         frame.decoded = true;
@@ -1015,7 +1165,11 @@ impl ViewerMedia {
         let Some(last) = receiver.pending.drain(..complete).next_back() else { return Ok(Vec::new()) };
         let header = last.header;
         receiver.last_decoded = Some(header);
-        let mut events = vec![ViewerMediaEvent::Send(MediaFeedback { kind: FeedbackKind::Decoded, header }.message())];
+        if !header.is_idr && header.frame_id >= 8 && !receiver.reported_playback {
+            receiver.reported_playback = true;
+            log::info!("viewer decoded continuous {} video (transport epoch {}, through frame {})", path.name(), stream.transport_epoch, header.frame_id);
+        }
+        let mut events = vec![ViewerMediaEvent::feedback(path, FeedbackKind::Decoded, header)];
         if let Some(transaction) = self.transaction.as_mut().filter(|transaction| transaction.stage == ViewerStage::Ready) {
             transaction.stage = ViewerStage::Decoded;
             events.push(ViewerMediaEvent::Send(transaction.route.transaction(MediaOperation::DecodedReady, transaction.id).message()?));
@@ -1041,14 +1195,19 @@ impl ViewerMedia {
     pub fn tick(&mut self, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
         let mut events = Vec::new();
         if let Some((header, _)) = self.awaiting_decode().filter(|(_, deadline)| now >= *deadline) {
-            events.push(ViewerMediaEvent::Send(MediaFeedback { kind: FeedbackKind::Expired, header }.message()));
-            if self.transaction.as_ref().is_some_and(|pending| pending.route.stream == header.stream) {
+            events.push(ViewerMediaEvent::feedback(self.frame_path(), FeedbackKind::Expired, header));
+            if self.frame_path() == MediaPath::Udp {
+                events.extend(self.set_udp_verified(false, now)?);
+            } else if self.transaction.as_ref().is_some_and(|pending| pending.route.stream == header.stream) {
                 events.extend(self.abandon().map(|abort| abort.message().map(ViewerMediaEvent::Send)).transpose()?);
                 self.retry_at = Some(now + Self::RETRY_DELAY);
             } else {
                 events.extend(self.begin(now)?);
             }
         } else if self.transaction.as_ref().is_some_and(|transaction| now >= transaction.started + TRANSACTION_TIMEOUT) {
+            if self.frame_path() == MediaPath::Udp {
+                return self.set_udp_verified(false, now);
+            }
             events.extend(self.abandon().map(|abort| abort.message().map(ViewerMediaEvent::Send)).transpose()?);
             self.retry_at = Some(now + Self::RETRY_DELAY);
         } else if self.retry_at.is_some_and(|at| now >= at) {
@@ -1129,11 +1288,11 @@ mod tests {
     #[test]
     fn feedback_has_the_macos_byte_layout_and_refuses_what_does_not_parse() {
         let header = MediaFrameHeader { stream: stream(3), frame_id: 7, is_idr: false };
-        let message = MediaFeedback { kind: FeedbackKind::Decoded, header }.message();
+        let message = MediaFeedback { missing: Vec::new(), kind: FeedbackKind::Decoded, header }.message();
         assert_eq!(message.payload.len(), 39);
         assert_eq!(message.payload[..4], [0x51, 0x4D, 1, 3]);
         assert_eq!(message.payload[36..], [0, 2, 0]);
-        assert_eq!(MediaFeedback::decode(&message.payload).unwrap(), MediaFeedback { kind: FeedbackKind::Decoded, header });
+        assert_eq!(MediaFeedback::decode(&message.payload).unwrap(), MediaFeedback { missing: Vec::new(), kind: FeedbackKind::Decoded, header });
         // A repair request names ranges; without them, or with them on another kind, it is not one.
         let mut nack = message.payload.clone();
         nack[37] = 4;
@@ -1270,6 +1429,11 @@ mod tests {
                         self.settled += settled;
                         assert!(controls.is_empty());
                     }
+                    ViewerMediaEvent::DatagramFeedback(feedback) => {
+                        let (settled, controls) = self.host.feedback(&feedback);
+                        self.settled += settled;
+                        assert!(controls.is_empty());
+                    }
                     ViewerMediaEvent::Video(packet, _, first_in_stream) => {
                         if first_in_stream {
                             self.stream_openers.push(packet.sequence);
@@ -1286,6 +1450,11 @@ mod tests {
             match self.host.frame(sequence, frame).unwrap() {
                 HostFrame::Legacy(_) => "legacy",
                 HostFrame::Dropped => "dropped",
+                HostFrame::Datagram(frame) => {
+                    let events = self.viewer.assembled_frame(frame, self.now).unwrap();
+                    self.viewer_events(events);
+                    "udp"
+                }
                 HostFrame::Media(message) => {
                     let events = self.viewer.frame_on(self.host.frame_path(), &message.payload, self.now).unwrap();
                     self.viewer_events(events);
@@ -1308,6 +1477,29 @@ mod tests {
             self.viewer_events(events);
         }
 
+        fn offer_udp(&mut self) {
+            self.host.set_udp_available(true);
+            self.viewer.set_udp_available(true);
+            self.viewer.enable_auxiliary();
+            self.host_receives(ViewerMedia::request());
+        }
+
+        fn verify_udp(&mut self) {
+            assert_eq!(self.host.set_udp_verified(true), (0, Vec::new()));
+            let events = self.viewer.set_udp_verified(true, self.now).unwrap();
+            self.viewer_events(events);
+        }
+
+        fn early_udp_prepare(&mut self) -> MediaControl {
+            self.offer_udp();
+            self.bind_video();
+            let events = self.viewer.set_udp_verified(true, self.now).unwrap();
+            let [ViewerMediaEvent::Send(request)] = events.as_slice() else { panic!("expected UDP prepare") };
+            let request = MediaControl::read(request).unwrap();
+            assert_eq!(self.host.control_with_datagram(&request, false, true).unwrap(), [HostMediaEvent::Settled(0)]);
+            request
+        }
+
         /// The exchange up to the first committed stream.
         fn open(&mut self) {
             self.host_receives(ViewerMedia::request());
@@ -1316,6 +1508,208 @@ mod tests {
             assert_eq!(self.encode(1, key_frame()), "media");
             self.decode(1);
         }
+    }
+
+    #[test]
+    fn a_verified_datagram_stream_starts_with_one_reassembled_keyframe_and_one_decode_ack() {
+        let mut pair = Pair::new();
+        pair.offer_udp();
+        pair.bind_video();
+        assert_eq!(pair.viewer.deadline(), Some(pair.now + Duration::from_millis(1500)));
+        assert!(pair.prepared.is_empty());
+        pair.verify_udp();
+        assert_eq!((pair.host.frame_path(), pair.viewer.frame_path()), (MediaPath::Udp, MediaPath::Udp));
+        assert!(pair.viewer.receiving_stream().is_none());
+        let ready = pair.host.prepared().unwrap();
+        pair.viewer_receives(ready);
+        let HostFrame::Datagram(frame) = pair.host.frame(1, key_frame()).unwrap() else { panic!("expected a datagram frame") };
+        let header = frame.header;
+        assert_eq!(pair.viewer.receiving_stream(), Some(header.stream));
+        let encoded = frame.message().unwrap();
+        for path in [MediaPath::Shared, MediaPath::Tcp, MediaPath::Udp] {
+            assert!(pair.viewer.frame_on(path, &encoded.payload, pair.now).unwrap().is_empty());
+        }
+        let events = pair.viewer.assembled_frame(frame, pair.now).unwrap();
+        assert!(matches!(events.as_slice(), [ViewerMediaEvent::Video(_, _, true)]));
+        pair.viewer_events(events);
+        let decoded = pair.viewer.decoded(DecodeReceipt::Media(header.stream, 1)).unwrap();
+        assert!(matches!(decoded.as_slice(), [ViewerMediaEvent::DatagramFeedback(ack), ViewerMediaEvent::Send(ready)] if
+            *ack == MediaFeedback::new(FeedbackKind::Decoded, header).unwrap()
+            && MediaControl::read(ready).unwrap().operation == MediaOperation::DecodedReady));
+        pair.viewer_events(decoded);
+        assert_eq!((pair.host.gate(), pair.settled), (Gate::Open, 1));
+        assert_eq!(pair.encode(2, dependent_frame()), "udp");
+    }
+
+    #[test]
+    fn an_unverified_host_refuses_udp_and_a_retry_on_bound_tcp_opens_normally() {
+        let mut pair = Pair::new();
+        pair.offer_udp();
+        pair.bind_video();
+        let events = pair.viewer.set_udp_verified(true, pair.now).unwrap();
+        pair.viewer_events(events);
+        assert!(pair.prepared.is_empty());
+        assert_eq!(pair.log.last(), Some(&("host", MediaOperation::Abort)));
+        assert_eq!(pair.host.gate(), Gate::Open);
+        let deadline = pair.viewer.deadline().unwrap();
+        let events = pair.viewer.tick(deadline).unwrap();
+        pair.viewer_events(events);
+        assert_eq!(pair.prepared.len(), 1);
+        assert_eq!(pair.host.frame_path(), MediaPath::Tcp);
+        let ready = pair.host.prepared().unwrap();
+        pair.viewer_receives(ready);
+        assert_eq!(pair.encode(1, key_frame()), "media");
+        pair.decode(1);
+        assert_eq!(pair.host.gate(), Gate::Open);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_authenticated_udp_prepare_waits_for_the_local_probe_before_opening_the_encoder() {
+        let mut pair = Pair::new();
+        let prepare = pair.early_udp_prepare();
+        let deadline = pair.host.deadline().unwrap();
+        tokio::time::advance(Duration::from_millis(349)).await;
+        assert!(pair.host.control_with_datagram(&prepare, false, true).unwrap().is_empty());
+        assert_eq!(pair.host.deadline(), Some(deadline));
+        assert!(pair.host.prepared().is_none());
+        assert_eq!(pair.host.gate(), Gate::Closed);
+        assert!(matches!(pair.host.frame(1, key_frame()).unwrap(), HostFrame::Dropped));
+
+        assert_eq!(pair.host.set_udp_verified(true), (0, vec![]));
+        let opening = pair.host.preparing().unwrap();
+        let ready = pair.host.prepared().unwrap();
+        assert_eq!(ready.transaction_id, prepare.transaction_id);
+        pair.viewer_receives(ready);
+        assert_eq!(pair.encode(2, key_frame()), "udp");
+        let decoded = pair.viewer.decoded(DecodeReceipt::Media(opening, 2)).unwrap();
+        pair.viewer_events(decoded);
+        assert_eq!(pair.encode(3, dependent_frame()), "udp");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_udp_prepare_aborts_even_when_verification_wakes_first() {
+        for verification_wakes_first in [true, false] {
+            let mut pair = Pair::new();
+            let prepare = pair.early_udp_prepare();
+            tokio::time::advance(Duration::from_millis(350)).await;
+            let (_, replies) = if verification_wakes_first { pair.host.set_udp_verified(true) } else { pair.host.expire(Instant::now()) };
+            let [abort] = replies.as_slice() else { panic!("expected one abort") };
+            assert_eq!((abort.operation, abort.transaction_id), (MediaOperation::Abort, prepare.transaction_id));
+            assert_eq!(pair.host.set_udp_verified(true), (0, vec![]));
+            assert!(pair.host.prepared().is_none());
+            pair.viewer_receives(abort.clone());
+            let events = pair.viewer.tick(pair.viewer.deadline().unwrap()).unwrap();
+            pair.viewer_events(events);
+            let ready = pair.host.prepared().unwrap();
+            pair.viewer_receives(ready);
+            assert_eq!(pair.encode(1, key_frame()), "media");
+            pair.decode(1);
+            assert_eq!(pair.host.frame_path(), MediaPath::Tcp);
+        }
+    }
+
+    #[test]
+    fn fallback_after_probe_timeout_uses_the_available_reliable_route_and_finishes_its_cutover() {
+        for bound in [false, true] {
+            let mut pair = Pair::new();
+            pair.offer_udp();
+            if bound {
+                pair.bind_video();
+            }
+            let deadline = pair.viewer.deadline().unwrap();
+            assert_eq!(deadline, pair.now + Duration::from_millis(1500));
+            assert!(pair.viewer.tick(deadline - Duration::from_millis(1)).unwrap().is_empty());
+            let events = pair.viewer.tick(deadline).unwrap();
+            pair.viewer_events(events);
+            let chosen = if bound { MediaPath::Tcp } else { MediaPath::Shared };
+            assert_eq!(pair.host.frame_path(), chosen);
+            pair.verify_udp();
+            assert_eq!(pair.viewer.frame_path(), chosen);
+            assert_eq!(pair.prepared.len(), 1);
+            let ready = pair.host.prepared().unwrap();
+            pair.viewer_receives(ready);
+            assert_eq!(pair.encode(1, key_frame()), "media");
+            pair.decode(1);
+            assert_eq!(pair.host.gate(), Gate::Open);
+            let upgrade_at = pair.viewer.deadline().unwrap();
+            let events = pair.viewer.tick(upgrade_at).unwrap();
+            pair.viewer_events(events);
+            assert_eq!(pair.host.frame_path(), MediaPath::Udp);
+        }
+    }
+
+    #[test]
+    fn a_tcp_only_offer_disables_datagrams_even_if_the_viewer_has_a_route() {
+        let mut pair = Pair::new();
+        pair.viewer.set_udp_available(true);
+        pair.host_receives(ViewerMedia::request());
+        assert_eq!(pair.host.frame_path(), MediaPath::Shared);
+        assert!(pair.viewer.set_udp_verified(true, pair.now).unwrap().is_empty());
+        let ready = pair.host.prepared().unwrap();
+        pair.viewer_receives(ready);
+        assert_eq!(pair.encode(1, key_frame()), "media");
+        pair.decode(1);
+    }
+
+    #[test]
+    fn lost_datagrams_release_old_credit_and_decode_only_the_new_reliable_stream() {
+        for (bound, committed) in [(true, false), (true, true), (false, true)] {
+            let mut pair = Pair::new();
+            pair.offer_udp();
+            if bound {
+                pair.bind_video();
+            }
+            pair.verify_udp();
+            let ready = pair.host.prepared().unwrap();
+            pair.viewer_receives(ready);
+            assert_eq!(pair.encode(1, key_frame()), "udp");
+            let old = pair.viewer.receiving_stream().unwrap();
+            if committed {
+                pair.decode(1);
+            }
+            let late = MediaFrame::new(old, 2, VideoPacket::h264(2, dependent_frame())).unwrap();
+            if committed {
+                assert_eq!(pair.encode(2, dependent_frame()), "udp");
+            }
+            let (settled, replies) = pair.host.set_udp_verified(false);
+            assert_eq!(settled, 1);
+            let events = pair.viewer.set_udp_verified(false, pair.now).unwrap();
+            pair.viewer_events(events);
+            for reply in replies {
+                pair.viewer_receives(reply);
+            }
+            assert!(pair.viewer.receiving_stream().is_none());
+            let path = if bound { MediaPath::Tcp } else { MediaPath::Shared };
+            assert_eq!(pair.host.frame_path(), path);
+            assert!(pair.viewer.assembled_frame(late, pair.now).unwrap().is_empty());
+            let ready = pair.host.prepared().unwrap();
+            pair.viewer_receives(ready);
+            assert_eq!(pair.encode(2, key_frame()), "media");
+            assert!(pair.viewer.decoded(DecodeReceipt::Media(old, 2)).unwrap().is_empty());
+            assert_eq!(pair.host.gate(), Gate::Closed);
+            pair.decode(2);
+            assert_eq!(pair.host.gate(), Gate::Open);
+        }
+    }
+
+    #[test]
+    fn an_unreceived_udp_keyframe_expires_into_a_new_reliable_transaction() {
+        let mut pair = Pair::new();
+        pair.offer_udp();
+        pair.verify_udp();
+        let ready = pair.host.prepared().unwrap();
+        pair.viewer_receives(ready);
+        assert!(matches!(pair.host.frame(1, key_frame()).unwrap(), HostFrame::Datagram(_)));
+        let deadline = pair.viewer.deadline().unwrap();
+        let events = pair.viewer.tick(deadline).unwrap();
+        pair.viewer_events(events);
+        assert_eq!(pair.settled, 1);
+        assert_eq!((pair.host.frame_path(), pair.viewer.frame_path()), (MediaPath::Shared, MediaPath::Shared));
+        let ready = pair.host.prepared().unwrap();
+        pair.viewer_receives(ready);
+        assert_eq!(pair.encode(1, key_frame()), "media");
+        pair.decode(1);
+        assert_eq!(pair.host.gate(), Gate::Open);
     }
 
     #[test]
@@ -1330,7 +1724,7 @@ mod tests {
         assert!(pair.viewer.tick(initial_deadline - Duration::from_millis(1)).unwrap().is_empty());
         let events = pair.viewer.tick(initial_deadline).unwrap();
         pair.viewer_events(events);
-        assert_eq!(pair.host.frame_path(), ReliablePath::Shared);
+        assert_eq!(pair.host.frame_path(), MediaPath::Shared);
         pair.bind_video();
         let ready = pair.host.prepared().unwrap();
         assert_eq!(ready.path.as_deref(), Some("shared"));
@@ -1361,7 +1755,7 @@ mod tests {
         assert_eq!(pair.host.gate(), Gate::Closed);
         pair.decode(2);
         assert_eq!(pair.host.gate(), Gate::Open);
-        assert_eq!(pair.host.frame_path(), ReliablePath::Shared);
+        assert_eq!(pair.host.frame_path(), MediaPath::Shared);
     }
 
     #[test]
@@ -1378,15 +1772,15 @@ mod tests {
         assert!(pair.host.control(&wrong, false).unwrap().is_empty());
         assert_eq!(pair.host.gate(), Gate::Closed);
         pair.viewer_receives(ready);
-        assert_eq!(pair.host.frame_path(), ReliablePath::Tcp);
+        assert_eq!(pair.host.frame_path(), MediaPath::Tcp);
         let HostFrame::Media(frame) = pair.host.frame(1, key_frame()).unwrap() else { panic!("expected TCP keyframe") };
         assert!(pair.viewer.frame(&frame.payload, pair.now).unwrap().is_empty());
-        let accepted = pair.viewer.frame_on(ReliablePath::Tcp, &frame.payload, pair.now).unwrap();
+        let accepted = pair.viewer.frame_on(MediaPath::Tcp, &frame.payload, pair.now).unwrap();
         pair.viewer_events(accepted);
         assert_eq!(pair.host.gate(), Gate::Closed);
         pair.decode(1);
         assert_eq!(pair.host.gate(), Gate::Open);
-        assert_eq!(pair.host.frame_path(), ReliablePath::Tcp);
+        assert_eq!(pair.host.frame_path(), MediaPath::Tcp);
     }
 
     #[test]
@@ -1424,7 +1818,7 @@ mod tests {
             assert_eq!(pair.encode(1, key_frame()), "media");
             pair.decode(1);
             assert_eq!(pair.host.gate(), Gate::Open);
-            assert_eq!(pair.host.frame_path(), ReliablePath::Shared);
+            assert_eq!(pair.host.frame_path(), MediaPath::Shared);
         }
     }
 
@@ -1542,7 +1936,7 @@ mod tests {
         // with a stream in use, a new one asked for.
         pair.viewer_receives(MediaControl::recover(second));
         let third = pair.prepared[2];
-        let expired = MediaFeedback { kind: FeedbackKind::Expired, header: MediaFrameHeader { stream: third, frame_id: 1, is_idr: true } };
+        let expired = MediaFeedback { missing: Vec::new(), kind: FeedbackKind::Expired, header: MediaFrameHeader { stream: third, frame_id: 1, is_idr: true } };
         assert_eq!(pair.host.feedback(&expired), (0, Vec::new()), "this keyframe has not been sent");
         let ready = pair.host.prepared().unwrap();
         pair.viewer_receives(ready);
@@ -1563,11 +1957,11 @@ mod tests {
         let deadline = pair.host.deadline().unwrap();
         let header = MediaFrameHeader { stream, frame_id: 2, is_idr: false };
         for wrong in [MediaFrameHeader { is_idr: true, ..header }, MediaFrameHeader { frame_id: 3, ..header }] {
-            assert_eq!(pair.host.feedback(&MediaFeedback { kind: FeedbackKind::Decoded, header: wrong }), (0, Vec::new()));
+            assert_eq!(pair.host.feedback(&MediaFeedback { missing: Vec::new(), kind: FeedbackKind::Decoded, header: wrong }), (0, Vec::new()));
         }
         assert_eq!(pair.host.deadline(), Some(deadline));
         // Repeated receipt of an already reassembled frame cannot postpone recovery indefinitely.
-        pair.host.feedback(&MediaFeedback { kind: FeedbackKind::Reassembled, header });
+        pair.host.feedback(&MediaFeedback { missing: Vec::new(), kind: FeedbackKind::Reassembled, header });
         assert_eq!(pair.host.deadline(), Some(deadline));
         assert_eq!(pair.host.expire(deadline - Duration::from_millis(1)), (0, Vec::new()));
         assert_eq!(pair.host.expire(deadline), (1, vec![MediaControl::recover(stream)]));
@@ -1576,7 +1970,7 @@ mod tests {
 
         let events = pair.viewer.tick(pair.now + FRAME_TIMEOUT).unwrap();
         assert!(matches!(&events[..], [ViewerMediaEvent::Send(feedback), ViewerMediaEvent::Send(prepare)]
-            if MediaFeedback::decode(&feedback.payload).unwrap() == MediaFeedback { kind: FeedbackKind::Expired, header }
+            if MediaFeedback::decode(&feedback.payload).unwrap() == MediaFeedback { missing: Vec::new(), kind: FeedbackKind::Expired, header }
                 && MediaControl::read(prepare).unwrap().operation == MediaOperation::Prepare));
         assert!(pair.viewer.decoded(DecodeReceipt::Media(stream, 2)).unwrap().is_empty(), "a late callback cannot confirm the expired frame");
     }

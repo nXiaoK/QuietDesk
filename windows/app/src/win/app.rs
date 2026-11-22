@@ -7,7 +7,7 @@ use super::util::Com;
 use quietdesk_core::clipboard::{Exchange, Role};
 use quietdesk_core::clipboard_session::SessionClipboard;
 use quietdesk_core::error::{DeskError, Result};
-use quietdesk_core::host::{self, HostCommand, HostEvent, HostOptions};
+use quietdesk_core::host::{self, HostCommand, HostConnections, HostEvent, HostOptions};
 use quietdesk_core::media::{DecodeReceipt, MediaStreamId};
 use quietdesk_core::messages::{DeviceIdentity, StreamSettings};
 use quietdesk_core::pairing::PairingKey;
@@ -101,6 +101,7 @@ pub async fn serve_host(
         drop(waiting);
         let mut active = tls::PendingHandshakes::new(&acceptor);
         let (auxiliary, accepted) = mpsc::channel(4);
+        let connections = HostConnections { auxiliary: Some(accepted), datagram: stream.get_ref().local_addr().ok() };
         notify(HostNotice::Connected);
         let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
         let (session_commands, queue) = mpsc::unbounded_channel();
@@ -121,7 +122,7 @@ pub async fn serve_host(
                 }
                 report(HostNotice::Session(event));
             },
-            accepted,
+            connections,
         );
         tokio::pin!(session);
         let period = std::time::Duration::from_secs(2);
@@ -404,7 +405,7 @@ pub async fn run_viewer<S: ViewerSink>(
         || tls::connect(&target.0, target.1, &key),
         |stream, attempt| {
             let attempt = match stream.get_ref().peer_addr() {
-                Ok(addr) => attempt.with_auxiliary(addr, key.clone()),
+                Ok(addr) => attempt.with_auxiliary(addr, key.clone()).with_datagrams(addr),
                 Err(_) => attempt,
             };
             viewer_session(stream, attempt, frame.clone(), sink.clone())

@@ -21,7 +21,7 @@ use tokio::sync::{oneshot, watch};
 
 enum Command {
     Size(Sender<Result<(u32, u32)>>),
-    Displays(Sender<Result<HostDisplays>>),
+    Displays(oneshot::Sender<Result<HostDisplays>>),
     SwitchDisplay(u32, StreamSettings, FrameSink, oneshot::Sender<Result<DisplaySwitch>>),
     Configure(StreamSettings, FrameSink, oneshot::Sender<Result<VideoStreamState>>),
     Pause(bool, oneshot::Sender<Result<()>>),
@@ -347,6 +347,12 @@ fn stopped() -> DeskError {
     DeskError::platform("屏幕采集线程已停止")
 }
 
+async fn display_topology(commands: &Sender<Command>) -> Result<HostDisplays> {
+    let (reply, answer) = oneshot::channel();
+    commands.send(Command::Displays(reply)).map_err(|_| stopped())?;
+    tokio::time::timeout(Duration::from_secs(10), answer).await.map_err(|_| stopped())?.map_err(|_| stopped())?
+}
+
 impl HostPlatform for WindowsHost {
     fn supports_audio_capture(&self) -> bool {
         true
@@ -383,10 +389,8 @@ impl HostPlatform for WindowsHost {
         inject::input_action(action, move || display.lock().unwrap().as_ref().is_some_and(Display::still_at_bounds))
     }
 
-    fn displays(&mut self) -> Result<Option<HostDisplays>> {
-        let (reply, answer) = channel();
-        self.commands.send(Command::Displays(reply)).map_err(|_| stopped())?;
-        answer.recv_timeout(Duration::from_secs(10)).map_err(|_| stopped())?.map(Some)
+    async fn displays(&mut self) -> Result<Option<HostDisplays>> {
+        display_topology(&self.commands).await.map(Some)
     }
 
     async fn switch_display(&mut self, id: u32, settings: StreamSettings, sink: FrameSink) -> Result<DisplaySwitch> {
@@ -444,5 +448,25 @@ impl HostPlatform for WindowsHost {
     fn stop(&mut self) {
         self.gestures.cancel();
         self.buttons.release_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn slow_display_enumeration_yields_the_network_thread_and_preserves_worker_errors() {
+        let (commands, capture) = channel();
+        let query = display_topology(&commands);
+        tokio::pin!(query);
+        tokio::select! {
+            biased;
+            _ = &mut query => panic!("the capture worker has not replied"),
+            () = tokio::task::yield_now() => {}
+        }
+        let Ok(Command::Displays(reply)) = capture.try_recv() else { panic!("missing topology request") };
+        reply.send(Err(DeskError::platform("synthetic display failure"))).unwrap();
+        assert!(query.await.unwrap_err().to_string().contains("synthetic display failure"));
     }
 }

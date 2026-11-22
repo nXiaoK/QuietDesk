@@ -34,6 +34,7 @@ struct Approval {
     sequence: u32,
     cancelled: AtomicBool,
     accepted: AtomicBool,
+    paste: Option<Weak<Promise>>,
 }
 
 struct Shared {
@@ -76,10 +77,37 @@ impl StaPort {
     }
 }
 enum Command {
-    Read { generation: u64, token: u64, kind: Kind },
-    Install { generation: u64, sequence: u32, promise: Weak<Promise>, ack: Option<Revision> },
+    CountFileRoots {
+        generation: u64,
+        token: u64,
+    },
+    Read {
+        generation: u64,
+        token: u64,
+        kind: Kind,
+    },
+    Install(Installation),
+    #[cfg(test)]
+    RetainInstalled(mpsc::SyncSender<windows::core::AgileReference<IDataObject>>),
     Clear,
     Stop,
+}
+struct Installation {
+    generation: u64,
+    sequence: u32,
+    promise: Weak<Promise>,
+    ack: Option<Revision>,
+}
+impl Installation {
+    fn finish(&self, shared: &Shared, success: bool) {
+        if !success && let Some(promise) = self.promise.upgrade() {
+            promise.cancel();
+            shared.active.lock().unwrap().take_if(|p| Arc::ptr_eq(p, &promise));
+        }
+        if let Some(revision) = self.ack {
+            shared.applied(revision, success);
+        }
+    }
 }
 struct Prepare {
     revision: Revision,
@@ -154,20 +182,32 @@ impl NativeClipboard {
 
     pub fn action(&self, action: Action) {
         match action {
+            Action::CountFileRoots { token } => self.sta.send(Command::CountFileRoots { generation: self.shared.generation(), token }),
             Action::Read { token, kind } => self.sta.send(Command::Read { generation: self.shared.generation(), token, kind }),
-            Action::Advertise { revision, kind } => {
+            Action::Advertise { revision, kind, .. } => {
                 self.shared.reset();
                 let promise = Arc::new(Promise::new(revision, kind, self.shared.input.clone(), None));
                 *self.shared.active.lock().unwrap() = Some(promise.clone());
-                self.sta.send(Command::Install { generation: self.shared.generation(), sequence: sequence(), promise: Arc::downgrade(&promise), ack: None });
+                self.sta.send(Command::Install(Installation {
+                    generation: self.shared.generation(),
+                    sequence: sequence(),
+                    promise: Arc::downgrade(&promise),
+                    ack: None,
+                }));
             }
             Action::Clear => {
                 self.shared.reset();
                 self.sta.send(Command::Clear);
             }
             Action::FileOffer(offer) => {
-                let gate =
-                    Arc::new(Approval { revision: offer.revision, sequence: sequence(), cancelled: AtomicBool::new(false), accepted: AtomicBool::new(false) });
+                let paste = self.shared.active.lock().unwrap().as_ref().filter(|p| !offer.explicit_drop && p.pending_file()).map(Arc::downgrade);
+                let gate = Arc::new(Approval {
+                    revision: offer.revision,
+                    sequence: sequence(),
+                    cancelled: AtomicBool::new(false),
+                    accepted: AtomicBool::new(false),
+                    paste,
+                });
                 if let Some(old) = self.shared.approval.lock().unwrap().replace(gate.clone()) {
                     old.cancelled.store(true, Ordering::Release);
                 }
@@ -233,7 +273,7 @@ fn prepare_payload(job: Prepare, shared: &Shared, sta: &StaPort) {
             old.cancel();
         }
         drop(slot);
-        sta.send(Command::Install { generation: job.generation, sequence: expected, promise: Arc::downgrade(&promise), ack: Some(job.revision) });
+        sta.send(Command::Install(Installation { generation: job.generation, sequence: expected, promise: Arc::downgrade(&promise), ack: Some(job.revision) }));
     }
 }
 fn show_offer(offer: FileOffer, gate: Arc<Approval>, shared: &Shared) {
@@ -255,10 +295,17 @@ fn show_offer(offer: FileOffer, gate: Arc<Approval>, shared: &Shared) {
         ..Default::default()
     };
     let mut button = 0;
-    let accept = unsafe { TaskDialogIndirect(&config, Some(&mut button), None, None) }.is_ok()
+    let mut accept = unsafe { TaskDialogIndirect(&config, Some(&mut button), None, None) }.is_ok()
         && button == IDYES.0
         && (offer.explicit_drop || sequence() == gate.sequence || shared.active.lock().unwrap().as_ref().is_some_and(|p| p.owned()));
     if !gate.cancelled.load(Ordering::Acquire) {
+        if let Some(paste) = &gate.paste {
+            let pending = paste.upgrade();
+            accept = accept && pending.as_ref().is_some_and(|p| p.approve_file());
+            if !accept && let Some(p) = pending {
+                p.cancel();
+            }
+        }
         gate.accepted.store(accept, Ordering::Release);
         let _ = shared.input.blocking_send(Input::Decision { revision: offer.revision, accept });
     }
@@ -314,44 +361,73 @@ fn sta(shared: Arc<Shared>, commands: mpsc::Receiver<Command>, started: mpsc::Sy
 fn message_loop(hwnd: HWND, formats: Formats, shared: &Shared, commands: &mpsc::Receiver<Command>, mut last: u32) {
     let mut installed: Option<(IDataObject, Arc<Promise>)> = None;
     let mut own_clear = None;
+    let mut deferred: Option<(Installation, u8)> = None;
     let mut retry = 0;
     let mut msg = MSG::default();
     let mut running = true;
     while running && unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
-        if msg.hwnd == hwnd && msg.message == WAKE {
-            while let Ok(cmd) = commands.try_recv() {
+        let install_timer = msg.message == WM_TIMER && msg.wParam.0 == 2;
+        if msg.hwnd == hwnd && (msg.message == WAKE || install_timer) {
+            let due = if install_timer {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), 2);
+                }
+                deferred.take().map(|(job, attempts)| (Command::Install(job), attempts))
+            } else {
+                None
+            };
+            for (cmd, attempts) in due.into_iter().chain(commands.try_iter().map(|cmd| (cmd, 0))) {
                 match cmd {
+                    Command::CountFileRoots { generation, token } => {
+                        if shared.generation() == generation && u64::from(last) == token {
+                            let count = clipboard::file_root_count(token, formats);
+                            if u64::from(sequence()) == token && shared.generation() == generation {
+                                let _ = shared.input.blocking_send(Input::FileRootCount { token, count });
+                            }
+                        }
+                    }
                     Command::Read { generation, token, kind } => {
                         let payload = (shared.generation() == generation).then(|| clipboard::read(token, kind, formats)).flatten();
                         let _ = shared.input.blocking_send(Input::Read { token, payload });
                     }
-                    Command::Install { generation, sequence: expected, promise, ack } => {
-                        let Some(promise) = promise.upgrade() else {
-                            if let Some(revision) = ack {
-                                shared.applied(revision, false);
-                            }
+                    Command::Install(job) => {
+                        let Some(promise) = job.promise.upgrade().filter(|_| shared.generation() == job.generation) else {
+                            job.finish(shared, false);
                             continue;
                         };
                         let observed = sequence();
-                        let sequence_matches = observed == expected || own_clear == Some(expected) && unsafe { GetClipboardOwner() == Ok(hwnd) };
-                        let ok = shared.generation() == generation && sequence_matches && {
-                            let obj: IDataObject = DataObject { formats, promise: promise.clone() }.into();
-                            if unsafe { OleSetClipboard(&obj) }.is_ok() {
+                        let sequence_matches = observed == job.sequence || own_clear == Some(job.sequence) && unsafe { GetClipboardOwner() == Ok(hwnd) };
+                        if !sequence_matches {
+                            job.finish(shared, false);
+                            continue;
+                        }
+                        let obj: IDataObject = DataObject { formats, promise: promise.clone() }.into();
+                        match unsafe { OleSetClipboard(&obj) } {
+                            Ok(()) => {
                                 promise.installed();
-                                installed = Some((obj, promise.clone()));
+                                if let Some((_, old)) = installed.replace((obj, promise)) {
+                                    old.displaced();
+                                }
                                 last = sequence();
-                                true
-                            } else {
-                                false
+                                job.finish(shared, true);
                             }
-                        };
-                        if !ok {
-                            promise.cancel();
-                            shared.active.lock().unwrap().take_if(|p| Arc::ptr_eq(p, &promise));
+                            Err(e)
+                                if matches!(e.code(), CLIPBRD_E_CANT_OPEN | E_ACCESSDENIED)
+                                    && attempts < 20
+                                    && unsafe { SetTimer(Some(hwnd), 2, 50, None) } != 0 =>
+                            {
+                                // A consumer may still have the clipboard open while returning the old GetData result.
+                                if let Some((old, _)) = deferred.replace((job, attempts + 1)) {
+                                    old.finish(shared, false);
+                                }
+                            }
+                            Err(_) => job.finish(shared, false),
                         }
-                        if let Some(revision) = ack {
-                            shared.applied(revision, ok);
-                        }
+                    }
+                    #[cfg(test)]
+                    Command::RetainInstalled(reply) => {
+                        let (obj, _) = installed.as_ref().unwrap();
+                        reply.send(windows::core::AgileReference::new(obj).unwrap()).unwrap();
                     }
                     Command::Clear => {
                         if let Some((obj, p)) = &installed
@@ -393,7 +469,7 @@ fn message_loop(hwnd: HWND, formats: Formats, shared: &Shared, commands: &mpsc::
                 continue;
             }
             if let Some((_, p)) = installed.take() {
-                p.cancel();
+                p.displaced();
             }
             match clipboard::inspect(formats) {
                 Ok((token, kind)) => {
@@ -439,8 +515,12 @@ mod tests {
     use uuid::Uuid;
     use windows::Win32::System::Com::{DATADIR_GET, DVASPECT_CONTENT, FORMATETC, TYMED_HGLOBAL};
     use windows::Win32::System::Ole::{CF_HDROP, OleGetClipboard, ReleaseStgMedium};
-    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+    use windows::Win32::UI::Shell::{DragQueryFileW, FO_COPY, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, HDROP, SHFILEOPSTRUCTW, SHFileOperationW};
 
+    fn file_format() -> FORMATETC {
+        FORMATETC { cfFormat: CF_HDROP.0, tymed: TYMED_HGLOBAL.0 as u32, dwAspect: DVASPECT_CONTENT.0, lindex: -1, ..Default::default() }
+    }
+    #[track_caller]
     fn eventually<T>(mut f: impl FnMut() -> Option<T>) -> T {
         let until = Instant::now() + Duration::from_secs(6);
         loop {
@@ -467,62 +547,85 @@ mod tests {
         let manifest = Revision { counter: 1, origin: Uuid::new_v4() };
         let stream = Revision { counter: 2, ..manifest };
         let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
-        let paths = vec![dir.join("one file.txt"), dir.join("文档.txt")];
-        broker.action(Action::Advertise { revision: manifest, kind: Kind::Files });
+        let received = dir.join("received");
+        let destination = dir.join("paste here");
+        std::fs::create_dir_all(&destination).unwrap();
+        let paths = vec![received.join("one file.txt"), received.join("文档")];
+        broker.action(Action::Advertise { revision: manifest, kind: Kind::Files, file_root_count: Some(2) });
         let (probed, format_ok) = std::sync::mpsc::channel();
         let (go, read) = std::sync::mpsc::channel();
         let expected = paths.clone();
+        let target = destination.clone();
         let client = std::thread::spawn(move || unsafe {
             OleInitialize(None).unwrap();
             eventually(|| IsClipboardFormatAvailable(u32::from(CF_HDROP.0)).ok());
             let object = OleGetClipboard().unwrap();
-            let format = FORMATETC { cfFormat: CF_HDROP.0, tymed: TYMED_HGLOBAL.0 as u32, dwAspect: DVASPECT_CONTENT.0, lindex: -1, ..Default::default() };
+            let format = file_format();
             object.EnumFormatEtc(DATADIR_GET.0 as u32).unwrap();
             object.QueryGetData(&format).ok().unwrap();
             probed.send(()).unwrap();
             read.recv().unwrap();
-            for _ in 0..2 {
-                let mut medium = object.GetData(&format).unwrap();
-                let drop = HDROP(medium.u.hGlobal.0);
-                assert_eq!(DragQueryFileW(drop, u32::MAX, None), 2);
-                for (i, expected) in expected.iter().enumerate() {
-                    let mut path = [0; 512];
-                    let n = DragQueryFileW(drop, i as u32, Some(&mut path)) as usize;
-                    let actual = PathBuf::from(String::from_utf16(&path[..n]).unwrap());
-                    assert_eq!(&actual, expected);
-                    assert_eq!(std::fs::read(actual).unwrap(), [i as u8]);
-                }
-                ReleaseStgMedium(&mut medium);
+            let mut medium = object.GetData(&format).unwrap();
+            let drop = HDROP(medium.u.hGlobal.0);
+            assert_eq!(DragQueryFileW(drop, u32::MAX, None), 2);
+            let mut sources = Vec::new();
+            for (i, expected) in expected.iter().enumerate() {
+                let mut path = [0; 512];
+                let n = DragQueryFileW(drop, i as u32, Some(&mut path)) as usize;
+                let actual = PathBuf::from(String::from_utf16(&path[..n]).unwrap());
+                assert_eq!(&actual, expected);
+                sources.extend_from_slice(&path[..=n]);
             }
+            sources.push(0);
+            ReleaseStgMedium(&mut medium);
+            let mut to = wide(target.to_str().unwrap());
+            to.push(0);
+            let mut operation = SHFILEOPSTRUCTW {
+                wFunc: FO_COPY,
+                pFrom: PCWSTR(sources.as_ptr()),
+                pTo: PCWSTR(to.as_ptr()),
+                fFlags: (FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT).0 as u16,
+                ..Default::default()
+            };
+            assert_eq!(SHFileOperationW(&mut operation), 0);
+            assert!(!operation.fAnyOperationsAborted.as_bool());
             std::mem::drop(object);
             OleUninitialize();
         });
         format_ok.recv_timeout(Duration::from_secs(8)).unwrap();
         assert!(rx.try_recv().is_err());
-        assert!(!dir.exists());
+        assert!(!received.exists());
         go.send(()).unwrap();
         assert!(matches!(input(&mut rx),Input::Paste(r) if r==manifest));
         broker.action(Action::FileOffer(FileOffer {
             revision: stream,
-            names: vec!["one file.txt".into(), "文档.txt".into()],
+            names: vec!["one file.txt".into(), "文档".into()],
             roots: 2,
-            entries: 2,
+            entries: 3,
             bytes: 2,
             explicit_drop: false,
         }));
         let dialog = eventually(|| unsafe { FindWindowW(PCWSTR::null(), w!("QuietDesk · 文件接收")).ok() });
-        assert!(!dir.exists());
+        assert!(!received.exists());
+        let pending = broker.shared.active.lock().unwrap().clone().unwrap();
+        let responsive = unsafe { SendMessageTimeoutW(HWND(broker.sta.window as _), WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, 1500, None) };
+        assert_ne!(responsive.0, 0, "the clipboard STA must dispatch synchronous window messages while approval is pending");
+        std::thread::sleep(Duration::from_secs(13));
+        assert!(!client.is_finished(), "the original paste is still waiting for approval");
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
         unsafe {
             PostMessageW(Some(dialog), TDM_CLICK_BUTTON.0 as u32, WPARAM(IDYES.0 as usize), LPARAM(0)).unwrap();
         }
         assert!(matches!(input(&mut rx),Input::Decision{revision,accept:true} if revision==stream));
-        std::fs::create_dir(&dir).unwrap();
-        for (i, path) in paths.iter().enumerate() {
-            std::fs::write(path, [i as u8]).unwrap();
-        }
+        std::fs::create_dir_all(&paths[1]).unwrap();
+        std::fs::write(&paths[0], [37]).unwrap();
+        std::fs::write(paths[1].join("里面.txt"), [82]).unwrap();
         broker.action(Action::Apply { revision: stream, manifest: Some(manifest), payload: Payload::Files(paths.clone()), explicit_drop: false });
         assert!(matches!(input(&mut rx),Input::Applied{revision,success:true} if revision==stream));
         client.join().unwrap();
+        assert_eq!(pending.render_calls.load(Ordering::Relaxed), 1, "one provider call must complete the physical paste");
+        assert_eq!(std::fs::read(destination.join("one file.txt")).unwrap(), [37]);
+        assert_eq!(std::fs::read(destination.join("文档").join("里面.txt")).unwrap(), [82]);
         assert!(rx.try_recv().is_err());
 
         // A later local copy wins over late remote data, including when the session is detached.
@@ -537,10 +640,92 @@ mod tests {
 
     #[test]
     #[ignore = "requires the disposable Wine/Xvfb clipboard"]
+    fn clipboard_native_approved_call_survives_a_local_copy_until_completed_or_cancelled() {
+        assert_eq!(std::env::var("QUIETDESK_ISOLATED_CLIPBOARD_CHECK").as_deref(), Ok("1"));
+        let path = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        for cancel in [false, true] {
+            let (tx, mut rx) = async_mpsc::channel(16);
+            let broker = NativeClipboard::start(tx, false).unwrap();
+            let revision = Revision { counter: 1, origin: Uuid::new_v4() };
+            let stream = Revision { counter: 2, ..revision };
+            broker.action(Action::Advertise { revision, kind: Kind::Files, file_root_count: Some(1) });
+            eventually(|| broker.shared.active.lock().unwrap().as_ref().is_some_and(|p| p.owned()).then_some(()));
+            // Retain the installed source directly. Wine's clipboard wrapper itself holds OpenClipboard during GetData.
+            let (reply, retained) = mpsc::sync_channel(1);
+            broker.sta.send(Command::RetainInstalled(reply));
+            let source = retained.recv_timeout(Duration::from_secs(3)).unwrap();
+            let original = source.clone();
+            let expected = path.clone();
+            let client = std::thread::spawn(move || unsafe {
+                OleInitialize(None).unwrap();
+                let obj = original.resolve().unwrap();
+                let data = obj.GetData(&file_format());
+                if cancel {
+                    assert!(data.is_err());
+                } else {
+                    let mut medium = data.unwrap();
+                    let mut name = [0; 512];
+                    let n = DragQueryFileW(HDROP(medium.u.hGlobal.0), 0, Some(&mut name)) as usize;
+                    assert_eq!(PathBuf::from(String::from_utf16(&name[..n]).unwrap()), expected);
+                    assert_eq!(std::fs::read(&expected).unwrap(), b"accepted");
+                    ReleaseStgMedium(&mut medium);
+                }
+                drop(obj);
+                drop(original);
+                OleUninitialize();
+            });
+            assert!(matches!(input(&mut rx), Input::Paste(r) if r == revision));
+            broker.action(Action::FileOffer(FileOffer { revision: stream, names: vec!["file".into()], roots: 1, entries: 1, bytes: 8, explicit_drop: false }));
+            let dialog = eventually(|| unsafe { FindWindowW(PCWSTR::null(), w!("QuietDesk · 文件接收")).ok() });
+            unsafe {
+                PostMessageW(Some(dialog), TDM_CLICK_BUTTON.0 as u32, WPARAM(IDYES.0 as usize), LPARAM(0)).unwrap();
+            }
+            assert!(matches!(input(&mut rx), Input::Decision {revision,accept:true} if revision == stream));
+            clipboard::set_text("keep my new copy").unwrap();
+            let stale = std::thread::spawn(move || unsafe {
+                OleInitialize(None).unwrap();
+                let obj = source.resolve().unwrap();
+                assert!(obj.GetData(&file_format()).is_err(), "a new read on the displaced object must not join an approved download");
+                drop(obj);
+                drop(source);
+                OleUninitialize();
+            });
+            eventually(|| stale.is_finished().then_some(()));
+            stale.join().unwrap();
+            assert!(!client.is_finished());
+            if cancel {
+                broker.action(Action::Clear);
+            } else {
+                std::fs::write(&path, b"accepted").unwrap();
+                broker.action(Action::Apply { revision: stream, manifest: Some(revision), payload: Payload::Files(vec![path.clone()]), explicit_drop: false });
+            }
+            eventually(|| client.is_finished().then_some(()));
+            client.join().unwrap();
+            assert_eq!(clipboard::text().as_deref(), Some("keep my new copy"));
+            if !cancel {
+                loop {
+                    match input(&mut rx) {
+                        Input::Applied { revision, success: true } if revision == stream => break,
+                        Input::LocalChanged { .. } => {}
+                        _ => panic!("the displaced object must not request another transfer"),
+                    }
+                }
+                std::fs::remove_file(&path).unwrap();
+            }
+            let window = HWND(broker.sta.window as _);
+            drop(broker);
+            eventually(|| (!unsafe { IsWindow(Some(window)) }.as_bool()).then_some(()));
+            assert_eq!(clipboard::text().as_deref(), Some("keep my new copy"));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the disposable Wine/Xvfb clipboard"]
     fn clipboard_native_preconnection_and_cancelled_demand() {
         assert_eq!(std::env::var("QUIETDESK_ISOLATED_CLIPBOARD_CHECK").as_deref(), Ok("1"));
-        let paths = vec![std::env::temp_dir().join("preexisting choice.txt")];
-        clipboard::external_files(paths.clone());
+        let absent = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let paths = vec![absent.join("preexisting choice.txt"), absent.join("目录")];
+        clipboard::external_files(&paths, false);
         let (tx, mut rx) = async_mpsc::channel(16);
         let host = NativeClipboard::start(tx, false).unwrap();
         std::thread::sleep(Duration::from_millis(100));
@@ -549,17 +734,29 @@ mod tests {
         let (tx, mut rx) = async_mpsc::channel(16);
         let broker = NativeClipboard::start(tx, true).unwrap();
         let Input::LocalChanged { token, kind: Some(Kind::Files) } = input(&mut rx) else { panic!("initial file format") };
+        broker.action(Action::CountFileRoots { token });
+        assert!(matches!(input(&mut rx),Input::FileRootCount{token:t,count:Some(2)} if t==token));
+        assert!(!absent.exists());
+        broker.action(Action::Read { token, kind: Kind::Files });
+        assert!(matches!(input(&mut rx),Input::Read{payload:Some(Payload::Files(p)),..} if p==paths));
+
+        clipboard::external_files(&[], true);
+        assert!(matches!(input(&mut rx), Input::LocalChanged { kind: None, .. }));
+        clipboard::external_files(&paths, true);
+        let Input::LocalChanged { token, kind: Some(Kind::Files) } = input(&mut rx) else { panic!("mixed file formats") };
+        broker.action(Action::CountFileRoots { token });
+        assert!(matches!(input(&mut rx),Input::FileRootCount{token:t,count:None} if t==token));
         broker.action(Action::Read { token, kind: Kind::Files });
         assert!(matches!(input(&mut rx),Input::Read{payload:Some(Payload::Files(p)),..} if p==paths));
 
         let revision = Revision { counter: 2, origin: Uuid::new_v4() };
-        broker.action(Action::Advertise { revision, kind: Kind::Files });
+        broker.action(Action::Advertise { revision, kind: Kind::Files, file_root_count: None });
         let client = std::thread::spawn(move || unsafe {
             OleInitialize(None).unwrap();
             let marker = Formats::new().unwrap().marker;
             eventually(|| IsClipboardFormatAvailable(u32::from(marker)).ok());
             let object = OleGetClipboard().unwrap();
-            let f = FORMATETC { cfFormat: CF_HDROP.0, tymed: TYMED_HGLOBAL.0 as u32, dwAspect: DVASPECT_CONTENT.0, lindex: -1, ..Default::default() };
+            let f = file_format();
             assert!(object.GetData(&f).is_err());
             drop(object);
             OleUninitialize();
@@ -580,5 +777,74 @@ mod tests {
             PostMessageW(Some(hwnd), TDM_CLICK_BUTTON.0 as u32, WPARAM(IDNO.0 as usize), LPARAM(0)).unwrap();
         }
         assert!(matches!(input(&mut rx),Input::Decision{revision,accept:false} if revision==offer.revision));
+    }
+
+    #[test]
+    #[ignore = "requires the disposable Wine/Xvfb clipboard"]
+    fn clipboard_native_pending_file_read_releases_while_the_shell_keeps_its_object() {
+        assert_eq!(std::env::var("QUIETDESK_ISOLATED_CLIPBOARD_CHECK").as_deref(), Ok("1"));
+        enum Finish {
+            Decline,
+            Disconnect,
+            ReplaceManifest,
+        }
+        for finish in [Finish::Decline, Finish::Disconnect, Finish::ReplaceManifest] {
+            let (tx, mut rx) = async_mpsc::channel(16);
+            let broker = NativeClipboard::start(tx, false).unwrap();
+            let window = HWND(broker.sta.window as _);
+            let revision = Revision { counter: 10, origin: Uuid::new_v4() };
+            broker.action(Action::Advertise { revision, kind: Kind::Files, file_root_count: Some(1) });
+            eventually(|| broker.shared.active.lock().unwrap().as_ref().is_some_and(|p| p.owned()).then_some(()));
+            let (done, returned) = mpsc::channel();
+            let (release, retain) = mpsc::channel();
+            let client = std::thread::spawn(move || unsafe {
+                OleInitialize(None).unwrap();
+                let obj = OleGetClipboard().unwrap();
+                let format = file_format();
+                assert!(obj.GetData(&format).is_err());
+                done.send(()).unwrap();
+                retain.recv_timeout(Duration::from_secs(8)).unwrap();
+                drop(obj);
+                OleUninitialize();
+            });
+            assert!(matches!(input(&mut rx),Input::Paste(r) if r==revision));
+            match finish {
+                Finish::Decline => {
+                    let offer = FileOffer {
+                        revision: Revision { counter: 11, ..revision },
+                        names: vec!["declined".into()],
+                        roots: 1,
+                        entries: 1,
+                        bytes: 0,
+                        explicit_drop: false,
+                    };
+                    broker.action(Action::FileOffer(offer.clone()));
+                    let dialog = eventually(|| unsafe { FindWindowW(PCWSTR::null(), w!("QuietDesk · 文件接收")).ok() });
+                    unsafe {
+                        PostMessageW(Some(dialog), TDM_CLICK_BUTTON.0 as u32, WPARAM(IDNO.0 as usize), LPARAM(0)).unwrap();
+                    }
+                    assert!(matches!(input(&mut rx),Input::Decision{revision,accept:false} if revision==offer.revision));
+                    returned.recv_timeout(Duration::from_secs(3)).unwrap();
+                    drop(broker);
+                }
+                Finish::Disconnect => {
+                    drop(broker);
+                    returned.recv_timeout(Duration::from_secs(3)).unwrap();
+                }
+                Finish::ReplaceManifest => {
+                    let next = Revision { counter: 12, ..revision };
+                    broker.action(Action::Advertise { revision: next, kind: Kind::Text, file_root_count: None });
+                    returned.recv_timeout(Duration::from_secs(3)).unwrap();
+                    eventually(|| broker.shared.active.lock().unwrap().as_ref().is_some_and(|p| p.revision == next && p.owned()).then_some(()));
+                    clipboard::set_text("new local copy").unwrap();
+                    assert!(matches!(input(&mut rx), Input::LocalChanged { kind: None, .. }));
+                    assert_eq!(clipboard::text().as_deref(), Some("new local copy"));
+                    drop(broker);
+                }
+            }
+            eventually(|| (!unsafe { IsWindow(Some(window)) }.as_bool()).then_some(()));
+            release.send(()).unwrap();
+            client.join().unwrap();
+        }
     }
 }

@@ -15,7 +15,7 @@ public enum ClipboardAutomaticLimits {
     }
 }
 
-public struct ClipboardRevision: Codable, Equatable, Comparable, Sendable {
+public struct ClipboardRevision: Codable, Hashable, Comparable, Sendable {
     public let counter: UInt64
     public let origin: UUID
     public init(counter: UInt64, origin: UUID) {
@@ -36,10 +36,18 @@ public enum ClipboardManifestKind: String, Codable, Equatable, Sendable {
 public struct ClipboardManifest: Codable, Equatable, Sendable {
     public let revision: ClipboardRevision
     public let kind: ClipboardManifestKind
+    public let fileRootCount: Int?
 
-    public init(revision: ClipboardRevision, kind: ClipboardManifestKind) {
+    public init(revision: ClipboardRevision, kind: ClipboardManifestKind, fileRootCount: Int? = nil) {
         self.revision = revision
         self.kind = kind
+        self.fileRootCount = fileRootCount
+    }
+
+    fileprivate func validate() throws {
+        if let fileRootCount, kind != .files || !(1...ClipboardTransfer.maximumPromisedFileRoots).contains(fileRootCount) {
+            throw DeskError.invalid("文件粘贴清单的根项目数量无效")
+        }
     }
 }
 
@@ -84,13 +92,15 @@ public struct ClipboardFileOffer: Identifiable {
     public let bytes: UInt64
     public let createdUptime: TimeInterval
     public let isExplicitDrop: Bool
+    public let sourceManifest: ClipboardRevision?
 
     public init(id: UUID, names: [String], count: Int, bytes: UInt64, entryCount: Int? = nil,
-                createdUptime: TimeInterval = SessionClock.now, isExplicitDrop: Bool = false) {
+                createdUptime: TimeInterval = SessionClock.now, isExplicitDrop: Bool = false, sourceManifest: ClipboardRevision? = nil) {
         self.id = id; self.names = names; self.count = count; self.bytes = bytes
         self.entryCount = entryCount ?? count
         self.createdUptime = createdUptime
         self.isExplicitDrop = isExplicitDrop
+        self.sourceManifest = sourceManifest
     }
 }
 
@@ -176,6 +186,7 @@ public enum ClipboardPaths {
 // File I/O, protocol ordering and mutable state are confined to queue.
 public final class ClipboardTransfer {
     public static let maximumFileEntries = 200_000
+    public static let maximumPromisedFileRoots = 4096
 
     public static func previewName(_ name: String) -> String {
         String(decoding: name.utf8.prefix(120), as: UTF8.self)
@@ -191,6 +202,8 @@ public final class ClipboardTransfer {
     public var onPullRequested: ((ClipboardPullRequest) -> Void)?
     /// True when the request reached the approval prompt. File reception has its own result.
     public var onFilePasteRequestEnded: ((ClipboardRevision, Bool) -> Void)?
+    /// Called on the transfer queue when a requested file manifest has complete local roots or its request ends.
+    public var onFilePasteResolved: ((ClipboardRevision, [URL]?) -> Void)?
     public var validatePulledPNG: (@Sendable (Data) -> Bool)?
     public var onStatus: ((String) -> Void)?
     public var onFileOffer: ((ClipboardFileOffer?) -> Void)?
@@ -214,7 +227,7 @@ public final class ClipboardTransfer {
     private var newestFile: ClipboardRevision?
     private var announcedManifest: ClipboardManifest?
     private var requestedLocalFiles: (request: ClipboardPullRequest, answered: Bool)?
-    private var remoteFileManifest: ClipboardRevision?
+    private var remoteFileManifest: ClipboardManifest?
     private var pendingFilePull: (request: ClipboardPullRequest, created: TimeInterval)?
     private var activePull: ActivePull?
     private var outgoing: Outgoing?
@@ -340,7 +353,12 @@ public final class ClipboardTransfer {
         var handle: FileHandle?
         var updated = SessionClock.now
         var progressAt: TimeInterval = 0
-        init(begin: ClipboardBegin, directory: URL) { self.begin = begin; self.directory = directory }
+        let sourceManifest: ClipboardRevision?
+        init(begin: ClipboardBegin, directory: URL, sourceManifest: ClipboardRevision?) {
+            self.begin = begin
+            self.directory = directory
+            self.sourceManifest = sourceManifest
+        }
         deinit { try? handle?.close() }
     }
 
@@ -357,7 +375,7 @@ public final class ClipboardTransfer {
         queue.async { try? ClipboardPartialStorage.removeAbandoned(storage: storage) }
     }
 
-    public func announceManifest(kind: ClipboardManifestKind, completion: @escaping (ClipboardRevision?) -> Void = { _ in }) {
+    public func announceManifest(kind: ClipboardManifestKind, fileRootCount: Int? = nil, completion: @escaping (ClipboardRevision?) -> Void = { _ in }) {
         queue.async { [self] in
             guard !stopped, allowsOnDemandClipboard else {
                 completion(nil)
@@ -387,7 +405,9 @@ public final class ClipboardTransfer {
             clock &+= 1
             let revision = ClipboardRevision(counter: clock, origin: origin)
             newest = revision
-            let manifest = ClipboardManifest(revision: revision, kind: kind)
+            let count = kind == .files && allowsPhysicalFilePaste
+                ? fileRootCount.flatMap { (1...Self.maximumPromisedFileRoots).contains($0) ? $0 : nil } : nil
+            let manifest = ClipboardManifest(revision: revision, kind: kind, fileRootCount: count)
             announcedManifest = manifest
             sendJSON(.clipboardManifest, manifest)
             switch kind {
@@ -396,7 +416,11 @@ public final class ClipboardTransfer {
             case .png:
                 onStatus?("图片已就绪，粘贴时按需同步")
             case .files:
-                onStatus?(allowsPhysicalFilePaste ? "文件已复制，接收端粘贴时发起传输确认" : "文件已复制，在远端按 ⌘V 时发起传输确认")
+                if allowsPhysicalFilePaste, let fileRootCount, fileRootCount > Self.maximumPromisedFileRoots {
+                    onStatus?("顶层项目超过 \(Self.maximumPromisedFileRoots) 个，接收完成后可再次粘贴")
+                } else {
+                    onStatus?(allowsPhysicalFilePaste ? "文件已复制，接收端粘贴时发起传输确认" : "文件已复制，在远端按 ⌘V 时发起传输确认")
+                }
             }
             completion(revision)
         }
@@ -405,7 +429,7 @@ public final class ClipboardTransfer {
     public func invalidateRemoteManifest(_ revision: ClipboardRevision) {
         queue.async { [self] in
             guard !stopped, allowsOnDemandClipboard else { return }
-            if remoteFileManifest == revision {
+            if remoteFileManifest?.revision == revision {
                 invalidateFilePaste(reason: "对端剪贴板已更新")
                 return
             }
@@ -457,8 +481,12 @@ public final class ClipboardTransfer {
     /// Called on the first content read of the installed file placeholder.
     public func requestFilePaste(revision: ClipboardRevision) {
         queue.async { [self] in
-            guard !stopped, remoteFileManifest == revision, pendingFilePull == nil,
-                  pendingFileOffer?.sourceManifest != revision else { return }
+            if pendingFilePull?.request.revision == revision || pendingFileOffer?.sourceManifest == revision
+                || incoming?.sourceManifest == revision || fileIncoming?.sourceManifest == revision { return }
+            guard !stopped, remoteFileManifest?.revision == revision, pendingFilePull == nil else {
+                onFilePasteResolved?(revision, nil)
+                return
+            }
             let request = ClipboardPullRequest(revision: revision, kind: .files)
             pendingFilePull = (request, SessionClock.now)
             ensureTimer()
@@ -467,11 +495,12 @@ public final class ClipboardTransfer {
     }
 
     private func invalidateFilePaste(reason: String, notify: Bool = true, ending: ClipboardFileOfferEndReason = .superseded) {
-        guard let revision = remoteFileManifest else { return }
+        guard let revision = remoteFileManifest?.revision else { return }
         remoteFileManifest = nil
         onManifestInvalidated?(revision)
         if pendingFilePull != nil {
             pendingFilePull = nil
+            onFilePasteResolved?(revision, nil)
             onFilePasteRequestEnded?(revision, false)
         }
         if let offer = pendingFileOffer, offer.sourceManifest == revision {
@@ -574,7 +603,7 @@ public final class ClipboardTransfer {
             let fileLane = pending.begin.independentFileLane == true
             if accept {
                 do {
-                    try startReceiving(pending.begin)
+                    try startReceiving(pending.begin, sourceManifest: pending.sourceManifest)
                     finishFileOffer(.accepted)
                 }
                 catch {
@@ -789,12 +818,18 @@ public final class ClipboardTransfer {
                 case .clipboardManifest:
                     let manifest = try Wire.readJSON(ClipboardManifest.self, message.payload)
                     guard allowsOnDemandClipboard else { throw DeskError.invalid("对端未协商按需剪贴板") }
+                    do { try manifest.validate() }
+                    catch {
+                        sendJSON(.clipboardCancel, ClipboardReceipt(revision: manifest.revision, sequence: 0, reason: error.localizedDescription))
+                        onStatus?(error.localizedDescription)
+                        return
+                    }
                     clock = max(clock, manifest.revision.counter)
                     guard newest == nil || manifest.revision > newest! else { return }
                     newest = manifest.revision
                     invalidateFilePaste(reason: "对端有更新的剪贴板内容")
                     withdrawLocalFiles(reason: "对端有更新的剪贴板内容")
-                    remoteFileManifest = allowsPhysicalFilePaste && manifest.kind == .files ? manifest.revision : nil
+                    remoteFileManifest = allowsPhysicalFilePaste && manifest.kind == .files ? manifest : nil
                     if let previous = announcedManifest {
                         announcedManifest = nil
                         onManifestInvalidated?(previous.revision)
@@ -870,7 +905,7 @@ public final class ClipboardTransfer {
                     } else { try fillWindow(activeOutgoing) }
                 case .clipboardCancel:
                     let receipt = try Wire.readJSON(ClipboardReceipt.self, message.payload)
-                    if remoteFileManifest == receipt.revision {
+                    if remoteFileManifest?.revision == receipt.revision {
                         invalidateFilePaste(reason: receipt.reason ?? "对端取消文件复制", notify: false)
                     }
                     if announcedManifest?.revision == receipt.revision {
@@ -1106,6 +1141,13 @@ public final class ClipboardTransfer {
                     sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: 0, reason: "文件粘贴请求已失效"))
                     return
                 }
+                if let promised = remoteFileManifest?.fileRootCount, value.rootCount != promised {
+                    let reason = "文件根项目数量与粘贴清单不一致"
+                    invalidateFilePaste(reason: reason, notify: false)
+                    sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: 0, reason: reason))
+                    onStatus?(reason)
+                    return
+                }
                 sourceManifest = pending.request.revision
             } else {
                 guard let pull = activePull, !pull.isFinished, pull.requestID == pullID, pull.kind.rawValue == value.type else {
@@ -1195,7 +1237,7 @@ public final class ClipboardTransfer {
             ensureTimer()
             onFileOffer?(ClipboardFileOffer(id: id, names: value.names ?? [], count: value.rootCount ?? value.count,
                 bytes: value.bytes, entryCount: value.count, createdUptime: created,
-                isExplicitDrop: value.explicitDrop == true))
+                isExplicitDrop: value.explicitDrop == true, sourceManifest: sourceManifest))
             onStatus?(value.explicitDrop == true ? "收到拖拽文件传输请求，确认接收后才会下载（90 秒内）" : "收到文件复制请求，确认接收后才会下载（90 秒内）")
             return
         }
@@ -1215,7 +1257,7 @@ public final class ClipboardTransfer {
         }
     }
 
-    private func startReceiving(_ value: ClipboardBegin) throws {
+    private func startReceiving(_ value: ClipboardBegin, sourceManifest: ClipboardRevision? = nil) throws {
         try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         guard value.bytes <= (try availableCapacity(storage)) else {
             throw DeskError.invalid("接收目录可用磁盘空间不足，未下载文件内容")
@@ -1225,11 +1267,8 @@ public final class ClipboardTransfer {
         let folder = partialStorage.directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let useFileLane = value.independentFileLane == true || (allowsDecoupledFileTransfer && value.type == "files")
-        if useFileLane {
-            fileIncoming = Incoming(begin: value, directory: folder)
-        } else {
-            incoming = Incoming(begin: value, directory: folder)
-        }
+        let reception = Incoming(begin: value, directory: folder, sourceManifest: sourceManifest)
+        if useFileLane { fileIncoming = reception } else { incoming = reception }
         if value.type == "files" {
             let id = UUID()
             receivingFileID = id
@@ -1334,7 +1373,9 @@ public final class ClipboardTransfer {
             try FileManager.default.createDirectory(at: complete, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let destination = complete.appendingPathComponent(UUID().uuidString, isDirectory: true)
             try FileManager.default.moveItem(at: activeIncoming.directory, to: destination)
-            payload = .files(activeIncoming.roots.map { destination.appendingPathComponent($0) })
+            let roots = activeIncoming.roots.map { destination.appendingPathComponent($0) }
+            payload = .files(roots)
+            if let revision = activeIncoming.sourceManifest { onFilePasteResolved?(revision, roots) }
         } else {
             let data = try Data(contentsOf: activeIncoming.directory.appendingPathComponent("content"), options: .mappedIfSafe)
             if activeIncoming.begin.type == "text" {
@@ -1487,9 +1528,12 @@ public final class ClipboardTransfer {
     private func finishFileOffer(_ reason: ClipboardFileOfferEndReason) {
         guard let pending = pendingFileOffer else { return }
         pendingFileOffer = nil
-        if let source = pending.sourceManifest, remoteFileManifest == source {
-            remoteFileManifest = nil
-            if reason != .accepted { onManifestInvalidated?(source) }
+        if let source = pending.sourceManifest {
+            if remoteFileManifest?.revision == source {
+                remoteFileManifest = nil
+                if reason != .accepted { onManifestInvalidated?(source) }
+            }
+            if reason != .accepted { onFilePasteResolved?(source, nil) }
         }
         onFileOfferEnded?(pending.id, reason)
         onFileOffer?(nil)
@@ -1503,6 +1547,7 @@ public final class ClipboardTransfer {
             pull.settle(nil)
         }
         if let incoming {
+            if let source = incoming.sourceManifest { onFilePasteResolved?(source, nil) }
             try? incoming.handle?.close(); incoming.handle = nil
             try? FileManager.default.removeItem(at: incoming.directory)
             self.incoming = nil
@@ -1516,6 +1561,7 @@ public final class ClipboardTransfer {
         finishFileOffer(reason)
         finishFileReception()
         if let fileIncoming {
+            if let source = fileIncoming.sourceManifest { onFilePasteResolved?(source, nil) }
             try? fileIncoming.handle?.close(); fileIncoming.handle = nil
             try? FileManager.default.removeItem(at: fileIncoming.directory)
             self.fileIncoming = nil
@@ -1538,6 +1584,7 @@ public final class ClipboardTransfer {
         finishFileOffer(reason)
         finishFileReception()
         if let incoming {
+            if let source = incoming.sourceManifest { onFilePasteResolved?(source, nil) }
             try? incoming.handle?.close(); incoming.handle = nil
             try? FileManager.default.removeItem(at: incoming.directory)
             self.incoming = nil

@@ -48,8 +48,12 @@ impl Pair {
     }
     fn readies(&mut self, kind: Kind) -> Revision {
         self.act(0, Input::LocalChanged { token: 57, kind: Some(kind) });
+        if kind == Kind::Files {
+            assert!(matches!(self.actions.back(), Some((0, Action::CountFileRoots { token: 57 }))));
+            self.act(0, Input::FileRootCount { token: 57, count: Some(1) });
+        }
         let manifest = self.wire.last().unwrap().1.read_json::<Manifest>().unwrap();
-        assert!(matches!(self.actions.back(),Some((1,Action::Advertise {revision,kind:k})) if *revision==manifest.revision && *k==kind));
+        assert!(matches!(self.actions.back(),Some((1,Action::Advertise {revision,kind:k,..})) if *revision==manifest.revision && *k==kind));
         self.act(1, Input::Paste(manifest.revision));
         assert!(matches!(self.actions.back(),Some((0,Action::Read{token:57,kind:k})) if *k==kind));
         manifest.revision
@@ -194,6 +198,65 @@ fn focus_only_exposes_the_newest_copy_once_and_cancelled_reads_cannot_send_data(
     assert!(p.states[1].pull.is_none());
     assert!(p.states[1].remote_manifest.is_none());
 }
+
+#[test]
+fn only_the_current_selection_exposes_a_bounded_count_before_file_demand() {
+    let mut p = Pair::new();
+    for token in [1, 2] {
+        p.act(0, Input::LocalChanged { token, kind: Some(Kind::Files) });
+    }
+    p.act(0, Input::FileRootCount { token: 1, count: Some(9) });
+    assert!(!p.wire.iter().any(|(_, m)| m.kind == M::ClipboardManifest));
+    p.act(0, Input::FileRootCount { token: 2, count: Some(MAX_PROMISED_FILE_ROOTS) });
+    let board: Value = p.wire.last().unwrap().1.read_json().unwrap();
+    assert_eq!(board.as_object().unwrap().len(), 3);
+    assert_eq!(board["fileRootCount"], MAX_PROMISED_FILE_ROOTS);
+    assert!(!p.actions.iter().any(|(_, a)| matches!(a, Action::Read { .. })));
+
+    p.act(0, Input::LocalChanged { token: 3, kind: Some(Kind::Files) });
+    p.act(0, Input::FileRootCount { token: 3, count: Some(MAX_PROMISED_FILE_ROOTS + 1) });
+    let uncounted: Value = p.wire.last().unwrap().1.read_json().unwrap();
+    assert_eq!(uncounted.as_object().unwrap().len(), 2);
+    assert_eq!(uncounted["kind"], "files");
+    assert!(matches!(p.actions.back(), Some((1, Action::Advertise { file_root_count: None, .. }))));
+
+    legacy(&mut p.states[0]);
+    p.actions.clear();
+    p.act(0, Input::LocalChanged { token: 4, kind: Some(Kind::Files) });
+    assert!(!p.actions.iter().any(|(_, a)| matches!(a, Action::CountFileRoots { .. })));
+    assert!(matches!(p.actions.back(), Some((0, Action::Read { token: 4, .. }))));
+}
+
+#[test]
+fn invalid_manifest_counts_and_count_changes_never_authorize_a_file_offer() {
+    for (kind, count) in [("files", 0), ("files", MAX_PROMISED_FILE_ROOTS + 1), ("text", 1)] {
+        let mut p = Pair::new();
+        let rev = Revision { counter: 1, origin: Uuid::new_v4() };
+        p.act(1, raw(M::ClipboardManifest, json!({"revision":rev,"kind":kind,"fileRootCount":count})));
+        assert!(p.states[1].remote_manifest.is_none());
+        assert!(!p.actions.iter().any(|(_, a)| matches!(a, Action::Advertise { .. })));
+        assert!(p.wire.iter().any(|(_, m)| m.kind == M::ClipboardCancel));
+    }
+    let mut p = Pair::new();
+    let rev = p.readies(Kind::Files);
+    let id = p.states[1].pull.unwrap().request_id;
+    let stream = Revision { counter: rev.counter + 1, ..rev };
+    p.act(1, raw(M::ClipboardBegin, json!({"revision":stream,"type":"files","count":2,"rootCount":2,"sequence":0,"bytes":4,"pullRequestID":id})));
+    assert!(p.states[1].incoming.is_none());
+    assert!(!p.actions.iter().any(|(_, a)| matches!(a, Action::FileOffer(..))));
+    assert!(p.wire.iter().any(|(_, m)| m.kind == M::ClipboardCancel));
+}
+
+#[test]
+fn a_changed_source_root_count_cancels_before_opening_the_paths() {
+    let mut p = Pair::new();
+    let manifest = p.readies(Kind::Files);
+    p.act(0, Input::Read { token: 57, payload: Some(Payload::Files(vec![p.root.join("missing 1"), p.root.join("missing 2")])) });
+    assert!(!p.wire.iter().any(|(_, m)| m.kind == M::ClipboardBegin));
+    let cancel = p.wire.iter().find(|(_, m)| m.kind == M::ClipboardCancel).unwrap().1.read_json::<Receipt>().unwrap();
+    assert_eq!(cancel.revision, manifest);
+    assert_eq!(cancel.reason.as_deref(), Some("源剪贴板顶层数量已改变"));
+}
 #[test]
 fn legacy_eager_text_omits_extensions_and_reordered_chunks_fail_without_application() {
     let mut p = Pair::new();
@@ -286,7 +349,7 @@ fn a_new_local_copy_during_an_approved_file_download_is_preserved_until_the_file
     let path = p.root.join("sample");
     let contents = vec![0x42; CHUNK + 47];
     fs::write(&path, &contents).unwrap();
-    p.readies(Kind::Files);
+    let manifest = p.readies(Kind::Files);
     p.act(0, Input::Read { token: 57, payload: Some(Payload::Files(vec![path])) });
     let rev = p.states[1].incoming.as_ref().unwrap().begin.revision;
     p.states[1].handle(Input::Decision { revision: rev, accept: true });
@@ -301,13 +364,26 @@ fn a_new_local_copy_during_an_approved_file_download_is_preserved_until_the_file
     mac.handle(Input::LocalChanged { token: 101, kind: Some(Kind::Png) });
     assert!(!mac.effects.iter().any(|e| matches!(e,Output::Send(m) if m.kind==M::ClipboardManifest||m.kind==M::ClipboardCancel)));
     p.exchange(1);
+    let mut applied = p.actions.iter().filter_map(|(i, a)| match a {
+        Action::Apply { revision, manifest: Some(source), payload: Payload::Files(urls), explicit_drop: false } if *i == 1 => Some((revision, source, urls)),
+        _ => None,
+    });
+    let Some((revision, source, urls)) = applied.next() else { panic!("the pending paste must receive its files") };
+    assert_eq!((*revision, *source), (rev, manifest));
+    assert_eq!(fs::read(&urls[0]).unwrap(), contents);
+    assert!(applied.next().is_none());
+    assert!(
+        !p.wire
+            .iter()
+            .any(|(i, m)| *i == 1 && (m.kind == M::ClipboardManifest || m.kind == M::ClipboardReceipt && m.read_json::<Receipt>().unwrap().sequence == 4))
+    );
+    p.act(1, Input::Applied { revision: rev, success: true });
     let final_ack = p.wire.iter().position(|(i, m)| *i == 1 && m.kind == M::ClipboardReceipt && m.read_json::<Receipt>().unwrap().sequence == 4).unwrap();
     let new_manifest = p.wire.iter().position(|(i, m)| *i == 1 && m.kind == M::ClipboardManifest).unwrap();
     assert!(final_ack < new_manifest);
     assert_eq!(p.wire[new_manifest].1.read_json::<Manifest>().unwrap().kind, Kind::Png);
     assert_eq!(p.states[1].published_token, Some(101));
     assert!(p.actions.iter().any(|(_, a)| matches!(a,Action::Status(s) if s.contains("保留了新的本机复制"))));
-    assert!(!p.actions.iter().any(|(i, a)| *i == 1 && matches!(a, Action::Apply { .. })));
     let completed = fs::read_dir(p.states[1].storage.join("received")).unwrap().next().unwrap().unwrap().path().join("sample");
     assert_eq!(fs::read(completed).unwrap(), contents);
 }

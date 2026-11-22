@@ -16,6 +16,7 @@ func runFileApprovalChecks() {
                 let manifest = Box<ClipboardManifest?>(nil), offer = Box<ClipboardFileOffer?>(nil)
                 let sent = Box<[MessageKind]>([]), requested = Box(0), receipts = Box(0), handedOff = Box<[Bool]>([])
                 let published = Box<[String]>([]), success = Box(false)
+                let resolved = Box<[(ClipboardRevision, [URL]?)]>([])
                 let copied = DispatchSemaphore(value: 0), prompted = DispatchSemaphore(value: 0), done = DispatchSemaphore(value: 0)
                 sender.onSend = { [weak receiver] message in sent.update { $0.append(message.kind) }; receiver?.receive(message) }
                 receiver.onSend = { [weak sender] message in
@@ -29,16 +30,19 @@ func runFileApprovalChecks() {
                 receiver.onManifest = { manifest.set($0); copied.signal() }
                 receiver.onFilePasteRequestEnded = { _, result in handedOff.update { $0.append(result) } }
                 receiver.onFileOffer = { if let value = $0 { offer.set(value); prompted.signal() } }
-                receiver.onReceive = { payload in
-                    if case .files(let files) = payload {
-                        published.set(files.compactMap { try? String(contentsOf: $0, encoding: .utf8) })
-                    }
+                receiver.onFilePasteResolved = { revision, roots in resolved.update { $0.append((revision, roots)) } }
+                receiver.onApplyWithPermit = { payload, _, complete in
+                    guard case .files(let files) = payload, resolved.read().last?.1 == files else { complete(false); return }
+                    published.set(files.compactMap { try? String(contentsOf: $0, encoding: .utf8) })
+                    complete(true)
                 }
                 defer { stopTransfers(sender, receiver) }
-                sender.announceManifest(kind: .files)
+                let count = independentLane ? roots.count : nil
+                sender.announceManifest(kind: .files, fileRootCount: count)
                 try wait(copied, "File manifest did not arrive")
                 guard let revision = manifest.read()?.revision else { throw CheckFailure("Missing file manifest") }
-                try check(sent.read() == [.clipboardManifest] && requested.read() == 0, "Copy initiated file transfer")
+                try check(manifest.read()?.fileRootCount == count && sent.read() == [.clipboardManifest] && requested.read() == 0,
+                          "The file manifest changed root cardinality or initiated file transfer")
                 receiver.requestFilePaste(revision: revision)
                 receiver.requestFilePaste(revision: revision)
                 try wait(prompted, "Physical read did not reach approval")
@@ -48,8 +52,8 @@ func runFileApprovalChecks() {
                           "A repeated read downloaded or acknowledged files before approval")
                 receiver.respondToFileOffer(id: offered.id, accept: true)
                 try wait(done, "Approved files did not finish")
-                try check(success.read() && published.read() == roots.map(\.lastPathComponent),
-                          "Approved file roots did not reach normal clipboard application")
+                try check(success.read() && resolved.read().map { $0.0 } == [revision] && published.read() == roots.map(\.lastPathComponent),
+                          "The complete roots did not resolve their source exactly once before clipboard application")
             }
         }
     }
@@ -63,7 +67,8 @@ func runFileApprovalChecks() {
             let file = folder.appendingPathComponent("example")
             try Data([1]).write(to: file)
             let sent = Box<[MessageKind]>([]), results = Box<[Bool]>([]), dropped = Box<[String]>([])
-            let prompts = Box<[Bool]>([]), done = DispatchSemaphore(value: 0)
+            let prompts = Box<[Bool]>([]), rendered = Box<[Bool]>([]), done = DispatchSemaphore(value: 0)
+            receiver.onFilePasteResolved = { _, urls in rendered.update { $0.append(urls != nil) } }
             sender.onSend = { [weak receiver] message in sent.update { $0.append(message.kind) }; receiver?.receive(message) }
             receiver.onSend = { [weak sender] in sender?.receive($0) }
             receiver.onManifest = { [weak receiver] in receiver?.requestFilePaste(revision: $0.revision) }
@@ -84,7 +89,7 @@ func runFileApprovalChecks() {
             try check(sent.read() == [.clipboardManifest, .clipboardBegin] && results.read() == [false], "Decline sent contents")
             sender.sendExplicitFiles([file]) { value in results.update { $0.append(value) }; done.signal() }
             try wait(done, "The later explicit drop did not finish")
-            try check(prompts.read() == [false, true] && dropped.read() == ["example"] && results.read() == [false, true],
+            try check(rendered.read() == [false] && prompts.read() == [false, true] && dropped.read() == ["example"] && results.read() == [false, true],
                       "Explicit drop required a paste, or was applied to the clipboard")
         }
     }
@@ -119,6 +124,104 @@ func runFileApprovalChecks() {
             try wait(done, "Replacing the pasteboard did not stop the sending file")
             try check(superseded.read() && !delivered.read() && !payloadSeen.read(),
                       "The replaced approval started a download")
+        }
+    }
+
+    run("A file paste rejects invalid manifest counts and a changed count cannot reach approval") {
+        try withCheckFolder { folder in
+            let receiver = ClipboardTransfer(storage: folder, requireFileApproval: true, allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+            defer { receiver.stop() }
+            let origin = UUID(), revision = ClipboardRevision(counter: 10, origin: origin)
+            let seen = Box<[ClipboardRevision]>([]), prompted = Box(false), request = Box<ClipboardPullRequest?>(nil)
+            let resolved = Box<[ClipboardRevision]>([]), answered = DispatchSemaphore(value: 0)
+            receiver.onManifest = { manifest in seen.update { $0.append(manifest.revision) } }
+            receiver.onSend = { msg in
+                if msg.kind == .clipboardPull { request.set(try? Wire.readJSON(ClipboardPullRequest.self, msg.payload)) }
+                if msg.kind == .clipboardPull || msg.kind == .clipboardCancel { answered.signal() }
+            }
+            receiver.onFileOffer = { if $0 != nil { prompted.set(true) } }
+            receiver.onFilePasteResolved = { revision, urls in if urls == nil { resolved.update { $0.append(revision) } } }
+            for (kind, count) in [(ClipboardManifestKind.files, 0), (.files, ClipboardTransfer.maximumPromisedFileRoots + 1), (.text, 1)] {
+                receiver.receive(try Wire.json(.clipboardManifest, ClipboardManifest(revision: revision, kind: kind, fileRootCount: count)))
+                try wait(answered, "Invalid root count was accepted")
+            }
+            receiver.receive(try Wire.json(.clipboardManifest, ClipboardManifest(revision: revision, kind: .files, fileRootCount: 2)))
+            receiver.requestFilePaste(revision: revision)
+            try wait(answered, "Missing valid pull")
+            guard let pull = request.read() else { throw CheckFailure("Missing pull ID") }
+            let begin: [String: Any] = ["revision": ["counter": 11, "origin": origin.uuidString], "type": "files",
+                                        "sequence": 0, "count": 2, "rootCount": 1, "bytes": 0, "pullRequestID": pull.requestID.uuidString]
+            receiver.receive(Message(.clipboardBegin, try JSONSerialization.data(withJSONObject: begin)))
+            try wait(answered, "Changed root count was accepted")
+            try check(seen.read() == [revision] && !prompted.read() && resolved.read() == [revision],
+                      "Invalid root metadata installed a promise, started approval, or stranded the original read")
+        }
+    }
+
+    run("More roots than the native promise limit retain the legacy file manifest") {
+        try withCheckFolder { folder in
+            let sender = ClipboardTransfer(storage: folder, requireFileApproval: true, allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+            defer { sender.stop() }
+            let manifest = Box<ClipboardManifest?>(nil), announced = DispatchSemaphore(value: 0)
+            sender.onSend = { message in
+                if message.kind == .clipboardManifest {
+                    manifest.set(try? Wire.readJSON(ClipboardManifest.self, message.payload)); announced.signal()
+                }
+            }
+            sender.announceManifest(kind: .files, fileRootCount: ClipboardTransfer.maximumPromisedFileRoots + 1)
+            try wait(announced, "The legacy file manifest was suppressed")
+            try check(manifest.read()?.kind == .files && manifest.read()?.fileRootCount == nil, "The oversized native item count reached the peer")
+        }
+    }
+
+    run("A promised paste with fewer actual roots fails after approval and never materializes partial URLs") {
+        try withCheckFolder { folder in
+            let directory = folder.appendingPathComponent("photos"), store = folder.appendingPathComponent("receiver")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data([4]).write(to: directory.appendingPathComponent("image.bin"))
+            let source = ClipboardTransfer(storage: folder.appendingPathComponent("source"), requireFileApproval: true,
+                                           allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+            let sink = ClipboardTransfer(storage: store, requireFileApproval: true, allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+            let captured = Box<ClipboardRevision?>(nil), resolved = Box<[ClipboardRevision]>([])
+            let approved = Box(false), published = Box(false), sent = Box(true), done = DispatchSemaphore(value: 0)
+            source.onSend = { [weak sink] msg in
+                if msg.kind == .clipboardBegin, var body = try? JSONSerialization.jsonObject(with: msg.payload) as? [String: Any] {
+                    body["rootCount"] = 2
+                    if let bytes = try? JSONSerialization.data(withJSONObject: body) { sink?.receive(Message(.clipboardBegin, bytes)) }
+                } else { sink?.receive(msg) }
+            }
+            source.onPullRequested = { [weak source] request in
+                source?.sendPulled(.files([directory]), requestID: request.requestID) { sent.set($0); done.signal() }
+            }
+            sink.onManifest = { [weak sink] manifest in captured.set(manifest.revision); sink?.requestFilePaste(revision: manifest.revision) }
+            sink.onSend = { [weak source] msg in source?.receive(msg) }
+            sink.onFileOffer = { [weak sink] offer in
+                if let offer { approved.set(offer.count == 2); sink?.respondToFileOffer(id: offer.id, accept: true) }
+            }
+            sink.onFilePasteResolved = { revision, urls in if urls == nil { resolved.update { $0.append(revision) } } }
+            sink.onReceive = { _ in published.set(true) }
+            source.announceManifest(kind: .files, fileRootCount: 2)
+            try wait(done, "The sender did not receive the final rejection")
+            stopTransfers(source, sink)
+            try check(approved.read() && !sent.read() && !published.read() && resolved.read() == captured.read().map { [$0] },
+                      "The mismatched received roots escaped into a completed paste")
+            try check(!FileManager.default.fileExists(atPath: store.appendingPathComponent("received").path),
+                      "An incomplete set of roots moved into the received directory")
+        }
+    }
+
+    run("A content read queued behind withdrawal resolves without issuing a stale pull") {
+        try withCheckFolder { folder in
+            let receiver = ClipboardTransfer(storage: folder, requireFileApproval: true, allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+            defer { receiver.stop() }
+            let revision = ClipboardRevision(counter: 1, origin: UUID()), pulls = Box(0), resolved = DispatchSemaphore(value: 0)
+            receiver.onSend = { if $0.kind == .clipboardPull { pulls.update { $0 += 1 } } }
+            receiver.onFilePasteResolved = { source, urls in if source == revision && urls == nil { resolved.signal() } }
+            receiver.receive(try Wire.json(.clipboardManifest, ClipboardManifest(revision: revision, kind: .files, fileRootCount: 1)))
+            receiver.invalidateRemoteManifest(revision)
+            receiver.requestFilePaste(revision: revision)
+            try wait(resolved, "A stale content reader did not wake")
+            try check(pulls.read() == 0, "A read on a retired manifest started another file pull")
         }
     }
 
@@ -169,7 +272,7 @@ func runFileApprovalChecks() {
             let file = folder.appendingPathComponent("copied.txt")
             try Data([1, 2]).write(to: file)
             let manifest = Box<ClipboardRevision?>(nil), held = Box<Message?>(nil), shown = Box(false), acked = Box(false)
-            let callback = Box<[Bool]>([]), complete = Box<[Bool]>([])
+            let callback = Box<[Bool]>([]), complete = Box<[Bool]>([]), resolved = Box<[ClipboardRevision]>([])
             let copied = DispatchSemaphore(value: 0), prepared = DispatchSemaphore(value: 0), cancelled = DispatchSemaphore(value: 0)
             let rejected = DispatchSemaphore(value: 0), finished = DispatchSemaphore(value: 0)
             source.onSend = { [weak sink] message in
@@ -187,6 +290,7 @@ func runFileApprovalChecks() {
                 }
             }
             sink.onManifest = { manifest.set($0.revision); copied.signal() }
+            sink.onFilePasteResolved = { revision, urls in if urls == nil { resolved.update { $0.append(revision) } } }
             sink.onFilePasteRequestEnded = { _, result in callback.update { $0.append(result) }; cancelled.signal() }
             sink.onFileOffer = { if $0 != nil { shown.set(true) } }
             defer { stopTransfers(source, sink) }
@@ -201,7 +305,7 @@ func runFileApprovalChecks() {
             guard let late = held.read() else { throw CheckFailure("Missing delayed offer") }
             sink.receive(late)
             try wait(rejected, "Late file offer was not rejected")
-            try check(callback.read() == [false] && complete.read() == [false] && !shown.read() && !acked.read(),
+            try check(callback.read() == [false] && resolved.read() == [revision] && complete.read() == [false] && !shown.read() && !acked.read(),
                       "Stale file data prompted or began downloading")
         }
     }

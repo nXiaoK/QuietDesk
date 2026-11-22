@@ -143,27 +143,31 @@ fn local_kind(clip: &Open, f: Formats) -> Option<Kind> {
         None
     }
 }
-fn redirected() -> Option<bool> {
-    use windows::Win32::System::Threading::{
-        GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
-    };
+fn owner_pid(window: HWND) -> u32 {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+    pid
+}
+fn process_image(pid: u32) -> Option<String> {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW};
     unsafe {
-        let owner = GetClipboardOwner().ok()?;
-        let mut pid = 0;
-        GetWindowThreadProcessId(owner, Some(&mut pid));
-        if pid == GetCurrentProcessId() {
-            return Some(false);
-        }
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut path = [0u16; 1024];
         let mut len = path.len() as u32;
         let read = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(path.as_mut_ptr()), &mut len);
         let _ = CloseHandle(process);
         read.ok()?;
-        let name = path[..len as usize].rsplit(|u| *u == b'\\' as u16).next()?;
-        let name = String::from_utf16(name).ok()?;
-        Some(["rdpclip.exe", "mstsc.exe", "msrdc.exe"].iter().any(|rdp| name.eq_ignore_ascii_case(rdp)))
+        String::from_utf16(&path[..len as usize]).ok()
     }
+}
+fn redirected() -> Option<bool> {
+    let pid = owner_pid(unsafe { GetClipboardOwner().ok()? });
+    if pid == unsafe { windows::Win32::System::Threading::GetCurrentProcessId() } {
+        return Some(false);
+    }
+    let image = process_image(pid)?;
+    let name = image.rsplit('\\').next()?;
+    Some(["rdpclip.exe", "mstsc.exe", "msrdc.exe"].iter().any(|rdp| name.eq_ignore_ascii_case(rdp)))
 }
 fn roaming() -> bool {
     use windows::ApplicationModel::DataTransfer::Clipboard;
@@ -178,6 +182,35 @@ pub(super) fn inspect(f: Formats) -> windows::core::Result<(u64, Option<Kind>)> 
         return Err(ERROR_RETRY.into());
     }
     Ok((u64::from(token), if relayed { None } else { local_kind(&clip, f) }))
+}
+
+pub(super) fn file_root_count(token: u64, f: Formats) -> Option<usize> {
+    let clip = Open::new(None).ok()?;
+    unsafe {
+        if u64::from(GetClipboardSequenceNumber()) != token || f.virtual_files.into_iter().any(available) {
+            return None;
+        }
+        // A live owner may implement CF_HDROP by fetching files during WM_RENDERFORMAT.
+        // Leave third-party providers untouched until an actual pull.
+        if let Ok(owner) = GetClipboardOwner() {
+            let source = owner_pid(owner);
+            let shell = owner_pid(GetShellWindow());
+            if shell == 0 || source != shell && !process_image(source)?.eq_ignore_ascii_case(&process_image(shell)?) {
+                return None;
+            }
+        }
+        if available(f.shell_items) {
+            // CIDA begins with the number of children followed by parent and child offsets.
+            return clip.data(f.shell_items, MAX_DROP_BYTES, |bytes, _| {
+                let count = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+                (count <= (bytes.len() / 4).saturating_sub(2)).then_some(count)
+            });
+        }
+        clip.data(CF_HDROP.0, MAX_DROP_BYTES, |bytes, _| {
+            let (names, wide) = drop_names(bytes)?;
+            if wide { count_terminated(names.as_chunks::<2>().0, &[0, 0]) } else { count_terminated(names, &0) }
+        })
+    }
 }
 
 pub(super) fn read(token: u64, kind: Kind, f: Formats) -> Option<Payload> {
@@ -199,18 +232,30 @@ pub(super) fn read(token: u64, kind: Kind, f: Formats) -> Option<Payload> {
     }
 }
 
-fn file_roots(bytes: &[u8]) -> Option<Vec<PathBuf>> {
+fn drop_names(bytes: &[u8]) -> Option<(&[u8], bool)> {
     let header = bytes.get(..20)?;
     let offset = u32::from_le_bytes(header[..4].try_into().ok()?) as usize;
     let names = bytes.get(offset..)?;
-    if offset < 20 {
-        return None;
-    }
-    let mut paths = Vec::new();
-    if header[16..20] != [0, 0, 0, 0] {
-        if !offset.is_multiple_of(2) {
-            return None;
+    let wide = header[16..20] != [0, 0, 0, 0];
+    (offset >= 20 && (!wide || offset.is_multiple_of(2))).then_some((names, wide))
+}
+
+fn count_terminated<T: PartialEq>(mut names: &[T], nul: &T) -> Option<usize> {
+    let mut roots = 0;
+    loop {
+        let end = names.iter().position(|c| c == nul)?;
+        if end == 0 {
+            return Some(roots);
         }
+        roots += 1;
+        names = &names[end + 1..];
+    }
+}
+
+fn file_roots(bytes: &[u8]) -> Option<Vec<PathBuf>> {
+    let (names, wide) = drop_names(bytes)?;
+    let mut paths = Vec::new();
+    if wide {
         let mut names = names.as_chunks::<2>().0;
         loop {
             let n = names.iter().position(|u| *u == [0, 0])?;
@@ -246,13 +291,19 @@ fn file_roots(bytes: &[u8]) -> Option<Vec<PathBuf>> {
     (!paths.is_empty()).then_some(paths)
 }
 #[cfg(test)]
-pub(super) fn external_files(paths: Vec<PathBuf>) {
-    let Some(super::clipboard_ole::Rendered::Files(bytes)) = super::clipboard_ole::Rendered::build(Payload::Files(paths)) else { panic!() };
+pub(super) fn external_files(paths: &[PathBuf], virtual_content: bool) {
     unsafe {
         let hwnd = window().unwrap();
         let open = Open::new(Some(hwnd)).unwrap();
         EmptyClipboard().unwrap();
-        store(CF_HDROP.0, &bytes).unwrap();
+        if !paths.is_empty() {
+            let Some(super::clipboard_ole::Rendered::Files(bytes)) = super::clipboard_ole::Rendered::build(Payload::Files(paths.to_vec())) else { panic!() };
+            store(CF_HDROP.0, &bytes).unwrap();
+        }
+        if virtual_content {
+            let format = RegisterClipboardFormatW(w!("FileContents"));
+            store(u16::try_from(format).unwrap(), b"virtual data").unwrap();
+        }
         drop(open);
         DestroyWindow(hwnd).unwrap();
     }
@@ -261,6 +312,12 @@ pub(super) fn external_files(paths: Vec<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn eager_drop_counts_wide_and_ansi_roots_without_decoding_names() {
+        assert_eq!(count_terminated(&[[0, 0xd8], [0, 0], [0xac, 0], [0, 0], [0, 0]], &[0, 0]), Some(2));
+        assert_eq!(count_terminated(&[0xff, 0, 80, 0, 0], &0), Some(2));
+        assert_eq!(count_terminated(&[b'a', 0], &0), None);
+    }
     #[test]
     #[ignore = "requires the disposable Wine/Xvfb clipboard"]
     fn clipboard_native_manual_read_survives_another_listener() {

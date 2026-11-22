@@ -2,23 +2,27 @@
 use super::{clipboard_image, util::wide};
 use quietdesk_core::clipboard::{Input, Kind, Payload, Revision};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::{
-    Arc, Condvar, Mutex,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::DataExchange::{GetClipboardOwner, RegisterClipboardFormatW};
 use windows::Win32::System::Memory::*;
 use windows::Win32::System::Ole::{CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 use windows::Win32::UI::Shell::SHCreateStdEnumFmtEtc;
 use windows::core::{BOOL, HRESULT, Interface, Ref, Result, implement, w};
 
 #[derive(Clone, Copy)]
 pub(super) struct Formats {
     pub png: u16,
+    pub virtual_files: [u16; 3],
+    pub shell_items: u16,
     pub marker: u16,
     pub exclude: u16,
     pub ignore: u16,
@@ -31,6 +35,8 @@ impl Formats {
         let register = |name| u16::try_from(unsafe { RegisterClipboardFormatW(name) }).ok().filter(|f| *f != 0).ok_or_else(windows::core::Error::from_thread);
         Ok(Self {
             png: register(w!("PNG"))?,
+            virtual_files: [register(w!("FileContents"))?, register(w!("FileGroupDescriptorW"))?, register(w!("FileGroupDescriptor"))?],
+            shell_items: register(w!("Shell IDList Array"))?,
             marker: register(w!("local.quietdesk.clipboard-session"))?,
             exclude: register(w!("ExcludeClipboardContentFromMonitorProcessing"))?,
             ignore: register(w!("Clipboard Viewer Ignore"))?,
@@ -111,16 +117,28 @@ fn medium(bytes: &[u8]) -> Result<STGMEDIUM> {
 
 enum State {
     Advertised,
-    Requested,
+    Requested { event: Arc<OwnedHandle>, approved_file: bool },
     Ready(Arc<Rendered>),
     Cancelled,
 }
+impl State {
+    fn finish(&mut self, new: Self) {
+        if let Self::Requested { event, .. } = std::mem::replace(self, new) {
+            // A manual-reset event wakes every OLE consumer sharing this manifest.
+            unsafe {
+                let _ = SetEvent(HANDLE(event.as_raw_handle()));
+            }
+        }
+    }
+}
+
 pub(super) struct Promise {
     pub revision: Revision,
     pub kind: Kind,
     owner: AtomicUsize,
+    #[cfg(test)]
+    pub render_calls: AtomicUsize,
     state: Mutex<State>,
-    ready: Condvar,
     input: Sender<Input>,
 }
 impl Promise {
@@ -130,8 +148,9 @@ impl Promise {
             kind,
             input,
             owner: AtomicUsize::new(0),
+            #[cfg(test)]
+            render_calls: AtomicUsize::new(0),
             state: Mutex::new(ready.map_or(State::Advertised, |p| State::Ready(Arc::new(p)))),
-            ready: Condvar::new(),
         }
     }
     pub fn owned(&self) -> bool {
@@ -145,35 +164,84 @@ impl Promise {
     pub fn materialized(&self) -> bool {
         matches!(*self.state.lock().unwrap(), State::Ready(_))
     }
+    pub fn pending_file(&self) -> bool {
+        self.kind == Kind::Files && matches!(*self.state.lock().unwrap(), State::Requested { .. })
+    }
+    pub fn approve_file(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if let State::Requested { approved_file, .. } = &mut *state
+            && self.owned()
+        {
+            *approved_file = true;
+            return true;
+        }
+        false
+    }
+    pub fn displaced(&self) {
+        self.owner.store(0, Ordering::Release);
+        let mut state = self.state.lock().unwrap();
+        if matches!(*state, State::Advertised | State::Requested { approved_file: false, .. }) {
+            state.finish(State::Cancelled);
+        }
+    }
     pub fn resolve(&self, data: Rendered) -> bool {
         let mut state = self.state.lock().unwrap();
-        if !matches!(*state, State::Requested) || !self.owned() {
+        if !matches!(*state, State::Requested { approved_file, .. } if approved_file || self.owned()) {
             return false;
         }
-        *state = State::Ready(Arc::new(data));
-        self.ready.notify_all();
+        state.finish(State::Ready(Arc::new(data)));
         true
     }
     pub fn cancel(&self) {
         let mut state = self.state.lock().unwrap();
         if !matches!(*state, State::Ready(_)) {
-            *state = State::Cancelled;
-            self.ready.notify_all();
+            state.finish(State::Cancelled);
         }
     }
     fn read(&self) -> Result<Arc<Rendered>> {
-        let mut state = self.state.lock().unwrap();
-        if matches!(*state, State::Advertised) {
-            if !self.owned() || self.input.try_send(Input::Paste(self.revision)).is_err() {
+        #[cfg(test)]
+        self.render_calls.fetch_add(1, Ordering::Relaxed);
+        let event = {
+            let mut state = self.state.lock().unwrap();
+            if (self.kind == Kind::Files || !matches!(*state, State::Ready(_))) && !self.owned() {
                 return Err(E_ABORT.into());
             }
-            *state = State::Requested;
-        }
-        // A long transfer can still finish after the consumer's synchronous rendering call returns.
-        let (state, _) = self.ready.wait_timeout_while(state, Duration::from_secs(12), |s| matches!(s, State::Requested)).unwrap();
-        match &*state {
-            State::Ready(data) => Ok(data.clone()),
-            _ => Err(E_ABORT.into()),
+            match &*state {
+                State::Ready(data) => return Ok(data.clone()),
+                State::Cancelled => return Err(E_ABORT.into()),
+                State::Requested { event, .. } => event.clone(),
+                State::Advertised => {
+                    let event = unsafe { OwnedHandle::from_raw_handle(CreateEventW(None, true, false, None)?.0) };
+                    if self.input.try_send(Input::Paste(self.revision)).is_err() {
+                        return Err(E_ABORT.into());
+                    }
+                    let event = Arc::new(event);
+                    *state = State::Requested { event: event.clone(), approved_file: false };
+                    event
+                }
+            }
+        };
+        let deadline = (self.kind != Kind::Files).then(|| Instant::now() + Duration::from_secs(12));
+        loop {
+            if !self.owned() {
+                self.displaced();
+            }
+            match &*self.state.lock().unwrap() {
+                State::Ready(data) => return Ok(data.clone()),
+                State::Requested { .. } => {}
+                _ => return Err(E_ABORT.into()),
+            }
+            if deadline.is_some_and(|end| Instant::now() >= end) {
+                return Err(E_ABORT.into());
+            }
+            // Approval, transfer progress and cancellation run on other threads. Keep this STA
+            // available to COM while checking for a local copy that displaced the remote promise.
+            let wait = unsafe { CoWaitForMultipleHandles(COWAIT_DEFAULT.0 as u32, 100, &[HANDLE(event.as_raw_handle())]) };
+            if let Err(error) = wait
+                && error.code() != RPC_S_CALLPENDING
+            {
+                return Err(error);
+            }
         }
     }
 }

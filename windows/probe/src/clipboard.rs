@@ -56,15 +56,26 @@ impl SyntheticClipboard {
             let Some(input) = weak_input.upgrade() else { return };
             let mut board = board.lock().unwrap();
             match action {
+                Action::CountFileRoots { token } => {
+                    if board.token == token
+                        && let Some(Payload::Files(paths)) = board.local.as_ref()
+                    {
+                        let _ = input.try_send(Input::FileRootCount { token, count: Some(paths.len()) });
+                    }
+                }
                 Action::Read { token, kind } => {
                     emit(json!({"event":"clipboardRead","kind":kind}));
                     let payload = if board.token == token { board.local.clone() } else { None };
                     let _ = input.try_send(Input::Read { token, payload });
                 }
-                Action::Advertise { revision, kind } => {
+                Action::Advertise { revision, kind, file_root_count } => {
                     board.local = None;
                     board.manifest = Some(revision);
-                    emit(json!({"event":"clipboardManifest","kind":kind,"revision":revision}));
+                    let mut event = json!({"event":"clipboardManifest","kind":kind,"revision":revision});
+                    if let Some(count) = file_root_count {
+                        event["fileRootCount"] = json!(count);
+                    }
+                    emit(event);
                 }
                 Action::FileOffer(offer) => {
                     board.offer = Some(offer.revision);

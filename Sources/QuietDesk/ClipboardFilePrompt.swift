@@ -81,11 +81,11 @@ struct ClipboardFilePromptView: View {
                     .frame(width: 40, height: 44)
                     .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
                 VStack(alignment: .leading, spacing: 5) {
-                    Text(peerName.isEmpty ? "接收另一台 Mac 的文件？" : "接收来自「\(peerName)」的文件？")
+                    Text(peerName.isEmpty ? "接收对端的文件？" : "接收来自「\(peerName)」的文件？")
                         .font(.system(size: 15, weight: .semibold))
                         .lineLimit(3)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("确认后才下载文件，接收完成后可再次粘贴。")
+                    Text("确认接收后开始下载文件。")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

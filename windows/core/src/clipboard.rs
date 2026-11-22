@@ -18,6 +18,7 @@ use uuid::Uuid;
 pub const MAX_TEXT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PNG_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_FILE_ENTRIES: usize = 200_000;
+pub const MAX_PROMISED_FILE_ROOTS: usize = 4096;
 const CHUNK: usize = 32_768;
 const STALL: Duration = Duration::from_secs(30);
 const OFFER_TIMEOUT: Duration = Duration::from_secs(90);
@@ -69,6 +70,7 @@ pub enum Input {
     Peer(Message),
     Preferences { enabled: bool, receives: bool },
     LocalChanged { token: u64, kind: Option<Kind> },
+    FileRootCount { token: u64, count: Option<usize> },
     Paste(Revision),
     Read { token: u64, payload: Option<Payload> },
     Decision { revision: Revision, accept: bool },
@@ -77,8 +79,9 @@ pub enum Input {
 }
 #[derive(Debug)]
 pub enum Action {
+    CountFileRoots { token: u64 },
     Read { token: u64, kind: Kind },
-    Advertise { revision: Revision, kind: Kind },
+    Advertise { revision: Revision, kind: Kind, file_root_count: Option<usize> },
     Clear,
     FileOffer(FileOffer),
     Apply { revision: Revision, manifest: Option<Revision>, payload: Payload, explicit_drop: bool },
@@ -108,6 +111,8 @@ struct Preference {
 struct Manifest {
     revision: Revision,
     kind: Kind,
+    #[serde(rename = "fileRootCount", skip_serializing_if = "Option::is_none")]
+    file_root_count: Option<usize>,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct Pull {
@@ -187,6 +192,7 @@ struct State {
     storage: PathBuf,
     backend: Arc<dyn StorageBackend>,
     local: Option<(u64, Kind)>,
+    counting: Option<u64>,
     published_token: Option<u64>,
     deferred_local: bool,
     local_manifest: Option<Manifest>,
@@ -214,6 +220,7 @@ impl State {
             storage,
             backend,
             local: None,
+            counting: None,
             published_token: None,
             deferred_local: false,
             local_manifest: None,
@@ -279,6 +286,7 @@ impl State {
         self.send(M::ClipboardReceipt, &Receipt::ok(revision, sequence));
     }
     fn cancel(&mut self, reason: &str, notify: bool) {
+        self.counting = None;
         let mut pending = Vec::new();
         if let Some(t) = self.incoming.take() {
             pending.push((t.begin.revision, t.sequence));
@@ -378,6 +386,22 @@ impl State {
                 self.publish_local()
             }
             _ if !self.active() => return,
+            Input::FileRootCount { token, count } => {
+                if self.counting.take_if(|t| *t == token).is_none() {
+                    return;
+                }
+                if !self.remote_receives() {
+                    self.published_token = None;
+                    return;
+                }
+                if count == Some(0) {
+                    return;
+                }
+                if count.is_some_and(|n| n > MAX_PROMISED_FILE_ROOTS) {
+                    self.native(Action::Status("所选顶层文件较多，将使用兼容文件接收方式".into()));
+                }
+                self.publish_manifest(Kind::Files, count.filter(|n| *n <= MAX_PROMISED_FILE_ROOTS))
+            }
             Input::Peer(msg) => self.peer(msg),
             Input::Paste(revision) => {
                 let Some(m) = self.remote_manifest.filter(|m| m.revision == revision) else { return };
@@ -445,7 +469,14 @@ impl State {
                 if success {
                     self.ack(revision, r.sequence);
                     if r.kind == Kind::Files {
-                        self.native(Action::Status(if r.explicit_drop { "拖入文件已保存到接收目录" } else { "文件已保存到接收目录，可再次粘贴" }.into()));
+                        let status = if r.explicit_drop {
+                            "拖入文件已保存到接收目录"
+                        } else if self.pull.is_some() {
+                            "文件已交给本机粘贴"
+                        } else {
+                            "文件已保存到接收目录"
+                        };
+                        self.native(Action::Status(status.into()));
                     }
                 } else {
                     self.reject(revision, r.sequence, "无法写入系统剪贴板");
@@ -501,17 +532,31 @@ impl State {
             return Ok(());
         }
         self.published_token = Some(token);
-        if self.on_demand() && (kind != Kind::Files || self.physical()) {
-            let manifest = Manifest { revision: self.next_revision()?, kind };
-            self.local_manifest = Some(manifest);
-            self.send(M::ClipboardManifest, &manifest);
+        if kind == Kind::Files && self.physical() {
+            self.counting = Some(token);
+            self.native(Action::CountFileRoots { token });
+        } else if kind != Kind::Files && self.on_demand() {
+            self.publish_manifest(kind, None)?;
         } else {
             self.reading = Some(Reading { token, kind, pull: None });
             self.native(Action::Read { token, kind });
         }
         Ok(())
     }
+    fn publish_manifest(&mut self, kind: Kind, file_root_count: Option<usize>) -> Result<()> {
+        let manifest = Manifest { revision: self.next_revision()?, kind, file_root_count };
+        self.local_manifest = Some(manifest);
+        self.send(M::ClipboardManifest, &manifest);
+        Ok(())
+    }
     fn start_outgoing(&mut self, payload: Payload, pull: Option<Pull>, explicit: bool) -> Result<()> {
+        if let (Some(p), Payload::Files(paths)) = (pull, &payload)
+            && self.local_manifest.and_then(|m| m.file_root_count).is_some_and(|n| n != paths.len())
+        {
+            let reason = "源剪贴板顶层数量已改变";
+            self.reject(p.revision, 0, reason);
+            return Err(DeskError::invalid(reason));
+        }
         let revision = self.next_revision()?;
         match Outgoing::new(payload, revision, pull.map(|p| p.request_id), explicit, &*self.backend) {
             Ok((transfer, begin)) => {
@@ -542,9 +587,14 @@ impl State {
                 self.cancel("对端剪贴板已更新", true);
                 self.local_manifest = None;
                 self.newest = Some(m.revision);
+                if m.file_root_count.is_some_and(|n| m.kind != Kind::Files || !(1..=MAX_PROMISED_FILE_ROOTS).contains(&n)) {
+                    self.reject(m.revision, 0, "文件清单顶层数量无效");
+                    self.native(Action::Status("文件清单顶层数量无效".into()));
+                    return Ok(());
+                }
                 if self.receives && (m.kind != Kind::Files || self.physical()) {
                     self.remote_manifest = Some(m);
-                    self.native(Action::Advertise { revision: m.revision, kind: m.kind });
+                    self.native(Action::Advertise { revision: m.revision, kind: m.kind, file_root_count: m.file_root_count });
                 }
             }
             M::ClipboardPull => {
@@ -666,7 +716,7 @@ impl State {
                         return Ok(());
                     }
                 };
-                if kind == Kind::Files && self.deferred_local {
+                if kind == Kind::Files && self.deferred_local && self.pull.is_none() {
                     self.saved_after_copy(r.revision, r.sequence);
                     return Ok(());
                 }
@@ -697,6 +747,9 @@ impl State {
                 || b.explicit_drop == Some(true)
             {
                 return Err(DeskError::invalid("按需粘贴请求已失效"));
+            }
+            if self.remote_manifest.and_then(|m| m.file_root_count).is_some_and(|n| b.root_count != Some(n)) {
+                return Err(DeskError::invalid("文件传输顶层数量与粘贴清单不符"));
             }
         } else {
             if self.physical() && b.kind == Kind::Files && b.explicit_drop != Some(true) {

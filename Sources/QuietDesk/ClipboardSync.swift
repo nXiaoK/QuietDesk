@@ -14,6 +14,9 @@ protocol ClipboardPasteboard: AnyObject {
     var isRelayedFromOtherDevice: Bool { get }
     var isSensitive: Bool { get }
     func inspectCurrentKind() -> ClipboardManifestKind?
+    var fileRootCount: Int? { get }
+    func writePromisedFiles(count: Int, marker: String, request: @escaping @MainActor () -> Bool) -> ClipboardFilePromise?
+    func alreadyProvides(_ urls: [URL], marker: String) -> Bool
     func discardFilePromise(marker: String)
     func write(_ payload: ClipboardPayload, marker: String) -> Bool
     func writeLazy(
@@ -25,6 +28,9 @@ protocol ClipboardPasteboard: AnyObject {
 }
 
 extension ClipboardPasteboard {
+    var fileRootCount: Int? { nil }
+    func writePromisedFiles(count: Int, marker: String, request: @escaping @MainActor () -> Bool) -> ClipboardFilePromise? { nil }
+    func alreadyProvides(_ urls: [URL], marker: String) -> Bool { false }
     func discardFilePromise(marker: String) {}
     var isRelayedFromOtherDevice: Bool { false }
     var tiffData: Data? { nil }
@@ -42,6 +48,107 @@ extension ClipboardPasteboard {
         asyncFetch: @escaping @MainActor (@escaping (ClipboardPayload?) -> Void) -> Void
     ) -> Bool {
         false
+    }
+}
+
+/// One approved transfer supplies every promised item, including repeated reads by the same paste.
+final class ClipboardFilePromise: @unchecked Sendable {
+    private enum State { case idle, waiting, finished([URL]?) }
+    private let lock = NSCondition()
+    private var state = State.idle
+    private let count: Int
+    private let request: @MainActor () -> Bool
+
+    init(count: Int, request: @escaping @MainActor () -> Bool) {
+        self.count = count
+        self.request = request
+    }
+
+    func finish(_ urls: [URL]?) {
+        lock.lock()
+        defer { lock.unlock() }
+        if case .finished = state { return }
+        state = .finished(urls?.count == count ? urls : nil)
+        lock.broadcast()
+    }
+
+    var files: [URL]? {
+        lock.withLock {
+            if case .finished(let urls) = state { return urls }
+            return nil
+        }
+    }
+
+    func url(at index: Int) -> URL? {
+        let first = lock.withLock {
+            guard case .idle = state else { return false }
+            state = .waiting
+            return true
+        }
+        if first {
+            let start: @MainActor () -> Void = { if !self.request() { self.finish(nil) } }
+            if Thread.isMainThread { MainActor.assumeIsolated { start() } }
+            else { DispatchQueue.main.async { start() } }
+        }
+        lock.lock()
+        while case .waiting = state {
+            if Thread.isMainThread {
+                // Finder's synchronous read can arrive on the app thread. Continue dispatching local approval
+                // and cancellation events while the independent transfer queue writes the files.
+                lock.unlock()
+                MainActor.assumeIsolated {
+                    let deadline = Date(timeIntervalSinceNow: 0.025)
+                    if let app = NSApp {
+                        if let event = app.nextEvent(matching: .any, until: deadline, inMode: .default, dequeue: true) {
+                            app.sendEvent(event)
+                        }
+                    } else {
+                        RunLoop.current.run(until: deadline)
+                    }
+                }
+                lock.lock()
+            } else {
+                lock.wait()
+            }
+        }
+        defer { lock.unlock() }
+        guard case .finished(let urls?) = state else { return nil }
+        return urls[index]
+    }
+}
+
+/// Core resolves requests on its transfer queue, including while AppKit is inside a synchronous read.
+private final class ClipboardFileRequests: @unchecked Sendable {
+    private let lock = NSLock()
+    private var promises: [ClipboardRevision: ClipboardFilePromise] = [:]
+
+    func insert(_ promise: ClipboardFilePromise, for revision: ClipboardRevision) {
+        lock.withLock { promises[revision] = promise }
+    }
+
+    func finish(_ revision: ClipboardRevision, files: [URL]?) {
+        lock.withLock { promises.removeValue(forKey: revision) }?.finish(files)
+    }
+
+    func stop() {
+        let waiting = lock.withLock { let all = promises; promises.removeAll(); return all }
+        for promise in waiting.values { promise.finish(nil) }
+    }
+}
+
+private final class FileURLProvider: NSObject, NSPasteboardItemDataProvider {
+    let promise: ClipboardFilePromise
+    let index: Int
+
+    init(_ promise: ClipboardFilePromise, index: Int) {
+        self.promise = promise
+        self.index = index
+    }
+
+    func pasteboard(_ pasteboard: NSPasteboard?, item: NSPasteboardItem, provideDataForType type: NSPasteboard.PasteboardType) {
+        if type == .fileURL, let url = promise.url(at: index) {
+            item.setString(url.absoluteString, forType: .fileURL)
+        }
     }
 }
 
@@ -101,6 +208,7 @@ private final class LazyClipboardItemProvider: NSObject, NSPasteboardItemDataPro
 final class SystemClipboardPasteboard: ClipboardPasteboard {
     private let pasteboard: NSPasteboard
     private var activeLazyProvider: LazyClipboardItemProvider?
+    private var fileProviders: [FileURLProvider] = []
     private static let marker = NSPasteboard.PasteboardType("local.quietdesk.clipboard-session")
 
     init(pasteboard: NSPasteboard = .general) {
@@ -138,8 +246,37 @@ final class SystemClipboardPasteboard: ClipboardPasteboard {
         return nil
     }
 
+    var fileRootCount: Int? {
+        guard let items = pasteboard.pasteboardItems, !items.isEmpty else { return nil }
+        if items.count > ClipboardTransfer.maximumPromisedFileRoots { return items.count }
+        guard items.allSatisfy({ $0.types.contains(.fileURL) }) else { return nil }
+        return items.count
+    }
+
+    func writePromisedFiles(count: Int, marker: String, request: @escaping @MainActor () -> Bool) -> ClipboardFilePromise? {
+        guard (1...ClipboardTransfer.maximumPromisedFileRoots).contains(count) else { return nil }
+        let promise = ClipboardFilePromise(count: count, request: request)
+        var providers: [FileURLProvider] = [], items: [NSPasteboardItem] = []
+        for index in 0..<count {
+            let item = NSPasteboardItem(), provider = FileURLProvider(promise, index: index)
+            guard item.setString(marker, forType: Self.marker), item.setDataProvider(provider, forTypes: [.fileURL]) else { return nil }
+            items.append(item)
+            providers.append(provider)
+        }
+        _ = pasteboard.prepareForNewContents(with: .currentHostOnly)
+        guard pasteboard.writeObjects(items) else { return nil }
+        activeLazyProvider = nil
+        fileProviders = providers
+        return promise
+    }
+
+    func alreadyProvides(_ urls: [URL], marker: String) -> Bool {
+        fileProviders.first?.promise.files == urls && contentMarker == marker
+    }
+
     func discardFilePromise(marker: String) {
-        guard contentMarker == marker, activeLazyProvider != nil else { return }
+        guard contentMarker == marker, activeLazyProvider != nil || !fileProviders.isEmpty else { return }
+        fileProviders.removeAll()
         activeLazyProvider = nil
         _ = pasteboard.prepareForNewContents(with: .currentHostOnly)
     }
@@ -172,6 +309,7 @@ final class SystemClipboardPasteboard: ClipboardPasteboard {
             guard item.setString(marker, forType: Self.marker) else { return false }
         }
         activeLazyProvider = nil
+        fileProviders.removeAll()
         _ = pasteboard.prepareForNewContents(with: .currentHostOnly)
         return pasteboard.writeObjects(items)
     }
@@ -199,6 +337,7 @@ final class SystemClipboardPasteboard: ClipboardPasteboard {
             }
         }
         guard item.setDataProvider(provider, forTypes: [promisedType]) else { return false }
+        fileProviders.removeAll()
         activeLazyProvider = provider
         _ = pasteboard.prepareForNewContents(with: .currentHostOnly)
         let wrote = pasteboard.writeObjects([item])
@@ -312,6 +451,8 @@ final class ClipboardSync {
     private let allowsPhysicalFilePaste: Bool
     private let deferFileOfferUntilPaste: Bool
     private let sourceGate = OnDemandSourceGate()
+    private let fileRequests = ClipboardFileRequests()
+    private var announcedFilePromise: ClipboardFilePromise?
     private var localOnDemandCopy: LocalOnDemandCopy?
     private var trackedRemoteManifest: TrackedRemoteManifest?
     private var allowsAutomaticSending: Bool
@@ -324,7 +465,7 @@ final class ClipboardSync {
     private var initialSeedChange: Int?
     // A copy made before taking control may still be waiting for activation or session resume.
     private var pendingLocalChange: Int?
-    private var pendingFileOffer: (id: UUID, change: Int, explicitDrop: Bool)?
+    private var pendingFileOffer: (id: UUID, change: Int, explicitDrop: Bool, source: ClipboardRevision?)?
     private var receivingFileID: UUID?
     private var receivingFileChange: Int?
     private var receivedFilesKeptLocally = false
@@ -390,6 +531,7 @@ final class ClipboardSync {
         transfer.onSend = send
         let validatorBox = PNGValidatorBox(resolvedValidatePNG)
         transfer.validatePulledPNG = { data in validatorBox.validate(data) }
+        transfer.onFilePasteResolved = { [fileRequests] revision, files in fileRequests.finish(revision, files: files) }
         transfer.onManifest = { [weak self] manifest in
             DispatchQueue.main.async {
                 guard let self, self.running else { return }
@@ -476,28 +618,30 @@ final class ClipboardSync {
         transfer.onFileOffer = { [weak self] offer in
             DispatchQueue.main.async {
                 guard let self, self.running, let offer else { return }
-                if self.allowsDecoupledFileTransfer {
-                    let change = self.pasteboard.changeCount
-                    self.pendingFileOffer = (offer.id, change, offer.isExplicitDrop)
-                    if !offer.isExplicitDrop {
-                        self.staleFileChange = change
-                    }
-                    self.onDiagnostic?(.fileOfferReceived(count: offer.count, totalBytes: offer.bytes))
-                    self.onFileOffer?(offer)
-                    return
-                }
-                self.lastSharedMarker = nil
-                self.cancelImageApplication()
-                if self.imagePreparation != nil {
-                    self.imagePreparation = nil
-                    self.sendingChange = nil
-                    self.settleWaiters(false)
-                }
                 let change = self.pasteboard.changeCount
-                self.pendingFileOffer = (offer.id, change, offer.isExplicitDrop)
-                self.pendingLocalChange = nil
-                self.deferredLocalChange = change
-                self.staleFileChange = change
+                if let source = offer.sourceManifest {
+                    guard let manifest = self.trackedRemoteManifest, manifest.revision == source,
+                          manifest.change == change || self.pasteboard.isRelayedFromOtherDevice else {
+                        // A newer local copy won before the original paste reached the approval dialog.
+                        self.transfer.respondToFileOffer(id: offer.id, accept: false)
+                        return
+                    }
+                }
+                self.pendingFileOffer = (offer.id, change, offer.isExplicitDrop, offer.sourceManifest)
+                if self.allowsDecoupledFileTransfer {
+                    if !offer.isExplicitDrop { self.staleFileChange = change }
+                } else {
+                    self.lastSharedMarker = nil
+                    self.cancelImageApplication()
+                    if self.imagePreparation != nil {
+                        self.imagePreparation = nil
+                        self.sendingChange = nil
+                        self.settleWaiters(false)
+                    }
+                    self.pendingLocalChange = nil
+                    self.deferredLocalChange = change
+                    self.staleFileChange = change
+                }
                 self.onDiagnostic?(.fileOfferReceived(count: offer.count, totalBytes: offer.bytes))
                 self.onFileOffer?(offer)
             }
@@ -655,7 +799,7 @@ final class ClipboardSync {
             pending.change = pasteboard.changeCount
             pendingFileOffer = pending
         }
-        if !allowsDecoupledFileTransfer, accept, pasteboard.changeCount != pending.change {
+        if accept, pasteboard.changeCount != pending.change, pending.source != nil || !allowsDecoupledFileTransfer {
             transfer.respondToFileOffer(id: id, accept: false)
             sendCurrent()
             return
@@ -766,6 +910,7 @@ final class ClipboardSync {
     }
 
     func stop() {
+        fileRequests.stop()
         if let manifest = trackedRemoteManifest, manifest.kind == .files {
             discardRemoteFilePromise(manifest)
         }
@@ -826,6 +971,8 @@ final class ClipboardSync {
 
     private func discardRemoteFilePromise(_ manifest: TrackedRemoteManifest) {
         trackedRemoteManifest = nil
+        announcedFilePromise = nil
+        fileRequests.finish(manifest.revision, files: nil)
         guard allowsPhysicalFilePaste, manifest.installedOnPasteboard,
               pasteboard.changeCount == manifest.change else { return }
         pasteboard.discardFilePromise(marker: Self.lazyMarker(for: manifest.revision, kind: .files, session: session))
@@ -954,7 +1101,8 @@ final class ClipboardSync {
         sourceGate.clear()
         let gate = sourceGate
         let pullable = kind != .files || allowsPhysicalFilePaste
-        transfer.announceManifest(kind: kind) { [weak self] revision in
+        let roots = kind == .files && allowsPhysicalFilePaste ? pasteboard.fileRootCount : nil
+        transfer.announceManifest(kind: kind, fileRootCount: roots) { [weak self] revision in
             if pullable {
                 gate.setExpected(revision: revision, kind: kind)
             } else {
@@ -1206,6 +1354,7 @@ final class ClipboardSync {
         localOnDemandCopy = nil
         sourceGate.clear()
 
+        announcedFilePromise = nil
         if manifest.kind == .files && !allowsPhysicalFilePaste {
             trackedRemoteManifest = TrackedRemoteManifest(
                 revision: manifest.revision,
@@ -1219,30 +1368,39 @@ final class ClipboardSync {
         let marker = Self.lazyMarker(for: manifest.revision, kind: manifest.kind, session: session)
         let revision = manifest.revision
         let kind = manifest.kind
-        let wrote = pasteboard.writeLazy(
-            kind,
-            marker: marker,
-            fetch: { [weak self] in
-                guard let self, self.running else { return nil }
-                if kind == .files {
-                    self.requestPromisedFiles(revision: revision)
-                    return nil
-                }
-                return self.pullRemotePayloadSynchronously(revision: revision, kind: kind)
-            },
-            asyncFetch: { [weak self] completion in
-                guard let self, self.running else {
-                    completion(nil)
-                    return
-                }
-                if kind == .files {
-                    self.requestPromisedFiles(revision: revision)
-                    completion(nil)
-                } else {
-                    self.pullRemotePayloadAsynchronously(revision: revision, kind: kind, completion: completion)
-                }
+        let wrote: Bool
+        if kind == .files, let count = manifest.fileRootCount {
+            let promise = pasteboard.writePromisedFiles(count: count, marker: marker) { [weak self] in
+                self?.requestPromisedFiles(revision: revision) ?? false
             }
-        )
+            announcedFilePromise = promise
+            wrote = promise != nil
+        } else {
+            wrote = pasteboard.writeLazy(
+                kind,
+                marker: marker,
+                fetch: { [weak self] in
+                    guard let self, self.running else { return nil }
+                    if kind == .files {
+                        self.requestPromisedFiles(revision: revision)
+                        return nil
+                    }
+                    return self.pullRemotePayloadSynchronously(revision: revision, kind: kind)
+                },
+                asyncFetch: { [weak self] completion in
+                    guard let self, self.running else {
+                        completion(nil)
+                        return
+                    }
+                    if kind == .files {
+                        self.requestPromisedFiles(revision: revision)
+                        completion(nil)
+                    } else {
+                        self.pullRemotePayloadAsynchronously(revision: revision, kind: kind, completion: completion)
+                    }
+                }
+            )
+        }
         guard wrote else {
             let failedKind: PayloadKind = kind == .files ? .files : kind == .png ? .png : .text
             onDiagnostic?(.applyFailed(failedKind, fileCount: 0))
@@ -1268,11 +1426,14 @@ final class ClipboardSync {
         sendingChange = nil
     }
 
-    private func requestPromisedFiles(revision: ClipboardRevision) {
+    @discardableResult
+    private func requestPromisedFiles(revision: ClipboardRevision) -> Bool {
         guard running, allowsPhysicalFilePaste,
               let manifest = trackedRemoteManifest, manifest.revision == revision,
-              manifest.change == pasteboard.changeCount, !pasteboard.isSensitive else { return }
+              manifest.change == pasteboard.changeCount, !pasteboard.isSensitive else { return false }
+        if let announcedFilePromise { fileRequests.insert(announcedFilePromise, for: revision) }
         transfer.requestFilePaste(revision: revision)
+        return true
     }
 
     private func pullRemotePayloadSynchronously(revision: ClipboardRevision, kind: ClipboardManifestKind) -> ClipboardPayload? {
@@ -1520,11 +1681,18 @@ final class ClipboardSync {
                 return true
             }
         }
+        let existingMarker: String?
+        if case .files(let urls) = payload, let manifest = trackedRemoteManifest {
+            let marker = Self.lazyMarker(for: manifest.revision, kind: .files, session: session)
+            existingMarker = pasteboard.alreadyProvides(urls, marker: marker) ? marker : nil
+        } else {
+            existingMarker = nil
+        }
         trackedRemoteManifest = nil
         localOnDemandCopy = nil
         sourceGate.clear()
-        let contentMarker = contentMarker ?? Self.marker(for: payload, session: session)
-        guard pasteboard.write(payload, marker: contentMarker) else {
+        let contentMarker = existingMarker ?? contentMarker ?? Self.marker(for: payload, session: session)
+        guard existingMarker != nil || pasteboard.write(payload, marker: contentMarker) else {
             onDiagnostic?(.applyFailed(summary.kind, fileCount: summary.fileCount))
             onStatus?("系统剪贴板写入失败")
             return false

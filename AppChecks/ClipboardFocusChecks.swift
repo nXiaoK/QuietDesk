@@ -18,8 +18,8 @@ private func pump(for seconds: TimeInterval) {
 }
 
 @MainActor
-private func eventually(_ message: String, _ condition: () -> Bool) throws {
-    let end = Date().addingTimeInterval(5)
+private func eventually(_ message: String, seconds: TimeInterval = 5, _ condition: () -> Bool) throws {
+    let end = Date().addingTimeInterval(seconds)
     while !condition(), Date() < end { pump(for: 0.01) }
     try require(condition(), message)
 }
@@ -217,10 +217,37 @@ private final class ClipboardPair {
     }
 }
 
+@MainActor
+private final class FileApprovalAction: NSObject {
+    private let approve: () -> Void
+    init(_ approve: @escaping () -> Void) { self.approve = approve }
+    @objc func click(_ sender: NSButton) { approve() }
+}
+
+private let filePasteBoardPrefix = "local.quietdesk.checks.file-paste."
+
+@MainActor
+private func copyPromisedFiles(boardName: String, destination: URL) throws {
+    guard boardName.hasPrefix(filePasteBoardPrefix), UUID(uuidString: String(boardName.dropFirst(filePasteBoardPrefix.count))) != nil else {
+        throw FocusCheckFailure("Expected an isolated named pasteboard")
+    }
+    let board = NSPasteboard(name: NSPasteboard.Name(boardName))
+    let urls = board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+    for url in urls {
+        try FileManager.default.copyItem(at: url, to: destination.appendingPathComponent(url.lastPathComponent))
+    }
+}
+
 @main
 private struct ClipboardFocusChecks {
     @MainActor
     static func main() {
+        let arguments = CommandLine.arguments
+        if arguments.count == 4, arguments[1] == "--copy-file-urls" {
+            do { try copyPromisedFiles(boardName: arguments[2], destination: URL(fileURLWithPath: arguments[3])) }
+            catch { print("FAIL isolated paste consumer: \(error)"); exit(1) }
+            return
+        }
         var passed = 0, failed = 0
         func run(_ name: String, _ body: (URL) throws -> Void) {
             let folder = FileManager.default.temporaryDirectory.appendingPathComponent("quietdesk-focus-" + UUID().uuidString)
@@ -1990,6 +2017,158 @@ private struct ClipboardFocusChecks {
                 try eventually("Revoked file URL remained available") { !pair.remote.hasLazyItem }
                 try require(!pair.localMessages.contains(.clipboardChunk), "File bytes escaped without approval")
                 if ending == "replace" { try require(pair.remote.copiedText == "new local value", "Withdrawal erased a newer copy") }
+            }
+        }
+
+        for (rootCount, approve, delay) in [(1, true, 0.0), (2, true, 13.0), (2, false, 0.0)] {
+            run("One AppKit URL read copies \(rootCount) promised roots into the destination (approve: \(approve), delay: \(delay))") { folder in
+                _ = NSApplication.shared.setActivationPolicy(.prohibited)
+                let board = NSPasteboard(name: NSPasteboard.Name(filePasteBoardPrefix + UUID().uuidString))
+                defer { board.releaseGlobally() }
+                let sender = ClipboardTransfer(storage: folder.appendingPathComponent("sender"), requireFileApproval: true,
+                                               allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+                let wire = ChannelSafeBox<[MessageKind]>([]), requests = ChannelSafeBox<[MessageKind]>([]), sendResult = ChannelSafeBox<Bool?>(nil)
+                let sink = ClipboardSync(session: UUID(), allowsFileSending: true, allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true,
+                                         pasteboard: SystemClipboardPasteboard(pasteboard: board), storage: folder.appendingPathComponent("receiver")) {
+                    requests.append($0.kind); sender.receive($0)
+                }
+                defer { sink.stop(); sender.stop() }
+                let first = folder.appendingPathComponent("empty.txt"), directory = folder.appendingPathComponent("资料")
+                let roots = rootCount == 1 ? [first] : [directory, first]
+                let destination = folder.appendingPathComponent("destination", isDirectory: true)
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+                let content = Data((0..<90_000).map { UInt8(truncatingIfNeeded: $0) })
+                try content.write(to: directory.appendingPathComponent("nested.bin")); try Data().write(to: first)
+                let receive = sink.receiveMessage
+                sender.onSend = { message in wire.append(message.kind); receive(message) }
+                sender.onPullRequested = { [weak sender] request in
+                    sender?.sendPulled(.files(roots), requestID: request.requestID) { sendResult.set($0) }
+                }
+                var prompts = 0, offeredTooLate = false
+                sink.onFileOffer = { [weak sink] offer in
+                    guard let offer else { return }
+                    prompts += 1
+                    offeredTooLate = wire.read().contains(.clipboardEntry) || wire.read().contains(.clipboardChunk)
+                    let action = FileApprovalAction { sink?.respondToFileOffer(id: offer.id, accept: approve) }
+                    let button = NSButton(title: approve ? "接收" : "拒绝", target: action, action: #selector(FileApprovalAction.click(_:)))
+                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                        withExtendedLifetime(action) { button.performClick(nil) }
+                    }
+                }
+                sender.announceManifest(kind: .files, fileRootCount: rootCount)
+                try eventually("The promised file items did not appear") { board.pasteboardItems?.count == rootCount }
+                try require(board.availableType(from: [.fileURL]) == .fileURL && wire.read() == [.clipboardManifest],
+                            "Looking up a file format started the download")
+                let initialChange = board.changeCount
+                @MainActor func paste(into target: URL) throws {
+                    let consumer = Process()
+                    consumer.executableURL = URL(fileURLWithPath: arguments[0])
+                    consumer.arguments = ["--copy-file-urls", board.name.rawValue, target.path]
+                    try consumer.run()
+                    defer { if consumer.isRunning { consumer.terminate() } }
+                    try eventually("A single content read did not finish", seconds: delay + 12) { !consumer.isRunning }
+                    try require(consumer.terminationStatus == 0, "The separate paste consumer could not copy its file URLs")
+                }
+                try paste(into: destination)
+                try eventually("The sender did not receive the transfer outcome") { sendResult.read() != nil }
+                try require(sendResult.read() == approve && prompts == 1 && !offeredTooLate,
+                            "A paste finished before approval or requested the files twice")
+                let names = try FileManager.default.contentsOfDirectory(atPath: destination.path)
+                try require(Set(names) == (approve ? Set(roots.map(\.lastPathComponent)) : []), "The first URL read did not copy exactly the selected roots")
+                if approve {
+                    try require(try Data(contentsOf: destination.appendingPathComponent("empty.txt")).isEmpty, "The empty file changed")
+                    if rootCount > 1 {
+                        try require(try Data(contentsOf: destination.appendingPathComponent("资料/nested.bin")) == content, "The folder lost data")
+                        let again = folder.appendingPathComponent("second-paste", isDirectory: true)
+                        try FileManager.default.createDirectory(at: again, withIntermediateDirectories: true)
+                        try paste(into: again)
+                        try require(board.changeCount == initialChange && prompts == 1 && requests.read().filter { $0 == .clipboardPull }.count == 1
+                                    && (try Data(contentsOf: again.appendingPathComponent("资料/nested.bin"))) == content
+                                    && (try Data(contentsOf: again.appendingPathComponent("empty.txt"))).isEmpty,
+                                    "A second paste replaced the original provider, asked again, or lost files")
+                        _ = board.prepareForNewContents(with: .currentHostOnly)
+                        try require(board.setString("new local copy", forType: .string), "Could not replace the named pasteboard")
+                        sink.stop()
+                        pump(for: 0.05)
+                        try require(board.string(forType: .string) == "new local copy" && board.availableType(from: [.fileURL]) == nil,
+                                    "Stopping the old file promise displaced the newer local copy")
+                    }
+                } else {
+                    try require(!wire.read().contains(.clipboardChunk), "File contents followed a declined paste")
+                }
+            }
+        }
+
+        for boundary in ["before offer", "before approval", "after approval"] {
+            run("A newer named-board copy \(boundary) protects the clipboard during the original paste") { folder in
+                _ = NSApplication.shared.setActivationPolicy(.prohibited)
+                let board = NSPasteboard(name: NSPasteboard.Name(filePasteBoardPrefix + UUID().uuidString))
+                defer { board.releaseGlobally() }
+                let receiverDirectory = folder.appendingPathComponent("receiver")
+                let sender = ClipboardTransfer(storage: folder.appendingPathComponent("sender"), requireFileApproval: true,
+                                               allowsDecoupledFileTransfer: true, allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
+                let sink = ClipboardSync(session: UUID(), allowsFileSending: true, allowsAutomaticSending: false,
+                                         allowsDecoupledFileTransfer: true, allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true,
+                                         pasteboard: SystemClipboardPasteboard(pasteboard: board), storage: receiverDirectory) { sender.receive($0) }
+                defer { sink.stop(); sender.stop() }
+                let source = folder.appendingPathComponent("selected.txt")
+                let target = folder.appendingPathComponent("paste-destination", isDirectory: true)
+                let data = Data([21, 72, 96])
+                try data.write(to: source)
+                try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+                let result = ChannelSafeBox<Bool?>(nil), sent = ChannelSafeBox<[MessageKind]>([])
+                var replacements = 0, offers = 0, keptFiles = false
+                @MainActor func newLocalCopy() {
+                    _ = board.prepareForNewContents(with: .currentHostOnly)
+                    if board.setString("new local clipboard", forType: .string) { replacements += 1 }
+                }
+                let receive = sink.receiveMessage
+                sender.onSend = { message in
+                    sent.append(message.kind)
+                    if (boundary == "before offer" && message.kind == .clipboardBegin)
+                        || (boundary == "after approval" && message.kind == .clipboardChunk) {
+                        DispatchQueue.main.async { newLocalCopy(); receive(message) }
+                    } else { receive(message) }
+                }
+                sender.onPullRequested = { [weak sender] request in
+                    sender?.sendPulled(.files([source]), requestID: request.requestID) { result.set($0) }
+                }
+                sink.onFileOffer = { [weak sink] offer in
+                    guard let offer else { return }
+                    offers += 1
+                    if boundary == "before approval" { newLocalCopy() }
+                    sink?.respondToFileOffer(id: offer.id, accept: true)
+                }
+                sink.onReceivedFilesKept = { keptFiles = true }
+                sender.announceManifest(kind: .files, fileRootCount: 1)
+                try eventually("The named board did not receive the file promise") { board.availableType(from: [.fileURL]) == .fileURL }
+                let consumer = Process()
+                consumer.executableURL = URL(fileURLWithPath: arguments[0])
+                consumer.arguments = ["--copy-file-urls", board.name.rawValue, target.path]
+                try consumer.run()
+                defer { if consumer.isRunning { consumer.terminate() } }
+                try eventually("The original paste did not settle", seconds: 8) { !consumer.isRunning && result.read() != nil }
+                let accepted = boundary == "after approval"
+                try require(replacements == 1 && board.string(forType: .string) == "new local clipboard",
+                            "The file transfer replaced the newer local copy")
+                try require(result.read() == accepted && offers == (boundary == "before offer" ? 0 : 1),
+                            "The offer was approved using a later clipboard change")
+                try require(consumer.terminationStatus == 0 && sent.read().contains(.clipboardChunk) == accepted,
+                            "Files were sent across a cancelled offer")
+                let output = target.appendingPathComponent(source.lastPathComponent)
+                if accepted {
+                    try eventually("The saved-file notice did not reach the receiver") { keptFiles }
+                    let received = receiverDirectory.appendingPathComponent("received")
+                    let transfers = try FileManager.default.contentsOfDirectory(at: received, includingPropertiesForKeys: nil)
+                    try require(transfers.count == 1 && (try Data(contentsOf: transfers[0].appendingPathComponent(source.lastPathComponent))) == data,
+                                "The accepted file was lost after the pasteboard owner changed")
+                    if FileManager.default.fileExists(atPath: output.path) {
+                        try require(try Data(contentsOf: output) == data, "The original paste received a partial file")
+                    }
+                } else {
+                    try require(!FileManager.default.fileExists(atPath: output.path), "An unapproved paste created a file")
+                }
             }
         }
 

@@ -1606,9 +1606,10 @@ private func checkPhysicalClipboard(_ board: InteropClipboard, _ probe: Probe) t
     }
     let previousSent = fileMessages(board.sent.get())
     board.copied.update { $0 = .files([folder, empty]) }
-    transfer.announceManifest(kind: .files)
-    _ = try probe.next("clipboardManifest", matching: { $0["kind"] as? String == "files" })
-    try require(probe.all("clipboardOffer").isEmpty, "File offer appeared on copy")
+    transfer.announceManifest(kind: .files, fileRootCount: names.count)
+    let announced = try probe.next("clipboardManifest", matching: { $0["kind"] as? String == "files" })
+    try require(announced["fileRootCount"] as? Int == names.count && probe.all("clipboardOffer").isEmpty,
+                "The on-copy manifest lost the root count or disclosed the offer before paste")
     try probe.send(["command": "clipboardPaste"])
     let offer = try probe.next("clipboardOffer")
     try require(offer["count"] as? Int == names.count && offer["bytes"] as? Int == contents.count &&
@@ -1623,7 +1624,7 @@ private func checkPhysicalClipboard(_ board: InteropClipboard, _ probe: Probe) t
         board.manifest.update { $0 = nil }
         try probe.send(["command": "copyFiles", "names": names])
         try until("Mac receives Windows file manifest") { board.manifest.get()?.kind == .files }
-        guard let manifest = board.manifest.get() else { throw Failure("Missing Windows file manifest") }
+        guard let manifest = board.manifest.get(), manifest.fileRootCount == names.count else { throw Failure("Missing promised Windows file roots") }
         let initial = fileMessages(board.received.get()), offerCount = board.offers.get().count
         transfer.requestFilePaste(revision: manifest.revision)
         transfer.requestFilePaste(revision: manifest.revision)

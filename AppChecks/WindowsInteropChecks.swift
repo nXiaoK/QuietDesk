@@ -277,6 +277,7 @@ private func writeRecording(_ packets: [VideoPacket], to path: String) throws ->
 private final class InteropClipboard: @unchecked Sendable {
     let directory: URL
     let physical: Bool
+    let receivesFileRootNames: Bool
     let transfer = Shared<ClipboardTransfer?>(nil)
     let copied = Shared<ClipboardPayload?>(nil)
     let manifest = Shared<ClipboardManifest?>(nil)
@@ -289,9 +290,10 @@ private final class InteropClipboard: @unchecked Sendable {
     private let media = Shared<MediaSession?>(nil)
     private let session = Shared<UUID?>(nil)
 
-    init(_ directory: URL, physical: Bool = true) {
+    init(_ directory: URL, physical: Bool = true, receivesFileRootNames: Bool = true) {
         self.directory = directory
         self.physical = physical
+        self.receivesFileRootNames = physical && receivesFileRootNames
     }
 
     func attach(_ session: MediaSession, to peer: Peer, failed: @escaping (String) -> Void) {
@@ -299,6 +301,8 @@ private final class InteropClipboard: @unchecked Sendable {
         session.onReliableData = { [weak self, weak peer] message in
             guard let self, let peer else { return }
             do {
+                try require(message.kind != .clipboardSettings && message.kind != .clipboardManifest,
+                            "Windows sent clipboard negotiation or a manifest on the bulk connection")
                 try require(self.receive(message, from: peer), "Unexpected message on bound bulk connection")
                 self.bulkReceived.update { $0.append(message.kind) }
             } catch { failed("bulk: \(error)") }
@@ -308,7 +312,8 @@ private final class InteropClipboard: @unchecked Sendable {
     func greet(_ peer: Peer, id: UUID) throws {
         session.update { $0 = id }
         peer.send(try Wire.json(.clipboardSettings, ClipboardPreference(enabled: true, session: id,
-                    receivesAutomaticUpdates: true, physicalFilePasteV1: physical ? true : nil)))
+                    receivesAutomaticUpdates: true, physicalFilePasteV1: physical ? true : nil,
+                    fileRootNamesV1: receivesFileRootNames ? true : nil)))
     }
 
     func receive(_ message: Message, from peer: Peer) throws -> Bool {
@@ -319,12 +324,15 @@ private final class InteropClipboard: @unchecked Sendable {
                   preference.onDemandClipboard == true, !physical || preference.physicalFilePasteV1 == true else {
                 throw Failure("The Windows peer did not negotiate compatible clipboard settings")
             }
+            if receivesFileRootNames {
+                try require(preference.providesFileRootNamesV1 == true, "Windows omitted its file-root name provider capability")
+            }
             if let existing = session.get() { try require(existing == id, "Clipboard session changed") }
             else { try greet(peer, id: id) }
             if transfer.get() != nil { return true }
             let copy = ClipboardTransfer(storage: directory.appendingPathComponent("received-by-mac"), requireFileApproval: true,
                 allowsChunkWindow: preference.chunkWindow == true, allowsDecoupledFileTransfer: preference.decoupledFileTransfer == true,
-                allowsOnDemandClipboard: true, allowsPhysicalFilePaste: physical)
+                allowsOnDemandClipboard: true, allowsPhysicalFilePaste: physical, allowsFileRootNames: receivesFileRootNames)
             copy.onSend = { [weak peer, sent, media] message in
                 sent.update { $0.append(message.kind) }
                 if let session = media.get() { session.sendReliableData(message) } else { peer?.send(message) }
@@ -1678,6 +1686,7 @@ private func checkPhysicalClipboard(_ board: InteropClipboard, _ probe: Probe) t
         try probe.send(["command": "copyFiles", "names": names])
         try until("Mac receives Windows file manifest") { board.manifest.get()?.kind == .files }
         guard let manifest = board.manifest.get(), manifest.fileRootCount == names.count else { throw Failure("Missing promised Windows file roots") }
+        try require(manifest.fileRootNames == names, "Windows did not announce the negotiated root names in source order")
         let initial = fileMessages(board.received.get()), offerCount = board.offers.get().count
         transfer.requestFilePaste(revision: manifest.revision)
         transfer.requestFilePaste(revision: manifest.revision)
@@ -2518,11 +2527,30 @@ private struct WindowsInteropChecks {
                     }
                 }
                 let all = board.received.get(), bulk = board.bulkReceived.get()
-                for kind in [MessageKind.clipboardManifest, .clipboardPull, .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd,
+                try require(all.contains(.clipboardManifest) && !bulk.contains(.clipboardManifest),
+                            "Windows clipboard manifests did not arrive on the ordered control connection")
+                for kind in [MessageKind.clipboardPull, .clipboardBegin, .clipboardEntry, .clipboardChunk, .clipboardEnd,
                              .clipboardReceipt, .clipboardCancel] {
                     try require(all.contains(kind) && all.filter { $0 == kind }.count == bulk.filter { $0 == kind }.count,
                                 "A clipboard transfer record bypassed the authenticated bulk socket: \(kind)")
                 }
+            }
+        }
+
+        run("A Windows viewer omits root names when the Mac accepts physical file paste without fileRootNamesV1") {
+            let directory = URL(fileURLWithPath: work).appendingPathComponent("unnamed-file-paste", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let board = InteropClipboard(directory, receivesFileRootNames: false)
+            let file = directory.appendingPathComponent("仅在粘贴时读取.txt")
+            try Data([1, 2]).write(to: file)
+            try withMacHost(advertiseMedia: false, clipboard: board, ["--synthetic-clipboard", directory.path]) { _, probe in
+                try until("the older physical-paste preferences arrive") { board.transfer.get() != nil }
+                try probe.send(["command": "copyFiles", "names": [file.lastPathComponent]])
+                try until("Windows announces a count-only file manifest") { board.manifest.get()?.kind == .files }
+                guard let manifest = board.manifest.get() else { throw Failure("Missing count-only manifest") }
+                try require(manifest.fileRootCount == 1 && manifest.fileRootNames == nil &&
+                            board.received.get() == [.clipboardManifest] && probe.all("clipboardRead").isEmpty,
+                            "Windows disclosed names, rendered a file, or offered contents to the older receiver on copy")
             }
         }
 

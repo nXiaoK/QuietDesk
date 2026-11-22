@@ -49,8 +49,8 @@ impl Pair {
     fn readies(&mut self, kind: Kind) -> Revision {
         self.act(0, Input::LocalChanged { token: 57, kind: Some(kind) });
         if kind == Kind::Files {
-            assert!(matches!(self.actions.back(), Some((0, Action::CountFileRoots { token: 57 }))));
-            self.act(0, Input::FileRootCount { token: 57, count: Some(1) });
+            assert!(matches!(self.actions.back(), Some((0, Action::CountFileRoots { token: 57, include_names: false }))));
+            self.act(0, Input::FileRootCount { token: 57, include_names: false, count: Some(1), names: None });
         }
         let manifest = self.wire.last().unwrap().1.read_json::<Manifest>().unwrap();
         assert!(matches!(self.actions.back(),Some((1,Action::Advertise {revision,kind:k,..})) if *revision==manifest.revision && *k==kind));
@@ -79,6 +79,8 @@ fn text_pull_binds_manifest_to_a_new_transfer_and_acks_only_after_native_apply()
     assert_eq!(p.wire.iter().map(|(i, m)| (*i, m.kind)).collect::<Vec<_>>(), [(0, M::ClipboardSettings), (1, M::ClipboardSettings)]);
     let pref: Value = p.wire[0].1.read_json().unwrap();
     assert_eq!(pref["physicalFilePasteV1"], true);
+    assert_eq!(pref["providesFileRootNamesV1"], true);
+    assert!(pref.get("fileRootNamesV1").is_none());
     assert_eq!(pref["chunkWindow"], false);
     let manifest = p.readies(Kind::Text);
     p.act(1, Input::Paste(manifest));
@@ -187,7 +189,7 @@ fn focus_only_exposes_the_newest_copy_once_and_cancelled_reads_cannot_send_data(
     }
     assert!(!p.wire.iter().any(|(_, m)| m.kind == M::ClipboardManifest));
     p.act(1, Input::Preferences { enabled: true, receives: true });
-    let revision = p.states[0].local_manifest.unwrap().revision;
+    let revision = p.states[0].local_manifest.as_ref().unwrap().revision;
     p.act(1, Input::Preferences { enabled: true, receives: false });
     p.act(1, Input::Preferences { enabled: true, receives: true });
     assert_eq!(p.wire.iter().filter(|(_, m)| m.kind == M::ClipboardManifest).count(), 1);
@@ -205,16 +207,16 @@ fn only_the_current_selection_exposes_a_bounded_count_before_file_demand() {
     for token in [1, 2] {
         p.act(0, Input::LocalChanged { token, kind: Some(Kind::Files) });
     }
-    p.act(0, Input::FileRootCount { token: 1, count: Some(9) });
+    p.act(0, Input::FileRootCount { token: 1, include_names: false, count: Some(9), names: None });
     assert!(!p.wire.iter().any(|(_, m)| m.kind == M::ClipboardManifest));
-    p.act(0, Input::FileRootCount { token: 2, count: Some(MAX_PROMISED_FILE_ROOTS) });
+    p.act(0, Input::FileRootCount { token: 2, include_names: false, count: Some(MAX_PROMISED_FILE_ROOTS), names: None });
     let board: Value = p.wire.last().unwrap().1.read_json().unwrap();
     assert_eq!(board.as_object().unwrap().len(), 3);
     assert_eq!(board["fileRootCount"], MAX_PROMISED_FILE_ROOTS);
     assert!(!p.actions.iter().any(|(_, a)| matches!(a, Action::Read { .. })));
 
     p.act(0, Input::LocalChanged { token: 3, kind: Some(Kind::Files) });
-    p.act(0, Input::FileRootCount { token: 3, count: Some(MAX_PROMISED_FILE_ROOTS + 1) });
+    p.act(0, Input::FileRootCount { token: 3, include_names: false, count: Some(MAX_PROMISED_FILE_ROOTS + 1), names: None });
     let uncounted: Value = p.wire.last().unwrap().1.read_json().unwrap();
     assert_eq!(uncounted.as_object().unwrap().len(), 2);
     assert_eq!(uncounted["kind"], "files");
@@ -225,6 +227,75 @@ fn only_the_current_selection_exposes_a_bounded_count_before_file_demand() {
     p.act(0, Input::LocalChanged { token: 4, kind: Some(Kind::Files) });
     assert!(!p.actions.iter().any(|(_, a)| matches!(a, Action::CountFileRoots { .. })));
     assert!(matches!(p.actions.back(), Some((0, Action::Read { token: 4, .. }))));
+}
+
+#[test]
+fn named_file_manifests_require_the_peer_request_and_match_the_later_selection() {
+    let mut pair = Pair::new();
+    let sender = &mut pair.states[0];
+    let names = vec!["资料".to_owned(), "空.txt".to_owned()];
+    let selection = |token| Input::LocalChanged { token, kind: Some(Kind::Files) };
+    let counted = |token, include_names, names: Vec<String>| Input::FileRootCount { token, include_names, count: Some(names.len()), names: Some(names) };
+    let manifest = |state: &State| {
+        let msg = state
+            .effects
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                Output::Send(m) if m.kind == M::ClipboardManifest => Some(m),
+                _ => None,
+            })
+            .unwrap();
+        serde_json::from_slice::<Value>(&msg.payload).unwrap()
+    };
+    sender.handle(selection(71));
+    sender.handle(counted(71, false, names.clone()));
+    assert!(manifest(sender).get("fileRootNames").is_none());
+
+    let mut preference = sender.remote.clone().unwrap();
+    preference.file_root_names_v1 = Some(true);
+    sender.handle(selection(72));
+    assert!(matches!(sender.effects.last(), Some(Output::Native(Action::CountFileRoots { token: 72, include_names: false }))));
+    sender.handle(Input::Peer(Message::json(M::ClipboardSettings, &preference).unwrap()));
+    assert!(matches!(sender.effects.last(), Some(Output::Native(Action::CountFileRoots { token: 72, include_names: true }))));
+    sender.effects.clear();
+    sender.handle(Input::FileRootCount { token: 72, include_names: false, count: Some(2), names: None });
+    assert!(sender.effects.is_empty() && sender.local_manifest.is_none());
+    sender.handle(counted(72, true, names.clone()));
+    assert_eq!(manifest(sender)["fileRootNames"], json!(names));
+
+    let revision = sender.local_manifest.as_ref().unwrap().revision;
+    let request = Pull { request_id: Uuid::new_v4(), revision, kind: Kind::Files };
+    // Selecting another file with the same root count cannot reuse this named offer.
+    assert!(sender.start_outgoing(Payload::Files(vec!["other".into(), "空.txt".into()]), Some(request), false).is_err());
+    assert!(!sender.effects.iter().any(|e| matches!(e, Output::Send(m) if m.kind == M::ClipboardBegin)));
+    for (token, invalid) in [(80, vec!["../outside".into()]), (81, vec!["A".into(), "a".into()]), (82, vec!["名".repeat(86)])] {
+        sender.handle(selection(token));
+        sender.handle(counted(token, true, invalid));
+        assert!(manifest(sender).get("fileRootNames").is_none());
+        assert!(manifest(sender)["fileRootCount"].is_u64());
+    }
+    let stem = "界".repeat(83);
+    let many: Vec<_> = (0..MAX_PROMISED_FILE_ROOTS).map(|i| format!("{stem}-{i:05}")).collect();
+    assert!(many.iter().all(|n| n.len() == 255));
+    sender.handle(selection(83));
+    sender.handle(counted(83, true, many.clone()));
+    assert_eq!(manifest(sender)["fileRootNames"], json!(many));
+    let encoded = serde_json::to_vec(&manifest(sender)).unwrap().len();
+    assert!(encoded > 1024 * 1024 && encoded <= MAX_NAMED_MANIFEST_BYTES);
+    sender.handle(selection(85));
+    preference.file_root_names_v1 = None;
+    sender.handle(Input::Peer(Message::json(M::ClipboardSettings, &preference).unwrap()));
+    sender.effects.clear();
+    sender.handle(counted(85, true, names.clone()));
+    assert!(sender.effects.is_empty() && sender.local_manifest.is_none());
+    sender.handle(Input::FileRootCount { token: 85, include_names: false, count: Some(2), names: None });
+    assert!(manifest(sender).get("fileRootNames").is_none());
+    preference.file_approval = Some(false);
+    sender.handle(Input::Peer(Message::json(M::ClipboardSettings, &preference).unwrap()));
+    sender.effects.clear();
+    sender.handle(selection(84));
+    assert!(!sender.effects.iter().any(|e| matches!(e, Output::Native(Action::CountFileRoots { .. }) | Output::Send(_))));
 }
 
 #[test]

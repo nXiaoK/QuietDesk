@@ -2,7 +2,7 @@
 use super::clipboard_image;
 use super::clipboard_ole::Formats;
 use super::util::{failed, wide};
-use quietdesk_core::clipboard::{Kind, MAX_FILE_ENTRIES, MAX_PNG_BYTES, MAX_TEXT_BYTES, Payload};
+use quietdesk_core::clipboard::{Kind, MAX_FILE_ENTRIES, MAX_PNG_BYTES, MAX_PROMISED_FILE_ROOTS, MAX_TEXT_BYTES, Payload, file_root_names};
 use quietdesk_core::error::Result;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
@@ -184,7 +184,7 @@ pub(super) fn inspect(f: Formats) -> windows::core::Result<(u64, Option<Kind>)> 
     Ok((u64::from(token), if relayed { None } else { local_kind(&clip, f) }))
 }
 
-pub(super) fn file_root_count(token: u64, f: Formats) -> Option<usize> {
+pub(super) fn file_root_metadata(token: u64, f: Formats, include_names: bool) -> Option<(usize, Option<Vec<String>>)> {
     let clip = Open::new(None).ok()?;
     unsafe {
         if u64::from(GetClipboardSequenceNumber()) != token || f.virtual_files.into_iter().any(available) {
@@ -199,17 +199,26 @@ pub(super) fn file_root_count(token: u64, f: Formats) -> Option<usize> {
                 return None;
             }
         }
-        if available(f.shell_items) {
+        let count = if available(f.shell_items) {
             // CIDA begins with the number of children followed by parent and child offsets.
-            return clip.data(f.shell_items, MAX_DROP_BYTES, |bytes, _| {
+            clip.data(f.shell_items, MAX_DROP_BYTES, |bytes, _| {
                 let count = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
                 (count <= (bytes.len() / 4).saturating_sub(2)).then_some(count)
-            });
-        }
-        clip.data(CF_HDROP.0, MAX_DROP_BYTES, |bytes, _| {
-            let (names, wide) = drop_names(bytes)?;
-            if wide { count_terminated(names.as_chunks::<2>().0, &[0, 0]) } else { count_terminated(names, &0) }
-        })
+            })
+        } else {
+            clip.data(CF_HDROP.0, MAX_DROP_BYTES, |bytes, _| {
+                let (names, wide) = drop_names(bytes)?;
+                if wide { count_terminated(names.as_chunks::<2>().0, &[0, 0]) } else { count_terminated(names, &0) }
+            })
+        }?;
+        // Use the same ordered DROPFILES selection that a later pull will read.
+        // Only inspect the Shell clipboard's existing paths; do not open or list them.
+        let names = if include_names && (1..=MAX_PROMISED_FILE_ROOTS).contains(&count) {
+            clip.data(CF_HDROP.0, MAX_DROP_BYTES, |bytes, _| file_root_names(&file_roots(bytes, count)?)).filter(|n| n.len() == count)
+        } else {
+            None
+        };
+        Some((count, names))
     }
 }
 
@@ -228,7 +237,7 @@ pub(super) fn read(token: u64, kind: Kind, f: Formats) -> Option<Payload> {
             drop(clip);
             clipboard_image::dib_to_png(&dib).map(Payload::Png)
         }
-        Kind::Files => clip.data(CF_HDROP.0, MAX_DROP_BYTES, |bytes, _| file_roots(bytes).map(Payload::Files)),
+        Kind::Files => clip.data(CF_HDROP.0, MAX_DROP_BYTES, |bytes, _| file_roots(bytes, MAX_FILE_ENTRIES).map(Payload::Files)),
     }
 }
 
@@ -252,7 +261,7 @@ fn count_terminated<T: PartialEq>(mut names: &[T], nul: &T) -> Option<usize> {
     }
 }
 
-fn file_roots(bytes: &[u8]) -> Option<Vec<PathBuf>> {
+fn file_roots(bytes: &[u8], limit: usize) -> Option<Vec<PathBuf>> {
     let (names, wide) = drop_names(bytes)?;
     let mut paths = Vec::new();
     if wide {
@@ -262,7 +271,7 @@ fn file_roots(bytes: &[u8]) -> Option<Vec<PathBuf>> {
             if n == 0 {
                 break;
             }
-            if n >= 32768 || paths.len() == MAX_FILE_ENTRIES {
+            if n >= 32768 || paths.len() >= limit {
                 return None;
             }
             let units: Vec<_> = names[..n].iter().map(|u| u16::from_le_bytes(*u)).collect();
@@ -276,7 +285,7 @@ fn file_roots(bytes: &[u8]) -> Option<Vec<PathBuf>> {
             if n == 0 {
                 break;
             }
-            if n >= 32768 || paths.len() == MAX_FILE_ENTRIES {
+            if n >= 32768 || paths.len() >= limit {
                 return None;
             }
             let mut units = vec![0; n];

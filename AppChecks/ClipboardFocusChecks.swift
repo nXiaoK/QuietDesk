@@ -259,6 +259,64 @@ private struct ClipboardFocusChecks {
             } catch { failed += 1; print("FAIL \(name): \(error)") }
         }
 
+        run("Overlapping background Finder reads cannot copy or prematurely restore promised names") { folder in
+            let url = folder.appendingPathComponent("document")
+            let original = Data("original stub".utf8)
+            try original.write(to: url)
+            let failed = ChannelSafeBox(false)
+            let root = PromisedFinderRoot(url: url, queue: OperationQueue(), failed: { failed.set(true) }, provide: { false })
+            let first = ChannelSafeBox<(@Sendable () -> Void)?>(nil)
+            let second = ChannelSafeBox<(@Sendable () -> Void)?>(nil)
+            root.relinquishPresentedItem(toReader: { first.set($0) })
+            root.relinquishPresentedItem(toReader: { second.set($0) })
+            try require(!FileManager.default.fileExists(atPath: url.path), "A background reader could copy the stub")
+            first.read()?()
+            try require(!FileManager.default.fileExists(atPath: url.path), "The first reader restored the stub too soon")
+            second.read()?()
+            try require(try Data(contentsOf: url) == original && !failed.read(), "The last reader did not restore the original")
+        }
+
+        run("Finishing background Finder reads preserves hydrated files and cancellation") { folder in
+            let url = folder.appendingPathComponent("document")
+            let received = Data("received bytes".utf8)
+            try Data().write(to: url)
+            let failed = ChannelSafeBox(false), allowed = ChannelSafeBox(false)
+            let root = PromisedFinderRoot(url: url, queue: OperationQueue(), failed: { failed.set(true) }, provide: { allowed.read() })
+            let restore = ChannelSafeBox<(@Sendable () -> Void)?>(nil)
+            root.relinquishPresentedItem(toReader: { restore.set($0) })
+            try received.write(to: url)
+            restore.read()?()
+            allowed.set(true)
+            root.relinquishPresentedItem(toReader: { restore.set($0) })
+            try require(restore.read() == nil && (try Data(contentsOf: url)) == received, "Restoring a stub displaced received bytes")
+            allowed.set(false)
+            root.relinquishPresentedItem(toReader: { restore.set($0) })
+            for item in try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) {
+                try FileManager.default.removeItem(at: item)
+            }
+            restore.read()?()
+            try require(!FileManager.default.fileExists(atPath: url.path) && !failed.read(), "A late reader resurrected cancelled files")
+        }
+
+        run("A Finder-capable peer without file names preserves the clipboard and asks for a fresh copy") { folder in
+            let board = MemoryPasteboard()
+            board.copy(.text(Data("keep this copy".utf8)))
+            let messages = ChannelSafeBox<[MessageKind]>([])
+            let sync = ClipboardSync(session: UUID(), allowsFileSending: true, allowsAutomaticSending: false,
+                                     allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true, usesFinderFilePaste: true,
+                                     pasteboard: board, storage: folder) { messages.append($0.kind) }
+            defer { sync.stop() }
+            var status = ""
+            sync.onStatus = { status = $0 }
+            let manifest = ClipboardManifest(revision: ClipboardRevision(counter: 1, origin: UUID()), kind: .files, fileRootCount: 1)
+            sync.receive(try Wire.json(.clipboardManifest, manifest))
+            try eventually("The failure was not reported to the receiver") { status.contains("重新复制") }
+            try require(board.copiedText == "keep this copy" && board.writes == 0 && !messages.snapshot().contains(.clipboardPull),
+                        "Missing names displaced the local clipboard or triggered a file request")
+        }
+
+        if Array(arguments.dropFirst()) == ["--finder-roots-only"] { exit(failed == 0 ? 0 : 1) }
+
         run("Background copies and paste preparation never read clipboard content; foreground sends only latest") { folder in
             let pair = ClipboardPair(storage: folder)
             defer { pair.stop() }

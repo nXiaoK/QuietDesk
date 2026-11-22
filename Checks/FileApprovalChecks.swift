@@ -158,6 +158,50 @@ func runFileApprovalChecks() {
         }
     }
 
+    run("Negotiated Finder root names are bounded, safe, and bound to the received tree") {
+        try withCheckFolder { folder in
+            let receiver = ClipboardTransfer(storage: folder, requireFileApproval: true, allowsOnDemandClipboard: true,
+                allowsPhysicalFilePaste: true, allowsFileRootNames: true)
+            defer { receiver.stop() }
+            let origin = UUID(), revision = ClipboardRevision(counter: 1, origin: origin)
+            let seen = DispatchSemaphore(value: 0), cancelled = DispatchSemaphore(value: 0)
+            let pulled = DispatchSemaphore(value: 0), approved = DispatchSemaphore(value: 0)
+            let request = Box<ClipboardPullRequest?>(nil)
+            receiver.onManifest = { _ in seen.signal() }
+            receiver.onSend = { message in
+                switch message.kind {
+                case .clipboardPull:
+                    request.set(try? Wire.readJSON(ClipboardPullRequest.self, message.payload)); pulled.signal()
+                case .clipboardCancel: cancelled.signal()
+                case .clipboardReceipt: approved.signal()
+                default: break
+                }
+            }
+            for names in [["../outside"], ["."], ["a/b"], ["Readme", "README"], [String(repeating: "a", count: 256)]] {
+                receiver.receive(try Wire.json(.clipboardManifest, ClipboardManifest(revision: revision, kind: .files,
+                    fileRootCount: names.count, fileRootNames: names)))
+                try wait(cancelled, "Unsafe Finder root was advertised")
+            }
+            let names = (0..<100).map { "root-\($0)-" + String(repeating: "x", count: 48) }
+            let manifest = try Wire.json(.clipboardManifest, ClipboardManifest(revision: revision, kind: .files,
+                fileRootCount: names.count, fileRootNames: names))
+            try check(manifest.payload.count > 4096, "Fixture must exercise a large negotiated manifest")
+            receiver.receive(manifest); try wait(seen, "Large negotiated root list did not reach the clipboard")
+            receiver.requestFilePaste(revision: revision); try wait(pulled, "Valid file paste was not requested")
+            let transfer: [String: Any] = ["counter": 2, "origin": origin.uuidString]
+            guard let id = request.read()?.requestID else { throw CheckFailure("Missing paste request") }
+            receiver.onFileOffer = { offer in if let offer { receiver.respondToFileOffer(id: offer.id, accept: true) } }
+            let begin: [String: Any] = ["revision": transfer, "sequence": 0, "type": "files", "count": names.count,
+                "rootCount": names.count, "names": [], "bytes": 0, "pullRequestID": id.uuidString]
+            receiver.receive(Message(.clipboardBegin, try JSONSerialization.data(withJSONObject: begin)))
+            try wait(approved, "Valid Finder transfer could not be approved")
+            let entry: [String: Any] = ["revision": transfer, "sequence": 1, "path": "substitute", "directory": false,
+                "bytes": 0, "mode": 0o600, "modified": 0]
+            receiver.receive(Message(.clipboardEntry, try JSONSerialization.data(withJSONObject: entry)))
+            try wait(cancelled, "Received root name escaped the approved manifest")
+        }
+    }
+
     run("More roots than the native promise limit retain the legacy file manifest") {
         try withCheckFolder { folder in
             let sender = ClipboardTransfer(storage: folder, requireFileApproval: true, allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)

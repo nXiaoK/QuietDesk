@@ -429,6 +429,7 @@ final class DeskModel: ObservableObject {
     private var remoteDecoupledFileTransfer = false
     private var remoteOnDemandClipboard = false
     private var remotePhysicalFilePaste = false
+    private var remoteProvidesFileRootNames = false
     private var remoteReceivesAutomaticClipboard = true
     private var remoteClipboardFocusAware = false
     private var lastClipboardReceivePreference: Bool?
@@ -5173,7 +5174,8 @@ final class DeskModel: ObservableObject {
         let enabled = activeRouteBenchmarkOverride == nil && clipboardEnabled
         let receives = enabled && !sessionInputSuspended && !hostSession.paused && (mode == .viewer ? !controlling : true)
         peer.send(try Wire.json(.clipboardSettings, ClipboardPreference(enabled: enabled,
-            session: clipboardSession, receivesAutomaticUpdates: receives, physicalFilePasteV1: remotePhysicalFilePaste ? true : nil)))
+            session: clipboardSession, receivesAutomaticUpdates: receives, physicalFilePasteV1: remotePhysicalFilePaste ? true : nil,
+            fileRootNamesV1: remotePhysicalFilePaste ? true : nil)))
         lastClipboardReceivePreference = receives
     }
 
@@ -5194,6 +5196,11 @@ final class DeskModel: ObservableObject {
         remoteDecoupledFileTransfer = preference.decoupledFileTransfer == true
         remoteOnDemandClipboard = preference.onDemandClipboard == true
         remotePhysicalFilePaste = remoteOnDemandClipboard && remoteFileApproval && preference.physicalFilePasteV1 == true
+        // Once this connection has advertised named roots, a later focus/settings update
+        // must not downgrade a pending Finder copy to an eager file URL provider.
+        if remotePhysicalFilePaste && preference.providesFileRootNamesV1 == true {
+            remoteProvidesFileRootNames = true
+        }
         remoteReceivesAutomaticClipboard = preference.receivesAutomaticUpdates ?? true
         remoteClipboardFocusAware = preference.receivesAutomaticUpdates != nil
     }
@@ -5226,6 +5233,15 @@ final class DeskModel: ObservableObject {
     private func updateClipboardSync() {
         let enabled = activeRouteBenchmarkOverride == nil && connected && supportsClipboard && clipboardEnabled && remoteClipboardEnabled
         canvas.synchronizesClipboard = enabled
+        if enabled, remotePhysicalFilePaste, remoteProvidesFileRootNames, let sync = clipboardSync, !sync.usesFinderFilePaste {
+            clipboardHandledChange = sync.handledChange
+            dataChannel?.configureClipboard(nil)
+            sync.stop()
+            clipboardSync = nil
+            dismissClipboardPrompt()
+            clipboardFilePrompt = nil
+            pendingFileOffer = nil
+        }
         if enabled, clipboardSync == nil, let peer, let clipboardSession {
             let channel = dataChannel
             let sync = ClipboardSync(session: clipboardSession, allowsFileSending: remoteFileApproval,
@@ -5233,6 +5249,7 @@ final class DeskModel: ObservableObject {
                 allowsDecoupledFileTransfer: remoteDecoupledFileTransfer,
                 allowsOnDemandClipboard: remoteOnDemandClipboard,
                 deferFileOfferUntilPaste: remoteOnDemandClipboard && mode == .viewer, allowsPhysicalFilePaste: remotePhysicalFilePaste,
+                usesFinderFilePaste: remoteProvidesFileRootNames,
                 controllingRemote: clipboardControlsRemote, handledChange: clipboardHandledChange,
                 syncInitialLocalClipboard: mode == .viewer && clipboardHandledChange == nil) { [weak peer, weak channel] message in
                     if let channel { channel.sendReliableData(message) }
@@ -5741,6 +5758,7 @@ final class DeskModel: ObservableObject {
         remoteDecoupledFileTransfer = false
         remoteOnDemandClipboard = false
         remotePhysicalFilePaste = false
+        remoteProvidesFileRootNames = false
         remoteReceivesAutomaticClipboard = true
         remoteClipboardFocusAware = false
         lastClipboardReceivePreference = nil

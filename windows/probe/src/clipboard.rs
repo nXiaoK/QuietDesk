@@ -56,11 +56,16 @@ impl SyntheticClipboard {
             let Some(input) = weak_input.upgrade() else { return };
             let mut board = board.lock().unwrap();
             match action {
-                Action::CountFileRoots { token } => {
+                Action::CountFileRoots { token, include_names } => {
                     if board.token == token
                         && let Some(Payload::Files(paths)) = board.local.as_ref()
                     {
-                        let _ = input.try_send(Input::FileRootCount { token, count: Some(paths.len()) });
+                        let _ = input.try_send(Input::FileRootCount {
+                            token,
+                            include_names,
+                            count: Some(paths.len()),
+                            names: include_names.then(|| quietdesk_core::clipboard::file_root_names(paths)).flatten(),
+                        });
                     }
                 }
                 Action::Read { token, kind } => {

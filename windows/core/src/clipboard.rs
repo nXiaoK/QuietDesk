@@ -7,9 +7,9 @@ mod transfer;
 use crate::error::{DeskError, Result};
 use crate::wire::{MAXIMUM_CONTROL_BYTES, Message, MessageKind as M};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{collections::HashSet, path::PathBuf};
 pub use storage::{StorageBackend, validate_filename};
 use tokio::sync::mpsc;
 use transfer::{Begin, Entry, Incoming, Outgoing, Receipt};
@@ -19,6 +19,7 @@ pub const MAX_TEXT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PNG_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_FILE_ENTRIES: usize = 200_000;
 pub const MAX_PROMISED_FILE_ROOTS: usize = 4096;
+const MAX_NAMED_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
 const CHUNK: usize = 32_768;
 const STALL: Duration = Duration::from_secs(30);
 const OFFER_TIMEOUT: Duration = Duration::from_secs(90);
@@ -70,7 +71,7 @@ pub enum Input {
     Peer(Message),
     Preferences { enabled: bool, receives: bool },
     LocalChanged { token: u64, kind: Option<Kind> },
-    FileRootCount { token: u64, count: Option<usize> },
+    FileRootCount { token: u64, include_names: bool, count: Option<usize>, names: Option<Vec<String>> },
     Paste(Revision),
     Read { token: u64, payload: Option<Payload> },
     Decision { revision: Revision, accept: bool },
@@ -79,7 +80,7 @@ pub enum Input {
 }
 #[derive(Debug)]
 pub enum Action {
-    CountFileRoots { token: u64 },
+    CountFileRoots { token: u64, include_names: bool },
     Read { token: u64, kind: Kind },
     Advertise { revision: Revision, kind: Kind, file_root_count: Option<usize> },
     Clear,
@@ -106,13 +107,38 @@ struct Preference {
     decoupled_file_transfer: Option<bool>,
     on_demand_clipboard: Option<bool>,
     physical_file_paste_v1: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_root_names_v1: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provides_file_root_names_v1: Option<bool>,
 }
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub fn file_root_names(paths: &[PathBuf]) -> Option<Vec<String>> {
+    if !(1..=MAX_PROMISED_FILE_ROOTS).contains(&paths.len()) {
+        return None;
+    }
+    paths.iter().map(|p| p.file_name()?.to_str().map(str::to_owned)).collect()
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(transparent)]
+struct RootNames(Vec<String>);
+
+impl RootNames {
+    fn checked(names: Vec<String>) -> Option<Self> {
+        let mut unique = HashSet::new();
+        ((1..=MAX_PROMISED_FILE_ROOTS).contains(&names.len())
+            && names.iter().all(|n| n.len() <= 255 && validate_filename(n).is_ok() && unique.insert(n.to_lowercase())))
+        .then_some(Self(names))
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Manifest {
     revision: Revision,
     kind: Kind,
     #[serde(rename = "fileRootCount", skip_serializing_if = "Option::is_none")]
     file_root_count: Option<usize>,
+    #[serde(rename = "fileRootNames", skip_deserializing, skip_serializing_if = "Option::is_none")]
+    file_root_names: Option<RootNames>,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct Pull {
@@ -192,7 +218,7 @@ struct State {
     storage: PathBuf,
     backend: Arc<dyn StorageBackend>,
     local: Option<(u64, Kind)>,
-    counting: Option<u64>,
+    counting: Option<(u64, bool)>,
     published_token: Option<u64>,
     deferred_local: bool,
     local_manifest: Option<Manifest>,
@@ -244,6 +270,9 @@ impl State {
     fn physical(&self) -> bool {
         self.on_demand() && self.remote.as_ref().is_some_and(|p| p.file_approval == Some(true) && p.physical_file_paste_v1 == Some(true))
     }
+    fn names_negotiated(&self) -> bool {
+        self.physical() && self.remote.as_ref().is_some_and(|p| p.file_root_names_v1 == Some(true))
+    }
     fn remote_receives(&self) -> bool {
         self.remote.as_ref().is_some_and(|p| p.receives_automatic_updates != Some(false))
     }
@@ -251,8 +280,9 @@ impl State {
         self.effects.push(Output::Native(action));
     }
     fn send<T: Serialize>(&mut self, kind: M, value: &T) {
+        let limit = if kind == M::ClipboardManifest && self.names_negotiated() { MAX_NAMED_MANIFEST_BYTES } else { MAXIMUM_CONTROL_BYTES };
         match Message::json(kind, value) {
-            Ok(msg) if msg.payload.len() <= MAXIMUM_CONTROL_BYTES => self.effects.push(Output::Send(msg)),
+            Ok(msg) if msg.payload.len() <= limit => self.effects.push(Output::Send(msg)),
             _ => self.native(Action::Status("剪贴板控制信息过大".into())),
         }
     }
@@ -269,6 +299,8 @@ impl State {
                     decoupled_file_transfer: Some(false),
                     on_demand_clipboard: Some(true),
                     physical_file_paste_v1: Some(true),
+                    file_root_names_v1: None,
+                    provides_file_root_names_v1: Some(true),
                 },
             );
         }
@@ -386,8 +418,8 @@ impl State {
                 self.publish_local()
             }
             _ if !self.active() => return,
-            Input::FileRootCount { token, count } => {
-                if self.counting.take_if(|t| *t == token).is_none() {
+            Input::FileRootCount { token, include_names, count, names } => {
+                if self.counting.take_if(|query| *query == (token, include_names)).is_none() {
                     return;
                 }
                 if !self.remote_receives() {
@@ -400,11 +432,12 @@ impl State {
                 if count.is_some_and(|n| n > MAX_PROMISED_FILE_ROOTS) {
                     self.native(Action::Status("所选顶层文件较多，将使用兼容文件接收方式".into()));
                 }
-                self.publish_manifest(Kind::Files, count.filter(|n| *n <= MAX_PROMISED_FILE_ROOTS))
+                let names = names.filter(|n| self.names_negotiated() && Some(n.len()) == count).and_then(RootNames::checked);
+                self.publish_manifest(Kind::Files, count.filter(|n| *n <= MAX_PROMISED_FILE_ROOTS), names)
             }
             Input::Peer(msg) => self.peer(msg),
             Input::Paste(revision) => {
-                let Some(m) = self.remote_manifest.filter(|m| m.revision == revision) else { return };
+                let Some(m) = self.remote_manifest.as_ref().filter(|m| m.revision == revision) else { return };
                 if self.pull.is_some() || self.incoming.is_some() || self.applying.is_some() || (m.kind == Kind::Files && !self.physical()) {
                     return;
                 }
@@ -503,7 +536,8 @@ impl State {
         let was_active = self.active();
         let allowed = self.remote_receives();
         let changed = self.remote.as_ref().is_some_and(|prior| {
-            (prior.on_demand_clipboard, prior.file_approval, prior.physical_file_paste_v1) != (p.on_demand_clipboard, p.file_approval, p.physical_file_paste_v1)
+            (prior.on_demand_clipboard, prior.file_approval, prior.physical_file_paste_v1, prior.file_root_names_v1)
+                != (p.on_demand_clipboard, p.file_approval, p.physical_file_paste_v1, p.file_root_names_v1)
         });
         self.session = Some(p.session);
         self.remote = Some(p);
@@ -533,27 +567,35 @@ impl State {
         }
         self.published_token = Some(token);
         if kind == Kind::Files && self.physical() {
-            self.counting = Some(token);
-            self.native(Action::CountFileRoots { token });
+            let include_names = self.names_negotiated();
+            self.counting = Some((token, include_names));
+            self.native(Action::CountFileRoots { token, include_names });
         } else if kind != Kind::Files && self.on_demand() {
-            self.publish_manifest(kind, None)?;
+            self.publish_manifest(kind, None, None)?;
         } else {
             self.reading = Some(Reading { token, kind, pull: None });
             self.native(Action::Read { token, kind });
         }
         Ok(())
     }
-    fn publish_manifest(&mut self, kind: Kind, file_root_count: Option<usize>) -> Result<()> {
-        let manifest = Manifest { revision: self.next_revision()?, kind, file_root_count };
-        self.local_manifest = Some(manifest);
+    fn publish_manifest(&mut self, kind: Kind, file_root_count: Option<usize>, file_root_names: Option<RootNames>) -> Result<()> {
+        let manifest = Manifest { revision: self.next_revision()?, kind, file_root_count, file_root_names };
         self.send(M::ClipboardManifest, &manifest);
+        self.local_manifest = Some(manifest);
         Ok(())
     }
     fn start_outgoing(&mut self, payload: Payload, pull: Option<Pull>, explicit: bool) -> Result<()> {
         if let (Some(p), Payload::Files(paths)) = (pull, &payload)
-            && self.local_manifest.and_then(|m| m.file_root_count).is_some_and(|n| n != paths.len())
+            && self.local_manifest.as_ref().and_then(|m| m.file_root_count).is_some_and(|n| n != paths.len())
         {
             let reason = "源剪贴板顶层数量已改变";
+            self.reject(p.revision, 0, reason);
+            return Err(DeskError::invalid(reason));
+        }
+        if let (Some(p), Payload::Files(paths), Some(names)) = (pull, &payload, self.local_manifest.as_ref().and_then(|m| m.file_root_names.as_ref()))
+            && paths.iter().map(|p| p.file_name().and_then(|n| n.to_str())).ne(names.0.iter().map(|n| Some(n.as_str())))
+        {
+            let reason = "源剪贴板顶层名称已改变";
             self.reject(p.revision, 0, reason);
             return Err(DeskError::invalid(reason));
         }
@@ -576,6 +618,7 @@ impl State {
     fn peer(&mut self, msg: Message) -> Result<()> {
         match msg.kind {
             M::ClipboardManifest => {
+                // This receiver uses Shell extraction and never requests a named manifest.
                 let m: Manifest = read_control(&msg)?;
                 if !self.on_demand() {
                     return Err(DeskError::invalid("对端未协商按需剪贴板"));
@@ -593,15 +636,15 @@ impl State {
                     return Ok(());
                 }
                 if self.receives && (m.kind != Kind::Files || self.physical()) {
-                    self.remote_manifest = Some(m);
                     self.native(Action::Advertise { revision: m.revision, kind: m.kind, file_root_count: m.file_root_count });
+                    self.remote_manifest = Some(m);
                 }
             }
             M::ClipboardPull => {
                 let p: Pull = read_control(&msg)?;
                 if !self.on_demand()
                     || (p.kind == Kind::Files && !self.physical())
-                    || self.local_manifest.is_none_or(|m| m.revision != p.revision || m.kind != p.kind)
+                    || self.local_manifest.as_ref().is_none_or(|m| m.revision != p.revision || m.kind != p.kind)
                 {
                     self.reject(p.revision, 0, "剪贴板内容已更新或不可用");
                     return Ok(());
@@ -661,7 +704,7 @@ impl State {
             }
             M::ClipboardCancel => {
                 let r: Receipt = read_control(&msg)?;
-                if self.remote_manifest.is_some_and(|m| m.revision == r.revision)
+                if self.remote_manifest.as_ref().is_some_and(|m| m.revision == r.revision)
                     || self.pull.is_some_and(|p| p.revision == r.revision)
                     || self.incoming.as_ref().is_some_and(|t| t.begin.revision == r.revision)
                     || self.outgoing.as_ref().is_some_and(|t| t.revision == r.revision)
@@ -748,7 +791,7 @@ impl State {
             {
                 return Err(DeskError::invalid("按需粘贴请求已失效"));
             }
-            if self.remote_manifest.and_then(|m| m.file_root_count).is_some_and(|n| b.root_count != Some(n)) {
+            if self.remote_manifest.as_ref().and_then(|m| m.file_root_count).is_some_and(|n| b.root_count != Some(n)) {
                 return Err(DeskError::invalid("文件传输顶层数量与粘贴清单不符"));
             }
         } else {

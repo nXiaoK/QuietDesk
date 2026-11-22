@@ -37,16 +37,58 @@ public struct ClipboardManifest: Codable, Equatable, Sendable {
     public let revision: ClipboardRevision
     public let kind: ClipboardManifestKind
     public let fileRootCount: Int?
+    public let fileRootNames: [String]?
 
-    public init(revision: ClipboardRevision, kind: ClipboardManifestKind, fileRootCount: Int? = nil) {
+    public init(revision: ClipboardRevision, kind: ClipboardManifestKind, fileRootCount: Int? = nil, fileRootNames: [String]? = nil) {
         self.revision = revision
         self.kind = kind
         self.fileRootCount = fileRootCount
+        self.fileRootNames = fileRootNames
     }
 
-    fileprivate func validate() throws {
+    public init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        revision = try fields.decode(ClipboardRevision.self, forKey: .revision)
+        kind = try fields.decode(ClipboardManifestKind.self, forKey: .kind)
+        fileRootCount = try fields.decodeIfPresent(Int.self, forKey: .fileRootCount)
+        if fields.contains(.fileRootNames), try !fields.decodeNil(forKey: .fileRootNames) {
+            var list = try fields.nestedUnkeyedContainer(forKey: .fileRootNames)
+            guard kind == .files, let count = fileRootCount,
+                  (1...ClipboardTransfer.maximumPromisedFileRoots).contains(count),
+                  list.count == nil || list.count == count else { throw DeskError.invalid("文件粘贴清单名称与项目数不符") }
+            var names: [String] = []
+            names.reserveCapacity(count)
+            while !list.isAtEnd {
+                guard names.count < count else { throw DeskError.invalid("文件粘贴清单过长") }
+                names.append(try list.decode(String.self))
+            }
+            fileRootNames = names
+        } else {
+            fileRootNames = nil
+        }
+    }
+
+    fileprivate static func decode(_ data: Data, allowsFileRootNames: Bool) throws -> Self {
+        if data.count <= 4096 { return try Wire.readJSON(Self.self, data) }
+        guard allowsFileRootNames, data.count <= 2 * 1024 * 1024 else { throw DeskError.invalid("剪贴板清单过大") }
+        let manifest = try JSONDecoder().decode(Self.self, from: data)
+        guard manifest.fileRootNames != nil else { throw DeskError.invalid("剪贴板清单过大") }
+        return manifest
+    }
+
+    fileprivate func validate(allowsFileRootNames: Bool) throws {
         if let fileRootCount, kind != .files || !(1...ClipboardTransfer.maximumPromisedFileRoots).contains(fileRootCount) {
             throw DeskError.invalid("文件粘贴清单的根项目数量无效")
+        }
+        guard let fileRootNames else { return }
+        guard allowsFileRootNames, fileRootCount == fileRootNames.count else { throw DeskError.invalid("文件粘贴清单名称与项目数不符") }
+        var seen = Set<String>()
+        for name in fileRootNames {
+            let folded = name.folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+            guard !name.isEmpty, name != ".", name != "..", name.utf8.count <= 255,
+                  !name.contains("/"), !name.contains("\\"), !name.contains(":"),
+                  !name.unicodeScalars.contains(where: { $0.properties.generalCategory == .control || (0x202a...0x202e).contains($0.value) || (0x2066...0x2069).contains($0.value) }),
+                  seen.insert(folded).inserted else { throw DeskError.invalid("文件粘贴清单含有无效或重复的名称") }
         }
     }
 }
@@ -72,15 +114,19 @@ public struct ClipboardPreference: Codable {
     public let decoupledFileTransfer: Bool?
     public let onDemandClipboard: Bool?
     public let physicalFilePasteV1: Bool?
+    public let fileRootNamesV1: Bool?
+    public let providesFileRootNamesV1: Bool?
     public init(enabled: Bool, session: UUID? = nil, fileApproval: Bool? = true, receivesAutomaticUpdates: Bool? = nil,
                 chunkWindow: Bool? = true, decoupledFileTransfer: Bool? = true, onDemandClipboard: Bool? = true,
-                physicalFilePasteV1: Bool? = nil) {
+                physicalFilePasteV1: Bool? = nil, fileRootNamesV1: Bool? = nil) {
         self.enabled = enabled; self.session = session; self.fileApproval = fileApproval
         self.receivesAutomaticUpdates = receivesAutomaticUpdates
         self.chunkWindow = chunkWindow
         self.decoupledFileTransfer = decoupledFileTransfer
         self.onDemandClipboard = onDemandClipboard
         self.physicalFilePasteV1 = physicalFilePasteV1
+        self.fileRootNamesV1 = fileRootNamesV1
+        self.providesFileRootNamesV1 = nil
     }
 }
 
@@ -219,6 +265,7 @@ public final class ClipboardTransfer {
     private let allowsDecoupledFileTransfer: Bool
     private let allowsOnDemandClipboard: Bool
     private let allowsPhysicalFilePaste: Bool
+    private let allowsFileRootNames: Bool
     private let availableCapacity: (URL) throws -> UInt64
     private var partialStorage: ClipboardPartialStorage?
     private let origin = UUID()
@@ -236,7 +283,7 @@ public final class ClipboardTransfer {
     private var fileIncoming: Incoming?
     private var receivingFileID: UUID?
     private var appliedFiles: [Part]?
-    private var pendingFileOffer: (id: UUID, begin: ClipboardBegin, created: TimeInterval, sourceManifest: ClipboardRevision?)?
+    private var pendingFileOffer: (id: UUID, begin: ClipboardBegin, created: TimeInterval, sourceManifest: ClipboardRevision?, rootNames: [String]?)?
     private var applying: (revision: ClipboardRevision, permit: ClipboardApplyPermit, files: [URL])?
     private var applyingFile: (revision: ClipboardRevision, permit: ClipboardApplyPermit, files: [URL])?
     private var sendPreparation: UUID?
@@ -354,7 +401,9 @@ public final class ClipboardTransfer {
         var updated = SessionClock.now
         var progressAt: TimeInterval = 0
         let sourceManifest: ClipboardRevision?
-        init(begin: ClipboardBegin, directory: URL, sourceManifest: ClipboardRevision?) {
+        let rootNames: [String]?
+        init(begin: ClipboardBegin, directory: URL, sourceManifest: ClipboardRevision?, rootNames: [String]?) {
+            self.rootNames = rootNames
             self.begin = begin
             self.directory = directory
             self.sourceManifest = sourceManifest
@@ -364,13 +413,14 @@ public final class ClipboardTransfer {
 
     public init(storage: URL, requireFileApproval: Bool = false, allowsChunkWindow: Bool = false,
                 allowsDecoupledFileTransfer: Bool = false, allowsOnDemandClipboard: Bool = false,
-                allowsPhysicalFilePaste: Bool = false,
+                allowsPhysicalFilePaste: Bool = false, allowsFileRootNames: Bool = false,
                 availableCapacity: ((URL) throws -> UInt64)? = nil) {
         self.storage = storage; self.requireFileApproval = requireFileApproval
         self.allowsChunkWindow = allowsChunkWindow
         self.allowsDecoupledFileTransfer = allowsDecoupledFileTransfer
         self.allowsOnDemandClipboard = allowsOnDemandClipboard
         self.allowsPhysicalFilePaste = allowsPhysicalFilePaste && allowsOnDemandClipboard && requireFileApproval
+        self.allowsFileRootNames = self.allowsPhysicalFilePaste && allowsFileRootNames
         self.availableCapacity = availableCapacity ?? ClipboardPartialStorage.availableCapacity
         queue.async { try? ClipboardPartialStorage.removeAbandoned(storage: storage) }
     }
@@ -603,7 +653,7 @@ public final class ClipboardTransfer {
             let fileLane = pending.begin.independentFileLane == true
             if accept {
                 do {
-                    try startReceiving(pending.begin, sourceManifest: pending.sourceManifest)
+                    try startReceiving(pending.begin, sourceManifest: pending.sourceManifest, rootNames: pending.rootNames)
                     finishFileOffer(.accepted)
                 }
                 catch {
@@ -816,9 +866,9 @@ public final class ClipboardTransfer {
             do {
                 switch message.kind {
                 case .clipboardManifest:
-                    let manifest = try Wire.readJSON(ClipboardManifest.self, message.payload)
+                    let manifest = try ClipboardManifest.decode(message.payload, allowsFileRootNames: allowsFileRootNames)
                     guard allowsOnDemandClipboard else { throw DeskError.invalid("对端未协商按需剪贴板") }
-                    do { try manifest.validate() }
+                    do { try manifest.validate(allowsFileRootNames: allowsFileRootNames) }
                     catch {
                         sendJSON(.clipboardCancel, ClipboardReceipt(revision: manifest.revision, sequence: 0, reason: error.localizedDescription))
                         onStatus?(error.localizedDescription)
@@ -1128,6 +1178,7 @@ public final class ClipboardTransfer {
         }
         if pendingFileOffer?.begin.revision == value.revision { return }
         var sourceManifest: ClipboardRevision?
+        var promisedNames: [String]?
         if let pullID = value.pullRequestID {
             guard allowsOnDemandClipboard else {
                 throw DeskError.invalid("对端未协商按需剪贴板")
@@ -1141,11 +1192,20 @@ public final class ClipboardTransfer {
                     sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: 0, reason: "文件粘贴请求已失效"))
                     return
                 }
-                if let promised = remoteFileManifest?.fileRootCount, value.rootCount != promised {
-                    let reason = "文件根项目数量与粘贴清单不一致"
-                    invalidateFilePaste(reason: reason, notify: false)
-                    sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: 0, reason: reason))
-                    onStatus?(reason)
+                promisedNames = remoteFileManifest?.fileRootNames
+                let mismatch: String?
+                if let count = remoteFileManifest?.fileRootCount, value.rootCount != count {
+                    mismatch = "文件根项目数量与粘贴清单不一致"
+                } else if let promisedNames, let preview = value.names,
+                          preview != promisedNames.prefix(preview.count).map(Self.previewName) {
+                    mismatch = "文件名称与粘贴清单不一致"
+                } else {
+                    mismatch = nil
+                }
+                if let mismatch {
+                    invalidateFilePaste(reason: mismatch, notify: false)
+                    sendJSON(.clipboardCancel, ClipboardReceipt(revision: value.revision, sequence: 0, reason: mismatch))
+                    onStatus?(mismatch)
                     return
                 }
                 sourceManifest = pending.request.revision
@@ -1229,7 +1289,7 @@ public final class ClipboardTransfer {
         if value.type == "files", requireFileApproval {
             let id = UUID()
             let created = SessionClock.now
-            pendingFileOffer = (id, value, created, sourceManifest)
+            pendingFileOffer = (id, value, created, sourceManifest, promisedNames)
             if let sourceManifest {
                 pendingFilePull = nil
                 onFilePasteRequestEnded?(sourceManifest, true)
@@ -1257,7 +1317,7 @@ public final class ClipboardTransfer {
         }
     }
 
-    private func startReceiving(_ value: ClipboardBegin, sourceManifest: ClipboardRevision? = nil) throws {
+    private func startReceiving(_ value: ClipboardBegin, sourceManifest: ClipboardRevision? = nil, rootNames: [String]? = nil) throws {
         try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         guard value.bytes <= (try availableCapacity(storage)) else {
             throw DeskError.invalid("接收目录可用磁盘空间不足，未下载文件内容")
@@ -1267,7 +1327,7 @@ public final class ClipboardTransfer {
         let folder = partialStorage.directory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let useFileLane = value.independentFileLane == true || (allowsDecoupledFileTransfer && value.type == "files")
-        let reception = Incoming(begin: value, directory: folder, sourceManifest: sourceManifest)
+        let reception = Incoming(begin: value, directory: folder, sourceManifest: sourceManifest, rootNames: rootNames)
         if useFileLane { fileIncoming = reception } else { incoming = reception }
         if value.type == "files" {
             let id = UUID()
@@ -1301,6 +1361,12 @@ public final class ClipboardTransfer {
                   activeIncoming.begin.names == nil || activeIncoming.roots.count >= activeIncoming.begin.names!.count
                     || Self.previewName(root) == activeIncoming.begin.names![activeIncoming.roots.count] else {
                 throw DeskError.invalid("文件内容与确认信息不一致")
+            }
+            if let names = activeIncoming.rootNames {
+                let index = activeIncoming.roots.count
+                guard names.indices.contains(index), names[index] == root else {
+                    throw DeskError.invalid("文件内容与粘贴清单的根名称不一致")
+                }
             }
             activeIncoming.roots.append(root)
         }

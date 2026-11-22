@@ -80,6 +80,7 @@ enum Command {
     CountFileRoots {
         generation: u64,
         token: u64,
+        include_names: bool,
     },
     Read {
         generation: u64,
@@ -187,7 +188,9 @@ impl NativeClipboard {
 
     pub fn action(&self, action: Action) {
         match action {
-            Action::CountFileRoots { token } => self.sta.send(Command::CountFileRoots { generation: self.shared.generation(), token }),
+            Action::CountFileRoots { token, include_names } => {
+                self.sta.send(Command::CountFileRoots { generation: self.shared.generation(), token, include_names })
+            }
             Action::Read { token, kind } => self.sta.send(Command::Read { generation: self.shared.generation(), token, kind }),
             Action::Advertise { revision, kind, .. } => {
                 self.shared.reset();
@@ -383,11 +386,12 @@ fn message_loop(hwnd: HWND, formats: Formats, shared: &Shared, commands: &mpsc::
             };
             for (cmd, attempts) in due.into_iter().chain(commands.try_iter().map(|cmd| (cmd, 0))) {
                 match cmd {
-                    Command::CountFileRoots { generation, token } => {
+                    Command::CountFileRoots { generation, token, include_names } => {
                         if shared.generation() == generation && u64::from(last) == token {
-                            let count = clipboard::file_root_count(token, formats);
+                            let (count, names) =
+                                clipboard::file_root_metadata(token, formats, include_names).map_or((None, None), |(count, names)| (Some(count), names));
                             if u64::from(sequence()) == token && shared.generation() == generation {
-                                let _ = shared.input.blocking_send(Input::FileRootCount { token, count });
+                                let _ = shared.input.blocking_send(Input::FileRootCount { token, include_names, count, names });
                             }
                         }
                     }
@@ -776,8 +780,10 @@ mod tests {
         let (tx, mut rx) = async_mpsc::channel(16);
         let broker = NativeClipboard::start(tx, true).unwrap();
         let Input::LocalChanged { token, kind: Some(Kind::Files) } = input(&mut rx) else { panic!("initial file format") };
-        broker.action(Action::CountFileRoots { token });
-        assert!(matches!(input(&mut rx),Input::FileRootCount{token:t,count:Some(2)} if t==token));
+        broker.action(Action::CountFileRoots { token, include_names: true });
+        assert!(
+            matches!(input(&mut rx),Input::FileRootCount{token:t,include_names:true,count:Some(2),names:Some(names)} if t==token && names==["preexisting choice.txt","目录"])
+        );
         assert!(!absent.exists());
         broker.action(Action::Read { token, kind: Kind::Files });
         assert!(matches!(input(&mut rx),Input::Read{payload:Some(Payload::Files(p)),..} if p==paths));
@@ -786,8 +792,8 @@ mod tests {
         assert!(matches!(input(&mut rx), Input::LocalChanged { kind: None, .. }));
         clipboard::external_files(&paths, true);
         let Input::LocalChanged { token, kind: Some(Kind::Files) } = input(&mut rx) else { panic!("mixed file formats") };
-        broker.action(Action::CountFileRoots { token });
-        assert!(matches!(input(&mut rx),Input::FileRootCount{token:t,count:None} if t==token));
+        broker.action(Action::CountFileRoots { token, include_names: true });
+        assert!(matches!(input(&mut rx),Input::FileRootCount{token:t,include_names:true,count:None,names:None} if t==token));
         broker.action(Action::Read { token, kind: Kind::Files });
         assert!(matches!(input(&mut rx),Input::Read{payload:Some(Payload::Files(p)),..} if p==paths));
 

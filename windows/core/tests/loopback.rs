@@ -305,7 +305,12 @@ async fn a_session_negotiates_streams_controls_and_ends_as_the_macos_roles_do() 
         {
             let log = fixture.viewer_log.lock().unwrap();
             let hello_stream = VideoStreamState { settings: StreamSettings::new(1920, 30, 8), width: 1920, height: 1080 };
-            assert_eq!(log.events[0], ViewerEvent::Connected { name: "检查用电脑".to_string(), can_control: true, stream: hello_stream, live_settings: true });
+            assert_eq!(
+                log.events[0],
+                ViewerEvent::Connected {
+                    name: "检查用电脑".to_string(), can_control: true, stream: hello_stream, live_settings: true, session_pause: true
+                }
+            );
             assert!(log.events.contains(&ViewerEvent::Control(true)), "the viewer subscribed to control changes");
             assert!(log.packets[0].is_key_frame());
         }

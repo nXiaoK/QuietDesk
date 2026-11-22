@@ -16,6 +16,7 @@ pub mod messages;
 pub mod pairing;
 pub mod peer;
 pub mod pixel;
+pub mod reliability;
 pub mod tls;
 pub mod video;
 pub mod viewer;

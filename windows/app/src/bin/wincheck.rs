@@ -13,6 +13,7 @@ fn main() {
     use quietdesk_core::messages::StreamSettings;
     use quietdesk_core::pairing::PairingKey;
     use quietdesk_core::pixel::Nv12Converter;
+    use quietdesk_core::reliability::RetryStatus;
     use quietdesk_core::viewer::ViewerEvent;
     use quietdesk_windows::win::app::{Frame, ViewerSink, network_runtime, run_viewer, serve_host};
     use quietdesk_windows::win::capture::ScreenCapture;
@@ -27,6 +28,10 @@ fn main() {
 
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let option = |name: &str| arguments.iter().position(|argument| argument == name).and_then(|index| arguments.get(index + 1)).cloned();
+    let pairing_key = || {
+        let code = option("--code").or_else(|| std::env::var("QUIETDESK_WINCHECK_PAIRING_CODE").ok()).unwrap_or_default();
+        PairingKey::parse(&code).unwrap_or_else(|error| fail("pairing code", error))
+    };
     // What the application writes to its log file goes to standard error here.
     let _logger = flexi_logger::Logger::try_with_str("info").and_then(|logger| logger.log_to_stderr().start());
     let _com = Com::enter();
@@ -103,7 +108,7 @@ fn main() {
             }
         }
         Some("host") => {
-            let key = PairingKey::parse(&option("--code").unwrap_or_default()).unwrap_or_else(|error| fail("pairing code", error));
+            let key = pairing_key();
             let port = option("--port").and_then(|port| port.parse().ok()).unwrap_or(5908);
             let limit = StreamSettings::new(2560, 60, 30);
             let options = HostOptions {
@@ -126,10 +131,18 @@ fn main() {
                 media_pictures: u64,
                 showed_candidate: bool,
                 cursor_stream: Option<MediaStreamId>,
+                retries: u32,
             }
             #[derive(Default)]
             struct Report(Mutex<Counts>);
             impl ViewerSink for Report {
+                fn retry(&self, status: RetryStatus) {
+                    if let RetryStatus::Waiting { attempt, .. } = status {
+                        self.0.lock().unwrap().retries = attempt;
+                        println!("viewer waiting for retry {attempt}");
+                    }
+                }
+
                 fn event(&self, event: ViewerEvent) {
                     if let ViewerEvent::Cursor(cursor) = &event {
                         if cursor.enabled && cursor.position.is_some() {
@@ -158,15 +171,24 @@ fn main() {
                     }
                 }
             }
-            let key = PairingKey::parse(&option("--code").unwrap_or_default()).unwrap_or_else(|error| fail("pairing code", error));
+            let key = pairing_key();
             let (address, port) =
                 (option("--host").unwrap_or_else(|| "127.0.0.1".to_string()), option("--port").and_then(|port| port.parse().ok()).unwrap_or(5908));
             let seconds = option("--seconds").and_then(|seconds| seconds.parse().ok()).unwrap_or(5);
             let (commands, queue) = tokio::sync::mpsc::unbounded_channel();
             let (frame, report) = (Arc::new(Mutex::new(Frame::default())), Arc::new(Report::default()));
-            let session = network_runtime().spawn(run_viewer(address, port, key, StreamSettings::new(1920, 30, 8), queue, frame.clone(), report.clone()));
+            let require_reconnect = arguments.iter().any(|argument| argument == "--require-reconnect");
+            let session = network_runtime().spawn(run_viewer(
+                (address, port),
+                key,
+                StreamSettings::new(1920, 30, 8),
+                require_reconnect,
+                queue,
+                frame.clone(),
+                report.clone(),
+            ));
             std::thread::sleep(std::time::Duration::from_secs(seconds));
-            let disconnected = commands.send(quietdesk_core::viewer::ViewerCommand::Disconnect).is_ok();
+            let disconnected = commands.send(quietdesk_core::viewer::ViewerCommand::Disconnect.into()).is_ok();
             let end = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(session).unwrap_or_else(|error| fail("viewer task", error));
             let counts = report.0.lock().unwrap();
             let pictures = counts.pictures;
@@ -194,11 +216,17 @@ fn main() {
                 }
                 println!("PASS cursor on the committed stream");
             }
+            if require_reconnect {
+                if counts.retries == 0 || pictures == 0 {
+                    fail("reconnect", "the viewer did not retry and recover video");
+                }
+                println!("PASS reconnect after the host became available");
+            }
             if pictures > 0 && frame.width > 0 { println!("PASS viewer") } else { fail("viewer", "no picture was decoded") }
         }
         _ => {
             println!(
-                "usage: quietdesk-wincheck capture | cursor | codec | host --code C [--port P] [--seconds S] | viewer --code C [--host H] [--port P] [--seconds S] [--require-media] [--require-cursor]"
+                "usage: quietdesk-wincheck capture | cursor | codec | host --code C [--port P] [--seconds S] | viewer --code C [--host H] [--port P] [--seconds S] [--require-media] [--require-cursor] [--require-reconnect]"
             )
         }
     }

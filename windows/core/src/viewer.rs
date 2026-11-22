@@ -9,6 +9,7 @@ use crate::messages::{
     StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState,
 };
 use crate::peer::{PeerEvent, PeerHandle};
+use crate::reliability::{Attempt, AttemptProgress};
 use crate::video::VideoPacket;
 use crate::wire::{self, Message, MessageKind};
 use std::sync::Arc;
@@ -44,6 +45,7 @@ pub enum ViewerEvent {
         can_control: bool,
         stream: VideoStreamState,
         live_settings: bool,
+        session_pause: bool,
     },
     /// The stream now has this size and quality; `error` says why a requested change was not applied.
     Stream {
@@ -69,6 +71,24 @@ pub struct ViewerEnd {
     /// The host's user ended the session on purpose; reconnecting would be unwelcome.
     pub host_ended: bool,
     pub retryable: bool,
+    /// The viewer's owner requested the stop or closed its command channel.
+    pub local_stop: bool,
+}
+
+impl ViewerEnd {
+    pub(crate) fn stopped(reason: &str) -> Self {
+        Self { reason: reason.into(), host_ended: false, retryable: false, local_stop: true }
+    }
+
+    pub fn should_retry(&self, auto_reconnect: bool) -> bool {
+        auto_reconnect && self.retryable && !self.host_ended
+    }
+}
+
+impl From<DeskError> for ViewerEnd {
+    fn from(error: DeskError) -> Self {
+        Self { retryable: error.is_retryable(), reason: error.to_string(), host_ended: false, local_stop: false }
+    }
 }
 
 pub trait ViewerPlatform {
@@ -99,18 +119,30 @@ struct ViewerSession<'a, P: ViewerPlatform> {
     pending_pause: Option<Uuid>,
     clipboard_requested: Option<Instant>,
     host_ended: bool,
+    progress: &'a AttemptProgress,
 }
 
 /// Runs a session on an authenticated connection until it ends. `quality` is the viewer's preference;
 /// `acknowledgements` reports the sequence numbers completed by the platform as specified by `ViewerPlatform`.
 pub async fn run<P: ViewerPlatform>(
     peer: PeerHandle,
-    mut incoming: mpsc::Receiver<PeerEvent>,
+    incoming: mpsc::Receiver<PeerEvent>,
     platform: &mut P,
     quality: StreamSettings,
-    mut commands: mpsc::UnboundedReceiver<ViewerCommand>,
+    commands: mpsc::UnboundedReceiver<ViewerCommand>,
+    acknowledgements: mpsc::UnboundedReceiver<DecodeReceipt>,
+) -> ViewerEnd {
+    Attempt::new(quality, commands).run(peer, incoming, platform, acknowledgements).await
+}
+
+pub(crate) async fn run_attempt<P: ViewerPlatform>(
+    peer: PeerHandle,
+    mut incoming: mpsc::Receiver<PeerEvent>,
+    platform: &mut P,
+    attempt: Attempt,
     mut acknowledgements: mpsc::UnboundedReceiver<DecodeReceipt>,
 ) -> ViewerEnd {
+    let Attempt { quality, mut commands, progress } = attempt;
     let mut session = ViewerSession {
         peer: &peer,
         platform,
@@ -125,6 +157,7 @@ pub async fn run<P: ViewerPlatform>(
         pending_pause: None,
         clipboard_requested: None,
         host_ended: false,
+        progress: &progress,
     };
     let hello_by = Instant::now() + HELLO_TIMEOUT;
     let end = loop {
@@ -143,7 +176,7 @@ pub async fn run<P: ViewerPlatform>(
                 None => Err(DeskError::platform("视频解码已停止")),
             },
             command = commands.recv() => match command {
-                Some(ViewerCommand::Disconnect) | None => break ViewerEnd { reason: "已断开连接".to_string(), host_ended: false, retryable: false },
+                Some(ViewerCommand::Disconnect) | None => break ViewerEnd::stopped("已断开连接"),
                 Some(command) => session.command(command),
             },
             _ = tokio::time::sleep_until(hello_by), if session.hello.is_none() => {
@@ -160,9 +193,27 @@ pub async fn run<P: ViewerPlatform>(
             }
         };
         if let Err(error) = outcome {
-            break ViewerEnd { retryable: !session.host_ended && error.is_retryable(), reason: error.to_string(), host_ended: session.host_ended };
+            let mut end = ViewerEnd::from(error);
+            // A decoder can stop while the host's final notice is already in the peer queue.
+            if !session.host_ended && end.retryable {
+                let notice = (0..incoming.len()).find_map(|_| match incoming.try_recv() {
+                    Ok(PeerEvent::Message(message)) if message.kind == MessageKind::SessionTermination => Some(message),
+                    _ => None,
+                });
+                if let Some(notice) = notice
+                    && let Err(termination) = session.receive(notice)
+                {
+                    end = ViewerEnd::from(termination);
+                }
+            }
+            if session.host_ended {
+                end.host_ended = true;
+                end.retryable = false;
+            }
+            break end;
         }
     };
+    let _ = progress.end.set(std::time::Instant::now());
     peer.close();
     end
 }
@@ -248,7 +299,14 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         let stream = VideoStreamState { settings: hello.settings, width: hello.width, height: hello.height };
         self.stream = Some(stream);
         let live_settings = hello.live_settings == Some(true);
-        self.platform.event(ViewerEvent::Connected { name: hello.name.clone(), can_control: hello.can_control, stream, live_settings });
+        let _ = self.progress.hello.set(std::time::Instant::now());
+        self.platform.event(ViewerEvent::Connected {
+            name: hello.name.clone(),
+            can_control: hello.can_control,
+            stream,
+            live_settings,
+            session_pause: hello.session_pause == Some(true),
+        });
         if hello.session_termination_v1 == Some(true) {
             self.peer.send(&Message::json(MessageKind::SessionTermination, &SessionTermination { operation: TerminationOperation::Subscribe })?)?;
         }
@@ -377,15 +435,15 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
     }
 
     fn command(&mut self, command: ViewerCommand) -> Result<()> {
-        let Some(hello) = &self.hello else { return Ok(()) };
         match command {
-            ViewerCommand::Input(input) => self.peer.send(&Message::json(MessageKind::Input, &input)?),
-            ViewerCommand::ReleaseInput => self.peer.send(&Message::empty(MessageKind::ReleaseInput)),
             ViewerCommand::Quality(settings) => {
                 settings.validate_control_values()?;
                 self.desired = settings;
                 self.request_settings()
             }
+            _ if self.hello.is_none() => Ok(()),
+            ViewerCommand::Input(input) => self.peer.send(&Message::json(MessageKind::Input, &input)?),
+            ViewerCommand::ReleaseInput => self.peer.send(&Message::empty(MessageKind::ReleaseInput)),
             ViewerCommand::SendClipboard(text) => {
                 if text.len() > wire::MAXIMUM_CLIPBOARD_BYTES {
                     return Err(DeskError::invalid("文字剪贴板最大支持 1 MB"));
@@ -397,7 +455,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 self.peer.send(&Message::empty(MessageKind::RequestClipboard))
             }
             ViewerCommand::Pause(paused) => {
-                if hello.session_pause != Some(true) || self.pending_pause.is_some() {
+                if !self.hello.as_ref().is_some_and(|hello| hello.session_pause == Some(true)) || self.pending_pause.is_some() {
                     return Ok(());
                 }
                 let request = SessionPauseRequest { id: Uuid::new_v4(), paused };
@@ -436,6 +494,38 @@ mod tests {
                 PeerEvent::Closed(error) => panic!("session ended before expected message: {error}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_queued_host_ending_survives_a_concurrent_decoder_failure() {
+        let (stream, _other) = tokio::io::duplex(4096);
+        let (peer, _transport) = peer::spawn(stream, PeerConfig::default());
+        let (events, incoming) = mpsc::channel(4);
+        let quality = StreamSettings::new(1920, 30, 8);
+        let hello = serde_json::json!({"version": 1, "name": "host", "width": 640, "height": 360,
+            "settings": quality, "canControl": false, "sessionTerminationV1": true});
+        let (_controls, commands) = mpsc::unbounded_channel();
+        let (_decoder, acknowledgements) = mpsc::unbounded_channel();
+        let termination = SessionTermination { operation: TerminationOperation::Ended };
+        events.try_send(PeerEvent::Message(Message::json(MessageKind::Hello, &hello).unwrap())).unwrap();
+        let packet = VideoPacket::h264(1, EncodedFrame { sps: vec![0x67], pps: vec![0x68], avcc: vec![0, 0, 0, 1, 0x65] });
+        events.try_send(PeerEvent::Message(Message::new(MessageKind::Video, packet.encode().unwrap()))).unwrap();
+        events.try_send(PeerEvent::Message(Message::json(MessageKind::SessionTermination, &termination).unwrap())).unwrap();
+
+        struct FailedDecoder;
+        impl ViewerPlatform for FailedDecoder {
+            fn video(&mut self, _: VideoPacket) -> Result<()> {
+                Err(DeskError::platform("解码已停止"))
+            }
+            fn media_video(&mut self, _: VideoPacket, _: MediaStreamId, _: bool) -> Result<()> {
+                unreachable!()
+            }
+            fn event(&mut self, _: ViewerEvent) {}
+        }
+        let end = run(peer, incoming, &mut FailedDecoder, quality, commands, acknowledgements).await;
+        assert!(end.host_ended);
+        assert!(!end.retryable);
+        assert_eq!(end.reason, HOST_ENDED_REASON);
     }
 
     #[tokio::test]

@@ -282,6 +282,11 @@ impl ViewerInputTranslator {
         input
     }
 
+    /// Buttons whose press was forwarded and still needs a matching release.
+    pub fn pressed_buttons(&self) -> &BTreeSet<i64> {
+        &self.buttons
+    }
+
     /// `at` is a monotonic time and `pixel` the position in window pixels, both only compared with earlier presses.
     pub fn button(&mut self, button: i64, down: bool, x: f64, y: f64, at: Duration, pixel: (i32, i32)) -> RemoteInput {
         if down {
@@ -321,6 +326,7 @@ impl ViewerInputTranslator {
         self.modifiers.clear();
         self.keys.clear();
         self.buttons.clear();
+        self.click = None;
     }
 }
 
@@ -530,5 +536,14 @@ mod tests {
         // A Windows host turns it back into the same notch.
         let mut host = HostInputTranslator::new(MacModifierMapping::Standard);
         assert_eq!(host.translate(&wheel)[1], InjectOp::Wheel { vertical: 120, horizontal: 60 });
+    }
+
+    #[test]
+    fn releasing_control_ends_the_drag_and_the_click_sequence() {
+        let mut viewer = viewer(PcModifierMapping::Standard);
+        viewer.button(0, true, 0.5, 0.5, Duration::ZERO, (100, 100));
+        viewer.release_all();
+        assert_eq!(viewer.pointer_move(0.5, 0.5).kind, InputKind::Move);
+        assert_eq!(viewer.button(0, true, 0.5, 0.5, Duration::from_millis(20), (100, 100)).clicks, 1);
     }
 }

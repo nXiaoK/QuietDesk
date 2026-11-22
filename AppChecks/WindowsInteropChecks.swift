@@ -98,6 +98,11 @@ private final class Probe {
 
     func all(_ name: String) -> [[String: Any]] { events.get().filter { $0["event"] as? String == name } }
 
+    func exitStatus() throws -> Int32 {
+        try until("the probe exits on its own") { !process.isRunning }
+        return process.terminationStatus
+    }
+
     func stop() {
         try? input.fileHandleForWriting.close()
         let deadline = Date().addingTimeInterval(3)
@@ -481,7 +486,8 @@ private final class MacHost: @unchecked Sendable {
     private let injector: InputInjector
     private var pump: DispatchSourceTimer?
 
-    init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int), advertiseMedia: Bool, cursorImage: CursorImage?) throws {
+    init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int), advertiseMedia: Bool, cursorImage: CursorImage?,
+         on port: NWEndpoint.Port = .any) throws {
         self.advertiseMedia = advertiseMedia
         self.cursorImage = cursorImage
         self.key = key
@@ -505,7 +511,8 @@ private final class MacHost: @unchecked Sendable {
             },
             capsLockState: { false }, pointerLocation: { state.get().pointer })
         let parameters = try MediaSecureTransport.tlsParameters(key: key, roles: MediaChannelRole.allCases)
-        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+        parameters.allowLocalEndpointReuse = true
+        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: port)
         listener = try NWListener(using: parameters)
         let ready = DispatchSemaphore(value: 0)
         listener.stateUpdateHandler = { if case .ready = $0 { ready.signal() } }
@@ -1263,13 +1270,42 @@ private struct WindowsInteropChecks {
             }
         }
 
-        run("A Windows viewer with another pairing code is refused by a Mac host as a pairing failure") {
-            try withMacHost(viewerKey: try PairingKey.generate()) { host, probe in
+        run("A Windows viewer recovers its chosen settings and video after a Mac host restarts, then respects the host's ending") {
+            try withMacHost(["--reconnect"]) { first, probe in
+                let original = try probe.next("mediaCommitted")
+                try probe.send(["command": "quality", "settings": "2560,30,8"])
+                _ = try probe.next("stream") { settings($0) == [2560, 30, 8, 640, 360] }
+                _ = try probe.next("mediaCommitted")
+                first.stop()
+                let retry = try probe.next("retryWaiting")
+                try require(retry["attempt"] as? Int == 1, "An interrupted first session did not start its first retry")
+                let second = try MacHost(key: key, packets: packets, size: size, advertiseMedia: true, cursorImage: nil,
+                                         on: NWEndpoint.Port(rawValue: first.port)!)
+                defer { second.stop() }
+                try require(second.port == first.port, "The restarted fixture listened on a different port")
+                let fresh = try probe.next("mediaCommitted")
+                try require(fresh["sessionID"] as? String != original["sessionID"] as? String, "The viewer reported the old session after the restart")
+                try until("the restarted host sees new decoded frames") { second.state.get().decodedFeedback.contains { $0.frameID > 2 } }
+                let restored = second.state.get()
+                try require(restored.requests.first?.settings == StreamSettings(longestEdge: 2560, framesPerSecond: 30, megabits: 8)
+                            && restored.subscribedTermination && restored.failures.isEmpty, "The reconnected session lost its quality or termination subscription")
+                let retries = probe.all("retryWaiting").count
+                second.end()
+                let ended = try probe.next("ended")
+                try require(ended["hostEnded"] as? Bool == true && ended["retryable"] as? Bool == false
+                            && ended["reason"] as? String == SessionTermination.hostEndedReason && (try probe.exitStatus()) == 0
+                            && probe.all("retryWaiting").count == retries, "A deliberate ending restarted the viewer")
+            }
+        }
+
+        run("A Windows viewer with auto-reconnect and another pairing code stops after the Mac refuses it") {
+            try withMacHost(viewerKey: try PairingKey.generate(), ["--reconnect"]) { host, probe in
                 let failed = try probe.next("failed")
                 print("    the probe reported: \(failed["reason"] as? String ?? "")")
                 try require((failed["reason"] as? String)?.contains("配对码") == true, "A wrong pairing code was reported as another kind of failure: \(failed)")
                 try until("the Mac host gives up on the connection") { host.state.get().closed != nil }
-                try require(host.state.get().peer == nil && host.state.get().closed?.contains("TLS") == true,
+                try require(host.state.get().peer == nil && host.state.get().closed?.contains("TLS") == true
+                            && (try probe.exitStatus()) != 0 && probe.all("retryWaiting").isEmpty && host.state.get().accepted.count == 1,
                             "The Mac host did not refuse the handshake itself: \(host.state.get().closed ?? "")")
             }
         }

@@ -45,6 +45,7 @@ pub struct Settings {
     pub clipboard: bool,
     pub quality_limit: usize,
     pub viewer_quality: usize,
+    pub auto_reconnect: bool,
     pub mac_modifiers: MacModifierMapping,
     pub pc_modifiers: PcModifierMapping,
     pub connections: Vec<Connection>,
@@ -59,6 +60,7 @@ impl Default for Settings {
             clipboard: true,
             quality_limit: 1,
             viewer_quality: 2,
+            auto_reconnect: true,
             mac_modifiers: MacModifierMapping::default(),
             pc_modifiers: PcModifierMapping::default(),
             connections: Vec::new(),
@@ -137,4 +139,24 @@ pub fn protect(code: &str) -> Result<String> {
 pub fn unprotect(stored: &str) -> Option<String> {
     let bytes: Option<Vec<u8>> = stored.as_bytes().chunks(2).map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()).collect();
     String::from_utf8(unsafe { transform(&bytes?, false) }.ok()?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn older_settings_enable_reconnect_and_keep_saved_connections() {
+        let json = r#"{"port":49123,"hostCode":"test-host","connections":[{"address":"example.invalid","port":49124,"name":"测试电脑","code":"test-code"}]}"#;
+        let mut settings: Settings = serde_json::from_str(json).unwrap();
+        assert!(settings.auto_reconnect);
+        assert_eq!(settings.port, 49123);
+        settings.auto_reconnect = false;
+        let saved: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(!saved.auto_reconnect);
+        assert_eq!(saved.host_code.as_deref(), Some("test-host"));
+        assert_eq!(saved.connections.len(), 1);
+        assert_eq!(saved.connections[0].port, 49124);
+        assert_eq!(saved.connections[0].code, "test-code");
+    }
 }

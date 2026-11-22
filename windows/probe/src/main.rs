@@ -13,13 +13,15 @@ use quietdesk_core::media::{DecodeReceipt, MediaStreamId};
 use quietdesk_core::messages::{StreamSettings, VideoStreamState};
 use quietdesk_core::pairing::PairingKey;
 use quietdesk_core::peer::{self, PeerConfig};
+use quietdesk_core::reliability::{self, RetryStatus};
 use quietdesk_core::tls;
 use quietdesk_core::video::{EncodedFrame, H264FrameAssembler, VideoPacket};
-use quietdesk_core::viewer::{self, ViewerCommand, ViewerEvent, ViewerPlatform};
+use quietdesk_core::viewer::{ViewerCommand, ViewerEvent, ViewerPlatform};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -261,7 +263,7 @@ struct ReportingViewer {
 #[derive(Default)]
 struct ScriptFeedback {
     hold: bool,
-    held: Vec<(u32, DecodeReceipt)>,
+    held: Vec<(u32, DecodeReceipt, mpsc::UnboundedSender<DecodeReceipt>)>,
 }
 
 impl ReportingViewer {
@@ -273,7 +275,7 @@ impl ReportingViewer {
             "annexB": hex(&stream), "firstInMediaStream": first_in_media_stream, "held": feedback.hold
         }));
         if feedback.hold {
-            feedback.held.push((packet.sequence, receipt));
+            feedback.held.push((packet.sequence, receipt, self.acknowledgements.clone()));
         } else {
             let _ = self.acknowledgements.send(receipt);
         }
@@ -294,7 +296,7 @@ impl ViewerPlatform for ReportingViewer {
 
     fn event(&mut self, event: ViewerEvent) {
         emit(match event {
-            ViewerEvent::Connected { name, can_control, stream, live_settings } => {
+            ViewerEvent::Connected { name, can_control, stream, live_settings, .. } => {
                 json!({ "event": "connected", "name": name, "canControl": can_control, "stream": stream_json(stream), "liveSettings": live_settings })
             }
             ViewerEvent::Stream { stream, error } => json!({ "event": "stream", "stream": stream_json(stream), "error": error }),
@@ -374,24 +376,22 @@ enum Script {
     Disconnect,
 }
 
-async fn run_viewer(arguments: &HashMap<String, String>) -> Result<()> {
+async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
     let required = |name: &str| arguments.get(name).ok_or_else(|| DeskError::invalid(format!("缺少参数 --{name}")));
     let key = PairingKey::parse(required("code")?)?;
     let port: u16 = required("port")?.parse().map_err(|_| DeskError::invalid("端口无效"))?;
     let quality = parse_settings(arguments.get("quality").map_or("1920,30,8", String::as_str))?;
     let mapping = if arguments.contains_key("control-as-command") { PcModifierMapping::ControlAsCommand } else { PcModifierMapping::Standard };
     let mut lines = input_lines();
-    let stream = tls::connect(arguments.get("host").map_or("127.0.0.1", String::as_str), port, &key).await?;
-    emit(json!({ "event": "secured" }));
-    let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
-    let (commands, command_queue) = mpsc::unbounded_channel();
-    let (acknowledgements, acknowledged) = mpsc::unbounded_channel();
+    let host = arguments.get("host").map_or("127.0.0.1", String::as_str);
+    let (commands, controls) = mpsc::unbounded_channel();
     let feedback = Arc::new(Mutex::new(ScriptFeedback::default()));
-    let mut platform = ReportingViewer { acknowledgements: acknowledgements.clone(), feedback: feedback.clone() };
-    let mut translator = ViewerInputTranslator::new(mapping, DoubleClick { interval: Duration::from_millis(500), distance: 4 });
+    let new_translator = || ViewerInputTranslator::new(mapping, DoubleClick { interval: Duration::from_millis(500), distance: 4 });
+    let input = Mutex::new(new_translator());
 
     let script = async {
         while let Some(line) = lines.recv().await {
+            let mut translator = input.lock().unwrap();
             let command = match serde_json::from_value::<Script>(line) {
                 Ok(Script::Key { scan_code, extended, virtual_key, down, repeat, caps_lock }) => {
                     let Some(input) = translator.key(PcKeyEvent { scan_code, extended, virtual_key, down, repeat }, caps_lock) else { continue };
@@ -422,8 +422,8 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<()> {
                 }
                 Ok(Script::Acknowledge { sequence }) => {
                     let mut feedback = feedback.lock().unwrap();
-                    if let Some(index) = feedback.held.iter().position(|(held_sequence, _)| *held_sequence == sequence) {
-                        let (_, receipt) = feedback.held.remove(index);
+                    if let Some(index) = feedback.held.iter().position(|(held_sequence, _, _)| *held_sequence == sequence) {
+                        let (_, receipt, acknowledgements) = feedback.held.remove(index);
                         let _ = acknowledgements.send(receipt);
                     }
                     continue;
@@ -434,24 +434,59 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<()> {
                     continue;
                 }
             };
-            if commands.send(command).is_err() {
+            if commands.send(command.into()).is_err() {
                 break;
             }
         }
         // The driver went away: end the session rather than linger without one.
-        let _ = commands.send(ViewerCommand::Disconnect);
+        let _ = commands.send(ViewerCommand::Disconnect.into());
         std::future::pending::<()>().await
     };
+    let connect_failure = Mutex::new(None);
+    let lifecycle = reliability::run(
+        quality,
+        arguments.contains_key("reconnect"),
+        controls,
+        |status| {
+            emit(match status {
+                RetryStatus::Waiting { attempt, reason, .. } => json!({ "event": "retryWaiting", "attempt": attempt, "reason": reason }),
+                RetryStatus::Connecting { attempt } => json!({ "event": "retryConnecting", "attempt": attempt }),
+                RetryStatus::Deferred { reason } => json!({ "event": "retryDeferred", "reason": reason }),
+            })
+        },
+        || async {
+            let result = tls::connect(host, port, &key).await;
+            *connect_failure.lock().unwrap() = result.as_ref().err().map(ToString::to_string);
+            result
+        },
+        |stream, attempt| {
+            emit(json!({ "event": "secured" }));
+            *input.lock().unwrap() = new_translator();
+            *feedback.lock().unwrap() = ScriptFeedback::default();
+            let feedback = feedback.clone();
+            async move {
+                let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
+                let (acknowledgements, acknowledged) = mpsc::unbounded_channel();
+                let mut platform = ReportingViewer { acknowledgements, feedback };
+                let end = attempt.run(peer.clone(), incoming, &mut platform, acknowledged).await;
+                peer.finished().await;
+                end
+            }
+        },
+    );
     let end = tokio::select! {
-        end = viewer::run(peer.clone(), incoming, &mut platform, quality, command_queue, acknowledged) => end,
+        end = lifecycle => end,
         () = script => unreachable!("the script future never completes"),
     };
-    peer.finished().await;
+    if connect_failure.into_inner().unwrap().as_ref() == Some(&end.reason) {
+        emit(json!({ "event": "failed", "reason": end.reason }));
+        return Ok(ExitCode::FAILURE);
+    }
     emit(json!({ "event": "ended", "reason": end.reason, "hostEnded": end.host_ended, "retryable": end.retryable }));
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
-fn main() {
+fn main() -> ExitCode {
     let mut arguments = std::env::args().skip(1);
     let role = arguments.next().unwrap_or_default();
     let mut options = HashMap::new();
@@ -476,13 +511,16 @@ fn main() {
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("the runtime starts");
     let result = runtime.block_on(async {
         match role.as_str() {
-            "host" => run_host(&options).await,
+            "host" => run_host(&options).await.map(|()| ExitCode::SUCCESS),
             "viewer" => run_viewer(&options).await,
             _ => Err(DeskError::invalid("用法：quietdesk-probe host|viewer --code <配对码> …")),
         }
     });
-    if let Err(error) = result {
-        emit(json!({ "event": "failed", "reason": error.to_string() }));
-        std::process::exit(1);
+    match result {
+        Ok(status) => status,
+        Err(error) => {
+            emit(json!({ "event": "failed", "reason": error.to_string() }));
+            ExitCode::FAILURE
+        }
     }
 }

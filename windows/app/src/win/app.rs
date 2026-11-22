@@ -11,9 +11,10 @@ use quietdesk_core::messages::StreamSettings;
 use quietdesk_core::pairing::PairingKey;
 use quietdesk_core::peer::{self, PeerConfig};
 use quietdesk_core::pixel::nv12_to_bgra;
+use quietdesk_core::reliability::{self, Attempt, RetryStatus, ViewerControl};
 use quietdesk_core::tls;
 use quietdesk_core::video::VideoPacket;
-use quietdesk_core::viewer::{self, ViewerCommand, ViewerEnd, ViewerEvent, ViewerPlatform};
+use quietdesk_core::viewer::{ViewerEnd, ViewerEvent, ViewerPlatform};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -134,6 +135,7 @@ impl Frame {
 /// Where a viewer session reports to. Called from the network and decode threads.
 pub trait ViewerSink: Send + Sync + 'static {
     fn event(&self, event: ViewerEvent);
+    fn retry(&self, status: RetryStatus);
     /// `frame` holds a new picture.
     fn frame_ready(&self, stream: Option<MediaStreamId>);
 }
@@ -275,28 +277,26 @@ fn decode<S: ViewerSink>(
 
 /// Connects to a host and runs the session until it ends. Pictures appear in `frame`.
 pub async fn run_viewer<S: ViewerSink>(
-    address: String,
-    port: u16,
+    target: (String, u16),
     key: PairingKey,
     quality: StreamSettings,
-    mut commands: mpsc::UnboundedReceiver<ViewerCommand>,
+    auto_reconnect: bool,
+    controls: mpsc::UnboundedReceiver<ViewerControl>,
     frame: Arc<Mutex<Frame>>,
     sink: Arc<S>,
 ) -> ViewerEnd {
-    let connecting = async {
-        tokio::select! {
-            connected = tls::connect(&address, port, &key) => connected,
-            // Nothing but leaving makes sense before there is a session.
-            _ = async { while !matches!(commands.recv().await, Some(ViewerCommand::Disconnect) | None) {} } => {
-                Err(DeskError::invalid("已断开连接"))
-            }
-        }
-    };
-    let stream = match connecting.await {
-        Ok(stream) => stream,
-        Err(error) => return ViewerEnd { retryable: error.is_retryable(), reason: error.to_string(), host_ended: false },
-    };
-    let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
+    reliability::run(
+        quality,
+        auto_reconnect,
+        controls,
+        |status| sink.retry(status),
+        || tls::connect(&target.0, target.1, &key),
+        |stream, attempt| viewer_session(stream, attempt, frame.clone(), sink.clone()),
+    )
+    .await
+}
+
+async fn viewer_session<S: ViewerSink>(stream: tls::SecureStream, attempt: Attempt, frame: Arc<Mutex<Frame>>, sink: Arc<S>) -> ViewerEnd {
     // Two three-frame windows allow the previous stream to retire while the next one opens.
     let (packets, queue) = std::sync::mpsc::sync_channel(2 * host::FrameSink::WINDOW + 1);
     let (acknowledgements, acknowledged) = mpsc::unbounded_channel();
@@ -311,15 +311,18 @@ pub async fn run_viewer<S: ViewerSink>(
         let _ = finished.send(result);
     });
     if let Err(error) = decoding {
-        return ViewerEnd { reason: format!("无法启动解码线程：{error}"), host_ended: false, retryable: false };
+        return ViewerEnd { reason: format!("无法启动解码线程：{error}"), host_ended: false, retryable: false, local_stop: false };
     }
+    let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
     let mut platform = WindowsViewer { packets, sink };
-    let mut end = viewer::run(peer.clone(), incoming, &mut platform, quality, commands, acknowledged).await;
+    let mut end = attempt.run(peer.clone(), incoming, &mut platform, acknowledged).await;
     stopped.store(true, Ordering::Release);
     drop(platform);
     let (_, decode_result) = tokio::join!(peer.finished(), decode_result);
-    if let Ok(Err(error)) = decode_result {
-        end.reason = error.to_string();
+    if end.retryable
+        && let Ok(Err(error)) = decode_result
+    {
+        end = error.into();
     }
     end
 }

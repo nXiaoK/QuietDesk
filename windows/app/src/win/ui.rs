@@ -1,7 +1,7 @@
 //! The main window: connect to another machine, or share this PC.
 
 use super::app::{HostNotice, computer_name, network_runtime, serve_host, start_logging};
-use super::canvas::{self, WM_CANVAS_CONNECTED};
+use super::canvas::{self, WM_CANVAS_CLOSED, WM_CANVAS_CONNECTED};
 use super::clipboard;
 use super::settings::{Connection, QUALITY_LIMITS, Settings, VIEWER_QUALITIES, protect, unprotect};
 use super::util::{from_wide, wide};
@@ -11,6 +11,7 @@ use quietdesk_core::pairing::PairingKey;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::watch;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, CreateFontIndirectW, HBRUSH, HFONT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -27,6 +28,7 @@ const RECENT: usize = 1005;
 const FORGET: usize = 1006;
 const VIEWER_QUALITY: usize = 1007;
 const PC_MODIFIERS: usize = 1008;
+const AUTO_RECONNECT: usize = 1009;
 const HOST_STATUS: usize = 1101;
 const HOST_PORT: usize = 1102;
 const SHARE: usize = 1103;
@@ -41,6 +43,7 @@ const MAC_MODIFIERS: usize = 1110;
 struct Main {
     window: HWND,
     settings: Settings,
+    auto_reconnect: watch::Sender<bool>,
     runtime: tokio::runtime::Handle,
     /// Present while this PC is shared; closing it stops the listener and ends the session.
     sharing: Option<UnboundedSender<HostCommand>>,
@@ -132,7 +135,7 @@ impl Main {
             Ok(stored) => stored,
             Err(error) => return self.alert(&error.to_string()),
         };
-        match canvas::open(&self.runtime, self.window, address.clone(), port, key, self.settings.viewer_quality(), self.settings.pc_modifiers) {
+        match canvas::open(&self.runtime, self.window, address.clone(), port, key, &self.settings, self.auto_reconnect.subscribe()) {
             Ok(window) => self.connecting.push((window.0 as isize, Connection { address, port, name: String::new(), code: stored })),
             Err(error) => self.alert(&format!("无法打开远程窗口：{error}")),
         }
@@ -194,6 +197,12 @@ impl Main {
         let chosen = |main: &Self, id: usize| main.message(id, CB_GETCURSEL, 0, 0).max(0) as usize;
         match (id, notification) {
             (CONNECT, BN_CLICKED) => self.connect(),
+            (AUTO_RECONNECT, BN_CLICKED) => {
+                let enabled = checked(self, id);
+                self.settings.auto_reconnect = enabled;
+                self.auto_reconnect.send_replace(enabled);
+                self.save();
+            }
             (RECENT, LBN_SELCHANGE | LBN_DBLCLK) => {
                 let Some(connection) = self.selected().map(|index| self.settings.connections[index].clone()) else { return };
                 self.set_text(ADDRESS, &connection.address);
@@ -302,6 +311,7 @@ impl Main {
             add(edit, "", field, true, 70, 65, 374, 24, CODE)?;
             add(button, "连接", push | BS_DEFPUSHBUTTON as u32, false, 454, 33, 84, 56, CONNECT)?;
             add(label, "最近连接（双击直接连接）", 0, false, 24, 100, 300, 20, 0)?;
+            add(button, "断线后自动重连", check, false, 328, 96, 210, 22, AUTO_RECONNECT)?;
             add(list, "", tab | LBS_NOTIFY as u32 | WS_VSCROLL.0, true, 24, 120, 420, 82, RECENT)?;
             add(button, "删除", push, false, 454, 120, 84, 26, FORGET)?;
             add(label, "画质", 0, false, 24, 214, 44, 20, 0)?;
@@ -344,6 +354,7 @@ impl Main {
                 usize::from(self.settings.mac_modifiers != MacModifierMapping::CommandAsControl),
             );
             self.message(ALLOW_CONTROL, BM_SETCHECK, usize::from(self.settings.allow_control), 0);
+            self.message(AUTO_RECONNECT, BM_SETCHECK, usize::from(self.settings.auto_reconnect), 0);
             self.message(ALLOW_CLIPBOARD, BM_SETCHECK, usize::from(self.settings.clipboard), 0);
             if let Some(code) = self.settings.host_code.as_deref().and_then(unprotect) {
                 self.set_text(HOST_CODE, &code);
@@ -381,6 +392,7 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                     main.refresh_recent();
                 }
             }
+            WM_CANVAS_CLOSED => main.connecting.retain(|(canvas, _)| *canvas != wparam.0 as isize),
             WM_DESTROY => {
                 main.sharing = None;
                 PostQuitMessage(0);
@@ -437,9 +449,11 @@ unsafe fn run_window() -> windows::core::Result<()> {
         let mut metrics = NONCLIENTMETRICSW { cbSize: size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, metrics.cbSize, Some(std::ptr::from_mut(&mut metrics).cast()), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0))?;
         let font = CreateFontIndirectW(&metrics.lfMessageFont);
+        let settings = Settings::load();
         let main = Box::into_raw(Box::new(Main {
             window,
-            settings: Settings::load(),
+            auto_reconnect: watch::Sender::new(settings.auto_reconnect),
+            settings,
             runtime: network_runtime(),
             sharing: None,
             notices: Arc::new(Mutex::new(VecDeque::new())),

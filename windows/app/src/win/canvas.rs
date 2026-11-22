@@ -2,32 +2,34 @@
 
 use super::app::{Frame, ViewerSink, run_viewer};
 use super::clipboard;
-use super::settings::VIEWER_QUALITIES;
+use super::settings::{Settings, VIEWER_QUALITIES};
 use super::util::wide;
 use super::viewer_cursor::ViewerCursor;
 use quietdesk_core::cursor::CursorPresentationState;
 use quietdesk_core::input::{DoubleClick, PcKeyEvent, ViewerInputTranslator};
-use quietdesk_core::keymap::PcModifierMapping;
 use quietdesk_core::media::MediaStreamId;
-use quietdesk_core::messages::StreamSettings;
 use quietdesk_core::pairing::PairingKey;
+use quietdesk_core::reliability::{RetryStatus, ViewerControl};
 use quietdesk_core::viewer::{ViewerCommand, ViewerEnd, ViewerEvent};
 use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::watch;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Gdi::{ScreenToClient, ValidateRect};
+use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject, ScreenToClient, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ESCAPE, VK_RETURN,
+    EnableWindow, GetAsyncKeyState, GetCapture, GetDoubleClickTime, GetFocus, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, ReleaseCapture, SetCapture, SetFocus,
+    TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL,
+    VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
@@ -37,18 +39,31 @@ const WM_SESSION_FRAME: u32 = WM_APP + 2;
 const WM_SESSION_ENDED: u32 = WM_APP + 3;
 /// Sent to the owner window when a session reports the host's name: the canvas window and the name's text.
 pub const WM_CANVAS_CONNECTED: u32 = WM_APP + 20;
+pub const WM_CANVAS_CLOSED: u32 = WM_APP + 21;
 const MOVE_TIMER: usize = 1;
+const RETRY_TIMER: usize = 2;
+const IDLE_TIMER: usize = 3;
+const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const MOVE_INTERVAL: Duration = Duration::from_millis(8);
 const MENU_FULL_SCREEN: usize = 100;
 const MENU_SEND_CLIPBOARD: usize = 101;
 const MENU_REQUEST_CLIPBOARD: usize = 102;
 const MENU_DISCONNECT: usize = 103;
+const RETRY_NOW: usize = 104;
+const CANCEL_RETRY: usize = 105;
 const MENU_QUALITY: usize = 200;
 
 /// What the session threads leave for the window thread.
+enum Notice {
+    Session(ViewerEvent),
+    Retry { status: RetryStatus, serial: u64, generation: u64 },
+}
+
 struct Mailbox {
     window: isize,
-    events: Mutex<VecDeque<ViewerEvent>>,
+    events: Mutex<VecDeque<Notice>>,
+    frame: Arc<Mutex<Frame>>,
+    generation: AtomicU64,
     ended: Mutex<Option<ViewerEnd>>,
     frame_posted: AtomicBool,
 }
@@ -63,11 +78,22 @@ impl ViewerSink for Mailbox {
     fn event(&self, event: ViewerEvent) {
         let mut events = self.events.lock().unwrap();
         // A newer snapshot includes the previous shape and position. One pending notification suffices.
-        if matches!(event, ViewerEvent::Cursor(_)) && matches!(events.back(), Some(ViewerEvent::Cursor(_))) {
-            *events.back_mut().unwrap() = event;
+        if matches!(event, ViewerEvent::Cursor(_)) && matches!(events.back(), Some(Notice::Session(ViewerEvent::Cursor(_)))) {
+            *events.back_mut().unwrap() = Notice::Session(event);
             return;
         }
-        events.push_back(event);
+        events.push_back(Notice::Session(event));
+        drop(events);
+        self.post(WM_SESSION_EVENT);
+    }
+
+    fn retry(&self, status: RetryStatus) {
+        // Invalidate input even if the window thread has not yet processed its disconnect.
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let serial = self.frame.lock().unwrap().serial;
+        let mut events = self.events.lock().unwrap();
+        events.clear();
+        events.push_back(Notice::Retry { status, serial, generation });
         drop(events);
         self.post(WM_SESSION_EVENT);
     }
@@ -83,9 +109,9 @@ impl ViewerSink for Mailbox {
 struct Canvas {
     window: HWND,
     owner: HWND,
-    commands: UnboundedSender<ViewerCommand>,
+    commands: UnboundedSender<ViewerControl>,
     mailbox: Arc<Mailbox>,
-    frame: Arc<Mutex<Frame>>,
+    generation: u64,
     target: Option<ID2D1HwndRenderTarget>,
     bitmap: Option<(ID2D1Bitmap, usize, usize)>,
     uploaded_serial: Option<u64>,
@@ -100,13 +126,20 @@ struct Canvas {
     name: String,
     connected: bool,
     can_control: bool,
+    supports_pause: bool,
+    retry: Option<RetryStatus>,
+    retry_panel: RetryPanel,
+    fresh_after: Option<u64>,
     held: BTreeSet<(u32, bool)>,
+    withheld_keys: BTreeSet<u16>,
     caps_lock: bool,
     hook: Option<HHOOK>,
     pending_move: Option<(f64, f64)>,
     last_move: Instant,
     full_screen: Option<(WINDOW_STYLE, WINDOWPLACEMENT, HMENU)>,
     paused: bool,
+    pending_pause: Option<bool>,
+    attention: Attention,
     /// The user asked for the session to end, so its ending needs no explanation.
     closing: bool,
 }
@@ -123,8 +156,8 @@ pub fn open(
     address: String,
     port: u16,
     key: PairingKey,
-    quality: StreamSettings,
-    mapping: PcModifierMapping,
+    settings: &Settings,
+    mut auto_reconnect: watch::Receiver<bool>,
 ) -> windows::core::Result<HWND> {
     unsafe {
         let instance: HINSTANCE = GetModuleHandleW(None)?.into();
@@ -140,6 +173,7 @@ pub fn open(
         };
         // Registering twice fails harmlessly for the second window.
         RegisterClassExW(&definition);
+        let factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
         let menu = CreateMenu()?;
         let session = CreatePopupMenu()?;
         AppendMenuW(session, MF_STRING, MENU_FULL_SCREEN, w!("全屏\tCtrl+Alt+Enter"))?;
@@ -158,7 +192,7 @@ pub fn open(
             WINDOW_EX_STYLE(0),
             class,
             PCWSTR(title.as_ptr()),
-            WS_OVERLAPPEDWINDOW,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1280,
@@ -168,17 +202,33 @@ pub fn open(
             Some(instance),
             None,
         )?;
+        let retry_panel = match RetryPanel::new(window, instance) {
+            Ok(panel) => panel,
+            Err(error) => {
+                let _ = DestroyWindow(window);
+                return Err(error);
+            }
+        };
         let (commands, queue) = unbounded_channel();
-        let mailbox =
-            Arc::new(Mailbox { window: window.0 as isize, events: Mutex::new(VecDeque::new()), ended: Mutex::new(None), frame_posted: AtomicBool::new(false) });
         let frame = Arc::new(Mutex::new(Frame::default()));
+        let mailbox = Arc::new(Mailbox {
+            window: window.0 as isize,
+            events: Mutex::new(VecDeque::new()),
+            frame: frame.clone(),
+            generation: AtomicU64::new(0),
+            ended: Mutex::new(None),
+            frame_posted: AtomicBool::new(false),
+        });
         let double_click = DoubleClick { interval: Duration::from_millis(u64::from(GetDoubleClickTime())), distance: GetSystemMetrics(SM_CXDOUBLECLK) / 2 };
+        let quality = settings.viewer_quality();
+        let preferences = commands.clone();
+        let enabled = *auto_reconnect.borrow_and_update();
         let canvas = Box::new(Canvas {
             window,
             owner,
             commands,
             mailbox: mailbox.clone(),
-            frame: frame.clone(),
+            generation: 0,
             target: None,
             bitmap: None,
             uploaded_serial: None,
@@ -187,25 +237,42 @@ pub fn open(
             shown_cursor: None,
             cursor: ViewerCursor::default(),
             local_pointer: false,
-            factory: D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?,
-            translator: ViewerInputTranslator::new(mapping, double_click),
+            factory,
+            translator: ViewerInputTranslator::new(settings.pc_modifiers, double_click),
             started: Instant::now(),
             name: address.clone(),
             connected: false,
             can_control: false,
+            supports_pause: false,
+            retry: None,
+            retry_panel,
+            fresh_after: Some(0),
             held: BTreeSet::new(),
+            withheld_keys: BTreeSet::new(),
             caps_lock: false,
             hook: None,
             pending_move: None,
             last_move: Instant::now(),
             full_screen: None,
             paused: false,
+            pending_pause: None,
+            attention: Attention::default(),
             closing: false,
         });
         SetWindowLongPtrW(window, GWLP_USERDATA, Box::into_raw(canvas) as isize);
         let _ = ShowWindow(window, SW_SHOW);
         runtime.spawn(async move {
-            let end = run_viewer(address, port, key, quality, queue, frame, mailbox.clone()).await;
+            let session = run_viewer((address, port), key, quality, enabled, queue, frame, mailbox.clone());
+            tokio::pin!(session);
+            let end = loop {
+                tokio::select! {
+                    end = &mut session => break end,
+                    changed = auto_reconnect.changed() => {
+                        if changed.is_err() { break session.await; }
+                        let _ = preferences.send(ViewerControl::AutoReconnect(*auto_reconnect.borrow_and_update()));
+                    }
+                }
+            };
             *mailbox.ended.lock().unwrap() = Some(end);
             mailbox.post(WM_SESSION_ENDED);
         });
@@ -217,9 +284,103 @@ fn point(lparam: LPARAM) -> (i32, i32) {
     ((lparam.0 & 0xFFFF) as i16 as i32, ((lparam.0 >> 16) & 0xFFFF) as i16 as i32)
 }
 
+fn local_key(held: &mut BTreeSet<u16>, key: u16, down: bool) -> bool {
+    if down && held.iter().any(|&k| matches!(VIRTUAL_KEY(k), VK_LCONTROL | VK_RCONTROL | VK_LSHIFT | VK_RSHIFT | VK_LMENU | VK_RMENU | VK_LWIN | VK_RWIN)) {
+        held.insert(key);
+    }
+    if down { held.contains(&key) } else { held.remove(&key) }
+}
+
+#[derive(Default)]
+struct Attention {
+    away_since: Option<Instant>,
+    idle: bool,
+}
+
+impl Attention {
+    fn update(&mut self, now: Instant, attended: bool, minimized: bool) {
+        if attended && !minimized {
+            self.away_since = None;
+            self.idle = false;
+        } else {
+            let since = self.away_since.get_or_insert(now);
+            self.idle |= minimized || now.duration_since(*since) >= IDLE_TIMEOUT;
+        }
+    }
+}
+
+struct RetryPanel {
+    status: HWND,
+    retry: HWND,
+    cancel: HWND,
+}
+
+impl RetryPanel {
+    unsafe fn new(window: HWND, instance: HINSTANCE) -> windows::core::Result<Self> {
+        unsafe {
+            let control = |class, title, id, style| -> windows::core::Result<HWND> {
+                let child =
+                    CreateWindowExW(WINDOW_EX_STYLE(0), class, title, WS_CHILD | style, 0, 0, 0, 0, Some(window), Some(HMENU(id as _)), Some(instance), None)?;
+                SendMessageW(child, WM_SETFONT, Some(WPARAM(GetStockObject(DEFAULT_GUI_FONT).0 as usize)), Some(LPARAM(0)));
+                Ok(child)
+            };
+            Ok(Self {
+                status: control(w!("STATIC"), w!(""), 0, WINDOW_STYLE(0))?,
+                retry: control(w!("BUTTON"), w!("立即重试"), RETRY_NOW, WS_TABSTOP)?,
+                cancel: control(w!("BUTTON"), w!("取消重连"), CANCEL_RETRY, WS_TABSTOP)?,
+            })
+        }
+    }
+
+    unsafe fn layout(&self, window: HWND) {
+        unsafe {
+            let mut client = RECT::default();
+            let _ = GetClientRect(window, &mut client);
+            let dpi = GetDpiForWindow(window).max(96) as i32;
+            let px = |value| value * dpi / 96;
+            let button = px(92).min(client.right / 2);
+            let flags = SWP_NOZORDER | SWP_NOACTIVATE;
+            let _ = SetWindowPos(self.status, None, 0, 0, client.right, px(30), flags);
+            let _ = SetWindowPos(self.retry, None, 0, px(30), button, px(30), flags);
+            let _ = SetWindowPos(self.cancel, None, button, px(30), button, px(30), flags);
+        }
+    }
+
+    unsafe fn visible(&self, visible: bool) {
+        unsafe {
+            for control in [self.status, self.retry, self.cancel] {
+                let _ = ShowWindow(control, if visible { SW_SHOWNA } else { SW_HIDE });
+            }
+        }
+    }
+}
+
+fn retry_title(status: &RetryStatus, now: Instant) -> String {
+    match status {
+        RetryStatus::Waiting { attempt, deadline, reason } => {
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                format!("第 {attempt} 次重连即将开始 · {reason}")
+            } else {
+                let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0);
+                format!("第 {attempt} 次重连，{seconds} 秒后重试 · {reason}")
+            }
+        }
+        RetryStatus::Connecting { attempt } => format!("正在进行第 {attempt} 次重连…"),
+        RetryStatus::Deferred { reason } => format!("已暂停重连，返回窗口后继续 · {reason}"),
+    }
+}
+
 impl Canvas {
     fn send(&self, command: ViewerCommand) {
-        let _ = self.commands.send(command);
+        let command = command.into();
+        if self.current_generation() {
+            let _ = self.commands.send(command);
+        }
+    }
+
+    fn current_generation(&self) -> bool {
+        self.generation == self.mailbox.generation.load(Ordering::Acquire)
     }
 
     fn set_title(&self, status: &str) {
@@ -247,7 +408,14 @@ impl Canvas {
     }
 
     fn controlling(&self) -> bool {
-        self.connected && self.can_control && !self.paused
+        self.connected
+            && self.can_control
+            && self.current_generation()
+            && !self.closing
+            && !self.attention.idle
+            && !self.paused
+            && self.pending_pause.is_none()
+            && self.fresh_after.is_none()
     }
 
     fn independent(&self) -> bool {
@@ -296,7 +464,10 @@ impl Canvas {
     }
 
     fn flush_move(&mut self) {
-        if let Some((x, y)) = self.pending_move.take() {
+        if let Some((x, y)) = self.pending_move.take()
+            && self.controlling()
+            && self.owns_input()
+        {
             self.last_move = Instant::now();
             self.send(ViewerCommand::Input(self.translator.pointer_move(x, y)));
         }
@@ -326,16 +497,21 @@ impl Canvas {
             }
             let Some(target) = self.target.clone() else { return };
             {
-                let frame = self.frame.lock().unwrap();
+                let frame = self.mailbox.frame.lock().unwrap();
                 if frame.width > 0 && self.uploaded_serial != Some(frame.serial) && frame.bgra.len() == frame.width * frame.height * 4 {
-                    if self.bitmap.as_ref().is_none_or(|(_, width, height)| (*width, *height) != (frame.width, frame.height)) {
+                    let pixels = frame.bgra.as_ptr().cast();
+                    let stride = (frame.width * 4) as u32;
+                    let copied = if let Some((bitmap, _, _)) = self.bitmap.as_ref().filter(|(_, w, h)| (*w, *h) == (frame.width, frame.height)) {
+                        bitmap.CopyFromMemory(None, pixels, stride).is_ok()
+                    } else {
                         let properties = D2D1_BITMAP_PROPERTIES { pixelFormat: format, dpiX: 96.0, dpiY: 96.0 };
-                        let created = target.CreateBitmap(D2D_SIZE_U { width: frame.width as u32, height: frame.height as u32 }, None, 0, &properties);
-                        self.bitmap = created.ok().map(|bitmap| (bitmap, frame.width, frame.height));
-                    }
-                    if let Some((bitmap, _, _)) = &self.bitmap
-                        && bitmap.CopyFromMemory(None, frame.bgra.as_ptr().cast(), (frame.width * 4) as u32).is_ok()
-                    {
+                        let size = D2D_SIZE_U { width: frame.width as u32, height: frame.height as u32 };
+                        target
+                            .CreateBitmap(size, Some(pixels), stride, &properties)
+                            .map(|bitmap| self.bitmap = Some((bitmap, frame.width, frame.height)))
+                            .is_ok()
+                    };
+                    if copied {
                         self.uploaded_serial = Some(frame.serial);
                         self.drawn_stream = frame.stream;
                     }
@@ -344,11 +520,17 @@ impl Canvas {
             let _ = target.Resize(&size);
             target.BeginDraw();
             target.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }));
-            if let (Some((bitmap, _, _)), Some((left, top, width, height))) = (&self.bitmap, self.picture()) {
+            let painted = if let (Some((bitmap, _, _)), Some((left, top, width, height))) = (&self.bitmap, self.picture()) {
                 let area = D2D_RECT_F { left, top, right: left + width, bottom: top + height };
                 target.DrawBitmap(bitmap, Some(&area), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
-            }
-            if self.latest_cursor.committed_stream() == self.drawn_stream {
+                true
+            } else {
+                false
+            };
+            let fresh = painted && self.fresh_after.zip(self.uploaded_serial).is_some_and(|(old, serial)| serial > old);
+            if !self.connected || (self.fresh_after.is_some() && !fresh) {
+                self.shown_cursor = None;
+            } else if self.latest_cursor.committed_stream() == self.drawn_stream {
                 self.shown_cursor = Some(self.latest_cursor.clone());
             } else if self.shown_cursor.as_ref().is_some_and(|s| s.committed_stream() != self.drawn_stream) {
                 self.shown_cursor = None;
@@ -366,6 +548,9 @@ impl Canvas {
             if target.EndDraw(None, None).is_err() {
                 self.target = None;
                 self.bitmap = None;
+            } else if self.connected && fresh {
+                self.fresh_after = None;
+                self.update_pointer();
             }
         }
     }
@@ -407,10 +592,19 @@ impl Canvas {
         if let Some(hook) = self.hook.take() {
             let _ = unsafe { UnhookWindowsHookEx(hook) };
         }
-        FOCUSED.set(std::ptr::null_mut());
+        if self.owns_input() {
+            FOCUSED.set(std::ptr::null_mut());
+        }
         self.held.clear();
+        self.withheld_keys.clear();
         self.pending_move = None;
         self.translator.release_all();
+        unsafe {
+            let _ = KillTimer(Some(self.window), MOVE_TIMER);
+            if GetCapture() == self.window {
+                let _ = ReleaseCapture();
+            }
+        }
         if self.connected {
             self.send(ViewerCommand::ReleaseInput);
         }
@@ -418,14 +612,25 @@ impl Canvas {
 
     /// Takes the keyboard, including the shortcuts Windows would otherwise keep for itself.
     unsafe fn capture_keyboard(&mut self) {
-        if self.hook.is_none() && self.controlling() {
+        if !self.owns_input() && self.controlling() && unsafe { GetFocus() } == self.window {
+            // A press that began while the window had no control must finish locally.
+            self.withheld_keys = (8..=254).filter(|&key| unsafe { GetAsyncKeyState(i32::from(key)) } < 0).collect();
             FOCUSED.set(std::ptr::from_mut(self));
             self.hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) }.ok();
         }
     }
 
     /// One key event of this PC: a local shortcut, or input for the host.
-    unsafe fn key(&mut self, virtual_key: u32, scan_code: u32, extended: bool, down: bool) {
+    unsafe fn key(&mut self, virtual_key: u32, scan_code: u32, extended: bool, down: bool) -> bool {
+        // WM_KEY messages use generic modifier keys; the hook and the physical snapshot distinguish their sides.
+        let physical_key = if matches!(VIRTUAL_KEY(virtual_key as u16), VK_SHIFT | VK_CONTROL | VK_MENU) {
+            unsafe { MapVirtualKeyW(scan_code | if extended { 0xe000 } else { 0 }, MAPVK_VSC_TO_VK_EX) as u16 }
+        } else {
+            virtual_key as u16
+        };
+        if local_key(&mut self.withheld_keys, physical_key, down) {
+            return false;
+        }
         let repeat = down && !self.held.insert((scan_code, extended));
         if !down {
             self.held.remove(&(scan_code, extended));
@@ -444,7 +649,7 @@ impl Canvas {
                     self.set_title("已释放控制，点击画面继续");
                 }
             }
-            return;
+            return true;
         }
         if scan_code == 0x3A && !extended && down && !repeat {
             self.caps_lock = !self.caps_lock;
@@ -454,18 +659,103 @@ impl Canvas {
         if let Some(input) = self.translator.key(event, self.caps_lock) {
             self.send(ViewerCommand::Input(input));
         }
+        true
+    }
+
+    unsafe fn update_retry_title(&self) {
+        if let Some(status) = &self.retry {
+            let title = retry_title(status, Instant::now());
+            self.set_title(&title);
+            let _ = unsafe { SetWindowTextW(self.retry_panel.status, PCWSTR(wide(&title).as_ptr())) };
+        }
+    }
+
+    unsafe fn retry_event(&mut self, status: RetryStatus, serial: u64) {
+        unsafe {
+            self.connected = false;
+            self.can_control = false;
+            self.release();
+            self.paused = false;
+            self.pending_pause = None;
+            self.fresh_after = Some(serial);
+            self.latest_cursor = Arc::default();
+            self.shown_cursor = None;
+            let waiting = matches!(status, RetryStatus::Waiting { .. });
+            self.retry = Some(status);
+            let _ = KillTimer(Some(self.window), RETRY_TIMER);
+            if waiting {
+                SetTimer(Some(self.window), RETRY_TIMER, 1000, None);
+            }
+            let _ = EnableWindow(self.retry_panel.retry, waiting);
+            self.update_retry_title();
+            self.retry_panel.layout(self.window);
+            self.retry_panel.visible(true);
+            self.draw();
+        }
+    }
+
+    fn reconcile_pause(&mut self) {
+        if self.connected && self.supports_pause && self.pending_pause.is_none() && self.attention.idle != self.paused {
+            self.pending_pause = Some(self.attention.idle);
+            if !self.attention.idle {
+                self.fresh_after = Some(self.mailbox.frame.lock().unwrap().serial);
+            }
+            self.send(ViewerCommand::Pause(self.attention.idle));
+        }
+    }
+
+    unsafe fn update_attention(&mut self, active: bool, visible: bool, minimized: bool) {
+        unsafe {
+            let now = Instant::now();
+            let was_idle = self.attention.idle;
+            self.attention.update(now, active && visible, minimized);
+            let _ = KillTimer(Some(self.window), IDLE_TIMER);
+            if !self.attention.idle
+                && let Some(since) = self.attention.away_since
+            {
+                let remaining = IDLE_TIMEOUT.saturating_sub(now.duration_since(since));
+                SetTimer(Some(self.window), IDLE_TIMER, remaining.as_millis().max(1) as u32, None);
+            }
+            if was_idle != self.attention.idle {
+                if self.attention.idle {
+                    self.release();
+                }
+                let _ = self.commands.send(ViewerControl::Idle(self.attention.idle));
+                self.reconcile_pause();
+            }
+        }
+    }
+
+    unsafe fn disconnect(&mut self) {
+        if !self.closing {
+            self.closing = true;
+            unsafe { self.release() };
+            self.connected = false;
+            let _ = self.commands.send(ViewerCommand::Disconnect.into());
+        }
     }
 
     unsafe fn session_event(&mut self, event: ViewerEvent) {
         match event {
-            ViewerEvent::Connected { name, can_control, .. } => {
+            ViewerEvent::Connected { name, can_control, session_pause, .. } => {
+                if self.retry.take().is_some() {
+                    unsafe {
+                        let _ = KillTimer(Some(self.window), RETRY_TIMER);
+                        self.retry_panel.visible(false);
+                    }
+                }
                 self.name = name;
                 self.connected = true;
                 self.can_control = can_control;
+                self.supports_pause = session_pause;
+                self.reconcile_pause();
                 self.set_title(if can_control { "已连接，点击画面开始操作" } else { "已连接 · 仅观看" });
                 let name = wide(&self.name);
                 // The owner copies the text before this call returns.
-                unsafe { SendMessageW(self.owner, WM_CANVAS_CONNECTED, Some(WPARAM(self.window.0 as usize)), Some(LPARAM(name.as_ptr() as isize))) };
+                unsafe {
+                    SendMessageW(self.owner, WM_CANVAS_CONNECTED, Some(WPARAM(self.window.0 as usize)), Some(LPARAM(name.as_ptr() as isize)));
+                    self.draw();
+                }
             }
             ViewerEvent::Stream { stream, error } => match error {
                 Some(error) => self.set_title(&format!("画质调整失败：{error}")),
@@ -479,8 +769,18 @@ impl Canvas {
                 self.set_title(if can_control { "被控端允许控制" } else { "仅观看（被控端已关闭控制）" });
                 unsafe { self.draw() };
             }
-            ViewerEvent::Paused { paused, .. } => {
+            ViewerEvent::Paused { paused, error } => {
+                let request = self.pending_pause.take();
                 self.paused = paused;
+                if let Some(error) = error {
+                    self.set_title(&error);
+                    if request != Some(self.attention.idle) {
+                        self.reconcile_pause();
+                    }
+                } else {
+                    self.set_title(if paused { "已暂停画面传输" } else { "已恢复画面传输" });
+                    self.reconcile_pause();
+                }
                 unsafe { self.draw() };
             }
             ViewerEvent::Cursor(state) => {
@@ -500,11 +800,14 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     unsafe {
         let canvas = FOCUSED.get();
         if code == HC_ACTION as i32 && !canvas.is_null() {
+            if !(*canvas).controlling() {
+                return CallNextHookEx(None, code, wparam, lparam);
+            }
             let key = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
             let down = wparam.0 as u32 == WM_KEYDOWN || wparam.0 as u32 == WM_SYSKEYDOWN;
-            (*canvas).key(key.vkCode, key.scanCode & 0xFF, key.flags.0 & LLKHF_EXTENDED.0 != 0, down);
-            // The key belongs to the remote machine, whatever Windows would have done with it.
-            return LRESULT(1);
+            if (*canvas).key(key.vkCode, key.scanCode & 0xFF, key.flags.0 & LLKHF_EXTENDED.0 != 0, down) {
+                return LRESULT(1);
+            }
         }
         CallNextHookEx(None, code, wparam, lparam)
     }
@@ -528,15 +831,28 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 canvas.draw();
             }
             WM_SESSION_EVENT => {
-                while let Some(event) = { canvas.mailbox.events.lock().unwrap().pop_front() } {
-                    canvas.session_event(event);
+                let events = std::mem::take(&mut *canvas.mailbox.events.lock().unwrap());
+                if !canvas.closing {
+                    for event in events {
+                        match event {
+                            Notice::Session(event) if canvas.current_generation() => canvas.session_event(event),
+                            Notice::Session(_) => {}
+                            Notice::Retry { status, serial, generation } => {
+                                canvas.generation = generation;
+                                canvas.retry_event(status, serial);
+                            }
+                        }
+                    }
                 }
             }
             WM_SESSION_ENDED => {
-                canvas.release();
+                let Some(end) = canvas.mailbox.ended.lock().unwrap().take() else { return LRESULT(0) };
                 canvas.connected = false;
-                let end = canvas.mailbox.ended.lock().unwrap().take();
-                if let Some(end) = end.filter(|_| !canvas.closing) {
+                canvas.release();
+                if !canvas.closing && !end.local_stop {
+                    canvas.closing = true;
+                    let _ = KillTimer(Some(window), RETRY_TIMER);
+                    canvas.retry_panel.visible(false);
                     canvas.set_title(&format!("已结束：{}", end.reason));
                     let text = wide(&end.reason);
                     MessageBoxW(Some(window), PCWSTR(text.as_ptr()), w!("QuietDesk"), MB_OK | MB_ICONINFORMATION);
@@ -544,19 +860,29 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 let _ = DestroyWindow(window);
             }
             WM_SIZE => {
-                if canvas.connected {
-                    let minimized = wparam.0 as u32 == SIZE_MINIMIZED;
-                    if minimized != canvas.paused {
-                        canvas.send(ViewerCommand::Pause(minimized));
-                    }
+                canvas.update_attention(GetForegroundWindow() == window, IsWindowVisible(window).as_bool(), wparam.0 as u32 == SIZE_MINIMIZED);
+                if canvas.retry.is_some() {
+                    canvas.retry_panel.layout(window);
                 }
                 canvas.draw();
+            }
+            WM_ACTIVATE => {
+                canvas.update_attention((wparam.0 & 0xffff) as u32 != WA_INACTIVE, IsWindowVisible(window).as_bool(), IsIconic(window).as_bool());
+                return DefWindowProcW(window, message, wparam, lparam);
+            }
+            WM_SHOWWINDOW => {
+                canvas.update_attention(GetForegroundWindow() == window, wparam.0 != 0, IsIconic(window).as_bool());
+                return DefWindowProcW(window, message, wparam, lparam);
             }
             WM_SETFOCUS => {
                 canvas.capture_keyboard();
                 canvas.draw();
             }
             WM_KILLFOCUS => {
+                canvas.release();
+                canvas.draw();
+            }
+            WM_CAPTURECHANGED if !canvas.translator.pressed_buttons().is_empty() => {
                 canvas.release();
                 canvas.draw();
             }
@@ -583,14 +909,12 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                         canvas.draw();
                     }
                 }
-                if !canvas.controlling() {
+                if !canvas.controlling() || !canvas.owns_input() {
                     return LRESULT(0);
                 }
                 let (x, y) = point(lparam);
                 if let Some(position) = canvas.fraction(x, y) {
-                    if canvas.independent()
-                        && !(canvas.owns_input() && (Canvas::inside_picture(position) || windows::Win32::UI::Input::KeyboardAndMouse::GetCapture() == window))
-                    {
+                    if canvas.independent() && !Canvas::inside_picture(position) && GetCapture() != window {
                         return LRESULT(0);
                     }
                     canvas.pending_move = Some(position);
@@ -605,13 +929,22 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 let _ = KillTimer(Some(window), MOVE_TIMER);
                 canvas.flush_move();
             }
+            WM_TIMER if wparam.0 == RETRY_TIMER && !canvas.closing => canvas.update_retry_title(),
+            WM_TIMER if wparam.0 == IDLE_TIMER => {
+                canvas.update_attention(GetForegroundWindow() == window, IsWindowVisible(window).as_bool(), IsIconic(window).as_bool());
+            }
             WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP
                 if canvas.controlling() =>
             {
                 let down = matches!(message, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN);
                 let (x, y) = point(lparam);
-                let position = canvas.fraction(x, y);
-                if canvas.independent() && ((down && !position.is_some_and(Canvas::inside_picture)) || (!down && !canvas.owns_input())) {
+                let Some(position) = canvas.fraction(x, y) else {
+                    if !down {
+                        canvas.release();
+                    }
+                    return LRESULT(0);
+                };
+                if canvas.independent() && down && !Canvas::inside_picture(position) {
                     return LRESULT(0);
                 }
                 let button = match message {
@@ -621,24 +954,30 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                     _ => 2 + ((wparam.0 >> 16) & 0xFFFF) as i64,
                 };
                 if down {
+                    let _ = SetFocus(Some(window));
                     canvas.capture_keyboard();
+                    if !canvas.owns_input() {
+                        return LRESULT(0);
+                    }
+                } else if !canvas.translator.pressed_buttons().contains(&button) {
+                    return LRESULT(0);
+                }
+                canvas.flush_move();
+                let input = canvas.translator.button(button, down, position.0, position.1, canvas.started.elapsed(), (x, y));
+                canvas.send(ViewerCommand::Input(input));
+                if down {
                     SetCapture(window);
-                } else {
+                } else if canvas.translator.pressed_buttons().is_empty() {
                     let _ = ReleaseCapture();
                 }
-                if let Some((fraction_x, fraction_y)) = position {
-                    canvas.flush_move();
-                    let input = canvas.translator.button(button, down, fraction_x, fraction_y, canvas.started.elapsed(), (x, y));
-                    canvas.send(ViewerCommand::Input(input));
-                }
             }
-            WM_MOUSEWHEEL | WM_MOUSEHWHEEL if canvas.controlling() => {
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL if canvas.controlling() && canvas.owns_input() => {
                 let notches = f64::from(((wparam.0 >> 16) & 0xFFFF) as i16) / 120.0;
                 let (x, y) = point(lparam);
                 let mut position = POINT { x, y };
                 let _ = ScreenToClient(window, &mut position);
                 if let Some((fraction_x, fraction_y)) = canvas.fraction(position.x, position.y) {
-                    if canvas.independent() && !(canvas.owns_input() && Canvas::inside_picture((fraction_x, fraction_y))) {
+                    if canvas.independent() && !Canvas::inside_picture((fraction_x, fraction_y)) {
                         return LRESULT(0);
                     }
                     canvas.flush_move();
@@ -647,44 +986,105 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 }
             }
             // Without the hook, keys still arrive as messages, minus the ones Windows keeps.
-            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
-                if canvas.hook.is_none() && canvas.controlling() && (!canvas.independent() || canvas.owns_input()) =>
-            {
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP if canvas.hook.is_none() && canvas.controlling() && canvas.owns_input() => {
                 let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
-                canvas.key(wparam.0 as u32, ((lparam.0 >> 16) & 0xFF) as u32, lparam.0 & (1 << 24) != 0, down);
+                if !canvas.key(wparam.0 as u32, ((lparam.0 >> 16) & 0xFF) as u32, lparam.0 & (1 << 24) != 0, down) {
+                    return DefWindowProcW(window, message, wparam, lparam);
+                }
             }
             WM_COMMAND => match wparam.0 & 0xFFFF {
                 MENU_FULL_SCREEN => canvas.toggle_full_screen(),
-                MENU_SEND_CLIPBOARD => match clipboard::text() {
+                MENU_SEND_CLIPBOARD if canvas.connected && canvas.current_generation() && !canvas.closing => match clipboard::text() {
                     Some(text) => canvas.send(ViewerCommand::SendClipboard(text)),
                     None => canvas.set_title("本机剪贴板中没有文字"),
                 },
-                MENU_REQUEST_CLIPBOARD => canvas.send(ViewerCommand::RequestClipboard),
-                MENU_DISCONNECT => {
-                    canvas.closing = true;
-                    canvas.send(ViewerCommand::Disconnect);
+                MENU_REQUEST_CLIPBOARD if canvas.connected && !canvas.closing => canvas.send(ViewerCommand::RequestClipboard),
+                RETRY_NOW if matches!(canvas.retry, Some(RetryStatus::Waiting { .. })) && !canvas.closing => {
+                    let _ = canvas.commands.send(ViewerControl::RetryNow);
                 }
-                id if (MENU_QUALITY..MENU_QUALITY + VIEWER_QUALITIES.len()).contains(&id) => {
+                CANCEL_RETRY | MENU_DISCONNECT => canvas.disconnect(),
+                id if canvas.connected && !canvas.closing && (MENU_QUALITY..MENU_QUALITY + VIEWER_QUALITIES.len()).contains(&id) => {
                     canvas.send(ViewerCommand::Quality(VIEWER_QUALITIES[id - MENU_QUALITY].1))
                 }
                 _ => {}
             },
             WM_CLOSE => {
                 // The session ends first; its ending closes the window.
-                canvas.closing = true;
-                if canvas.mailbox.ended.lock().unwrap().is_none() && canvas.commands.send(ViewerCommand::Disconnect).is_ok() {
+                canvas.disconnect();
+                if !canvas.commands.is_closed() || canvas.mailbox.ended.lock().unwrap().is_some() {
                     return LRESULT(0);
                 }
                 let _ = DestroyWindow(window);
             }
             WM_NCDESTROY => {
+                canvas.disconnect();
                 canvas.release();
                 SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+                SendMessageW(canvas.owner, WM_CANVAS_CLOSED, Some(WPARAM(window.0 as usize)), None);
                 drop(Box::from_raw(std::ptr::from_mut(canvas)));
                 return DefWindowProcW(window, message, wparam, lparam);
             }
             _ => return DefWindowProcW(window, message, wparam, lparam),
         }
         LRESULT(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_modifier_held_before_control_keeps_its_whole_chord_local() {
+        let key = u16::from(b'C');
+        let mut held = BTreeSet::from([VK_LCONTROL.0]);
+        assert!(local_key(&mut held, key, true));
+        assert!(local_key(&mut held, VK_LCONTROL.0, false));
+        assert!(local_key(&mut held, key, true));
+        assert!(local_key(&mut held, key, false));
+        assert!(!local_key(&mut held, key, true));
+    }
+
+    #[test]
+    fn only_continuous_time_away_pauses_an_attended_window() {
+        let start = Instant::now();
+        let mut state = Attention::default();
+        state.update(start, true, false);
+        let left = start + IDLE_TIMEOUT * 3;
+        state.update(left, true, false);
+        assert!(!state.idle);
+        state.update(left, false, false);
+        state.update(left + IDLE_TIMEOUT - Duration::from_millis(1), true, false);
+        let left_again = left + IDLE_TIMEOUT;
+        state.update(left_again, false, false);
+        state.update(left_again + IDLE_TIMEOUT - Duration::from_millis(1), false, false);
+        assert!(!state.idle);
+        state.update(left_again + IDLE_TIMEOUT, false, false);
+        assert!(state.idle);
+        state.update(left_again + IDLE_TIMEOUT, true, false);
+        assert!(!state.idle);
+    }
+
+    #[test]
+    fn minimizing_pauses_immediately_and_restoring_focus_resumes() {
+        let now = Instant::now();
+        let mut state = Attention::default();
+        state.update(now, true, true);
+        assert!(state.idle);
+        state.update(now, false, false);
+        assert!(state.idle);
+        state.update(now, true, false);
+        assert!(!state.idle);
+    }
+
+    #[test]
+    fn retry_caption_uses_remaining_time_until_the_actual_attempt_starts() {
+        let now = Instant::now();
+        let wait = RetryStatus::Waiting { attempt: 2, deadline: now + Duration::from_millis(1001), reason: "连接中断".into() };
+        assert_eq!(retry_title(&wait, now), "第 2 次重连，2 秒后重试 · 连接中断");
+        assert_eq!(retry_title(&wait, now + Duration::from_secs(2)), "第 2 次重连即将开始 · 连接中断");
+        assert_eq!(retry_title(&RetryStatus::Connecting { attempt: 2 }, now), "正在进行第 2 次重连…");
+        let defer = RetryStatus::Deferred { reason: "连接中断".into() };
+        assert_eq!(retry_title(&defer, now), "已暂停重连，返回窗口后继续 · 连接中断");
     }
 }

@@ -20,6 +20,7 @@ pub const MAX_DATAGRAM: usize = 1 + crate::media::fragment::MAX_RECORD_BYTES;
 const WIRE_LIMIT: usize = 2048;
 const LINK_MTU: u32 = 1200;
 const QUEUE: usize = 128;
+const AUDIO_BACKLOG: usize = 5;
 const HANDSHAKE: Duration = Duration::from_secs(2);
 const MAX_CANDIDATES: usize = 4;
 
@@ -62,6 +63,10 @@ impl DatagramSender {
 
     /// Returns true for an enqueued application datagram.
     pub(crate) fn try_send(&self, data: Vec<u8>) -> bool {
+        // Five 20 ms packets already span the playback queue. Skip audio while the socket is this far behind.
+        if data.first() == Some(&crate::audio::DATAGRAM_KIND) && self.outgoing.max_capacity() - self.outgoing.capacity() >= AUDIO_BACKLOG {
+            return false;
+        }
         self.authenticated() && (1..=MAX_DATAGRAM).contains(&data.len()) && self.outgoing.try_send(data.into_boxed_slice()).is_ok()
     }
 }

@@ -65,6 +65,7 @@ fn wire_frame_keeps_previous_packet_before_current_packet() {
     assert_eq!(frame.previous_opus_payload(), Some(&[0xf0, 0x33][..]));
     assert_eq!(frame.opus_payload(), &[0xa1]);
     assert_eq!(frame.message().payload, bytes);
+    assert_eq!(frame.datagram(), [&[9][..], &bytes].concat());
     let mut first = bytes;
     first[15] = 1;
     assert!(AudioPacket::read(&first).is_err());
@@ -89,7 +90,7 @@ fn audio_frame_boundaries_cannot_consume_an_empty_or_oversize_payload() {
     }
     let mut max = valid.to_vec();
     max.resize(MAX_PACKET_BYTES, 2);
-    assert!(AudioPacket::read(&max).is_ok());
+    assert_eq!(AudioPacket::read(&max).unwrap().datagram().len(), crate::datagram_transport::MAX_DATAGRAM);
     max.push(3);
     assert!(AudioPacket::read(&max).is_err());
 }

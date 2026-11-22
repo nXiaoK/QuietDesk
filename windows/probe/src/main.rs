@@ -88,6 +88,7 @@ fn parse_settings(text: &str) -> Result<StreamSettings> {
 }
 
 struct Replay {
+    cursor_samples: Option<watch::Sender<Option<HostCursorSample>>>,
     sink: Option<FrameSink>,
     next: usize,
     paused: bool,
@@ -116,7 +117,6 @@ struct ReplayHost {
     synthetic_clipboard: Option<SyntheticClipboard>,
     refuse_edge: Option<i64>,
     synthetic_cursor: bool,
-    cursor_samples: Option<watch::Sender<Option<HostCursorSample>>>,
     synthetic_displays: bool,
     synthetic_audio: bool,
     fail_audio: bool,
@@ -206,7 +206,7 @@ impl HostPlatform for ReplayHost {
             let image = CursorImage::from_rgba(3, 2, 1.5, 1.0, 0.5, 0.25, &pixels)?;
             sender.send_replace(Some(HostCursorSample { image: Some(Arc::new(image)), inside_display: true, x: 0.25, y: 0.75 }));
         }
-        self.cursor_samples = samples;
+        self.replay.lock().unwrap().cursor_samples = samples;
         Ok(())
     }
 
@@ -323,6 +323,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
     let mut lines = input_lines();
 
     let replay = Arc::new(Mutex::new(Replay {
+        cursor_samples: None,
         sink: None,
         next: 0,
         paused: false,
@@ -391,7 +392,6 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
             synthetic_clipboard: clipboard.clone(),
             refuse_edge,
             synthetic_cursor: arguments.contains_key("synthetic-cursor"),
-            cursor_samples: None,
             synthetic_displays,
             synthetic_audio: arguments.contains_key("synthetic-audio"),
             fail_audio: arguments.contains_key("fail-audio"),
@@ -424,6 +424,13 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
                     if clipboard.as_ref().is_some_and(|copy| copy.command(&line)) { continue; }
                     match line["command"].as_str() {
                         Some("allowControl") => { let _ = commands.send(HostCommand::AllowControl(line["value"].as_bool() == Some(true))); }
+                        Some("moveSyntheticCursor") => {
+                            if let (Some(samples), Some(x), Some(y)) = (&replay.lock().unwrap().cursor_samples, line["x"].as_f64(), line["y"].as_f64()) {
+                                samples.send_modify(|current| {
+                                    if let Some(sample) = current { sample.x = x; sample.y = y; }
+                                });
+                            }
+                        }
                         Some("detachExternal") => {
                             replay.lock().unwrap().external_attached = false;
                             let _ = commands.send(HostCommand::RefreshDisplays);

@@ -367,6 +367,14 @@ private enum StereoTone {
         return (encoder.magicCookie, packets)
     }
 
+    static func matches(_ levels: [[Double]]) -> Bool {
+        guard levels.count == 2, levels.allSatisfy({ $0.count == 2 }) else { return false }
+        return (0..<2).allSatisfy { channel in
+            let primary = levels[channel][channel], secondary = levels[channel][1 - channel]
+            return primary > 0.05 && primary > 3 * secondary
+        }
+    }
+
     static func checkWindowsPackets(_ packets: [RemoteAudioPacket], status: RemoteAudioControl) throws {
         let decoder = try OpusAudioDecoder(magicCookie: status.magicCookie)
         var channels = [[Float](), [Float]()]
@@ -429,6 +437,8 @@ private final class MacViewer: @unchecked Sendable {
         var clipboard: [String] = []
         var terminated = false
         var audioStatuses: [RemoteAudioControl] = []
+        var datagramAudio: [RemoteAudioPacket] = []
+        var datagramPositions: [CursorPosition] = []
         var audioPackets: [RemoteAudioPacket] = []
         var holdAcknowledgements = false
     }
@@ -502,6 +512,13 @@ private final class MacViewer: @unchecked Sendable {
             if useMedia, hello.mediaTransportV1 == true {
                 let media = try MediaSession.viewer(control: peer, key: key, host: "127.0.0.1", port: auxiliaryPort, settings: hello.settings, udpEnabled: udp)
                 clipboard?.attach(media, to: peer) { [state] reason in state.update { $0.failures.append(reason) } }
+                media.onAudioPacket = { [state] packet in state.update { $0.datagramAudio.append(packet) } }
+                media.onCursorPosition = { [state] position in
+                    state.update { value in
+                        value.datagramPositions.append(position)
+                        _ = value.cursor.update(position)
+                    }
+                }
                 media.onVideo = { [weak self, state] frame, complete in
                     state.update { $0.mediaFrames.append(frame) }
                     self?.decode(frame.packet, frameID: frame.header.frameID, completion: complete)
@@ -1145,6 +1162,7 @@ private final class MacHost: @unchecked Sendable {
         var audioRequests: [RemoteAudioControl] = []
         var identities: [DeviceIdentity] = []
         var posted: [PostedEvent] = []
+        var datagramInputs: [RemoteInput] = []
         var inputs: [RemoteInput] = []
         var pointer = CGPoint(x: -1, y: -1)
         var released = 0
@@ -1274,6 +1292,7 @@ private final class MacHost: @unchecked Sendable {
                     }
                 }
                 media.onReceiveFrameWindow = { [state = self.state] limit in state.update { $0.receiverLimit = limit } }
+                media.onInteractiveInput = { [state = self.state] input in state.update { $0.datagramInputs.append(input) } }
                 media.onProduceRecoveryFrame = { [weak self] in self?.produceFrame(recovery: true) }
                 media.onResumeFrames = { [state = self.state] in state.update { $0.prepared = false } }
                 media.onAcknowledged = { [state = self.state] sequence in state.update { _ = $0.waiting.remove(sequence) } }
@@ -1342,6 +1361,15 @@ private final class MacHost: @unchecked Sendable {
             state.waiting.insert(state.sequence)
             media.sendVideo(VideoPacket(sequence: state.sequence, codec: .h264, vps: Data(), sps: source.sps, pps: source.pps, avcc: source.avcc))
         }
+    }
+
+    func moveCursor(sequence: UInt64, x: Double, y: Double) throws -> Bool {
+        let position = try CursorPosition(cursorID: cursorID, epoch: 1, sequence: sequence, insideDisplay: true, x: x, y: y)
+        let current = state.get()
+        guard let media = current.media, let peer = current.peer else { throw Failure("Missing active cursor session") }
+        if media.sendCursorPosition(position) { return true }
+        peer.send(Message(.cursorPosition, position.encode()))
+        return false
     }
 
     func sendFECFrame(source: VideoPacket, fullFragments: Int) throws -> VideoPacket {
@@ -1797,6 +1825,59 @@ private struct WindowsInteropChecks {
                 try require(second.epoch! > first.epoch!, "Windows reused the previous audio epoch")
                 try until("eight plain audio packets arrive") { viewer.state.get().audioPackets.filter { $0.epoch == second.epoch }.count >= 8 }
                 try StereoTone.checkWindowsPackets(Array(viewer.state.get().audioPackets.filter { $0.epoch == second.epoch }.prefix(8)), status: second)
+            }
+        }
+
+        run("Windows sends cursor and Opus datagrams and accepts a sequenced pointer before returning to reliable control") {
+            var route: InteropMediaRoute?
+            defer { route?.stop() }
+            try withWindowsHost(["--synthetic-audio", "--synthetic-cursor"], udp: true, routeAuxiliary: { port in
+                let proxy = try InteropMediaRoute(target: port, forwardUDP: true)
+                route = proxy
+                return proxy.port
+            }) { probe, viewer in
+                try until("UDP video commits before enabling the cursor") { viewer.state.get().commitPaths.last == "udp" }
+                _ = try viewer.requestCursor(enabled: true)
+                try until("the cursor is bound to a visible stream") { viewer.state.get().cursor.enabled }
+                try probe.send(["command": "moveSyntheticCursor", "x": 0.375, "y": 0.625])
+                try until("a cursor datagram updates the live Mac presentation") {
+                    let s = viewer.state.get()
+                    return s.datagramPositions.last?.x == 0.375 && s.cursor.position?.y == 0.625
+                }
+                guard let media = viewer.state.get().media else { throw Failure("Missing viewer media") }
+                var move = RemoteInput(kind: .move)
+                move.x = 0.375; move.y = 0.625; move.pointerSequence = 15
+                try require(media.sendInteractiveInput(move), "The Mac could not submit a pointer datagram")
+                _ = try probe.next("inject") { $0["operations"] as? [String] == ["Move { x: 0.375, y: 0.625 }"] }
+                let toggle = RemoteAudioControl.request(enabled: true, redundantOpus: true)
+                viewer.peer.send(try toggle.message())
+                try until("eight Windows Opus datagrams arrive") { viewer.state.get().datagramAudio.count >= 8 }
+                let before = viewer.state.get()
+                guard let status = before.audioStatuses.first(where: { $0.requestID == toggle.requestID && $0.enabled }) else {
+                    throw Failure("The audio epoch was not acknowledged")
+                }
+                try StereoTone.checkWindowsPackets(Array(before.datagramAudio.prefix(8)), status: status)
+                try require(before.audioPackets.isEmpty, "UDP audio was duplicated on control")
+                route?.forwardUDP(false)
+                try until("the session falls back to reliable video and receives live audio on control", seconds: 15) {
+                    let s = viewer.state.get()
+                    return s.commitPaths.last == "tcp" && s.audioPackets.contains { $0.epoch == status.epoch }
+                }
+                try probe.send(["command": "moveSyntheticCursor", "x": 0.875, "y": 0.125])
+                try until("VideoToolbox decodes Windows video after UDP loss") {
+                    let state = viewer.state.get()
+                    guard let stream = state.commits.last, let frame = state.mediaFrames.first(where: { $0.header.stream == stream && $0.header.frameID == 5 })
+                    else { return false }
+                    return state.decoded.contains { $0.sequence == frame.packet.sequence } && annexB(frame.packet) == replayFrames[4]
+                }
+                try until("the same cursor advances on control after UDP loss") {
+                    let s = viewer.state.get()
+                    return s.cursor.position?.x == 0.875 && s.datagramPositions.last?.x == 0.375
+                }
+                move.x = 0.875; move.y = 0.125; move.pointerSequence = 16
+                try require(!media.sendInteractiveInput(move), "A blackholed path accepted a new pointer")
+                try viewer.send(move)
+                _ = try probe.next("inject") { $0["operations"] as? [String] == ["Move { x: 0.875, y: 0.125 }"] }
             }
         }
 
@@ -2552,8 +2633,8 @@ private struct WindowsInteropChecks {
                 try require(samples.count == 12 && samples.allSatisfy { $0["epoch"] as? Int == Int(epoch) && $0["frames"] as? Int == 960 },
                             "The viewer played a stale epoch, skipped a packet or decoded the wrong duration")
                 let audible = samples.dropFirst(3).allSatisfy { sample in
-                    guard let levels = sample["levels"] as? [[Double]], levels.count == 2, levels.allSatisfy({ $0.count == 2 }) else { return false }
-                    return (0..<2).allSatisfy { levels[$0][$0] > 0.05 && levels[$0][$0] > 3 * levels[$0][1 - $0] }
+                    guard let levels = sample["levels"] as? [[Double]] else { return false }
+                    return StereoTone.matches(levels)
                 }
                 try require(audible, "The sound Windows actually decoded did not preserve the left and right Mac tones")
                 try probe.send(["command": "remoteAudio", "enabled": false])
@@ -2566,6 +2647,92 @@ private struct WindowsInteropChecks {
                 let before = probe.all("frame").count
                 try until("video continues after muting") { probe.all("frame").count > before + 6 }
                 try require(probe.all("audioSamples").count == samples.count, "Windows played late audio after muting")
+            }
+        }
+
+        run("Windows receives the Mac cursor and Opus and sends motion over negotiated datagrams before resuming on TCP") {
+            var route: InteropMediaRoute?
+            defer { route?.stop() }
+            try withMacHost(udp: true, route: { port in
+                let proxy = try InteropMediaRoute(target: port, forwardUDP: true)
+                route = proxy
+                return proxy.port
+            }, cursorImage: SyntheticCursor.image(), ["--synthetic-audio"]) { host, probe in
+                try until("the Mac has the cursor binding") { host.state.get().heldCursorPreparation != nil }
+                guard let binding = host.state.update({ state in
+                    defer { state.heldCursorPreparation = nil }
+                    return state.heldCursorPreparation
+                }) else { throw Failure("Missing cursor transaction") }
+                binding.complete(true)
+                try until("the Mac serves a committed UDP stream") { host.state.get().commits.last?.path == "udp" }
+                try require(try host.moveCursor(sequence: 2, x: 0.875, y: 0.125), "The Mac could not submit a cursor datagram")
+                _ = try probe.next("cursor") { event in
+                    let p = event["position"] as? [String: Any]
+                    return event["enabled"] as? Bool == true && p?["x"] as? Double == 0.875 && p?["y"] as? Double == 0.125
+                }
+                try probe.send(["command": "move", "x": 0.375, "y": 0.625])
+                try until("the Mac receives the sequenced move on its UDP callback") {
+                    host.state.get().datagramInputs.contains { $0.kind == .move && $0.x == 0.375 && $0.pointerSequence != nil }
+                }
+                try probe.send(["command": "button", "button": 0, "down": true, "x": 0.375, "y": 0.625, "atMilliseconds": 100, "pixel": [30, 50]])
+                try until("the Mac receives the button on its reliable input handler") { host.state.get().inputs.contains { $0.kind == .down } }
+                let inputs = host.state.get()
+                try require(inputs.inputs.allSatisfy { $0.kind != .move } && inputs.datagramInputs.allSatisfy { $0.kind == .move }, "Pointer traffic used the wrong path")
+                guard let peer = inputs.peer, let media = inputs.media else { throw Failure("Missing active host") }
+                try probe.send(["command": "remoteAudio", "enabled": true])
+                try until("the Windows viewer requests audio") { !host.state.get().audioRequests.isEmpty }
+                let request = host.state.get().audioRequests[0], epoch: UInt32 = 5, tones = try StereoTone.encode()
+                peer.send(try RemoteAudioControl.status(requestID: request.requestID, enabled: true, epoch: epoch, magicCookie: tones.cookie, redundantOpus: false).message())
+                _ = try probe.next("audio") { $0["enabled"] as? Bool == true && $0["pending"] as? Bool == false }
+                for (index, opus) in tones.packets.prefix(10).enumerated() {
+                    let packet = try RemoteAudioPacket(epoch: epoch, sequence: UInt64(index + 1), opusPayload: opus)
+                    try require(media.sendAudioPacket(packet), "Could not queue the Mac audio packet")
+                    usleep(20_000)
+                }
+                try until("the Windows audio sink receives the stereo tones") { probe.all("audioSamples").count >= 10 }
+                let samples = probe.all("audioSamples").dropFirst(3)
+                try require(samples.allSatisfy { sample in
+                    guard sample["epoch"] as? Int == Int(epoch), let levels = sample["levels"] as? [[Double]] else { return false }
+                    return StereoTone.matches(levels)
+                }, "Windows decoded the wrong stereo tones")
+
+                try probe.send(["command": "button", "button": 0, "down": false, "x": 0.375, "y": 0.625, "atMilliseconds": 150, "pixel": [30, 50]])
+                try until("the Mac receives the button release on control") { host.state.get().inputs.contains { $0.kind == .up } }
+                route?.forwardUDP(false)
+                try until("the Mac rebinds its cursor and Windows commits TCP video after UDP loss", seconds: 20) {
+                    let binding = host.state.update { state in
+                        defer { state.heldCursorPreparation = nil }
+                        return state.heldCursorPreparation
+                    }
+                    binding?.complete(true)
+                    return host.state.get().commits.last?.path == "tcp"
+                }
+                guard let start = host.state.get().recoverySequences.last else { throw Failure("Missing TCP recovery frame") }
+                for index in 0..<5 {
+                    let frame = try probe.next("frame") { $0["sequence"] as? UInt32 == start + UInt32(index) }
+                    try require(frame["annexB"] as? String == hex(annexB(packets[index])) && frame["firstInMediaStream"] as? Bool == (index == 0),
+                                "Windows received different H.264 bytes after UDP loss")
+                }
+                try require(try !host.moveCursor(sequence: 3, x: 0.625, y: 0.25), "The Mac still selected a cursor datagram after UDP loss")
+                _ = try probe.next("cursor") { event in
+                    let position = event["position"] as? [String: Any]
+                    return event["enabled"] as? Bool == true && position?["x"] as? Double == 0.625 && position?["y"] as? Double == 0.25
+                }
+                try probe.send(["command": "move", "x": 0.125, "y": 0.875])
+                try until("Windows resumes sequenced pointer motion on control") {
+                    host.state.get().inputs.contains { $0.kind == .move && $0.x == 0.125 && $0.y == 0.875 && $0.pointerSequence != nil }
+                }
+                for (i, opus) in tones.packets.dropFirst(10).prefix(2).enumerated() {
+                    let packet = try RemoteAudioPacket(epoch: epoch, sequence: UInt64(i + 11), opusPayload: opus)
+                    try require(media.sendAudioPacket(packet), "The Mac did not accept an audio frame for fallback")
+                    usleep(20_000)
+                }
+                _ = try probe.next("audioSamples") { sample in
+                    guard sample["epoch"] as? Int == Int(epoch), sample["receivedSequence"] as? Int == 12,
+                          let levels = sample["levels"] as? [[Double]] else { return false }
+                    return StereoTone.matches(levels)
+                }
+                try require((route?.dropped.get() ?? 0) > 0, "The proxy did not drop any UDP records")
             }
         }
 

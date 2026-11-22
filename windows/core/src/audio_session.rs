@@ -1,5 +1,6 @@
 //! Bounded connections between one authenticated desktop and its audio device workers.
 use crate::audio::{AudioControl, AudioPacket, AudioState};
+use crate::datagram_path::DatagramPath;
 use crate::error::{DeskError, Result};
 use crate::host::HostPlatform;
 use crate::peer::PeerHandle;
@@ -153,6 +154,17 @@ impl HostAudio {
         }
     }
 
+    /// A device may have reported ready or failed while capture settings were changing.
+    /// Deliver those events and skip just the audio samples already queued at this boundary.
+    pub fn configuration_finished(&mut self, peer: &PeerHandle) -> Result<()> {
+        let queued = self.capture.as_ref().map_or(0, |capture| capture.events.len());
+        for _ in 0..queued {
+            let Some(event) = self.capture.as_mut().and_then(|capture| capture.events.try_recv().ok()) else { break };
+            self.deliver(event, true, peer, None)?;
+        }
+        Ok(())
+    }
+
     pub async fn next(&mut self) -> CaptureEvent {
         let Some(capture) = self.capture.as_mut() else { return std::future::pending().await };
         if let Some((_, deadline)) = self.starting {
@@ -162,7 +174,7 @@ impl HostAudio {
         }
     }
 
-    pub fn deliver(&mut self, event: CaptureEvent, paused: bool, peer: &PeerHandle) -> Result<()> {
+    pub fn deliver(&mut self, event: CaptureEvent, paused: bool, peer: &PeerHandle, datagrams: Option<&DatagramPath>) -> Result<()> {
         match event {
             CaptureEvent::Ready => {
                 let Some((request_id, _)) = self.starting.take() else { return Ok(()) };
@@ -175,7 +187,12 @@ impl HostAudio {
             }
             CaptureEvent::Packet(packet, revision) => {
                 let current_run = self.capture.as_ref().is_some_and(|capture| capture.paused.borrow().revision == revision);
-                if current_run && !paused && self.starting.is_none() && packet.epoch().get() == self.epoch && peer.queued_send_bytes() <= 512 * 1024 {
+                if !current_run || paused || self.starting.is_some() || packet.epoch().get() != self.epoch {
+                    return Ok(());
+                }
+                if let Some(path) = datagrams.filter(|path| path.verified()) {
+                    path.send(packet.datagram());
+                } else if peer.queued_send_bytes() <= 512 * 1024 {
                     peer.send(&packet.message())?;
                 }
                 Ok(())
@@ -273,12 +290,16 @@ impl ViewerAudio {
     }
 
     pub fn frame(&mut self, message: &Message, paused: bool, peer: &PeerHandle, platform: &mut impl ViewerPlatform) -> Result<()> {
-        let Some(output) = &self.output else { return Ok(()) };
-        if paused {
+        if paused || self.output.is_none() {
             return Ok(());
         }
-        let packet = AudioPacket::read(&message.payload)?;
-        if self.epoch == Some(packet.epoch())
+        self.play(AudioPacket::read(&message.payload)?, paused, peer, platform)
+    }
+
+    pub fn play(&mut self, packet: AudioPacket, paused: bool, peer: &PeerHandle, platform: &mut impl ViewerPlatform) -> Result<()> {
+        if !paused
+            && self.epoch == Some(packet.epoch())
+            && let Some(output) = &self.output
             && let Err(error) = output.play(packet)
         {
             return self.failed(error, peer, platform);
@@ -305,5 +326,118 @@ impl ViewerAudio {
             }
             PlaybackEvent::Failed(error) => self.failed(error, peer, platform),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::{AudioEncoder, DATAGRAM_KIND, INTERLEAVED_SAMPLES};
+    use crate::datagram_path::PathEvent;
+    use crate::media::{MediaControl, MediaOperation, ViewerMedia};
+    use crate::peer::{self, PeerConfig, PeerEvent};
+    use crate::wire::MessageKind;
+
+    #[tokio::test]
+    async fn reconfiguration_drops_stale_sound_and_preserves_device_readiness_and_failure() {
+        let (left, right) = tokio::io::duplex(8192);
+        let (control, _) = peer::spawn(left, PeerConfig::default());
+        let (_other, mut messages) = peer::spawn(right, PeerConfig::default());
+        let (capture, worker) = AudioCapture::channel(false);
+        let epoch = NonZeroU32::new(1).unwrap();
+        let id = Uuid::new_v4();
+        let mut audio =
+            HostAudio { capture: Some(capture), epoch: epoch.get(), starting: Some((id, Instant::now() + Duration::from_secs(2))), ..Default::default() };
+        let mut encoder = AudioEncoder::new(epoch, false).unwrap();
+        worker.events.try_send(CaptureEvent::Ready).unwrap();
+        worker.events.try_send(CaptureEvent::Packet(encoder.encode(&[0.0; INTERLEAVED_SAMPLES]).unwrap(), 0)).unwrap();
+        audio.configuration_finished(&control).unwrap();
+        let fresh = encoder.encode(&[0.0; INTERLEAVED_SAMPLES]).unwrap();
+        let expected = fresh.sequence();
+        worker.events.try_send(CaptureEvent::Packet(fresh, 0)).unwrap();
+        let event = audio.next().await;
+        audio.deliver(event, false, &control, None).unwrap();
+        worker.events.try_send(CaptureEvent::Failed(DeskError::platform("synthetic device stopped"))).unwrap();
+        audio.configuration_finished(&control).unwrap();
+        tokio::time::timeout(Duration::from_secs(1),async {
+            for (index,kind) in [MessageKind::AudioControl,MessageKind::AudioFrame,MessageKind::AudioControl].into_iter().enumerate() {
+                let message=loop { if let Some(PeerEvent::Message(message))=messages.recv().await { break message; } };
+                assert_eq!(message.kind,kind);
+                match index {
+                    0 => assert!(matches!(AudioControl::read(&message).unwrap(),AudioControl::Status{request_id:Some(request),state:AudioState::Enabled{..}} if request==id)),
+                    1 => assert_eq!(AudioPacket::read(&message.payload).unwrap().sequence(),expected),
+                    _ => assert!(matches!(AudioControl::read(&message).unwrap(),AudioControl::Status{state:AudioState::Disabled{error:Some(error)},..} if error.contains("synthetic device stopped"))),
+                }
+            }
+        }).await.unwrap();
+        assert!(audio.capture.is_none());
+        assert_eq!(worker.paused.borrow().revision, 0);
+    }
+
+    #[tokio::test]
+    async fn verified_audio_uses_one_dtls_record_and_lost_or_legacy_paths_resume_on_control() {
+        let address = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let offer = MediaControl {
+            operation: MediaOperation::Offer,
+            session_id: Some(Uuid::new_v4()),
+            datagram_key: Some(vec![17; 32]),
+            path: Some("udp".into()),
+            ..ViewerMedia::request()
+        };
+        let mut server = DatagramPath::new(Some(address));
+        let mut client = DatagramPath::new(Some(address));
+        assert!(server.offer(&offer, true));
+        assert!(client.offer(&offer, false));
+        let (left, right) = tokio::io::duplex(8192);
+        let (control, _) = peer::spawn(left, PeerConfig::default());
+        let (_control, mut replies) = peer::spawn(right, PeerConfig::default());
+        let (capture, _worker) = AudioCapture::channel(false);
+        let epoch = NonZeroU32::new(7).unwrap();
+        let mut audio = HostAudio { capture: Some(capture), epoch: epoch.get(), ..Default::default() };
+        let mut encoder = AudioEncoder::new(epoch, true).unwrap();
+        let mut packet = || encoder.encode(&[0.0; INTERLEAVED_SAMPLES]).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let before = packet();
+            audio.deliver(CaptureEvent::Packet(before.clone(), 0), false, &control, Some(&server)).unwrap();
+            let (client_event, server_event) = tokio::join!(client.next(), server.next());
+            assert!(matches!((client_event, server_event), (PathEvent::Verified, PathEvent::Verified)));
+            let via_dtls = packet();
+            audio.deliver(CaptureEvent::Packet(via_dtls.clone(), 0), false, &control, Some(&server)).unwrap();
+            let PathEvent::Record(DATAGRAM_KIND, record) = client.next().await else {
+                panic!("missing verified audio datagram");
+            };
+            assert_eq!(AudioPacket::read(&record[1..]).unwrap(), via_dtls);
+            assert!(via_dtls.previous_opus_payload().is_some());
+
+            audio.pause(true);
+            audio.deliver(CaptureEvent::Packet(packet(), 1), true, &control, Some(&server)).unwrap();
+            audio.pause(false);
+            audio.deliver(CaptureEvent::Packet(packet(), 0), false, &control, Some(&server)).unwrap();
+            let current = packet();
+            audio.deliver(CaptureEvent::Packet(current.clone(), 2), false, &control, Some(&server)).unwrap();
+            assert!(matches!(client.next().await,PathEvent::Record(DATAGRAM_KIND,bytes) if AudioPacket::read(&bytes[1..]).unwrap()==current));
+
+            let legacy = packet();
+            audio.deliver(CaptureEvent::Packet(legacy.clone(), 2), false, &control, None).unwrap();
+            server.retire();
+            let after = packet();
+            audio.deliver(CaptureEvent::Packet(after.clone(), 2), false, &control, Some(&server)).unwrap();
+            for expected in [before, legacy, after] {
+                loop {
+                    match replies.recv().await.unwrap() {
+                        PeerEvent::Message(message) => {
+                            assert_eq!(message.kind, MessageKind::AudioFrame);
+                            assert_eq!(AudioPacket::read(&message.payload).unwrap(), expected);
+                            break;
+                        }
+                        PeerEvent::RoundTrip(_) => {}
+                        PeerEvent::Closed(error) => panic!("{error}"),
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
     }
 }

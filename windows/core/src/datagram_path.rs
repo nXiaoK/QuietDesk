@@ -201,6 +201,16 @@ impl DatagramPath {
         }
     }
 
+    pub fn send_payload(&self, kind: u8, bytes: &[u8]) -> bool {
+        if bytes.len() >= datagram_transport::MAX_DATAGRAM {
+            return false;
+        }
+        let mut record = Vec::with_capacity(1 + bytes.len());
+        record.push(kind);
+        record.extend_from_slice(bytes);
+        self.send(record)
+    }
+
     pub fn send(&self, record: Vec<u8>) -> bool {
         self.verified && !self.paused && self.driver.as_ref().is_some_and(|io| io.send.try_send(record))
     }

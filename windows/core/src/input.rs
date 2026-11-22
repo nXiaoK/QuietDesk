@@ -285,6 +285,10 @@ impl HostInputTranslator {
         ops.push(event(gesture, input.gesture_phase));
     }
 
+    pub(crate) fn permits_datagram_drag(&self, input: &RemoteInput) -> bool {
+        input.kind != InputKind::Drag || MouseButton::from_number(input.button).is_some_and(|button| self.buttons.contains(&button))
+    }
+
     /// Keys the host's Caps or Win+Space shortcut would press or combine with.
     pub(crate) fn shortcut_keys_held(&self) -> bool {
         const SPACE: PcKey = PcKey::Scan { code: 0x39, extended: false };

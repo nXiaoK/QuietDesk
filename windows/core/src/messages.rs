@@ -464,6 +464,10 @@ impl RemoteInput {
         }
     }
 
+    pub(crate) fn is_sequenced_motion(&self) -> bool {
+        matches!(self.kind, InputKind::Move | InputKind::Drag) && self.pointer_sequence.is_some()
+    }
+
     /// Use the host's current pointer instead of a normalized picture position.
     pub fn at_current_pointer(mut self) -> Self {
         self.x = 0.5;

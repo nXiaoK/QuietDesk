@@ -16,7 +16,8 @@ pub const FRAMES_PER_PACKET: usize = 960;
 pub const INTERLEAVED_SAMPLES: usize = FRAMES_PER_PACKET * CHANNELS;
 const BIT_RATE: i32 = 96_000;
 const HEADER_BYTES: usize = 16;
-const MAX_PACKET_BYTES: usize = 1_100;
+pub(crate) const DATAGRAM_KIND: u8 = 9;
+const MAX_PACKET_BYTES: usize = crate::media::fragment::MAX_RECORD_BYTES;
 const MAX_PAYLOAD_BYTES: usize = MAX_PACKET_BYTES - HEADER_BYTES;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -212,7 +213,16 @@ impl AudioPacket {
     }
 
     pub fn message(&self) -> Message {
-        let mut bytes = Vec::with_capacity(HEADER_BYTES + self.payload.len() + self.previous.as_ref().map_or(0, |p| p.len() + 2));
+        Message::new(MessageKind::AudioFrame, self.encode(&[]))
+    }
+
+    pub(crate) fn datagram(&self) -> Vec<u8> {
+        self.encode(&[DATAGRAM_KIND])
+    }
+
+    fn encode(&self, prefix: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(prefix.len() + HEADER_BYTES + self.payload.len() + self.previous.as_ref().map_or(0, |p| p.len() + 2));
+        bytes.extend_from_slice(prefix);
         bytes.extend_from_slice(&[1, u8::from(self.previous.is_some()), self.channels, 0]);
         bytes.extend_from_slice(&self.epoch.get().to_be_bytes());
         bytes.extend_from_slice(&self.sequence.to_be_bytes());
@@ -221,7 +231,7 @@ impl AudioPacket {
             bytes.extend_from_slice(previous);
         }
         bytes.extend_from_slice(&self.payload);
-        Message::new(MessageKind::AudioFrame, bytes)
+        bytes
     }
 }
 

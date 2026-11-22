@@ -168,7 +168,7 @@ impl HostCursor {
         Ok(samples.borrow_and_update().clone())
     }
 
-    fn send_sample(&mut self, peer: &PeerHandle, sample: HostCursorSample) -> Result<()> {
+    fn send_sample(&mut self, peer: &PeerHandle, path: Option<&DatagramPath>, sample: HostCursorSample) -> Result<()> {
         let previous = self.previous.as_ref();
         if previous.is_none_or(|last| match (&last.image, &sample.image) {
             (Some(a), Some(b)) => !Arc::ptr_eq(a, b) && a != b,
@@ -180,17 +180,18 @@ impl HostCursor {
         }
         if previous.is_none_or(|last| (last.inside_display, last.x, last.y) != (sample.inside_display, sample.x, sample.y)) {
             self.sequence += 1;
-            peer.send(
-                &CursorPosition {
-                    cursor_id: self.id,
-                    epoch: self.epoch,
-                    sequence: self.sequence,
-                    inside_display: sample.inside_display,
-                    x: sample.x,
-                    y: sample.y,
-                }
-                .message()?,
-            )?;
+            let position = CursorPosition {
+                cursor_id: self.id,
+                epoch: self.epoch,
+                sequence: self.sequence,
+                inside_display: sample.inside_display,
+                x: sample.x,
+                y: sample.y,
+            }
+            .message()?;
+            if !path.is_some_and(|path| path.send_payload(6, &position.payload)) {
+                peer.send(&position)?;
+            }
         }
         self.previous = Some(sample);
         Ok(())
@@ -328,7 +329,7 @@ struct HostSession<'a, P: HostPlatform> {
     relative_mouse: bool,
     trackpad_gestures: bool,
     input_action: Option<PendingInputAction>,
-    queued_input: VecDeque<RemoteInput>,
+    queued_input: VecDeque<(RemoteInput, bool)>,
     keyboard_needs_click: bool,
     /// `None` until the stream has started.
     state: Option<VideoStreamState>,
@@ -478,7 +479,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 _ = tokio::time::sleep_until(start_by), if self.state.is_none() => self.start(initial, events).await.map(drop),
                 _ = tokio::time::sleep_until(media_deadline.unwrap_or(start_by)), if !self.paused && media_deadline.is_some() => self.tick_media(),
                 _ = tokio::time::sleep_until(gesture_check.unwrap_or(start_by)), if gesture_check.is_some() => { self.platform.check_gestures(); Ok(()) }
-                audio = self.audio.next() => self.audio.deliver(audio, self.paused, self.peer),
+                audio = self.audio.next() => self.audio.deliver(audio, self.paused, self.peer, self.media.datagram_audio.then_some(&self.datagrams)),
                 event = self.datagrams.next() => self.datagram_event(event).await,
                 _ = tokio::time::sleep_until(udp_by.unwrap_or(start_by)), if udp_by.is_some() && !self.paused => {
                     if self.udp_frames.as_mut().is_some_and(|frames| !frames.pump(&self.datagrams, Instant::now())) {
@@ -494,7 +495,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 frame = next_frame(&mut self.frames) => self.send_frame(frame),
                 feedback = async { self.input_action.as_mut().expect("active input action").await }, if self.input_action.is_some() => self.finish_input_action(feedback),
                 sample = self.cursor.changed(), if !self.paused => match sample {
-                    Ok(Some(sample)) => self.cursor.send_sample(self.peer, sample),
+                    Ok(Some(sample)) => self.publish_cursor(sample),
                     Ok(None) => Ok(()),
                     Err(error) => Err(error),
                 },
@@ -574,7 +575,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
         self.window = Arc::new(Mutex::new(FrameWindow::new(self.capture_gate())));
         self.unacknowledged.clear();
         self.frames = None;
-        let state = self.platform.configure(settings, FrameSink { frames: sender, window: self.window.clone() }).await?;
+        let result = self.platform.configure(settings, FrameSink { frames: sender, window: self.window.clone() }).await;
+        self.audio.configuration_finished(self.peer)?;
+        let state = result?;
         if self.paused {
             self.platform.set_paused(true).await?;
         }
@@ -675,6 +678,15 @@ impl<P: HostPlatform> HostSession<'_, P> {
             }
             PathEvent::Lost => return self.lose_datagrams(),
             PathEvent::FreshPong(id) => self.media.answered_fast_challenge(id),
+            PathEvent::Record(7, mut data)
+                if self.datagrams.authenticated()
+                    && self.media.interactive_datagrams()
+                    && self.options.allow_control
+                    && !self.paused
+                    && self.state.is_some() =>
+            {
+                self.receive_input_message(Message::new(MessageKind::Input, data.split_off(1)), true)?;
+            }
             PathEvent::Record(11, mut data) if self.media.fast_recovery_negotiated() => {
                 let message = Message::new(MessageKind::MediaControl, data.split_off(1));
                 if let Ok(control) = MediaControl::read(&message)
@@ -725,6 +737,10 @@ impl<P: HostPlatform> HostSession<'_, P> {
         if control.operation == MediaOperation::Offer {
             let udp = self.datagrams.offer(&control, true);
             self.media.set_udp_available(udp);
+            if !udp {
+                control.datagram_interactive = None;
+            }
+            control.datagram_audio = (udp && self.supports_audio && self.media.datagram_audio).then_some(true);
             if udp && let Some(features) = self.fragment_features {
                 features.advertise(&mut control);
             }
@@ -882,7 +898,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
         let (sender, receiver) = mpsc::unbounded_channel();
         let window = Arc::new(Mutex::new(FrameWindow::new(Gate::Closed)));
         let sink = FrameSink { frames: sender, window: window.clone() };
-        match self.platform.switch_display(target, quality, sink).await? {
+        let result = self.platform.switch_display(target, quality, sink).await;
+        self.audio.configuration_finished(self.peer)?;
+        match result? {
             DisplaySwitch::Applied(state) => {
                 self.window = window;
                 self.frames = Some(receiver);
@@ -896,9 +914,14 @@ impl<P: HostPlatform> HostSession<'_, P> {
         }
     }
 
+    fn publish_cursor(&mut self, sample: HostCursorSample) -> Result<()> {
+        let path = (!self.paused && self.media.interactive_datagrams()).then_some(&self.datagrams);
+        self.cursor.send_sample(self.peer, path, sample)
+    }
+
     fn send_current_cursor(&mut self) -> Result<()> {
         if let Some(sample) = self.cursor.samples.as_mut().and_then(|rx| rx.borrow_and_update().clone()) {
-            self.cursor.send_sample(self.peer, sample)?;
+            self.publish_cursor(sample)?;
         }
         Ok(())
     }
@@ -1023,7 +1046,42 @@ impl<P: HostPlatform> HostSession<'_, P> {
         self.keyboard_needs_click = true;
     }
 
-    fn perform_input(&mut self, input: &RemoteInput) {
+    fn receive_input_message(&mut self, message: Message, from_datagram: bool) -> Result<()> {
+        let mut input: RemoteInput = message.read_json()?;
+        input.validate()?;
+        if from_datagram && !input.is_sequenced_motion() {
+            return Err(DeskError::invalid("交互数据报只能携带有序移动或拖动"));
+        }
+        if !self.options.allow_control
+            || self.paused
+            || self.state.is_none()
+            || (input.relative_mouse == Some(true) && !self.relative_mouse)
+            || (input.kind.is_gesture() && !self.trackpad_gestures)
+        {
+            return Ok(());
+        }
+        if !self.input_actions {
+            input.independent_caps_lock = None;
+        }
+        if self.input_action.is_none() {
+            self.perform_input(&input, from_datagram);
+        } else if self.queued_input.len() < crate::input::INPUT_QUEUE_CAPACITY {
+            self.queued_input.push_back((input, from_datagram));
+        } else if !from_datagram {
+            if let Some(i) = self.queued_input.iter().position(|(_, datagram)| *datagram) {
+                self.queued_input.remove(i);
+                self.queued_input.push_back((input, false));
+            } else {
+                self.require_keyboard_refocus();
+            }
+        }
+        Ok(())
+    }
+
+    fn perform_input(&mut self, input: &RemoteInput, from_datagram: bool) {
+        if from_datagram && !self.translator.permits_datagram_drag(input) {
+            return;
+        }
         let action = input.kind.action();
         if self.keyboard_needs_click && (action.is_some() || matches!(input.kind, InputKind::KeyDown | InputKind::KeyUp | InputKind::Flags)) {
             return;
@@ -1065,9 +1123,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
         }
         self.peer.send(&message)?;
         while self.input_action.is_none()
-            && let Some(input) = self.queued_input.pop_front()
+            && let Some((input, from_datagram)) = self.queued_input.pop_front()
         {
-            self.perform_input(&input);
+            self.perform_input(&input, from_datagram);
         }
         Ok(())
     }
@@ -1086,28 +1144,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 }
             }
             MessageKind::Ping => self.peer.send(&Message::new(MessageKind::Pong, message.payload))?,
-            MessageKind::Input => {
-                let mut input: RemoteInput = message.read_json()?;
-                input.validate()?;
-                if input.relative_mouse == Some(true) && !self.relative_mouse {
-                    return Ok(());
-                }
-                if input.kind.is_gesture() && !self.trackpad_gestures {
-                    return Ok(());
-                }
-                if !self.input_actions {
-                    input.independent_caps_lock = None;
-                }
-                if self.options.allow_control && !self.paused && self.state.is_some() {
-                    if self.input_action.is_none() {
-                        self.perform_input(&input);
-                    } else if self.queued_input.len() < crate::input::INPUT_QUEUE_CAPACITY {
-                        self.queued_input.push_back(input);
-                    } else {
-                        self.require_keyboard_refocus();
-                    }
-                }
-            }
+            MessageKind::Input => self.receive_input_message(message, false)?,
             MessageKind::ReleaseInput => {
                 self.release_input();
             }
@@ -1334,5 +1371,182 @@ mod tests {
         assert_eq!(sink.try_submit(frame.clone()), FrameSubmission::Closed);
         assert!(!sink.submit(frame));
         assert_eq!(sink.outstanding(), 0);
+    }
+
+    #[tokio::test]
+    async fn cursor_shapes_remain_reliable_and_position_uses_one_sequence_across_paths() {
+        use crate::peer::{self, PeerConfig};
+        let address = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let offer = MediaControl {
+            operation: MediaOperation::Offer,
+            session_id: Some(Uuid::new_v4()),
+            datagram_key: Some(vec![19; 32]),
+            path: Some("udp".into()),
+            ..crate::media::ViewerMedia::request()
+        };
+        let mut host = DatagramPath::new(Some(address));
+        let mut viewer = DatagramPath::new(Some(address));
+        assert!(host.offer(&offer, true));
+        assert!(viewer.offer(&offer, false));
+        let (left, right) = tokio::io::duplex(8192);
+        let (reliable, _reverse) = peer::spawn(left, PeerConfig::default());
+        let (_receiver, mut input) = peer::spawn(right, PeerConfig::default());
+        let mut cursor = HostCursor { id: Uuid::new_v4(), epoch: 1, revision: 0, sequence: 0, samples: None, previous: None };
+        let sample = |x| HostCursorSample { image: None, inside_display: true, x, y: 0.25 };
+        tokio::time::timeout(Duration::from_secs(4), async {
+            assert!(matches!(host.next().await, PathEvent::Verified));
+            assert!(matches!(viewer.next().await, PathEvent::Verified));
+            cursor.send_sample(&reliable, Some(&host), sample(0.25)).unwrap();
+            async fn control(input: &mut mpsc::Receiver<PeerEvent>) -> Message {
+                loop {
+                    match input.recv().await.unwrap() {
+                        PeerEvent::Message(message) => return message,
+                        PeerEvent::Closed(error) => panic!("control ended: {error}"),
+                        PeerEvent::RoundTrip(_) => {}
+                    }
+                }
+            }
+            let shape = control(&mut input).await;
+            assert_eq!(shape.kind, MessageKind::CursorShape);
+            assert_eq!(CursorShape::decode(&shape.payload).unwrap().revision, 1);
+            let PathEvent::Record(6, record) = viewer.next().await else { panic!("expected cursor datagram") };
+            let first = CursorPosition::decode(&record[1..]).unwrap();
+            assert_eq!((first.cursor_id, first.epoch, first.sequence, first.x), (cursor.id, 1, 1, 0.25));
+            host.retire();
+            cursor.send_sample(&reliable, Some(&host), sample(0.5)).unwrap();
+            let fallback = control(&mut input).await;
+            assert_eq!(fallback.kind, MessageKind::CursorPosition);
+            let next = CursorPosition::decode(&fallback.payload).unwrap();
+            assert_eq!((next.cursor_id, next.epoch, next.sequence, next.x), (first.cursor_id, first.epoch, 2, 0.5));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn datagram_drags_require_the_matching_reliable_button_and_never_grant_control() {
+        use crate::media::{ViewerMedia, ViewerMediaEvent};
+        use crate::messages::StreamSettingsRequest;
+        use crate::peer::{self, PeerConfig};
+        struct InputOnly {
+            ops: mpsc::UnboundedSender<Vec<InjectOp>>,
+            sink: Option<FrameSink>,
+        }
+        impl HostPlatform for InputOnly {
+            fn display_size(&mut self) -> Result<(u32, u32)> {
+                Ok((640, 360))
+            }
+            async fn configure(&mut self, settings: StreamSettings, sink: FrameSink) -> Result<VideoStreamState> {
+                self.sink = Some(sink);
+                Ok(VideoStreamState { width: 640, height: 360, settings })
+            }
+            async fn request_key_frame(&mut self) -> Result<()> {
+                Ok(())
+            }
+            async fn set_paused(&mut self, _: bool) -> Result<()> {
+                Ok(())
+            }
+            fn inject(&mut self, ops: &[InjectOp]) -> bool {
+                if !ops.is_empty() {
+                    self.ops.send(ops.to_vec()).unwrap();
+                }
+                true
+            }
+            fn clipboard_text(&mut self) -> Option<String> {
+                None
+            }
+            fn set_clipboard_text(&mut self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+        }
+        async fn next(input: &mut mpsc::Receiver<PeerEvent>, kind: MessageKind) -> Message {
+            loop {
+                match input.recv().await.unwrap() {
+                    PeerEvent::Message(message) if message.kind == kind => return message,
+                    PeerEvent::Closed(reason) => panic!("host ended early: {reason}"),
+                    _ => {}
+                }
+            }
+        }
+        fn pointer(kind: InputKind, seq: u64, x: f64) -> Message {
+            let mut input = RemoteInput::new(kind);
+            input.pointer_sequence = Some(seq);
+            input.x = x;
+            Message::json(MessageKind::Input, &input).unwrap()
+        }
+        let address = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let (a, b) = tokio::io::duplex(65536);
+        let (host, incoming) = peer::spawn(a, PeerConfig::default());
+        let (viewer, mut from_host) = peer::spawn(b, PeerConfig::default());
+        let (commands, queue) = mpsc::unbounded_channel();
+        let (ops, mut operations) = mpsc::unbounded_channel();
+        let mut platform = InputOnly { ops, sink: None };
+        let settings = StreamSettings::new(1920, 30, 8);
+        let options = HostOptions {
+            name: "test".into(),
+            device_id: None,
+            allow_control: true,
+            clipboard: false,
+            preferred: settings,
+            limit: settings,
+            modifiers: MacModifierMapping::Standard,
+            preferred_display: None,
+        };
+        let session = run_with_auxiliary(host, incoming, &mut platform, options, queue, |_| {}, HostConnections { auxiliary: None, datagram: Some(address) });
+        let exchange = async {
+            next(&mut from_host, MessageKind::Hello).await;
+            viewer.send(&Message::empty(MessageKind::ControlStatus)).unwrap();
+            next(&mut from_host, MessageKind::ControlStatus).await;
+            viewer.send(&Message::json(MessageKind::StreamSettingsRequest, &StreamSettingsRequest::new(settings)).unwrap()).unwrap();
+            next(&mut from_host, MessageKind::StreamSettingsResult).await;
+            let mut media = ViewerMedia::default();
+            let mut request = ViewerMedia::request();
+            media.request_interactive(&mut request);
+            media.set_udp_available(true);
+            viewer.send(&request.message().unwrap()).unwrap();
+            let offer = MediaControl::read(&next(&mut from_host, MessageKind::MediaControl).await).unwrap();
+            assert_eq!(offer.datagram_interactive, Some(true));
+            let mut path = DatagramPath::new(Some(address));
+            assert!(path.offer(&offer, false));
+            media.control(&offer, Instant::now()).unwrap();
+            assert!(matches!(path.next().await, PathEvent::Verified));
+            let [ViewerMediaEvent::Send(prepare)] = &media.set_udp_verified(true, Instant::now()).unwrap()[..] else { panic!("expected prepare") };
+            viewer.send(prepare).unwrap();
+            let ready = MediaControl::read(&next(&mut from_host, MessageKind::MediaControl).await).unwrap();
+            assert_eq!(ready.operation, MediaOperation::Ready);
+            // The orphan with the larger sequence must not displace the following legitimate move.
+            assert!(path.send_payload(7, &pointer(InputKind::Drag, 90, 0.9).payload));
+            assert!(path.send_payload(7, &pointer(InputKind::Move, 1, 0.1).payload));
+            assert_eq!(operations.recv().await.unwrap(), vec![InjectOp::Move { x: 0.1, y: 0.0 }]);
+            viewer.send(&pointer(InputKind::Down, 2, 0.2)).unwrap();
+            assert!(matches!(operations.recv().await.unwrap().as_slice(), [_, InjectOp::Button { down: true, .. }]));
+            assert!(path.send_payload(7, &pointer(InputKind::Drag, 3, 0.3).payload));
+            assert_eq!(operations.recv().await.unwrap(), vec![InjectOp::Move { x: 0.3, y: 0.0 }]);
+            viewer.send(&pointer(InputKind::Up, 4, 0.4)).unwrap();
+            assert!(matches!(operations.recv().await.unwrap().as_slice(), [_, InjectOp::Button { down: false, .. }]));
+            assert!(path.send_payload(7, &pointer(InputKind::Move, 3, 0.3).payload));
+            assert!(path.send_payload(7, &pointer(InputKind::Move, 5, 0.5).payload));
+            assert_eq!(operations.recv().await.unwrap(), vec![InjectOp::Move { x: 0.5, y: 0.0 }]);
+            commands.send(HostCommand::AllowControl(false)).unwrap();
+            assert!(!next(&mut from_host, MessageKind::ControlStatus).await.read_json::<ControlStatus>().unwrap().can_control);
+            assert!(path.send_payload(7, &pointer(InputKind::Move, 6, 0.6).payload));
+            assert!(tokio::time::timeout(Duration::from_millis(50), operations.recv()).await.is_err());
+            commands.send(HostCommand::AllowControl(true)).unwrap();
+            assert!(next(&mut from_host, MessageKind::ControlStatus).await.read_json::<ControlStatus>().unwrap().can_control);
+            // Edges on this lane are a protocol error and never reach platform input.
+            assert!(path.send_payload(7, &pointer(InputKind::Down, 7, 0.7).payload));
+            next_closed(&mut from_host).await;
+            assert!(operations.try_recv().is_err());
+        };
+        async fn next_closed(incoming: &mut mpsc::Receiver<PeerEvent>) {
+            while let Some(event) = incoming.recv().await {
+                if matches!(event, PeerEvent::Closed(_)) {
+                    break;
+                }
+            }
+        }
+        let (reason, ()) = tokio::time::timeout(Duration::from_secs(6), async { tokio::join!(session, exchange) }).await.unwrap();
+        assert!(reason.to_string().contains("有序移动或拖动"));
     }
 }

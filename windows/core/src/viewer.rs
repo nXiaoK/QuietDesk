@@ -1,6 +1,7 @@
 //! The viewer side of a session: the role of `DeskModel.handleViewer` in the macOS application, for a
 //! viewer that negotiates its media paths and platform capabilities with the host.
 
+use crate::audio::{self, AudioPacket};
 use crate::audio_session::{AudioPlayback, ViewerAudio};
 use crate::auxiliary::{Auxiliary, AuxiliaryEvent};
 use crate::clipboard_session::SessionClipboard;
@@ -38,6 +39,8 @@ const SETTINGS_REPLY_TIMEOUT: Duration = Duration::from_secs(25);
 #[derive(Debug)]
 pub enum ViewerCommand {
     Input(RemoteInput),
+    /// The canvas flushed this movement before a reliable click, wheel, gesture or key.
+    FlushPointer(Box<RemoteInput>),
     /// The window lost the keyboard: the host lets go of every key and button.
     ReleaseInput,
     Quality(StreamSettings),
@@ -180,7 +183,7 @@ struct ViewerSession<'a, P: ViewerPlatform> {
     pending_pause: Option<Uuid>,
     paused: bool,
     input_reply_deadline: Option<Instant>,
-    queued_input: VecDeque<RemoteInput>,
+    queued_input: VecDeque<(RemoteInput, bool)>,
     input_echo_sequence: u32,
     pointer_sequence: u64,
     waiting_for_input_echo: bool,
@@ -396,9 +399,9 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                     }
                     self.input_reply_deadline = None;
                     self.platform.event(ViewerEvent::InputStatus(feedback));
-                    while self.queued_input.front().is_some_and(|next| self.input_reply_deadline.is_none() || next.kind.action().is_none()) {
-                        let input = self.queued_input.pop_front().unwrap();
-                        self.send_input(input)?;
+                    while self.queued_input.front().is_some_and(|(next, _)| self.input_reply_deadline.is_none() || next.kind.action().is_none()) {
+                        let (input, flush) = self.queued_input.pop_front().unwrap();
+                        self.send_input(input, flush)?;
                     }
                 }
             }
@@ -496,10 +499,14 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             let mut request = ViewerMedia::request();
             media.request_fast_recovery(&mut request);
             media.request_dynamic_window(&mut request);
-            self.media = Some(media);
             if self.datagrams.enabled() {
                 request.request_fragment_features();
+                media.request_interactive(&mut request);
+                if self.audio.supported {
+                    media.request_datagram_audio(&mut request);
+                }
             }
+            self.media = Some(media);
             self.peer.send(&request.message()?)?;
         }
         let confirm = live_settings && hello.initial_stream_negotiation_v1 == Some(true);
@@ -587,6 +594,16 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         match event {
             PathEvent::Verified => self.update_media(|media| media.set_udp_verified(true, Instant::now())),
             PathEvent::Lost => self.lose_datagrams(),
+            PathEvent::Record(6, mut data)
+                if self.hello.as_ref().is_some_and(|hello| hello.independent_cursor_v1 == Some(true))
+                    && self.media.as_ref().is_some_and(ViewerMedia::interactive_datagrams)
+                    && self.datagrams.authenticated() =>
+            {
+                self.receive_cursor(Message::new(MessageKind::CursorPosition, data.split_off(1)))
+            }
+            PathEvent::Record(audio::DATAGRAM_KIND, data) if self.media.as_ref().is_some_and(ViewerMedia::receives_datagram_audio) => {
+                self.audio.play(AudioPacket::read(&data[1..])?, self.paused, self.peer, self.platform)
+            }
             PathEvent::Record(kind @ (3 | 5 | 8 | 10), data) => {
                 let parity = matches!(kind, 8 | 10);
                 if parity && !self.media.as_ref().is_some_and(|media| media.accepts_fec(kind)) {
@@ -789,34 +806,8 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 self.request_settings()
             }
             _ if self.hello.is_none() => Ok(()),
-            ViewerCommand::Input(mut input) => {
-                let hello = self.hello.as_ref().unwrap();
-                if !hello.can_control || self.paused || self.pending_pause.is_some() || self.display_request.is_some() {
-                    return Ok(());
-                }
-                if input.relative_mouse == Some(true) && hello.relative_mouse_v1 != Some(true) {
-                    return Ok(());
-                }
-                if input.kind.is_gesture() && hello.trackpad_gestures_v1 != Some(true) {
-                    return Ok(());
-                }
-                if hello.input_actions != Some(true) {
-                    if input.kind.action().is_some() {
-                        return Ok(());
-                    }
-                    input.independent_caps_lock = None;
-                }
-                // inputStatus has no request ID. Only one action can be confirmed at a time.
-                if !self.queued_input.is_empty() || (self.input_reply_deadline.is_some() && input.kind.action().is_some()) {
-                    if self.queued_input.len() == crate::input::INPUT_QUEUE_CAPACITY {
-                        return self.input_timeout();
-                    }
-                    self.queued_input.push_back(input);
-                    Ok(())
-                } else {
-                    self.send_input(input)
-                }
-            }
+            ViewerCommand::Input(input) => self.queue_input(input, false),
+            ViewerCommand::FlushPointer(input) => self.queue_input(*input, true),
             ViewerCommand::ReleaseInput => self.cancel_input_replies(true),
             ViewerCommand::SelectDisplay(id) => {
                 if self.display_request.is_some() || self.selected_display == Some(id) {
@@ -875,7 +866,36 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         Ok(())
     }
 
-    fn send_input(&mut self, mut input: RemoteInput) -> Result<()> {
+    fn queue_input(&mut self, mut input: RemoteInput, flush: bool) -> Result<()> {
+        let hello = self.hello.as_ref().unwrap();
+        if !hello.can_control || self.paused || self.pending_pause.is_some() || self.display_request.is_some() {
+            return Ok(());
+        }
+        if input.relative_mouse == Some(true) && hello.relative_mouse_v1 != Some(true) {
+            return Ok(());
+        }
+        if input.kind.is_gesture() && hello.trackpad_gestures_v1 != Some(true) {
+            return Ok(());
+        }
+        if hello.input_actions != Some(true) {
+            if input.kind.action().is_some() {
+                return Ok(());
+            }
+            input.independent_caps_lock = None;
+        }
+        // inputStatus has no request ID. Only one action can be confirmed at a time.
+        if !self.queued_input.is_empty() || (self.input_reply_deadline.is_some() && input.kind.action().is_some()) {
+            if self.queued_input.len() == crate::input::INPUT_QUEUE_CAPACITY {
+                return self.input_timeout();
+            }
+            self.queued_input.push_back((input, flush));
+            Ok(())
+        } else {
+            self.send_input(input, flush)
+        }
+    }
+
+    fn send_input(&mut self, mut input: RemoteInput, flush: bool) -> Result<()> {
         if input.kind.action().is_some() {
             self.input_reply_deadline = Some(Instant::now() + INPUT_REPLY_TIMEOUT);
         }
@@ -885,7 +905,17 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 self.pointer_sequence = sequence;
             }
         }
-        self.peer.send(&Message::json(MessageKind::Input, &input)?)
+        let message = Message::json(MessageKind::Input, &input)?;
+        if !flush
+            && input.is_sequenced_motion()
+            && message.payload.len() < crate::datagram_transport::MAX_DATAGRAM
+            && self.media.as_ref().is_some_and(ViewerMedia::interactive_datagrams)
+            && (self.datagrams.send_payload(7, &message.payload) || self.datagrams.authenticated())
+        {
+            // A saturated live motion lane drops samples; the next boundary is flushed on the control connection.
+            return Ok(());
+        }
+        self.peer.send(&message)
     }
 
     fn input_timeout(&mut self) -> Result<()> {
@@ -1166,6 +1196,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_audio_datagrams_and_reliable_frames_feed_the_same_requested_playback_epoch() {
+        use crate::audio::{AudioControl, AudioEncoder, AudioState, INTERLEAVED_SAMPLES};
+        use crate::audio_session::{PlaybackEvent, PlaybackWorker};
+        use std::num::NonZeroU32;
+
+        struct Output(Option<tokio::sync::oneshot::Sender<PlaybackWorker>>);
+        impl ViewerPlatform for Output {
+            fn supports_audio_playback(&self) -> bool {
+                true
+            }
+            fn start_audio_playback(&mut self, _: NonZeroU32, paused: bool) -> Result<AudioPlayback> {
+                let (handle, worker) = AudioPlayback::channel(paused);
+                assert!(self.0.take().unwrap().send(worker).is_ok());
+                Ok(handle)
+            }
+            fn event(&mut self, _: ViewerEvent) {}
+            fn video(&mut self, _: VideoPacket) -> Result<()> {
+                unreachable!()
+            }
+            fn media_video(&mut self, _: VideoPacket, _: MediaStreamId, _: bool) -> Result<()> {
+                unreachable!()
+            }
+        }
+
+        let address = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let mut path = DatagramPath::new(Some(address));
+        let (left, right) = tokio::io::duplex(64 * 1024);
+        let (host, mut messages) = peer::spawn(left, PeerConfig::default());
+        let (viewer, incoming) = peer::spawn(right, PeerConfig::default());
+        let (controls, queue) = mpsc::unbounded_channel();
+        let (_decoder, acknowledgements) = mpsc::unbounded_channel();
+        let (output, worker) = tokio::sync::oneshot::channel();
+        let mut platform = Output(Some(output));
+        let quality = StreamSettings::new(1920, 30, 8);
+        let session = Attempt::new(quality, queue).with_datagrams(address).run(viewer, incoming, &mut platform, acknowledgements);
+        let exchange = async {
+            let hello = serde_json::json!({"version":1,"name":"host","width":640,"height":360,"settings":quality,"canControl":false,"remoteAudioV1":true,"mediaTransportV1":true});
+            host.send(&Message::json(MessageKind::Hello, &hello).unwrap()).unwrap();
+            let request = MediaControl::read(&next(&mut messages).await).unwrap();
+            assert_eq!(request.datagram_audio, Some(true));
+            let mut media = HostMedia::default();
+            media.set_udp_available(true);
+            let Some(HostMediaEvent::Send(mut offer)) = media.control(&request, false).unwrap().pop() else { panic!("expected offer") };
+            offer.datagram_audio = Some(true);
+            assert!(path.offer(&offer, true));
+            host.send(&offer.message().unwrap()).unwrap();
+            assert!(matches!(path.next().await, PathEvent::Verified));
+            controls.send(ViewerCommand::RemoteAudio(true)).unwrap();
+            let id = loop {
+                let message = next(&mut messages).await;
+                if message.kind == MessageKind::AudioControl {
+                    let AudioControl::Request { request_id, enabled: true, .. } = AudioControl::read(&message).unwrap() else {
+                        panic!("expected audio enable")
+                    };
+                    break request_id;
+                }
+            };
+            let epoch = NonZeroU32::new(15).unwrap();
+            let state = AudioState::Enabled { epoch, magic_cookie: None, redundant_opus: true };
+            host.send(&AudioControl::Status { request_id: Some(id), state }.message().unwrap()).unwrap();
+            let mut worker = worker.await.unwrap();
+            worker.events.send(PlaybackEvent::Ready).await.unwrap();
+            let mut codec = AudioEncoder::new(epoch, true).unwrap();
+            let earlier = AudioEncoder::new(NonZeroU32::new(14).unwrap(), false).unwrap().encode(&[0.0; INTERLEAVED_SAMPLES]).unwrap();
+            assert!(path.send(earlier.datagram()));
+            let first = codec.encode(&[0.0; INTERLEAVED_SAMPLES]).unwrap();
+            assert!(path.send(first.datagram()));
+            assert_eq!(worker.packets.recv().await.unwrap(), first);
+            let next_frame = codec.encode(&[0.0; INTERLEAVED_SAMPLES]).unwrap();
+            host.send(&next_frame.message()).unwrap();
+            assert_eq!(worker.packets.recv().await.unwrap(), next_frame);
+            assert!(path.send(vec![audio::DATAGRAM_KIND, 0]));
+        };
+        let (end, ()) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(session, exchange) }).await.unwrap();
+        assert!(end.reason.contains("远端音频数据包长度无效"));
+    }
+
+    #[tokio::test]
     async fn the_viewer_repairs_a_missing_keyframe_fragment_and_falls_back_when_dtls_stops() {
         use crate::media::HostFrame;
         use crate::media::fragment::RepairCache;
@@ -1347,5 +1455,87 @@ mod tests {
         };
         let (end, ()) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(session, exchange) }).await.unwrap();
         assert!(!end.retryable);
+    }
+
+    #[tokio::test]
+    async fn negotiated_motion_uses_dtls_while_flushes_buttons_and_scroll_share_one_reliable_sequence() {
+        use crate::messages::InputKind;
+        let address = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let (left, right) = tokio::io::duplex(64 * 1024);
+        let (host, mut messages) = peer::spawn(left, PeerConfig::default());
+        let (viewer, incoming) = peer::spawn(right, PeerConfig::default());
+        let (commands, queue) = mpsc::unbounded_channel();
+        let (_decoder, acknowledgements) = mpsc::unbounded_channel();
+        let (observer, mut events) = mpsc::unbounded_channel();
+        let mut observer = Observer(observer);
+        let quality = StreamSettings::new(1920, 30, 8);
+        let session = Attempt::new(quality, queue).with_datagrams(address).run(viewer, incoming, &mut observer, acknowledgements);
+        let exchange = async {
+            let hello = serde_json::json!({"version":1,"name":"host","width":640,"height":360,"settings":quality,
+                "canControl":true,"controlStatusUpdates":true,"mediaTransportV1":true});
+            host.send(&Message::json(MessageKind::Hello, &hello).unwrap()).unwrap();
+            assert_eq!(next(&mut messages).await.kind, MessageKind::ControlStatus);
+            let request = MediaControl::read(&next(&mut messages).await).unwrap();
+            assert_eq!(request.datagram_interactive, Some(true));
+            commands.send(ViewerCommand::Input(RemoteInput::new(InputKind::Move))).unwrap();
+            let first: RemoteInput = next(&mut messages).await.read_json().unwrap();
+            assert_eq!((first.kind, first.pointer_sequence), (InputKind::Move, Some(1)));
+            let mut media = HostMedia::default();
+            media.set_udp_available(true);
+            let Some(HostMediaEvent::Send(offer)) = media.control(&request, false).unwrap().pop() else { panic!("expected offer") };
+            assert_eq!(offer.datagram_interactive, Some(true));
+            let mut path = DatagramPath::new(Some(address));
+            assert!(path.offer(&offer, true));
+            host.send(&offer.message().unwrap()).unwrap();
+            assert!(matches!(path.next().await, PathEvent::Verified));
+            let prepare = MediaControl::read(&next(&mut messages).await).unwrap();
+            assert_eq!(prepare.path.as_deref(), Some("udp"));
+            for command in [
+                ViewerCommand::Input(RemoteInput::new(InputKind::Move)),
+                ViewerCommand::FlushPointer(Box::new(RemoteInput::new(InputKind::Move))),
+                ViewerCommand::Input(RemoteInput::new(InputKind::Down)),
+                ViewerCommand::Input(RemoteInput::new(InputKind::Drag)),
+                ViewerCommand::Input(RemoteInput::new(InputKind::Scroll)),
+                ViewerCommand::Input(RemoteInput::new(InputKind::Up)),
+                ViewerCommand::Input(RemoteInput::new(InputKind::KeyDown)),
+            ] {
+                commands.send(command).unwrap();
+            }
+            for (kind, sequence) in
+                [(InputKind::Move, Some(3)), (InputKind::Down, Some(4)), (InputKind::Scroll, Some(6)), (InputKind::Up, Some(7)), (InputKind::KeyDown, None)]
+            {
+                let message = next(&mut messages).await;
+                assert_eq!(message.kind, MessageKind::Input);
+                let input: RemoteInput = message.read_json().unwrap();
+                assert_eq!((input.kind, input.pointer_sequence), (kind, sequence));
+            }
+            for (kind, sequence) in [(InputKind::Move, 2), (InputKind::Drag, 5)] {
+                let PathEvent::Record(7, bytes) = path.next().await else { panic!("expected interactive UDP record") };
+                let input: RemoteInput = serde_json::from_slice(&bytes[1..]).unwrap();
+                assert_eq!((input.kind, input.pointer_sequence), (kind, Some(sequence)));
+            }
+            host.send(&Message::json(MessageKind::ControlStatus, &ControlStatus { can_control: false }).unwrap()).unwrap();
+            while !matches!(events.recv().await.unwrap(), ViewerEvent::Control(false)) {}
+            commands.send(ViewerCommand::Input(RemoteInput::new(InputKind::Move))).unwrap();
+            commands.send(ViewerCommand::ReleaseInput).unwrap();
+            assert_eq!(next(&mut messages).await.kind, MessageKind::ReleaseInput);
+            assert!(tokio::time::timeout(Duration::from_millis(50), path.next()).await.is_err());
+            path.retire();
+            loop {
+                let next = MediaControl::read(&next(&mut messages).await).unwrap();
+                if next.operation == MediaOperation::Prepare {
+                    assert_eq!(next.path.as_deref(), Some("shared"));
+                    break;
+                }
+            }
+            host.send(&Message::json(MessageKind::ControlStatus, &ControlStatus { can_control: true }).unwrap()).unwrap();
+            while !matches!(events.recv().await.unwrap(), ViewerEvent::Control(true)) {}
+            commands.send(ViewerCommand::Input(RemoteInput::new(InputKind::Move))).unwrap();
+            let reliable: RemoteInput = next(&mut messages).await.read_json().unwrap();
+            assert_eq!((reliable.kind, reliable.pointer_sequence), (InputKind::Move, Some(8)));
+            commands.send(ViewerCommand::Disconnect).unwrap();
+        };
+        let (end, ()) = tokio::time::timeout(Duration::from_secs(7), async { tokio::join!(session, exchange) }).await.unwrap();
+        assert!(end.local_stop);
     }
 }

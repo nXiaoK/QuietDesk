@@ -524,16 +524,20 @@ fn retry_title(status: &RetryStatus, now: Instant) -> String {
 
 impl Canvas {
     fn send(&self, mut command: ViewerCommand) {
-        if let ViewerCommand::Input(mut input) = command {
+        let input = match &mut command {
+            ViewerCommand::Input(input) => Some(input),
+            ViewerCommand::FlushPointer(input) => Some(input.as_mut()),
+            _ => None,
+        };
+        if let Some(input) = input {
             if self.uses_caps_actions() {
                 input.independent_caps_lock = Some(true);
             }
             if self.relative_mouse.is_some()
                 && matches!(input.kind, InputKind::Down | InputKind::Up | InputKind::Scroll | InputKind::Magnify | InputKind::Rotate | InputKind::SmartMagnify)
             {
-                input = input.at_current_pointer();
+                *input = input.clone().at_current_pointer();
             }
-            command = ViewerCommand::Input(input);
         }
         if self.current_generation() {
             let _ = self.commands.send(command.into());
@@ -685,6 +689,10 @@ impl Canvas {
     }
 
     fn flush_move(&mut self) {
+        self.send_pending_move(true);
+    }
+
+    fn send_pending_move(&mut self, flush: bool) {
         if let Some(movement) = self.pending_move.take()
             && self.controlling()
             && self.owns_input()
@@ -698,14 +706,14 @@ impl Canvas {
                 }
                 _ => return,
             };
-            self.send(ViewerCommand::Input(input));
+            self.send(if flush { ViewerCommand::FlushPointer(Box::new(input)) } else { ViewerCommand::Input(input) });
         }
     }
 
     fn pace_move(&mut self, movement: PendingMove) {
         self.pending_move = Some(movement.accumulating(self.pending_move.take()));
         if self.last_move.elapsed() >= MOVE_INTERVAL {
-            self.flush_move();
+            self.send_pending_move(false);
         } else {
             unsafe { SetTimer(Some(self.window), MOVE_TIMER, MOVE_INTERVAL.as_millis() as u32, None) };
         }
@@ -1357,7 +1365,7 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
             }
             WM_TIMER if wparam.0 == MOVE_TIMER => {
                 let _ = KillTimer(Some(window), MOVE_TIMER);
-                canvas.flush_move();
+                canvas.send_pending_move(false);
             }
             WM_TIMER if wparam.0 == RETRY_TIMER && !canvas.closing => canvas.update_retry_title(),
             WM_TIMER if wparam.0 == IDLE_TIMER => {

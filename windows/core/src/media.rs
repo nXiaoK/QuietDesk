@@ -580,6 +580,7 @@ pub enum HostFrame {
 pub struct HostMedia {
     session: Option<Uuid>,
     credentials: Option<(Vec<u8>, Vec<u8>)>,
+    datagram_interactive: bool,
     epochs: (u32, u32),
     transaction: Option<HostTransaction>,
     /// A commit sent before capture was interrupted can still be confirmed by the viewer.
@@ -590,6 +591,7 @@ pub struct HostMedia {
     udp_verified: bool,
     fast_recovery: bool,
     pub(crate) capture_limits: window::CaptureLimits,
+    pub(crate) datagram_audio: bool,
     /// Frames wait for the viewer to open a new stream.
     hold: bool,
     next_frame: u64,
@@ -647,6 +649,7 @@ impl HostMedia {
             session_id: self.session,
             token: Some(token),
             fast_recovery: self.fast_recovery.then_some(true),
+            datagram_interactive: self.datagram_interactive.then_some(true),
             datagram_key: Some(key),
             dynamic_frame_window: self.capture_limits.dynamic.then_some(true),
             path: Some(if self.udp_available { "udp" } else { "tcp" }.to_string()),
@@ -671,8 +674,10 @@ impl HostMedia {
                     }
                     self.session = Some(Uuid::new_v4());
                     self.fast_recovery = control.fast_recovery == Some(true);
+                    self.datagram_interactive = control.datagram_interactive == Some(true);
                     self.credentials = Some((token, key));
                     self.capture_limits = window::CaptureLimits::from_request(control);
+                    self.datagram_audio = control.datagram_audio == Some(true);
                 }
                 return Ok(self.offer().map(|offer| HostMediaEvent::Send(Box::new(offer))).into_iter().collect());
             }
@@ -775,6 +780,10 @@ impl HostMedia {
                 Vec::new()
             }
         })
+    }
+
+    pub(crate) fn interactive_datagrams(&self) -> bool {
+        self.datagram_interactive && self.udp_verified && self.frame_path() == MediaPath::Udp && (!self.hold || self.transaction.is_some())
     }
 
     pub(crate) fn fast_recovery_negotiated(&self) -> bool {
@@ -1008,6 +1017,7 @@ impl ViewerMediaEvent {
 #[derive(Default)]
 pub struct ViewerMedia {
     udp_trials: UdpTrials,
+    datagram_interactive: bool,
     session: Option<Uuid>,
     epochs: (u32, u32),
     transaction: Option<ViewerTransaction>,
@@ -1017,6 +1027,7 @@ pub struct ViewerMedia {
     fragments: FragmentFeatures,
     fast_recovery: bool,
     dynamic_window: bool,
+    datagram_audio: bool,
     udp_verified: bool,
     receiving: Option<ReceivingStream>,
     auxiliary_enabled: bool,
@@ -1031,6 +1042,15 @@ impl ViewerMedia {
     /// Asks the host for a session. No optional capability is named, so the host uses none.
     pub fn request() -> MediaControl {
         MediaControl::new(MediaOperation::Request)
+    }
+
+    pub(crate) fn request_datagram_audio(&mut self, request: &mut MediaControl) {
+        self.datagram_audio = true;
+        request.datagram_audio = Some(true);
+    }
+
+    pub(crate) fn receives_datagram_audio(&self) -> bool {
+        self.datagram_audio && self.udp_verified
     }
 
     pub(crate) fn request_dynamic_window(&mut self, request: &mut MediaControl) {
@@ -1093,6 +1113,19 @@ impl ViewerMedia {
             }
             Ok(Vec::new())
         }
+    }
+
+    pub(crate) fn request_interactive(&mut self, request: &mut MediaControl) {
+        self.datagram_interactive = true;
+        request.datagram_interactive = Some(true);
+    }
+
+    pub(crate) fn interactive_datagrams(&self) -> bool {
+        self.datagram_interactive
+            && self.udp_verified
+            && !self.paused
+            && self.frame_path() == MediaPath::Udp
+            && (self.receiving.is_some() || self.transaction.is_some())
     }
 
     pub(crate) fn request_fast_recovery(&mut self, request: &mut MediaControl) {
@@ -1201,7 +1234,9 @@ impl ViewerMedia {
                 self.session = control.session_id;
                 self.fragments = FragmentFeatures::from_peer(control);
                 self.fast_recovery &= control.fast_recovery == Some(true);
+                self.datagram_interactive &= control.datagram_interactive == Some(true);
                 self.dynamic_window &= control.dynamic_frame_window == Some(true);
+                self.datagram_audio &= control.datagram_audio == Some(true);
                 self.udp_available &= control.path.as_deref() != Some("tcp");
                 self.udp_verified &= self.udp_available;
                 if !self.udp_verified && (self.udp_available || (self.auxiliary_enabled && !self.video_bound)) {
@@ -2260,6 +2295,36 @@ mod tests {
         let events = pair.viewer.tick(pair.now + ViewerMedia::RETRY_DELAY).unwrap();
         pair.viewer_events(events);
         assert_eq!(pair.host.preparing().unwrap().transport_epoch, 2);
+    }
+
+    #[test]
+    fn audio_datagrams_require_the_first_offers_agreement_and_a_live_verified_path() {
+        let now = Instant::now();
+        let mut request = ViewerMedia::request();
+        let mut viewer = ViewerMedia::default();
+        viewer.request_datagram_audio(&mut request);
+        let mut host = HostMedia::default();
+        let initial = host.control(&request, false).unwrap();
+        assert!(host.datagram_audio);
+        let [HostMediaEvent::Send(offer)] = initial.as_slice() else { panic!("missing offer") };
+        let mut capable = offer.clone();
+        capable.path = Some("udp".into());
+        capable.datagram_audio = Some(true);
+        let mut old = ViewerMedia::default();
+        for side in [&mut viewer, &mut old] {
+            side.set_udp_available(true);
+            side.control(&capable, now).unwrap();
+            assert!(!side.receives_datagram_audio());
+            side.set_udp_verified(true, now).unwrap();
+        }
+        assert!(viewer.receives_datagram_audio());
+        assert!(!old.receives_datagram_audio());
+        viewer.set_udp_verified(false, now).unwrap();
+        assert!(!viewer.receives_datagram_audio());
+        let mut legacy = HostMedia::default();
+        legacy.control(&ViewerMedia::request(), false).unwrap();
+        legacy.control(&request, false).unwrap();
+        assert!(!legacy.datagram_audio);
     }
 
     #[test]

@@ -190,7 +190,11 @@ final class FinderClipboardPaste: @unchecked Sendable {
             for (name, url) in zip(names, urls) {
                 guard !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.contains("\\"),
                       !name.contains("\0"), name.utf8.count <= 255 else { throw DeskError.invalid("对端文件名无效，请重新复制") }
-                try Data().write(to: url, options: .withoutOverwriting)
+                // Mode 000 makes uncoordinated reads fail with EACCES instead of reading a 0-byte file;
+                // Finder only opens the item through coordinated reading after replacing it with the real file.
+                let fd = Darwin.open(url.path, O_CREAT | O_EXCL | O_WRONLY, 0)
+                guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+                _ = Darwin.close(fd)
             }
             monitor = try FinderPasteIntent(isTrusted: isTrusted) { [weak self] in self?.recordPaste() }
             readers = urls.map { url in
@@ -214,7 +218,7 @@ final class FinderClipboardPaste: @unchecked Sendable {
         if first { DispatchQueue.main.async { [weak self] in self?.onFailure(message) } }
     }
 
-    private func recordPaste() {
+    func recordPaste() {
         lock.withLock { intentUntil = ProcessInfo.processInfo.systemUptime + 2 }
     }
 

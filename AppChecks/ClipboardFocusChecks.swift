@@ -384,6 +384,132 @@ private struct ClipboardFocusChecks {
             } catch is DeskError {}
         }
 
+        run("Non-Finder reads of Finder paste placeholders never receive empty files") { folder in
+            var finishPromise: ClipboardFilePromise?
+            let promise = ClipboardFilePromise(count: 2) {
+                DispatchQueue.global().async {
+                    guard let promise = finishPromise else { return }
+                    let srcFile = folder.appendingPathComponent("src/report.txt")
+                    let srcDir = folder.appendingPathComponent("src/bundle")
+                    let srcNested = srcDir.appendingPathComponent("inner.bin")
+                    try? FileManager.default.createDirectory(at: srcDir, withIntermediateDirectories: true)
+                    try? Data("full-payload".utf8).write(to: srcFile)
+                    try? FileManager.default.setAttributes([
+                        .posixPermissions: 0o750,
+                        .modificationDate: Date(timeIntervalSince1970: 1_700_000_000),
+                    ], ofItemAtPath: srcFile.path)
+                    try? Data([1, 2, 3, 4, 5]).write(to: srcNested)
+                    promise.finish([srcFile, srcDir])
+                }
+                return true
+            }
+            finishPromise = promise
+            let offered = try FinderClipboardPaste(names: ["report.txt", "bundle"], promise: promise, isTrusted: { true })
+            defer { offered.stop() }
+            let stubURL = offered.urls[0]
+
+            let board = NSPasteboard(name: NSPasteboard.Name(filePasteBoardPrefix + UUID().uuidString))
+            defer { board.releaseGlobally() }
+            let item = NSPasteboardItem()
+            item.setString(stubURL.absoluteString, forType: .fileURL)
+            board.prepareForNewContents(with: .currentHostOnly)
+            try require(board.writeObjects([item]), "Failed writing placeholder URL to isolated pasteboard")
+
+            // (a) Uncoordinated Data(contentsOf:) / open(2)
+            var directDesc = ""
+            var directSucceeded = false
+            do {
+                let d = try Data(contentsOf: stubURL)
+                directSucceeded = true
+                directDesc = "returned \(d.count) bytes"
+            } catch {
+                directDesc = "error \(error)"
+            }
+            let fd = Darwin.open(stubURL.path, O_RDONLY)
+            let openErrno = fd >= 0 ? 0 : errno
+            if fd >= 0 { Darwin.close(fd) }
+            print("  (a) direct: \(directDesc), open(O_RDONLY) fd=\(fd) errno=\(openErrno)")
+
+            // (b) Coordinated read without Finder paste intent
+            var coordErr: NSError?
+            var coordInnerDesc = "block-not-called"
+            var coordInnerFailed = false
+            var coordSucceededEmpty = false
+            NSFileCoordinator().coordinate(readingItemAt: stubURL, options: [], error: &coordErr) { url in
+                do {
+                    let d = try Data(contentsOf: url)
+                    coordInnerDesc = "returned \(d.count) bytes"
+                    if d.isEmpty { coordSucceededEmpty = true }
+                } catch {
+                    coordInnerFailed = true
+                    coordInnerDesc = "inner error \(error)"
+                }
+            }
+            print("  (b) NSFileCoordinator: coordErr=\(String(describing: coordErr)), inner=\(coordInnerDesc)")
+            let afterCoordFd = Darwin.open(stubURL.path, O_RDONLY)
+            let afterCoordErrno = afterCoordFd >= 0 ? 0 : errno
+            if afterCoordFd >= 0 { Darwin.close(afterCoordFd) }
+
+            // (c) NSPasteboard.readObjects([NSURL.self]) followed by read
+            let readURLs = board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+            try require(readURLs.count == 1, "Expected 1 URL from readObjects, got \(readURLs.count)")
+            var pbDesc = ""
+            var pbSucceeded = false
+            do {
+                let d = try Data(contentsOf: readURLs[0])
+                pbSucceeded = true
+                pbDesc = "returned \(d.count) bytes"
+            } catch {
+                pbDesc = "error \(error)"
+            }
+            print("  (c) readObjects+read: \(pbDesc)")
+
+            try require(!directSucceeded && fd < 0 && openErrno == EACCES, "Uncoordinated read did not fail with EACCES: \(directDesc), fd=\(fd), errno=\(openErrno)")
+            try require(!coordSucceededEmpty && (coordErr != nil || coordInnerFailed) && afterCoordFd < 0 && afterCoordErrno == EACCES,
+                        "Coordinated non-Finder read succeeded or restored a readable stub: inner=\(coordInnerDesc) afterFd=\(afterCoordFd) afterErrno=\(afterCoordErrno)")
+            try require(!pbSucceeded, "Pasteboard readObjects URL read succeeded instead of failing: \(pbDesc)")
+
+            // Verify Finder coordinated read after paste intent materializes both file and folder, preserving mode & mtime.
+            offered.recordPaste()
+            var readErr: NSError?
+            var materializedBytes: Data?
+            NSFileCoordinator().coordinate(readingItemAt: offered.urls[0], options: [], error: &readErr) { url in
+                materializedBytes = try? Data(contentsOf: url)
+            }
+            try require(readErr == nil && materializedBytes == Data("full-payload".utf8),
+                        "Coordinated Finder read did not obtain materialized file: \(String(describing: readErr))")
+            let attrs = try FileManager.default.attributesOfItem(atPath: offered.urls[0].path)
+            let perms = (attrs[.posixPermissions] as? NSNumber)?.intValue
+            let mtime = attrs[.modificationDate] as? Date
+            try require(perms == 0o750 && mtime == Date(timeIntervalSince1970: 1_700_000_000),
+                        "Materialized file lost permissions or mtime: perms=\(String(describing: perms)) mtime=\(String(describing: mtime))")
+            try require((try? Data(contentsOf: offered.urls[1].appendingPathComponent("inner.bin"))) == Data([1, 2, 3, 4, 5]),
+                        "Materialized folder stub did not preserve nested content")
+
+            // Verify ClipboardSync + SystemClipboardPasteboard status tells users to paste into a Finder folder.
+            let syncPB = NSPasteboard(name: NSPasteboard.Name(filePasteBoardPrefix + UUID().uuidString))
+            defer { syncPB.releaseGlobally() }
+            let sysPB = SystemClipboardPasteboard(pasteboard: syncPB, isFinderTrusted: { true })
+            let sync = ClipboardSync(session: UUID(), allowsFileSending: true, allowsAutomaticSending: false,
+                                     allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true, usesFinderFilePaste: true,
+                                     pasteboard: sysPB, storage: folder.appendingPathComponent("sync-status")) { _ in }
+            defer { sync.stop() }
+            var statuses: [String] = []
+            sync.onStatus = { statuses.append($0) }
+            let manifest = ClipboardManifest(revision: ClipboardRevision(counter: 1, origin: UUID()), kind: .files,
+                                             fileRootCount: 1, fileRootNames: ["notes.txt"])
+            sync.receive(try Wire.json(.clipboardManifest, manifest))
+            try eventually("ClipboardSync did not publish Finder-only paste guidance") {
+                statuses.contains { $0.contains("请粘贴到 Finder 的文件夹") }
+            }
+            let publishedURLs = sysPB.fileURLs ?? []
+            try require(publishedURLs.count == 1, "Expected 1 URL written by writeFinderFiles")
+            let publishedFd = Darwin.open(publishedURLs[0].path, O_RDONLY)
+            let publishedErrno = publishedFd >= 0 ? 0 : errno
+            if publishedFd >= 0 { Darwin.close(publishedFd) }
+            try require(publishedFd < 0 && publishedErrno == EACCES, "SystemClipboardPasteboard published a readable empty stub: errno=\(publishedErrno)")
+        }
+
         if Array(arguments.dropFirst()) == ["--finder-roots-only"] { exit(failed == 0 ? 0 : 1) }
 
         run("Background copies and paste preparation never read clipboard content; foreground sends only latest") { folder in

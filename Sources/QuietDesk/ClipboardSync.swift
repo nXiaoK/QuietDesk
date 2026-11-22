@@ -211,14 +211,16 @@ private final class LazyClipboardItemProvider: NSObject, NSPasteboardItemDataPro
 @MainActor
 final class SystemClipboardPasteboard: ClipboardPasteboard {
     private let pasteboard: NSPasteboard
+    private let isFinderTrusted: () -> Bool
     private var activeLazyProvider: LazyClipboardItemProvider?
     private var fileProviders: [FileURLProvider] = []
     private var finderFiles: FinderClipboardPaste?
     private var finderMarker: String?
     private static let marker = NSPasteboard.PasteboardType("local.quietdesk.clipboard-session")
 
-    init(pasteboard: NSPasteboard = .general) {
+    init(pasteboard: NSPasteboard = .general, isFinderTrusted: @escaping () -> Bool = { AXIsProcessTrusted() }) {
         self.pasteboard = pasteboard
+        self.isFinderTrusted = isFinderTrusted
     }
 
     var changeCount: Int { pasteboard.changeCount }
@@ -280,7 +282,7 @@ final class SystemClipboardPasteboard: ClipboardPasteboard {
     func writeFinderFiles(names: [String], marker: String, onFailure: @escaping @MainActor (String) -> Void, request: @escaping @MainActor () -> Bool) throws -> ClipboardFilePromise? {
         guard (1...ClipboardTransfer.maximumPromisedFileRoots).contains(names.count) else { throw DeskError.invalid("对端文件清单无效，请重新复制") }
         let promise = ClipboardFilePromise(count: names.count, request: request)
-        let offered = try FinderClipboardPaste(names: names, promise: promise, onFailure: onFailure)
+        let offered = try FinderClipboardPaste(names: names, promise: promise, isTrusted: isFinderTrusted, onFailure: onFailure)
         let items = offered.urls.map { url in
             let item = NSPasteboardItem()
             item.setString(marker, forType: Self.marker)
@@ -1433,6 +1435,9 @@ final class ClipboardSync {
                         self?.onDiagnostic?(.applyFailed(.files, fileCount: names.count))
                     }) { [weak self] in
                         self?.requestPromisedFiles(revision: revision) ?? false
+                    }
+                    if promise != nil {
+                        onStatus?("对端已复制文件，请粘贴到 Finder 的文件夹；确认接收后完成粘贴")
                     }
                 } catch let unavailable as FinderPasteUnavailable {
                     // Without the permission the copy must stay receivable. This is the offer a peer without

@@ -7,7 +7,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Component, Path, Prefix};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
@@ -17,7 +17,7 @@ use windows::Win32::System::DataExchange::{GetClipboardOwner, RegisterClipboardF
 use windows::Win32::System::Memory::*;
 use windows::Win32::System::Ole::{CF_DIBV5, CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent};
-use windows::Win32::UI::Shell::SHCreateStdEnumFmtEtc;
+use windows::Win32::UI::Shell::{IDataObjectAsyncCapability, IDataObjectAsyncCapability_Impl, SHCreateStdEnumFmtEtc};
 use windows::core::{BOOL, HRESULT, Interface, Ref, Result, implement, w};
 
 #[derive(Clone, Copy)]
@@ -59,6 +59,9 @@ impl Formats {
         formats
     }
 }
+
+// winerror.h defines E_PENDING as an operation whose data is not yet available.
+const E_PENDING: HRESULT = HRESULT(0x8000_000a_u32 as i32);
 
 pub(super) enum Rendered {
     Text(Vec<u16>),
@@ -217,14 +220,17 @@ impl Promise {
             state.finish(State::Cancelled);
         }
     }
-    fn read(&self) -> Result<Arc<Rendered>> {
-        #[cfg(test)]
-        self.render_calls.fetch_add(1, Ordering::Relaxed);
+    fn read(&self, shell_operation: bool) -> Result<Arc<Rendered>> {
         let event = {
             let mut state = self.state.lock().unwrap();
             if (self.kind == Kind::Files || !matches!(*state, State::Ready(_))) && !self.owned() {
                 return Err(E_ABORT.into());
             }
+            if self.kind == Kind::Files && !shell_operation && matches!(*state, State::Advertised) {
+                return Err(E_PENDING.into());
+            }
+            #[cfg(test)]
+            self.render_calls.fetch_add(1, Ordering::Relaxed);
             match &*state {
                 State::Ready(data) => return Ok(data.clone()),
                 State::Cancelled => return Err(E_ABORT.into()),
@@ -265,10 +271,44 @@ impl Promise {
     }
 }
 
-#[implement(IDataObject)]
+// Explorer inspects CF_HDROP to enable Paste, even before a user chooses it.
+// Only an extraction started by the shell may initiate a file transfer.
+#[implement(IDataObject, IDataObjectAsyncCapability)]
 pub(super) struct DataObject {
-    pub formats: Formats,
-    pub promise: Arc<Promise>,
+    formats: Formats,
+    promise: Arc<Promise>,
+    async_mode: AtomicBool,
+    operations: AtomicUsize,
+}
+
+impl DataObject {
+    pub fn new(formats: Formats, promise: Arc<Promise>) -> Self {
+        Self { formats, async_mode: AtomicBool::new(promise.kind == Kind::Files), promise, operations: AtomicUsize::new(0) }
+    }
+}
+
+impl IDataObjectAsyncCapability_Impl for DataObject_Impl {
+    fn SetAsyncMode(&self, enabled: BOOL) -> Result<()> {
+        self.async_mode.store(self.promise.kind == Kind::Files && enabled.as_bool(), Ordering::Release);
+        Ok(())
+    }
+    fn GetAsyncMode(&self) -> Result<BOOL> {
+        Ok(self.async_mode.load(Ordering::Acquire).into())
+    }
+    fn StartOperation(&self, _: Ref<IBindCtx>) -> Result<()> {
+        if !self.async_mode.load(Ordering::Acquire) || !self.promise.owned() {
+            return Err(E_ABORT.into());
+        }
+        self.operations.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+    fn InOperation(&self) -> Result<BOOL> {
+        Ok((self.operations.load(Ordering::Acquire) != 0).into())
+    }
+    fn EndOperation(&self, _: HRESULT, _: Ref<IBindCtx>, _: u32) -> Result<()> {
+        self.operations.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)).map_err(|_| E_UNEXPECTED)?;
+        Ok(())
+    }
 }
 
 impl DataObject_Impl {
@@ -298,7 +338,7 @@ impl IDataObject_Impl for DataObject_Impl {
         if format == self.formats.preferred_effect {
             return medium(&DROPEFFECT_COPY.0.to_le_bytes());
         }
-        self.promise.read()?.medium(format, self.formats)
+        self.promise.read(self.operations.load(Ordering::Acquire) != 0)?.medium(format, self.formats)
     }
     fn QueryGetData(&self, f: *const FORMATETC) -> HRESULT {
         self.format(f).map_or_else(|e| e, |_| S_OK)

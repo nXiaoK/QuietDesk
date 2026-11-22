@@ -88,6 +88,11 @@ enum Command {
     },
     Install(Installation),
     #[cfg(test)]
+    ShellExtraction {
+        start: bool,
+        done: mpsc::SyncSender<()>,
+    },
+    #[cfg(test)]
     RetainInstalled(mpsc::SyncSender<windows::core::AgileReference<IDataObject>>),
     Clear,
     Stop,
@@ -401,7 +406,7 @@ fn message_loop(hwnd: HWND, formats: Formats, shared: &Shared, commands: &mpsc::
                             job.finish(shared, false);
                             continue;
                         }
-                        let obj: IDataObject = DataObject { formats, promise: promise.clone() }.into();
+                        let obj: IDataObject = DataObject::new(formats, promise.clone()).into();
                         match unsafe { OleSetClipboard(&obj) } {
                             Ok(()) => {
                                 promise.installed();
@@ -423,6 +428,21 @@ fn message_loop(hwnd: HWND, formats: Formats, shared: &Shared, commands: &mpsc::
                             }
                             Err(_) => job.finish(shared, false),
                         }
+                    }
+                    #[cfg(test)]
+                    Command::ShellExtraction { start, done } => {
+                        use windows::core::Interface;
+                        let shell = installed.as_ref().unwrap().0.cast::<windows::Win32::UI::Shell::IDataObjectAsyncCapability>().unwrap();
+                        unsafe {
+                            assert!(shell.GetAsyncMode().unwrap().as_bool());
+                            if start {
+                                shell.StartOperation(None).unwrap();
+                            } else {
+                                shell.EndOperation(S_OK, None, windows::Win32::System::Ole::DROPEFFECT_COPY.0).unwrap();
+                            }
+                            assert_eq!(shell.InOperation().unwrap().as_bool(), start);
+                        }
+                        done.send(()).unwrap();
                     }
                     #[cfg(test)]
                     Command::RetainInstalled(reply) => {
@@ -520,6 +540,12 @@ mod tests {
     fn file_format() -> FORMATETC {
         FORMATETC { cfFormat: CF_HDROP.0, tymed: TYMED_HGLOBAL.0 as u32, dwAspect: DVASPECT_CONTENT.0, lindex: -1, ..Default::default() }
     }
+    fn shell_extraction(broker: &NativeClipboard, start: bool) {
+        eventually(|| broker.shared.active.lock().unwrap().as_ref().is_some_and(|p| p.owned()).then_some(()));
+        let (done, started) = mpsc::sync_channel(1);
+        broker.sta.send(Command::ShellExtraction { start, done });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
     #[track_caller]
     fn eventually<T>(mut f: impl FnMut() -> Option<T>) -> T {
         let until = Instant::now() + Duration::from_secs(6);
@@ -563,6 +589,8 @@ mod tests {
             let format = file_format();
             object.EnumFormatEtc(DATADIR_GET.0 as u32).unwrap();
             object.QueryGetData(&format).ok().unwrap();
+            let early = object.GetData(&format);
+            assert!(early.is_err(), "background format reads must not start a transfer");
             probed.send(()).unwrap();
             read.recv().unwrap();
             let mut medium = object.GetData(&format).unwrap();
@@ -595,6 +623,7 @@ mod tests {
         format_ok.recv_timeout(Duration::from_secs(8)).unwrap();
         assert!(rx.try_recv().is_err());
         assert!(!received.exists());
+        shell_extraction(&broker, true);
         go.send(()).unwrap();
         assert!(matches!(input(&mut rx),Input::Paste(r) if r==manifest));
         broker.action(Action::FileOffer(FileOffer {
@@ -627,6 +656,15 @@ mod tests {
         assert!(matches!(input(&mut rx),Input::Applied{revision,success:true} if revision==stream));
         client.join().unwrap();
         assert_eq!(pending.render_calls.load(Ordering::Relaxed), 1, "one provider call must complete the physical paste");
+        shell_extraction(&broker, false);
+        // Synchronous consumers can read files already materialized by the user's paste.
+        unsafe {
+            OleInitialize(None).unwrap();
+            let mut repeated = OleGetClipboard().unwrap().GetData(&file_format()).unwrap();
+            assert_eq!(DragQueryFileW(HDROP(repeated.u.hGlobal.0), u32::MAX, None), 2);
+            ReleaseStgMedium(&mut repeated);
+            OleUninitialize();
+        }
         assert_eq!(std::fs::read(destination.join("one file.txt")).unwrap(), [37]);
         assert_eq!(std::fs::read(destination.join("文档").join("里面.txt")).unwrap(), [82]);
         assert!(rx.try_recv().is_err());
@@ -657,6 +695,7 @@ mod tests {
             let (reply, retained) = mpsc::sync_channel(1);
             broker.sta.send(Command::RetainInstalled(reply));
             let source = retained.recv_timeout(Duration::from_secs(3)).unwrap();
+            shell_extraction(&broker, true);
             let original = source.clone();
             let expected = path.clone();
             let client = std::thread::spawn(move || unsafe {
@@ -754,6 +793,7 @@ mod tests {
 
         let revision = Revision { counter: 2, origin: Uuid::new_v4() };
         broker.action(Action::Advertise { revision, kind: Kind::Files, file_root_count: None });
+        shell_extraction(&broker, true);
         let client = std::thread::spawn(move || unsafe {
             OleInitialize(None).unwrap();
             let marker = Formats::new().unwrap().marker;
@@ -798,6 +838,7 @@ mod tests {
             let revision = Revision { counter: 10, origin: Uuid::new_v4() };
             broker.action(Action::Advertise { revision, kind: Kind::Files, file_root_count: Some(1) });
             eventually(|| broker.shared.active.lock().unwrap().as_ref().is_some_and(|p| p.owned()).then_some(()));
+            shell_extraction(&broker, true);
             let (done, returned) = mpsc::channel();
             let (release, retain) = mpsc::channel();
             let client = std::thread::spawn(move || unsafe {

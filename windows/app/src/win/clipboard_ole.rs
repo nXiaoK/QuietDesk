@@ -1,8 +1,10 @@
 //! OLE clipboard formats and the object retained by consumers while a paste is pending.
 use super::{clipboard_image, util::wide};
 use quietdesk_core::clipboard::{Input, Kind, Payload, Revision};
-use std::os::windows::ffi::OsStrExt;
+use std::ffi::OsString;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::path::{Component, Path, Prefix};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -13,7 +15,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::DataExchange::{GetClipboardOwner, RegisterClipboardFormatW};
 use windows::Win32::System::Memory::*;
-use windows::Win32::System::Ole::{CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::System::Ole::{CF_DIBV5, CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent};
 use windows::Win32::UI::Shell::SHCreateStdEnumFmtEtc;
 use windows::core::{BOOL, HRESULT, Interface, Ref, Result, implement, w};
@@ -23,6 +25,7 @@ pub(super) struct Formats {
     pub png: u16,
     pub virtual_files: [u16; 3],
     pub shell_items: u16,
+    pub preferred_effect: u16,
     pub marker: u16,
     pub exclude: u16,
     pub ignore: u16,
@@ -37,6 +40,7 @@ impl Formats {
             png: register(w!("PNG"))?,
             virtual_files: [register(w!("FileContents"))?, register(w!("FileGroupDescriptorW"))?, register(w!("FileGroupDescriptor"))?],
             shell_items: register(w!("Shell IDList Array"))?,
+            preferred_effect: register(w!("Preferred DropEffect"))?,
             marker: register(w!("local.quietdesk.clipboard-session"))?,
             exclude: register(w!("ExcludeClipboardContentFromMonitorProcessing"))?,
             ignore: register(w!("Clipboard Viewer Ignore"))?,
@@ -49,7 +53,7 @@ impl Formats {
         let mut formats = match kind {
             Kind::Text => vec![CF_UNICODETEXT.0],
             Kind::Png => vec![self.png, CF_DIBV5.0],
-            Kind::Files => vec![CF_HDROP.0],
+            Kind::Files => vec![CF_HDROP.0, self.preferred_effect],
         };
         formats.extend([self.marker, self.exclude]);
         formats
@@ -61,6 +65,21 @@ pub(super) enum Rendered {
     Image { png: Vec<u8>, dib: Vec<u8> },
     Files(Vec<u8>),
 }
+
+// Rust's canonical storage paths use the NT verbatim namespace. Explorer's file
+// clipboard consumes DOS paths. Keep the original spelling when dropping the
+// prefix would change the object (e.g. a trailing dot) or exceed MAX_PATH.
+fn shell_path(path: &Path) -> Vec<u16> {
+    let original: Vec<_> = path.as_os_str().encode_wide().collect();
+    let Some(Component::Prefix(prefix)) = path.components().next() else { return original };
+    let dos = match prefix.kind() {
+        Prefix::VerbatimDisk(_) => original[4..].to_vec(),
+        Prefix::VerbatimUNC(_, _) => [&original[..2], &original[8..]].concat(),
+        _ => return original,
+    };
+    if dos.len() < MAX_PATH as usize && std::fs::canonicalize(OsString::from_wide(&dos)).is_ok_and(|canonical| canonical == path) { dos } else { original }
+}
+
 impl Rendered {
     pub fn build(payload: Payload) -> Option<Self> {
         match payload {
@@ -75,11 +94,11 @@ impl Rendered {
                 drop[..4].copy_from_slice(&20u32.to_le_bytes());
                 drop[16..].copy_from_slice(&1u32.to_le_bytes());
                 for path in paths {
-                    let units = path.as_os_str().encode_wide();
-                    if drop.len() + 2 * (units.clone().count() + 2) > super::clipboard::MAX_DROP_BYTES {
+                    let units = shell_path(&path);
+                    if drop.len() + 2 * (units.len() + 2) > super::clipboard::MAX_DROP_BYTES {
                         return None;
                     }
-                    for unit in units.chain(Some(0)) {
+                    for unit in units.into_iter().chain(Some(0)) {
                         drop.extend_from_slice(&unit.to_le_bytes());
                     }
                 }
@@ -275,6 +294,9 @@ impl IDataObject_Impl for DataObject_Impl {
         let format = self.format(f)?;
         if format == self.formats.marker || format == self.formats.exclude {
             return medium(&[1, 0, 0, 0]);
+        }
+        if format == self.formats.preferred_effect {
+            return medium(&DROPEFFECT_COPY.0.to_le_bytes());
         }
         self.promise.read()?.medium(format, self.formats)
     }

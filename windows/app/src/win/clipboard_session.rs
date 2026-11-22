@@ -620,7 +620,10 @@ mod tests {
         std::fs::create_dir_all(&paths[1]).unwrap();
         std::fs::write(&paths[0], [37]).unwrap();
         std::fs::write(paths[1].join("里面.txt"), [82]).unwrap();
-        broker.action(Action::Apply { revision: stream, manifest: Some(manifest), payload: Payload::Files(paths.clone()), explicit_drop: false });
+        // The protocol stages files beneath a canonicalized Windows directory.
+        // DragQueryFile above must return the ordinary shell paths expected by Explorer.
+        let staged = paths.iter().map(std::fs::canonicalize).collect::<std::io::Result<_>>().unwrap();
+        broker.action(Action::Apply { revision: stream, manifest: Some(manifest), payload: Payload::Files(staged), explicit_drop: false });
         assert!(matches!(input(&mut rx),Input::Applied{revision,success:true} if revision==stream));
         client.join().unwrap();
         assert_eq!(pending.render_calls.load(Ordering::Relaxed), 1, "one provider call must complete the physical paste");

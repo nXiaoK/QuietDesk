@@ -8,14 +8,15 @@ use crate::input::{HostInputTranslator, InjectOp};
 use crate::keymap::MacModifierMapping;
 use crate::media::{Gate, HostFrame, HostMedia, HostMediaEvent, MediaControl, MediaFeedback, MediaOperation};
 use crate::messages::{
-    ControlStatus, HOST_ENDED_REASON, Hello, RemoteInput, SessionPauseRequest, SessionPauseResult, SessionTermination, StreamSettings, StreamSettingsRequest,
-    StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState,
+    ControlStatus, HOST_ENDED_REASON, Hello, InputAction, InputFeedback, InputKind, RemoteInput, SessionPauseRequest, SessionPauseResult, SessionTermination,
+    StreamSettings, StreamSettingsRequest, StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState,
 };
 use crate::peer::{PeerEvent, PeerHandle};
 use crate::video::EncodedFrame;
 use crate::wire::{self, Message, MessageKind};
 use std::collections::VecDeque;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -177,7 +178,15 @@ pub trait HostPlatform {
     }
     /// Stops or resumes frame production; a resumed stream continues with a keyframe of the current screen.
     fn set_paused(&mut self, paused: bool) -> impl Future<Output = Result<()>> + Send;
-    fn inject(&mut self, operations: &[InjectOp]);
+    /// Returns true when the system accepted the complete batch for the shared display.
+    fn inject(&mut self, operations: &[InjectOp]) -> bool;
+    fn supports_input_actions(&self) -> bool {
+        false
+    }
+    /// Dropping the future cancels remaining work. Feedback describes the host's observed lock state.
+    fn input_action(&mut self, _action: InputAction) -> impl Future<Output = Result<InputActionOutcome>> + Send + 'static {
+        std::future::ready(Err(DeskError::platform("当前系统不支持远端键盘动作")))
+    }
     fn clipboard_text(&mut self) -> Option<String>;
     fn set_clipboard_text(&mut self, text: &str) -> Result<()>;
     fn stop(&mut self);
@@ -222,6 +231,15 @@ enum DisplayChange {
     Remote(Uuid, u32),
 }
 
+#[derive(Debug)]
+pub enum InputActionOutcome {
+    Confirmed(InputFeedback),
+    /// Caps was observed, but queued keys cannot safely be sent to the original target.
+    Unconfirmed(InputFeedback),
+}
+
+type PendingInputAction = Pin<Box<dyn Future<Output = Result<InputActionOutcome>> + Send>>;
+
 struct HostSession<'a, P: HostPlatform> {
     peer: &'a PeerHandle,
     platform: &'a mut P,
@@ -230,6 +248,10 @@ struct HostSession<'a, P: HostPlatform> {
     display_subscribed: bool,
     remote_display: Option<u32>,
     translator: HostInputTranslator,
+    input_actions: bool,
+    input_action: Option<PendingInputAction>,
+    queued_input: VecDeque<RemoteInput>,
+    keyboard_needs_click: bool,
     /// `None` until the stream has started.
     state: Option<VideoStreamState>,
     frames: Option<mpsc::UnboundedReceiver<CapturedFrame>>,
@@ -255,6 +277,7 @@ pub async fn run<P: HostPlatform>(
     events: impl Fn(HostEvent),
 ) -> DeskError {
     let translator = HostInputTranslator::new(options.modifiers);
+    let input_actions = platform.supports_input_actions();
     let mut session = HostSession {
         peer: &peer,
         platform,
@@ -263,6 +286,10 @@ pub async fn run<P: HostPlatform>(
         display_subscribed: false,
         remote_display: None,
         translator,
+        input_actions,
+        input_action: None,
+        queued_input: VecDeque::new(),
+        keyboard_needs_click: false,
         state: None,
         frames: None,
         window: Arc::new(Mutex::new(FrameWindow::new(Gate::Open))),
@@ -277,8 +304,7 @@ pub async fn run<P: HostPlatform>(
         termination_subscribed: false,
     };
     let reason = session.serve(&mut incoming, &mut commands, &events).await;
-    let released = session.translator.release_all();
-    session.platform.inject(&released);
+    session.release_input();
     session.platform.stop();
     peer.close();
     reason
@@ -308,6 +334,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 _ = tokio::time::sleep_until(start_by), if self.state.is_none() => self.start(initial, events).await.map(drop),
                 _ = tokio::time::sleep_until(media_deadline.unwrap_or(start_by)), if !self.paused && media_deadline.is_some() => self.tick_media(),
                 frame = next_frame(&mut self.frames) => self.send_frame(frame),
+                feedback = async { self.input_action.as_mut().expect("active input action").await }, if self.input_action.is_some() => self.finish_input_action(feedback),
                 sample = self.cursor.changed(), if !self.paused => match sample {
                     Ok(Some(sample)) => self.cursor.send_sample(self.peer, sample),
                     Ok(None) => Ok(()),
@@ -329,6 +356,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
 
     /// Sends the hello. Its settings are the ones the stream starts with unless the viewer asks first.
     fn announce(&mut self, events: &impl Fn(HostEvent)) -> Result<StreamSettings> {
+        if self.input_actions {
+            self.peer.order_input_echoes(MessageKind::Ping);
+        }
         let (pixel_width, pixel_height) = self.platform.display_size()?;
         self.displays = self.platform.displays()?;
         if let Some(layout) = &self.displays {
@@ -347,6 +377,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 height: i64::from(height),
                 settings: initial,
                 can_control: self.options.allow_control,
+                input_actions: self.input_actions.then_some(true),
                 live_settings: Some(true),
                 control_status_updates: Some(true),
                 extended_video_settings: Some(true),
@@ -557,8 +588,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
     }
 
     async fn replace_display(&mut self, target: u32, quality: StreamSettings, events: &impl Fn(HostEvent)) -> Result<Option<String>> {
-        let released = self.translator.release_all();
-        self.platform.inject(&released);
+        self.release_input();
         self.hold_for_configuration()?;
         let (sender, receiver) = mpsc::unbounded_channel();
         let window = Arc::new(Mutex::new(FrameWindow::new(Gate::Closed)));
@@ -651,8 +681,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
         }
         self.options.allow_control = allowed;
         if !allowed {
-            let released = self.translator.release_all();
-            self.platform.inject(&released);
+            self.release_input();
         }
         if self.control_subscribed {
             self.peer.send(&Message::json(MessageKind::ControlStatus, &ControlStatus { can_control: allowed })?)?;
@@ -660,19 +689,88 @@ impl<P: HostPlatform> HostSession<'_, P> {
         Ok(())
     }
 
+    fn release_input(&mut self) {
+        self.input_action = None;
+        self.queued_input.clear();
+        let released = self.translator.release_all();
+        self.platform.inject(&released);
+    }
+
+    fn require_keyboard_refocus(&mut self) {
+        self.release_input();
+        self.keyboard_needs_click = true;
+    }
+
+    fn perform_input(&mut self, input: &RemoteInput) {
+        let action = input.kind.action();
+        if self.keyboard_needs_click && (action.is_some() || matches!(input.kind, InputKind::KeyDown | InputKind::KeyUp | InputKind::Flags)) {
+            return;
+        }
+        if let Some(action) = action {
+            if self.input_actions {
+                if self.translator.shortcut_keys_held() {
+                    self.require_keyboard_refocus();
+                    return;
+                }
+                let action = self.platform.input_action(action);
+                self.input_action = Some(Box::pin(async move {
+                    tokio::time::timeout(Duration::from_secs(5), action).await.map_err(|_| DeskError::platform("远端键盘状态确认超时"))?
+                }));
+            }
+        } else {
+            let operations = self.translator.translate(input);
+            let accepted = self.platform.inject(&operations);
+            if accepted && self.keyboard_needs_click && operations.iter().any(|op| matches!(op, InjectOp::Button { down: true, .. })) {
+                self.keyboard_needs_click = false;
+            }
+        }
+    }
+
+    fn finish_input_action(&mut self, result: Result<InputActionOutcome>) -> Result<()> {
+        self.input_action = None;
+        let confirmed = matches!(result, Ok(InputActionOutcome::Confirmed(_)));
+        if !confirmed {
+            self.require_keyboard_refocus();
+        }
+        let feedback = match result {
+            Ok(InputActionOutcome::Confirmed(feedback) | InputActionOutcome::Unconfirmed(feedback)) => feedback,
+            Err(_) => return Ok(()),
+        };
+        let message = Message::json(MessageKind::InputStatus, &feedback)?;
+        if message.payload.len() > wire::MAXIMUM_CONTROL_BYTES {
+            self.require_keyboard_refocus();
+            return Ok(());
+        }
+        self.peer.send(&message)?;
+        while self.input_action.is_none()
+            && let Some(input) = self.queued_input.pop_front()
+        {
+            self.perform_input(&input);
+        }
+        Ok(())
+    }
+
     async fn receive(&mut self, message: Message, events: &impl Fn(HostEvent)) -> Result<()> {
         match message.kind {
+            MessageKind::Ping => self.peer.send(&Message::new(MessageKind::Pong, message.payload))?,
             MessageKind::Input => {
-                let input: RemoteInput = message.read_json()?;
+                let mut input: RemoteInput = message.read_json()?;
                 input.validate()?;
+                if !self.input_actions {
+                    input.independent_caps_lock = None;
+                }
                 if self.options.allow_control && !self.paused && self.state.is_some() {
-                    let operations = self.translator.translate(&input);
-                    self.platform.inject(&operations);
+                    if self.input_action.is_none() {
+                        self.perform_input(&input);
+                    } else if self.queued_input.len() < crate::input::INPUT_QUEUE_CAPACITY {
+                        self.queued_input.push_back(input);
+                    } else {
+                        self.require_keyboard_refocus();
+                    }
                 }
             }
             MessageKind::ReleaseInput => {
-                let released = self.translator.release_all();
-                self.platform.inject(&released);
+                self.release_input();
             }
             MessageKind::Acknowledgement => {
                 let sequence = u32::from_be_bytes(message.payload[..].try_into().map_err(|_| DeskError::invalid("画面确认无效"))?);
@@ -708,8 +806,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
             }
             MessageKind::SessionPauseRequest => {
                 let request: SessionPauseRequest = message.read_json()?;
-                let released = self.translator.release_all();
-                self.platform.inject(&released);
+                self.release_input();
                 if self.paused && !request.paused {
                     self.interrupt_media()?;
                 }

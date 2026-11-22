@@ -198,6 +198,7 @@ private final class MacViewer: @unchecked Sendable {
         var readyWithCursor: [MediaStreamID] = []
         var displayRequest: UUID?
         var displayUpdates: [DisplayControl] = []
+        var inputFeedback: [InputFeedback] = []
         var tuning: VideoTuningSession?
         var decoded: [(sequence: UInt32, key: Bool, width: Int, height: Int)] = []
         var received: [UInt32] = []
@@ -306,6 +307,9 @@ private final class MacViewer: @unchecked Sendable {
                 }
                 state.displayUpdates.append(update)
             }
+        case .inputStatus where state.get().hello?.inputActions == true:
+            let feedback = try Wire.readJSON(InputFeedback.self, message.payload)
+            state.update { $0.inputFeedback.append(feedback) }
         case .cursorControl where state.get().hello?.independentCursorV1 == true:
             let control = try CursorControl.read(message.payload)
             try state.update { state in
@@ -467,10 +471,34 @@ private enum SyntheticDisplays {
     static let external = RemoteDisplayInfo(id: 2, name: "Synthetic external", width: 320, height: 240, isMain: false)
 }
 
+private final class SyntheticInputSources: InputSourceAccess {
+    private let english = KeyboardSource(id: "abc", name: "ABC", isChinese: false, isASCII: true)
+    private let chinese = KeyboardSource(id: "pinyin", name: "合成拼音", isChinese: true, isASCII: true)
+    nonisolated let active = Shared("abc")
+    nonisolated let refuse = Shared(false)
+    private var requested: KeyboardSource?
+
+    nonisolated init() {}
+    func enabledSources() -> [KeyboardSource] { [english, chinese] }
+    func currentSource() -> KeyboardSource? { enabledSources().first { $0.id == active.get() } }
+    func prepareContextRefresh() -> InputSourceContextRefresh? { nil }
+    func select(_ source: KeyboardSource) throws {
+        if refuse.get() { throw DeskError.invalid("Synthetic input source rejected") }
+        requested = source
+    }
+    func applyRequestedSource() {
+        if let requested {
+            active.update { $0 = requested.id }
+            self.requested = nil
+        }
+    }
+}
+
 private struct PostedEvent {
     let type: CGEventType
     let keyCode: Int64
     let flags: CGEventFlags
+    let sourceID: String
     let location: CGPoint
     let clicks: Int64
     let button: Int64
@@ -526,23 +554,31 @@ private final class MacHost: @unchecked Sendable {
     private let key: PairingKey
     private let size: (width: Int, height: Int)
     private let injector: InputInjector
+    let keyboard = SyntheticInputSources()
+    private let inputActions: Bool
     private var pump: DispatchSourceTimer?
 
     init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int), advertiseMedia: Bool, cursorImage: CursorImage?,
-         externalPackets: [VideoPacket] = [], on port: NWEndpoint.Port = .any) throws {
+         externalPackets: [VideoPacket] = [], inputActions: Bool = true, on port: NWEndpoint.Port = .any) throws {
         self.advertiseMedia = advertiseMedia
         self.cursorImage = cursorImage
         self.key = key
         self.packets = packets
         self.externalPackets = externalPackets
+        self.inputActions = inputActions
         self.size = size
         let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8)
         let state = Shared(State(applied: VideoStreamState(settings: settings, width: size.width, height: size.height)))
         self.state = state
         if !externalPackets.isEmpty { state.update { $0.displays = [SyntheticDisplays.primary, SyntheticDisplays.external] } }
+        let keyboard = self.keyboard
+        let sources = InputSources(access: keyboard) {
+            await Task.yield()
+            await keyboard.applyRequestedSource()
+        }
         injector = InputInjector(concurrentBounds: CGRect(x: 0, y: 0, width: 1600, height: 900), isTrusted: { true },
             postEvent: { event in
-                let posted = PostedEvent(type: event.type, keyCode: event.getIntegerValueField(.keyboardEventKeycode), flags: event.flags,
+                let posted = PostedEvent(type: event.type, keyCode: event.getIntegerValueField(.keyboardEventKeycode), flags: event.flags, sourceID: keyboard.active.get(),
                     location: event.location, clicks: event.getIntegerValueField(.mouseEventClickState),
                     button: event.getIntegerValueField(.mouseEventButtonNumber),
                     repeated: event.getIntegerValueField(.keyboardEventAutorepeat) != 0,
@@ -553,7 +589,7 @@ private final class MacHost: @unchecked Sendable {
                     if [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged].contains(event.type) { state.pointer = event.location }
                 }
             },
-            capsLockState: { false }, pointerLocation: { state.get().pointer })
+            inputSources: sources, capsLockState: { false }, pointerLocation: { state.get().pointer })
         let parameters = try MediaSecureTransport.tlsParameters(key: key, roles: MediaChannelRole.allCases)
         parameters.allowLocalEndpointReuse = true
         parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: port)
@@ -602,7 +638,7 @@ private final class MacHost: @unchecked Sendable {
                 // The capability set the application announces, with the fields of this Mac filled in.
                 let preferred = StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 20)
                 peer.send(try Wire.json(.hello, Hello(name: "检查用 Mac", width: applied.width, height: applied.height, settings: applied.settings,
-                    canControl: true, preferredSettings: preferred.extendedCompatible, deviceID: UUID(), deviceIdentityExchange: true,
+                    canControl: true, inputActions: self.inputActions ? true : nil, preferredSettings: preferred.extendedCompatible, deviceID: UUID(), deviceIdentityExchange: true,
                     highRefreshVideoSettings: true, preferredHighRefreshSettings: preferred.highRefreshCompatible,
                     sessionEffects: true, sessionPause: true, mediaTransportV1: self.advertiseMedia ? true : nil,
                     independentCursorV1: self.cursorImage == nil ? nil : true,
@@ -622,12 +658,15 @@ private final class MacHost: @unchecked Sendable {
                 peer.close("\(error)")
             }
         }
-        peer.onMessage = { [weak self, weak peer] message in
-            guard let self, let peer else { return }
-            do { try self.handle(message, peer: peer) }
-            catch {
-                self.state.update { $0.failures.append("\(message.kind): \(error)") }
-                peer.close("\(error)")
+        peer.onMessageHandled = { [weak self, weak peer] message, resume in
+            Task {
+                defer { resume() }
+                guard let self, let peer else { return }
+                do { try await self.handle(message, peer: peer) }
+                catch {
+                    self.state.update { $0.failures.append("\(message.kind): \(error)") }
+                    peer.close("\(error)")
+                }
             }
         }
         peer.start()
@@ -653,7 +692,7 @@ private final class MacHost: @unchecked Sendable {
         }
     }
 
-    private func handle(_ message: Message, peer: Peer) throws {
+    private func handle(_ message: Message, peer: Peer) async throws {
         state.update { $0.received.append(message.kind) }
         if advertiseMedia {
             if message.kind == .mediaControl {
@@ -751,8 +790,9 @@ private final class MacHost: @unchecked Sendable {
             state.get().media?.setPaused(request.paused)
         case .input:
             let input = try Wire.readJSON(RemoteInput.self, message.payload)
-            try input.validate()
-            _ = try injector.receiveImmediateOnInputQueue(input, validated: true)
+            if let feedback = try await injector.receive(input) {
+                peer.send(try Wire.json(.inputStatus, feedback))
+            }
         case .releaseInput:
             injector.releaseAllOnInputQueue()
             state.update { $0.released += 1 }
@@ -829,7 +869,11 @@ private func settings(_ event: [String: Any]) -> [Int] {
 
 @main
 private struct WindowsInteropChecks {
-    static func main() {
+    static func main() async {
+        await Task.detached { runChecks() }.value
+    }
+
+    private nonisolated static func runChecks() {
         guard CommandLine.arguments.count == 3 else {
             print("usage: WindowsInteropChecks <quietdesk-probe> <work directory>")
             exit(2)
@@ -1091,6 +1135,44 @@ private struct WindowsInteropChecks {
             }
         }
 
+        run("A Mac viewer receives the Windows host's Caps Lock and layout state after each independent action") {
+            try withWindowsHost(["--synthetic-keyboard"]) { probe, viewer in
+                try until("the Windows host is sharing a picture with keyboard actions") {
+                    let state = viewer.state.get()
+                    return state.hello?.inputActions == true && !state.decoded.isEmpty
+                }
+                var press = CapsLockPress()
+                func action(start: TimeInterval, duration: TimeInterval) throws -> InputFeedback {
+                    _ = press.update(isDown: true, time: start)
+                    guard let kind = press.update(isDown: false, time: start + duration) else { throw Failure("Missing Mac Caps Lock action") }
+                    var input = RemoteInput(kind: kind)
+                    input.independentCapsLock = true
+                    let count = viewer.state.get().inputFeedback.count
+                    try viewer.send(input)
+                    try until("the Windows keyboard status arrives") { viewer.state.get().inputFeedback.count > count }
+                    return viewer.state.get().inputFeedback[count]
+                }
+                let enabled = try action(start: 1, duration: 0.7)
+                try require(enabled.capsLocked && enabled.message == "Synthetic Caps Lock on", "Windows reported the wrong Caps Lock state")
+                var key = RemoteInput(kind: .keyDown)
+                key.keyCode = 8
+                key.independentCapsLock = true
+                try viewer.send(key)
+                try require(try probe.next("inject")["operations"] as? [String] == ["Key { key: Scan { code: 46, extended: false }, down: true }"],
+                            "An ordinary key overwrote the Windows host's Caps Lock with the Mac's flag")
+                key.kind = .keyUp
+                try viewer.send(key)
+                let disabled = try action(start: 2, duration: 0.1)
+                let switched = try action(start: 3, duration: 0.1)
+                try require(!disabled.capsLocked && disabled.message == "Synthetic Caps Lock off"
+                            && !switched.capsLocked && switched.message == "Synthetic layout B", "The Windows host changed layout before releasing Caps Lock")
+                try probe.send(["command": "refuseLayout"])
+                _ = try probe.next("layoutRefusalArmed")
+                let refused = try action(start: 4, duration: 0.1)
+                try require(!refused.capsLocked && refused.message == "Synthetic layout change unconfirmed", "An unconfirmed Windows layout change was reported as successful")
+            }
+        }
+
         run("Mac keys, modifiers, clicks and scrolling reach a Windows host as the keys at the same positions") {
             func operations(_ probe: Probe) throws -> [String] { (try probe.next("inject")["operations"] as? [String]) ?? [] }
             try withWindowsHost { probe, viewer in
@@ -1183,9 +1265,9 @@ private struct WindowsInteropChecks {
             }
         }
 
-        func withMacHost(advertiseMedia: Bool = true, cursorImage: CursorImage? = nil, twoDisplays: Bool = false, viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
+        func withMacHost(advertiseMedia: Bool = true, cursorImage: CursorImage? = nil, twoDisplays: Bool = false, inputActions: Bool = true, viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
             let host = try MacHost(key: key, packets: packets, size: size, advertiseMedia: advertiseMedia, cursorImage: cursorImage,
-                                   externalPackets: twoDisplays ? externalPackets : [])
+                                   externalPackets: twoDisplays ? externalPackets : [], inputActions: inputActions)
             defer { host.stop() }
             let probe = try Probe(probePath, ["viewer", "--code", (viewerKey ?? key).code, "--port", "\(host.port)", "--quality", quality] + extra)
             defer { probe.stop() }
@@ -1366,6 +1448,53 @@ private struct WindowsInteropChecks {
                 let end = try probe.next("ended")
                 try require(end["retryable"] as? Bool == false && end["hostEnded"] as? Bool == false,
                             "Windows accepted a display request sent in the host direction")
+            }
+        }
+
+        run("A Windows viewer uses confirmed Mac keyboard actions and preserves the next key's input source") {
+            func press(_ probe: Probe, start: Int, duration: Int) throws {
+                try probe.send(["command": "capsPress", "down": true, "atMilliseconds": start])
+                try probe.send(["command": "capsPress", "down": false, "atMilliseconds": start + duration])
+            }
+            try withMacHost(["--independent-caps"]) { host, probe in
+                try require(try probe.next("connected")["inputActions"] as? Bool == true, "Windows did not negotiate Mac keyboard actions")
+                _ = try probe.next("frame")
+                try press(probe, start: 100, duration: 600)
+                let upper = try probe.next("inputStatus")
+                try require(upper["capsLocked"] as? Bool == true && upper["message"] as? String == "远端大写锁定已开启", "The Mac's Caps Lock confirmation was lost")
+                try probe.send(["command": "key", "scanCode": 0x1e, "down": true])
+                try until("the Mac injector posts a capitalized letter") {
+                    host.state.get().posted.contains { $0.type == .keyDown && $0.keyCode == 0 && $0.flags.contains(.maskAlphaShift) && $0.sourceID == "abc" }
+                }
+                try probe.send(["command": "key", "scanCode": 0x1e, "down": false])
+                try press(probe, start: 1000, duration: 100)
+                let lower = try probe.next("inputStatus")
+                try require(lower["capsLocked"] as? Bool == false && lower["message"] as? String == "远端大写锁定已关闭" && host.keyboard.active.get() == "abc",
+                            "A short press selected an input source while Caps Lock was still active")
+                try press(probe, start: 2000, duration: 100)
+                try probe.send(["command": "key", "scanCode": 0x30, "down": true, "capsLock": true])
+                let source = try probe.next("inputStatus")
+                try require(source["message"] as? String == "远端输入源已确认：合成拼音" && source["capsLocked"] as? Bool == false,
+                            "Windows did not expose the Mac's confirmed input source")
+                try until("the next key uses the confirmed Mac input source") {
+                    host.state.get().posted.contains { $0.type == .keyDown && $0.keyCode == 11 && !$0.flags.contains(.maskAlphaShift) && $0.sourceID == "pinyin" }
+                }
+                try probe.send(["command": "key", "scanCode": 0x30, "down": false])
+                host.keyboard.refuse.update { $0 = true }
+                try press(probe, start: 3000, duration: 100)
+                let refused = try probe.next("inputStatus")
+                try require((refused["message"] as? String)?.contains("Synthetic input source rejected") == true && refused["capsLocked"] as? Bool == false
+                            && host.keyboard.active.get() == "pinyin", "Windows reported success after the Mac input source refused the request")
+            }
+            try withMacHost(inputActions: false, ["--independent-caps"]) { host, probe in
+                try require(try probe.next("connected")["inputActions"] as? Bool == false, "Windows enabled keyboard actions for an older Mac")
+                try press(probe, start: 1000, duration: 700)
+                try probe.send(["command": "requestClipboard"])
+                _ = try probe.next("clipboardText")
+                try require(!host.state.get().received.contains(.input), "An older Mac received an unnegotiated keyboard action")
+                host.state.get().peer?.send(try Wire.json(.inputStatus, InputFeedback(message: "Unsolicited", capsLocked: true)))
+                try require(try probe.next("ended")["retryable"] as? Bool == false && probe.all("inputStatus").isEmpty,
+                            "Windows trusted an unnegotiated input status")
             }
         }
 

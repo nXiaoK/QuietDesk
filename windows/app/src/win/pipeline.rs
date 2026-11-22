@@ -8,9 +8,9 @@ use super::util::Com;
 use super::{clipboard, inject};
 use quietdesk_core::display::{DisplaySwitch, HostDisplays};
 use quietdesk_core::error::{DeskError, Result};
-use quietdesk_core::host::{FrameSink, HostCursorSample, HostPlatform};
+use quietdesk_core::host::{FrameSink, HostCursorSample, HostPlatform, InputActionOutcome};
 use quietdesk_core::input::InjectOp;
-use quietdesk_core::messages::{StreamSettings, VideoStreamState};
+use quietdesk_core::messages::{InputAction, StreamSettings, VideoStreamState};
 use quietdesk_core::pixel::{Nv12Converter, draw_pointer};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -320,6 +320,15 @@ fn stopped() -> DeskError {
 }
 
 impl HostPlatform for WindowsHost {
+    fn supports_input_actions(&self) -> bool {
+        inject::supports_input_actions()
+    }
+
+    fn input_action(&mut self, action: InputAction) -> impl Future<Output = Result<InputActionOutcome>> + Send + 'static {
+        let display = self.input_display.clone();
+        inject::input_action(action, move || display.lock().unwrap().as_ref().is_some_and(Display::still_at_bounds))
+    }
+
     fn displays(&mut self) -> Result<Option<HostDisplays>> {
         let (reply, answer) = channel();
         self.commands.send(Command::Displays(reply)).map_err(|_| stopped())?;
@@ -366,14 +375,16 @@ impl HostPlatform for WindowsHost {
         answer.await.map_err(|_| stopped())?
     }
 
-    fn inject(&mut self, operations: &[InjectOp]) {
+    fn inject(&mut self, operations: &[InjectOp]) -> bool {
         let area = self.input_display.lock().unwrap().as_ref().filter(|d| d.still_at_bounds()).map(|d| d.bounds);
         if let Some(area) = area {
-            inject::inject(operations, area);
+            inject::inject(operations, area)
         } else {
+            // Clearing held inputs still works after the captured monitor disappears.
             for op in operations.iter().filter(|op| matches!(op, InjectOp::Key { down: false, .. } | InjectOp::Button { down: false, .. })) {
                 inject::inject(std::slice::from_ref(op), RECT::default());
             }
+            false
         }
     }
 

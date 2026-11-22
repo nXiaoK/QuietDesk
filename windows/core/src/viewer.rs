@@ -6,13 +6,14 @@ use crate::display::{DisplayControl, RemoteDisplayInfo};
 use crate::error::{DeskError, Result};
 use crate::media::{DecodeReceipt, MediaControl, MediaStreamId, ViewerMedia, ViewerMediaEvent};
 use crate::messages::{
-    ControlStatus, HOST_ENDED_REASON, Hello, RemoteInput, SessionPauseRequest, SessionPauseResult, SessionTermination, StreamSettings, StreamSettingsRequest,
-    StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState,
+    ControlStatus, HOST_ENDED_REASON, Hello, InputFeedback, RemoteInput, SessionPauseRequest, SessionPauseResult, SessionTermination, StreamSettings,
+    StreamSettingsRequest, StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState,
 };
-use crate::peer::{PeerEvent, PeerHandle};
+use crate::peer::{PeerEvent, PeerHandle, input_echo};
 use crate::reliability::{Attempt, AttemptProgress};
 use crate::video::VideoPacket;
 use crate::wire::{self, Message, MessageKind};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -23,6 +24,7 @@ use uuid::Uuid;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a requested clipboard text is still accepted.
 const CLIPBOARD_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+const INPUT_REPLY_TIMEOUT: Duration = Duration::from_secs(6);
 /// A host that does not confirm a quality change in this time has stopped responding.
 const SETTINGS_REPLY_TIMEOUT: Duration = Duration::from_secs(25);
 
@@ -48,6 +50,7 @@ pub enum ViewerEvent {
         stream: VideoStreamState,
         live_settings: bool,
         session_pause: bool,
+        input_actions: bool,
     },
     /// The stream now has this size and quality; `error` says why a requested change was not applied.
     Stream {
@@ -58,6 +61,8 @@ pub enum ViewerEvent {
     MediaCommitted(MediaStreamId),
     Cursor(Arc<CursorPresentationState>),
     Control(bool),
+    InputStatus(InputFeedback),
+    InputActionTimeout,
     Displays {
         displays: Vec<RemoteDisplayInfo>,
         selected: Option<u32>,
@@ -131,6 +136,11 @@ struct ViewerSession<'a, P: ViewerPlatform> {
     /// The request in flight: its identifier, when it was sent and what it asked for.
     pending_settings: Option<(Uuid, Instant, StreamSettings)>,
     pending_pause: Option<Uuid>,
+    paused: bool,
+    input_reply_deadline: Option<Instant>,
+    queued_input: VecDeque<RemoteInput>,
+    input_echo_sequence: u32,
+    waiting_for_input_echo: bool,
     clipboard_requested: Option<Instant>,
     host_ended: bool,
     progress: &'a AttemptProgress,
@@ -173,6 +183,11 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
         display_request: None,
         pending_settings: None,
         pending_pause: None,
+        paused: false,
+        input_reply_deadline: None,
+        queued_input: VecDeque::new(),
+        input_echo_sequence: 0,
+        waiting_for_input_echo: false,
         clipboard_requested: None,
         host_ended: false,
         progress: &progress,
@@ -183,6 +198,7 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
         let media_by = session.media.as_ref().and_then(ViewerMedia::deadline);
         let cursor_by = session.pending_cursor.map(|(_, deadline)| deadline);
         let display_by = session.display_request.map(|(_, _, deadline)| deadline);
+        let input_by = session.input_reply_deadline;
         let outcome = tokio::select! {
             event = incoming.recv() => match event {
                 Some(PeerEvent::Message(message)) => session.receive(message),
@@ -215,6 +231,7 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
                 session.display_event(Some("切换显示器超时，请稍后重试".into()));
                 Ok(())
             }
+            _ = tokio::time::sleep_until(input_by.unwrap_or(hello_by)), if input_by.is_some() => session.input_timeout(),
         };
         if let Err(error) = outcome {
             let mut end = ViewerEnd::from(error);
@@ -287,12 +304,39 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             }
             MessageKind::ControlStatus if hello.control_status_updates == Some(true) => {
                 let status: ControlStatus = message.read_json()?;
+                self.hello.as_mut().unwrap().can_control = status.can_control;
+                if !status.can_control {
+                    self.cancel_input_replies(false)?;
+                }
                 self.platform.event(ViewerEvent::Control(status.can_control));
+            }
+            MessageKind::InputStatus if hello.input_actions == Some(true) => {
+                let feedback: InputFeedback = message.read_json()?;
+                if let Some(deadline) = self.input_reply_deadline
+                    && !self.waiting_for_input_echo
+                {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return self.input_timeout();
+                    }
+                    self.input_reply_deadline = None;
+                    self.platform.event(ViewerEvent::InputStatus(feedback));
+                    while self.queued_input.front().is_some_and(|next| self.input_reply_deadline.is_none() || next.kind.action().is_none()) {
+                        let input = self.queued_input.pop_front().unwrap();
+                        self.send_input(&input)?;
+                    }
+                }
+            }
+            MessageKind::Pong if hello.input_actions == Some(true) => {
+                if message.payload == input_echo(self.input_echo_sequence) {
+                    self.waiting_for_input_echo = false;
+                }
             }
             MessageKind::SessionPauseResult if hello.session_pause == Some(true) => {
                 let result: SessionPauseResult = message.read_json()?;
                 if self.pending_pause == Some(result.id) {
                     self.pending_pause = None;
+                    self.paused = result.paused;
                     if self.media.is_some() {
                         self.update_media(|media| media.set_paused(result.paused, Instant::now()))?;
                     }
@@ -331,7 +375,11 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             stream,
             live_settings,
             session_pause: hello.session_pause == Some(true),
+            input_actions: hello.input_actions == Some(true),
         });
+        if hello.input_actions == Some(true) {
+            self.peer.order_input_echoes(MessageKind::Pong);
+        }
         if hello.session_termination_v1 == Some(true) {
             self.peer.send(&Message::json(MessageKind::SessionTermination, &SessionTermination { operation: TerminationOperation::Subscribe })?)?;
         }
@@ -388,6 +436,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 || displays.iter().any(|screen| screen.id == selected && (screen.width, screen.height) != (previous.width, previous.height)))
         {
             self.display_revision += 1;
+            self.cancel_input_replies(false)?;
         }
         if let Some(stream) = state {
             if stream.settings.frames_per_second > 60 {
@@ -518,8 +567,29 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 self.request_settings()
             }
             _ if self.hello.is_none() => Ok(()),
-            ViewerCommand::Input(input) => self.peer.send(&Message::json(MessageKind::Input, &input)?),
-            ViewerCommand::ReleaseInput => self.peer.send(&Message::empty(MessageKind::ReleaseInput)),
+            ViewerCommand::Input(mut input) => {
+                let hello = self.hello.as_ref().unwrap();
+                if !hello.can_control || self.paused || self.pending_pause.is_some() || self.display_request.is_some() {
+                    return Ok(());
+                }
+                if hello.input_actions != Some(true) {
+                    if input.kind.action().is_some() {
+                        return Ok(());
+                    }
+                    input.independent_caps_lock = None;
+                }
+                // inputStatus has no request ID. Only one action can be confirmed at a time.
+                if !self.queued_input.is_empty() || (self.input_reply_deadline.is_some() && input.kind.action().is_some()) {
+                    if self.queued_input.len() == crate::input::INPUT_QUEUE_CAPACITY {
+                        return self.input_timeout();
+                    }
+                    self.queued_input.push_back(input);
+                    Ok(())
+                } else {
+                    self.send_input(&input)
+                }
+            }
+            ViewerCommand::ReleaseInput => self.cancel_input_replies(true),
             ViewerCommand::SelectDisplay(id) => {
                 if self.display_request.is_some() || self.selected_display == Some(id) {
                     self.display_event(None);
@@ -530,6 +600,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                     return Ok(());
                 }
                 let request = Uuid::new_v4();
+                self.cancel_input_replies(true)?;
                 self.peer.send(&DisplayControl::Select { id: request, display_id: id }.message()?)?;
                 self.display_request = Some((request, id, Instant::now() + Duration::from_secs(15)));
                 self.display_event(None);
@@ -550,11 +621,41 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                     return Ok(());
                 }
                 let request = SessionPauseRequest { id: Uuid::new_v4(), paused };
+                self.cancel_input_replies(false)?;
                 self.pending_pause = Some(request.id);
                 self.peer.send(&Message::json(MessageKind::SessionPauseRequest, &request)?)
             }
             ViewerCommand::Disconnect => Ok(()),
         }
+    }
+
+    fn cancel_input_replies(&mut self, release: bool) -> Result<()> {
+        let awaiting = self.input_reply_deadline.take().is_some();
+        self.queued_input.clear();
+        if release || awaiting {
+            self.peer.send(&Message::empty(MessageKind::ReleaseInput))?;
+        }
+        if awaiting {
+            // inputStatus carries no request ID. The echo follows all earlier statuses and the release
+            // on the remote connection, so a late result cannot be assigned to the next physical press.
+            self.input_echo_sequence = self.input_echo_sequence.wrapping_add(1);
+            self.waiting_for_input_echo = true;
+            self.peer.send(&Message::new(MessageKind::Ping, input_echo(self.input_echo_sequence).to_vec()))?;
+        }
+        Ok(())
+    }
+
+    fn send_input(&mut self, input: &RemoteInput) -> Result<()> {
+        if input.kind.action().is_some() {
+            self.input_reply_deadline = Some(Instant::now() + INPUT_REPLY_TIMEOUT);
+        }
+        self.peer.send(&Message::json(MessageKind::Input, input)?)
+    }
+
+    fn input_timeout(&mut self) -> Result<()> {
+        self.cancel_input_replies(false)?;
+        self.platform.event(ViewerEvent::InputActionTimeout);
+        Ok(())
     }
 }
 
@@ -587,20 +688,89 @@ mod tests {
         }
     }
 
+    struct Observer(mpsc::UnboundedSender<ViewerEvent>);
+    impl ViewerPlatform for Observer {
+        fn video(&mut self, _: VideoPacket) -> Result<()> {
+            unreachable!()
+        }
+        fn media_video(&mut self, _: VideoPacket, _: MediaStreamId, _: bool) -> Result<()> {
+            unreachable!()
+        }
+        fn event(&mut self, event: ViewerEvent) {
+            self.0.send(event).unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_and_expired_input_status_cannot_be_assigned_to_a_later_press() {
+        let (left, right) = tokio::io::duplex(64 * 1024);
+        let (host, mut from_viewer) = peer::spawn(left, PeerConfig::default());
+        host.order_input_echoes(MessageKind::Ping);
+        let (viewer, incoming) = peer::spawn(right, PeerConfig::default());
+        let (input, commands) = mpsc::unbounded_channel();
+        let (_decoder, acks) = mpsc::unbounded_channel();
+        let (notices, mut events) = mpsc::unbounded_channel();
+        let mut observer = Observer(notices);
+        let quality = StreamSettings::new(1920, 30, 8);
+        let session = run(viewer, incoming, &mut observer, quality, commands, acks);
+        let exchange = async {
+            let hello = serde_json::json!({"version":1,"name":"host","width":1280,"height":720,"settings":quality,"canControl":true,"inputActions":true});
+            host.send(&Message::json(MessageKind::Hello, &hello).unwrap()).unwrap();
+            assert!(matches!(events.recv().await.unwrap(), ViewerEvent::Connected { input_actions: true, .. }));
+            let press = || input.send(ViewerCommand::Input(crate::messages::InputAction::ToggleCapsLock.remote_input())).unwrap();
+            let status = |text: &str| {
+                let feedback = InputFeedback { message: text.into(), caps_locked: true };
+                host.send(&Message::json(MessageKind::InputStatus, &feedback).unwrap()).unwrap();
+                feedback
+            };
+            for expire in [false, true] {
+                press();
+                assert_eq!(next(&mut from_viewer).await.kind, MessageKind::Input);
+                press();
+                input.send(ViewerCommand::RequestClipboard).unwrap();
+                assert_eq!(next(&mut from_viewer).await.kind, MessageKind::RequestClipboard, "the second action waits for feedback");
+                if expire {
+                    tokio::time::advance(INPUT_REPLY_TIMEOUT).await;
+                    loop {
+                        match events.recv().await.unwrap() {
+                            ViewerEvent::InputActionTimeout => break,
+                            ViewerEvent::RoundTrip(_) => {}
+                            other => panic!("expected input timeout, got {other:?}"),
+                        }
+                    }
+                } else {
+                    input.send(ViewerCommand::ReleaseInput).unwrap();
+                }
+                assert_eq!(next(&mut from_viewer).await.kind, MessageKind::ReleaseInput);
+                let fence = next(&mut from_viewer).await;
+                assert_eq!(fence.kind, MessageKind::Ping);
+                press();
+                assert_eq!(next(&mut from_viewer).await.kind, MessageKind::Input);
+                if expire {
+                    host.send(&Message::new(MessageKind::Pong, input_echo(1).to_vec())).unwrap();
+                }
+                status("过期");
+                host.send(&Message::new(MessageKind::Pong, fence.payload)).unwrap();
+                let current = status("当前");
+                loop {
+                    match events.recv().await.unwrap() {
+                        ViewerEvent::InputStatus(actual) => {
+                            assert_eq!(actual, current);
+                            break;
+                        }
+                        ViewerEvent::RoundTrip(_) => {}
+                        other => panic!("unexpected input feedback: {other:?}"),
+                    }
+                }
+            }
+            input.send(ViewerCommand::Disconnect).unwrap();
+        };
+        let (end, ()) = tokio::time::timeout(Duration::from_secs(20), async { tokio::join!(session, exchange) }).await.unwrap();
+        assert!(end.local_stop);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_display_timeout_keeps_the_session_and_ignores_the_late_result() {
-        struct Observer(mpsc::UnboundedSender<ViewerEvent>);
-        impl ViewerPlatform for Observer {
-            fn video(&mut self, _: VideoPacket) -> Result<()> {
-                unreachable!()
-            }
-            fn media_video(&mut self, _: VideoPacket, _: MediaStreamId, _: bool) -> Result<()> {
-                unreachable!()
-            }
-            fn event(&mut self, event: ViewerEvent) {
-                self.0.send(event).unwrap();
-            }
-        }
         let (left, right) = tokio::io::duplex(64 * 1024);
         let (host, mut from_viewer) = peer::spawn(left, PeerConfig::default());
         let (viewer, incoming) = peer::spawn(right, PeerConfig::default());
@@ -613,7 +783,7 @@ mod tests {
         let exchange = async {
             let screens = vec![RemoteDisplayInfo::new(1, "主屏", 1280, 720, true), RemoteDisplayInfo::new(2, "副屏", 720, 1280, false)];
             let hello = serde_json::json!({"version":1,"name":"host","width":1280,"height":720,"settings":quality,
-                "canControl":false,"displaySwitchingV1":true});
+                "canControl":true,"displaySwitchingV1":true,"inputActions":true});
             host.send(&Message::json(MessageKind::Hello, &hello).unwrap()).unwrap();
             assert_eq!(DisplayControl::read(&next(&mut from_viewer).await).unwrap(), DisplayControl::Subscribe);
             let updated = DisplayControl::State {
@@ -628,8 +798,13 @@ mod tests {
             host.send(&updated).unwrap();
             while !matches!(events.recv().await.unwrap(), ViewerEvent::Displays { selected: Some(1), revision: 1, .. }) {}
             input.send(ViewerCommand::SelectDisplay(2)).unwrap();
+            assert_eq!(next(&mut from_viewer).await.kind, MessageKind::ReleaseInput);
             let DisplayControl::Select { id, .. } = DisplayControl::read(&next(&mut from_viewer).await).unwrap() else { panic!("expected a display request") };
             while !matches!(events.recv().await.unwrap(), ViewerEvent::Displays { pending: Some(2), .. }) {}
+            input.send(ViewerCommand::Input(crate::messages::InputAction::SwitchInputSource.remote_input())).unwrap();
+            input.send(ViewerCommand::Input(RemoteInput::new(crate::messages::InputKind::KeyDown))).unwrap();
+            input.send(ViewerCommand::RequestClipboard).unwrap();
+            assert_eq!(next(&mut from_viewer).await.kind, MessageKind::RequestClipboard);
             tokio::time::advance(Duration::from_secs(15)).await;
             while !matches!(events.recv().await.unwrap(), ViewerEvent::Displays { selected: Some(1), pending: None, error: Some(_), .. }) {}
             host.send(
@@ -653,6 +828,7 @@ mod tests {
                 }
             }
             input.send(ViewerCommand::SelectDisplay(2)).unwrap();
+            assert_eq!(next(&mut from_viewer).await.kind, MessageKind::ReleaseInput);
             let DisplayControl::Select { id: retry, .. } = DisplayControl::read(&next(&mut from_viewer).await).unwrap() else {
                 panic!("expected a second request")
             };

@@ -47,6 +47,7 @@ pub struct Settings {
     pub shared_display: Option<u32>,
     pub viewer_quality: usize,
     pub auto_reconnect: bool,
+    pub caps_forwarding: bool,
     pub mac_modifiers: MacModifierMapping,
     pub pc_modifiers: PcModifierMapping,
     pub connections: Vec<Connection>,
@@ -63,6 +64,7 @@ impl Default for Settings {
             shared_display: None,
             viewer_quality: 2,
             auto_reconnect: true,
+            caps_forwarding: false,
             mac_modifiers: MacModifierMapping::default(),
             pc_modifiers: PcModifierMapping::default(),
             connections: Vec::new(),
@@ -152,10 +154,13 @@ mod tests {
         let json = r#"{"port":49123,"hostCode":"test-host","connections":[{"address":"example.invalid","port":49124,"name":"测试电脑","code":"test-code"}]}"#;
         let mut settings: Settings = serde_json::from_str(json).unwrap();
         assert!(settings.auto_reconnect);
+        assert!(!settings.caps_forwarding);
         assert_eq!(settings.port, 49123);
         settings.auto_reconnect = false;
+        settings.caps_forwarding = true;
         let saved: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert!(!saved.auto_reconnect);
+        assert!(saved.caps_forwarding);
         assert_eq!(saved.host_code.as_deref(), Some("test-host"));
         assert_eq!(saved.connections.len(), 1);
         assert_eq!(saved.connections[0].port, 49124);

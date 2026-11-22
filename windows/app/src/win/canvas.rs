@@ -7,7 +7,7 @@ use super::util::{display_label, wide};
 use super::viewer_cursor::ViewerCursor;
 use quietdesk_core::cursor::CursorPresentationState;
 use quietdesk_core::display::RemoteDisplayInfo;
-use quietdesk_core::input::{DoubleClick, PcKeyEvent, ViewerInputTranslator};
+use quietdesk_core::input::{CapsLockPress, DoubleClick, PcKeyEvent, ViewerInputTranslator};
 use quietdesk_core::media::MediaStreamId;
 use quietdesk_core::pairing::PairingKey;
 use quietdesk_core::reliability::{RetryStatus, ViewerControl};
@@ -41,6 +41,7 @@ const WM_SESSION_ENDED: u32 = WM_APP + 3;
 /// Sent to the owner window when a session reports the host's name: the canvas window and the name's text.
 pub const WM_CANVAS_CONNECTED: u32 = WM_APP + 20;
 pub const WM_CANVAS_CLOSED: u32 = WM_APP + 21;
+pub const WM_CAPS_PREFERENCE: u32 = WM_APP + 22;
 const MOVE_TIMER: usize = 1;
 const RETRY_TIMER: usize = 2;
 const IDLE_TIMER: usize = 3;
@@ -52,6 +53,7 @@ const MENU_REQUEST_CLIPBOARD: usize = 102;
 const MENU_DISCONNECT: usize = 103;
 const RETRY_NOW: usize = 104;
 const CANCEL_RETRY: usize = 105;
+const MENU_CAPS_ACTIONS: usize = 106;
 const MENU_QUALITY: usize = 200;
 const MENU_DISPLAY: usize = 300;
 
@@ -138,6 +140,10 @@ struct Canvas {
     held: BTreeSet<(u32, bool)>,
     withheld_keys: BTreeSet<u16>,
     caps_lock: bool,
+    caps_press: CapsLockPress,
+    caps_forwarding: bool,
+    supports_input_actions: bool,
+    session_menu: HMENU,
     hook: Option<HHOOK>,
     pending_move: Option<(f64, f64)>,
     last_move: Instant,
@@ -182,6 +188,7 @@ pub fn open(
         let menu = CreateMenu()?;
         let session = CreatePopupMenu()?;
         AppendMenuW(session, MF_STRING, MENU_FULL_SCREEN, w!("全屏\tCtrl+Alt+Enter"))?;
+        AppendMenuW(session, MF_STRING | MF_GRAYED, MENU_CAPS_ACTIONS, w!("独立转发 Caps Lock（短按切输入法，长按切大写）"))?;
         AppendMenuW(session, MF_STRING, MENU_SEND_CLIPBOARD, w!("发送本机剪贴板文字"))?;
         AppendMenuW(session, MF_STRING, MENU_REQUEST_CLIPBOARD, w!("获取远端剪贴板文字"))?;
         AppendMenuW(session, MF_SEPARATOR, 0, None)?;
@@ -259,6 +266,10 @@ pub fn open(
             held: BTreeSet::new(),
             withheld_keys: BTreeSet::new(),
             caps_lock: false,
+            caps_press: CapsLockPress::default(),
+            caps_forwarding: settings.caps_forwarding,
+            supports_input_actions: false,
+            session_menu: session,
             hook: None,
             pending_move: None,
             last_move: Instant::now(),
@@ -428,10 +439,26 @@ fn retry_title(status: &RetryStatus, now: Instant) -> String {
 }
 
 impl Canvas {
-    fn send(&self, command: ViewerCommand) {
-        let command = command.into();
+    fn send(&self, mut command: ViewerCommand) {
+        if let ViewerCommand::Input(input) = &mut command
+            && self.uses_caps_actions()
+        {
+            input.independent_caps_lock = Some(true);
+        }
         if self.current_generation() {
-            let _ = self.commands.send(command);
+            let _ = self.commands.send(command.into());
+        }
+    }
+
+    fn uses_caps_actions(&self) -> bool {
+        self.caps_forwarding && self.supports_input_actions && self.hook.is_some() && self.controlling() && self.owns_input()
+    }
+
+    fn update_caps_menu(&self) {
+        let enabled = self.connected && self.supports_input_actions;
+        unsafe {
+            let _ = EnableMenuItem(self.session_menu, MENU_CAPS_ACTIONS as u32, if enabled { MF_ENABLED } else { MF_GRAYED });
+            CheckMenuItem(self.session_menu, MENU_CAPS_ACTIONS as u32, if enabled && self.caps_forwarding { MF_CHECKED.0 } else { MF_UNCHECKED.0 });
         }
     }
 
@@ -653,6 +680,7 @@ impl Canvas {
 
     /// Stops forwarding keys and tells the host to let go of everything.
     unsafe fn release(&mut self) {
+        self.caps_press.reset();
         if let Some(hook) = self.hook.take() {
             let _ = unsafe { UnhookWindowsHookEx(hook) };
         }
@@ -681,6 +709,9 @@ impl Canvas {
             self.withheld_keys = (8..=254).filter(|&key| unsafe { GetAsyncKeyState(i32::from(key)) } < 0).collect();
             FOCUSED.set(std::ptr::from_mut(self));
             self.hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) }.ok();
+            if self.hook.is_none() && self.caps_forwarding && self.supports_input_actions {
+                self.set_title("键盘监听未就绪，Caps Lock 独立转发未启用");
+            }
         }
     }
 
@@ -715,8 +746,17 @@ impl Canvas {
             }
             return true;
         }
-        if scan_code == 0x3A && !extended && down && !repeat {
-            self.caps_lock = !self.caps_lock;
+        if scan_code == 0x3A && !extended {
+            if self.uses_caps_actions() {
+                if let Some(action) = self.caps_press.update(down, self.started.elapsed()) {
+                    self.flush_move();
+                    self.send(ViewerCommand::Input(action.remote_input()));
+                }
+                return true;
+            }
+            if down && !repeat {
+                self.caps_lock = !self.caps_lock;
+            }
         }
         self.flush_move();
         let event = PcKeyEvent { scan_code: scan_code as u16, extended, virtual_key: virtual_key as u16, down, repeat };
@@ -737,6 +777,8 @@ impl Canvas {
     unsafe fn retry_event(&mut self, status: RetryStatus, serial: u64) {
         unsafe {
             self.connected = false;
+            self.supports_input_actions = false;
+            self.update_caps_menu();
             let _ = self.displays.update(self.window, &[], None, false);
             self.can_control = false;
             self.release();
@@ -802,7 +844,7 @@ impl Canvas {
 
     unsafe fn session_event(&mut self, event: ViewerEvent) {
         match event {
-            ViewerEvent::Connected { name, can_control, session_pause, .. } => {
+            ViewerEvent::Connected { name, can_control, session_pause, input_actions, .. } => {
                 if self.retry.take().is_some() {
                     unsafe {
                         let _ = KillTimer(Some(self.window), RETRY_TIMER);
@@ -813,6 +855,8 @@ impl Canvas {
                 self.connected = true;
                 self.can_control = can_control;
                 self.supports_pause = session_pause;
+                self.supports_input_actions = input_actions;
+                self.update_caps_menu();
                 self.reconcile_pause();
                 self.set_title(if can_control { "已连接，点击画面开始操作" } else { "已连接 · 仅观看" });
                 let name = wide(&self.name);
@@ -854,6 +898,9 @@ impl Canvas {
             ViewerEvent::Paused { paused, error } => {
                 let request = self.pending_pause.take();
                 self.paused = paused;
+                if paused && self.owns_input() {
+                    unsafe { self.release() };
+                }
                 if let Some(error) = error {
                     self.set_title(&error);
                     if request != Some(self.attention.idle) {
@@ -868,6 +915,16 @@ impl Canvas {
             ViewerEvent::Cursor(state) => {
                 self.latest_cursor = state;
                 unsafe { self.draw() };
+            }
+            ViewerEvent::InputStatus(feedback) => {
+                if self.uses_caps_actions() {
+                    self.set_title(&feedback.message.replace(char::is_control, " "));
+                }
+            }
+            ViewerEvent::InputActionTimeout => {
+                if self.uses_caps_actions() {
+                    self.set_title("未能确认远端键盘状态，请点击远端输入位置后重试");
+                }
             }
             ViewerEvent::RoundTrip(_) | ViewerEvent::MediaCommitted(_) => {}
             ViewerEvent::ClipboardText(text) => match clipboard::set_text(&text) {
@@ -1076,6 +1133,13 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
             }
             WM_COMMAND => match wparam.0 & 0xFFFF {
                 MENU_FULL_SCREEN => canvas.toggle_full_screen(),
+                MENU_CAPS_ACTIONS if canvas.connected && canvas.current_generation() && canvas.supports_input_actions && !canvas.closing => {
+                    canvas.release();
+                    canvas.caps_forwarding = !canvas.caps_forwarding;
+                    canvas.update_caps_menu();
+                    SendMessageW(canvas.owner, WM_CAPS_PREFERENCE, Some(WPARAM(usize::from(canvas.caps_forwarding))), None);
+                    canvas.capture_keyboard();
+                }
                 MENU_SEND_CLIPBOARD if canvas.connected && canvas.current_generation() && !canvas.closing => match clipboard::text() {
                     Some(text) => canvas.send(ViewerCommand::SendClipboard(text)),
                     None => canvas.set_title("本机剪贴板中没有文字"),

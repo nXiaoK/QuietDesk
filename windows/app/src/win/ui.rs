@@ -1,7 +1,7 @@
 //! The main window: connect to another machine, or share this PC.
 
 use super::app::{HostNotice, computer_name, network_runtime, serve_host, start_logging};
-use super::canvas::{self, WM_CANVAS_CLOSED, WM_CANVAS_CONNECTED};
+use super::canvas::{self, WM_CANVAS_CLOSED, WM_CANVAS_CONNECTED, WM_CAPS_PREFERENCE};
 use super::clipboard;
 use super::displays;
 use super::settings::{Connection, QUALITY_LIMITS, Settings, VIEWER_QUALITIES, protect, unprotect};
@@ -475,6 +475,10 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 }
             }
             WM_CANVAS_CLOSED => main.connecting.retain(|(canvas, _)| *canvas != wparam.0 as isize),
+            WM_CAPS_PREFERENCE => {
+                main.settings.caps_forwarding = wparam.0 != 0;
+                main.save();
+            }
             WM_DESTROY => {
                 main.sharing = None;
                 PostQuitMessage(0);

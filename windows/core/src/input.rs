@@ -5,9 +5,32 @@
 //! Mac host means macOS key codes and `NSEvent` modifier flags.
 
 use crate::keymap::{self, MacModifierMapping, PcKey, PcModifierMapping, mac, pc};
-use crate::messages::{InputKind, RemoteInput};
+use crate::messages::{InputAction, InputKind, RemoteInput};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
+
+pub(crate) const INPUT_QUEUE_CAPACITY: usize = 256;
+
+/// Gestures are decided on release so repeated key-downs and cancelled presses have no effect.
+#[derive(Default)]
+pub struct CapsLockPress {
+    started: Option<Duration>,
+}
+
+impl CapsLockPress {
+    pub fn update(&mut self, down: bool, time: Duration) -> Option<InputAction> {
+        if down {
+            self.started.get_or_insert(time);
+            return None;
+        }
+        let held = time.checked_sub(self.started.take()?)?;
+        Some(if held >= Duration::from_millis(600) { InputAction::ToggleCapsLock } else { InputAction::SwitchInputSource })
+    }
+
+    pub fn reset(&mut self) {
+        self.started = None;
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MouseButton {
@@ -82,7 +105,9 @@ impl HostInputTranslator {
     /// The operations for one validated event. Kinds this host did not advertise produce nothing.
     pub fn translate(&mut self, input: &RemoteInput) -> Vec<InjectOp> {
         let mut ops = Vec::new();
+        let independent = input.independent_caps_lock == Some(true);
         match input.kind {
+            InputKind::KeyDown | InputKind::KeyUp | InputKind::Flags if independent && input.key_code == mac::CAPS_LOCK => {}
             InputKind::Flags if input.key_code == mac::CAPS_LOCK => {
                 ops.push(InjectOp::CapsLock(input.flags & mac::FLAG_CAPS_LOCK != 0));
             }
@@ -105,7 +130,9 @@ impl HostInputTranslator {
                     // a modifier change this host never saw must not turn the key into another shortcut.
                     self.adopt_flags(input.flags);
                     self.apply_modifiers(&mut ops);
-                    ops.push(InjectOp::CapsLock(input.flags & mac::FLAG_CAPS_LOCK != 0));
+                    if !independent {
+                        ops.push(InjectOp::CapsLock(input.flags & mac::FLAG_CAPS_LOCK != 0));
+                    }
                     self.keys.insert(key);
                 } else if !self.keys.remove(&key) {
                     return ops;
@@ -139,6 +166,12 @@ impl HostInputTranslator {
             InputKind::Magnify | InputKind::Rotate | InputKind::SmartMagnify | InputKind::SwitchInputSource | InputKind::ToggleCapsLock => {}
         }
         ops
+    }
+
+    /// Keys the host's Caps or Win+Space shortcut would press or combine with.
+    pub(crate) fn shortcut_keys_held(&self) -> bool {
+        const SPACE: PcKey = PcKey::Scan { code: 0x39, extended: false };
+        !self.pc_modifiers.is_empty() || self.keys.contains(&SPACE) || self.keys.contains(&pc::CAPS_LOCK)
     }
 
     /// Releases everything this viewer holds, for a lost focus, a pause or the end of the session.
@@ -353,6 +386,32 @@ mod tests {
 
     fn key(key: PcKey, down: bool) -> InjectOp {
         InjectOp::Key { key, down }
+    }
+
+    #[test]
+    fn caps_lock_release_uses_the_first_press_and_cancelling_forgets_it() {
+        let mut press = CapsLockPress::default();
+        press.update(true, Duration::ZERO);
+        assert_eq!(press.update(false, Duration::from_millis(599)), Some(InputAction::SwitchInputSource));
+        press.update(true, Duration::from_secs(1));
+        press.update(true, Duration::from_millis(1500));
+        assert_eq!(press.update(false, Duration::from_millis(1600)), Some(InputAction::ToggleCapsLock));
+        press.update(true, Duration::from_secs(2));
+        press.reset();
+        assert_eq!(press.update(false, Duration::from_secs(3)), None);
+    }
+
+    #[test]
+    fn independent_caps_preserves_the_host_lock_while_other_modifiers_still_apply() {
+        let mut host = HostInputTranslator::new(MacModifierMapping::Standard);
+        let mut caps = flags_event(mac::CAPS_LOCK, mac::FLAG_CAPS_LOCK);
+        caps.independent_caps_lock = Some(true);
+        assert!(host.translate(&caps).is_empty());
+        let mut key_down = key_event(InputKind::KeyDown, C, mac::FLAG_SHIFT);
+        key_down.independent_caps_lock = Some(true);
+        assert_eq!(host.translate(&key_down), [key(pc::LEFT_SHIFT, true), key(PC_C, true)]);
+        key_down.independent_caps_lock = None;
+        assert!(host.translate(&key_down).contains(&InjectOp::CapsLock(false)));
     }
 
     #[test]

@@ -174,7 +174,7 @@ fn main() {
                         counts.committed = Some(stream);
                         counts.media_pictures = 0;
                     }
-                    if !matches!(event, ViewerEvent::RoundTrip(_)) {
+                    if !matches!(event, ViewerEvent::RoundTrip(_) | ViewerEvent::InputStatus(_)) {
                         println!("viewer {event:?}");
                     }
                 }

@@ -7,11 +7,11 @@
 use quietdesk_core::cursor::CursorImage;
 use quietdesk_core::display::{DisplaySwitch, HostDisplays, RemoteDisplayInfo};
 use quietdesk_core::error::{DeskError, Result};
-use quietdesk_core::host::{self, FrameSink, HostCommand, HostCursorSample, HostEvent, HostOptions, HostPlatform};
-use quietdesk_core::input::{DoubleClick, InjectOp, PcKeyEvent, ViewerInputTranslator};
+use quietdesk_core::host::{self, FrameSink, HostCommand, HostCursorSample, HostEvent, HostOptions, HostPlatform, InputActionOutcome};
+use quietdesk_core::input::{CapsLockPress, DoubleClick, InjectOp, PcKeyEvent, ViewerInputTranslator};
 use quietdesk_core::keymap::{MacModifierMapping, PcModifierMapping};
 use quietdesk_core::media::{DecodeReceipt, MediaStreamId};
-use quietdesk_core::messages::{StreamSettings, VideoStreamState};
+use quietdesk_core::messages::{InputAction, InputFeedback, StreamSettings, VideoStreamState};
 use quietdesk_core::pairing::PairingKey;
 use quietdesk_core::peer::{self, PeerConfig};
 use quietdesk_core::reliability::{self, RetryStatus};
@@ -79,6 +79,7 @@ struct Replay {
     display_id: u32,
     external_attached: bool,
     reject_next_switch: bool,
+    refuse_layout: bool,
 }
 
 const EXTERNAL_SIZE: (u32, u32) = (320, 240);
@@ -92,6 +93,9 @@ struct ReplayHost {
     synthetic_cursor: bool,
     cursor_samples: Option<watch::Sender<Option<HostCursorSample>>>,
     synthetic_displays: bool,
+    synthetic_keyboard: bool,
+    caps_locked: bool,
+    alternate_layout: bool,
 }
 
 impl HostPlatform for ReplayHost {
@@ -173,11 +177,41 @@ impl HostPlatform for ReplayHost {
         Ok(())
     }
 
-    fn inject(&mut self, operations: &[InjectOp]) {
+    fn supports_input_actions(&self) -> bool {
+        self.synthetic_keyboard
+    }
+
+    fn input_action(&mut self, action: InputAction) -> impl Future<Output = Result<InputActionOutcome>> + Send + 'static {
+        if action == InputAction::SwitchInputSource && !self.caps_locked && self.replay.lock().unwrap().refuse_layout {
+            return std::future::ready(Ok(InputActionOutcome::Unconfirmed(InputFeedback {
+                message: "Synthetic layout change unconfirmed".into(),
+                caps_locked: false,
+            })));
+        }
+        let message = match action {
+            InputAction::SwitchInputSource if !self.caps_locked => {
+                self.alternate_layout = !self.alternate_layout;
+                if self.alternate_layout { "Synthetic layout B" } else { "Synthetic layout A" }
+            }
+            _ => {
+                self.caps_locked = !self.caps_locked;
+                if self.caps_locked { "Synthetic Caps Lock on" } else { "Synthetic Caps Lock off" }
+            }
+        };
+        std::future::ready(Ok(InputActionOutcome::Confirmed(InputFeedback { message: message.into(), caps_locked: self.caps_locked })))
+    }
+
+    fn inject(&mut self, operations: &[InjectOp]) -> bool {
+        for operation in operations {
+            if let InjectOp::CapsLock(value) = operation {
+                self.caps_locked = *value;
+            }
+        }
         if !operations.is_empty() {
             let operations: Vec<String> = operations.iter().map(|operation| format!("{operation:?}")).collect();
             emit(json!({ "event": "inject", "operations": operations }));
         }
+        true
     }
 
     fn clipboard_text(&mut self) -> Option<String> {
@@ -236,8 +270,15 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
     let acceptor = tls::Acceptor::new(&key)?;
     let mut lines = input_lines();
 
-    let replay =
-        Arc::new(Mutex::new(Replay { sink: None, next: 0, paused: false, display_id: 1, external_attached: synthetic_displays, reject_next_switch: false }));
+    let replay = Arc::new(Mutex::new(Replay {
+        sink: None,
+        next: 0,
+        paused: false,
+        display_id: 1,
+        external_attached: synthetic_displays,
+        reject_next_switch: false,
+        refuse_layout: false,
+    }));
     let producer = replay.clone();
     tokio::spawn(async move {
         loop {
@@ -271,6 +312,9 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
             synthetic_cursor: arguments.contains_key("synthetic-cursor"),
             cursor_samples: None,
             synthetic_displays,
+            synthetic_keyboard: arguments.contains_key("synthetic-keyboard"),
+            caps_locked: false,
+            alternate_layout: false,
         };
         let report = |event: HostEvent| {
             if let HostEvent::Streaming(stream) = event {
@@ -294,6 +338,10 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
                         Some("rejectNextDisplay") => {
                             replay.lock().unwrap().reject_next_switch = true;
                             emit(json!({ "event": "displayFailureArmed" }));
+                        }
+                        Some("refuseLayout") => {
+                            replay.lock().unwrap().refuse_layout = true;
+                            emit(json!({ "event": "layoutRefusalArmed" }));
                         }
                         Some("end") => { let _ = commands.send(HostCommand::End); }
                         Some("quit") => { let _ = commands.send(HostCommand::End); break ((&mut session).await, true) }
@@ -352,9 +400,11 @@ impl ViewerPlatform for ReportingViewer {
 
     fn event(&mut self, event: ViewerEvent) {
         emit(match event {
-            ViewerEvent::Connected { name, can_control, stream, live_settings, .. } => {
-                json!({ "event": "connected", "name": name, "canControl": can_control, "stream": stream_json(stream), "liveSettings": live_settings })
+            ViewerEvent::Connected { name, can_control, stream, live_settings, input_actions, .. } => {
+                json!({ "event": "connected", "name": name, "canControl": can_control, "stream": stream_json(stream), "liveSettings": live_settings, "inputActions":input_actions })
             }
+            ViewerEvent::InputStatus(feedback) => json!({ "event": "inputStatus", "message": feedback.message, "capsLocked": feedback.caps_locked }),
+            ViewerEvent::InputActionTimeout => json!({ "event": "inputActionTimeout" }),
             ViewerEvent::Stream { stream, error } => json!({ "event": "stream", "stream": stream_json(stream), "error": error }),
             ViewerEvent::MediaCommitted(stream) => json!({
                 "event": "mediaCommitted", "sessionID": stream.session_id.to_string(),
@@ -395,6 +445,11 @@ enum Script {
         repeat: bool,
         #[serde(default)]
         caps_lock: bool,
+    },
+    #[serde(rename_all = "camelCase")]
+    CapsPress {
+        down: bool,
+        at_milliseconds: u64,
     },
     Move {
         x: f64,
@@ -450,14 +505,21 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
     let feedback = Arc::new(Mutex::new(ScriptFeedback::default()));
     let new_translator = || ViewerInputTranslator::new(mapping, DoubleClick { interval: Duration::from_millis(500), distance: 4 });
     let input = Mutex::new(new_translator());
+    let press = Mutex::new(CapsLockPress::default());
+    let independent = arguments.contains_key("independent-caps");
 
     let script = async {
         while let Some(line) = lines.recv().await {
             let mut translator = input.lock().unwrap();
             let command = match serde_json::from_value::<Script>(line) {
                 Ok(Script::Key { scan_code, extended, virtual_key, down, repeat, caps_lock }) => {
-                    let Some(input) = translator.key(PcKeyEvent { scan_code, extended, virtual_key, down, repeat }, caps_lock) else { continue };
+                    let Some(mut input) = translator.key(PcKeyEvent { scan_code, extended, virtual_key, down, repeat }, caps_lock) else { continue };
+                    input.independent_caps_lock = independent.then_some(true);
                     ViewerCommand::Input(input)
+                }
+                Ok(Script::CapsPress { down, at_milliseconds }) => {
+                    let Some(action) = press.lock().unwrap().update(down, Duration::from_millis(at_milliseconds)) else { continue };
+                    ViewerCommand::Input(action.remote_input())
                 }
                 Ok(Script::Move { x, y }) => ViewerCommand::Input(translator.pointer_move(x, y)),
                 Ok(Script::Button { button, down, x, y, at_milliseconds, pixel }) => {
@@ -466,6 +528,7 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
                 Ok(Script::Wheel { vertical, horizontal, x, y }) => ViewerCommand::Input(translator.wheel(vertical, horizontal, x, y)),
                 Ok(Script::Release) => {
                     translator.release_all();
+                    press.lock().unwrap().reset();
                     ViewerCommand::ReleaseInput
                 }
                 Ok(Script::Quality { settings }) => match parse_settings(&settings) {
@@ -525,6 +588,7 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
         |stream, attempt| {
             emit(json!({ "event": "secured" }));
             *input.lock().unwrap() = new_translator();
+            press.lock().unwrap().reset();
             *feedback.lock().unwrap() = ScriptFeedback::default();
             let feedback = feedback.clone();
             async move {

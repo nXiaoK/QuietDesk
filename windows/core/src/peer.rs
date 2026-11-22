@@ -5,7 +5,7 @@ use crate::error::{DeskError, Result};
 use crate::wire::{self, MAXIMUM_MESSAGE_BYTES, Message, MessageKind};
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -43,6 +43,7 @@ enum Outgoing {
 }
 
 struct Shared {
+    ordered_ping_kind: AtomicU8,
     pending_bytes: AtomicUsize,
     last_received: Mutex<Instant>,
     ping: Mutex<Option<(u64, Instant)>>,
@@ -57,6 +58,12 @@ pub struct PeerHandle {
 }
 
 impl PeerHandle {
+    /// A released Mac finishes the preceding input/release handler before echoing the next ping.
+    /// The two Rust roles order these echoes with input, while ordinary heartbeats stay on the I/O task.
+    pub(crate) fn order_input_echoes(&self, kind: MessageKind) {
+        self.shared.ordered_ping_kind.store(kind as u8, Ordering::Release);
+    }
+
     /// Queues a message behind those already queued. An error means the message itself cannot be sent;
     /// a connection that has closed drops it, and `PeerEvent::Closed` tells the session why it closed.
     pub fn send(&self, message: &Message) -> Result<()> {
@@ -79,6 +86,12 @@ impl PeerHandle {
     pub async fn finished(&self) {
         let _ = self.finished.clone().wait_for(|finished| *finished).await;
     }
+}
+
+pub(crate) fn input_echo(sequence: u32) -> [u8; 8] {
+    let mut bytes = *b"QDIN0000";
+    bytes[4..].copy_from_slice(&sequence.to_be_bytes());
+    bytes
 }
 
 struct ActivityReader<R> {
@@ -110,7 +123,12 @@ where
     // A full channel stops reading, which lets TCP push back on a peer that sends faster than the session consumes.
     let (events, incoming) = mpsc::channel(32);
     let (finish, finished) = watch::channel(false);
-    let shared = Arc::new(Shared { pending_bytes: AtomicUsize::new(0), last_received: Mutex::new(Instant::now()), ping: Mutex::new(None) });
+    let shared = Arc::new(Shared {
+        ordered_ping_kind: AtomicU8::new(0),
+        pending_bytes: AtomicUsize::new(0),
+        last_received: Mutex::new(Instant::now()),
+        ping: Mutex::new(None),
+    });
     let handle = PeerHandle { outgoing, shared: shared.clone(), finished };
 
     let read_handle = handle.clone();
@@ -123,12 +141,15 @@ where
                 Ok(None) => return DeskError::Network("对方已断开连接".to_string()),
                 Err(error) => return error,
             };
+            let ordered = read_handle.shared.ordered_ping_kind.load(Ordering::Acquire) == message.kind as u8
+                && message.payload.len() == 8
+                && message.payload.starts_with(b"QDIN");
             match message.kind {
-                MessageKind::Ping => {
+                MessageKind::Ping if !ordered => {
                     let echo = if message.payload.len() == 8 { message.payload } else { Vec::new() };
                     let _ = read_handle.send(&Message::new(MessageKind::Pong, echo));
                 }
-                MessageKind::Pong => {
+                MessageKind::Pong if !ordered => {
                     let sent = read_handle.shared.ping.lock().unwrap().take_if(|(identifier, _)| identifier.to_be_bytes()[..] == message.payload[..]);
                     if let Some((_, sent)) = sent {
                         let _ = read_events.send(PeerEvent::RoundTrip(sent.elapsed().as_secs_f64() * 1000.0)).await;

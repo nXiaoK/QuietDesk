@@ -3,11 +3,11 @@
 
 use quietdesk_core::display::{DisplaySwitch, HostDisplays, RemoteDisplayInfo};
 use quietdesk_core::error::{DeskError, Result};
-use quietdesk_core::host::{self, FrameSink, HostCommand, HostEvent, HostOptions, HostPlatform};
+use quietdesk_core::host::{self, FrameSink, HostCommand, HostEvent, HostOptions, HostPlatform, InputActionOutcome};
 use quietdesk_core::input::InjectOp;
 use quietdesk_core::keymap::MacModifierMapping;
 use quietdesk_core::media::{DecodeReceipt, MediaControl, MediaFrame, MediaOperation, MediaStreamId, ViewerMedia, ViewerMediaEvent};
-use quietdesk_core::messages::{InputKind, RemoteInput, StreamSettings, VideoStreamState};
+use quietdesk_core::messages::{InputAction, InputFeedback, InputKind, RemoteInput, StreamSettings, VideoStreamState};
 use quietdesk_core::peer::{self, PeerConfig, PeerEvent};
 use quietdesk_core::video::{EncodedFrame, VideoPacket};
 use quietdesk_core::viewer::{self, ViewerCommand, ViewerEnd, ViewerEvent, ViewerPlatform};
@@ -30,6 +30,9 @@ struct HostLog {
     selected: u32,
     refused_display: Option<u32>,
     switched: Vec<u32>,
+    actions: Vec<(InputAction, tokio::sync::oneshot::Sender<Result<InputActionOutcome>>)>,
+    supports_actions: bool,
+    refuse_next_button_down: bool,
 }
 
 struct Capture {
@@ -45,6 +48,15 @@ struct FakeHost {
 }
 
 impl HostPlatform for FakeHost {
+    fn supports_input_actions(&self) -> bool {
+        self.log.lock().unwrap().supports_actions
+    }
+
+    fn input_action(&mut self, action: InputAction) -> impl Future<Output = Result<InputActionOutcome>> + Send + 'static {
+        let (complete, result) = tokio::sync::oneshot::channel();
+        self.log.lock().unwrap().actions.push((action, complete));
+        async move { result.await.unwrap() }
+    }
     fn display_size(&mut self) -> Result<(u32, u32)> {
         let log = self.log.lock().unwrap();
         Ok(log.displays.iter().find(|screen| screen.id == log.selected).map_or((2560, 1440), |screen| (screen.width, screen.height)))
@@ -107,8 +119,14 @@ impl HostPlatform for FakeHost {
         Ok(())
     }
 
-    fn inject(&mut self, operations: &[InjectOp]) {
-        self.log.lock().unwrap().injected.extend_from_slice(operations);
+    fn inject(&mut self, operations: &[InjectOp]) -> bool {
+        let mut log = self.log.lock().unwrap();
+        if log.refuse_next_button_down && operations.iter().any(|op| matches!(op, InjectOp::Button { down: true, .. })) {
+            log.refuse_next_button_down = false;
+            return false;
+        }
+        log.injected.extend_from_slice(operations);
+        true
     }
 
     fn clipboard_text(&mut self) -> Option<String> {
@@ -276,6 +294,7 @@ where
         refuse,
         displays: vec![RemoteDisplayInfo::new(1, "横屏", 2560, 1440, true), RemoteDisplayInfo::new(2, "竖屏", 1080, 1920, false)],
         selected: 1,
+        supports_actions: true,
         ..HostLog::default()
     }));
     let sink = Arc::new(Mutex::new(None));
@@ -345,7 +364,12 @@ async fn a_session_negotiates_streams_controls_and_ends_as_the_macos_roles_do() 
             assert_eq!(
                 log.events[0],
                 ViewerEvent::Connected {
-                    name: "检查用电脑".to_string(), can_control: true, stream: hello_stream, live_settings: true, session_pause: true
+                    name: "检查用电脑".to_string(),
+                    can_control: true,
+                    stream: hello_stream,
+                    live_settings: true,
+                    session_pause: true,
+                    input_actions: true
                 }
             );
             assert!(log.events.contains(&ViewerEvent::Control(true)), "the viewer subscribed to control changes");
@@ -469,6 +493,143 @@ async fn updating_the_display_list_or_confirming_the_same_local_screen_keeps_the
         fixture.viewer_commands.send(ViewerCommand::Disconnect).unwrap();
     })
     .await;
+}
+
+#[tokio::test]
+async fn keys_wait_for_the_confirmed_input_action_and_revoking_control_cancels_the_next_one() {
+    run_sessions(StreamSettings::new(1920, 30, 8), None, |fixture| async move {
+        until("the stream is ready", || !fixture.viewer_log.lock().unwrap().commits.is_empty()).await;
+        let action = |kind: InputAction| fixture.viewer_commands.send(ViewerCommand::Input(kind.remote_input())).unwrap();
+        let mut key = RemoteInput::new(InputKind::KeyDown);
+        key.key_code = 8;
+        key.independent_caps_lock = Some(true);
+        action(InputAction::SwitchInputSource);
+        fixture.viewer_commands.send(ViewerCommand::Input(key.clone())).unwrap();
+        fixture.viewer_commands.send(ViewerCommand::RequestClipboard).unwrap();
+        until("the host processed commands following the input", || fixture.has_event(&ViewerEvent::ClipboardText("来自被控端".into()))).await;
+        assert!(fixture.host_log.lock().unwrap().injected.is_empty());
+        let (sent, complete) = fixture.host_log.lock().unwrap().actions.pop().unwrap();
+        assert_eq!(sent, InputAction::SwitchInputSource);
+        let confirmed = InputFeedback { message: "已确认合成输入源".into(), caps_locked: false };
+        complete.send(Ok(InputActionOutcome::Confirmed(confirmed.clone()))).unwrap();
+        until("the viewer receives actual feedback", || fixture.has_event(&ViewerEvent::InputStatus(confirmed.clone()))).await;
+        let pressed = InjectOp::Key { key: quietdesk_core::keymap::PcKey::Scan { code: 0x2E, extended: false }, down: true };
+        assert_eq!(fixture.host_log.lock().unwrap().injected, [pressed]);
+        action(InputAction::ToggleCapsLock);
+        key.key_code = 0;
+        fixture.viewer_commands.send(ViewerCommand::Input(key)).unwrap();
+        until("the second action started", || !fixture.host_log.lock().unwrap().actions.is_empty()).await;
+        let (_, cancelled) = fixture.host_log.lock().unwrap().actions.pop().unwrap();
+        fixture.host_commands.send(HostCommand::AllowControl(false)).unwrap();
+        until("the viewer learns that control was revoked", || fixture.has_event(&ViewerEvent::Control(false))).await;
+        assert!(cancelled.is_closed());
+        assert_eq!(fixture.host_log.lock().unwrap().injected.len(), 2, "only the previously held C key was released");
+        fixture.viewer_commands.send(ViewerCommand::Disconnect).unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_unconfirmed_action_blocks_keyboard_input_until_a_real_pointer_press() {
+    run_sessions(StreamSettings::new(1920, 30, 8), None, |fixture| async move {
+        until("the stream is ready", || !fixture.viewer_log.lock().unwrap().commits.is_empty()).await;
+        let send = |input| fixture.viewer_commands.send(ViewerCommand::Input(input)).unwrap();
+        let mut key = RemoteInput::new(InputKind::KeyDown);
+        key.key_code = 8;
+        key.independent_caps_lock = Some(true);
+        send(InputAction::SwitchInputSource.remote_input());
+        send(key.clone());
+        fixture.viewer_commands.send(ViewerCommand::RequestClipboard).unwrap();
+        until("the host has read the queued key", || fixture.has_event(&ViewerEvent::ClipboardText("来自被控端".into()))).await;
+        let (_, complete) = fixture.host_log.lock().unwrap().actions.pop().unwrap();
+        let feedback = InputFeedback { message: "请点击远端输入位置后继续".into(), caps_locked: true };
+        complete.send(Ok(InputActionOutcome::Unconfirmed(feedback.clone()))).unwrap();
+        until("the failure includes the observed Caps state", || fixture.has_event(&ViewerEvent::InputStatus(feedback.clone()))).await;
+        fixture.host_log.lock().unwrap().refuse_next_button_down = true;
+        send(RemoteInput::new(InputKind::Move));
+        send(key.clone());
+        let mut flags = RemoteInput::new(InputKind::Flags);
+        flags.key_code = quietdesk_core::keymap::mac::SHIFT;
+        flags.flags = quietdesk_core::keymap::mac::FLAG_SHIFT;
+        send(flags);
+        send(InputAction::ToggleCapsLock.remote_input());
+        fixture.viewer_commands.send(ViewerCommand::ReleaseInput).unwrap();
+        send(key.clone());
+        send(RemoteInput::new(InputKind::Down));
+        send(RemoteInput::new(InputKind::Up));
+        send(key.clone());
+        send(RemoteInput::new(InputKind::Down));
+        send(RemoteInput::new(InputKind::Up));
+        send(key);
+        let pressed = InjectOp::Key { key: quietdesk_core::keymap::PcKey::Scan { code: 0x2e, extended: false }, down: true };
+        until("typing resumes after the click", || fixture.host_log.lock().unwrap().injected.contains(&pressed)).await;
+        {
+            use quietdesk_core::input::MouseButton;
+            let log = fixture.host_log.lock().unwrap();
+            let accepted_click = log.injected.iter().position(|op| *op == InjectOp::Button { button: MouseButton::Left, down: true }).unwrap();
+            assert!(log.injected[..accepted_click].iter().all(|op| !matches!(op, InjectOp::Key { .. })));
+            assert_eq!(log.injected.iter().filter(|op| matches!(op, InjectOp::Key { .. })).collect::<Vec<_>>(), [&pressed]);
+            assert!(log.actions.is_empty());
+        }
+        fixture.viewer_commands.send(ViewerCommand::Disconnect).unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_forwarded_modifier_cannot_combine_with_the_platform_shortcut() {
+    run_sessions(StreamSettings::new(1920, 30, 8), None, |fixture| async move {
+        until("the stream is ready", || !fixture.viewer_log.lock().unwrap().commits.is_empty()).await;
+        let mut flags = RemoteInput::new(InputKind::Flags);
+        flags.key_code = quietdesk_core::keymap::mac::SHIFT;
+        flags.flags = quietdesk_core::keymap::mac::FLAG_SHIFT;
+        fixture.viewer_commands.send(ViewerCommand::Input(flags)).unwrap();
+        fixture.viewer_commands.send(ViewerCommand::Input(InputAction::SwitchInputSource.remote_input())).unwrap();
+        fixture.viewer_commands.send(ViewerCommand::RequestClipboard).unwrap();
+        until("the host handled the action", || fixture.has_event(&ViewerEvent::ClipboardText("来自被控端".into()))).await;
+        {
+            let log = fixture.host_log.lock().unwrap();
+            assert!(log.actions.is_empty());
+            let shift = quietdesk_core::keymap::pc::LEFT_SHIFT;
+            assert_eq!(log.injected, [InjectOp::Key { key: shift, down: true }, InjectOp::Key { key: shift, down: false }]);
+        }
+        fixture.viewer_commands.send(ViewerCommand::Disconnect).unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_unavailable_input_action_cannot_disable_legacy_caps_synchronization() {
+    use quietdesk_core::messages::Hello;
+    let (left, right) = tokio::io::duplex(64 * 1024);
+    let (host, incoming) = peer::spawn(left, PeerConfig::default());
+    let (viewer, mut messages) = peer::spawn(right, PeerConfig::default());
+    let log = Arc::new(Mutex::new(HostLog::default()));
+    let mut platform = FakeHost { log: log.clone(), sink: Arc::default() };
+    let (commands, queue) = mpsc::unbounded_channel();
+    let exchange = async {
+        let hello = next_message(&mut messages).await;
+        assert_eq!(hello.kind, MessageKind::Hello);
+        assert!(hello.read_json::<Hello>().unwrap().input_actions.is_none());
+        until("capture starts", || !log.lock().unwrap().configured.is_empty()).await;
+        let mut key = RemoteInput::new(InputKind::KeyDown);
+        key.key_code = 8;
+        key.flags = quietdesk_core::keymap::mac::FLAG_CAPS_LOCK;
+        key.independent_caps_lock = Some(true);
+        for input in [InputAction::ToggleCapsLock.remote_input(), key] {
+            viewer.send(&Message::json(MessageKind::Input, &input).unwrap()).unwrap();
+        }
+        until("the legacy key is injected", || !log.lock().unwrap().injected.is_empty()).await;
+        {
+            let log = log.lock().unwrap();
+            assert!(log.actions.is_empty());
+            assert_eq!(log.injected[0], InjectOp::CapsLock(true));
+        }
+        commands.send(HostCommand::End).unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(host::run(host, incoming, &mut platform, host_options(), queue, |_| {}), exchange) })
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

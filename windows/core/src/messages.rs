@@ -90,6 +90,8 @@ pub struct Hello {
     pub height: i64,
     pub settings: StreamSettings,
     pub can_control: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_actions: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_settings: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -265,6 +267,40 @@ pub enum InputKind {
     ToggleCapsLock,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputAction {
+    SwitchInputSource,
+    ToggleCapsLock,
+}
+
+impl InputAction {
+    pub fn remote_input(self) -> RemoteInput {
+        let mut input = RemoteInput::new(match self {
+            Self::SwitchInputSource => InputKind::SwitchInputSource,
+            Self::ToggleCapsLock => InputKind::ToggleCapsLock,
+        });
+        input.independent_caps_lock = Some(true);
+        input
+    }
+}
+
+impl InputKind {
+    pub fn action(self) -> Option<InputAction> {
+        match self {
+            Self::SwitchInputSource => Some(InputAction::SwitchInputSource),
+            Self::ToggleCapsLock => Some(InputAction::ToggleCapsLock),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputFeedback {
+    pub message: String,
+    pub caps_locked: bool,
+}
+
 /// One pointer or keyboard event. Positions are fractions of the shared display, key codes are macOS
 /// virtual key codes and `flags` are `NSEvent.ModifierFlags` bits, whichever platform sends them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -280,6 +316,8 @@ pub struct RemoteInput {
     pub delta_y: f64,
     pub clicks: i64,
     pub is_repeat: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub independent_caps_lock: Option<bool>,
     /// Line deltas of a wheel without precise deltas; `delta_x`/`delta_y` then carry the pixel equivalent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_delta_x: Option<f64>,
@@ -305,6 +343,7 @@ impl RemoteInput {
             delta_y: 0.0,
             clicks: 1,
             is_repeat: false,
+            independent_caps_lock: None,
             line_delta_x: None,
             line_delta_y: None,
         }
@@ -384,6 +423,7 @@ mod tests {
             height: 1080,
             settings: StreamSettings::new(1920, 30, 8),
             can_control: true,
+            input_actions: None,
             live_settings: Some(true),
             control_status_updates: None,
             extended_video_settings: None,

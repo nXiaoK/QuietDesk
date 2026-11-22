@@ -7,7 +7,7 @@ use quietdesk_core::host::{self, FrameSink, HostCommand, HostEvent, HostOptions,
 use quietdesk_core::input::InjectOp;
 use quietdesk_core::keymap::MacModifierMapping;
 use quietdesk_core::media::{DecodeReceipt, MediaControl, MediaFrame, MediaOperation, MediaStreamId, ViewerMedia, ViewerMediaEvent};
-use quietdesk_core::messages::{InputAction, InputFeedback, InputKind, RemoteInput, StreamSettings, VideoStreamState};
+use quietdesk_core::messages::{DeviceIdentity, Hello, InputAction, InputFeedback, InputKind, RemoteInput, StreamSettings, VideoStreamState};
 use quietdesk_core::peer::{self, PeerConfig, PeerEvent};
 use quietdesk_core::video::{EncodedFrame, VideoPacket};
 use quietdesk_core::viewer::{self, ViewerCommand, ViewerEnd, ViewerEvent, ViewerPlatform};
@@ -205,6 +205,7 @@ struct ViewerLog {
 struct FakeViewer {
     log: Arc<Mutex<ViewerLog>>,
     acknowledgements: mpsc::UnboundedSender<DecodeReceipt>,
+    identity: Option<DeviceIdentity>,
 }
 
 impl FakeViewer {
@@ -220,6 +221,9 @@ impl FakeViewer {
 }
 
 impl ViewerPlatform for FakeViewer {
+    fn local_identity(&self) -> Option<&DeviceIdentity> {
+        self.identity.as_ref()
+    }
     fn video(&mut self, packet: VideoPacket) -> Result<()> {
         let receipt = DecodeReceipt::Legacy(packet.sequence);
         self.receive(packet, receipt);
@@ -323,7 +327,7 @@ where
     let mut host_platform = FakeHost { log: host_log.clone(), sink: sink.clone() };
     let viewer_log = Arc::new(Mutex::new(ViewerLog::default()));
     let (acknowledgements, acknowledged) = mpsc::unbounded_channel();
-    let mut viewer_platform = FakeViewer { log: viewer_log.clone(), acknowledgements: acknowledgements.clone() };
+    let mut viewer_platform = FakeViewer { log: viewer_log.clone(), acknowledgements: acknowledgements.clone(), identity: None };
     let (host_commands, host_command_queue) = mpsc::unbounded_channel();
     let (viewer_commands, viewer_command_queue) = mpsc::unbounded_channel();
     let host_events = Arc::new(Mutex::new(Vec::new()));
@@ -352,6 +356,7 @@ where
 fn host_options() -> HostOptions {
     HostOptions {
         name: "检查用电脑".to_string(),
+        device_id: None,
         allow_control: true,
         clipboard: true,
         preferred: StreamSettings::new(1920, 30, 8),
@@ -387,6 +392,7 @@ async fn a_session_negotiates_streams_controls_and_ends_as_the_macos_roles_do() 
                 log.events[0],
                 ViewerEvent::Connected {
                     name: "检查用电脑".to_string(),
+                    device_id: None,
                     can_control: true,
                     stream: hello_stream,
                     live_settings: true,
@@ -861,6 +867,114 @@ async fn next_message(messages: &mut mpsc::Receiver<PeerEvent>) -> Message {
 }
 
 #[tokio::test]
+async fn a_host_binds_the_first_viewer_id_and_accepts_a_later_name_without_granting_control() {
+    use quietdesk_core::messages::ControlStatus;
+    for enabled in [false, true] {
+        let (left, right) = tokio::io::duplex(16 * 1024);
+        let (host, incoming) = peer::spawn(left, PeerConfig::default());
+        let (viewer, mut replies) = peer::spawn(right, PeerConfig::default());
+        let mut platform = FakeHost { log: Arc::default(), sink: Arc::default() };
+        let (_commands, queue) = mpsc::unbounded_channel();
+        let local_id = enabled.then(uuid::Uuid::new_v4);
+        let options = HostOptions { device_id: local_id, allow_control: false, ..host_options() };
+        let remote_id = uuid::Uuid::new_v4();
+        let mut notices = Vec::new();
+        let (events, mut observed) = mpsc::unbounded_channel();
+        let exchange = async {
+            let hello: Hello = next_message(&mut replies).await.read_json().unwrap();
+            assert_eq!((hello.device_id, hello.device_identity_exchange), (local_id, enabled.then_some(true)));
+            let announce = |id: uuid::Uuid, name: &str| {
+                viewer.send(&Message::json(MessageKind::DeviceIdentity, &DeviceIdentity { id, name: name.into() }).unwrap()).unwrap()
+            };
+            announce(remote_id, "  首个\n设备 ");
+            if enabled {
+                announce(remote_id, "首个 设备");
+                announce(remote_id, "已改名");
+                viewer.send(&Message::empty(MessageKind::ControlStatus)).unwrap();
+                let status = next_message(&mut replies).await;
+                assert_eq!(status.kind, MessageKind::ControlStatus);
+                assert!(!status.read_json::<ControlStatus>().unwrap().can_control);
+                announce(uuid::Uuid::new_v4(), "冒名设备");
+            }
+        };
+        let (end, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                host::run(host, incoming, &mut platform, options, queue, |notice| {
+                    let _ = events.send(notice);
+                }),
+                exchange
+            )
+        })
+        .await
+        .unwrap();
+        while let Ok(notice) = observed.try_recv() {
+            if let HostEvent::ViewerIdentity(identity) = notice {
+                notices.push(identity);
+            }
+        }
+        assert!(!end.is_retryable());
+        if enabled {
+            assert_eq!(end.to_string(), "连接中的设备标识发生变化");
+            assert_eq!(notices, [DeviceIdentity { id: remote_id, name: "首个 设备".into() }, DeviceIdentity { id: remote_id, name: "已改名".into() }]);
+        } else {
+            assert!(notices.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_viewer_exchanges_only_an_available_local_identity_and_treats_the_host_id_as_metadata() {
+    let host_id = uuid::Uuid::new_v4();
+    let viewer_id = uuid::Uuid::new_v4();
+    for (id, exchange_id, local) in
+        [(Some(host_id), None, true), (Some(host_id), Some(false), true), (None, Some(true), true), (Some(host_id), Some(true), false)]
+    {
+        let (left, right) = tokio::io::duplex(16 * 1024);
+        let (host, mut replies) = peer::spawn(left, PeerConfig::default());
+        let (viewer, incoming) = peer::spawn(right, PeerConfig::default());
+        let (commands, queue) = mpsc::unbounded_channel();
+        let (acknowledgements, decoded) = mpsc::unbounded_channel();
+        let log = Arc::new(Mutex::new(ViewerLog::default()));
+        let mut platform =
+            FakeViewer { log: log.clone(), acknowledgements, identity: local.then(|| DeviceIdentity { id: viewer_id, name: "本机\r名字".into() }) };
+        let quality = StreamSettings::new(1920, 30, 8);
+        let exchange = async {
+            let mut hello = serde_json::json!({"version":1,"name":"主机\n名字","width":1280,"height":720,"settings":quality,"canControl":false});
+            if let Some(id) = id {
+                hello["deviceID"] = serde_json::json!(id);
+            }
+            if let Some(exchange_id) = exchange_id {
+                hello["deviceIdentityExchange"] = serde_json::json!(exchange_id);
+            }
+            host.send(&Message::json(MessageKind::Hello, &hello).unwrap()).unwrap();
+            until("the remote display name and optional ID are delivered", || {
+                log.lock()
+                    .unwrap()
+                    .events
+                    .iter()
+                    .any(|notice| matches!(notice,ViewerEvent::Connected{device_id,name,..} if *device_id==id && name=="主机 名字"))
+            })
+            .await;
+            commands.send(ViewerCommand::ReleaseInput).unwrap();
+            if exchange_id == Some(true) && local {
+                let identity = next_message(&mut replies).await;
+                assert_eq!(identity.kind, MessageKind::DeviceIdentity);
+                assert_eq!(identity.read_json::<DeviceIdentity>().unwrap(), DeviceIdentity { id: viewer_id, name: "本机 名字".into() });
+            }
+            assert_eq!(next_message(&mut replies).await.kind, MessageKind::ReleaseInput);
+            // Only viewers send message 21; even a correctly encoded identity from this host is invalid.
+            host.send(&Message::json(MessageKind::DeviceIdentity, &DeviceIdentity { id: host_id, name: "主机".into() }).unwrap()).unwrap();
+        };
+        let (end, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(viewer::run(viewer, incoming, &mut platform, quality, queue, decoded), exchange)
+        })
+        .await
+        .unwrap();
+        assert!(!end.retryable && !end.host_ended && !end.local_stop);
+    }
+}
+
+#[tokio::test]
 async fn a_prepare_before_the_first_settings_keeps_its_transaction_until_capture_starts() {
     let (host_stream, viewer_stream) = tokio::io::duplex(64 * 1024);
     let (host, incoming) = peer::spawn(host_stream, PeerConfig::default());
@@ -897,7 +1011,7 @@ async fn an_old_host_gets_legacy_acknowledgements_and_cannot_send_unnegotiated_m
         let log = Arc::new(Mutex::new(ViewerLog::default()));
         let (acknowledgements, decoded) = mpsc::unbounded_channel();
         let (commands, command_queue) = mpsc::unbounded_channel();
-        let mut platform = FakeViewer { log: log.clone(), acknowledgements };
+        let mut platform = FakeViewer { log: log.clone(), acknowledgements, identity: None };
         let settings = StreamSettings::new(1920, 30, 8);
         let packet = VideoPacket::h264(19, key_frame());
         let old_host = async {

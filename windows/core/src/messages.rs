@@ -5,6 +5,7 @@ use crate::display::{self, RemoteDisplayInfo};
 use crate::error::{DeskError, Result};
 use crate::wire;
 use serde::{Deserialize, Serialize};
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +87,10 @@ impl StreamSettings {
 pub struct Hello {
     pub version: i64,
     pub name: String,
+    #[serde(rename = "deviceID", default, with = "uuid::serde::hyphenated::option", skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_identity_exchange: Option<bool>,
     pub width: i64,
     pub height: i64,
     pub settings: StreamSettings,
@@ -124,6 +129,35 @@ pub struct Hello {
     pub displays: Option<Vec<RemoteDisplayInfo>>,
     #[serde(rename = "selectedDisplayID", skip_serializing_if = "Option::is_none")]
     pub selected_display_id: Option<u32>,
+}
+
+/// A label and identifier supplied by a peer after the pairing handshake.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceIdentity {
+    #[serde(with = "uuid::serde::hyphenated")]
+    pub id: Uuid,
+    pub name: String,
+}
+
+pub fn device_display_name(name: &str) -> String {
+    let separator =
+        |c: char| c.is_control() || c.is_whitespace() || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let single_line = name.split(separator).filter(|word| !word.is_empty()).collect::<Vec<_>>().join(" ");
+    let label = single_line.graphemes(true).take(80).collect::<String>();
+    if label.is_empty() { "未命名设备".into() } else { label.trim_end().into() }
+}
+
+impl DeviceIdentity {
+    pub(crate) fn message(&self) -> Result<wire::Message> {
+        let mut identity = Self { id: self.id, name: device_display_name(&self.name) };
+        let message = wire::Message::json(wire::MessageKind::DeviceIdentity, &identity)?;
+        if message.payload.len() <= wire::MAXIMUM_CONTROL_BYTES {
+            return Ok(message);
+        }
+        // A single grapheme can contain an arbitrary number of combining characters.
+        identity.name = device_display_name("");
+        wire::Message::json(wire::MessageKind::DeviceIdentity, &identity)
+    }
 }
 
 impl Hello {
@@ -525,6 +559,8 @@ mod tests {
         let hello = Hello {
             version: 1,
             name: "PC".into(),
+            device_id: None,
+            device_identity_exchange: None,
             width: 1920,
             height: 1080,
             settings: StreamSettings::new(1920, 30, 8),
@@ -574,6 +610,41 @@ mod tests {
         hello.settings.megabits = 12;
         hello.version = 2;
         assert!(hello.validate().is_err());
+    }
+
+    #[test]
+    fn device_identity_accepts_the_same_uuid_text_as_swift() {
+        let canonical = "12345678-1234-4234-9234-123456789ABC";
+        for value in [canonical.to_owned(), canonical.to_lowercase(), Uuid::nil().to_string()] {
+            let identity: DeviceIdentity = serde_json::from_value(serde_json::json!({"id":value,"name":"Mac"})).unwrap();
+            assert_eq!(identity.id, Uuid::parse_str(&value).unwrap());
+        }
+        let base = serde_json::json!({"version":1,"name":"host","width":1280,"height":720,"settings":StreamSettings::new(1920,30,8),"canControl":false});
+        for invalid in [
+            serde_json::json!(canonical.replace('-', "")),
+            serde_json::json!(format!("{{{canonical}}}")),
+            serde_json::json!(format!("urn:uuid:{canonical}")),
+            serde_json::json!(vec![0u8; 16]),
+        ] {
+            let mut hello = base.clone();
+            hello["deviceID"] = invalid.clone();
+            assert!(serde_json::from_value::<Hello>(hello).is_err());
+            assert!(serde_json::from_value::<DeviceIdentity>(serde_json::json!({"id":invalid,"name":"Mac"})).is_err());
+        }
+        assert!(serde_json::from_value::<DeviceIdentity>(serde_json::json!({"id":canonical})).is_err());
+        assert!(serde_json::from_value::<DeviceIdentity>(serde_json::json!({"name":"Mac"})).is_err());
+    }
+
+    #[test]
+    fn device_labels_fit_the_control_message_and_keep_whole_graphemes() {
+        assert_eq!(device_display_name(" \n 工作站\0   本地\u{202e}标签  "), "工作站 本地 标签");
+        assert_eq!(device_display_name("\r\u{200e}  "), "未命名设备");
+        let glyph = "👩‍💻";
+        assert_eq!(device_display_name(&glyph.repeat(81)), glyph.repeat(80));
+        let identity = DeviceIdentity { id: Uuid::new_v4(), name: format!("x{}", "\u{301}".repeat(3000)) };
+        let sent: DeviceIdentity = identity.message().unwrap().read_json().unwrap();
+        assert_eq!(sent.id, identity.id);
+        assert_eq!(sent.name, "未命名设备");
     }
 
     #[test]

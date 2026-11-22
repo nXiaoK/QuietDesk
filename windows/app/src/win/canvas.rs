@@ -11,12 +11,13 @@ use quietdesk_core::cursor::CursorPresentationState;
 use quietdesk_core::display::RemoteDisplayInfo;
 use quietdesk_core::input::{CapsLockPress, DoubleClick, PcKeyEvent, ViewerInputTranslator};
 use quietdesk_core::media::MediaStreamId;
-use quietdesk_core::messages::{InputKind, RemoteInput};
+use quietdesk_core::messages::{DeviceIdentity, InputKind, RemoteInput};
 use quietdesk_core::pairing::PairingKey;
 use quietdesk_core::reliability::{RetryStatus, ViewerControl};
 use quietdesk_core::viewer::{ViewerCommand, ViewerEnd, ViewerEvent};
 use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,7 +43,7 @@ use windows::core::{PCWSTR, w};
 const WM_SESSION_EVENT: u32 = WM_APP + 1;
 const WM_SESSION_FRAME: u32 = WM_APP + 2;
 const WM_SESSION_ENDED: u32 = WM_APP + 3;
-/// Sent to the owner window when a session reports the host's name: the canvas window and the name's text.
+/// The owner can now take authenticated host details from its viewer window.
 pub const WM_CANVAS_CONNECTED: u32 = WM_APP + 20;
 pub const WM_CANVAS_CLOSED: u32 = WM_APP + 21;
 pub const WM_CAPS_PREFERENCE: u32 = WM_APP + 22;
@@ -70,6 +71,7 @@ enum Notice {
 }
 
 struct Mailbox {
+    local_identity: Option<DeviceIdentity>,
     window: isize,
     events: Mutex<VecDeque<Notice>>,
     frame: Arc<Mutex<Frame>>,
@@ -85,6 +87,10 @@ impl Mailbox {
 }
 
 impl ViewerSink for Mailbox {
+    fn local_identity(&self) -> Option<&DeviceIdentity> {
+        self.local_identity.as_ref()
+    }
+
     fn event(&self, event: ViewerEvent) {
         let mut events = self.events.lock().unwrap();
         // A newer snapshot includes the previous shape and position. One pending notification suffices.
@@ -136,7 +142,18 @@ impl PendingMove {
     }
 }
 
+pub(super) struct ConnectedHost {
+    pub name: String,
+    pub id: Option<uuid::Uuid>,
+}
+
+pub(super) struct ViewerWindow {
+    pub window: HWND,
+    pub connected: Rc<Cell<Option<ConnectedHost>>>,
+}
+
 struct Canvas {
+    host_details: Weak<Cell<Option<ConnectedHost>>>,
     window: HWND,
     owner: HWND,
     commands: UnboundedSender<ViewerControl>,
@@ -193,15 +210,15 @@ thread_local! {
 }
 
 /// Opens a viewer window and starts its session on `runtime`. `owner` hears `WM_CANVAS_CONNECTED`.
-pub fn open(
+pub(super) fn open(
     runtime: &tokio::runtime::Handle,
     owner: HWND,
-    address: String,
-    port: u16,
+    (address, port): (String, u16),
     key: PairingKey,
     settings: &Settings,
+    local_identity: Option<DeviceIdentity>,
     mut auto_reconnect: watch::Receiver<bool>,
-) -> windows::core::Result<HWND> {
+) -> windows::core::Result<ViewerWindow> {
     unsafe {
         let instance: HINSTANCE = GetModuleHandleW(None)?.into();
         let class = w!("QuietDeskCanvas");
@@ -258,6 +275,7 @@ pub fn open(
         let (commands, queue) = unbounded_channel();
         let frame = Arc::new(Mutex::new(Frame::default()));
         let mailbox = Arc::new(Mailbox {
+            local_identity,
             window: window.0 as isize,
             events: Mutex::new(VecDeque::new()),
             frame: frame.clone(),
@@ -269,7 +287,9 @@ pub fn open(
         let quality = settings.viewer_quality();
         let preferences = commands.clone();
         let enabled = *auto_reconnect.borrow_and_update();
+        let host_details = Rc::new(Cell::new(None));
         let canvas = Box::new(Canvas {
+            host_details: Rc::downgrade(&host_details),
             window,
             owner,
             commands,
@@ -335,7 +355,7 @@ pub fn open(
             *mailbox.ended.lock().unwrap() = Some(end);
             mailbox.post(WM_SESSION_ENDED);
         });
-        Ok(window)
+        Ok(ViewerWindow { window, connected: host_details })
     }
 }
 
@@ -949,7 +969,7 @@ impl Canvas {
 
     unsafe fn session_event(&mut self, event: ViewerEvent) {
         match event {
-            ViewerEvent::Connected { name, can_control, session_pause, input_actions, relative_mouse, trackpad_gestures, .. } => {
+            ViewerEvent::Connected { name, device_id, can_control, session_pause, input_actions, relative_mouse, trackpad_gestures, .. } => {
                 if self.retry.take().is_some() {
                     unsafe {
                         let _ = KillTimer(Some(self.window), RETRY_TIMER);
@@ -967,10 +987,11 @@ impl Canvas {
                 self.update_input_menu();
                 self.reconcile_pause();
                 self.set_title(if can_control { "已连接，点击画面开始操作" } else { "已连接 · 仅观看" });
-                let name = wide(&self.name);
-                // The owner copies the text before this call returns.
+                if let Some(details) = self.host_details.upgrade() {
+                    details.set(Some(ConnectedHost { name: self.name.clone(), id: device_id }));
+                    unsafe { SendMessageW(self.owner, WM_CANVAS_CONNECTED, Some(WPARAM(self.window.0 as usize)), None) };
+                }
                 unsafe {
-                    SendMessageW(self.owner, WM_CANVAS_CONNECTED, Some(WPARAM(self.window.0 as usize)), Some(LPARAM(name.as_ptr() as isize)));
                     self.draw();
                 }
             }

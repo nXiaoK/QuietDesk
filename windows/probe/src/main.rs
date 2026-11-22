@@ -11,7 +11,7 @@ use quietdesk_core::host::{self, FrameSink, HostCommand, HostCursorSample, HostE
 use quietdesk_core::input::{CapsLockPress, DoubleClick, InjectOp, PcKeyEvent, ViewerInputTranslator};
 use quietdesk_core::keymap::{MacModifierMapping, PcModifierMapping};
 use quietdesk_core::media::{DecodeReceipt, MediaStreamId};
-use quietdesk_core::messages::{InputAction, InputFeedback, MomentumPhase, ScrollPhase, StreamSettings, TrackpadGesture, VideoStreamState};
+use quietdesk_core::messages::{DeviceIdentity, InputAction, InputFeedback, MomentumPhase, ScrollPhase, StreamSettings, TrackpadGesture, VideoStreamState};
 use quietdesk_core::pairing::PairingKey;
 use quietdesk_core::peer::{self, PeerConfig};
 use quietdesk_core::reliability::{self, RetryStatus};
@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
+use uuid::Uuid;
 
 fn emit(event: Value) {
     let mut output = std::io::stdout().lock();
@@ -62,6 +63,10 @@ fn settings_json(settings: StreamSettings) -> Value {
 
 fn stream_json(stream: VideoStreamState) -> Value {
     json!({ "settings": settings_json(stream.settings), "width": stream.width, "height": stream.height })
+}
+
+fn device_id(arguments: &HashMap<String, String>) -> Result<Option<Uuid>> {
+    arguments.get("device-id").map(|value| value.parse().map_err(|_| DeskError::invalid("--device-id 应为 UUID"))).transpose()
 }
 
 fn parse_settings(text: &str) -> Result<StreamSettings> {
@@ -267,6 +272,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
     let [width, height] = size[..] else { return Err(DeskError::invalid("--size 应为 宽x高")) };
     let options = HostOptions {
         name: arguments.get("name").cloned().unwrap_or_else(|| "QuietDesk Probe".to_string()),
+        device_id: device_id(arguments)?,
         allow_control: true,
         clipboard: true,
         preferred_display: None,
@@ -328,10 +334,10 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
             caps_locked: false,
             alternate_layout: false,
         };
-        let report = |event: HostEvent| {
-            if let HostEvent::Streaming(stream) = event {
-                emit(json!({ "event": "streaming", "stream": stream_json(stream) }));
-            }
+        let report = |event: HostEvent| match event {
+            HostEvent::Streaming(stream) => emit(json!({ "event": "streaming", "stream": stream_json(stream) })),
+            HostEvent::ViewerIdentity(identity) => emit(json!({ "event": "viewerIdentity", "id": identity.id, "name": identity.name })),
+            _ => {}
         };
         let session = host::run(peer.clone(), incoming, &mut platform, options.clone(), command_queue, report);
         tokio::pin!(session);
@@ -374,6 +380,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
 struct ReportingViewer {
     acknowledgements: mpsc::UnboundedSender<DecodeReceipt>,
     feedback: Arc<Mutex<ScriptFeedback>>,
+    identity: Option<DeviceIdentity>,
 }
 
 #[derive(Default)]
@@ -400,6 +407,10 @@ impl ReportingViewer {
 }
 
 impl ViewerPlatform for ReportingViewer {
+    fn local_identity(&self) -> Option<&DeviceIdentity> {
+        self.identity.as_ref()
+    }
+
     fn video(&mut self, packet: VideoPacket) -> Result<()> {
         let receipt = DecodeReceipt::Legacy(packet.sequence);
         self.report(packet, receipt, None)
@@ -412,9 +423,9 @@ impl ViewerPlatform for ReportingViewer {
 
     fn event(&mut self, event: ViewerEvent) {
         emit(match event {
-            ViewerEvent::Connected { name, can_control, stream, live_settings, input_actions, relative_mouse, trackpad_gestures, .. } => {
+            ViewerEvent::Connected { name, device_id, can_control, stream, live_settings, input_actions, relative_mouse, trackpad_gestures, .. } => {
                 json!({ "event": "connected", "name": name, "canControl": can_control, "stream": stream_json(stream), "liveSettings": live_settings,
-                    "inputActions": input_actions, "relativeMouse": relative_mouse, "trackpadGestures": trackpad_gestures })
+                    "inputActions": input_actions, "relativeMouse": relative_mouse, "trackpadGestures": trackpad_gestures, "deviceID": device_id })
             }
             ViewerEvent::InputStatus(feedback) => json!({ "event": "inputStatus", "message": feedback.message, "capsLocked": feedback.caps_locked }),
             ViewerEvent::InputActionTimeout => json!({ "event": "inputActionTimeout" }),
@@ -540,6 +551,7 @@ enum Script {
 }
 
 async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
+    let identity = device_id(arguments)?.map(|id| DeviceIdentity { id, name: arguments.get("name").cloned().unwrap_or_else(|| "QuietDesk Probe".to_string()) });
     let required = |name: &str| arguments.get(name).ok_or_else(|| DeskError::invalid(format!("缺少参数 --{name}")));
     let key = PairingKey::parse(required("code")?)?;
     let port: u16 = required("port")?.parse().map_err(|_| DeskError::invalid("端口无效"))?;
@@ -653,10 +665,11 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<ExitCode> {
             press.lock().unwrap().reset();
             *feedback.lock().unwrap() = ScriptFeedback::default();
             let feedback = feedback.clone();
+            let identity = identity.clone();
             async move {
                 let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
                 let (acknowledgements, acknowledged) = mpsc::unbounded_channel();
-                let mut platform = ReportingViewer { acknowledgements, feedback };
+                let mut platform = ReportingViewer { acknowledgements, feedback, identity };
                 let end = attempt.run(peer.clone(), incoming, &mut platform, acknowledged).await;
                 peer.finished().await;
                 end

@@ -397,6 +397,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
  "windows",
 ]
 
@@ -424,6 +425,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

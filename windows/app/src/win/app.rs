@@ -7,7 +7,7 @@ use super::util::Com;
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::host::{self, HostCommand, HostEvent, HostOptions};
 use quietdesk_core::media::{DecodeReceipt, MediaStreamId};
-use quietdesk_core::messages::StreamSettings;
+use quietdesk_core::messages::{DeviceIdentity, StreamSettings};
 use quietdesk_core::pairing::PairingKey;
 use quietdesk_core::peer::{self, PeerConfig};
 use quietdesk_core::pixel::nv12_to_bgra;
@@ -193,6 +193,9 @@ impl Frame {
 
 /// Where a viewer session reports to. Called from the network and decode threads.
 pub trait ViewerSink: Send + Sync + 'static {
+    fn local_identity(&self) -> Option<&DeviceIdentity> {
+        None
+    }
     fn event(&self, event: ViewerEvent);
     fn retry(&self, status: RetryStatus);
     /// `frame` holds a new picture.
@@ -221,6 +224,9 @@ impl<S: ViewerSink> WindowsViewer<S> {
 }
 
 impl<S: ViewerSink> ViewerPlatform for WindowsViewer<S> {
+    fn local_identity(&self) -> Option<&DeviceIdentity> {
+        self.sink.local_identity()
+    }
     fn video(&mut self, packet: VideoPacket) -> Result<()> {
         let receipt = DecodeReceipt::Legacy(packet.sequence);
         self.enqueue(DecodeCommand::Packet { packet, receipt, first: false, display: self.display })

@@ -6,8 +6,8 @@ use crate::display::{DisplayControl, RemoteDisplayInfo};
 use crate::error::{DeskError, Result};
 use crate::media::{DecodeReceipt, MediaControl, MediaStreamId, ViewerMedia, ViewerMediaEvent};
 use crate::messages::{
-    ControlStatus, HOST_ENDED_REASON, Hello, InputFeedback, RemoteInput, SessionPauseRequest, SessionPauseResult, SessionTermination, StreamSettings,
-    StreamSettingsRequest, StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState,
+    ControlStatus, DeviceIdentity, HOST_ENDED_REASON, Hello, InputFeedback, RemoteInput, SessionPauseRequest, SessionPauseResult, SessionTermination,
+    StreamSettings, StreamSettingsRequest, StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState, device_display_name,
 };
 use crate::peer::{PeerEvent, PeerHandle, input_echo};
 use crate::reliability::{Attempt, AttemptProgress};
@@ -46,6 +46,7 @@ pub enum ViewerCommand {
 pub enum ViewerEvent {
     Connected {
         name: String,
+        device_id: Option<Uuid>,
         can_control: bool,
         stream: VideoStreamState,
         live_settings: bool,
@@ -109,6 +110,10 @@ impl From<DeskError> for ViewerEnd {
 }
 
 pub trait ViewerPlatform {
+    /// The installation's persistent identity, if available for this authenticated session.
+    fn local_identity(&self) -> Option<&DeviceIdentity> {
+        None
+    }
     /// A legacy frame. The platform reports its sequence once the decoder has taken it.
     fn video(&mut self, packet: VideoPacket) -> Result<()>;
     /// Media feedback confirms decoded output. A buffering decoder must report this sequence only
@@ -374,7 +379,8 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         let live_settings = hello.live_settings == Some(true);
         let _ = self.progress.hello.set(std::time::Instant::now());
         self.platform.event(ViewerEvent::Connected {
-            name: hello.name.clone(),
+            name: device_display_name(&hello.name),
+            device_id: hello.device_id,
             can_control: hello.can_control,
             stream,
             live_settings,
@@ -383,6 +389,11 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             relative_mouse: hello.relative_mouse_v1 == Some(true),
             trackpad_gestures: hello.trackpad_gestures_v1 == Some(true),
         });
+        if hello.device_identity_exchange == Some(true)
+            && let Some(identity) = self.platform.local_identity()
+        {
+            self.peer.send(&identity.message()?)?;
+        }
         if hello.input_actions == Some(true) {
             self.peer.order_input_echoes(MessageKind::Pong);
         }

@@ -127,6 +127,7 @@ fn main() {
             let limit = StreamSettings::new(2560, 60, 30);
             let options = HostOptions {
                 name: "wincheck".to_string(),
+                device_id: None,
                 allow_control: true,
                 clipboard: false,
                 preferred: limit,

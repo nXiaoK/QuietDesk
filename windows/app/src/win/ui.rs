@@ -4,11 +4,12 @@ use super::app::{HostNotice, computer_name, network_runtime, serve_host, start_l
 use super::canvas::{self, WM_CANVAS_CLOSED, WM_CANVAS_CONNECTED, WM_CAPS_PREFERENCE};
 use super::clipboard;
 use super::displays;
-use super::settings::{Connection, QUALITY_LIMITS, Settings, VIEWER_QUALITIES, protect, unprotect};
+use super::settings::{Connection, QUALITY_LIMITS, Settings, VIEWER_QUALITIES, local_device_id, protect, unprotect};
 use super::util::{display_label, from_wide, wide};
 use quietdesk_core::display::RemoteDisplayInfo;
 use quietdesk_core::host::{HostCommand, HostEvent, HostOptions};
 use quietdesk_core::keymap::{MacModifierMapping, PcModifierMapping};
+use quietdesk_core::messages::{DeviceIdentity, device_display_name};
 use quietdesk_core::pairing::PairingKey;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -46,6 +47,9 @@ const SHARED_DISPLAY: usize = 1111;
 struct Main {
     window: HWND,
     settings: Settings,
+    local_identity: Option<DeviceIdentity>,
+    viewer_name: Option<String>,
+    session_status: String,
     displays: Vec<RemoteDisplayInfo>,
     active_display: Option<u32>,
     auto_reconnect: watch::Sender<bool>,
@@ -53,8 +57,8 @@ struct Main {
     /// Present while this PC is shared; closing it stops the listener and ends the session.
     sharing: Option<UnboundedSender<HostCommand>>,
     notices: Arc<Mutex<VecDeque<HostNotice>>>,
-    /// Viewer windows whose connection is saved once the host has answered.
-    connecting: Vec<(isize, Connection)>,
+    /// Save an explicitly opened connection once. Retrying must not restore a forgotten record.
+    viewers: Vec<(canvas::ViewerWindow, Connection)>,
 }
 
 impl Main {
@@ -146,7 +150,7 @@ impl Main {
     fn refresh_recent(&self) {
         self.message(RECENT, LB_RESETCONTENT, 0, 0);
         for connection in &self.settings.connections {
-            let label = wide(&format!("{}  —  {}:{}", connection.name, connection.address, connection.port));
+            let label = wide(&format!("{}  —  {}:{}", device_display_name(&connection.name), connection.address, connection.port));
             self.message(RECENT, LB_ADDSTRING, 0, label.as_ptr() as isize);
         }
     }
@@ -169,13 +173,22 @@ impl Main {
             Ok(stored) => stored,
             Err(error) => return self.alert(&error.to_string()),
         };
-        match canvas::open(&self.runtime, self.window, address.clone(), port, key, &self.settings, self.auto_reconnect.subscribe()) {
-            Ok(window) => self.connecting.push((window.0 as isize, Connection { address, port, name: String::new(), code: stored })),
+        match canvas::open(
+            &self.runtime,
+            self.window,
+            (address.clone(), port),
+            key,
+            &self.settings,
+            self.local_identity.clone(),
+            self.auto_reconnect.subscribe(),
+        ) {
+            Ok(window) => self.viewers.push((window, Connection { address, port, name: String::new(), code: stored, device_id: None })),
             Err(error) => self.alert(&format!("无法打开远程窗口：{error}")),
         }
     }
 
     fn toggle_sharing(&mut self) {
+        self.viewer_name = None;
         if self.sharing.take().is_some() {
             self.active_display = None;
             self.refresh_displays();
@@ -189,6 +202,7 @@ impl Main {
         self.save();
         let options = HostOptions {
             name: computer_name(),
+            device_id: self.local_identity.as_ref().map(|device| device.id),
             allow_control: self.settings.allow_control,
             clipboard: self.settings.clipboard,
             preferred: self.settings.quality_limit(),
@@ -220,15 +234,22 @@ impl Main {
                 self.set_text(SHARE, "开始共享");
                 self.set_text(HOST_STATUS, &format!("共享未开启：{reason}"));
             }
-            HostNotice::Connected => self.set_text(HOST_STATUS, "控制端已连接，正在准备画面…"),
+            HostNotice::Connected => {
+                self.viewer_name = None;
+                self.update_session_status("控制端已连接，正在准备画面…".into());
+            }
+            HostNotice::Session(HostEvent::ViewerIdentity(device)) => {
+                self.viewer_name = Some(device.name);
+                self.show_session_status();
+            }
             HostNotice::DisplayError(reason) => self.set_text(HOST_STATUS, &format!("无法读取显示器：{reason}")),
             HostNotice::Session(HostEvent::Streaming(stream)) => {
-                self.set_text(HOST_STATUS, &format!("正在共享 · {} × {} · {}", stream.width, stream.height, stream.settings.summary()));
+                self.update_session_status(format!("正在共享 · {} × {} · {}", stream.width, stream.height, stream.settings.summary()));
             }
             HostNotice::Session(HostEvent::Displays { displays, selected, error }) => {
                 self.show_displays(displays, Some(selected));
                 if let Some(error) = error {
-                    self.set_text(HOST_STATUS, &format!("显示器切换失败：{error}"));
+                    self.update_session_status(format!("显示器切换失败：{error}"));
                 }
             }
             HostNotice::Session(HostEvent::LocalDisplaySelected(preference)) => {
@@ -236,13 +257,28 @@ impl Main {
                 self.save();
                 self.refresh_displays();
             }
-            HostNotice::Session(HostEvent::Paused(true)) => self.set_text(HOST_STATUS, "控制端已暂停画面，连接保持"),
+            HostNotice::Session(HostEvent::Paused(true)) => self.update_session_status("控制端已暂停画面，连接保持".into()),
             HostNotice::Session(_) => {}
             HostNotice::Ended(reason) => {
+                self.viewer_name = None;
                 self.active_display = None;
                 self.refresh_displays();
                 self.set_text(HOST_STATUS, &format!("等待重新连接 · {reason}"));
             }
+        }
+    }
+
+    fn update_session_status(&mut self, text: String) {
+        self.session_status = text;
+        self.show_session_status();
+    }
+
+    fn show_session_status(&self) {
+        let text = &self.session_status;
+        if let Some(name) = &self.viewer_name {
+            self.set_text(HOST_STATUS, &format!("{text} · {name}"));
+        } else {
+            self.set_text(HOST_STATUS, text);
         }
     }
 
@@ -464,17 +500,18 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 }
             }
             WM_CANVAS_CONNECTED => {
-                if let Some(position) = main.connecting.iter().position(|(canvas, _)| *canvas == wparam.0 as isize) {
-                    let (_, mut connection) = main.connecting.remove(position);
-                    let name = lparam.0 as *const u16;
-                    let length = (0..256).find(|offset| *name.add(*offset) == 0).unwrap_or(256);
-                    connection.name = from_wide(std::slice::from_raw_parts(name, length));
+                if let Some(index) = main.viewers.iter().position(|(viewer, _)| viewer.window.0 as usize == wparam.0)
+                    && let Some(host) = main.viewers[index].0.connected.take()
+                {
+                    let (_, mut connection) = main.viewers.remove(index);
+                    connection.name = host.name;
+                    connection.device_id = host.id;
                     main.settings.remember(connection);
                     main.save();
                     main.refresh_recent();
                 }
             }
-            WM_CANVAS_CLOSED => main.connecting.retain(|(canvas, _)| *canvas != wparam.0 as isize),
+            WM_CANVAS_CLOSED => main.viewers.retain(|(viewer, _)| viewer.window.0 as usize != wparam.0),
             WM_CAPS_PREFERENCE => {
                 main.settings.caps_forwarding = wparam.0 != 0;
                 main.save();
@@ -542,6 +579,9 @@ unsafe fn run_window() -> windows::core::Result<()> {
         let settings = Settings::load();
         let main = Box::into_raw(Box::new(Main {
             window,
+            local_identity: local_device_id().map(|id| DeviceIdentity { id, name: device_display_name(&computer_name()) }),
+            viewer_name: None,
+            session_status: String::new(),
             auto_reconnect: watch::Sender::new(settings.auto_reconnect),
             settings,
             displays: Vec::new(),
@@ -549,7 +589,7 @@ unsafe fn run_window() -> windows::core::Result<()> {
             runtime: network_runtime(),
             sharing: None,
             notices: Arc::new(Mutex::new(VecDeque::new())),
-            connecting: Vec::new(),
+            viewers: Vec::new(),
         }));
         (*main).build(font, scale)?;
         SetWindowLongPtrW(window, GWLP_USERDATA, main as isize);

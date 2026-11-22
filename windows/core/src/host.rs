@@ -8,8 +8,8 @@ use crate::input::{HostInputTranslator, InjectOp};
 use crate::keymap::MacModifierMapping;
 use crate::media::{Gate, HostFrame, HostMedia, HostMediaEvent, MediaControl, MediaFeedback, MediaOperation};
 use crate::messages::{
-    ControlStatus, HOST_ENDED_REASON, Hello, InputAction, InputFeedback, InputKind, RemoteInput, SessionPauseRequest, SessionPauseResult, SessionTermination,
-    StreamSettings, StreamSettingsRequest, StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState,
+    ControlStatus, DeviceIdentity, HOST_ENDED_REASON, Hello, InputAction, InputFeedback, InputKind, RemoteInput, SessionPauseRequest, SessionPauseResult,
+    SessionTermination, StreamSettings, StreamSettingsRequest, StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState, device_display_name,
 };
 use crate::peer::{PeerEvent, PeerHandle};
 use crate::video::EncodedFrame;
@@ -206,6 +206,7 @@ pub trait HostPlatform {
 #[derive(Clone, Debug)]
 pub struct HostOptions {
     pub name: String,
+    pub device_id: Option<Uuid>,
     pub allow_control: bool,
     /// Whether the viewer may read and write the clipboard text with the manual clipboard messages.
     pub clipboard: bool,
@@ -229,6 +230,7 @@ pub enum HostCommand {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostEvent {
+    ViewerIdentity(DeviceIdentity),
     Streaming(VideoStreamState),
     Paused(bool),
     RoundTrip(f64),
@@ -255,6 +257,7 @@ struct HostSession<'a, P: HostPlatform> {
     peer: &'a PeerHandle,
     platform: &'a mut P,
     options: HostOptions,
+    viewer_identity: Option<DeviceIdentity>,
     displays: Option<HostDisplays>,
     display_subscribed: bool,
     remote_display: Option<u32>,
@@ -297,6 +300,7 @@ pub async fn run<P: HostPlatform>(
         peer: &peer,
         platform,
         options,
+        viewer_identity: None,
         displays: None,
         display_subscribed: false,
         remote_display: None,
@@ -391,7 +395,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
             MessageKind::Hello,
             &Hello {
                 version: wire::VERSION,
-                name: self.options.name.clone(),
+                name: device_display_name(&self.options.name),
+                device_id: self.options.device_id,
+                device_identity_exchange: self.options.device_id.map(|_| true),
                 width: i64::from(width),
                 height: i64::from(height),
                 settings: initial,
@@ -777,6 +783,17 @@ impl<P: HostPlatform> HostSession<'_, P> {
 
     async fn receive(&mut self, message: Message, events: &impl Fn(HostEvent)) -> Result<()> {
         match message.kind {
+            MessageKind::DeviceIdentity if self.options.device_id.is_some() => {
+                let mut identity: DeviceIdentity = message.read_json()?;
+                if self.viewer_identity.as_ref().is_some_and(|known| known.id != identity.id) {
+                    return Err(DeskError::invalid("连接中的设备标识发生变化"));
+                }
+                identity.name = device_display_name(&identity.name);
+                if self.viewer_identity.as_ref() != Some(&identity) {
+                    self.viewer_identity = Some(identity.clone());
+                    events(HostEvent::ViewerIdentity(identity));
+                }
+            }
             MessageKind::Ping => self.peer.send(&Message::new(MessageKind::Pong, message.payload))?,
             MessageKind::Input => {
                 let mut input: RemoteInput = message.read_json()?;

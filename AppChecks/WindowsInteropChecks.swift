@@ -219,11 +219,13 @@ private final class MacViewer: @unchecked Sendable {
     private let port: UInt16
     private let key: PairingKey
     private let useMedia: Bool
+    private let identity: DeviceIdentity?
 
-    init(port: UInt16, key: PairingKey, preferred: StreamSettings, useMedia: Bool) {
+    init(port: UInt16, key: PairingKey, preferred: StreamSettings, useMedia: Bool, identity: DeviceIdentity? = nil) {
         self.port = port
         self.key = key
         self.useMedia = useMedia
+        self.identity = identity
         self.preferred = preferred
         let connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!,
                                       using: SecureTransport.parameters(key: key, responsiveAcknowledgements: true))
@@ -264,6 +266,7 @@ private final class MacViewer: @unchecked Sendable {
             let applied = VideoStreamState(settings: hello.settings, width: hello.width, height: hello.height)
             var tuning = try VideoTuningSession(applied: applied, preferred: preferred)
             if hello.sessionTerminationV1 == true { peer.send(try SessionTermination(.subscribe).message()) }
+            if hello.deviceIdentityExchange == true, let identity { peer.send(try Wire.json(.deviceIdentity, identity)) }
             if hello.controlStatusUpdates == true { peer.send(Message(.controlStatus)) }
             if hello.displaySwitchingV1 == true { peer.send(try DisplayControl.subscribe().message()) }
             if useMedia, hello.mediaTransportV1 == true {
@@ -562,6 +565,7 @@ private final class MacHost: @unchecked Sendable {
         var pauseRequests: [Bool] = []
         var clipboard = "Mac 主机剪贴板"
         var received: [MessageKind] = []
+        var identities: [DeviceIdentity] = []
         var posted: [PostedEvent] = []
         var inputs: [RemoteInput] = []
         var pointer = CGPoint(x: -1, y: -1)
@@ -582,10 +586,14 @@ private final class MacHost: @unchecked Sendable {
     private let inputActions: Bool
     private let relativeMouse: Bool
     private let trackpadGestures: Bool
+    private let deviceID: UUID?
+    private let identityExchange: Bool?
+    private let prepareHello: (Message) throws -> Message
     private var pump: DispatchSourceTimer?
 
     init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int), advertiseMedia: Bool, cursorImage: CursorImage?,
          externalPackets: [VideoPacket] = [], inputActions: Bool = true, relativeMouse: Bool = true, trackpadGestures: Bool = true,
+         deviceID: UUID? = UUID(), identityExchange: Bool? = true, prepareHello: @escaping (Message) throws -> Message = { $0 },
          on port: NWEndpoint.Port = .any) throws {
         self.advertiseMedia = advertiseMedia
         self.cursorImage = cursorImage
@@ -595,6 +603,9 @@ private final class MacHost: @unchecked Sendable {
         self.inputActions = inputActions
         self.relativeMouse = relativeMouse
         self.trackpadGestures = trackpadGestures
+        self.deviceID = deviceID
+        self.identityExchange = identityExchange
+        self.prepareHello = prepareHello
         self.size = size
         let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8)
         let state = Shared(State(applied: VideoStreamState(settings: settings, width: size.width, height: size.height)))
@@ -668,8 +679,8 @@ private final class MacHost: @unchecked Sendable {
                 self.state.update { $0.peer = peer; $0.media = media }
                 // The capability set the application announces, with the fields of this Mac filled in.
                 let preferred = StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 20)
-                peer.send(try Wire.json(.hello, Hello(name: "检查用 Mac", width: applied.width, height: applied.height, settings: applied.settings,
-                    canControl: true, inputActions: self.inputActions ? true : nil, preferredSettings: preferred.extendedCompatible, deviceID: UUID(), deviceIdentityExchange: true,
+                let hello = try Wire.json(.hello, Hello(name: "检查用 Mac", width: applied.width, height: applied.height, settings: applied.settings,
+                    canControl: true, inputActions: self.inputActions ? true : nil, preferredSettings: preferred.extendedCompatible, deviceID: self.deviceID, deviceIdentityExchange: self.identityExchange,
                     highRefreshVideoSettings: true, preferredHighRefreshSettings: preferred.highRefreshCompatible,
                     sessionEffects: true, sessionPause: true, mediaTransportV1: self.advertiseMedia ? true : nil,
                     independentCursorV1: self.cursorImage == nil ? nil : true,
@@ -681,7 +692,8 @@ private final class MacHost: @unchecked Sendable {
                     displays: self.externalPackets.isEmpty ? nil : self.state.get().displays,
                     selectedDisplayID: self.externalPackets.isEmpty ? nil : self.state.get().selectedDisplay,
                     remoteAudioV1: true, relativeMouseV1: self.relativeMouse ? true : nil, trackpadGesturesV1: self.trackpadGestures ? true : nil,
-                    initialCursorNegotiationV1: self.cursorImage == nil ? nil : true, qualityProbeV1: true, typeTextV1: true)))
+                    initialCursorNegotiationV1: self.cursorImage == nil ? nil : true, qualityProbeV1: true, typeTextV1: true))
+                peer.send(try self.prepareHello(hello))
                 // The application waits this long for the viewer's first settings before it starts capture.
                 DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in self?.state.update { $0.streaming = true } }
             } catch {
@@ -736,6 +748,10 @@ private final class MacHost: @unchecked Sendable {
             if state.get().media?.receive(message) == true { return }
         }
         switch message.kind {
+        case .deviceIdentity:
+            guard identityExchange == true else { throw Failure("The viewer sent an identity without negotiation") }
+            let identity = try Wire.readJSON(DeviceIdentity.self, message.payload)
+            state.update { $0.identities.append(identity) }
         case .displayControl where !externalPackets.isEmpty:
             let control = try DisplayControl.read(message.payload)
             switch control.operation {
@@ -933,15 +949,19 @@ private struct WindowsInteropChecks {
             exit(1)
         }
         let key = try! PairingKey.generate()
+        let macIdentity = DeviceIdentity(id: UUID(), name: "  合成\tMac\n工作台  ")
+        let windowsID = UUID()
+        let windowsIdentityOptions = ["--device-id", windowsID.uuidString, "--name", "  合成\nWindows\t电脑  "]
         let command = Int(CGEventFlags.maskCommand.rawValue) | 0x08, shift = Int(CGEventFlags.maskShift.rawValue) | 0x02
 
-        func withWindowsHost(_ extra: [String] = [], useMedia: Bool = true, viewerKey: PairingKey? = nil, preferred: StreamSettings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8),
+        func withWindowsHost(_ extra: [String] = [], useMedia: Bool = true, viewerKey: PairingKey? = nil, identity: DeviceIdentity? = nil,
+                             preferred: StreamSettings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8),
                              _ body: (Probe, MacViewer) throws -> Void) throws {
             let probe = try Probe(probePath, ["host", "--code", key.code, "--recording", recording, "--size", "\(size.width)x\(size.height)",
                                               "--name", "检查用 Windows 电脑"] + extra)
             defer { probe.stop() }
             guard let port = try probe.next("listening")["port"] as? Int else { throw Failure("The probe did not report its port") }
-            let viewer = MacViewer(port: UInt16(port), key: viewerKey ?? key, preferred: preferred, useMedia: useMedia)
+            let viewer = MacViewer(port: UInt16(port), key: viewerKey ?? key, preferred: preferred, useMedia: useMedia, identity: identity)
             defer { viewer.stop() }
             try body(probe, viewer)
             let failures = viewer.state.get().failures
@@ -1391,8 +1411,51 @@ private struct WindowsInteropChecks {
             }
         }
 
+        run("A Mac viewer learns the Windows host ID and may rename its own device within the authenticated session") {
+            try withWindowsHost(["--device-id", windowsID.uuidString], identity: macIdentity) { probe, viewer in
+                let received = try probe.next("viewerIdentity")
+                try until("the authenticated Windows hello is applied") { viewer.state.get().hello != nil }
+                let hello = viewer.state.get().hello
+                try require(hello?.deviceID == windowsID && hello?.deviceIdentityExchange == true, "The Windows hello omitted its stable host ID or the exchange flag")
+                try require(received["id"] as? String == macIdentity.id.uuidString.lowercased() && received["name"] as? String == macIdentity.displayName,
+                            "Windows reported a different viewer ID or display name: \(received)")
+                let renamed = DeviceIdentity(id: macIdentity.id, name: "Mac 已改名")
+                viewer.peer.send(try Wire.json(.deviceIdentity, renamed))
+                try require(try probe.next("viewerIdentity")["name"] as? String == renamed.name, "The same viewer could not update its name")
+                let nextViewer = DeviceIdentity(id: UUID(), name: "另一台 Mac")
+                viewer.peer.send(try Wire.json(.deviceIdentity, nextViewer))
+                let end = try probe.next("ended")
+                try require((end["reason"] as? String)?.contains("设备标识发生变化") == true && probe.all("viewerIdentity").count == 2,
+                            "Windows accepted a different UUID in the same session: \(end)")
+                guard let port = probe.all("listening").first?["port"] as? UInt16 else { throw Failure("The Windows listener lost its port") }
+                let newSession = MacViewer(port: port, key: key, preferred: .init(longestEdge: 1920, framesPerSecond: 30, megabits: 8), useMedia: false, identity: nextViewer)
+                defer { newSession.stop() }
+                let identity = try probe.next("viewerIdentity")
+                try until("another authenticated viewer decodes the new session") { !newSession.state.get().decoded.isEmpty }
+                try require(identity["id"] as? String == nextViewer.id.uuidString.lowercased() && newSession.state.get().hello?.deviceID == windowsID,
+                            "The host's own ID changed, or the previous session's viewer ID leaked into the new session")
+            }
+        }
+
+        run("A Windows host rejects unnegotiated or malformed viewer identity messages") {
+            try withWindowsHost(identity: macIdentity) { probe, viewer in
+                try until("a viewer with an identity decodes video from the legacy host") { !viewer.state.get().decoded.isEmpty }
+                try require(viewer.state.get().hello?.deviceID == nil && probe.all("viewerIdentity").isEmpty, "The legacy host exchanged device identities")
+                viewer.peer.send(try Wire.json(.deviceIdentity, macIdentity))
+                try require(try (probe.next("ended")["reason"] as? String)?.contains("不支持") == true && probe.all("viewerIdentity").isEmpty,
+                            "Windows accepted an unsolicited identity")
+            }
+            try withWindowsHost(["--device-id", windowsID.uuidString]) { probe, viewer in
+                try until("the host streams to a viewer without a device ID") { !viewer.state.get().decoded.isEmpty }
+                let compactID = macIdentity.id.uuidString.replacingOccurrences(of: "-", with: "")
+                viewer.peer.send(try Wire.json(.deviceIdentity, ["id": compactID, "name": "Mac"]))
+                _ = try probe.next("ended")
+                try require(probe.all("viewerIdentity").isEmpty, "Windows recorded a UUID that Swift cannot decode")
+            }
+        }
+
         run("A Mac viewer with another pairing code gets no further with a Windows host than with a Mac host") {
-            try withWindowsHost(viewerKey: try PairingKey.generate()) { probe, viewer in
+            try withWindowsHost(["--device-id", windowsID.uuidString], viewerKey: try PairingKey.generate(), identity: macIdentity) { probe, viewer in
                 try require(try probe.next("rejected")["reason"] as? String != nil, "The Windows host did not record the refusal")
                 // Network.framework reports the host's bad-record-MAC alert while it keeps the connection
                 // waiting, exactly as it does against a Mac host; Peer then ends the attempt at its
@@ -1400,14 +1463,16 @@ private struct WindowsInteropChecks {
                 usleep(300_000)
                 let current = viewer.state.get()
                 try require(!current.ready && current.hello == nil && current.received.isEmpty, "A viewer without the key got through")
-                try require(probe.all("accepted").isEmpty, "The Windows host accepted a viewer without the key")
+                try require(probe.all("accepted").isEmpty && probe.all("viewerIdentity").isEmpty, "The Windows host accepted or identified a viewer without the key")
             }
         }
 
         func withMacHost(advertiseMedia: Bool = true, cursorImage: CursorImage? = nil, twoDisplays: Bool = false, inputActions: Bool = true, relativeMouse: Bool = true,
-                         trackpadGestures: Bool = true, viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
+                         trackpadGestures: Bool = true, deviceID: UUID? = UUID(), identityExchange: Bool? = true, prepareHello: @escaping (Message) throws -> Message = { $0 },
+                         viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
             let host = try MacHost(key: key, packets: packets, size: size, advertiseMedia: advertiseMedia, cursorImage: cursorImage,
-                                   externalPackets: twoDisplays ? externalPackets : [], inputActions: inputActions, relativeMouse: relativeMouse, trackpadGestures: trackpadGestures)
+                                   externalPackets: twoDisplays ? externalPackets : [], inputActions: inputActions, relativeMouse: relativeMouse, trackpadGestures: trackpadGestures,
+                                   deviceID: deviceID, identityExchange: identityExchange, prepareHello: prepareHello)
             defer { host.stop() }
             let probe = try Probe(probePath, ["viewer", "--code", (viewerKey ?? key).code, "--port", "\(host.port)", "--quality", quality] + extra)
             defer { probe.stop() }
@@ -1875,14 +1940,56 @@ private struct WindowsInteropChecks {
             }
         }
 
+        run("A Windows viewer sends its device identity only when a validated Mac hello requests it") {
+            try withMacHost(deviceID: macIdentity.id, windowsIdentityOptions) { host, probe in
+                let connected = try probe.next("connected")
+                _ = try probe.next("frame")
+                let expected = DeviceIdentity(id: windowsID, name: "合成 Windows 电脑")
+                try require(connected["deviceID"] as? String == macIdentity.id.uuidString.lowercased() && connected["name"] as? String == "检查用 Mac"
+                            && host.state.get().identities == [expected], "The authenticated peers did not exchange their own IDs and names")
+            }
+            try withMacHost(deviceID: nil, windowsIdentityOptions) { host, probe in
+                let connected = try probe.next("connected")
+                try until("the Mac decodes the viewer identity and starts capture") { !host.state.get().requests.isEmpty }
+                try require(connected["deviceID"] is NSNull && host.state.get().identities.map(\.id) == [windowsID], "The viewer required the host's own ID to return its identity")
+                guard let peer = host.state.get().peer else { throw Failure("The authenticated Mac peer disappeared") }
+                peer.send(try Wire.json(.deviceIdentity, macIdentity))
+                let ended = try probe.next("ended")
+                try require((ended["reason"] as? String)?.contains("不支持") == true && ended["retryable"] as? Bool == false,
+                            "Windows accepted a viewer-only message from its host: \(ended)")
+            }
+            try withMacHost(deviceID: macIdentity.id, identityExchange: nil, windowsIdentityOptions) { host, probe in
+                let connected = try probe.next("connected")
+                _ = try probe.next("frame")
+                try require(connected["deviceID"] as? String == macIdentity.id.uuidString.lowercased() && host.state.get().identities.isEmpty,
+                            "An older host's own UUID enabled an unsolicited viewer identity")
+            }
+        }
+
+        run("A malformed device ID in a Mac hello cannot elicit a Windows viewer identity") {
+            try withMacHost(prepareHello: { hello in
+                guard var fields = try JSONSerialization.jsonObject(with: hello.payload) as? [String: Any] else {
+                    throw Failure("The fixture did not generate a JSON hello")
+                }
+                fields["deviceID"] = macIdentity.id.uuidString.replacingOccurrences(of: "-", with: "")
+                return Message(.hello, try JSONSerialization.data(withJSONObject: fields))
+            }, windowsIdentityOptions) { host, probe in
+                _ = try probe.next("secured")
+                let ended = try probe.next("ended")
+                try require(ended["retryable"] as? Bool == false && probe.all("connected").isEmpty && host.state.get().received.isEmpty,
+                            "A malformed hello led to a connected session or outbound viewer messages: \(ended)")
+            }
+        }
+
         run("A Windows viewer with auto-reconnect and another pairing code stops after the Mac refuses it") {
-            try withMacHost(viewerKey: try PairingKey.generate(), ["--reconnect"]) { host, probe in
+            try withMacHost(viewerKey: try PairingKey.generate(), windowsIdentityOptions + ["--reconnect"]) { host, probe in
                 let failed = try probe.next("failed")
                 print("    the probe reported: \(failed["reason"] as? String ?? "")")
                 try require((failed["reason"] as? String)?.contains("配对码") == true, "A wrong pairing code was reported as another kind of failure: \(failed)")
                 try until("the Mac host gives up on the connection") { host.state.get().closed != nil }
                 try require(host.state.get().peer == nil && host.state.get().closed?.contains("TLS") == true
-                            && (try probe.exitStatus()) != 0 && probe.all("retryWaiting").isEmpty && host.state.get().accepted.count == 1,
+                            && (try probe.exitStatus()) != 0 && probe.all("retryWaiting").isEmpty && host.state.get().accepted.count == 1
+                            && probe.all("secured").isEmpty && host.state.get().received.isEmpty,
                             "The Mac host did not refuse the handshake itself: \(host.state.get().closed ?? "")")
             }
         }

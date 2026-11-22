@@ -26,6 +26,7 @@ flexi_logger.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 windows = { version = "0.62.2", features = [
     "Win32_Devices_DeviceAndDriverInstallation",
@@ -41,6 +42,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Gdi",
     "Win32_Media_MediaFoundation",
     "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_DataExchange",
     "Win32_System_IO",

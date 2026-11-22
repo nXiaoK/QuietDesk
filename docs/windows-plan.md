@@ -22,7 +22,7 @@
 | WP6 | 自动剪贴板，图片与文件 | 大 | 已提交 macOS `fe4ec9c`、Windows `97793b9`。双向配对 TLS、隔离原生剪贴板及窗口检查通过，真实 Finder / 资源管理器组合待验 |
 | WP7 | 视频性能：GPU 缩放与色彩转换、硬件编码、HEVC、60 fps 以上、码率自适应 | 大，可拆分 | 每秒性能统计已提交 `e9002e1`。已按用户决定优先开发双向文件粘贴。GPU、硬件编码及 HEVC 等待 Windows 实机 |
 | WP8 | 远端声音 | 中 | 已提交 `4e57867`。双向配对 TLS、Wine 虚拟声卡、默认输出切换与窗口菜单检查通过，物理声卡和蓝牙耳机待 Windows 实机确认 |
-| WP9 | 辅助 TCP 通道与 UDP 视频（DTLS、分片、补传、FEC、路径策略） | 特大，分 5 步 | 未开始，依赖 WP1 |
+| WP9 | 辅助 TCP 通道与 UDP 视频（DTLS、分片、补传、FEC、路径策略） | 特大，分 5 步 | 9a 已提交 `1e243d1`，独立加密视频、批量 TCP 和 `shared` 回退通过双向互通。9b–9e 待交付 |
 | WP10 | 自托管中继 | 大 | 未开始，依赖 WP9 |
 | WP11 | 会话工具：模拟键入、桌面操作、静音/黑屏遮罩/断开后锁屏、自动解锁、画质探测 | 中，可拆分 | 未开始 |
 | WP12 | 端口映射 | 中 | 未开始 |
@@ -51,6 +51,7 @@ windows/
     video.rs     VideoPacket、H.264 Annex B 与 AVCC 转换、H264FrameAssembler
     host.rs      被控端会话（HostPlatform、FrameSink、HostOptions/HostCommand/HostEvent）
     viewer.rs    控制端会话（ViewerPlatform、ViewerCommand/ViewerEvent/ViewerEnd）
+    auxiliary.rs  同一配对控制会话中的视频、批量 TCP 连接与绑定授权
     audio.rs audio_session.rs  Opus、抖动缓冲、远端声音开关与设备生命周期
     clipboard.rs  剪贴板能力协商、清单、按需拉取、接收确认与文件传输
     media.rs     媒体会话线格式与双方状态机，供 host.rs / viewer.rs 协商与传输视频
@@ -80,7 +81,7 @@ scripts/check-cargo-lock-age.py        检查锁定的依赖是否已发布满 7
 初版 Windows 端通过 macOS 的旧版兼容路径互通。WP1 在此基础上增加了可选媒体会话。
 
 - 被控端 Hello 声明 `liveSettings`、`controlStatusUpdates`、`extendedVideoSettings`、`preferredSettings`、`highRefreshVideoSettings`、`preferredHighRefreshSettings`、`sessionPause`、`sessionTerminationV1`、`initialStreamNegotiationV1`。WP1 新增 `mediaTransportV1`，WP2 在平台支持光标采样时声明 `independentCursorV1`，在首个媒体流提交后独立协商。
-- 两端支持时使用控制连接上的 `shared` 流，H.264 视频通过 `mediaFrame` 发送并以 `mediaFeedback` 确认。首次切换前和对接旧版本时继续支持 `video` / `acknowledgement`。Windows 被控端最多等待 3 帧确认。
+- 两端支持时优先在视频辅助连接建立 `tcp` 流，绑定不可用时通过控制连接建立 `shared` 流。H.264 视频通过 `mediaFrame` 发送并以 `mediaFeedback` 确认。首次切换前和对接旧版本时继续支持 `video` / `acknowledgement`。Windows 被控端最多等待 3 帧确认。
 - 被控端能枚举活动屏幕时声明 `displaySwitchingV1`，能读取当前控制台的键盘大写状态时声明 `inputActions`。两项能力独立协商。
 - Windows 剪贴板监听器启动后，被控端声明 `clipboardSync` 和 `physicalFilePasteV1`。两端通过消息 11 确认可用能力和开关。复制文件只通告类型，首次读取才索取预览，接收端同意后传输内容。
 - Windows 被控端通过 `remoteAudioV1` 声明远端系统声音。控制端可在会话内开启声音，设备启动成功后才确认开启。
@@ -297,7 +298,7 @@ Windows 被控端通过 WASAPI 回环采集默认输出设备，控制端通过 
 
 体量最大，建议拆成 9a–9e 逐步交付，每步都保持 `shared` 路径可用作回退。全部待核实，除特别注明外。
 
-- **9a 辅助 TCP 视频通道**：同一端口上按 ALPN 区分连接（已核实：`quietdesk-control/1`、`quietdesk-media/1`、`quietdesk-bulk/1`、`quietdesk-mapping/1`，见 `MediaSecureTransport.swift`）。现在 `tls.rs` 的接受端只接受控制协议。新连接发 `bind { sessionID, role, token }`，被控端核对 offer 里发出的 `token`（`MediaBindingGrant`，已核实有效期 15 秒；重复绑定等其余规则见 `receiveBinding`）后回 `bound`；之后 macOS 控制端会立即选择 `tcp` 路径，不再等 1.5 秒。好处是视频与控制消息不再互相排队。参考 `MediaSession.receiveBinding` / `acceptAuxiliary` / `openAuxiliary`。`app.rs` 的 `serve_host` 目前在会话期间直接丢弃其他连接，需要改为按 ALPN 分流。
+- **9a 辅助 TCP 视频通道**：同一端口上按 ALPN 区分连接（已核实：`quietdesk-control/1`、`quietdesk-media/1`、`quietdesk-bulk/1`、`quietdesk-mapping/1`，见 `MediaSecureTransport.swift`）。Windows 监听器现在区分控制、视频和批量三种连接。新连接发 `bind { sessionID, role, token }`，被控端核对 offer 里发出的 `token`（`MediaBindingGrant`，已核实有效期 15 秒；重复绑定等其余规则见 `receiveBinding`）后回 `bound`；之后 macOS 控制端会立即选择 `tcp` 路径，不再等 1.5 秒。好处是视频与控制消息不再互相排队。对照 `MediaSession.receiveBinding` / `acceptAuxiliary` / `openAuxiliary`。Windows 用控制会话 UUID、令牌和 ALPN 角色绑定辅助连接，批量通道只传剪贴板清单与传输记录。视频通道结束后重新协商关键帧并降级 `shared`。
 - **9b UDP 与 DTLS**：DTLS 1.2、`TLS_PSK_WITH_AES_128_GCM_SHA256`，密钥是 offer 里的 `datagramKey`（32 字节），身份是会话 UUID 的字符串（已核实：`prepareListener` 用 `identifier.uuidString`，即大写形式，并在会话的同一端口号上监听 UDP）。OpenSSL 支持 DTLS-PSK，需要一层把 UDP 数据报接到 `SslStream` 的适配并处理多对端分流。数据报首字节为类型（已核实）：1 探测（共 1024 字节：类型 + 16 字节随机数 + 填充）、2 应答（原样回送，首字节改 2）、3 分片、4 反馈、5 补传的分片、6 光标位置、7 交互输入、8 奇偶校验、9 音频包、10 分组 FEC、11 恢复请求。类型字节之后的记录不超过 1100 字节。先做握手、探测验证、分片与重组、基于 `nack` 的补传。参考 `MediaSession.startUDP` / `sendPing` / `verifiedUDP`、`MediaProtocol.swift` 的 `MediaFragment`、`MediaReassembly.swift`。
 - **9c 前向纠错**：单包 XOR 奇偶校验（`MediaFrameParity`）与 Cauchy Reed-Solomon 分组 FEC（`ReedSolomonFEC.swift`、`MediaFrameFECShard`）。GF(256) 运算用成熟 crate 前先确认生成矩阵与 macOS 完全一致，否则只能照搬实现并用 macOS 生成的向量做测试。
 - **9d 路径策略与发送节奏**：`MediaPathPolicy.swift`（1253 行：UDP 试用、回退、恢复）、`VideoSendPacing.swift`、动态帧窗口（`dynamicFrameWindow`，上限 24）、快速恢复（`fastRecovery`）。

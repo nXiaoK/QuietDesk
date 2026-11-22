@@ -505,6 +505,8 @@ pub struct HostMedia {
     credentials: Option<(Vec<u8>, Vec<u8>)>,
     epochs: (u32, u32),
     transaction: Option<HostTransaction>,
+    /// A commit sent before capture was interrupted can still be confirmed by the viewer.
+    interrupted_commit: Option<(Uuid, RoutedStream)>,
     active: Option<RoutedStream>,
     video_bound: bool,
     /// Frames wait for the viewer to open a new stream.
@@ -594,6 +596,7 @@ impl HostMedia {
                         _ => return Ok(refuse()),
                     };
                     self.epochs = (stream.transport_epoch, stream.codec_epoch);
+                    self.interrupted_commit = None;
                     self.hold = true;
                     self.transaction = Some(HostTransaction {
                         id,
@@ -631,6 +634,10 @@ impl HostMedia {
                     self.hold = false;
                     log::info!("host committed {path} media stream (transport epoch {}, codec epoch {})", stream.transport_epoch, stream.codec_epoch);
                     Vec::new()
+                }
+                None if self.interrupted_commit.is_some_and(|(pending, route)| pending == id && route.stream == stream && route.path.name() == path) => {
+                    self.active = self.interrupted_commit.take().map(|(_, route)| route);
+                    if paused { Vec::new() } else { self.recovery().map(|recover| HostMediaEvent::Send(Box::new(recover))).into_iter().collect() }
                 }
                 _ => Vec::new(),
             },
@@ -716,7 +723,7 @@ impl HostMedia {
     /// Returns how many frames stop counting against the frame window and what to tell the viewer;
     /// frames are held until it has opened a new stream.
     pub fn interrupted(&mut self) -> (usize, Vec<MediaControl>) {
-        let aborted = self.transaction.take().map(|transaction| transaction.route.transaction(MediaOperation::Abort, transaction.id));
+        let aborted = self.abort_transaction();
         self.hold = self.hold || self.active.is_some() || aborted.is_some();
         let settled = std::mem::take(&mut self.unsettled).len();
         (settled, aborted.into_iter().chain(self.recovery()).collect())
@@ -724,7 +731,14 @@ impl HostMedia {
 
     /// Stops the exchange in progress; a paused host opens no stream.
     pub fn paused(&mut self) -> Option<MediaControl> {
+        self.abort_transaction()
+    }
+
+    fn abort_transaction(&mut self) -> Option<MediaControl> {
         let transaction = self.transaction.take()?;
+        if transaction.stage == HostStage::Decoded {
+            self.interrupted_commit = Some((transaction.id, transaction.route));
+        }
         Some(transaction.route.transaction(MediaOperation::Abort, transaction.id))
     }
 
@@ -1447,6 +1461,52 @@ mod tests {
         assert_eq!(pair.settled, 3, "both contiguous pictures settle at once");
         assert_eq!(pair.encode(7, key_frame()), "media");
         assert_eq!(pair.stream_openers, [4], "a periodic IDR does not require isolated decoding");
+    }
+
+    #[test]
+    fn a_commit_confirmed_after_capture_changes_recovers_the_viewers_actual_stream() {
+        let mut pair = Pair::new();
+        pair.open();
+        let initial = pair.viewer.active().unwrap();
+        pair.viewer_receives(MediaControl::recover(initial));
+        let selected = *pair.prepared.last().unwrap();
+        let ready = pair.host.prepared().unwrap();
+        pair.viewer_receives(ready);
+        assert_eq!(pair.encode(2, key_frame()), "media");
+
+        let decoded = pair.viewer.decoded(DecodeReceipt::Media(selected, 2)).unwrap();
+        let [ViewerMediaEvent::Send(_), ViewerMediaEvent::Send(confirm)] = decoded.as_slice() else { panic!("missing decodedReady") };
+        let replies = pair.host.control(&MediaControl::read(confirm).unwrap(), false).unwrap();
+        let [HostMediaEvent::Settled(1), HostMediaEvent::Send(commit)] = replies.as_slice() else { panic!("missing commit") };
+        let events = pair.viewer.control(commit, pair.now).unwrap();
+        let [ViewerMediaEvent::Committed(_), ViewerMediaEvent::Send(committed)] = events.as_slice() else { panic!("missing committed") };
+        let acknowledged = MediaControl::read(committed).unwrap();
+        assert_eq!(pair.viewer.active(), Some(selected));
+
+        // During the platform switch only abort is sent. The prior stream is still the host's last confirmation.
+        let (count, controls) = pair.host.interrupted();
+        assert_eq!(count, 0);
+        assert_eq!(controls[0].operation, MediaOperation::Abort);
+        pair.viewer_receives(controls[0].clone());
+        assert_eq!(pair.host.gate(), Gate::Closed);
+        let previous = pair.host.recovery().unwrap();
+        assert_eq!(previous, MediaControl::recover(initial));
+        assert!(pair.viewer.control(&previous, pair.now).unwrap().is_empty());
+        let mut unrelated = acknowledged.clone();
+        unrelated.transaction_id = Some(Uuid::new_v4());
+        assert!(pair.host.control(&unrelated, false).unwrap().is_empty());
+
+        // The session reads the delayed confirmation once platform reconfiguration returns.
+        pair.host_receives(acknowledged.clone());
+        assert!(pair.host.control(&acknowledged, false).unwrap().is_empty());
+        let next = *pair.prepared.last().unwrap();
+        assert!(next.transport_epoch > selected.transport_epoch);
+        assert_eq!(pair.host.gate(), Gate::Closed);
+        let ready = pair.host.prepared().unwrap();
+        pair.viewer_receives(ready);
+        assert_eq!(pair.encode(3, key_frame()), "media");
+        pair.decode(3);
+        assert_eq!((pair.viewer.active(), pair.host.gate()), (Some(next), Gate::Open));
     }
 
     #[test]

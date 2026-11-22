@@ -61,6 +61,10 @@ impl ScreenCapture {
         (self.bounds.bottom - self.bounds.top) as usize
     }
 
+    pub fn has_frame(&self) -> bool {
+        self.has_frame
+    }
+
     /// Opens the primary display.
     pub fn open() -> Result<Self> {
         match Self::open_duplication() {
@@ -159,7 +163,7 @@ impl ScreenCapture {
     /// pointer differs from the last call; an error means the capture has to be opened again.
     pub fn grab(&mut self, wait_milliseconds: u32) -> Result<bool> {
         let (width, height) = (self.width(), self.height());
-        let first = !std::mem::replace(&mut self.has_frame, true);
+        let first = !self.has_frame;
         match &mut self.source {
             Source::Duplication(source) => unsafe {
                 let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -207,7 +211,10 @@ impl ScreenCapture {
                 };
                 source.duplication.ReleaseFrame().map_err(failed("释放桌面画面"))?;
                 match copied {
-                    Some(Ok(())) => Ok(true),
+                    Some(Ok(())) => {
+                        self.has_frame = true;
+                        Ok(true)
+                    }
                     Some(Err(error)) => Err(failed("读取桌面画面")(error)),
                     None => Ok(changed),
                 }
@@ -240,6 +247,7 @@ impl ScreenCapture {
                     return Ok(false);
                 }
                 self.frame.copy_from_slice(captured);
+                self.has_frame = true;
                 Ok(true)
             },
         }

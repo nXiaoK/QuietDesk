@@ -8,6 +8,7 @@ use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::host::{self, FrameSink, HostCommand, HostEvent, HostOptions, HostPlatform};
 use quietdesk_core::input::{DoubleClick, InjectOp, PcKeyEvent, ViewerInputTranslator};
 use quietdesk_core::keymap::{MacModifierMapping, PcModifierMapping};
+use quietdesk_core::media::{DecodeReceipt, MediaStreamId};
 use quietdesk_core::messages::{StreamSettings, VideoStreamState};
 use quietdesk_core::pairing::PairingKey;
 use quietdesk_core::peer::{self, PeerConfig};
@@ -106,6 +107,11 @@ impl HostPlatform for ReplayHost {
         Ok(())
     }
 
+    async fn request_key_frame(&mut self) -> Result<()> {
+        self.replay.lock().unwrap().next = 0;
+        Ok(())
+    }
+
     fn inject(&mut self, operations: &[InjectOp]) {
         if !operations.is_empty() {
             let operations: Vec<String> = operations.iter().map(|operation| format!("{operation:?}")).collect();
@@ -173,8 +179,9 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(4)).await;
             let mut replay = producer.lock().unwrap();
             let Some(sink) = replay.sink.clone().filter(|sink| !replay.paused && sink.has_credit()) else { continue };
-            sink.submit(frames[replay.next].clone());
-            replay.next = (replay.next + 1) % frames.len();
+            if sink.submit(frames[replay.next].clone()) {
+                replay.next = (replay.next + 1) % frames.len();
+            }
         }
     });
 
@@ -202,6 +209,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
         let (reason, quit) = loop {
             tokio::select! {
                 reason = &mut session => break (reason, false),
+                accepted = listener.accept() => drop(accepted?),
                 line = lines.recv() => {
                     let Some(line) = line else { let _ = commands.send(HostCommand::End); break ((&mut session).await, true) };
                     match line["command"].as_str() {
@@ -223,17 +231,42 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
 
 /// Stands in for decoding and display: reports each frame and acknowledges it.
 struct ReportingViewer {
-    acknowledgements: mpsc::UnboundedSender<u32>,
-    hold_acknowledgements: Arc<Mutex<bool>>,
+    acknowledgements: mpsc::UnboundedSender<DecodeReceipt>,
+    feedback: Arc<Mutex<ScriptFeedback>>,
+}
+
+#[derive(Default)]
+struct ScriptFeedback {
+    hold: bool,
+    held: Vec<(u32, DecodeReceipt)>,
+}
+
+impl ReportingViewer {
+    fn report(&mut self, packet: VideoPacket, receipt: DecodeReceipt, first_in_media_stream: Option<bool>) -> Result<()> {
+        let stream = packet.annex_b()?;
+        let mut feedback = self.feedback.lock().unwrap();
+        emit(json!({
+            "event": "frame", "sequence": packet.sequence, "key": packet.is_key_frame(),
+            "annexB": hex(&stream), "firstInMediaStream": first_in_media_stream, "held": feedback.hold
+        }));
+        if feedback.hold {
+            feedback.held.push((packet.sequence, receipt));
+        } else {
+            let _ = self.acknowledgements.send(receipt);
+        }
+        Ok(())
+    }
 }
 
 impl ViewerPlatform for ReportingViewer {
-    fn video(&mut self, packet: VideoPacket) {
-        let stream = packet.annex_b().unwrap_or_default();
-        emit(json!({ "event": "frame", "sequence": packet.sequence, "key": packet.is_key_frame(), "annexB": hex(&stream) }));
-        if !*self.hold_acknowledgements.lock().unwrap() {
-            let _ = self.acknowledgements.send(packet.sequence);
-        }
+    fn video(&mut self, packet: VideoPacket) -> Result<()> {
+        let receipt = DecodeReceipt::Legacy(packet.sequence);
+        self.report(packet, receipt, None)
+    }
+
+    fn media_video(&mut self, packet: VideoPacket, stream: MediaStreamId, first_in_stream: bool) -> Result<()> {
+        let receipt = DecodeReceipt::Media(stream, packet.sequence);
+        self.report(packet, receipt, Some(first_in_stream))
     }
 
     fn event(&mut self, event: ViewerEvent) {
@@ -242,6 +275,10 @@ impl ViewerPlatform for ReportingViewer {
                 json!({ "event": "connected", "name": name, "canControl": can_control, "stream": stream_json(stream), "liveSettings": live_settings })
             }
             ViewerEvent::Stream { stream, error } => json!({ "event": "stream", "stream": stream_json(stream), "error": error }),
+            ViewerEvent::MediaCommitted(stream) => json!({
+                "event": "mediaCommitted", "sessionID": stream.session_id.to_string(),
+                "transportEpoch": stream.transport_epoch, "codecEpoch": stream.codec_epoch
+            }),
             ViewerEvent::Control(can_control) => json!({ "event": "control", "canControl": can_control }),
             ViewerEvent::Paused { paused, error } => json!({ "event": "paused", "paused": paused, "error": error }),
             ViewerEvent::RoundTrip(milliseconds) => json!({ "event": "roundTrip", "milliseconds": milliseconds }),
@@ -317,8 +354,8 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<()> {
     let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
     let (commands, command_queue) = mpsc::unbounded_channel();
     let (acknowledgements, acknowledged) = mpsc::unbounded_channel();
-    let hold_acknowledgements = Arc::new(Mutex::new(false));
-    let mut platform = ReportingViewer { acknowledgements: acknowledgements.clone(), hold_acknowledgements: hold_acknowledgements.clone() };
+    let feedback = Arc::new(Mutex::new(ScriptFeedback::default()));
+    let mut platform = ReportingViewer { acknowledgements: acknowledgements.clone(), feedback: feedback.clone() };
     let mut translator = ViewerInputTranslator::new(mapping, DoubleClick { interval: Duration::from_millis(500), distance: 4 });
 
     let script = async {
@@ -348,11 +385,15 @@ async fn run_viewer(arguments: &HashMap<String, String>) -> Result<()> {
                 Ok(Script::RequestClipboard) => ViewerCommand::RequestClipboard,
                 Ok(Script::Pause { paused }) => ViewerCommand::Pause(paused),
                 Ok(Script::HoldAcknowledgements { hold }) => {
-                    *hold_acknowledgements.lock().unwrap() = hold;
+                    feedback.lock().unwrap().hold = hold;
                     continue;
                 }
                 Ok(Script::Acknowledge { sequence }) => {
-                    let _ = acknowledgements.send(sequence);
+                    let mut feedback = feedback.lock().unwrap();
+                    if let Some(index) = feedback.held.iter().position(|(held_sequence, _)| *held_sequence == sequence) {
+                        let (_, receipt) = feedback.held.remove(index);
+                        let _ = acknowledgements.send(receipt);
+                    }
                     continue;
                 }
                 Ok(Script::Disconnect) => ViewerCommand::Disconnect,

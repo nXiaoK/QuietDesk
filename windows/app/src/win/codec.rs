@@ -228,6 +228,7 @@ impl H264Encoder {
 
 /// A decoded picture, valid during the callback that receives it.
 pub struct Picture<'a> {
+    pub sample_time: Option<i64>,
     pub luma: Plane<'a>,
     pub chroma: Plane<'a>,
     pub width: usize,
@@ -246,13 +247,18 @@ struct Layout {
 pub struct H264Decoder {
     transform: IMFTransform,
     layout: Layout,
-    samples: i64,
+    next_sample_time: i64,
 }
 
 // Used by the decode thread alone.
 unsafe impl Send for H264Decoder {}
 
 impl H264Decoder {
+    // Input times identify pictures. The sender paces presentation, so this clock is independent
+    // of screen capture rate. MFTs that synthesize output times use the input type's frame rate.
+    const CLOCK_RATE: u32 = 30;
+    const SAMPLE_DURATION: i64 = 10_000_000 / Self::CLOCK_RATE as i64;
+
     pub fn new() -> Result<Self> {
         unsafe {
             let transform: IMFTransform = CoCreateInstance(&CLSID_MSH264DecoderMFT, None, CLSCTX_INPROC_SERVER).map_err(failed("创建 H.264 解码器"))?;
@@ -260,9 +266,15 @@ impl H264Decoder {
             if let Ok(attributes) = transform.GetAttributes() {
                 let _ = attributes.SetUINT32(&MF_LOW_LATENCY, 1);
             }
+            if let Ok(control) = transform.cast::<ICodecAPI>() {
+                // The Microsoft H.264 decoder expects VT_UI4 for this option.
+                let enabled = VARIANT::from(1u32);
+                let _ = control.SetValue(&CODECAPI_AVLowLatencyMode, std::ptr::from_ref(&enabled).cast());
+            }
             let input = video_type(&MFVideoFormat_H264).map_err(failed("配置 H.264 解码器"))?;
+            input.SetUINT64(&MF_MT_FRAME_RATE, pack(Self::CLOCK_RATE, 1)).map_err(failed("配置解码时间基准"))?;
             transform.SetInputType(0, &input, 0).map_err(failed("配置 H.264 解码器"))?;
-            let mut decoder = Self { transform, layout: Layout::default(), samples: 0 };
+            let mut decoder = Self { transform, layout: Layout::default(), next_sample_time: 0 };
             decoder.choose_output().map_err(failed("配置 H.264 解码输出"))?;
             decoder.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0).map_err(failed("启动 H.264 解码器"))?;
             decoder.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0).map_err(failed("启动 H.264 解码器"))?;
@@ -301,11 +313,15 @@ impl H264Decoder {
         }
     }
 
+    pub fn next_sample_time(&self) -> i64 {
+        self.next_sample_time
+    }
+
     /// Decodes one access unit and hands every picture it completes to `picture`.
     pub fn decode(&mut self, annex_b: &[u8], mut picture: impl FnMut(Picture)) -> Result<()> {
         unsafe {
-            let sample = sample_with(annex_b, self.samples, 1).map_err(failed("准备解码输入"))?;
-            self.samples += 1;
+            let sample = sample_with(annex_b, self.next_sample_time, Self::SAMPLE_DURATION).map_err(failed("准备解码输入"))?;
+            self.next_sample_time += Self::SAMPLE_DURATION;
             let mut submitted = false;
             loop {
                 if !submitted {
@@ -330,6 +346,7 @@ impl H264Decoder {
                 if layout.width < 2 || layout.height < 2 {
                     continue;
                 }
+                let sample_time = output.GetSampleTime().ok();
                 let buffer = output.ConvertToContiguousBuffer().map_err(failed("读取解码输出"))?;
                 let (mut data, mut length) = (std::ptr::null_mut(), 0);
                 buffer.Lock(&mut data, None, Some(&mut length)).map_err(failed("读取解码输出"))?;
@@ -337,6 +354,7 @@ impl H264Decoder {
                 let chroma_start = layout.stride * layout.coded_height;
                 if bytes.len() >= chroma_start + layout.stride * (layout.height / 2 - 1) + layout.width {
                     picture(Picture {
+                        sample_time,
                         luma: Plane { data: &bytes[..chroma_start], stride: layout.stride },
                         chroma: Plane { data: &bytes[chroma_start..], stride: layout.stride },
                         width: layout.width,

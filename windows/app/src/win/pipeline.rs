@@ -19,6 +19,7 @@ enum Command {
     Size(Sender<Result<(u32, u32)>>),
     Configure(StreamSettings, FrameSink, oneshot::Sender<Result<VideoStreamState>>),
     Pause(bool, oneshot::Sender<Result<()>>),
+    KeyFrame(oneshot::Sender<Result<()>>),
 }
 
 struct Stream {
@@ -119,6 +120,17 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
                 }
                 let _ = reply.send(Ok(()));
             }
+            Ok(Command::KeyFrame(reply)) => {
+                let result = stream.as_mut().ok_or_else(stopped).and_then(|stream| {
+                    // A delayed IDR from the old configuration could otherwise open the new stream.
+                    if stream.encoder.pending() > 0 {
+                        stream.encoder.restart()?;
+                    }
+                    stream.restart_from_key_frame();
+                    Ok(())
+                });
+                let _ = reply.send(result);
+            }
             Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {}
         }
@@ -126,7 +138,8 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
         if !active.sink.has_credit() || Instant::now() < active.due {
             continue;
         }
-        let changed = match screen.grab(if active.fresh || active.flush > 0 { 0 } else { 50 }) {
+        let use_cached = screen.has_frame() && (active.fresh || active.flush > 0);
+        let changed = match screen.grab(if use_cached { 0 } else { 50 }) {
             Ok(changed) => changed,
             Err(error) => {
                 // The desktop was switched (lock screen, elevation prompt) or the display mode changed.
@@ -146,6 +159,10 @@ fn run(commands: Receiver<Command>, bounds: Arc<Mutex<RECT>>) {
                 continue;
             }
         };
+        // Desktop duplication can time out before delivering the very first surface.
+        if !screen.has_frame() {
+            continue;
+        }
         let current = changed || active.fresh;
         if !current && active.flush == 0 {
             continue;
@@ -236,6 +253,12 @@ impl HostPlatform for WindowsHost {
     async fn set_paused(&mut self, paused: bool) -> Result<()> {
         let (reply, answer) = oneshot::channel();
         self.commands.send(Command::Pause(paused, reply)).map_err(|_| stopped())?;
+        answer.await.map_err(|_| stopped())?
+    }
+
+    async fn request_key_frame(&mut self) -> Result<()> {
+        let (reply, answer) = oneshot::channel();
+        self.commands.send(Command::KeyFrame(reply)).map_err(|_| stopped())?;
         answer.await.map_err(|_| stopped())?
     }
 

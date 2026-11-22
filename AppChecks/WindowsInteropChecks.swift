@@ -154,14 +154,25 @@ private func annexB(_ packet: VideoPacket) -> Data {
     ([packet.sps, packet.pps].filter { !$0.isEmpty } + nalUnits(packet)).reduce(into: Data()) { $0.append(contentsOf: [0, 0, 0, 1]); $0.append($1) }
 }
 
-private func writeRecording(_ packets: [VideoPacket], to path: String) throws {
+private func writeRecording(_ packets: [VideoPacket], to path: String) throws -> [Data] {
+    // Store the parameter sets and picture NALs that the Windows encoder hands to FrameSink.
+    // Annex B discards trailing zero padding. VideoToolbox can also add non-picture SEI or filler.
+    let frames = packets.map { packet in
+        let units = [packet.sps, packet.pps].filter { !$0.isEmpty } + nalUnits(packet).filter {
+            $0.first.map { (1...5).contains($0 & 0x1f) } == true
+        }
+        return units.reduce(into: Data()) { result, unit in
+            result.append(contentsOf: [0, 0, 0, 1])
+            result.append(unit.prefix(through: unit.lastIndex(where: { $0 != 0 })!))
+        }
+    }
     var recording = Data()
-    for packet in packets {
-        let stream = annexB(packet)
+    for stream in frames {
         recording.put(UInt32(stream.count))
         recording.append(stream)
     }
     try recording.write(to: URL(fileURLWithPath: path))
+    return frames
 }
 
 /// The viewer steps of `DeskModel.handleViewer` that every released version performs, on Core types.
@@ -170,9 +181,15 @@ private final class MacViewer: @unchecked Sendable {
         var ready = false
         var closed: (reason: String, retryable: Bool)?
         var hello: Hello?
+        var media: MediaSession?
+        var commits: [MediaStreamID] = []
+        var commitPaths: [String] = []
+        var mediaFrames: [MediaFrame] = []
+        var heldDecodes: [(frameID: UInt64, complete: () -> Void)] = []
         var tuning: VideoTuningSession?
         var decoded: [(sequence: UInt32, key: Bool, width: Int, height: Int)] = []
         var received: [UInt32] = []
+        var legacyFrames = 0
         var failures: [String] = []
         var results: [StreamSettingsResult] = []
         var control: [Bool] = []
@@ -186,7 +203,14 @@ private final class MacViewer: @unchecked Sendable {
     private let decoder = VideoDecoder()
     private let preferred: StreamSettings
 
-    init(port: UInt16, key: PairingKey, preferred: StreamSettings) {
+    private let port: UInt16
+    private let key: PairingKey
+    private let useMedia: Bool
+
+    init(port: UInt16, key: PairingKey, preferred: StreamSettings, useMedia: Bool) {
+        self.port = port
+        self.key = key
+        self.useMedia = useMedia
         self.preferred = preferred
         let connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!,
                                       using: SecureTransport.parameters(key: key, responsiveAcknowledgements: true))
@@ -202,6 +226,16 @@ private final class MacViewer: @unchecked Sendable {
     }
 
     private func handle(_ message: Message) throws {
+        if let media = state.get().media {
+            if message.kind == .mediaFrame {
+                let frame = try MediaFrame.decode(message.payload)
+                state.update { $0.mediaFrames.append(frame) }
+            } else if message.kind == .mediaControl {
+                let control = try MediaControl.read(message.payload)
+                if control.operation == .commit, let path = control.path { state.update { $0.commitPaths.append(path) } }
+            }
+            if media.receive(message) { return }
+        }
         switch message.kind {
         case .hello:
             let hello = try Wire.readJSON(Hello.self, message.payload)
@@ -210,6 +244,15 @@ private final class MacViewer: @unchecked Sendable {
             var tuning = try VideoTuningSession(applied: applied, preferred: preferred)
             if hello.sessionTerminationV1 == true { peer.send(try SessionTermination(.subscribe).message()) }
             if hello.controlStatusUpdates == true { peer.send(Message(.controlStatus)) }
+            if useMedia, hello.mediaTransportV1 == true {
+                let media = try MediaSession.viewer(control: peer, key: key, host: "127.0.0.1", port: port, settings: hello.settings)
+                media.onVideo = { [weak self] frame, complete in
+                    self?.decode(frame.packet, frameID: frame.header.frameID, completion: complete)
+                }
+                media.onCommitStream = { [state] stream, _ in state.update { $0.commits.append(stream) } }
+                state.update { $0.media = media }
+                media.start()
+            }
             if hello.liveSettings == true {
                 let request = hello.initialStreamNegotiationV1 == true ? tuning.initialConfirmationRequest() : tuning.nextRequest()
                 if let request { peer.send(try Wire.json(.streamSettingsRequest, request)) }
@@ -217,19 +260,9 @@ private final class MacViewer: @unchecked Sendable {
             state.update { $0.hello = hello; $0.tuning = tuning }
         case .video:
             let packet = try VideoPacket.decode(message.payload)
-            state.update { $0.received.append(packet.sequence) }
-            decoder.decode(packet) { [weak self] result in
-                guard let self else { return }
-                switch result {
-                case .success(let image):
-                    let hold = self.state.update { state -> Bool in
-                        state.decoded.append((packet.sequence, !packet.sps.isEmpty, CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image)))
-                        return state.holdAcknowledgements
-                    }
-                    if !hold { self.acknowledge(packet.sequence) }
-                case .failure(let error):
-                    self.state.update { $0.failures.append("decode \(packet.sequence): \(error)") }
-                }
+            state.update { $0.legacyFrames += 1 }
+            decode(packet, frameID: nil) { [weak self] success in
+                if success { self?.acknowledge(packet.sequence) }
             }
         case .streamSettingsResult:
             let result = try Wire.readJSON(StreamSettingsResult.self, message.payload)
@@ -246,6 +279,7 @@ private final class MacViewer: @unchecked Sendable {
             state.update { $0.control.append(status.canControl) }
         case .sessionPauseResult:
             let result = try Wire.readJSON(SessionPauseResult.self, message.payload)
+            state.get().media?.setPaused(result.paused)
             state.update { $0.pauses.append(result) }
         case .sessionTermination:
             let notice = try SessionTermination.read(message.payload)
@@ -257,6 +291,36 @@ private final class MacViewer: @unchecked Sendable {
         default:
             throw Failure("A released viewer would close the connection on this message")
         }
+    }
+
+    private func decode(_ packet: VideoPacket, frameID: UInt64?, completion: @escaping (Bool) -> Void) {
+        state.update { $0.received.append(packet.sequence) }
+        decoder.decode(packet) { [state] result in
+            switch result {
+            case .success(let image):
+                let hold = state.update { state -> Bool in
+                    state.decoded.append((packet.sequence, !packet.sps.isEmpty, CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image)))
+                    if state.holdAcknowledgements, let frameID {
+                        state.heldDecodes.append((frameID, { completion(true) }))
+                    }
+                    return state.holdAcknowledgements
+                }
+                if !hold { completion(true) }
+            case .failure(let error):
+                state.update { $0.failures.append("decode \(packet.sequence): \(error)") }
+                completion(false)
+            }
+        }
+    }
+
+    func stop() {
+        let media = state.update { state -> MediaSession? in
+            defer { state.media = nil; state.heldDecodes.removeAll() }
+            return state.media
+        }
+        media?.stop()
+        decoder.stop()
+        peer.close("check finished")
     }
 
     func acknowledge(_ sequence: UInt32) {
@@ -308,6 +372,10 @@ private final class MacHost: @unchecked Sendable {
         var next = 0
         var paused = false
         var streaming = false
+        var prepared = false
+        var commits: [MediaControl] = []
+        var decodedFeedback = Set<MediaFrameHeader>()
+        var recoverySequences: [UInt32] = []
         var requests: [StreamSettingsRequest] = []
         var applied: VideoStreamState
         var subscribedTermination = false
@@ -321,6 +389,7 @@ private final class MacHost: @unchecked Sendable {
     }
     let state: Shared<State>
     let port: UInt16
+    private let advertiseMedia: Bool
     private let listener: NWListener
     private let packets: [VideoPacket]
     private let key: PairingKey
@@ -328,7 +397,8 @@ private final class MacHost: @unchecked Sendable {
     private let injector: InputInjector
     private var pump: DispatchSourceTimer?
 
-    init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int)) throws {
+    init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int), advertiseMedia: Bool) throws {
+        self.advertiseMedia = advertiseMedia
         self.key = key
         self.packets = packets
         self.size = size
@@ -373,6 +443,12 @@ private final class MacHost: @unchecked Sendable {
                 try require(role == nil || role == .control, "The viewer opened an auxiliary channel nobody offered")
                 let applied = self.state.get().applied
                 let media = try MediaSession.host(control: peer, key: self.key, port: self.port, settings: applied.settings, relayRouting: true)
+                media.onPrepareStream = { [state = self.state] _, completion in
+                    state.update { $0.prepared = true; $0.waiting.removeAll() }
+                    completion(true)
+                }
+                media.onProduceRecoveryFrame = { [weak self] in self?.produceFrame(recovery: true) }
+                media.onResumeFrames = { [state = self.state] in state.update { $0.prepared = false } }
                 media.onAcknowledged = { [state = self.state] sequence in state.update { _ = $0.waiting.remove(sequence) } }
                 media.start()
                 self.state.update { $0.peer = peer; $0.media = media }
@@ -381,7 +457,7 @@ private final class MacHost: @unchecked Sendable {
                 peer.send(try Wire.json(.hello, Hello(name: "检查用 Mac", width: applied.width, height: applied.height, settings: applied.settings,
                     canControl: true, preferredSettings: preferred.extendedCompatible, deviceID: UUID(), deviceIdentityExchange: true,
                     highRefreshVideoSettings: true, preferredHighRefreshSettings: preferred.highRefreshCompatible,
-                    sessionEffects: true, sessionPause: true, mediaTransportV1: true, independentCursorV1: true,
+                    sessionEffects: true, sessionPause: true, mediaTransportV1: self.advertiseMedia ? true : nil, independentCursorV1: true,
                     relayTransportV1: true, relayDeviceID: nil, sessionLockV1: true, adaptiveVideoV1: true, sessionUnlockV1: true,
                     screenLocked: false, higherFrameRateVideoV1: true, preferredHigherFrameRateSettings: preferred,
                     displayDimmingV1: true, builtInDisplayDimmable: false, sessionTerminationV1: true, desktopActionsV1: true,
@@ -412,21 +488,32 @@ private final class MacHost: @unchecked Sendable {
         pump.resume()
     }
 
-    private func produceFrame() {
-        let frame = state.update { state -> (MediaSession, VideoPacket)? in
-            guard state.streaming, !state.paused, let media = state.media, state.waiting.count < MediaBufferLimits.legacyFrameWindow else { return nil }
+    private func produceFrame(recovery: Bool = false) {
+        state.update { state in
+            guard state.streaming, !state.paused, state.prepared == recovery, let media = state.media,
+                  state.waiting.count < MediaBufferLimits.legacyFrameWindow else { return }
+            if recovery { state.next = 0 }
             let source = packets[state.next]
             state.next = (state.next + 1) % packets.count
             state.sequence &+= 1
+            if recovery { state.recoverySequences.append(state.sequence) }
             state.waiting.insert(state.sequence)
-            return (media, VideoPacket(sequence: state.sequence, codec: .h264, vps: Data(), sps: source.sps, pps: source.pps, avcc: source.avcc))
+            media.sendVideo(VideoPacket(sequence: state.sequence, codec: .h264, vps: Data(), sps: source.sps, pps: source.pps, avcc: source.avcc))
         }
-        if let (media, packet) = frame { media.sendVideo(packet) }
     }
 
     private func handle(_ message: Message, peer: Peer) throws {
         state.update { $0.received.append(message.kind) }
-        if state.get().media?.receive(message) == true { return }
+        if advertiseMedia {
+            if message.kind == .mediaControl {
+                let control = try MediaControl.read(message.payload)
+                if control.operation == .committed { state.update { $0.commits.append(control) } }
+            } else if message.kind == .mediaFeedback {
+                let feedback = try MediaFeedback.decode(message.payload)
+                if feedback.kind == .decoded { state.update { _ = $0.decodedFeedback.insert(feedback.header) } }
+            }
+            if state.get().media?.receive(message) == true { return }
+        }
         switch message.kind {
         case .acknowledgement:
             try require(message.payload.count == 4, "A frame acknowledgement had the wrong size")
@@ -449,10 +536,16 @@ private final class MacHost: @unchecked Sendable {
                 state.requests.append(request)
                 let restart = state.streaming && state.applied != applied
                 state.applied = applied
-                if restart { state.next = 0; state.waiting.removeAll() }
+                if restart {
+                    state.next = 0
+                    state.waiting.removeAll()
+                    // The reconfigured encoder waits for a new media commit before emitting P-frames.
+                    if !state.commits.isEmpty { state.prepared = true }
+                }
                 state.streaming = true
                 return restart
             }
+            state.get().media?.updateSettings(applied.settings, restartsStream: restart)
             peer.send(try Wire.json(.streamSettingsResult, StreamSettingsResult(id: request.id, state: applied, error: nil,
                 codec: request.codec == nil ? nil : .h264, chromaSubsampling: request.chromaSubsampling == nil ? nil : .yuv420,
                 restartsStream: restart)))
@@ -462,9 +555,14 @@ private final class MacHost: @unchecked Sendable {
             state.update { state in
                 state.pauseRequests.append(request.paused)
                 state.paused = request.paused
-                if !request.paused { state.next = 0; state.waiting.removeAll() }
+                if !request.paused {
+                    state.next = 0
+                    state.waiting.removeAll()
+                    if !state.commits.isEmpty { state.prepared = true }
+                }
             }
             peer.send(try Wire.json(.sessionPauseResult, SessionPauseResult(id: request.id, paused: request.paused)))
+            state.get().media?.setPaused(request.paused)
         case .input:
             let input = try Wire.readJSON(RemoteInput.self, message.payload)
             try input.validate()
@@ -493,10 +591,13 @@ private final class MacHost: @unchecked Sendable {
 
     func stop() {
         pump?.cancel()
-        let current = state.get()
+        listener.cancel()
+        let current = state.update { state -> State in
+            defer { state.peer = nil; state.media = nil; state.accepted.removeAll() }
+            return state
+        }
         current.media?.stop()
         current.accepted.forEach { $0.close("check finished") }
-        listener.cancel()
     }
 }
 
@@ -522,9 +623,10 @@ private struct WindowsInteropChecks {
         let size = (width: 640, height: 360)
         let packets: [VideoPacket]
         let recording = work + "/recording.h264"
+        let replayFrames: [Data]
         do {
             packets = try encodeFrames(width: size.width, height: size.height, count: 24)
-            try writeRecording(packets, to: recording)
+            replayFrames = try writeRecording(packets, to: recording)
         } catch {
             print("FAIL Encoding the synthetic stream: \(error)")
             exit(1)
@@ -532,14 +634,14 @@ private struct WindowsInteropChecks {
         let key = try! PairingKey.generate()
         let command = Int(CGEventFlags.maskCommand.rawValue) | 0x08, shift = Int(CGEventFlags.maskShift.rawValue) | 0x02
 
-        func withWindowsHost(_ extra: [String] = [], viewerKey: PairingKey? = nil, preferred: StreamSettings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8),
+        func withWindowsHost(_ extra: [String] = [], useMedia: Bool = true, viewerKey: PairingKey? = nil, preferred: StreamSettings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8),
                              _ body: (Probe, MacViewer) throws -> Void) throws {
             let probe = try Probe(probePath, ["host", "--code", key.code, "--recording", recording, "--size", "\(size.width)x\(size.height)",
                                               "--name", "检查用 Windows 电脑"] + extra)
             defer { probe.stop() }
             guard let port = try probe.next("listening")["port"] as? Int else { throw Failure("The probe did not report its port") }
-            let viewer = MacViewer(port: UInt16(port), key: viewerKey ?? key, preferred: preferred)
-            defer { viewer.peer.close("check finished") }
+            let viewer = MacViewer(port: UInt16(port), key: viewerKey ?? key, preferred: preferred, useMedia: useMedia)
+            defer { viewer.stop() }
             try body(probe, viewer)
             let failures = viewer.state.get().failures
             try require(failures.isEmpty, "The macOS viewer rejected what the Windows host sent: \(failures)")
@@ -555,7 +657,8 @@ private struct WindowsInteropChecks {
                 try require(hello.liveSettings == true && hello.extendedVideoSettings == true && hello.highRefreshVideoSettings == true
                             && hello.controlStatusUpdates == true && hello.sessionPause == true && hello.sessionTerminationV1 == true
                             && hello.initialStreamNegotiationV1 == true, "Hello did not announce what the Windows host implements")
-                try require(hello.mediaTransportV1 == nil && hello.independentCursorV1 == nil && hello.clipboardSync == nil && hello.inputActions == nil
+                try require(hello.mediaTransportV1 == true, "The Windows host omitted the media capability")
+                try require(hello.independentCursorV1 == nil && hello.clipboardSync == nil && hello.inputActions == nil
                             && hello.hevcVideoV1 == nil && hello.adaptiveVideoV1 == nil && hello.higherFrameRateVideoV1 == nil && hello.remoteAudioV1 == nil
                             && hello.displaySwitchingV1 == nil && hello.sessionEffects == nil && hello.deviceIdentityExchange == nil
                             && hello.relativeMouseV1 == nil && hello.trackpadGesturesV1 == nil && hello.typeTextV1 == nil && hello.desktopActionsV1 == nil,
@@ -570,8 +673,8 @@ private struct WindowsInteropChecks {
             }
         }
 
-        run("VideoToolbox decodes the stream a Windows host frames, and three unacknowledged frames stop it") {
-            try withWindowsHost { _, viewer in
+        run("A legacy Mac viewer decodes Windows video, and three unacknowledged frames stop it") {
+            try withWindowsHost(useMedia: false) { _, viewer in
                 try until("thirty frames decode") { viewer.state.get().decoded.count >= 30 }
                 let decoded = viewer.state.get().decoded
                 try require(decoded.map(\.sequence) == Array(1...UInt32(decoded.count)), "Frames arrived out of order: \(decoded.map(\.sequence))")
@@ -592,9 +695,65 @@ private struct WindowsInteropChecks {
             }
         }
 
+        run("A Mac viewer commits shared Windows streams, decodes exact media frames and returns frame credits") {
+            try withWindowsHost { _, viewer in
+                func verifyStream(_ count: Int) throws {
+                    try until("shared stream \(count) delivers dependent frames") {
+                        let state = viewer.state.get()
+                        guard state.commits.count >= count else { return false }
+                        return state.mediaFrames.filter { $0.header.stream == state.commits[count - 1] }.count >= 8
+                    }
+                    let state = viewer.state.get(), stream = state.commits[count - 1]
+                    try require(state.commits.count == count && Set(state.commits).count == count
+                                && state.commitPaths == Array(repeating: "shared", count: count),
+                                "Expected \(count) distinct shared commits, got \(state.commitPaths)")
+                    if count > 1 {
+                        let old = state.commits[count - 2]
+                        try require(stream.sessionID == old.sessionID && stream.transportEpoch > old.transportEpoch
+                                    && stream.codecEpoch > old.codecEpoch, "The new stream reused an old epoch")
+                    }
+                    let frames = state.mediaFrames.filter { $0.header.stream == stream }.prefix(8)
+                    for (index, frame) in frames.enumerated() {
+                        try require(frame.header.frameID == UInt64(index + 1) && frame.header.isIDR == (index == 0)
+                                    && annexB(frame.packet) == replayFrames[index], "Media frame \(index + 1) differed from the recording")
+                    }
+                    let eighth = frames.last!.packet.sequence
+                    try until("VideoToolbox decodes the new stream") { viewer.state.get().decoded.contains { $0.sequence == eighth } }
+                }
+
+                try verifyStream(1)
+                try require(viewer.state.get().legacyFrames > 0, "No legacy frames decoded before the shared path opened")
+                viewer.state.update { $0.holdAcknowledgements = true }
+                try until("three media frames remain unpaid") {
+                    let state = viewer.state.get()
+                    guard let held = state.heldDecodes.first, let last = state.mediaFrames.last else { return false }
+                    return last.header.frameID >= held.frameID + 2
+                }
+                usleep(100_000)
+                let state = viewer.state.get()
+                try require(state.mediaFrames.last!.header.frameID == state.heldDecodes.first!.frameID + 2,
+                            "A Windows host sent more than three frames without decode feedback")
+                let held = viewer.state.update { state -> [() -> Void] in
+                    state.holdAcknowledgements = false
+                    defer { state.heldDecodes.removeAll() }
+                    return state.heldDecodes.map(\.complete)
+                }
+                held.forEach { $0() }
+                try until("decode feedback reopens the window") { viewer.state.get().mediaFrames.count > state.mediaFrames.count + 6 }
+
+                try viewer.choose(StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 20))
+                try verifyStream(2)
+                viewer.peer.send(try Wire.json(.sessionPauseRequest, SessionPauseRequest(paused: true)))
+                try until("the host is paused") { viewer.state.get().pauses.last?.paused == true }
+                viewer.peer.send(try Wire.json(.sessionPauseRequest, SessionPauseRequest(paused: false)))
+                try verifyStream(3)
+            }
+        }
+
         run("A Windows host lowers a request to its limit, restarts from a keyframe and survives a setting its encoder refuses") {
-            try withWindowsHost(["--limit", "2560,60,30", "--refuse-edge", "1280"]) { probe, viewer in
+            try withWindowsHost(["--limit", "2560,60,30", "--refuse-edge", "1280"], useMedia: false) { probe, viewer in
                 try until("frames flow") { viewer.state.get().decoded.count >= 5 }
+                let before = viewer.state.get().decoded.count
                 try viewer.choose(.highest)
                 try until("the lowered settings are confirmed") { viewer.state.get().results.count == 2 }
                 var current = viewer.state.get()
@@ -602,8 +761,9 @@ private struct WindowsInteropChecks {
                 try require(current.results[1].state.settings == lowered && current.results[1].error == nil, "The limit was not applied: \(current.results[1])")
                 try require(current.tuning?.applied.settings == lowered && current.tuning?.desired == lowered && current.tuning?.pending == nil,
                             "The viewer's tuning session did not settle on what the host applied")
-                let before = current.decoded.count
-                try until("the restarted stream decodes") { viewer.state.get().decoded.count > before + 5 }
+                try until("the restarted stream decodes") {
+                    viewer.state.get().decoded.dropFirst(before).contains { $0.key }
+                }
                 current = viewer.state.get()
                 try require(current.decoded[before...].contains { $0.key }, "The restarted stream did not begin with a keyframe")
 
@@ -664,7 +824,7 @@ private struct WindowsInteropChecks {
         }
 
         run("Pausing, withdrawn control, clipboard text and the host's ending reach a Mac viewer as its own host would send them") {
-            try withWindowsHost { probe, viewer in
+            try withWindowsHost(useMedia: false) { probe, viewer in
                 try until("frames flow") { viewer.state.get().decoded.count >= 3 }
                 let pause = SessionPauseRequest(paused: true)
                 viewer.peer.send(try Wire.json(.sessionPauseRequest, pause))
@@ -710,14 +870,32 @@ private struct WindowsInteropChecks {
             }
         }
 
-        func withMacHost(viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
-            let host = try MacHost(key: key, packets: packets, size: size)
+        func withMacHost(advertiseMedia: Bool = true, viewerKey: PairingKey? = nil, quality: String = "1920,60,20", _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
+            let host = try MacHost(key: key, packets: packets, size: size, advertiseMedia: advertiseMedia)
             defer { host.stop() }
             let probe = try Probe(probePath, ["viewer", "--code", (viewerKey ?? key).code, "--port", "\(host.port)", "--quality", quality] + extra)
             defer { probe.stop() }
             try body(host, probe)
             let failures = host.state.get().failures
             try require(failures.isEmpty, "The macOS host rejected what the Windows viewer sent: \(failures)")
+        }
+
+        func verifyWindowsViewerWindow(_ host: MacHost, _ probe: Probe) throws {
+            try probe.send(["command": "holdAcknowledgements", "hold": true])
+            let sequences = try (0..<MediaBufferLimits.legacyFrameWindow).map { _ -> UInt32 in
+                let frame = try probe.next("frame") { $0["held"] as? Bool == true }
+                guard let sequence = frame["sequence"] as? UInt32 else { throw Failure("Held frame omitted its sequence") }
+                return sequence
+            }
+            // Even though the pump has had time to produce more frames, only the held pictures
+            // may be outstanding until the platform returns their actual receipts.
+            usleep(100_000)
+            let frames = probe.all("frame")
+            try require(frames.filter { $0["held"] as? Bool == true }.count == sequences.count
+                        && host.state.get().waiting == Set(sequences), "The host exceeded or prematurely released its decode window")
+            try probe.send(["command": "holdAcknowledgements", "hold": false])
+            for sequence in sequences { try probe.send(["command": "acknowledge", "sequence": Int(sequence)]) }
+            try until("decode receipts reopen the Mac capture window") { probe.all("frame").count > frames.count + 6 }
         }
 
         run("A Windows viewer pairs with a Mac host, reads the application's hello and confirms its settings before capture starts") {
@@ -735,30 +913,61 @@ private struct WindowsInteropChecks {
                             "The first settings request was not the plain H.264 request a released host expects: \(current.requests)")
                 try require(current.subscribedTermination && current.subscribedControl, "The viewer did not subscribe to the ending notice and control changes")
                 try require(try probe.next("control")["canControl"] as? Bool == true, "The control status did not arrive")
-                try require(!current.received.contains(.mediaControl) && !current.received.contains(.cursorControl) && !current.received.contains(.deviceIdentity)
+                try require(!current.received.contains(.cursorControl) && !current.received.contains(.deviceIdentity)
                             && !current.received.contains(.clipboardSettings) && !current.received.contains(.displayControl) && !current.received.contains(.audioControl),
                             "The viewer used an extension it does not implement: \(current.received)")
             }
         }
 
-        run("A Mac host's media session sends a Windows viewer plain video messages, byte for byte what the encoder produced") {
-            try withMacHost { host, probe in
+        run("A Mac host without mediaTransportV1 sends plain video to a Windows viewer, byte for byte what the encoder produced") {
+            try withMacHost(advertiseMedia: false) { host, probe in
                 var frames: [[String: Any]] = []
                 for _ in 0..<30 { frames.append(try probe.next("frame")) }
                 try require(frames.compactMap { $0["sequence"] as? Int } == Array(1...30), "Frames arrived out of order")
                 for (index, frame) in frames.enumerated() {
                     let source = packets[index % packets.count]
-                    try require(frame["key"] as? Bool == !source.sps.isEmpty, "Frame \(index + 1) lost its keyframe marking")
+                    try require(frame["firstInMediaStream"] is NSNull && frame["key"] as? Bool == !source.sps.isEmpty,
+                                "Legacy frame \(index + 1) changed path or lost its keyframe marking")
                     try require(frame["annexB"] as? String == hex(annexB(source)), "Frame \(index + 1) reached the decoder with other bytes")
                 }
-                try probe.send(["command": "holdAcknowledgements", "hold": true])
-                usleep(200_000)
-                let stalled = probe.all("frame").count
-                usleep(200_000)
-                try require(probe.all("frame").count == stalled && host.state.get().waiting.count == 3, "The host's frame window was not three")
-                try probe.send(["command": "holdAcknowledgements", "hold": false])
-                for sequence in host.state.get().waiting { try probe.send(["command": "acknowledge", "sequence": Int(sequence)]) }
-                try until("frames resume") { probe.all("frame").count > stalled + 6 }
+                try verifyWindowsViewerWindow(host, probe)
+            }
+        }
+
+        run("A Windows viewer commits shared Mac streams and returns decode receipts for the encoder's exact frames") {
+            try withMacHost { host, probe in
+                func verifyStream(_ count: Int) throws {
+                    let event = try probe.next("mediaCommitted")
+                    try until("the Mac host sees shared commit \(count)") { host.state.get().commits.count >= count }
+                    let state = host.state.get(), commit = state.commits[count - 1]
+                    try require(state.commits.count == count && state.recoverySequences.count == count && commit.path == "shared"
+                                && event["sessionID"] as? String == commit.sessionID?.uuidString.lowercased()
+                                && event["transportEpoch"] as? UInt32 == commit.transportEpoch
+                                && event["codecEpoch"] as? UInt32 == commit.codecEpoch, "The endpoints committed different streams")
+                    let first = Int(state.recoverySequences[count - 1])
+                    for index in 0..<8 {
+                        let frame = try probe.next("frame") { $0["sequence"] as? Int == first + index }
+                        try require(frame["annexB"] as? String == hex(annexB(packets[index])) && frame["key"] as? Bool == (index == 0)
+                                    && frame["firstInMediaStream"] as? Bool == (index == 0),
+                                    "Windows received different bytes for shared frame \(index + 1)")
+                    }
+                    try until("the Windows viewer acknowledges the decoded media frame") {
+                        host.state.get().decodedFeedback.contains {
+                            $0.stream.sessionID == commit.sessionID && $0.stream.codecEpoch == commit.codecEpoch
+                            && $0.stream.transportEpoch == commit.transportEpoch && $0.frameID == 8
+                        }
+                    }
+                }
+
+                try verifyStream(1)
+                try verifyWindowsViewerWindow(host, probe)
+
+                try probe.send(["command": "quality", "settings": "2560,30,8"])
+                try verifyStream(2)
+                try probe.send(["command": "pause", "paused": true])
+                try require(try probe.next("paused")["paused"] as? Bool == true, "The Windows viewer did not observe the pause")
+                try probe.send(["command": "pause", "paused": false])
+                try verifyStream(3)
             }
         }
 
@@ -839,7 +1048,7 @@ private struct WindowsInteropChecks {
         }
 
         run("Quality changes, pausing, clipboard text and the Mac host's ending reach a Windows viewer") {
-            try withMacHost { host, probe in
+            try withMacHost(advertiseMedia: false) { host, probe in
                 _ = try probe.next("stream")
                 _ = try probe.next("frame")
                 try probe.send(["command": "quality", "settings": "8192,240,100"])

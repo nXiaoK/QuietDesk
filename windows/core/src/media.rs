@@ -36,6 +36,8 @@ const FEEDBACK_RECORD: u8 = 3;
 /// A feedback record fits one datagram of the macOS implementation, whatever carries it.
 const MAXIMUM_FEEDBACK_BYTES: usize = 1100;
 const PATH: &str = "shared";
+const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(8);
 
 fn begin(record: u8, header: &MediaFrameHeader, capacity: usize) -> Vec<u8> {
     let mut data = Vec::with_capacity(HEADER_BYTES + capacity);
@@ -181,6 +183,16 @@ impl MediaFeedback {
         if ranges > 64 || reader.remaining() != ranges * 4 || (kind == FeedbackKind::Nack) != (ranges > 0) {
             return Err(DeskError::invalid("媒体反馈类型或长度无效"));
         }
+        let mut previous_end = 0;
+        for _ in 0..ranges {
+            let first = u32::from(reader.u16()?);
+            let count = u32::from(reader.u16()?);
+            let end = first + count;
+            if count == 0 || first < previous_end || end > u32::from(u16::MAX) + 1 {
+                return Err(DeskError::invalid("媒体缺片范围重复或溢出"));
+            }
+            previous_end = end;
+        }
         Ok(Self { kind, header })
     }
 }
@@ -214,12 +226,13 @@ mod base64_key {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error> {
         let Some(text) = Option::<String>::deserialize(deserializer)? else { return Ok(None) };
-        // OpenSSL decodes whole blocks of four characters and nothing else.
         if text.len() % 4 != 0 || text.is_empty() {
             return Err(D::Error::custom("invalid base64"));
         }
-        let mut bytes = openssl::base64::decode_block(&text).map_err(|_| D::Error::custom("invalid base64"))?;
-        bytes.truncate(text.len() / 4 * 3 - text.bytes().rev().take_while(|byte| *byte == b'=').count());
+        let bytes = openssl::base64::decode_block(&text).map_err(|_| D::Error::custom("invalid base64"))?;
+        if openssl::base64::encode_block(&bytes) != text {
+            return Err(D::Error::custom("invalid base64"));
+        }
         Ok(Some(bytes))
     }
 }
@@ -357,6 +370,8 @@ impl MediaControl {
             && (self.marked_repairs.is_none() || operation == Request)
             && (self.fast.is_none() || operation == Prepare)
             && (operation == Stats || (self.encode_milliseconds.is_none() && self.encode_idle.is_none() && self.mapped_transfer.is_none()))
+            && self.mapped_transfer.as_deref().is_none_or(|state| matches!(state, "transferring" | "waitingForVideoCredit"))
+            && self.role.as_deref().is_none_or(|role| matches!(role, "control" | "video" | "bulk" | "portMapping"))
             && self.delivery_milliseconds.is_none_or(|delay| operation == Stats && (0.0..=60_000.0).contains(&delay));
         let no_identity = self.token.is_none() && self.datagram_key.is_none() && self.role.is_none();
         let no_transaction = self.transaction_id.is_none() && self.transport_epoch.is_none() && self.codec_epoch.is_none() && self.path.is_none();
@@ -423,6 +438,13 @@ struct HostTransaction {
     stream: MediaStreamId,
     stage: HostStage,
     key_frame_sent: bool,
+    deadline: Instant,
+}
+
+struct OutstandingFrame {
+    header: MediaFrameHeader,
+    deadline: Instant,
+    reassembled: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -458,7 +480,7 @@ pub struct HostMedia {
     hold: bool,
     next_frame: u64,
     /// Frames of the current stream the viewer has not reported as decoded.
-    unsettled: VecDeque<u64>,
+    unsettled: VecDeque<OutstandingFrame>,
 }
 
 impl HostMedia {
@@ -524,7 +546,13 @@ impl HostMedia {
                 None => {
                     self.epochs = (stream.transport_epoch, stream.codec_epoch);
                     self.hold = true;
-                    self.transaction = Some(HostTransaction { id, stream, stage: HostStage::Preparing, key_frame_sent: false });
+                    self.transaction = Some(HostTransaction {
+                        id,
+                        stream,
+                        stage: HostStage::Preparing,
+                        key_frame_sent: false,
+                        deadline: Instant::now() + TRANSACTION_TIMEOUT,
+                    });
                     self.next_frame = 1;
                     let settled = std::mem::take(&mut self.unsettled).len();
                     vec![HostMediaEvent::Settled(settled), HostMediaEvent::Prepare(stream)]
@@ -541,7 +569,7 @@ impl HostMedia {
                 Some(transaction) if transaction.key_frame_sent => {
                     transaction.stage = HostStage::Decoded;
                     // This confirmation stands for the keyframe's own feedback, which may still be on its way.
-                    let settled = self.unsettled.iter().take_while(|frame| **frame <= 1).count();
+                    let settled = self.unsettled.iter().take_while(|frame| frame.header.frame_id == 1).count();
                     self.unsettled.drain(..settled);
                     vec![HostMediaEvent::Settled(settled), HostMediaEvent::Send(Box::new(MediaControl::transaction(Commit, id, stream)))]
                 }
@@ -552,6 +580,7 @@ impl HostMedia {
                     self.active = Some(stream);
                     self.transaction = None;
                     self.hold = false;
+                    log::info!("host committed shared media stream (transport epoch {}, codec epoch {})", stream.transport_epoch, stream.codec_epoch);
                     Vec::new()
                 }
                 _ => Vec::new(),
@@ -560,6 +589,7 @@ impl HostMedia {
             _ => {
                 if current.is_some() {
                     self.transaction = None;
+                    return Ok(vec![HostMediaEvent::Settled(std::mem::take(&mut self.unsettled).len())]);
                 }
                 Vec::new()
             }
@@ -591,28 +621,46 @@ impl HostMedia {
                 None => return Ok(HostFrame::Legacy(VideoPacket::h264(sequence, frame))),
             },
         };
-        let message = MediaFrame::new(stream, self.next_frame, VideoPacket::h264(sequence, frame))?.message()?;
-        self.unsettled.push_back(self.next_frame);
-        self.next_frame += 1;
+        let frame = MediaFrame::new(stream, self.next_frame, VideoPacket::h264(sequence, frame))?;
+        self.next_frame = self.next_frame.checked_add(1).ok_or_else(|| DeskError::Network("媒体帧序号已耗尽，需要重新连接".to_string()))?;
+        let message = frame.message()?;
+        self.unsettled.push_back(OutstandingFrame { header: frame.header, deadline: Instant::now() + FRAME_TIMEOUT, reassembled: false });
         Ok(HostFrame::Media(message))
     }
 
     /// How many frames a viewer's report settles, and what to tell the viewer. A frame it gave up on
     /// calls for a new stream.
     pub fn feedback(&mut self, feedback: &MediaFeedback) -> (usize, Vec<MediaControl>) {
-        let current = self.transaction.as_ref().map(|transaction| transaction.stream).or(self.active);
-        if current != Some(feedback.header.stream) {
-            return (0, Vec::new());
+        if self.deadline().is_some_and(|deadline| Instant::now() >= deadline) {
+            return self.interrupted();
         }
+        let Some(index) =
+            self.unsettled.iter().position(|frame| frame.header.stream == feedback.header.stream && frame.header.frame_id == feedback.header.frame_id)
+        else {
+            return (0, Vec::new());
+        };
+        let frame = &mut self.unsettled[index];
         match feedback.kind {
-            FeedbackKind::Decoded => {
-                let settled = self.unsettled.iter().take_while(|frame| **frame <= feedback.header.frame_id).count();
-                self.unsettled.drain(..settled);
-                (settled, Vec::new())
+            FeedbackKind::Decoded if feedback.header == frame.header => {
+                self.unsettled.drain(..=index);
+                (index + 1, Vec::new())
             }
             FeedbackKind::Expired => self.interrupted(),
-            FeedbackKind::Reassembled | FeedbackKind::Nack => (0, Vec::new()),
+            FeedbackKind::Reassembled if feedback.header == frame.header && !frame.reassembled => {
+                frame.reassembled = true;
+                frame.deadline = Instant::now() + FRAME_TIMEOUT;
+                (0, Vec::new())
+            }
+            _ => (0, Vec::new()),
         }
+    }
+
+    pub fn deadline(&self) -> Option<Instant> {
+        self.unsettled.iter().map(|frame| frame.deadline).chain(self.transaction.as_ref().map(|transaction| transaction.deadline)).min()
+    }
+
+    pub fn expire(&mut self, now: Instant) -> (usize, Vec<MediaControl>) {
+        if self.deadline().is_some_and(|deadline| now >= deadline) { self.interrupted() } else { (0, Vec::new()) }
     }
 
     /// The encoder started over, or frames resume after a pause: what the viewer holds cannot continue.
@@ -651,11 +699,33 @@ struct ViewerTransaction {
     started: Instant,
 }
 
+/// Identifies the decoder submission even when an encoder restarts its packet sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeReceipt {
+    Legacy(u32),
+    Media(MediaStreamId, u32),
+}
+
+struct PendingMediaDecode {
+    sequence: u32,
+    header: MediaFrameHeader,
+    deadline: Instant,
+    decoded: bool,
+    bytes: usize,
+}
+
+struct ReceivingStream {
+    stream: MediaStreamId,
+    next_frame: u64,
+    pending: VecDeque<PendingMediaDecode>,
+    last_decoded: Option<MediaFrameHeader>,
+}
+
 #[derive(Debug)]
 pub enum ViewerMediaEvent {
     Send(Message),
-    /// A frame to decode; report its packet sequence to `decoded` afterwards.
-    Video(VideoPacket),
+    /// A frame to decode and whether the host needs its decoded receipt before sending another.
+    Video(VideoPacket, MediaStreamId, bool),
     /// Frames of this stream are now what the viewer shows.
     Committed(MediaStreamId),
 }
@@ -667,18 +737,17 @@ pub struct ViewerMedia {
     epochs: (u32, u32),
     transaction: Option<ViewerTransaction>,
     active: Option<MediaStreamId>,
-    /// The stream frames are taken from, and the id its next frame has.
-    receiving: Option<(MediaStreamId, u64)>,
-    /// Frames handed to the decoder, by packet sequence.
-    decoding: VecDeque<(u32, MediaFrameHeader)>,
+    receiving: Option<ReceivingStream>,
+    legacy_decodes: VecDeque<(u32, usize)>,
     retry_at: Option<Instant>,
     paused: bool,
 }
 
 impl ViewerMedia {
-    /// A host that has not answered an exchange in this time gets asked again.
-    const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(8);
     const RETRY_DELAY: Duration = Duration::from_millis(500);
+    // Legacy frames may still await acceptance when the first media keyframe arrives.
+    const MAXIMUM_PENDING_FRAMES: usize = 6;
+    const MAXIMUM_PENDING_BYTES: usize = 32 * 1024 * 1024;
 
     /// Asks the host for a session. No optional capability is named, so the host uses none.
     pub fn request() -> MediaControl {
@@ -698,15 +767,16 @@ impl ViewerMedia {
         let stream = MediaStreamId { session_id, transport_epoch: self.epochs.0, codec_epoch: self.epochs.1 };
         let transaction = ViewerTransaction { id: Uuid::new_v4(), stream, stage: ViewerStage::Preparing, started: now };
         let prepare = MediaControl::transaction(MediaOperation::Prepare, transaction.id, stream).message()?;
+        self.receiving = None;
         self.transaction = Some(transaction);
         self.retry_at = None;
         Ok(vec![ViewerMediaEvent::Send(prepare)])
     }
 
-    /// Gives up the exchange in progress and returns to the frames of the stream in use.
+    /// Retires every pending decode of the abandoned transaction.
     fn abandon(&mut self) -> Option<MediaControl> {
+        self.receiving = None;
         let transaction = self.transaction.take()?;
-        self.receiving = self.receiving.filter(|(stream, _)| Some(*stream) == self.active);
         Some(MediaControl::transaction(MediaOperation::Abort, transaction.id, transaction.stream))
     }
 
@@ -741,13 +811,14 @@ impl ViewerMedia {
         Ok(match (control.operation, transaction.stage) {
             (Ready, ViewerStage::Preparing) => {
                 transaction.stage = ViewerStage::Ready;
-                self.receiving = Some((stream, 1));
+                self.receiving = Some(ReceivingStream { stream, next_frame: 1, pending: VecDeque::new(), last_decoded: None });
                 vec![ViewerMediaEvent::Send(MediaControl::transaction(Ready, id, stream).message()?)]
             }
             (Commit, ViewerStage::Decoded) => {
                 self.transaction = None;
                 self.active = Some(stream);
-                vec![ViewerMediaEvent::Send(MediaControl::transaction(Committed, id, stream).message()?), ViewerMediaEvent::Committed(stream)]
+                log::info!("viewer committed shared media stream (transport epoch {}, codec epoch {})", stream.transport_epoch, stream.codec_epoch);
+                vec![ViewerMediaEvent::Committed(stream), ViewerMediaEvent::Send(MediaControl::transaction(Committed, id, stream).message()?)]
             }
             (Abort, _) => {
                 self.abandon();
@@ -763,49 +834,116 @@ impl ViewerMedia {
             return Err(DeskError::invalid("媒体帧会话尚未协商"));
         }
         let frame = MediaFrame::decode(payload)?;
-        let Some((_, expected)) = self.receiving.as_mut().filter(|(stream, _)| *stream == frame.header.stream) else { return Ok(Vec::new()) };
-        if frame.header.frame_id < *expected {
-            return Ok(Vec::new());
+        let Some(receiver) = self.receiving.as_ref().filter(|receiver| receiver.stream == frame.header.stream) else { return Ok(Vec::new()) };
+        let expected = receiver.next_frame;
+        if frame.header.frame_id < expected {
+            return Ok(receiver
+                .last_decoded
+                .map(|header| ViewerMediaEvent::Send(MediaFeedback { kind: FeedbackKind::Decoded, header }.message()))
+                .into_iter()
+                .collect());
         }
         // Frames of a stream arrive in order on this path, and a stream begins with a keyframe.
-        if frame.header.frame_id > *expected || (*expected == 1 && !frame.header.is_idr) {
+        if frame.header.frame_id > expected || expected == u64::MAX || (expected == 1 && !frame.header.is_idr) {
             let aborted = self.abandon();
-            self.receiving = None;
             let mut events: Vec<ViewerMediaEvent> = aborted.map(|abort| abort.message().map(ViewerMediaEvent::Send)).transpose()?.into_iter().collect();
             events.extend(self.begin(now)?);
             return Ok(events);
         }
-        *expected += 1;
-        self.decoding.push_back((frame.packet.sequence, frame.header));
+        if expected > 1 && self.transaction.is_some() {
+            return Err(DeskError::invalid("媒体流提交前只接受首个关键帧"));
+        }
+        if receiver.pending.iter().any(|pending| pending.sequence == frame.packet.sequence) {
+            return Err(DeskError::invalid("待解码的媒体帧序号重复"));
+        }
+        self.check_decode_capacity(payload.len())?;
+        let receiver = self.receiving.as_mut().expect("the frame belongs to this receiver");
+        receiver.pending.push_back(PendingMediaDecode {
+            sequence: frame.packet.sequence,
+            header: frame.header,
+            deadline: now + FRAME_TIMEOUT,
+            decoded: false,
+            bytes: payload.len(),
+        });
+        receiver.next_frame += 1;
         let arrived = MediaFeedback { kind: FeedbackKind::Reassembled, header: frame.header };
-        Ok(vec![ViewerMediaEvent::Send(arrived.message()), ViewerMediaEvent::Video(frame.packet)])
+        Ok(vec![ViewerMediaEvent::Send(arrived.message()), ViewerMediaEvent::Video(frame.packet, frame.header.stream, frame.header.frame_id == 1)])
     }
 
-    /// The decoder took the packet with this sequence. `None` when it was not a frame of this session.
-    pub fn decoded(&mut self, sequence: u32) -> Option<Result<Vec<ViewerMediaEvent>>> {
-        let position = self.decoding.iter().position(|(pending, _)| *pending == sequence)?;
-        let (_, header) = self.decoding.remove(position)?;
-        let mut events = vec![ViewerMediaEvent::Send(MediaFeedback { kind: FeedbackKind::Decoded, header }.message())];
-        if let Some(transaction) =
-            self.transaction.as_mut().filter(|transaction| transaction.stage == ViewerStage::Ready && transaction.stream == header.stream && header.is_idr)
-        {
-            transaction.stage = ViewerStage::Decoded;
-            match MediaControl::transaction(MediaOperation::DecodedReady, transaction.id, transaction.stream).message() {
-                Ok(message) => events.push(ViewerMediaEvent::Send(message)),
-                Err(error) => return Some(Err(error)),
-            }
+    pub fn legacy(&mut self, sequence: u32, bytes: usize) -> Result<()> {
+        self.check_decode_capacity(bytes)?;
+        self.legacy_decodes.push_back((sequence, bytes));
+        Ok(())
+    }
+
+    fn check_decode_capacity(&self, bytes: usize) -> Result<()> {
+        let sizes = self
+            .legacy_decodes
+            .iter()
+            .map(|(_, size)| *size)
+            .chain(self.receiving.iter().flat_map(|receiver| receiver.pending.iter().map(|frame| frame.bytes)));
+        let (count, used) = sizes.fold((0, 0), |(count, used), size| (count + 1, used + size));
+        if count >= Self::MAXIMUM_PENDING_FRAMES || bytes > Self::MAXIMUM_PENDING_BYTES - used {
+            return Err(DeskError::invalid("媒体解码队列超过上限"));
         }
-        Some(Ok(events))
+        Ok(())
+    }
+
+    pub fn decoded(&mut self, receipt: DecodeReceipt) -> Result<Vec<ViewerMediaEvent>> {
+        let (stream, sequence) = match receipt {
+            DecodeReceipt::Legacy(sequence) => {
+                let Some(index) = self.legacy_decodes.iter().position(|(submitted, _)| *submitted == sequence) else { return Ok(Vec::new()) };
+                self.legacy_decodes.remove(index);
+                return Ok(vec![ViewerMediaEvent::Send(Message::new(MessageKind::Acknowledgement, sequence.to_be_bytes().to_vec()))]);
+            }
+            DecodeReceipt::Media(stream, sequence) => (stream, sequence),
+        };
+        let timed_events = self.tick(Instant::now())?;
+        if !timed_events.is_empty() {
+            return Ok(timed_events);
+        }
+        let Some(receiver) = self.receiving.as_mut().filter(|receiver| receiver.stream == stream) else { return Ok(Vec::new()) };
+        let Some(frame) = receiver.pending.iter_mut().find(|pending| pending.sequence == sequence) else { return Ok(Vec::new()) };
+        frame.decoded = true;
+        // Feedback is cumulative. A later output must wait for every preceding picture.
+        let complete = receiver.pending.iter().take_while(|pending| pending.decoded).count();
+        let Some(last) = receiver.pending.drain(..complete).next_back() else { return Ok(Vec::new()) };
+        let header = last.header;
+        receiver.last_decoded = Some(header);
+        let mut events = vec![ViewerMediaEvent::Send(MediaFeedback { kind: FeedbackKind::Decoded, header }.message())];
+        if let Some(transaction) = self.transaction.as_mut().filter(|transaction| transaction.stage == ViewerStage::Ready) {
+            transaction.stage = ViewerStage::Decoded;
+            events.push(ViewerMediaEvent::Send(MediaControl::transaction(MediaOperation::DecodedReady, transaction.id, transaction.stream).message()?));
+        }
+        Ok(events)
     }
 
     /// When `tick` has something to do.
     pub fn deadline(&self) -> Option<Instant> {
-        self.transaction.as_ref().map(|transaction| transaction.started + Self::TRANSACTION_TIMEOUT).or(self.retry_at)
+        self.transaction
+            .as_ref()
+            .map(|transaction| transaction.started + TRANSACTION_TIMEOUT)
+            .or(self.retry_at)
+            .into_iter()
+            .chain(self.awaiting_decode().map(|(_, deadline)| deadline))
+            .min()
+    }
+
+    fn awaiting_decode(&self) -> Option<(MediaFrameHeader, Instant)> {
+        self.receiving.as_ref()?.pending.front().map(|frame| (frame.header, frame.deadline))
     }
 
     pub fn tick(&mut self, now: Instant) -> Result<Vec<ViewerMediaEvent>> {
         let mut events = Vec::new();
-        if self.transaction.as_ref().is_some_and(|transaction| now >= transaction.started + Self::TRANSACTION_TIMEOUT) {
+        if let Some((header, _)) = self.awaiting_decode().filter(|(_, deadline)| now >= *deadline) {
+            events.push(ViewerMediaEvent::Send(MediaFeedback { kind: FeedbackKind::Expired, header }.message()));
+            if self.transaction.as_ref().is_some_and(|pending| pending.stream == header.stream) {
+                events.extend(self.abandon().map(|abort| abort.message().map(ViewerMediaEvent::Send)).transpose()?);
+                self.retry_at = Some(now + Self::RETRY_DELAY);
+            } else {
+                events.extend(self.begin(now)?);
+            }
+        } else if self.transaction.as_ref().is_some_and(|transaction| now >= transaction.started + TRANSACTION_TIMEOUT) {
             events.extend(self.abandon().map(|abort| abort.message().map(ViewerMediaEvent::Send)).transpose()?);
             self.retry_at = Some(now + Self::RETRY_DELAY);
         } else if self.retry_at.is_some_and(|at| now >= at) {
@@ -898,6 +1036,15 @@ mod tests {
         nack[38] = 1;
         nack.extend_from_slice(&[0, 0, 0, 2]);
         assert_eq!(MediaFeedback::decode(&nack).unwrap().kind, FeedbackKind::Nack);
+        let mut overlap = nack.clone();
+        overlap[38] = 2;
+        overlap.extend_from_slice(&[0, 1, 0, 1]);
+        assert!(MediaFeedback::decode(&overlap).is_err());
+        for range in [[0, 2, 0, 0], [255, 255, 0, 2]] {
+            let mut invalid = nack.clone();
+            invalid[39..].copy_from_slice(&range);
+            assert!(MediaFeedback::decode(&invalid).is_err());
+        }
         nack[37] = 2;
         assert!(MediaFeedback::decode(&nack).is_err());
         let mut unknown = message.payload.clone();
@@ -957,6 +1104,7 @@ mod tests {
             .is_err()
         );
         assert!(serde_json::from_str::<MediaControl>(r#"{"operation":"rewind"}"#).is_err());
+        assert!(serde_json::from_str::<MediaControl>(r#"{"operation":"offer","token":"===="}"#).is_err());
     }
 
     /// Runs both sides against each other, delivering every message at once.
@@ -971,6 +1119,7 @@ mod tests {
         settled: usize,
         committed: Vec<MediaStreamId>,
         video: Vec<VideoPacket>,
+        stream_openers: Vec<u32>,
     }
 
     impl Pair {
@@ -985,6 +1134,7 @@ mod tests {
                 settled: 0,
                 committed: Vec::new(),
                 video: Vec::new(),
+                stream_openers: Vec::new(),
             }
         }
 
@@ -1015,7 +1165,12 @@ mod tests {
                         self.settled += settled;
                         assert!(controls.is_empty());
                     }
-                    ViewerMediaEvent::Video(packet) => self.video.push(packet),
+                    ViewerMediaEvent::Video(packet, _, first_in_stream) => {
+                        if first_in_stream {
+                            self.stream_openers.push(packet.sequence);
+                        }
+                        self.video.push(packet);
+                    }
                     ViewerMediaEvent::Committed(stream) => self.committed.push(stream),
                 }
             }
@@ -1035,7 +1190,8 @@ mod tests {
         }
 
         fn decode(&mut self, sequence: u32) {
-            let events = self.viewer.decoded(sequence).expect("a media frame").unwrap();
+            let stream = *self.prepared.last().unwrap();
+            let events = self.viewer.decoded(DecodeReceipt::Media(stream, sequence)).unwrap();
             self.viewer_events(events);
         }
 
@@ -1077,9 +1233,11 @@ mod tests {
         assert_eq!(pair.encode(5, dependent_frame()), "media");
         assert_eq!(pair.encode(6, dependent_frame()), "media");
         pair.decode(6);
-        assert_eq!(pair.settled, 3, "a report covers every earlier frame");
+        assert_eq!(pair.settled, 1, "a later picture cannot confirm a missing output");
         pair.decode(5);
-        assert_eq!(pair.settled, 3);
+        assert_eq!(pair.settled, 3, "both contiguous pictures settle at once");
+        assert_eq!(pair.encode(7, key_frame()), "media");
+        assert_eq!(pair.stream_openers, [4], "a periodic IDR does not require isolated decoding");
     }
 
     #[test]
@@ -1097,9 +1255,9 @@ mod tests {
         pair.viewer_receives(controls[0].clone());
         let second = pair.prepared[1];
         assert_eq!((second.transport_epoch, second.codec_epoch, pair.host.recovery()), (2, 2, None));
-        // A frame of the stream being replaced that was still on its way is still shown.
+        // As soon as the viewer starts a switch, only the pending transaction can supply frames.
         let late = MediaFrame::new(first, 3, VideoPacket::h264(4, dependent_frame())).unwrap().message().unwrap();
-        assert_eq!(pair.viewer.frame(&late.payload, pair.now).unwrap().len(), 2);
+        assert!(pair.viewer.frame(&late.payload, pair.now).unwrap().is_empty());
 
         let ready = pair.host.prepared().unwrap();
         pair.viewer_receives(ready);
@@ -1116,10 +1274,111 @@ mod tests {
         pair.viewer_receives(MediaControl::recover(second));
         let third = pair.prepared[2];
         let expired = MediaFeedback { kind: FeedbackKind::Expired, header: MediaFrameHeader { stream: third, frame_id: 1, is_idr: true } };
+        assert_eq!(pair.host.feedback(&expired), (0, Vec::new()), "this keyframe has not been sent");
+        let ready = pair.host.prepared().unwrap();
+        pair.viewer_receives(ready);
+        assert_eq!(pair.encode(6, key_frame()), "media");
         let (_, controls) = pair.host.feedback(&expired);
         assert_eq!(controls.iter().map(|control| control.operation).collect::<Vec<_>>(), [MediaOperation::Abort, MediaOperation::Recover]);
         let stale = MediaFeedback { header: MediaFrameHeader { stream: first, ..expired.header }, ..expired };
         assert_eq!(pair.host.feedback(&stale), (0, Vec::new()), "a report about a stream that is over changes nothing");
+    }
+
+    #[test]
+    fn shared_frame_feedback_and_deadlines_only_settle_outstanding_frames() {
+        let mut pair = Pair::new();
+        pair.open();
+        let stream = pair.viewer.active().unwrap();
+        assert!(pair.host.deadline().is_none());
+        assert_eq!(pair.encode(2, dependent_frame()), "media");
+        let deadline = pair.host.deadline().unwrap();
+        let header = MediaFrameHeader { stream, frame_id: 2, is_idr: false };
+        for wrong in [MediaFrameHeader { is_idr: true, ..header }, MediaFrameHeader { frame_id: 3, ..header }] {
+            assert_eq!(pair.host.feedback(&MediaFeedback { kind: FeedbackKind::Decoded, header: wrong }), (0, Vec::new()));
+        }
+        assert_eq!(pair.host.deadline(), Some(deadline));
+        // Repeated receipt of an already reassembled frame cannot postpone recovery indefinitely.
+        pair.host.feedback(&MediaFeedback { kind: FeedbackKind::Reassembled, header });
+        assert_eq!(pair.host.deadline(), Some(deadline));
+        assert_eq!(pair.host.expire(deadline - Duration::from_millis(1)), (0, Vec::new()));
+        assert_eq!(pair.host.expire(deadline), (1, vec![MediaControl::recover(stream)]));
+        assert!(pair.host.deadline().is_none());
+        assert_eq!(pair.host.gate(), Gate::Closed);
+
+        let events = pair.viewer.tick(pair.now + FRAME_TIMEOUT).unwrap();
+        assert!(matches!(&events[..], [ViewerMediaEvent::Send(feedback), ViewerMediaEvent::Send(prepare)]
+            if MediaFeedback::decode(&feedback.payload).unwrap() == MediaFeedback { kind: FeedbackKind::Expired, header }
+                && MediaControl::read(prepare).unwrap().operation == MediaOperation::Prepare));
+        assert!(pair.viewer.decoded(DecodeReceipt::Media(stream, 2)).unwrap().is_empty(), "a late callback cannot confirm the expired frame");
+    }
+
+    #[test]
+    fn a_host_aborts_a_timed_out_first_transaction_before_any_stream_committed() {
+        let mut pair = Pair::new();
+        pair.host_receives(ViewerMedia::request());
+        let deadline = pair.host.deadline().unwrap();
+        assert_eq!(pair.host.expire(deadline - Duration::from_millis(1)), (0, Vec::new()));
+        let (settled, controls) = pair.host.expire(deadline);
+        assert_eq!(settled, 0);
+        assert!(matches!(controls.as_slice(), [abort] if abort.operation == MediaOperation::Abort && abort.transport_epoch == Some(1)));
+        pair.viewer_receives(controls.into_iter().next().unwrap());
+        let events = pair.viewer.tick(pair.now + ViewerMedia::RETRY_DELAY).unwrap();
+        pair.viewer_events(events);
+        assert_eq!(pair.host.preparing().unwrap().transport_epoch, 2);
+    }
+
+    #[test]
+    fn pending_decode_limits_bound_work_across_legacy_and_media_streams() {
+        let mut viewer = ViewerMedia::default();
+        viewer.legacy(1, ViewerMedia::MAXIMUM_PENDING_BYTES).unwrap();
+        assert!(viewer.legacy(2, 1).is_err());
+        viewer.decoded(DecodeReceipt::Legacy(1)).unwrap();
+        for sequence in 0..ViewerMedia::MAXIMUM_PENDING_FRAMES as u32 {
+            viewer.legacy(sequence, 10).unwrap();
+        }
+        assert!(viewer.legacy(10, 10).is_err());
+        assert!(viewer.decoded(DecodeReceipt::Legacy(10)).unwrap().is_empty());
+        viewer.decoded(DecodeReceipt::Legacy(0)).unwrap();
+        viewer.legacy(10, 10).unwrap();
+    }
+
+    #[test]
+    fn legacy_and_media_receipts_distinguish_reused_sequences() {
+        let mut pair = Pair::new();
+        pair.open();
+        assert_eq!(pair.encode(8, dependent_frame()), "media");
+        pair.viewer.legacy(8, 10).unwrap();
+        let HostFrame::Media(reused) = pair.host.frame(8, dependent_frame()).unwrap() else { panic!("expected media frame") };
+        assert!(pair.viewer.frame(&reused.payload, pair.now).is_err());
+        assert!(matches!(pair.viewer.decoded(DecodeReceipt::Legacy(8)).unwrap().as_slice(), [ViewerMediaEvent::Send(message)]
+            if message.kind == MessageKind::Acknowledgement));
+        assert_eq!(pair.settled, 1);
+        pair.decode(8);
+        assert_eq!(pair.settled, 2);
+    }
+
+    #[test]
+    fn a_missing_decoder_output_expires_without_charging_the_replacement_stream() {
+        let mut pair = Pair::new();
+        pair.open();
+        for _ in 0..=ViewerMedia::MAXIMUM_PENDING_FRAMES {
+            let retired = pair.viewer.active().unwrap();
+            assert_eq!(pair.encode(2, dependent_frame()), "media");
+            assert_eq!(pair.encode(3, dependent_frame()), "media");
+            pair.decode(3);
+            let events = pair.viewer.tick(pair.now + FRAME_TIMEOUT).unwrap();
+            let [ViewerMediaEvent::Send(expired), ViewerMediaEvent::Send(prepare)] = events.as_slice() else { panic!("missing recovery request") };
+            let expired = MediaFeedback::decode(&expired.payload).unwrap();
+            assert_eq!((expired.kind, expired.header.frame_id), (FeedbackKind::Expired, 2));
+            pair.host.feedback(&expired);
+            pair.host_receives(MediaControl::read(prepare).unwrap());
+            let ready = pair.host.prepared().unwrap();
+            pair.viewer_receives(ready);
+            assert_eq!(pair.encode(2, key_frame()), "media");
+            assert!(pair.viewer.decoded(DecodeReceipt::Media(retired, 2)).unwrap().is_empty());
+            pair.decode(2);
+            assert_ne!(pair.viewer.active(), Some(retired));
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@ fn main() {}
 fn main() {
     use quietdesk_core::host::{HostCommand, HostOptions};
     use quietdesk_core::keymap::MacModifierMapping;
+    use quietdesk_core::media::MediaStreamId;
     use quietdesk_core::messages::StreamSettings;
     use quietdesk_core::pairing::PairingKey;
     use quietdesk_core::pixel::Nv12Converter;
@@ -17,7 +18,6 @@ fn main() {
     use quietdesk_windows::win::capture::ScreenCapture;
     use quietdesk_windows::win::codec::{H264Decoder, H264Encoder, MediaFoundation};
     use quietdesk_windows::win::util::Com;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn fail(step: &str, error: impl std::fmt::Display) -> ! {
@@ -115,15 +115,36 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_secs(option("--seconds").and_then(|seconds| seconds.parse().ok()).unwrap_or(3600)));
         }
         Some("viewer") => {
-            struct Report(AtomicU64);
+            #[derive(Default)]
+            struct Counts {
+                pictures: u64,
+                committed: Option<MediaStreamId>,
+                media_pictures: u64,
+                showed_candidate: bool,
+            }
+            #[derive(Default)]
+            struct Report(Mutex<Counts>);
             impl ViewerSink for Report {
                 fn event(&self, event: ViewerEvent) {
+                    if let ViewerEvent::MediaCommitted(stream) = event {
+                        let mut counts = self.0.lock().unwrap();
+                        counts.committed = Some(stream);
+                        counts.media_pictures = 0;
+                    }
                     if !matches!(event, ViewerEvent::RoundTrip(_)) {
                         println!("viewer {event:?}");
                     }
                 }
-                fn frame_ready(&self) {
-                    self.0.fetch_add(1, Ordering::Relaxed);
+                fn frame_ready(&self, stream: Option<MediaStreamId>) {
+                    let mut counts = self.0.lock().unwrap();
+                    counts.pictures += 1;
+                    if stream.is_some() {
+                        if stream == counts.committed {
+                            counts.media_pictures += 1;
+                        } else {
+                            counts.showed_candidate = true;
+                        }
+                    }
                 }
             }
             let key = PairingKey::parse(&option("--code").unwrap_or_default()).unwrap_or_else(|error| fail("pairing code", error));
@@ -131,17 +152,37 @@ fn main() {
                 (option("--host").unwrap_or_else(|| "127.0.0.1".to_string()), option("--port").and_then(|port| port.parse().ok()).unwrap_or(5908));
             let seconds = option("--seconds").and_then(|seconds| seconds.parse().ok()).unwrap_or(5);
             let (commands, queue) = tokio::sync::mpsc::unbounded_channel();
-            let (frame, report) = (Arc::new(Mutex::new(Frame::default())), Arc::new(Report(AtomicU64::new(0))));
+            let (frame, report) = (Arc::new(Mutex::new(Frame::default())), Arc::new(Report::default()));
             let session = network_runtime().spawn(run_viewer(address, port, key, StreamSettings::new(1920, 30, 8), queue, frame.clone(), report.clone()));
             std::thread::sleep(std::time::Duration::from_secs(seconds));
-            let _ = commands.send(quietdesk_core::viewer::ViewerCommand::Disconnect);
+            let disconnected = commands.send(quietdesk_core::viewer::ViewerCommand::Disconnect).is_ok();
             let end = tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(session).unwrap_or_else(|error| fail("viewer task", error));
-            let (pictures, frame) = (report.0.load(Ordering::Relaxed), frame.lock().unwrap());
-            println!("viewer ended: {} pictures={pictures} last={}x{} serial={}", end.reason, frame.width, frame.height, frame.serial);
+            let counts = report.0.lock().unwrap();
+            let pictures = counts.pictures;
+            // The opening picture was decoded before commit and is published by the commit itself.
+            let after_commit = counts.media_pictures.saturating_sub(1);
+            let frame = frame.lock().unwrap();
+            println!(
+                "viewer ended: {} pictures={pictures} after_commit={after_commit} last={}x{} serial={}",
+                end.reason, frame.width, frame.height, frame.serial
+            );
+            if arguments.iter().any(|argument| argument == "--require-media") {
+                if !disconnected || end.reason != "已断开连接" {
+                    fail("viewer", "session ended before the requested disconnect");
+                }
+                if counts.showed_candidate {
+                    fail("viewer", "displayed a media picture before its stream committed");
+                }
+                if after_commit == 0 {
+                    fail("viewer", "no picture decoded after the shared media stream committed");
+                }
+            }
             if pictures > 0 && frame.width > 0 { println!("PASS viewer") } else { fail("viewer", "no picture was decoded") }
         }
         _ => {
-            println!("usage: quietdesk-wincheck capture | codec | host --code C [--port P] [--seconds S] | viewer --code C [--host H] [--port P] [--seconds S]")
+            println!(
+                "usage: quietdesk-wincheck capture | codec | host --code C [--port P] [--seconds S] | viewer --code C [--host H] [--port P] [--seconds S] [--require-media]"
+            )
         }
     }
 }

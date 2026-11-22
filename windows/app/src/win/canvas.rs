@@ -58,7 +58,7 @@ impl ViewerSink for Mailbox {
         self.post(WM_SESSION_EVENT);
     }
 
-    fn frame_ready(&self) {
+    fn frame_ready(&self, _stream: Option<quietdesk_core::media::MediaStreamId>) {
         // One pending message is enough: the window always draws the latest picture.
         if !self.frame_posted.swap(true, Ordering::AcqRel) {
             self.post(WM_SESSION_FRAME);
@@ -383,7 +383,7 @@ impl Canvas {
                 self.set_title(if can_control { "被控端允许控制" } else { "仅观看（被控端已关闭控制）" });
             }
             ViewerEvent::Paused { paused, .. } => self.paused = paused,
-            ViewerEvent::RoundTrip(_) => {}
+            ViewerEvent::RoundTrip(_) | ViewerEvent::MediaCommitted(_) => {}
             ViewerEvent::ClipboardText(text) => match clipboard::set_text(&text) {
                 Ok(()) => self.set_title("已接收远端剪贴板文字"),
                 Err(error) => self.set_title(&error.to_string()),

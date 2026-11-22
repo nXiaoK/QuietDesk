@@ -1,11 +1,12 @@
 //! The sessions behind the windows: a listener that serves one viewer at a time, and a viewer connection
 //! with its decode thread. Both run on the network thread's runtime and report through callbacks.
 
-use super::codec::{H264Decoder, MediaFoundation};
+use super::codec::{H264Decoder, MediaFoundation, Picture};
 use super::pipeline::WindowsHost;
 use super::util::Com;
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::host::{self, HostCommand, HostEvent, HostOptions};
+use quietdesk_core::media::{DecodeReceipt, MediaStreamId};
 use quietdesk_core::messages::StreamSettings;
 use quietdesk_core::pairing::PairingKey;
 use quietdesk_core::peer::{self, PeerConfig};
@@ -13,7 +14,9 @@ use quietdesk_core::pixel::nv12_to_bgra;
 use quietdesk_core::tls;
 use quietdesk_core::video::VideoPacket;
 use quietdesk_core::viewer::{self, ViewerCommand, ViewerEnd, ViewerEvent, ViewerPlatform};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -118,22 +121,54 @@ pub struct Frame {
     pub serial: u64,
 }
 
+impl Frame {
+    fn update(&mut self, picture: Picture<'_>) {
+        self.width = picture.width;
+        self.height = picture.height;
+        self.bgra.resize(self.width * self.height * 4, 0);
+        nv12_to_bgra(picture.luma, picture.chroma, self.width, self.height, &mut self.bgra);
+    }
+}
+
 /// Where a viewer session reports to. Called from the network and decode threads.
 pub trait ViewerSink: Send + Sync + 'static {
     fn event(&self, event: ViewerEvent);
     /// `frame` holds a new picture.
-    fn frame_ready(&self);
+    fn frame_ready(&self, stream: Option<MediaStreamId>);
 }
 
 struct WindowsViewer<S: ViewerSink> {
-    packets: std::sync::mpsc::Sender<VideoPacket>,
+    packets: SyncSender<DecodeCommand>,
     sink: Arc<S>,
 }
 
+enum DecodeCommand {
+    Packet { packet: VideoPacket, receipt: DecodeReceipt, first: bool },
+    Commit(MediaStreamId),
+}
+
+impl<S: ViewerSink> WindowsViewer<S> {
+    fn enqueue(&self, command: DecodeCommand) -> Result<()> {
+        self.packets.try_send(command).map_err(|error| match error {
+            TrySendError::Full(_) => DeskError::platform("视频解码队列已满"),
+            TrySendError::Disconnected(_) => DeskError::platform("视频解码已停止"),
+        })
+    }
+}
+
 impl<S: ViewerSink> ViewerPlatform for WindowsViewer<S> {
-    fn video(&mut self, packet: VideoPacket) {
-        // A decode thread that has stopped ends the session through its acknowledgement channel.
-        let _ = self.packets.send(packet);
+    fn video(&mut self, packet: VideoPacket) -> Result<()> {
+        let receipt = DecodeReceipt::Legacy(packet.sequence);
+        self.enqueue(DecodeCommand::Packet { packet, receipt, first: false })
+    }
+
+    fn media_video(&mut self, packet: VideoPacket, stream: MediaStreamId, first: bool) -> Result<()> {
+        let receipt = DecodeReceipt::Media(stream, packet.sequence);
+        self.enqueue(DecodeCommand::Packet { packet, receipt, first })
+    }
+
+    fn media_committed(&mut self, stream: MediaStreamId) -> Result<()> {
+        self.enqueue(DecodeCommand::Commit(stream))
     }
 
     fn event(&mut self, event: ViewerEvent) {
@@ -142,30 +177,94 @@ impl<S: ViewerSink> ViewerPlatform for WindowsViewer<S> {
 }
 
 fn decode<S: ViewerSink>(
-    packets: std::sync::mpsc::Receiver<VideoPacket>,
-    acknowledgements: mpsc::UnboundedSender<u32>,
+    packets: std::sync::mpsc::Receiver<DecodeCommand>,
+    acknowledgements: mpsc::UnboundedSender<DecodeReceipt>,
     frame: Arc<Mutex<Frame>>,
     sink: Arc<S>,
+    stopped: &AtomicBool,
 ) -> Result<()> {
     let _com = Com::enter();
     let _media = MediaFoundation::start()?;
-    let mut decoder = H264Decoder::new()?;
-    for packet in packets {
-        let mut drawn = false;
-        decoder.decode(&packet.annex_b()?, |picture| {
-            let mut frame = frame.lock().unwrap();
-            frame.width = picture.width;
-            frame.height = picture.height;
-            frame.bgra.resize(picture.width * picture.height * 4, 0);
-            nv12_to_bgra(picture.luma, picture.chroma, picture.width, picture.height, &mut frame.bgra);
-            frame.serial += 1;
-            drawn = true;
-        })?;
-        if drawn {
-            sink.frame_ready();
+    let mut legacy_decoder = None;
+    let mut media_decoder = None;
+    let mut pending = VecDeque::new();
+    let publish = |picture: Picture<'_>, stream| {
+        {
+            let mut visible = frame.lock().unwrap();
+            visible.update(picture);
+            visible.serial += 1;
         }
-        if acknowledgements.send(packet.sequence).is_err() {
+        sink.frame_ready(stream);
+    };
+    let mut candidate: Option<(MediaStreamId, Frame)> = None;
+    for command in packets {
+        if stopped.load(Ordering::Acquire) {
             break;
+        }
+        let (packet, receipt, first) = match command {
+            DecodeCommand::Packet { packet, receipt, first } => (packet, receipt, first),
+            DecodeCommand::Commit(stream) => {
+                let Some((_, mut opening)) = candidate.take_if(|(id, _)| *id == stream) else {
+                    return Err(DeskError::platform("媒体流缺少已解码的首帧"));
+                };
+                {
+                    let mut visible = frame.lock().unwrap();
+                    opening.serial = visible.serial + 1;
+                    *visible = opening;
+                }
+                sink.event(ViewerEvent::MediaCommitted(stream));
+                sink.frame_ready(Some(stream));
+                continue;
+            }
+        };
+        let annex_b = packet.annex_b()?;
+        let stream = match receipt {
+            DecodeReceipt::Legacy(_) => {
+                let decoder = match &mut legacy_decoder {
+                    Some(decoder) => decoder,
+                    None => legacy_decoder.insert(H264Decoder::new()?),
+                };
+                decoder.decode(&annex_b, |picture| publish(picture, None))?;
+                if acknowledgements.send(receipt).is_err() {
+                    break;
+                }
+                continue;
+            }
+            DecodeReceipt::Media(stream, _) => stream,
+        };
+
+        // A fresh MFT isolates the candidate from buffered pictures and timestamps of retired streams.
+        if first {
+            media_decoder = Some(H264Decoder::new()?);
+            pending.clear();
+            candidate = None;
+        }
+        let decoder = media_decoder.as_mut().expect("the media receiver starts each stream with its opening frame");
+        // A buffering transform may need another copy of the same IDR to yield the first picture.
+        let copies = if first { 3 } else { 1 };
+        for _ in 0..copies {
+            pending.push_back((decoder.next_sample_time(), receipt));
+            decoder.decode(&annex_b, |picture| {
+                let Some(time) = picture.sample_time else { return };
+                let Some(position) = pending.iter().position(|(tag, _)| *tag == time) else { return };
+                let (_, completed) = pending.remove(position).expect("a picture with this sample time is pending");
+                if first {
+                    let mut opening = Frame::default();
+                    opening.update(picture);
+                    candidate = Some((stream, opening));
+                    // Later outputs for the same IDR copy have no separate receipt or visible frame.
+                    pending.clear();
+                } else {
+                    publish(picture, Some(stream));
+                }
+                let _ = acknowledgements.send(completed);
+            })?;
+            if !first || candidate.is_some() {
+                break;
+            }
+        }
+        if first && candidate.is_none() {
+            return Err(DeskError::platform("H.264 解码器未能输出媒体关键帧"));
         }
     }
     Ok(())
@@ -195,23 +294,28 @@ pub async fn run_viewer<S: ViewerSink>(
         Err(error) => return ViewerEnd { retryable: error.is_retryable(), reason: error.to_string(), host_ended: false },
     };
     let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
-    let (packets, queue) = std::sync::mpsc::channel();
+    // Two three-frame windows allow the previous stream to retire while the next one opens.
+    let (packets, queue) = std::sync::mpsc::sync_channel(2 * host::FrameSink::WINDOW + 1);
     let (acknowledgements, acknowledged) = mpsc::unbounded_channel();
-    let failure = Arc::new(Mutex::new(None::<DeskError>));
-    let (decode_failure, decode_sink) = (failure.clone(), sink.clone());
+    let (finished, decode_result) = tokio::sync::oneshot::channel();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let (decode_stop, decode_sink) = (stopped.clone(), sink.clone());
     let decoding = std::thread::Builder::new().name("decode".to_string()).spawn(move || {
-        if let Err(error) = decode(queue, acknowledgements, frame, decode_sink) {
+        let result = decode(queue, acknowledgements, frame, decode_sink, &decode_stop);
+        if let Err(error) = &result {
             log::error!("decoding stopped: {error}");
-            *decode_failure.lock().unwrap() = Some(error);
         }
+        let _ = finished.send(result);
     });
     if let Err(error) = decoding {
         return ViewerEnd { reason: format!("无法启动解码线程：{error}"), host_ended: false, retryable: false };
     }
     let mut platform = WindowsViewer { packets, sink };
     let mut end = viewer::run(peer.clone(), incoming, &mut platform, quality, commands, acknowledged).await;
-    peer.finished().await;
-    if let Some(error) = failure.lock().unwrap().take() {
+    stopped.store(true, Ordering::Release);
+    drop(platform);
+    let (_, decode_result) = tokio::join!(peer.finished(), decode_result);
+    if let Ok(Err(error)) = decode_result {
         end.reason = error.to_string();
     }
     end

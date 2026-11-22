@@ -2,6 +2,7 @@
 //! viewer that receives video over the control connection and uses only what the host advertised.
 
 use crate::error::{DeskError, Result};
+use crate::media::{DecodeReceipt, MediaControl, MediaStreamId, ViewerMedia, ViewerMediaEvent};
 use crate::messages::{
     ControlStatus, HOST_ENDED_REASON, Hello, RemoteInput, SessionPauseRequest, SessionPauseResult, SessionTermination, StreamSettings, StreamSettingsRequest,
     StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState,
@@ -47,6 +48,8 @@ pub enum ViewerEvent {
         stream: VideoStreamState,
         error: Option<String>,
     },
+    /// The viewer committed this stream after decoding its first keyframe and receiving the host's commit.
+    MediaCommitted(MediaStreamId),
     Control(bool),
     Paused {
         paused: bool,
@@ -66,9 +69,15 @@ pub struct ViewerEnd {
 }
 
 pub trait ViewerPlatform {
-    /// A frame to decode. The platform reports its sequence on the acknowledgement channel once the
-    /// decoder has taken it; the host sends at most three frames ahead of those reports.
-    fn video(&mut self, packet: VideoPacket);
+    /// A legacy frame. The platform reports its sequence once the decoder has taken it.
+    fn video(&mut self, packet: VideoPacket) -> Result<()>;
+    /// Media feedback confirms decoded output. A buffering decoder must report this sequence only
+    /// when it produces the corresponding picture, including the keyframe that opens the stream.
+    fn media_video(&mut self, packet: VideoPacket, stream: MediaStreamId, first_in_stream: bool) -> Result<()>;
+    fn media_committed(&mut self, stream: MediaStreamId) -> Result<()> {
+        self.event(ViewerEvent::MediaCommitted(stream));
+        Ok(())
+    }
     fn event(&mut self, event: ViewerEvent);
 }
 
@@ -76,6 +85,7 @@ struct ViewerSession<'a, P: ViewerPlatform> {
     peer: &'a PeerHandle,
     platform: &'a mut P,
     hello: Option<Hello>,
+    media: Option<ViewerMedia>,
     stream: Option<VideoStreamState>,
     desired: StreamSettings,
     /// The request in flight: its identifier, when it was sent and what it asked for.
@@ -86,19 +96,20 @@ struct ViewerSession<'a, P: ViewerPlatform> {
 }
 
 /// Runs a session on an authenticated connection until it ends. `quality` is the viewer's preference;
-/// `acknowledgements` carries the sequence numbers of frames the decoder has taken.
+/// `acknowledgements` reports the sequence numbers completed by the platform as specified by `ViewerPlatform`.
 pub async fn run<P: ViewerPlatform>(
     peer: PeerHandle,
     mut incoming: mpsc::Receiver<PeerEvent>,
     platform: &mut P,
     quality: StreamSettings,
     mut commands: mpsc::UnboundedReceiver<ViewerCommand>,
-    mut acknowledgements: mpsc::UnboundedReceiver<u32>,
+    mut acknowledgements: mpsc::UnboundedReceiver<DecodeReceipt>,
 ) -> ViewerEnd {
     let mut session = ViewerSession {
         peer: &peer,
         platform,
         hello: None,
+        media: None,
         stream: None,
         desired: quality,
         pending_settings: None,
@@ -109,6 +120,7 @@ pub async fn run<P: ViewerPlatform>(
     let hello_by = Instant::now() + HELLO_TIMEOUT;
     let end = loop {
         let settings_by = session.pending_settings.map(|(_, sent, _)| sent + SETTINGS_REPLY_TIMEOUT);
+        let media_by = session.media.as_ref().and_then(ViewerMedia::deadline);
         let outcome = tokio::select! {
             event = incoming.recv() => match event {
                 Some(PeerEvent::Message(message)) => session.receive(message),
@@ -116,8 +128,8 @@ pub async fn run<P: ViewerPlatform>(
                 Some(PeerEvent::Closed(reason)) => Err(reason),
                 None => Err(DeskError::Network("连接已关闭".to_string())),
             },
-            sequence = acknowledgements.recv() => match sequence {
-                Some(sequence) => peer.send(&Message::new(MessageKind::Acknowledgement, sequence.to_be_bytes().to_vec())),
+            receipt = acknowledgements.recv() => match receipt {
+                Some(receipt) => session.decoded(receipt),
                 None => Err(DeskError::platform("视频解码已停止")),
             },
             command = commands.recv() => match command {
@@ -129,6 +141,9 @@ pub async fn run<P: ViewerPlatform>(
             }
             _ = tokio::time::sleep_until(settings_by.unwrap_or(hello_by)), if settings_by.is_some() => {
                 Err(DeskError::Network("画质调整超过 25 秒未确认".to_string()))
+            }
+            _ = tokio::time::sleep_until(media_by.unwrap_or(hello_by)), if media_by.is_some() => {
+                session.update_media(|media| media.tick(Instant::now()))
             }
         };
         if let Err(error) = outcome {
@@ -148,7 +163,15 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             return self.connected(message.read_json()?);
         };
         match message.kind {
-            MessageKind::Video => self.platform.video(VideoPacket::decode(&message.payload)?),
+            MessageKind::Video => {
+                let packet = VideoPacket::decode(&message.payload)?;
+                if let Some(media) = &mut self.media {
+                    media.legacy(packet.sequence, message.payload.len())?;
+                }
+                self.platform.video(packet)?;
+            }
+            MessageKind::MediaControl => self.update_media(|media| media.control(&MediaControl::read(&message)?, Instant::now()))?,
+            MessageKind::MediaFrame => self.update_media(|media| media.frame(&message.payload, Instant::now()))?,
             MessageKind::StreamSettingsResult if hello.live_settings == Some(true) => {
                 let result: StreamSettingsResult = message.read_json()?;
                 // A reply to a request this viewer no longer waits for changes nothing.
@@ -175,6 +198,9 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 let result: SessionPauseResult = message.read_json()?;
                 if self.pending_pause == Some(result.id) {
                     self.pending_pause = None;
+                    if self.media.is_some() {
+                        self.update_media(|media| media.set_paused(result.paused, Instant::now()))?;
+                    }
                     self.platform.event(ViewerEvent::Paused { paused: result.paused, error: result.error });
                 }
             }
@@ -210,6 +236,10 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         if hello.control_status_updates == Some(true) {
             self.peer.send(&Message::empty(MessageKind::ControlStatus))?;
         }
+        if hello.media_transport_v1 == Some(true) {
+            self.media = Some(ViewerMedia::default());
+            self.peer.send(&ViewerMedia::request().message()?)?;
+        }
         let confirm = live_settings && hello.initial_stream_negotiation_v1 == Some(true);
         self.hello = Some(hello);
         if confirm && self.supported(self.desired) == stream.settings {
@@ -217,6 +247,34 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             return self.send_settings(stream.settings);
         }
         self.request_settings()
+    }
+
+    fn update_media(&mut self, update: impl FnOnce(&mut ViewerMedia) -> Result<Vec<ViewerMediaEvent>>) -> Result<()> {
+        let media = self.media.as_mut().ok_or_else(|| DeskError::invalid("当前连接未协商媒体会话"))?;
+        let events = update(media)?;
+        self.apply_media_events(events)
+    }
+
+    fn apply_media_events(&mut self, events: Vec<ViewerMediaEvent>) -> Result<()> {
+        for event in events {
+            match event {
+                ViewerMediaEvent::Send(message) => self.peer.send(&message)?,
+                ViewerMediaEvent::Video(packet, stream, first_in_stream) => self.platform.media_video(packet, stream, first_in_stream)?,
+                ViewerMediaEvent::Committed(stream) => self.platform.media_committed(stream)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn decoded(&mut self, receipt: DecodeReceipt) -> Result<()> {
+        if let Some(media) = &mut self.media {
+            let events = media.decoded(receipt)?;
+            return self.apply_media_events(events);
+        }
+        if let DecodeReceipt::Legacy(sequence) = receipt {
+            self.peer.send(&Message::new(MessageKind::Acknowledgement, sequence.to_be_bytes().to_vec()))?;
+        }
+        Ok(())
     }
 
     /// The closest settings to `settings` that this host's capabilities allow.
@@ -280,5 +338,74 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             }
             ViewerCommand::Disconnect => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::{FeedbackKind, HostMedia, HostMediaEvent, MediaFeedback, MediaFrame, MediaOperation};
+    use crate::peer::{self, PeerConfig};
+    use crate::video::EncodedFrame;
+
+    struct Decoder;
+
+    impl ViewerPlatform for Decoder {
+        fn video(&mut self, _: VideoPacket) -> Result<()> {
+            Ok(())
+        }
+        fn media_video(&mut self, _: VideoPacket, _: MediaStreamId, _: bool) -> Result<()> {
+            Ok(())
+        }
+        fn event(&mut self, _: ViewerEvent) {}
+    }
+
+    async fn next(events: &mut mpsc::Receiver<PeerEvent>) -> Message {
+        loop {
+            match events.recv().await.unwrap() {
+                PeerEvent::Message(message) => return message,
+                PeerEvent::RoundTrip(_) => {}
+                PeerEvent::Closed(error) => panic!("session ended before expected message: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_legacy_decode_cannot_confirm_a_media_keyframe_reusing_its_sequence() {
+        let (left, right) = tokio::io::duplex(64 * 1024);
+        let (host, mut events) = peer::spawn(left, PeerConfig::default());
+        let (viewer, incoming) = peer::spawn(right, PeerConfig::default());
+        let (commands, queue) = mpsc::unbounded_channel();
+        let (decoder, acknowledgements) = mpsc::unbounded_channel();
+        let quality = StreamSettings::new(1920, 30, 8);
+        let mut platform = Decoder;
+        let session = run(viewer, incoming, &mut platform, quality, queue, acknowledgements);
+        let exchange = async {
+            let hello = serde_json::json!({"version": 1, "name": "host", "width": 640, "height": 360,
+                "settings": quality, "canControl": false, "mediaTransportV1": true});
+            host.send(&Message::json(MessageKind::Hello, &hello).unwrap()).unwrap();
+            let request = MediaControl::read(&next(&mut events).await).unwrap();
+            let packet = VideoPacket::h264(17, EncodedFrame { sps: vec![0x67, 1], pps: vec![0x68, 2], avcc: vec![0, 0, 0, 2, 0x65, 3] });
+            host.send(&Message::new(MessageKind::Video, packet.encode().unwrap())).unwrap();
+            let mut media = HostMedia::default();
+            let Some(HostMediaEvent::Send(offer)) = media.control(&request, false).unwrap().pop() else { panic!("expected offer") };
+            host.send(&offer.message().unwrap()).unwrap();
+            let prepare = MediaControl::read(&next(&mut events).await).unwrap();
+            media.control(&prepare, false).unwrap();
+            let stream = media.preparing().unwrap();
+            host.send(&media.prepared().unwrap().message().unwrap()).unwrap();
+            assert_eq!(MediaControl::read(&next(&mut events).await).unwrap().operation, MediaOperation::Ready);
+            host.send(&MediaFrame::new(stream, 1, packet).unwrap().message().unwrap()).unwrap();
+            assert_eq!(MediaFeedback::decode(&next(&mut events).await.payload).unwrap().kind, FeedbackKind::Reassembled);
+
+            decoder.send(DecodeReceipt::Legacy(17)).unwrap();
+            assert_eq!(next(&mut events).await, Message::new(MessageKind::Acknowledgement, 17u32.to_be_bytes().to_vec()));
+            decoder.send(DecodeReceipt::Media(stream, 17)).unwrap();
+            assert_eq!(MediaFeedback::decode(&next(&mut events).await.payload).unwrap().kind, FeedbackKind::Decoded);
+            assert_eq!(MediaControl::read(&next(&mut events).await).unwrap().operation, MediaOperation::DecodedReady);
+            commands.send(ViewerCommand::Disconnect).unwrap();
+        };
+        let (end, ()) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(session, exchange) }).await.unwrap();
+        assert!(!end.retryable);
     }
 }

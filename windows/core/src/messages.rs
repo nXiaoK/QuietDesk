@@ -104,6 +104,8 @@ pub struct Hello {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_pause: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_transport_v1: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_termination_v1: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_stream_negotiation_v1: Option<bool>,
@@ -375,6 +377,7 @@ mod tests {
             high_refresh_video_settings: None,
             preferred_high_refresh_settings: None,
             session_pause: None,
+            media_transport_v1: None,
             session_termination_v1: None,
             initial_stream_negotiation_v1: None,
         };
@@ -386,6 +389,7 @@ mod tests {
         let from_mac = r#"{"version":1,"name":"Mac","width":2,"height":2,"canControl":false,"mediaTransportV1":true,
             "settings":{"megabits":3,"longestEdge":1920,"framesPerSecond":15},"displays":[{"id":1}],"sessionTerminationV1":true}"#;
         let parsed: Hello = serde_json::from_str(from_mac).unwrap();
+        assert_eq!(parsed.media_transport_v1, Some(true));
         assert_eq!(parsed.session_termination_v1, Some(true));
         assert_eq!(parsed.live_settings, None);
         parsed.validate().unwrap();

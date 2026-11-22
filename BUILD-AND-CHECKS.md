@@ -1,5 +1,17 @@
 # 构建与检查记录
 
+## 任务 B：消除向 Finder 以外应用粘贴时静默得到空文件的可能（2026-11-23，`3066595`）
+
+- **做了什么**：
+  - `Sources/QuietDesk/FinderClipboardPaste.swift`：用 `Darwin.open(..., O_CREAT | O_EXCL | O_WRONLY, 0)` 以 `000` 权限创建占位文件，并在内部开放 `recordPaste()` 供应用检查验证物化覆盖行为。
+  - `Sources/QuietDesk/ClipboardSync.swift`：通过 `writeFinderFiles` 成功发布占位后立即向状态栏发送 `对端已复制文件，请粘贴到 Finder 的文件夹；确认接收后完成粘贴`（不影响 `758732f` 无辅助功能回退路径）；为 `SystemClipboardPasteboard.init` 增加可注入 `isFinderTrusted` 以便隔离测试。
+- **跑了什么与结果**：
+  - 修复前在 `AppChecks/ClipboardFocusChecks.swift` 新增独立命名剪贴板检查执行 `./scripts/run-app-checks.sh`：观察到失败（`82 passed, 1 failed`）——(a) 直接 `Data(contentsOf:)` 与 `open(O_RDONLY)` 成功返回 `0 bytes`（`fd=3`），(b) `NSFileCoordinator` 无粘贴意图读取在回调内报 `NSCocoaErrorDomain` Code 260（`ENOENT`），(c) `NSPasteboard.readObjects(forClasses: [NSURL.self])` 取得 URL 后直接读取同样成功返回 `0 bytes`。
+  - 修复后 `./scripts/run-app-checks.sh` 全部通过（`83 passed, 0 failed`）：(a) 与 (c) 均以 `EACCES` / `NSCocoaErrorDomain` 257 失败，(b) 返回 `ENOENT` 且恢复后占位仍不可读；`recordPaste()` 后协调读取 `000` 占位替换为完整文件与嵌套目录并保留权限（`0750`）与修改时间；`758732f` 无权限回退与 `Overlapping background Finder reads...` 检查继续通过。
+  - `./scripts/run-file-result-checks.sh` 通过（`70 passed, 0 failed`）；`QuietDeskChecks` 运行 2 次：第 1 次 `436 passed, 1 failed`（已知偶发中继回环端口检查），第 2 次 `437 passed, 0 failed`。
+  - 已构建并签名独立验证包 `work/task-b-20261122/QuietDesk-TaskB-Finder-QA.app`（`local.quietdesk.qa.taskb.20261122`，arm64，`0.7.3` build `25`）。
+- **没验证什么**：新编译二进制哈希变更后无辅助功能/输入监控预授权（用户休息中按嘱跳过交互授权），真实 Finder 中 `000` 占位是否保持启用“粘贴”及 `⌘V` / “编辑 → 粘贴” 实测待用户授权后补充确认。
+
 ## 任务 A 复核：全量回归、打包与 Parallels Windows 11 实测（2026-11-22，`ff2806f`）
 
 - **做了什么**：按任务 A 在当前 `main`（`ff2806f`）补跑全量 Swift/Python 检查与 Wine 检查、构建并校验 Universal macOS / Windows x64 测试包（输出至 `outputs/windows/review-fix/`），并在 Parallels Windows 11 ARM64 虚拟机中用独立 bundle ID 实测 Windows → Mac 无辅助功能回退（`758732f`）、有辅助功能 Finder 粘贴及 WP0（`e8b0508`）被控端编码器首帧与每秒统计，不修改产品代码。详见 `outputs/windows/review-fix/实测报告.md`。

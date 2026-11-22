@@ -235,9 +235,10 @@ Windows 版位于 `windows/`（Rust 工作区，工具链版本固定在 `window
 ./scripts/run-windows-interop-checks.sh --rust-only
 ./scripts/run-windows-wine-checks.sh               # 交叉编译后在 Wine 容器中运行，需要 Docker
 ./scripts/build-windows.sh                         # 生成 outputs/windows/ 下的 ZIP 与 SHA-256
+python3 scripts/check-cargo-lock-age.py            # 锁定的依赖须已发布满 7 天，新增或升级依赖后运行（需要联网）
 ```
 
-`build-windows.sh` 使用 `scripts/windows-toolchain.sh` 准备 llvm-mingw（固定发行版并校验 SHA-256，放在 `work/toolchains/`）和 Rust 的 `x86_64-pc-windows-gnullvm` 目标，并检查可执行文件只导入 Windows 自带的库。构建缓存在 `work/windows-build/`。这些脚本尚未接入 `run-all-checks.sh` 与发布流程；各检查的范围和 Wine 的局限见 [Windows 版说明](windows.md#检查)。修改协议相关代码时，两端都要改：`Sources/QuietDeskCore` 与 `windows/core`，并运行互通检查。
+`build-windows.sh` 使用 `scripts/windows-toolchain.sh` 准备 llvm-mingw（固定发行版并校验 SHA-256，放在 `work/toolchains/`）和 Rust 的 `x86_64-pc-windows-gnullvm` 目标，并检查可执行文件只导入 Windows 自带的库。构建缓存在 `work/windows-build/`。这些脚本尚未接入 `run-all-checks.sh` 与发布流程；各检查的范围和 Wine 的局限见 [Windows 版说明](windows.md#检查)。修改协议相关代码时，两端都要改：`Sources/QuietDeskCore` 与 `windows/core`，并运行互通检查。尚未实现的功能及其实施方案见 [windows-plan.md](windows-plan.md)。
 
 ## 中继开发与检查
 

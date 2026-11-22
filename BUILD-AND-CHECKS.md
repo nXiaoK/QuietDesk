@@ -1,5 +1,12 @@
 # 构建与检查记录
 
+## Windows 版：媒体会话模块与后续实施方案（2026-11-22）
+
+- 新增 `windows/core/src/media.rs`：macOS `MediaSession` 在控制连接上传视频（`shared` 路径）所需的线格式（`MediaFrame`、`MediaFeedback`、`MediaControl` 及其校验）和双方状态机（request/offer/prepare/ready/decodedReady/commit/committed/abort/recover）。**尚未接入被控端与控制端会话**：Windows 端仍不声明 `mediaTransportV1`，行为与此前相同。它是独立光标的前提——macOS 控制端只在媒体流提交后才请求独立光标，这是实机反馈“光标跟随慢”的根本解法。
+- 用户改为由其他 agent 继续实现，新增 `docs/windows-plan.md`：现状、约束、15 个工作包（依赖、macOS 源码入口、要改的文件、完成标准）、实机验收清单，以及逐行核对过的媒体会话与光标协议笔记。标注“待核实”的部分只确认了入口，未读实现。
+- 新增 `scripts/check-cargo-lock-age.py`：检查 `windows/Cargo.lock` 中的依赖是否已发布满 7 天（需联网），当前 86 个依赖全部通过。
+- 检查：Rust 单元测试 56 项、回环 2 项通过；`run-windows-interop-checks.sh` 11 项通过；clippy 在本机目标与 Windows 目标均无告警；Python 测试 64 项通过。本节没有改动 Windows 程序的运行行为，未重新打包，未做 Wine 与实机检查。
+
 ## Windows 被控端光标与画面跟随慢（2026-11-22）
 
 - 实机日志：`encoder option … was not accepted: 参数错误 (0x80070057)`，且“the stream opens with a keyframe … after 18 captured frames”，即系统编码器先压住约 17 帧才出第一帧。被控端只在画面变化时出帧，所以光标每动一次，要再等十几次变化才显示出来。

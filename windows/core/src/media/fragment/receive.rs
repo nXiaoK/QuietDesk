@@ -20,49 +20,63 @@ struct Assembly {
     progress: Instant,
     last_nack: Option<Instant>,
     complete: Option<Instant>,
+    fec: Option<Box<fec::Stored>>,
 }
 
 impl Assembly {
-    fn new(f: &Incoming<'_>, now: Instant) -> Self {
+    fn new(header: MediaFrameHeader, bytes: usize, count: usize, now: Instant) -> Self {
         Self {
-            header: f.header,
-            data: vec![0; f.bytes],
-            received: vec![false; f.count],
-            exposed_at: vec![None; f.count],
+            header,
+            data: vec![0; bytes],
+            received: vec![false; count],
+            exposed_at: vec![None; count],
             exposed: 0,
             count: 0,
             first: now,
             progress: now,
             last_nack: None,
             complete: None,
+            fec: None,
         }
     }
 
-    fn add(&mut self, f: &Incoming<'_>, now: Instant) -> Result<bool> {
-        if f.header != self.header || f.bytes != self.data.len() {
-            return Err(DeskError::invalid("同一媒体帧的分片元数据冲突"));
+    fn expose(&mut self, end: usize, now: Instant) {
+        if end > self.exposed {
+            self.exposed_at[self.exposed..end].fill(Some(now));
+            self.exposed = end;
         }
-        let start = f.index * PAYLOAD;
-        let slice = &mut self.data[start..start + f.payload.len()];
-        if self.received[f.index] {
-            if slice != f.payload {
+    }
+
+    fn add(&mut self, index: usize, payload: &[u8], now: Instant) -> Result<bool> {
+        let start = index * PAYLOAD;
+        let slice = &mut self.data[start..start + payload.len()];
+        if self.received[index] {
+            if slice != payload {
                 return Err(DeskError::invalid("重复媒体分片内容冲突"));
             }
             return Ok(false);
         }
-        slice.copy_from_slice(f.payload);
-        self.received[f.index] = true;
+        slice.copy_from_slice(payload);
+        self.received[index] = true;
         self.count += 1;
-        if f.index >= self.exposed {
-            self.exposed_at[self.exposed..f.index].fill(Some(now));
-            self.exposed = f.index + 1;
-        }
+        self.expose(index + 1, now);
         self.progress = now;
         if self.count == self.received.len() {
             self.complete = Some(now);
-            return Ok(true);
         }
-        Ok(false)
+        Ok(true)
+    }
+
+    fn repair(&mut self, touched: usize, now: Instant) -> Result<()> {
+        let Some(fec) = self.fec.as_ref().filter(|_| self.complete.is_none()) else { return Ok(()) };
+        for (i, shard) in fec.recover(touched, &self.data, &self.received)? {
+            let length = PAYLOAD.min(self.data.len() - i * PAYLOAD);
+            if shard[length..].iter().any(|&b| b != 0) {
+                return Err(DeskError::invalid("媒体纠错恢复尾部非零"));
+            }
+            self.add(i, &shard[..length], now)?;
+        }
+        Ok(())
     }
 
     fn missing(&mut self, now: Instant) -> Option<MediaFeedback> {
@@ -199,52 +213,95 @@ impl Receiver {
         self.deliver(now)
     }
 
-    pub fn push(&mut self, record: &[u8], now: Instant) -> Result<Vec<ReceiveEvent>> {
-        let f = Incoming::read(record)?;
-        if self.failed || f.header.stream != self.stream {
-            return Ok(Vec::new());
+    /// Early feedback for old, expired or inconsistent records. A fresh frame reserves
+    /// its full advertised size before storing either original data or a parity shard.
+    fn prepare(&mut self, header: MediaFrameHeader, bytes: usize, count: usize, now: Instant) -> Option<Vec<ReceiveEvent>> {
+        if self.failed || header.stream != self.stream {
+            return Some(Vec::new());
         }
         if let Some(h) = self.expired(now) {
-            return Ok(self.fail(h));
+            return Some(self.fail(h));
         }
-        let id = f.header.frame_id;
+        let id = header.frame_id;
         if id < self.first_unconfirmed {
-            return Ok(self
-                .last_decoded
-                .map(|(h, _)| ReceiveEvent::Feedback(MediaFeedback::new(FeedbackKind::Decoded, h).expect("no ranges")))
-                .into_iter()
-                .collect());
+            return Some(
+                self.last_decoded.map(|(h, _)| ReceiveEvent::Feedback(MediaFeedback::new(FeedbackKind::Decoded, h).expect("no ranges"))).into_iter().collect(),
+            );
         }
         if id == u64::MAX || id - self.first_unconfirmed >= FRAME_WINDOW as u64 {
-            return Ok(self.fail(f.header));
+            return Some(self.fail(header));
         }
-        if !matches!(self.slots.get(&id), Some(Slot::Parts(_))) {
-            if f.bytes > BYTE_BUDGET - self.buffered {
-                return Ok(self.fail(f.header));
+        if let Some(Slot::Parts(a)) = self.slots.get(&id) {
+            if a.header != header || a.data.len() != bytes {
+                return Some(self.fail(header));
+            }
+        } else {
+            if bytes > BYTE_BUDGET - self.buffered {
+                return Some(self.fail(header));
             }
             for missing in self.first_unconfirmed..id {
                 self.slots.entry(missing).or_insert(Slot::Gap { since: now, last_nack: None });
             }
-            self.slots.insert(id, Slot::Parts(Assembly::new(&f, now)));
-            self.buffered += f.bytes;
+            self.slots.insert(id, Slot::Parts(Assembly::new(header, bytes, count, now)));
+            self.buffered += bytes;
             if id == self.next_delivery {
                 self.gap_started = None;
             } else if matches!(self.slots.get(&self.next_delivery), Some(Slot::Gap { .. })) {
                 self.gap_started.get_or_insert(now);
             }
         }
-        let Some(Slot::Parts(a)) = self.slots.get_mut(&id) else { unreachable!() };
-        match a.add(&f, now) {
+        None
+    }
+
+    fn progress(&mut self, header: MediaFrameHeader, index: usize, now: Instant) -> Result<Vec<ReceiveEvent>> {
+        let Some(Slot::Parts(a)) = self.slots.get_mut(&header.frame_id) else { unreachable!() };
+        if a.repair(index, now).is_err() {
+            return Ok(self.fail(header));
+        }
+        if a.complete.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut events = self.deliver(now);
+        if !self.failed {
+            events.insert(0, ReceiveEvent::Feedback(MediaFeedback::new(FeedbackKind::Reassembled, header)?));
+        }
+        Ok(events)
+    }
+
+    pub fn push(&mut self, record: &[u8], now: Instant) -> Result<Vec<ReceiveEvent>> {
+        let f = Incoming::read(record)?;
+        if let Some(events) = self.prepare(f.header, f.bytes, f.count, now) {
+            return Ok(events);
+        }
+        let Some(Slot::Parts(a)) = self.slots.get_mut(&f.header.frame_id) else { unreachable!() };
+        match a.add(f.index, f.payload, now) {
             Err(_) => Ok(self.fail(f.header)),
             Ok(false) => Ok(Vec::new()),
-            Ok(true) => {
-                let mut events = self.deliver(now);
-                if !self.failed {
-                    events.insert(0, ReceiveEvent::Feedback(MediaFeedback::new(FeedbackKind::Reassembled, f.header)?));
-                }
-                Ok(events)
-            }
+            Ok(true) => self.progress(f.header, f.index, now),
         }
+    }
+
+    /// Called only for a negotiated outer kind (8 XOR or 10 block FEC).
+    pub fn parity(&mut self, kind: u8, bytes: &[u8], now: Instant) -> Result<Vec<ReceiveEvent>> {
+        let record = fec::Record::read(kind, bytes)?;
+        let header = record.header;
+        if let Some(events) = self.prepare(header, record.bytes, record.count, now) {
+            return Ok(events);
+        }
+        let Some(Slot::Parts(a)) = self.slots.get_mut(&header.frame_id) else { unreachable!() };
+        let budget = BYTE_BUDGET - self.buffered;
+        match a.fec.get_or_insert_with(Box::default).add(&record, budget) {
+            Err(_) => return Ok(self.fail(header)),
+            Ok(false) => return Ok(Vec::new()),
+            Ok(true) => self.buffered += PAYLOAD,
+        }
+        if a.complete.is_some() {
+            return Ok(Vec::new());
+        }
+        let end = record.exposed_end();
+        a.expose(end, now);
+        a.progress = now;
+        self.progress(header, end - 1, now)
     }
 
     /// ViewerMedia confirmed a contiguous prefix from actual decoder callbacks and sent its ACK.
@@ -260,7 +317,7 @@ impl Receiver {
         }
         for id in self.first_unconfirmed..=header.frame_id {
             let Some(Slot::Parts(assembly)) = self.slots.remove(&id) else { unreachable!("submitted access units form a contiguous prefix") };
-            self.buffered -= assembly.data.len();
+            self.buffered -= assembly.data.len() + assembly.fec.as_deref().map_or(0, |fec| fec.bytes);
         }
         self.first_unconfirmed = header.frame_id + 1;
         self.last_decoded = Some((header, now));

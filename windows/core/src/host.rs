@@ -11,7 +11,7 @@ use crate::display::{DisplayControl, DisplaySwitch, HostDisplays, RemoteDisplayI
 use crate::error::{DeskError, Result};
 use crate::input::{HostInputTranslator, InjectOp};
 use crate::keymap::MacModifierMapping;
-use crate::media::{FeedbackKind, MediaFrameHeader, MediaPath};
+use crate::media::{FeedbackKind, FragmentFeatures, MediaFrameHeader, MediaPath};
 use crate::media::{Gate, HostFrame, HostMedia, HostMediaEvent, MediaControl, MediaFeedback, MediaOperation};
 use crate::messages::{
     ControlStatus, DeviceIdentity, HOST_ENDED_REASON, Hello, InputAction, InputFeedback, InputKind, RemoteInput, SessionPauseRequest, SessionPauseResult,
@@ -295,7 +295,7 @@ struct HostSession<'a, P: HostPlatform> {
     auxiliary: Auxiliary,
     datagrams: DatagramPath,
     udp_frames: Option<DatagramFrames>,
-    marked_repairs: Option<bool>,
+    fragment_features: Option<FragmentFeatures>,
     displays: Option<HostDisplays>,
     display_subscribed: bool,
     remote_display: Option<u32>,
@@ -373,7 +373,7 @@ pub async fn run_with_auxiliary<P: HostPlatform>(
         auxiliary: Auxiliary::host(connections.auxiliary),
         datagrams: DatagramPath::new(connections.datagram),
         udp_frames: None,
-        marked_repairs: None,
+        fragment_features: None,
         clipboard,
         peer: &peer,
         platform,
@@ -575,7 +575,8 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 let now = Instant::now();
                 if self.udp_frames.as_ref().is_none_or(|frames| frames.stream != frame.header.stream) {
                     let settings = self.state.map_or(self.options.preferred, |state| state.settings);
-                    self.udp_frames = Some(DatagramFrames::new(frame.header.stream, settings.megabits as u32, self.marked_repairs.unwrap_or(false), now));
+                    self.udp_frames =
+                        Some(DatagramFrames::new(frame.header.stream, settings, self.fragment_features.unwrap_or_default(), now, self.udp_frames.take()));
                 }
                 if self.udp_frames.as_mut().expect("active UDP stream").insert(frame, now, self.datagrams.rtt).is_err() {
                     self.lose_datagrams()?;
@@ -658,6 +659,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
         if control.operation == MediaOperation::Offer {
             let udp = self.datagrams.offer(&control, true);
             self.media.set_udp_available(udp);
+            if udp && let Some(features) = self.fragment_features {
+                features.advertise(&mut control);
+            }
             control.path = Some(if udp { "udp" } else { "tcp" }.into());
             self.auxiliary.offer(&control);
         }
@@ -838,7 +842,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
             log::info!("viewer media {:?} on {path} (epoch {epoch})", control.operation);
         }
         if control.operation == MediaOperation::Request {
-            self.marked_repairs.get_or_insert(control.marked_repairs == Some(true));
+            self.fragment_features.get_or_insert_with(|| FragmentFeatures::from_peer(&control));
         }
         if control.operation == MediaOperation::DecodedReady && self.media.frame_path() == MediaPath::Udp {
             let ready =

@@ -111,13 +111,24 @@ private final class Probe {
     }
 }
 
+private enum CheckFEC: String, CaseIterable {
+    case legacy, xor, block
+}
+
 /// Forwards loopback ciphertext. Halting only its UDP half leaves the bound TCP roles available.
 private final class InteropMediaRoute: @unchecked Sendable {
+    enum FragmentLoss {
+        case firstFullFragmentAndParity
+        case everyFullFragment
+    }
+
     let port: UInt16
     let dropped = Shared(0)
     private let tcp: RelayOpaqueProxy
     private let udp: NWListener
     private let queue = DispatchQueue(label: "interop.datagram-route")
+    private var sizes: [Int: Int] = [:]
+    private var loss: FragmentLoss?
     private var forwarding: Bool
     private var peers: [NWConnection] = []
 
@@ -140,19 +151,40 @@ private final class InteropMediaRoute: @unchecked Sendable {
             self.peers += [incoming, outgoing]
             incoming.start(queue: self.queue)
             outgoing.start(queue: self.queue)
-            self.receive(from: incoming, to: outgoing)
-            self.receive(from: outgoing, to: incoming)
+            self.receive(from: incoming, to: outgoing, video: false)
+            self.receive(from: outgoing, to: incoming, video: true)
         }
         udp.start(queue: queue)
         guard ready.wait(timeout: .now() + 5) == .success else { stop(); throw Failure("The loopback UDP route did not start") }
     }
 
-    private func receive(from source: NWConnection, to target: NWConnection) {
+    // The negotiated AES-GCM record adds its explicit nonce and tag after the 13-byte DTLS header.
+    static let overhead = 13 + 8 + 16
+    static let full = overhead + 1 + MediaFragment.maximumDatagramBytes
+    static let xor = overhead + 1 + MediaFrameParity.encodedHeaderBytes + MediaFragment.maximumPayloadBytes
+    static let block = overhead + 1 + MediaFrameFECShard.encodedHeaderBytes + MediaFragment.maximumPayloadBytes
+
+    func loseVideoFragments(_ loss: FragmentLoss) {
+        queue.sync { sizes.removeAll(); self.loss = loss }
+    }
+
+    func sizesAfterLoss() -> [Int: Int] { queue.sync { sizes } }
+
+    private func receive(from source: NWConnection, to target: NWConnection, video: Bool) {
         source.receiveMessage { [weak self] data, _, _, error in
             guard let self, error == nil, let data else { return }
-            if self.forwarding { target.send(content: data, completion: .idempotent) }
+            var forward = self.forwarding
+            if video, data.first == 23, let loss = self.loss {
+                self.sizes[data.count, default: 0] += 1
+                if data.count == Self.full {
+                    if loss == .everyFullFragment || self.sizes[data.count] == 1 { forward = false }
+                } else if loss == .firstFullFragmentAndParity && (data.count == Self.xor || data.count == Self.block) {
+                    forward = false
+                }
+            }
+            if forward { target.send(content: data, completion: .idempotent) }
             else { self.dropped.update { $0 += 1 } }
-            self.receive(from: source, to: target)
+            self.receive(from: source, to: target, video: video)
         }
     }
 
@@ -562,9 +594,10 @@ private final class MacViewer: @unchecked Sendable {
         }
     }
 
-    func requestMedia(markedRepairs: Bool? = nil) throws -> MediaControl {
+    func requestMedia(markedRepairs: Bool? = nil, fec: CheckFEC = .legacy) throws -> MediaControl {
         state.update { $0.inspectedControls = [] }
-        peer.send(try MediaControl(.request, markedRepairs: markedRepairs).message())
+        peer.send(try MediaControl(.request, markedRepairs: markedRepairs, parityFEC: fec == .xor ? true : nil,
+                                   blockFEC: fec == .block ? true : nil, fecFragmentLimit: fec == .block ? 256 : nil).message())
         try until("the Windows host offers media") { self.state.get().inspectedControls?.first != nil }
         guard let offer = state.get().inspectedControls?.first, offer.operation == .offer else { throw Failure("Missing media offer") }
         return offer
@@ -602,8 +635,10 @@ private final class MacViewer: @unchecked Sendable {
         }
     }
 
-    func checkDatagramRepair(recording: [Data]) throws {
-        let offer = try requestMedia(markedRepairs: true)
+    func checkDatagramRepair(recording: [Data], fec: CheckFEC = .legacy) throws {
+        let offer = try requestMedia(markedRepairs: true, fec: fec)
+        try require((offer.parityFEC == true) == (fec == .xor) && (offer.blockFEC == true) == (fec == .block),
+                    "The host's FEC offer did not match this viewer's request")
         guard offer.path == "udp", let session = offer.sessionID, let secret = offer.datagramKey else {
             throw Failure("The Windows host did not offer its UDP endpoint")
         }
@@ -613,18 +648,20 @@ private final class MacViewer: @unchecked Sendable {
             return try BoundedDatagramPeer(connection: connection, maximumDatagramBytes: MediaFragment.maximumDatagramBytes + 1)
         }
 
-        var wrong = secret
-        wrong[wrong.startIndex] ^= 1
-        let rejected = try endpoint(secret: wrong)
-        let admitted = Shared(false), closed = DispatchSemaphore(value: 0)
-        rejected.onReady = { admitted.update { $0 = true } }
-        rejected.onClose = { _ in closed.signal() }
-        rejected.start()
-        defer { rejected.close() }
-        try require(closed.wait(timeout: .now() + 4) == .success && !admitted.get(), "DTLS with a different session key became ready or failed to time out")
-        let oldCount = state.get().clipboard.count
-        peer.send(Message(.requestClipboard))
-        try until("the original control channel answers after the incorrect UDP key") { self.state.get().clipboard.count > oldCount }
+        if fec == .legacy {
+            var wrong = secret
+            wrong[wrong.startIndex] ^= 1
+            let rejected = try endpoint(secret: wrong)
+            let admitted = Shared(false), closed = DispatchSemaphore(value: 0)
+            rejected.onReady = { admitted.update { $0 = true } }
+            rejected.onClose = { _ in closed.signal() }
+            rejected.start()
+            defer { rejected.close() }
+            try require(closed.wait(timeout: .now() + 4) == .success && !admitted.get(), "DTLS with a different session key became ready or failed to time out")
+            let oldCount = state.get().clipboard.count
+            peer.send(Message(.requestClipboard))
+            try until("the original control channel answers after the incorrect UDP key") { self.state.get().clipboard.count > oldCount }
+        }
 
         let udp = try endpoint(secret: secret)
         defer { udp.close() }
@@ -664,6 +701,9 @@ private final class MacViewer: @unchecked Sendable {
         try wait(.ready)
         try send(.ready)
         var omitted: MediaFragment?, requested = false, repaired = false, decoded = 0
+        var parityHeaders: Set<MediaFrameHeader> = []
+        let damaged: UInt64 = fec == .xor ? 2 : 1
+        let hole: UInt16 = fec == .xor ? 0 : 1
         let deadline = Date().addingTimeInterval(6)
         while decoded < 2 {
             guard Date() < deadline else { throw Failure("Timed out during UDP repair (omitted \(omitted != nil), NACK \(requested), repair \(repaired), decoded \(decoded))") }
@@ -673,15 +713,30 @@ private final class MacViewer: @unchecked Sendable {
                 return pending
             }
             for data in batch {
-                guard let kind = data.first, kind == 3 || kind == 5 else { throw Failure("Unexpected UDP application record during video repair") }
-                let fragment = try MediaFragment.decode(Data(data.dropFirst()))
-                if kind == 3, fragment.header.frameID == 1, fragment.fragmentIndex == 1, omitted == nil {
-                    try require(fragment.fragmentCount >= 3, "The recovery fixture needs a middle fragment")
-                    omitted = fragment
+                guard let kind = data.first else { throw Failure("Empty application datagram") }
+                let body = Data(data.dropFirst())
+                if kind == 8 && fec == .xor {
+                    let parity = try MediaFrameParity.decode(body)
+                    parityHeaders.insert(parity.header)
+                    events += try receiver.receive(parity)
                     continue
                 }
-                if let omitted, fragment == omitted {
-                    try require(kind == 5 && requested, "The omitted bytes arrived without a marked reply to the matching NACK")
+                if kind == 10 && fec == .block {
+                    let shard = try MediaFrameFECShard.decode(body)
+                    parityHeaders.insert(shard.header)
+                    events += try receiver.receive(shard)
+                    continue
+                }
+                guard kind == 3 || kind == 5 else { throw Failure("Received a UDP record outside the negotiated FEC mode") }
+                let fragment = try MediaFragment.decode(body)
+                if fragment.header.frameID == damaged && fragment.fragmentIndex == hole {
+                    if kind == 3, omitted == nil {
+                        try require(Int(fragment.fragmentCount) >= Int(hole) + 2, "The fixture has too few fragments to expose the selected hole")
+                        omitted = fragment
+                        continue
+                    }
+                    if fec != .legacy { continue }
+                    try require(kind == 5 && requested && fragment == omitted, "The omitted bytes arrived without a marked reply to the matching NACK")
                     repaired = true
                 }
                 events += try receiver.receive(fragment, isRepair: kind == 5)
@@ -701,7 +756,10 @@ private final class MacViewer: @unchecked Sendable {
                         let frameID = frame.header.frameID
                         try require(frameID == UInt64(decoded + 1) && annexB(frame.packet) == recording[decoded % recording.count],
                                     "The reassembled UDP frame differed from the source")
-                        if frameID == 1 { try require(repaired, "The recovery frame arrived before its missing middle fragment was repaired") }
+                        if frameID == damaged {
+                            try require(omitted != nil && (fec == .legacy ? repaired : parityHeaders.contains(frame.header)),
+                                        "The damaged frame arrived without the negotiated recovery record")
+                        }
                         let ready = DispatchSemaphore(value: 0), success = Shared(false)
                         decode(frame.packet, frameID: frameID) { result in success.update { $0 = result }; ready.signal() }
                         try require(ready.wait(timeout: .now() + 2) == .success && success.get(), "VideoToolbox rejected the reassembled frame")
@@ -938,6 +996,7 @@ private final class MacHost: @unchecked Sendable {
     let state: Shared<State>
     let port: UInt16
     private let advertiseMedia: Bool
+    private let fec: CheckFEC?
     private let cursorImage: CursorImage?
     private let cursorID = UUID()
     private let listener: NWListener
@@ -960,7 +1019,8 @@ private final class MacHost: @unchecked Sendable {
     init(key: PairingKey, packets: [VideoPacket], size: (width: Int, height: Int), advertiseMedia: Bool, cursorImage: CursorImage?,
          externalPackets: [VideoPacket] = [], inputActions: Bool = true, relativeMouse: Bool = true, trackpadGestures: Bool = true,
          deviceID: UUID? = UUID(), identityExchange: Bool? = true, prepareHello: @escaping (Message) throws -> Message = { $0 },
-         on port: NWEndpoint.Port = .any, clipboard: InteropClipboard? = nil, advertiseAudio: Bool = true) throws {
+         on port: NWEndpoint.Port = .any, clipboard: InteropClipboard? = nil, advertiseAudio: Bool = true, fec: CheckFEC? = nil) throws {
+        self.fec = fec
         self.advertiseAudio = advertiseAudio
         self.advertiseMedia = advertiseMedia
         self.cursorImage = cursorImage
@@ -1110,6 +1170,7 @@ private final class MacHost: @unchecked Sendable {
     }
 
     private func produceFrame(recovery: Bool = false) {
+        if fec != nil && !recovery { return }
         state.update { state in
             guard state.streaming, !state.paused, state.prepared == recovery, let media = state.media,
                   state.waiting.count < MediaBufferLimits.legacyFrameWindow else { return }
@@ -1124,6 +1185,23 @@ private final class MacHost: @unchecked Sendable {
         }
     }
 
+    func sendFECFrame(source: VideoPacket, fullFragments: Int) throws -> VideoPacket {
+        guard let media = state.get().media else { throw Failure("No active media session") }
+        let seq = state.update { state in state.sequence += 1; return state.sequence }
+        // The short tail has a different record length from a full fragment and from either parity format.
+        let bytes = fullFragments * MediaFragment.maximumPayloadBytes + 930
+        let pad = bytes - (try source.encode()).count - 4
+        guard pad >= 2 else { throw Failure("The source frame is too large for the selected loss pattern") }
+        var avcc = source.avcc
+        avcc.put(UInt32(pad))
+        avcc.append(12)
+        avcc.append(Data(repeating: 0xff, count: pad - 2))
+        avcc.append(0x80)
+        let packet = VideoPacket(sequence: seq, codec: .h264, vps: source.vps, sps: source.sps, pps: source.pps, avcc: avcc)
+        media.sendVideo(packet)
+        return packet
+    }
+
     private func handle(_ message: Message, peer: Peer) async throws {
         let (stopped, media) = state.update { state in
             if !state.stopped { state.received.append(message.kind) }
@@ -1135,6 +1213,14 @@ private final class MacHost: @unchecked Sendable {
             if message.kind == .mediaControl {
                 let control = try MediaControl.read(message.payload)
                 if control.operation == .committed { state.update { $0.commits.append(control) } }
+                if control.operation == .request, let fec {
+                    let xor = fec == .xor && control.parityFEC == true, block = fec == .block && control.blockFEC == true
+                    try require(fec == .legacy || xor || block, "The Windows viewer did not advertise the requested FEC mode")
+                    let request = MediaControl(.request, receiveFrameWindow: control.receiveFrameWindow, markedRepairs: control.markedRepairs,
+                                               parityFEC: xor ? true : nil, blockFEC: block ? true : nil, fecFragmentLimit: control.fecFragmentLimit)
+                    _ = media?.receive(try request.message())
+                    return
+                }
             } else if message.kind == .mediaFeedback {
                 let feedback = try MediaFeedback.decode(message.payload)
                 if feedback.kind == .decoded { state.update { _ = $0.decodedFeedback.insert(feedback.header) } }
@@ -1604,6 +1690,15 @@ private struct WindowsInteropChecks {
                 let reliable = try check("tcp")
                 try require(route?.dropped.get() ?? 0 > 0 && reliable.sessionID == original.sessionID && reliable.transportEpoch > original.transportEpoch
                             && viewer.state.get().closed == nil, "UDP loss interrupted control or reused the old epoch")
+            }
+        }
+
+        for fec in [CheckFEC.xor, .block] {
+            run("A Mac reconstructs selected Windows UDP fragments using \(fec.rawValue) negotiation") {
+                try withWindowsHost(useMedia: false, udp: true) { _, viewer in
+                    try until("Windows offers its synthetic stream") { !viewer.state.get().decoded.isEmpty }
+                    try viewer.checkDatagramRepair(recording: replayFrames, fec: fec)
+                }
             }
         }
 
@@ -2114,13 +2209,13 @@ private struct WindowsInteropChecks {
             }
         }
 
-        func withMacHost(advertiseMedia: Bool = true, udp: Bool = false, route: ((UInt16) throws -> UInt16)? = nil, cursorImage: CursorImage? = nil, twoDisplays: Bool = false, inputActions: Bool = true, relativeMouse: Bool = true,
+        func withMacHost(advertiseMedia: Bool = true, udp: Bool = false, route: ((UInt16) throws -> UInt16)? = nil, fec: CheckFEC? = nil, cursorImage: CursorImage? = nil, twoDisplays: Bool = false, inputActions: Bool = true, relativeMouse: Bool = true,
                          trackpadGestures: Bool = true, deviceID: UUID? = UUID(), identityExchange: Bool? = true, prepareHello: @escaping (Message) throws -> Message = { $0 },
                          viewerKey: PairingKey? = nil, quality: String = "1920,60,20", clipboard: InteropClipboard? = nil, advertiseAudio: Bool = true,
                          _ extra: [String] = [], _ body: (MacHost, Probe) throws -> Void) throws {
             let host = try MacHost(key: key, packets: packets, size: size, advertiseMedia: advertiseMedia, cursorImage: cursorImage,
                                    externalPackets: twoDisplays ? externalPackets : [], inputActions: inputActions, relativeMouse: relativeMouse, trackpadGestures: trackpadGestures,
-                                   deviceID: deviceID, identityExchange: identityExchange, prepareHello: prepareHello, clipboard: clipboard, advertiseAudio: advertiseAudio)
+                                   deviceID: deviceID, identityExchange: identityExchange, prepareHello: prepareHello, clipboard: clipboard, advertiseAudio: advertiseAudio, fec: fec)
             defer { host.stop() }
             let port = try route?(host.port) ?? host.port
             let probe = try Probe(probePath, ["viewer", "--code", (viewerKey ?? key).code, "--port", "\(port)", "--quality", quality] + (udp ? [] : ["--no-udp"]) + extra)
@@ -2305,6 +2400,43 @@ private struct WindowsInteropChecks {
                     try require(frame["annexB"] as? String == hex(annexB(source)), "Frame \(index + 1) reached the decoder with other bytes")
                 }
                 try verifyWindowsViewerWindow(host, probe)
+            }
+        }
+
+        for fec in CheckFEC.allCases {
+            run("Windows recovers selected Mac UDP fragments using \(fec.rawValue) negotiation") {
+                var route: InteropMediaRoute?
+                defer { route?.stop() }
+                try withMacHost(udp: true, route: { port in
+                    let relay = try InteropMediaRoute(target: port, forwardUDP: true)
+                    route = relay
+                    return relay.port
+                }, fec: fec) { host, probe in
+                    try until("the isolated UDP stream commits") { host.state.get().commits.last?.path == "udp" }
+                    guard let route else { throw Failure("Missing loopback route") }
+                    func verify(_ source: VideoPacket, holes: Int) throws {
+                        let sent = try host.sendFECFrame(source: source, fullFragments: holes)
+                        do {
+                            let sample = try probe.next("frame", seconds: 3) { $0["sequence"] as? UInt32 == sent.sequence }
+                            try require(sample["annexB"] as? String == hex(annexB(sent)), "Recovery changed the encoder's bytes")
+                        } catch { throw Failure("\(error); encrypted datagram size counts \(route.sizesAfterLoss())") }
+                    }
+                    // A real NACK primes the host's two-shard policy before two packets from the next block are lost.
+                    route.loseVideoFragments(.firstFullFragmentAndParity)
+                    try verify(packets[1], holes: 1)
+                    try require((route.sizesAfterLoss()[InteropMediaRoute.full] ?? 0) >= 2, "The missing original and its repair were not both observed")
+                    if fec != .legacy {
+                        route.loseVideoFragments(.everyFullFragment)
+                        let holes = fec == .block ? 2 : 1
+                        try verify(packets[2], holes: holes)
+                        let counts = route.sizesAfterLoss(), shard = fec == .block ? InteropMediaRoute.block : InteropMediaRoute.xor
+                        try require(counts[shard, default: 0] >= holes && counts[InteropMediaRoute.full, default: 0] >= holes,
+                                    "FEC did not recover all continuously withheld data shards")
+                    } else {
+                        let counts = route.sizesAfterLoss()
+                        try require(counts[InteropMediaRoute.xor] == nil && counts[InteropMediaRoute.block] == nil, "A legacy peer received parity")
+                    }
+                }
             }
         }
 

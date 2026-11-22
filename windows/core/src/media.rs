@@ -360,7 +360,38 @@ pub struct MediaControl {
     pub fast: Option<bool>,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FragmentFeatures {
+    pub marked_repairs: bool,
+    pub xor: bool,
+    pub block_limit: usize,
+}
+
+impl FragmentFeatures {
+    pub fn from_peer(control: &MediaControl) -> Self {
+        use fragment::fec::{LEGACY_PROTECTED_FRAGMENTS, MAX_PROTECTED_FRAGMENTS};
+        let block_limit = if control.block_fec == Some(true) {
+            control.fec_fragment_limit.unwrap_or(LEGACY_PROTECTED_FRAGMENTS as i64).clamp(2, MAX_PROTECTED_FRAGMENTS as i64) as usize
+        } else {
+            0
+        };
+        Self { marked_repairs: control.marked_repairs == Some(true), xor: control.parity_fec == Some(true), block_limit }
+    }
+
+    pub fn advertise(self, offer: &mut MediaControl) {
+        offer.parity_fec = self.xor.then_some(true);
+        offer.block_fec = (self.block_limit > 0).then_some(true);
+    }
+}
+
 impl MediaControl {
+    pub(crate) fn request_fragment_features(&mut self) {
+        self.marked_repairs = Some(true);
+        self.parity_fec = Some(true);
+        self.block_fec = Some(true);
+        self.fec_fragment_limit = Some(fragment::fec::MAX_PROTECTED_FRAGMENTS as i64);
+    }
+
     fn new(operation: MediaOperation) -> Self {
         Self {
             operation,
@@ -883,6 +914,7 @@ pub struct ViewerMedia {
     active: Option<RoutedStream>,
     video_bound: bool,
     udp_available: bool,
+    fragments: FragmentFeatures,
     udp_verified: bool,
     receiving: Option<ReceivingStream>,
     auxiliary_enabled: bool,
@@ -900,6 +932,15 @@ impl ViewerMedia {
     /// Asks the host for a session. No optional capability is named, so the host uses none.
     pub fn request() -> MediaControl {
         MediaControl::new(MediaOperation::Request)
+    }
+
+    pub(crate) fn accepts_fec(&self, kind: u8) -> bool {
+        self.udp_available
+            && match kind {
+                fragment::fec::XOR_KIND => self.fragments.xor,
+                fragment::fec::BLOCK_KIND => self.fragments.block_limit > 0,
+                _ => false,
+            }
     }
 
     pub(crate) fn has_offer(&self) -> bool {
@@ -1007,6 +1048,7 @@ impl ViewerMedia {
                     return Ok(Vec::new());
                 }
                 self.session = control.session_id;
+                self.fragments = FragmentFeatures::from_peer(control);
                 self.udp_available &= control.path.as_deref() != Some("tcp");
                 self.udp_verified &= self.udp_available;
                 if !self.udp_verified && (self.udp_available || (self.auxiliary_enabled && !self.video_bound)) {
@@ -1234,6 +1276,38 @@ impl ViewerMedia {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fec_negotiation_keeps_the_first_offer_and_respects_older_receiver_limits() {
+        use fragment::fec::{BLOCK_KIND, XOR_KIND};
+        let mut request = ViewerMedia::request();
+        let old = FragmentFeatures::from_peer(&request);
+        assert!(!old.xor && old.block_limit == 0);
+        request.block_fec = Some(true);
+        assert_eq!(FragmentFeatures::from_peer(&request).block_limit, 256);
+        request.fec_fragment_limit = Some(i64::MAX);
+        assert_eq!(FragmentFeatures::from_peer(&request).block_limit, 4096);
+        request.fec_fragment_limit = Some(12);
+        assert_eq!(FragmentFeatures::from_peer(&request).block_limit, 12);
+        request.request_fragment_features();
+        assert_eq!(request.fec_fragment_limit, Some(4096));
+        let mut host = HostMedia::default();
+        host.set_udp_available(true);
+        let Some(HostMediaEvent::Send(mut offer)) = host.control(&request, false).unwrap().pop() else { panic!("expected offer") };
+        request.block_fec = None;
+        FragmentFeatures::from_peer(&request).advertise(&mut offer);
+        let mut viewer = ViewerMedia::default();
+        viewer.set_udp_available(true);
+        viewer.control(&offer, Instant::now()).unwrap();
+        assert!(viewer.accepts_fec(XOR_KIND));
+        assert!(!viewer.accepts_fec(BLOCK_KIND));
+        offer.block_fec = Some(true);
+        viewer.control(&offer, Instant::now()).unwrap();
+        assert!(!viewer.accepts_fec(BLOCK_KIND));
+        let mut disabled = ViewerMedia::default();
+        disabled.control(&offer, Instant::now()).unwrap();
+        assert!(!disabled.accepts_fec(XOR_KIND));
+    }
 
     fn stream(transport_epoch: u32) -> MediaStreamId {
         MediaStreamId { session_id: Uuid::from_bytes([0x11; 16]), transport_epoch, codec_epoch: transport_epoch + 4 }

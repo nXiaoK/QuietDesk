@@ -33,6 +33,11 @@ impl VideoPacket {
         !self.sps.is_empty()
     }
 
+    pub(crate) fn encoded_len(&self) -> usize {
+        let header = if self.codec == VideoCodec::Hevc { 10 } else { 8 };
+        header + self.vps.len() + self.sps.len() + self.pps.len() + self.avcc.len()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let hevc = self.codec == VideoCodec::Hevc;
         let overhead = if hevc { 12_299 } else { 8201 };
@@ -44,7 +49,7 @@ impl VideoPacket {
         {
             return Err(DeskError::invalid("编码帧大小无效"));
         }
-        let mut data = Vec::with_capacity(10 + self.vps.len() + self.sps.len() + self.pps.len() + self.avcc.len());
+        let mut data = Vec::with_capacity(self.encoded_len());
         data.extend_from_slice(&self.sequence.to_be_bytes());
         data.extend_from_slice(&(self.sps.len() as u16 | if hevc { HEVC_FLAG } else { 0 }).to_be_bytes());
         data.extend_from_slice(&(self.pps.len() as u16).to_be_bytes());
@@ -229,6 +234,7 @@ mod tests {
             avcc: avcc(&[&[0x65, 9, 9]]),
         };
         let encoded = packet.encode().unwrap();
+        assert_eq!(packet.encoded_len(), encoded.len());
         assert_eq!(encoded, [1, 2, 3, 4, 0, 3, 0, 2, 0x67, 1, 2, 0x68, 3, 0, 0, 0, 3, 0x65, 9, 9]);
         assert_eq!(VideoPacket::decode(&encoded).unwrap(), packet);
         assert_eq!(packet.annex_b().unwrap(), [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 9, 9]);
@@ -239,6 +245,7 @@ mod tests {
         let packet =
             VideoPacket { sequence: 7, codec: VideoCodec::Hevc, vps: vec![0x40, 1], sps: vec![0x42, 1], pps: vec![0x44, 1], avcc: avcc(&[&[0x26, 1]]) };
         let encoded = packet.encode().unwrap();
+        assert_eq!(packet.encoded_len(), encoded.len());
         assert_eq!(&encoded[4..10], &[0x80, 2, 0, 2, 0, 2]);
         assert_eq!(VideoPacket::decode(&encoded).unwrap(), packet);
     }

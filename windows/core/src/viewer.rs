@@ -495,7 +495,9 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             }
             self.media = Some(media);
             let mut request = ViewerMedia::request();
-            request.marked_repairs = self.datagrams.enabled().then_some(true);
+            if self.datagrams.enabled() {
+                request.request_fragment_features();
+            }
             self.peer.send(&request.message()?)?;
         }
         let confirm = live_settings && hello.initial_stream_negotiation_v1 == Some(true);
@@ -583,9 +585,15 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         match event {
             PathEvent::Verified => self.update_media(|media| media.set_udp_verified(true, Instant::now())),
             PathEvent::Lost => self.lose_datagrams(),
-            PathEvent::Record(3 | 5, data) => {
+            PathEvent::Record(kind @ (3 | 5 | 8 | 10), data) => {
+                let parity = matches!(kind, 8 | 10);
+                if parity && !self.media.as_ref().is_some_and(|media| media.accepts_fec(kind)) {
+                    return Ok(());
+                }
                 let Some(receiver) = &mut self.udp_receiver else { return Ok(()) };
-                match receiver.frames.push(&data[1..], Instant::now()) {
+                let now = Instant::now();
+                let events = if parity { receiver.frames.parity(kind, &data[1..], now) } else { receiver.frames.push(&data[1..], now) };
+                match events {
                     Ok(events) => self.receive_datagrams(events),
                     Err(_) => self.lose_datagrams(),
                 }

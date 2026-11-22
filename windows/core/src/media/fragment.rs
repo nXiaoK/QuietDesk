@@ -1,4 +1,5 @@
 //! Fragment records inside authenticated video datagrams. The outer DTLS kind is set by the session.
+pub mod fec;
 mod receive;
 mod repair;
 pub use receive::{ReceiveEvent, Receiver};
@@ -13,9 +14,9 @@ use std::time::Duration;
 pub const MAX_RECORD_BYTES: usize = 1100;
 const RECORD_KIND: u8 = 2;
 const FRAGMENT_HEADER: usize = super::HEADER_BYTES + 16;
-const PAYLOAD: usize = MAX_RECORD_BYTES - FRAGMENT_HEADER;
+pub const PAYLOAD: usize = MAX_RECORD_BYTES - FRAGMENT_HEADER;
 const FRAME_WINDOW: usize = 6;
-const BYTE_BUDGET: usize = 32 * 1024 * 1024;
+pub(crate) const BYTE_BUDGET: usize = 32 * 1024 * 1024;
 const REORDER_DELAY: Duration = Duration::from_millis(3);
 const NACK_INTERVAL: Duration = Duration::from_millis(10);
 const DECODE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -66,9 +67,20 @@ impl OutgoingFragment {
     pub fn index(&self) -> u16 {
         self.index
     }
-    pub fn record(&self) -> Vec<u8> {
+    pub fn frame_bytes(&self) -> usize {
+        self.frame.len()
+    }
+    /// Complete application datagram length, including its outer kind.
+    pub fn wire_len(&self) -> usize {
+        1 + FRAGMENT_HEADER + self.payload().len()
+    }
+    fn payload(&self) -> &[u8] {
         let start = usize::from(self.index) * PAYLOAD;
-        let payload = &self.frame[start..(start + PAYLOAD).min(self.frame.len())];
+        &self.frame[start..(start + PAYLOAD).min(self.frame.len())]
+    }
+
+    pub fn record(&self) -> Vec<u8> {
+        let payload = self.payload();
         let mut data = begin(RECORD_KIND, &self.header, 16 + payload.len());
         data.extend_from_slice(&self.sequence.to_be_bytes());
         data.extend_from_slice(&(self.frame.len() as u32).to_be_bytes());

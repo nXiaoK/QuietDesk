@@ -246,6 +246,159 @@ fn a_decode_receipt_cannot_retire_unsent_fragments_and_the_opener_keeps_its_subm
 }
 
 #[test]
+fn swift_xor_repairs_every_position_including_the_short_final_fragment() {
+    let now = Instant::now();
+    let mut tx = RepairCache::new(stream());
+    let key = frame(1, 32);
+    let first = originals(&mut tx, &key, now);
+    let source = frame(2, 2800);
+    let parts = originals(&mut tx, &source, now);
+    let protect = fec::Protection::Xor;
+    let block = fec::plan(&parts, protect).unwrap().pop().unwrap();
+    assert_eq!((block.after_index(), block.shard_count()), (2, 1));
+    let parity = block.encode().pop().unwrap().datagram();
+    assert_eq!(parity.len(), protect.wire_len());
+    assert_eq!(parity[0], fec::XOR_KIND);
+    assert_eq!(parity[1..], include_bytes!("vectors/xor.bin")[..]);
+    for missing in 0..parts.len() {
+        let mut rx = Receiver::new(stream());
+        rx.push(&first[0].record(), now).unwrap();
+        rx.decoded(key.header, now);
+        rx.committed(stream(), now);
+        assert!(rx.parity(parity[0], &parity[1..], now).unwrap().is_empty());
+        let mut events = Vec::new();
+        for (i, p) in parts.iter().enumerate() {
+            if i != missing {
+                events.extend(rx.push(&p.record(), now).unwrap());
+            }
+        }
+        assert!(
+            matches!(&events[..], [ReceiveEvent::Feedback(ack), ReceiveEvent::Frame(actual)] if ack.kind == FeedbackKind::Reassembled && *actual == source)
+        );
+        assert!(rx.push(&parts[missing].record(), now).unwrap().is_empty());
+    }
+}
+
+#[test]
+fn swift_rs_blocks_interleave_after_their_last_original_and_repair_separate_bursts() {
+    let now = Instant::now();
+    let src = frame(1, 14_013);
+    let parts = originals(&mut RepairCache::new(stream()), &src, now);
+    let protection = fec::Protection::Block { parity_per_block: 3 };
+    let blocks = fec::plan(&parts, protection).unwrap();
+    assert_eq!(blocks.iter().map(|b| (b.after_index(), b.shard_count())).collect::<Vec<_>>(), [(6, 3), (13, 3)]);
+    let records = [
+        include_bytes!("vectors/rs-0-0.bin"),
+        include_bytes!("vectors/rs-0-1.bin"),
+        include_bytes!("vectors/rs-0-2.bin"),
+        include_bytes!("vectors/rs-7-0.bin"),
+        include_bytes!("vectors/rs-7-1.bin"),
+        include_bytes!("vectors/rs-7-2.bin"),
+    ];
+    let shards: Vec<_> = blocks.into_iter().flat_map(fec::ParityBlock::encode).collect();
+    for (shard, reference) in shards.into_iter().zip(records) {
+        let datagram = shard.datagram();
+        assert_eq!(datagram.len(), protection.wire_len());
+        assert_eq!(datagram[0], fec::BLOCK_KIND);
+        assert_eq!(datagram[1..], reference[..]);
+    }
+    let mut rx = Receiver::new(stream());
+    let mut events = Vec::new();
+    for r in records.iter().rev() {
+        events.extend(rx.parity(fec::BLOCK_KIND, r.as_slice(), now).unwrap());
+    }
+    for (i, p) in parts.iter().enumerate().rev() {
+        if ![1, 2, 3, 8, 9, 13].contains(&i) {
+            events.extend(rx.push(&p.record(), now).unwrap());
+        }
+    }
+    assert!(matches!(&events[..], [ReceiveEvent::Feedback(ack),ReceiveEvent::Frame(actual)] if ack.kind == FeedbackKind::Reassembled && *actual == src));
+    rx.decoded(src.header, now);
+    let ack = rx.parity(fec::BLOCK_KIND, records[0], now).unwrap();
+    assert!(matches!(&ack[..], [ReceiveEvent::Feedback(f)] if f.kind == FeedbackKind::Decoded));
+}
+
+#[test]
+fn larger_losses_remain_eligible_for_nack_and_one_original_completes_the_fec_repair() {
+    let now = Instant::now();
+    let src = frame(1, 7200);
+    let parts = originals(&mut RepairCache::new(stream()), &src, now);
+    let mut rx = Receiver::new(stream());
+    for block in fec::plan(&parts, fec::Protection::Block { parity_per_block: 3 }).unwrap() {
+        for shard in block.encode() {
+            let bytes = shard.datagram();
+            rx.parity(bytes[0], &bytes[1..], now).unwrap();
+        }
+    }
+    for p in &parts[4..] {
+        assert!(rx.push(&p.record(), now).unwrap().is_empty());
+    }
+    let events = rx.poll(now + REORDER_DELAY);
+    assert!(matches!(&events[..], [ReceiveEvent::Feedback(f)] if f.missing_ranges()==[FragmentRange{first:0,count:4}]));
+    let repaired = rx.push(&parts[2].record(), now + REORDER_DELAY).unwrap();
+    assert!(matches!(&repaired[..],[ReceiveEvent::Feedback(_),ReceiveEvent::Frame(frame)] if *frame==src));
+}
+
+#[test]
+fn inconsistent_shards_overlapping_blocks_and_corrupted_zero_padding_retire_the_epoch() {
+    let now = Instant::now();
+    let rs = include_bytes!("vectors/rs-0-0.bin");
+    for (offset, value) in [(3, 4), (42, 1), (45, 17), (46, 3), (47, 5), (48, 1)] {
+        let mut bad = rs.to_vec();
+        bad[offset] = value;
+        assert!(Receiver::new(stream()).parity(fec::BLOCK_KIND, &bad, now).is_err());
+    }
+    for offset in [44, 45, 47, 49] {
+        let mut rx = Receiver::new(stream());
+        rx.parity(fec::BLOCK_KIND, rs, now).unwrap();
+        let mut bad = rs.to_vec();
+        bad[offset] ^= 1;
+        let events = rx.parity(fec::BLOCK_KIND, &bad, now).unwrap();
+        assert!(matches!(&events[..],[ReceiveEvent::Feedback(f)] if f.kind==FeedbackKind::Expired));
+    }
+    let mut rx = Receiver::new(stream());
+    let mut tx = RepairCache::new(stream());
+    originals(&mut tx, &frame(1, 32), now);
+    let parts = originals(&mut tx, &frame(2, 2800), now);
+    for p in &parts[..2] {
+        rx.push(&p.record(), now).unwrap();
+    }
+    let mut xor = include_bytes!("vectors/xor.bin").to_vec();
+    *xor.last_mut().unwrap() ^= 1;
+    let expired = rx.parity(fec::XOR_KIND, &xor, now).unwrap();
+    assert!(matches!(&expired[..],[ReceiveEvent::Feedback(f)] if f.kind==FeedbackKind::Expired && f.header.frame_id==2));
+}
+
+#[test]
+fn planner_obeys_current_and_legacy_frame_limits_and_balances_short_last_blocks() {
+    let rs = |n, parity_per_block| fec::parity_shard_count(n, fec::Protection::Block { parity_per_block });
+    assert_eq!((fec::LEGACY_PROTECTED_FRAGMENTS, fec::MAX_PROTECTED_FRAGMENTS), (256, 4096));
+    assert_eq!((rs(2, 3), rs(25, 3), rs(4096, 1), rs(4097, 1)), (1, 9, 410, 0));
+    assert_eq!((rs(1, 1), rs(10, 4), fec::parity_shard_count(8, fec::Protection::Xor), fec::parity_shard_count(9, fec::Protection::Xor)), (0, 0, 1, 0));
+}
+
+#[test]
+fn parity_shares_the_receiver_byte_limit_and_duplicate_rows_do_not_charge_it_twice() {
+    let now = Instant::now();
+    let first = include_bytes!("vectors/rs-0-0.bin");
+    let second = include_bytes!("vectors/rs-0-1.bin");
+    let mut rx = Receiver::new(stream());
+    assert!(rx.parity(fec::BLOCK_KIND, first, now).unwrap().is_empty());
+    let frame_bytes = usize::try_from(u32::from_be_bytes(first[37..41].try_into().unwrap())).unwrap();
+    let other_bytes = (BYTE_BUDGET - frame_bytes - PAYLOAD) / 2;
+    let mut original = include_bytes!("vectors/fragment-0.bin").to_vec();
+    original[45..49].copy_from_slice(&(other_bytes as u32).to_be_bytes());
+    original[51..53].copy_from_slice(&(other_bytes.div_ceil(PAYLOAD) as u16).to_be_bytes());
+    for id in [2u64, 3] {
+        original[28..36].copy_from_slice(&id.to_be_bytes());
+        assert!(rx.push(&original, now).unwrap().is_empty());
+    }
+    assert!(rx.parity(fec::BLOCK_KIND, first, now).unwrap().is_empty());
+    let events = rx.parity(fec::BLOCK_KIND, second, now).unwrap();
+    assert!(matches!(&events[..],[ReceiveEvent::Feedback(ack)] if ack.kind==FeedbackKind::Expired && ack.header.frame_id==1));
+}
+
+#[test]
 fn a_decoder_needing_the_next_access_unit_can_confirm_a_continuous_stream() {
     let now = Instant::now();
     let mut tx = RepairCache::new(stream());
@@ -301,4 +454,35 @@ fn submitted_frames_stay_in_the_bounded_window_until_the_matching_epoch_decodes_
     }
     assert!(rx.decoded(frame(2, 32).header, now).is_empty());
     assert!(rx.poll(now + DECODE_TIMEOUT).is_empty());
+}
+
+#[test]
+fn each_repaired_p_frame_feeds_a_decoder_that_still_holds_the_prior_picture() {
+    let now = Instant::now();
+    let mut tx = RepairCache::new(stream());
+    let mut rx = Receiver::new(stream());
+    let opening = frame(1, 32);
+    let key = originals(&mut tx, &opening, now);
+    rx.push(&key[0].record(), now).unwrap();
+    rx.decoded(opening.header, now);
+    rx.committed(stream(), now);
+    let mut pending = None;
+    for id in 2..=10 {
+        let source = frame(id, 2200);
+        let parts = originals(&mut tx, &source, now);
+        let mode = if id % 2 == 0 { fec::Protection::Block { parity_per_block: 1 } } else { fec::Protection::Xor };
+        let block = fec::plan(&parts, mode).unwrap().pop().unwrap();
+        let parity = block.encode().pop().unwrap().datagram();
+        for part in parts.iter().skip(1) {
+            rx.push(&part.record(), now).unwrap();
+        }
+        let events = rx.parity(parity[0], &parity[1..], now).unwrap();
+        assert!(matches!(&events[..],[ReceiveEvent::Feedback(ack),ReceiveEvent::Frame(f)] if ack.kind==FeedbackKind::Reassembled && *f==source));
+        if let Some(output) = pending.replace(source.header) {
+            rx.decoded(output, now);
+            tx.feedback(&MediaFeedback::new(FeedbackKind::Decoded, output).unwrap(), now, Duration::ZERO);
+        }
+    }
+    let last = rx.poll(now + Duration::from_millis(20));
+    assert!(matches!(&last[..],[ReceiveEvent::Feedback(ack)] if ack.kind==FeedbackKind::Decoded && ack.header.frame_id==9));
 }

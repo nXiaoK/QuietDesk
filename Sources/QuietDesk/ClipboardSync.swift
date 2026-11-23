@@ -9,6 +9,7 @@ protocol ClipboardPasteboard: AnyObject {
     var pngData: Data? { get }
     var tiffData: Data? { get }
     var text: String? { get }
+    var hasContentMarker: Bool { get }
     var contentMarker: String? { get }
     /// 内容由 macOS 通用剪贴板（接力/Handoff）等跨设备机制写入，而不是本机用户复制。
     var isRelayedFromOtherDevice: Bool { get }
@@ -30,6 +31,7 @@ protocol ClipboardPasteboard: AnyObject {
 }
 
 extension ClipboardPasteboard {
+    var hasContentMarker: Bool { false }
     var fileRootCount: Int? { nil }
     func writePromisedFiles(count: Int, marker: String, request: @escaping @MainActor () -> Bool) -> ClipboardFilePromise? { nil }
     func writeFinderFiles(names: [String], marker: String, onFailure: @escaping @MainActor (String) -> Void, request: @escaping @MainActor () -> Bool) throws -> ClipboardFilePromise? { nil }
@@ -228,6 +230,7 @@ final class SystemClipboardPasteboard: ClipboardPasteboard {
     var pngData: Data? { pasteboard.data(forType: .png) }
     var tiffData: Data? { pasteboard.data(forType: .tiff) }
     var text: String? { pasteboard.string(forType: .string) }
+    var hasContentMarker: Bool { pasteboard.types?.contains(Self.marker) == true }
     var contentMarker: String? { pasteboard.string(forType: Self.marker) }
     var isSensitive: Bool { ClipboardPrivacy.isSensitive(pasteboard) }
     // Universal Clipboard 写入的条目带有该类型；QuietDesk 不应把它当成本机新复制再转发给对端。
@@ -858,8 +861,10 @@ final class ClipboardSync {
     }
 
     private var isOtherSessionCopy: Bool {
-        guard allowsPhysicalFilePaste, let marker = pasteboard.contentMarker else { return false }
-        return !marker.hasPrefix(session.uuidString + ":")
+        guard allowsPhysicalFilePaste || pasteboard.hasContentMarker,
+              let marker = pasteboard.contentMarker,
+              !marker.hasPrefix(session.uuidString + ":") else { return false }
+        return allowsPhysicalFilePaste || marker.contains(":lazy:")
     }
 
     func prepareForPaste(_ completion: @escaping (Bool) -> Void) {
@@ -1226,6 +1231,12 @@ final class ClipboardSync {
             forgetLocalCopy()
             if !isInitialSeed { onStatus?("剪贴板内容已标记为敏感，未同步到对端") }
             settleWaiters(false)
+            return
+        }
+        if isOtherSessionCopy {
+            sendingChange = nil
+            forgetLocalCopy()
+            settleWaiters(controllingRemote)
             return
         }
         let payload: ClipboardPayload

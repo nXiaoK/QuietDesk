@@ -61,7 +61,7 @@ struct PortMappingView: View {
                     .help("将连接页填写的地址、端口和配对码保存并用于端口映射")
                 }
 
-                if let id = deviceID, id == model.currentMappingRecordID {
+                if let id = deviceID, model.hasConnectedDesktopSession(for: id) {
                     DeskPillBadge(text: "远控已连接", symbol: "display", tint: DeskPalette.emerald)
                 }
 
@@ -134,7 +134,7 @@ struct PortMappingView: View {
         .onAppear {
             let preferred = preferredDeviceID.flatMap { id in model.connections.first { $0.id == id } }
             let selectedRecord = model.connections.first { $0.id == model.selectedConnectionID }
-            deviceID = preferred?.id ?? model.currentMappingRecordID ?? selectedRecord?.id ?? model.connections.first?.id
+            deviceID = preferred?.id ?? model.preferredMappingRecordID ?? selectedRecord?.id ?? model.connections.first?.id
         }
         .onChange(of: preferredDeviceID) { _, newID in
             if let newID, model.connections.contains(where: { $0.id == newID }) {
@@ -142,7 +142,7 @@ struct PortMappingView: View {
             }
         }
         .sheet(item: $editor) { item in
-            PortMappingEditor(item: item, sessionAvailable: item.device.id == model.currentMappingRecordID) { rule, enable in
+            PortMappingEditor(item: item, sessionAvailable: model.hasConnectedDesktopSession(for: item.device.id)) { rule, enable in
                 try manager.saveRule(rule)
                 if enable { try model.startPortMapping(rule) }
                 error = nil

@@ -185,6 +185,12 @@ final class PortMappingManager: ObservableObject {
         for run in Array(running.values) where run.rule.scope == .session { stop(run.rule.id) }
     }
 
+    func stopSessionMappings(forDeviceID deviceID: UUID) {
+        for run in Array(running.values) where run.rule.scope == .session && run.rule.deviceID == deviceID {
+            stop(run.rule.id)
+        }
+    }
+
     func stopAllMappings() {
         for id in Array(running.keys) { stop(id) }
     }

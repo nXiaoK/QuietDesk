@@ -2,6 +2,7 @@ import SwiftUI
 import QuietDeskCore
 
 struct ConnectionView: View {
+    @ObservedObject var models: DeskModels
     @ObservedObject var model: DeskModel
     @ObservedObject private var benchmarkStore: RouteQualityBenchmarkStore
     @ObservedObject private var portMappings: PortMappingManager
@@ -17,6 +18,7 @@ struct ConnectionView: View {
     @State private var wakeConfigurationRecord: ConnectionRecord?
 
     init(
+        models: DeskModels,
         model: DeskModel,
         showOptions: Binding<Bool>,
         openCaps: @escaping () -> Void,
@@ -26,6 +28,7 @@ struct ConnectionView: View {
         openRelayWorkspace: (() -> Void)? = nil,
         openPortMappingWorkspace: ((ConnectionRecord) -> Void)? = nil
     ) {
+        self.models = models
         self.model = model
         self._benchmarkStore = ObservedObject(wrappedValue: model.routeBenchmarkStore)
         self._portMappings = ObservedObject(wrappedValue: model.portMappings)
@@ -81,9 +84,9 @@ struct ConnectionView: View {
                 openEffects: openEffects,
                 openBenchmark: { showOptions = false; openBenchmark(nil) }
             ),
-            connect: model.connect,
+            connect: { _ = models.connectFromHub() },
             cancel: { model.stop() },
-            quickConnect: model.quickConnect,
+            quickConnect: { _ = models.quickConnect($0) },
             remove: model.removeConnection,
             manage: { showRecords = true },
             openOptions: { model.canvas.releaseControl(); showOptions = true },
@@ -113,11 +116,19 @@ struct ConnectionView: View {
             toggleLANScan: { model.toggleLANScan() },
             dismissLANScan: { model.stopLANScan(clearResults: true) },
             hasSavedCredentialForDiscovered: { model.hasSavedCredential(for: $0) },
-            selectDiscoveredHost: { model.connectOrFillDiscoveredHost($0) },
+            selectDiscoveredHost: { _ = models.connectOrFillDiscoveredHost($0) },
             wakeRecord: { model.sendWakeOnLAN(for: $0) },
             configureWakeRecord: { wakeConfigurationRecord = $0 },
             wakeNotice: model.wakeStatusNotice,
-            dismissWakeNotice: { model.wakeStatusNotice = nil }
+            dismissWakeNotice: { model.wakeStatusNotice = nil },
+            activeSessions: models.activeSessionSummaries,
+            focusSession: { models.focusViewerSession(id: $0) },
+            disconnectSession: { models.disconnectViewerSession(id: $0) },
+            disconnectAllSessions: { models.disconnectAllViewerSessions() },
+            isRecordConnected: { record in
+                guard let existing = models.existingSession(for: record) else { return false }
+                return existing.active || existing.working || existing.reconnecting
+            }
         )
         .sheet(isPresented: $showRecords) {
             VStack(alignment: .leading, spacing: 16) {
@@ -151,7 +162,7 @@ struct ConnectionView: View {
                                 Button("唤醒") { showRecords = false; model.sendWakeOnLAN(for: record) }
                             }
                             Button("测速…") { showRecords = false; openBenchmark(record) }
-                            Button("连接") { showRecords = false; model.quickConnect(record) }
+                            Button("连接") { showRecords = false; _ = models.quickConnect(record) }
                             Button("移除") { model.removeConnection(record) }
                         }.padding(.vertical, 6)
                     }.listStyle(.inset).clipShape(RoundedRectangle(cornerRadius: 8))

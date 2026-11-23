@@ -231,6 +231,7 @@ struct NetworkWorkspaceView: View {
 }
 
 struct DiagnosticsWorkspaceView: View {
+    @ObservedObject var models: DeskModels
     @ObservedObject var viewer: DeskModel
     @ObservedObject var history: TrafficHistoryFeed
     @Binding var subTab: DiagnosticsWorkspaceSubTab
@@ -284,7 +285,7 @@ struct DiagnosticsWorkspaceView: View {
                             onConnectCandidate: { candidate, record in
                                 runner.shutdown()
                                 DispatchQueue.main.async {
-                                    viewer.connectUsingBenchmarkCandidate(candidate, record: record)
+                                    _ = models.connectUsingBenchmarkCandidate(candidate, record: record)
                                 }
                             },
                             onClose: {

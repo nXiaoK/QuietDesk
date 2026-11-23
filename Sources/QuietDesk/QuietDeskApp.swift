@@ -23,24 +23,23 @@ struct QuietDeskApp: App {
     init() {
         let models = DeskModels()
         _models = StateObject(wrappedValue: models)
-        let viewer = models.viewer
         let updater = UpdateController(sessionContext: { [weak models] in
             guard let models else { return .init() }
             let viewer = models.viewer, host = models.host, window = models.mainWindow
             return UpdateSessionContext(
                 mainWindowVisible: window?.isVisible == true && window?.isMiniaturized == false,
                 applicationActive: NSApp.isActive,
-                isControlling: viewer.isControllingAnotherMac || viewer.isRunningRouteBenchmark,
-                isFullScreen: viewer.isFullScreen,
+                isControlling: models.hasActiveViewerSession || viewer.isRunningRouteBenchmark,
+                isFullScreen: models.anyViewerFullScreen,
                 hasHostConnection: host.hasIncomingControlConnection,
                 isSharing: host.active || host.working || host.mappingHosting,
                 isHostDesktopSharing: host.active || host.working,
                 isMappingHosting: host.mappingHosting,
-                hasActiveConnection: viewer.connected || host.connected || viewer.portMappings.hasRunningMappings || host.portMappings.hasIncomingMappings,
+                hasActiveConnection: models.hasConnectedViewerSession || host.connected || viewer.portMappings.hasRunningMappings || host.portMappings.hasIncomingMappings,
                 autoStartSharing: host.autoStartSharing,
                 hasOtherPrompt: models.updatePromptBlocked
             )
-        }, mainWindow: { [weak models] in models?.mainWindow }, releaseControl: { [weak viewer] in viewer?.canvas.releaseControl() },
+        }, mainWindow: { [weak models] in models?.preferredAlertWindow }, releaseControl: { [weak models] in models?.releaseAllViewerControls() },
             contextChanges: models.changes)
         updater.onRestoreLaunchOptions = { [weak models] options in
             guard let models else { return }
@@ -57,7 +56,7 @@ struct QuietDeskApp: App {
         _updates = StateObject(wrappedValue: updater)
         appDelegate.models = models
         appDelegate.updates = updater
-        viewer.onConnectionDiagnosticReport = { [weak appDelegate] report in
+        models.onConnectionDiagnosticReport = { [weak appDelegate] report in
             appDelegate?.showConnectionReport(report)
         }
     }
@@ -83,40 +82,101 @@ struct QuietDeskApp: App {
                     ))
                 }
             }
-            RemoteControlCommands(viewer: models.viewer, host: models.host)
+            RemoteControlCommands(models: models, host: models.host)
         }
+        WindowGroup("远程桌面", id: "remote-session", for: UUID.self) { $sessionID in
+            RemoteSessionSceneView(models: models, updates: updates, sessionID: sessionID)
+        }
+        .defaultSize(width: 1200, height: 800)
+        .windowToolbarStyle(.unified)
         MenuBarExtra("QuietDesk", systemImage: "display.2") {
             TrayView(models: models, viewer: models.viewer, host: models.host, updates: updates)
         }
     }
 }
 
+private struct FocusedViewerSessionKey: FocusedValueKey {
+    typealias Value = DeskModel
+}
+
+private extension FocusedValues {
+    var viewerSession: DeskModel? {
+        get { self[FocusedViewerSessionKey.self] }
+        set { self[FocusedViewerSessionKey.self] = newValue }
+    }
+}
+
+private struct RemoteSessionSceneView: View {
+    @ObservedObject var models: DeskModels
+    @ObservedObject var updates: UpdateController
+    let sessionID: UUID?
+
+    var body: some View {
+        if let sessionID, let session = models.session(for: sessionID) {
+            DeskView(models: models, model: session, updates: updates, isDedicatedSessionWindow: true)
+        } else {
+            StaleSessionWindowCloser()
+        }
+    }
+}
+
+private struct StaleSessionWindowCloser: NSViewRepresentable {
+    func makeNSView(context: Context) -> CloserView { CloserView() }
+    func updateNSView(_ nsView: CloserView, context: Context) {}
+    final class CloserView: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let window else { return }
+            window.isRestorable = false
+            DispatchQueue.main.async { [weak window] in window?.close() }
+        }
+    }
+}
+
 private struct RemoteControlCommands: Commands {
-    @ObservedObject var viewer: DeskModel
+    @ObservedObject var models: DeskModels
     @ObservedObject var host: DeskModel
+    @FocusedValue(\.viewerSession) private var focusedSession
+
+    private var activeViewer: DeskModel {
+        focusedSession ?? models.preferredCommandViewer
+    }
 
     var body: some Commands {
         CommandMenu("远程控制") {
-            Button(viewer.isFullScreen ? "退出全屏" : "进入全屏") { viewer.toggleFullScreen() }
+            Button(activeViewer.isFullScreen ? "退出全屏" : "进入全屏") { activeViewer.toggleFullScreen() }
                 .keyboardShortcut("f", modifiers: [.control, .command])
             Button("释放键盘鼠标") {
-                viewer.cancelRemoteTypedText()
-                viewer.canvas.releaseControl()
+                activeViewer.cancelRemoteTypedText()
+                activeViewer.canvas.releaseControl()
             }
                 .keyboardShortcut(.escape, modifiers: [.control, .option])
             Toggle("仅观看防误触（锁定键鼠发送）", isOn: Binding(
-                get: { viewer.viewerViewOnlyLock },
-                set: { viewer.setViewerViewOnlyLock($0) }
+                get: { activeViewer.viewerViewOnlyLock },
+                set: { activeViewer.setViewerViewOnlyLock($0) }
             ))
-            Button("模拟键入本机剪贴板文字") { viewer.typeLocalClipboardText() }
-                .disabled(viewer.remoteTypingUnavailableReason != nil)
-            if viewer.remoteTypingWorking {
-                Button("停止模拟键入") { viewer.cancelRemoteTypedText() }
+            Button("模拟键入本机剪贴板文字") { activeViewer.typeLocalClipboardText() }
+                .disabled(activeViewer.remoteTypingUnavailableReason != nil)
+            if activeViewer.remoteTypingWorking {
+                Button("停止模拟键入") { activeViewer.cancelRemoteTypedText() }
             }
-            Button("截取远端画面到剪贴板") { viewer.copyRemoteFrame() }
+            Button("截取远端画面到剪贴板") { activeViewer.copyRemoteFrame() }
                 .keyboardShortcut("s", modifiers: [.control, .command])
-                .disabled(!viewer.connected)
-            Button("断开远程连接") { viewer.stop() }.disabled(!viewer.active && !viewer.working)
+                .disabled(!activeViewer.connected)
+            Button("断开远程连接") {
+                if activeViewer !== models.viewer {
+                    models.disconnectViewerSession(activeViewer)
+                } else {
+                    activeViewer.stop()
+                }
+            }
+            .disabled(!activeViewer.active && !activeViewer.working && !activeViewer.reconnecting)
+            if models.viewerSessions.count > 1 {
+                Button("断开全部远程连接（\(models.viewerSessions.count)）") {
+                    models.disconnectAllViewerSessions()
+                }
+            }
+            Divider()
             Button("断开控制端") { host.disconnectController() }.disabled(!host.hasIncomingControlConnection)
             Button("停止共享") { host.stop() }.disabled(!host.active && !host.working)
         }
@@ -157,8 +217,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         quitHandler.install()
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        guard let host = models?.host else { return true }
-        return !(host.active || host.working || host.autoStartSharing || host.mappingHosting || host.portMappings.hasRunningMappings)
+        guard let models else { return true }
+        let host = models.host
+        return !(models.hasActiveViewerSession || host.active || host.working || host.autoStartSharing || host.mappingHosting || host.portMappings.hasRunningMappings)
     }
     func applicationDidFinishLaunching(_ notification: Notification) {
         launchedAtLogin = launchedAtLogin || NSAppleEventManager.shared().currentAppleEvent?
@@ -189,24 +250,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func applicationWillTerminate(_ notification: Notification) {
         updates?.shutdown()
-        models?.viewer.onConnectionDiagnosticReport = nil
+        models?.onConnectionDiagnosticReport = nil
         models?.stopAll()
         DiagnosticLog.shared.record(.applicationStopped)
         DiagnosticLog.shared.flush()
     }
 }
 
-/// Shows the selected role; the other role keeps running behind it.
+/// Shows the selected role in the main workspace hub; remote sessions run in independent windows.
 struct DeskRootView: View {
     @ObservedObject var models: DeskModels
     @ObservedObject var updates: UpdateController
-    var body: some View { DeskView(models: models, model: models.current, updates: updates) }
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        DeskView(models: models, model: models.current, updates: updates)
+            .onAppear {
+                let open = openWindow
+                models.openSessionWindow = { id in
+                    open(id: "remote-session", value: id)
+                }
+            }
+    }
 }
 
 struct DeskView: View {
     @ObservedObject var models: DeskModels
     @ObservedObject var model: DeskModel
     @ObservedObject var updates: UpdateController
+    var isDedicatedSessionWindow: Bool = false
     @State private var showCapsSettings = false
     @State private var showOptions = false
     @State private var showFullScreenMenu = false
@@ -225,15 +297,19 @@ struct DeskView: View {
     @State private var dismissedReceptionID: UUID?
     @State private var clipboardNoticeRevision: UInt64 = 0
 
-    // Sharing keeps running in the background; only a viewer session pins the window to its role.
-    private var roleLocked: Bool { models.viewer.isControllingAnotherMac || routeBenchmarkRunner != nil || models.viewer.isRunningRouteBenchmark }
+    // Sharing and remote session windows run independently; only an active inline benchmark locks the hub.
+    private var roleLocked: Bool { !isDedicatedSessionWindow && (routeBenchmarkRunner != nil || models.viewer.isRunningRouteBenchmark) }
     private var locked: Bool { model.active || model.working }
     private var viewerHasSession: Bool {
         !models.viewer.isRunningRouteBenchmark && (models.viewer.connected || models.viewer.reconnecting)
     }
-    private var sessionLayout: Bool { model.mode == .viewer && viewerHasSession }
+    private var sessionLayout: Bool { isDedicatedSessionWindow || (model.mode == .viewer && viewerHasSession) }
     private var immersive: Bool { model.isFullScreen && model.mode == .viewer }
-    private var remoteTitle: String { model.remoteName.isEmpty ? model.address : model.remoteName }
+    private var remoteTitle: String { model.sessionWindowTitle }
+    private var remoteSubtitle: String {
+        let phase = model.connected ? "已连接" : model.reconnecting ? "正在重连" : model.working ? "正在连接" : "未连接"
+        return "\(phase) · \(model.sessionEndpointSubtitle)"
+    }
     private var showClipboardActivity: Bool { model.fileTransferNotice != nil || showClipboardStatus }
     private var showKeptFilesFallback: Bool { model.receivedFilesKeptInFolder && model.fileTransferNotice == nil }
     private var showClipboardStatus: Bool {
@@ -272,15 +348,33 @@ struct DeskView: View {
         .background(
             WindowReader(
                 sessionChrome: sessionLayout && !immersive,
-                resolved: { models.attachWindow($0) },
-                fullScreen: { value in models.all.forEach { $0.isFullScreen = value } }
+                restorable: !isDedicatedSessionWindow,
+                resolved: { window in
+                    if isDedicatedSessionWindow {
+                        model.attachWindow(window)
+                    } else {
+                        models.attachWindow(window)
+                    }
+                },
+                fullScreen: { value in
+                    if isDedicatedSessionWindow {
+                        model.isFullScreen = value
+                    } else {
+                        models.viewer.isFullScreen = value
+                        models.host.isFullScreen = value
+                    }
+                },
+                willClose: isDedicatedSessionWindow ? {
+                    models.windowDidCloseForSession(id: model.sessionID)
+                } : nil
             )
             .frame(width: 0, height: 0)
         )
+        .focusedSceneValue(\.viewerSession, isDedicatedSessionWindow ? model : nil)
         .frame(minWidth: 880, minHeight: 580)
         .ignoresSafeArea(immersive ? .container : (!sessionLayout ? .container : []), edges: immersive ? .all : .top)
         .navigationTitle(sessionLayout ? remoteTitle : "QuietDesk")
-        .navigationSubtitle(sessionLayout ? "\(model.reconnecting ? "正在重连" : "已连接") · \(model.address):\(model.port)" : "为两台 Mac 之间的专注工作而做")
+        .navigationSubtitle(sessionLayout ? remoteSubtitle : "为多台 Mac 之间的专注工作而做")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 if sessionLayout {
@@ -473,7 +567,13 @@ struct DeskView: View {
 
                     Divider()
 
-                    Button("断开") { model.stop() }
+                    Button("断开") {
+                        if isDedicatedSessionWindow {
+                            models.disconnectViewerSession(model)
+                        } else {
+                            model.stop()
+                        }
+                    }
                 }
             }
         }
@@ -508,7 +608,7 @@ struct DeskView: View {
                 onConnectCandidate: { candidate, record in
                     routeBenchmarkRunner = nil
                     DispatchQueue.main.async {
-                        model.connectUsingBenchmarkCandidate(candidate, record: record)
+                        _ = models.connectUsingBenchmarkCandidate(candidate, record: record)
                     }
                 },
                 onClose: {
@@ -586,9 +686,33 @@ struct DeskView: View {
                 .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
             }
             if !model.connected {
-                ConnectionRecoveryView(reconnecting: model.reconnecting, paused: model.sessionPaused,
-                    wait: model.reconnectWait, status: model.status, now: { SessionClock.now },
-                    stop: { model.stop() }, returnToConnection: { model.toggleFullScreen() })
+                ConnectionRecoveryView(
+                    reconnecting: model.reconnecting,
+                    paused: model.sessionPaused,
+                    wait: model.reconnectWait,
+                    status: model.status,
+                    now: { SessionClock.now },
+                    stop: {
+                        if isDedicatedSessionWindow {
+                            models.disconnectViewerSession(model)
+                        } else {
+                            model.stop()
+                        }
+                    },
+                    returnToConnection: {
+                        if isDedicatedSessionWindow {
+                            models.disconnectViewerSession(model)
+                        } else {
+                            model.toggleFullScreen()
+                        }
+                    },
+                    connecting: model.working && !model.reconnecting,
+                    failure: model.connectionFailure,
+                    disconnectedActionTitle: isDedicatedSessionWindow ? "关闭窗口" : "返回连接",
+                    retry: (isDedicatedSessionWindow && model.canRetryLastSessionLaunch)
+                        ? { model.retryLastSessionLaunch() }
+                        : nil
+                )
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -718,6 +842,7 @@ struct DeskView: View {
                     switch models.workspaceSection {
                     case .connect:
                         ConnectionView(
+                            models: models,
                             model: models.viewer,
                             showOptions: $showOptions,
                             openCaps: {
@@ -763,6 +888,7 @@ struct DeskView: View {
                         )
                     case .benchmark:
                         DiagnosticsWorkspaceView(
+                            models: models,
                             viewer: models.viewer,
                             history: models.viewer.trafficHistory,
                             subTab: $diagnosticsSubTab,
@@ -1175,7 +1301,9 @@ private struct DeskWorkspaceSidebar: View {
     private func sidebarAccessory(for section: DeskWorkspaceSection, active: Bool) -> some View {
         switch section {
         case .connect:
-            if !viewer.connections.isEmpty {
+            if !models.viewerSessions.isEmpty {
+                DeskPillBadge(text: "远控 \(models.viewerSessions.count)", tint: DeskPalette.emerald)
+            } else if !viewer.connections.isEmpty {
                 Text("\(viewer.connections.count)")
                     .font(.system(size: 10.5, weight: .semibold))
                     .monospacedDigit()
@@ -1303,7 +1431,23 @@ private struct TrayView: View {
     @State private var exportingLogs = false
     var body: some View {
         Text("共享：" + (host.active || host.working ? host.status : "未开启"))
-        if viewer.isControllingAnotherMac { Text("远程连接：" + viewer.status) }
+            .onAppear {
+                let open = openWindow
+                models.openSessionWindow = { id in
+                    open(id: "remote-session", value: id)
+                }
+            }
+        if !models.viewerSessions.isEmpty {
+            ForEach(models.activeSessionSummaries) { summary in
+                Menu("远控 · \(summary.title)（\(summary.connected ? "已连接" : summary.reconnecting ? "重连中" : summary.working ? "连接中" : "未连接")）") {
+                    Text(summary.endpointLabel)
+                    Button("切到窗口") { models.focusViewerSession(id: summary.id) }
+                    Button("断开此连接", role: .destructive) { models.disconnectViewerSession(id: summary.id) }
+                }
+            }
+        } else if viewer.isControllingAnotherMac {
+            Text("远程连接：" + viewer.status)
+        }
         Button("打开主窗口") {
             models.prepareShowWindow()
             openWindow(id: "main")
@@ -1316,7 +1460,13 @@ private struct TrayView: View {
             if host.active || host.working { host.stop() } else { host.startHosting() }
         }
         Toggle("共享时接通电源阻止空闲睡眠", isOn: $host.preventHostSleepOnExternalPower)
-        if viewer.isControllingAnotherMac { Button("断开远程连接") { viewer.stop() } }
+        if models.viewerSessions.count == 1, let only = models.viewerSessions.first {
+            Button("断开远程连接（\(only.sessionWindowTitle)）") { models.disconnectViewerSession(only) }
+        } else if models.viewerSessions.count > 1 {
+            Button("断开全部远程连接（\(models.viewerSessions.count)）") { models.disconnectAllViewerSessions() }
+        } else if viewer.isControllingAnotherMac {
+            Button("断开远程连接") { viewer.stop() }
+        }
         Divider()
         if updates.enabled {
             Button(updates.menuTitle) { updates.check() }
@@ -1376,28 +1526,37 @@ private struct TrayView: View {
 
 private struct WindowReader: NSViewRepresentable {
     let sessionChrome: Bool
+    var restorable: Bool = true
     let resolved: (NSWindow) -> Void
     let fullScreen: (Bool) -> Void
+    var willClose: (() -> Void)? = nil
     func makeNSView(context: Context) -> Probe {
         let view = Probe()
         view.sessionChrome = sessionChrome
+        view.restorable = restorable
         view.resolved = resolved
         view.fullScreen = fullScreen
+        view.willClose = willClose
         return view
     }
     func updateNSView(_ view: Probe, context: Context) {
         view.sessionChrome = sessionChrome
+        view.restorable = restorable
         view.resolved = resolved
         view.fullScreen = fullScreen
+        view.willClose = willClose
         view.applyWindowChrome()
     }
     final class Probe: NSView {
         var sessionChrome = false
+        var restorable = true
         var resolved: ((NSWindow) -> Void)?
         var fullScreen: ((Bool) -> Void)?
+        var willClose: (() -> Void)?
         private var observers: [NSObjectProtocol] = []
         func applyWindowChrome() {
             guard let window, !window.styleMask.contains(.fullScreen) else { return }
+            if window.isRestorable != restorable { window.isRestorable = restorable }
             if sessionChrome {
                 if window.titleVisibility != .visible { window.titleVisibility = .visible }
                 if window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = false }
@@ -1426,6 +1585,11 @@ private struct WindowReader: NSViewRepresentable {
                     }
                 })
             }
+            observers.append(NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.willClose?()
+                }
+            })
         }
         deinit { for observer in observers { NotificationCenter.default.removeObserver(observer) } }
     }

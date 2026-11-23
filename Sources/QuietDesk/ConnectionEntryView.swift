@@ -122,6 +122,7 @@ struct RecentConnectionsView: View {
     var openMapping: (ConnectionRecord) -> Void = { _ in }
     var qualityBadge: (ConnectionRecord) -> ConnectionRecordCardBadge? = { _ in nil }
     var runningMappingsCount: (ConnectionRecord) -> Int = { _ in 0 }
+    var isRecordConnected: (ConnectionRecord) -> Bool = { _ in false }
     var preFlight: ConnectionPreFlightSummary? = nil
     var openPreferences: (() -> Void)? = nil
     var wakeRecord: ((ConnectionRecord) -> Void)? = nil
@@ -193,6 +194,7 @@ struct RecentConnectionsView: View {
                             highlighted: index == 0 && !searching,
                             badge: qualityBadge(record),
                             activeMappings: runningMappingsCount(record),
+                            isConnected: isRecordConnected(record),
                             connect: { connect(record) },
                             remove: { remove(record) },
                             benchmark: { benchmark(record) },
@@ -267,12 +269,15 @@ private struct ConnectionDeskCard: View {
     let highlighted: Bool
     let badge: ConnectionRecordCardBadge?
     let activeMappings: Int
+    var isConnected: Bool = false
     let connect: () -> Void
     let remove: () -> Void
     let benchmark: () -> Void
     let openMapping: () -> Void
     var wake: (() -> Void)? = nil
     var configureWake: (() -> Void)? = nil
+
+    private var emeraldColor: Color { Color(red: 0.07, green: 0.64, blue: 0.44) }
 
     private var badgeColor: Color {
         switch badge?.tone {
@@ -302,7 +307,14 @@ private struct ConnectionDeskCard: View {
                             .lineLimit(1)
                             .help(record.name)
                         Spacer(minLength: 4)
-                        if let badge {
+                        if isConnected {
+                            Text("远控中")
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(emeraldColor)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2.5)
+                                .background(emeraldColor.opacity(0.14), in: Capsule())
+                        } else if let badge {
                             Text(badge.text)
                                 .font(.system(size: 10.5, weight: .semibold))
                                 .monospacedDigit()
@@ -387,10 +399,11 @@ private struct ConnectionDeskCard: View {
                     .help("实测此记录可用的直连与各中继线路质量及丢包情况")
                     .accessibilityLabel("测试 \(ConnectionEntryPresentation.title(record)) 的线路质量")
 
-                Button("连接", action: connect)
+                Button(isConnected ? "切到窗口" : "连接", action: connect)
                     .buttonStyle(.borderedProminent)
+                    .tint(isConnected ? emeraldColor : .accentColor)
                     .controlSize(.small)
-                    .accessibilityLabel("连接 \(ConnectionEntryPresentation.title(record))")
+                    .accessibilityLabel("\(isConnected ? "切到" : "连接") \(ConnectionEntryPresentation.title(record))")
 
                 Menu {
                     Button("测试线路质量…", action: benchmark)
@@ -425,7 +438,7 @@ private struct ConnectionDeskCard: View {
                 )
         }
         .contextMenu {
-            Button("连接", action: connect)
+            Button(isConnected ? "切到远控窗口" : "连接", action: connect)
             Button("测试线路质量…", action: benchmark)
             Button("配置 TCP 端口映射…", action: openMapping)
             if record.wakeOnLAN != nil, let wake {
@@ -536,6 +549,11 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
     var configureWakeRecord: ((ConnectionRecord) -> Void)? = nil
     var wakeNotice: String? = nil
     var dismissWakeNotice: (() -> Void)? = nil
+    var activeSessions: [ActiveRemoteSessionSummary] = []
+    var focusSession: (UUID) -> Void = { _ in }
+    var disconnectSession: (UUID) -> Void = { _ in }
+    var disconnectAllSessions: () -> Void = {}
+    var isRecordConnected: (ConnectionRecord) -> Bool = { _ in false }
     @State private var query = ""
     @State private var expandedRecords = false
     @FocusState private var focusedField: ConnectionEntryPresentation.Field?
@@ -546,6 +564,9 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
+                if !activeSessions.isEmpty {
+                    activeSessionsCard
+                }
                 if locked {
                     connectingBanner
                 }
@@ -567,6 +588,7 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                         openMapping: openPortMappingRecord,
                         qualityBadge: qualityBadge,
                         runningMappingsCount: runningMappingsCount,
+                        isRecordConnected: isRecordConnected,
                         preFlight: preFlight,
                         openPreferences: openCaps,
                         wakeRecord: wakeRecord,
@@ -591,6 +613,70 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
             if newFailure != nil {
                 focusIncompleteField()
             }
+        }
+    }
+
+    private var activeSessionsCard: some View {
+        let emerald = Color(red: 0.07, green: 0.64, blue: 0.44)
+        let amber = Color(red: 0.88, green: 0.52, blue: 0.08)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Label("当前活动远控会话（\(activeSessions.count) 台）", systemImage: "macwindow.on.rectangle")
+                    .font(.system(size: 13.5, weight: .bold))
+                Text("每个远端桌面运行在独立窗口中，可继续发起其他 Mac 连接")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                if activeSessions.count > 1 {
+                    Button("全部断开", role: .destructive, action: disconnectAllSessions)
+                        .controlSize(.small)
+                }
+            }
+
+            VStack(spacing: 8) {
+                ForEach(activeSessions) { session in
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(session.connected ? emerald : (session.reconnecting || session.working ? amber : .secondary))
+                            .frame(width: 7.5, height: 7.5)
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                Text(session.title)
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .lineLimit(1)
+                                Text(session.endpointLabel)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Text(session.statusLabel)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 8)
+                        Button("切到窗口") { focusSession(session.id) }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                        Button("断开") { disconnectSession(session.id) }
+                            .controlSize(.small)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .strokeBorder(Color(nsColor: .separatorColor).opacity(0.6), lineWidth: 0.8)
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(emerald.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(emerald.opacity(0.28), lineWidth: 1)
         }
     }
 

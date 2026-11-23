@@ -6,12 +6,13 @@ import IOKit.hid
 @preconcurrency import QuietDeskCore
 
 @MainActor
-final class DeskModel: ObservableObject {
+final class DeskModel: ObservableObject, Identifiable {
     enum Mode: String, CaseIterable { case viewer = "连接家里 Mac", host = "共享这台 Mac" }
-    /// Each model keeps one role for its lifetime; the app runs a viewer and a host side by side.
+    let sessionID = UUID()
+    nonisolated var id: UUID { sessionID }
+    /// Each model keeps one role for its lifetime; multiple viewer session models may run alongside the host.
     let mode: Mode
-    /// The model of the other role, for the one-session-at-a-time rule and settings both roles share.
-    weak var sibling: DeskModel?
+    unowned let services: DeskServices
     @Published var address = UserDefaults.standard.string(forKey: "remoteAddress") ?? ""
     @Published var port = UserDefaults.standard.string(forKey: "remotePort") ?? "5908"
     @Published var viewerCode = ""
@@ -97,7 +98,9 @@ final class DeskModel: ObservableObject {
         didSet {
             UserDefaults.standard.set(relayPeerAssist.rawValue, forKey: "relayPeerAssist")
             guard oldValue != relayPeerAssist else { return }
-            sibling?.relayPeerAssist = relayPeerAssist
+            for other in services.otherModels(excluding: self) {
+                other.relayPeerAssist = relayPeerAssist
+            }
             if activeRouteBenchmarkOverride == nil {
                 viewerSession.relayBridge?.setPeerAssistMode(relayPeerAssist)
                 viewerSession.mediaRelayBridge?.setPeerAssistMode(relayPeerAssist)
@@ -397,9 +400,10 @@ final class DeskModel: ObservableObject {
     private var peer: Peer? {
         didSet {
             // Reserve bandwidth from the control handshake onward, including the first keyframe.
-            portMappings.setDesktopActive(peer != nil || sibling?.peer != nil)
+            services.refreshDesktopActiveOnPortMappings()
         }
     }
+    var hasActivePeerConnection: Bool { peer != nil }
     private var dataChannel: SessionDataChannel?
     private var pending: [UUID: Peer] = [:]
     private var hostSession = HostSession()
@@ -450,7 +454,22 @@ final class DeskModel: ObservableObject {
     private var initialLaunchHandled = false
     private var loginWindowHandled = false
     private var shouldMinimizeOnLaunch = false
-    private struct Target {
+    struct SessionLaunch {
+        let target: Target
+        let identity: RemoteSessionTargetIdentity
+        let address: String
+        let port: String
+        let relayStrategy: RelayConnectionStrategy
+        let targetRelayDeviceID: String
+        let selectedConnectionID: UUID?
+        let viewerCode: String
+        let mediaTCPOnly: Bool
+        let relayPeerAssist: RelayPeerAssistMode
+        let relayNodeChoice: String
+        let connectionDiagnosticsEnabled: Bool
+    }
+    private var lastSessionLaunch: SessionLaunch?
+    struct Target {
         let address: String
         let port: UInt16
         let key: PairingKey
@@ -472,7 +491,7 @@ final class DeskModel: ObservableObject {
             return next
         }
     }
-    private struct RelayRoute {
+    struct RelayRoute {
         let info: RelayConnectionInfo
         let accessKey: Data
         let certificate: RelayNodeCertificate?
@@ -510,10 +529,12 @@ final class DeskModel: ObservableObject {
 
     init(mode: Mode, services: DeskServices) {
         self.mode = mode
+        self.services = services
         portMappings = services.portMappings
         trafficHistory = services.trafficHistory
         trafficHistoryStore = services.trafficHistoryStore
         routeBenchmarkStore = services.routeBenchmarkStore
+        services.register(self)
         idlePolicy = SessionIdlePolicy(now: SessionClock.now, enabled: !disableIdleAutoPause)
         if let data = UserDefaults.standard.data(forKey: "streamSettings"),
            let saved = try? JSONDecoder().decode(StreamSettings.self, from: data),
@@ -696,7 +717,7 @@ final class DeskModel: ObservableObject {
                 self.inputStatus = "\(message)；请点击重新检测，已勾选时可完全退出后重开，无需反复添加"
             }
         }
-        refreshPermissions(checkScreenCapture: true)
+        refreshPermissions(checkScreenCapture: mode == .host)
         permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
@@ -1181,9 +1202,9 @@ final class DeskModel: ObservableObject {
         try RelayCertificateStore(defaults: .standard).load(for: endpoint)
     }
 
-    /// The relay settings serve both roles, so they change only while neither is sharing or connected.
+    /// The relay settings serve all roles and sessions, so they change only while none is sharing or connected.
     var relaySettingsLocked: Bool {
-        active || working || mappingHosting || sibling?.active == true || sibling?.working == true || sibling?.mappingHosting == true
+        services.anyModelBlocksRelaySettings
     }
 
     static func loadRelayNodes() -> [String] {
@@ -1230,7 +1251,9 @@ final class DeskModel: ObservableObject {
         if !enabled { defaults.set(RelayConnectionStrategy.direct.rawValue, forKey: "relayStrategy") }
         if !endpoints.contains(where: { $0.address == relayNodeChoice }) { defaults.set("", forKey: "relayNodeChoice") }
         reloadRelayConfiguration()
-        sibling?.reloadRelayConfiguration()
+        for other in services.otherModels(excluding: self) {
+            other.reloadRelayConfiguration()
+        }
     }
 
     /// Re-reads the relay settings, which either role may have saved.
@@ -1662,11 +1685,11 @@ final class DeskModel: ObservableObject {
             DispatchQueue.main.async {
                 guard let self, let candidate, self.pending.removeValue(forKey: id) != nil,
                       self.generation == token, self.active, self.hostingRequested else { candidate?.close("桌面共享尚未开启"); return }
-                guard self.peer == nil else { candidate.close("这台 Mac 当前已有控制连接"); return }
-                // One session at a time: while this Mac controls another one it is not controlled itself.
-                if self.sibling?.isControllingAnotherMac == true {
-                    DiagnosticLog.shared.record(.connectionClosed, role: .host, state: .rejected)
-                    candidate.close("这台 Mac 正在远程控制另一台 Mac，暂不接受控制连接", retryable: true)
+                guard MultiSessionPolicy.allowsIncomingHostConnection(
+                    existingHostPeerActive: self.peer != nil,
+                    outgoingViewerSessionCount: self.services.otherModels(excluding: self).filter(\.isControllingAnotherMac).count
+                ) else {
+                    candidate.close("这台 Mac 当前已有控制连接")
                     return
                 }
                 DiagnosticLog.shared.record(.connectionReady, role: .host, state: .ready,
@@ -2064,6 +2087,119 @@ final class DeskModel: ObservableObject {
 
     var currentMappingRecordID: UUID? { connected ? currentRecordID : nil }
 
+    func hasConnectedDesktopSession(for recordID: UUID) -> Bool {
+        currentMappingRecordID == recordID || services.connectedViewerSession(forRecordID: recordID) != nil
+    }
+
+    var preferredMappingRecordID: UUID? {
+        currentMappingRecordID
+            ?? services.allModels.first(where: { $0.mode == .viewer && $0.connected && $0.currentRecordID != nil })?.currentRecordID
+    }
+
+    func reloadSavedConnections() {
+        connections = ConnectionStore.load()
+        if let selectedConnectionID, !connections.contains(where: { $0.id == selectedConnectionID }) {
+            self.selectedConnectionID = nil
+        }
+    }
+
+    func clearConnectionError() {
+        connectionError = nil
+    }
+
+    var canRetryLastSessionLaunch: Bool {
+        mode == .viewer && lastSessionLaunch != nil && !active && !working && !reconnecting
+    }
+
+    var sessionTargetIdentity: RemoteSessionTargetIdentity {
+        if let target {
+            return RemoteSessionTargetIdentity(
+                recordID: currentRecordID ?? target.recordID,
+                address: target.address,
+                port: target.port,
+                relayDeviceID: target.relay?.deviceID
+            )
+        }
+        if let launch = lastSessionLaunch {
+            return launch.identity
+        }
+        let parsedPort = UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 5908
+        let relayUUID = UUID(uuidString: targetRelayDeviceID.trimmingCharacters(in: .whitespacesAndNewlines))
+        return RemoteSessionTargetIdentity(
+            recordID: selectedConnectionID,
+            address: address,
+            port: parsedPort,
+            relayDeviceID: relayUUID
+        )
+    }
+
+    var sessionEndpointSubtitle: String {
+        if let target {
+            if !target.address.isEmpty {
+                return "\(target.address):\(target.port)"
+            }
+            if let relay = target.relay {
+                return "中继 \(relay.endpoint.host) · \(relay.deviceID.uuidString.prefix(8).lowercased())…"
+            }
+        }
+        if let launch = lastSessionLaunch {
+            if !launch.target.address.isEmpty {
+                return "\(launch.target.address):\(launch.target.port)"
+            }
+            if let relay = launch.target.relay {
+                return "中继 \(relay.endpoint.host) · \(relay.deviceID.uuidString.prefix(8).lowercased())…"
+            }
+        }
+        let cleanAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanAddress.isEmpty {
+            return "\(cleanAddress):\(port)"
+        }
+        let cleanRelay = targetRelayDeviceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanRelay.isEmpty {
+            return "设备 \(cleanRelay.prefix(8).lowercased())…"
+        }
+        return "远端 Mac"
+    }
+
+    var sessionWindowTitle: String {
+        if !remoteName.isEmpty { return remoteName }
+        if let id = currentRecordID ?? target?.recordID ?? lastSessionLaunch?.target.recordID,
+           let matched = connections.first(where: { $0.id == id }) {
+            return ConnectionEntryPresentation.title(matched)
+        }
+        let cleanAddress = (target?.address ?? lastSessionLaunch?.target.address ?? address)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanAddress.isEmpty { return cleanAddress }
+        return "远端 Mac"
+    }
+
+    var activeSessionSummary: ActiveRemoteSessionSummary {
+        let statusText: String
+        if connected {
+            var details: [String] = []
+            if !mediaTransportStatus.isEmpty { details.append(mediaTransportStatus) }
+            if !latency.isEmpty, latency != "— ms" { details.append(latency) }
+            if !frameRate.isEmpty { details.append(frameRate) }
+            statusText = details.isEmpty ? "已连接" : details.joined(separator: " · ")
+        } else if reconnecting {
+            statusText = sessionPaused ? "空闲暂停 · 待返回重连" : status
+        } else if working {
+            statusText = status
+        } else {
+            statusText = connectionFailure ?? status
+        }
+        return ActiveRemoteSessionSummary(
+            id: sessionID,
+            target: sessionTargetIdentity,
+            title: sessionWindowTitle,
+            endpointLabel: sessionEndpointSubtitle,
+            statusLabel: statusText,
+            connected: connected,
+            reconnecting: reconnecting,
+            working: working
+        )
+    }
+
     /// An explicitly saved endpoint may be paired for forwarding before its first desktop session.
     func savePortMappingDevice() throws -> UUID {
         guard mode == .viewer else { throw DeskError.invalid("请在连接设备页面保存目标") }
@@ -2082,6 +2218,7 @@ final class DeskModel: ObservableObject {
             if records != connections {
                 try ConnectionStore.save(records)
                 connections = records
+                services.notifyConnectionsChanged(excluding: self)
             }
             selectedConnectionID = id
             return id
@@ -2095,6 +2232,7 @@ final class DeskModel: ObservableObject {
         do { try ConnectionStore.save(records) }
         catch { try? KeyStore.remove(account: account); throw error }
         connections = records
+        services.notifyConnectionsChanged(excluding: self)
         selectedConnectionID = record.id
         return record.id
     }
@@ -2103,7 +2241,8 @@ final class DeskModel: ObservableObject {
         guard mode == .viewer, let record = connections.first(where: { $0.id == rule.deviceID }) else {
             throw DeskError.invalid("请先保存远端设备的连接信息")
         }
-        let session = currentMappingRecordID == record.id ? target : nil
+        let connectedModel = (currentMappingRecordID == record.id) ? self : services.connectedViewerSession(forRecordID: record.id)
+        let session = connectedModel?.target
         if rule.scope == .session, session == nil { throw DeskError.invalid("请先连接此设备的远控会话，或选择独立运行") }
         guard let key = try session?.key ?? KeyStore.load(account: "remote." + record.id.uuidString) else {
             throw DeskError.invalid("此设备缺少配对码，请在连接页面补录")
@@ -2126,7 +2265,8 @@ final class DeskModel: ObservableObject {
                 return { bridge.stop() }
             }
         }
-        let useRelay = address.isEmpty || (session == nil ? record.relay?.strategy == .relay : viewerSession.usesRelayControl)
+        let usesRelayControl = connectedModel?.viewerSession.usesRelayControl ?? false
+        let useRelay = address.isEmpty || (session == nil ? record.relay?.strategy == .relay : usesRelayControl)
         if useRelay {
             guard let relayRoute else { throw DeskError.invalid("此设备缺少可用的中继线路") }
             try portMappings.start(rule, route: relayRoute)
@@ -2139,15 +2279,10 @@ final class DeskModel: ObservableObject {
         }
     }
 
-    private func connect(savedRelayRoute: RelayConnectionInfo?) {
-        guard !active, !working else { return }
+    func prepareSessionLaunch(savedRelayRoute: RelayConnectionInfo?) -> SessionLaunch? {
+        guard mode == .viewer, !isRunningRouteBenchmark else { return nil }
         stopLANScan()
-        remoteName = ""
         connectionError = nil
-        if sibling?.hasIncomingControlConnection == true {
-            connectionError = "这台 Mac 正在被另一台 Mac 控制；对方断开后才能连接其他 Mac，共享无需关闭"
-            return
-        }
         do {
             let target = try formTarget(savedRelayRoute: savedRelayRoute)
             let address = target.address, relay = target.relay
@@ -2158,32 +2293,84 @@ final class DeskModel: ObservableObject {
             UserDefaults.standard.set(relay?.strategy.rawValue ?? RelayConnectionStrategy.direct.rawValue, forKey: "relayStrategy")
             relayStrategy = relay?.strategy ?? .direct
             UserDefaults.standard.set(targetRelayDeviceID, forKey: "targetRelayDeviceID")
-            let record = target.recordID.flatMap { id in connections.first { $0.id == id } }
-            let preference = record ?? (!address.isEmpty ? ConnectionStore.matching(connections, address: address, port: target.port, preferredID: selectedConnectionID) : nil)
-            self.target = target
-            relaySelectedForTarget = relay?.strategy == .relay || (relay != nil && address.isEmpty)
-            relayFallbackAttempted = false
-            relayFallbackCooldown.reset()
-            idlePolicy = SessionIdlePolicy(now: SessionClock.now, enabled: !disableIdleAutoPause)
-            _ = idlePolicy.attentionChanged(now: SessionClock.now, attended: sessionWindowAttended, suppressWake: true)
-            pauseTransmission = SessionPauseTransmission()
-            wakeInputGate = SessionWakeInputGate()
-            reconnectDeferredForIdle = false
-            freshFrameRequiredOnReconnect = false
-            clipboardHandledChange = nil
-            let saved = preference?.videoSettings
-            viewerQualityPolicy = ViewerQualityPolicy(preferred: saved.flatMap { (try? $0.validateControlValues()) != nil ? $0 : nil })
-            savedChromaPreference = preference?.chromaSubsampling
-            savedTarget = false
-            retryBackoff.reset()
-            generation = UUID()
-            if connectionDiagnosticsEnabled { connectionDiagnostics = ViewerConnectionDiagnostics() }
-            beginMetrics()
-            beginConnection(target)
+            let identity = RemoteSessionTargetIdentity(
+                recordID: target.recordID,
+                address: target.address,
+                port: target.port,
+                relayDeviceID: target.relay?.deviceID
+            )
+            return SessionLaunch(
+                target: target,
+                identity: identity,
+                address: self.address,
+                port: self.port,
+                relayStrategy: self.relayStrategy,
+                targetRelayDeviceID: self.targetRelayDeviceID,
+                selectedConnectionID: self.selectedConnectionID,
+                viewerCode: self.viewerCode,
+                mediaTCPOnly: self.mediaTCPOnly,
+                relayPeerAssist: self.relayPeerAssist,
+                relayNodeChoice: self.relayNodeChoice,
+                connectionDiagnosticsEnabled: self.connectionDiagnosticsEnabled
+            )
         } catch {
             recordDiagnosticFailure(.connectionFailed, error: error)
             self.connectionError = error.localizedDescription
+            return nil
         }
+    }
+
+    func startLaunchedSession(_ launch: SessionLaunch) {
+        guard mode == .viewer, !active, !working else { return }
+        stopLANScan()
+        lastSessionLaunch = launch
+        address = launch.address
+        port = launch.port
+        relayStrategy = launch.relayStrategy
+        targetRelayDeviceID = launch.targetRelayDeviceID
+        selectedConnectionID = launch.selectedConnectionID
+        viewerCode = launch.viewerCode
+        mediaTCPOnly = launch.mediaTCPOnly
+        relayPeerAssist = launch.relayPeerAssist
+        relayNodeChoice = launch.relayNodeChoice
+        connectionDiagnosticsEnabled = launch.connectionDiagnosticsEnabled
+        remoteName = ""
+        connectionError = nil
+        let target = launch.target
+        let address = target.address, relay = target.relay
+        let record = target.recordID.flatMap { id in connections.first { $0.id == id } }
+        let preference = record ?? (!address.isEmpty ? ConnectionStore.matching(connections, address: address, port: target.port, preferredID: selectedConnectionID) : nil)
+        self.target = target
+        relaySelectedForTarget = relay?.strategy == .relay || (relay != nil && address.isEmpty)
+        relayFallbackAttempted = false
+        relayFallbackCooldown.reset()
+        idlePolicy = SessionIdlePolicy(now: SessionClock.now, enabled: !disableIdleAutoPause)
+        _ = idlePolicy.attentionChanged(now: SessionClock.now, attended: sessionWindowAttended, suppressWake: true)
+        pauseTransmission = SessionPauseTransmission()
+        wakeInputGate = SessionWakeInputGate()
+        reconnectDeferredForIdle = false
+        freshFrameRequiredOnReconnect = false
+        clipboardHandledChange = nil
+        let saved = preference?.videoSettings
+        viewerQualityPolicy = ViewerQualityPolicy(preferred: saved.flatMap { (try? $0.validateControlValues()) != nil ? $0 : nil })
+        savedChromaPreference = preference?.chromaSubsampling
+        savedTarget = false
+        retryBackoff.reset()
+        generation = UUID()
+        if connectionDiagnosticsEnabled { connectionDiagnostics = ViewerConnectionDiagnostics() }
+        beginMetrics()
+        beginConnection(target)
+    }
+
+    func retryLastSessionLaunch() {
+        guard let launch = lastSessionLaunch, !active, !working, !reconnecting else { return }
+        startLaunchedSession(launch)
+    }
+
+    private func connect(savedRelayRoute: RelayConnectionInfo?) {
+        guard !active, !working else { return }
+        guard let launch = prepareSessionLaunch(savedRelayRoute: savedRelayRoute) else { return }
+        startLaunchedSession(launch)
     }
 
     private func makeDataChannel(for peer: Peer) -> SessionDataChannel {
@@ -2562,7 +2749,9 @@ final class DeskModel: ObservableObject {
         guard remoteAudioEnabled != enabled else { return }
         remoteAudioEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "remoteAudioEnabled")
-        sibling?.setRemoteAudioEnabled(enabled)
+        for other in services.otherModels(excluding: self) where !other.connected {
+            other.setRemoteAudioEnabled(enabled)
+        }
         guard mode == .viewer, connected else { return }
         guard supportsRemoteAudio else {
             remoteAudioStatus = "对端版本不支持远端声音回传"
@@ -3022,12 +3211,8 @@ final class DeskModel: ObservableObject {
         status = "连接已断开，空闲暂停期间不在后台重连 · \(reason)"
     }
 
-    func quickConnect(_ record: ConnectionRecord) {
-        guard !active, !working else { return }
-        if sibling?.hasIncomingControlConnection == true {
-            connectionError = "这台 Mac 正在被另一台 Mac 控制；对方断开后才能连接其他 Mac，共享无需关闭"
-            return
-        }
+    func prepareQuickConnectLaunch(_ record: ConnectionRecord) -> SessionLaunch? {
+        guard mode == .viewer, !isRunningRouteBenchmark else { return nil }
         address = record.address
         port = String(record.port)
         relayStrategy = record.relay?.strategy ?? .direct
@@ -3040,8 +3225,17 @@ final class DeskModel: ObservableObject {
                 throw DeskError.invalid("此记录尚未保存到本机凭据文件。请在上方补录原配对码后连接；成功后会记住，无需读取钥匙串")
             }
             viewerCode = key.code
-            connect(savedRelayRoute: record.relay)
-        } catch { self.connectionError = error.localizedDescription }
+            return prepareSessionLaunch(savedRelayRoute: record.relay)
+        } catch {
+            self.connectionError = error.localizedDescription
+            return nil
+        }
+    }
+
+    func quickConnect(_ record: ConnectionRecord) {
+        guard !active, !working else { return }
+        guard let launch = prepareQuickConnectLaunch(record) else { return }
+        startLaunchedSession(launch)
     }
 
     func removeConnection(_ record: ConnectionRecord) {
@@ -3050,6 +3244,7 @@ final class DeskModel: ObservableObject {
             connections.removeAll { $0.id == record.id }
             if selectedConnectionID == record.id { selectedConnectionID = nil }
             try ConnectionStore.save(connections)
+            services.notifyConnectionsChanged(excluding: self)
         } catch { self.error = error.localizedDescription; return }
         portMappings.removeDevice(record.id)
         Self.setAutoUnlock(false, for: record.id)
@@ -3080,6 +3275,7 @@ final class DeskModel: ObservableObject {
             connections.removeAll { $0.id == record.id }
             connections.insert(record, at: 0)
             try ConnectionStore.save(connections)
+            services.notifyConnectionsChanged(excluding: self)
             savedTarget = true
         } catch { self.error = "已连接，但快捷连接保存失败：\(error.localizedDescription)" }
     }
@@ -3153,12 +3349,8 @@ final class DeskModel: ObservableObject {
         return (try? KeyStore.load(account: "remote." + matched.id.uuidString)) != nil
     }
 
-    func connectOrFillDiscoveredHost(_ discovered: DiscoveredLANHost) {
-        guard mode == .viewer, !active, !working else { return }
-        if sibling?.hasIncomingControlConnection == true {
-            connectionError = "这台 Mac 正在被另一台 Mac 控制；对方断开后才能连接其他 Mac，共享无需关闭"
-            return
-        }
+    func prepareDiscoveredHostLaunch(_ discovered: DiscoveredLANHost) -> SessionLaunch? {
+        guard mode == .viewer, !isRunningRouteBenchmark else { return nil }
         stopLANScan()
         let matched = BonjourDiscovery.matchingRecord(for: discovered, in: connections)
         relayStrategy = .direct
@@ -3168,7 +3360,15 @@ final class DeskModel: ObservableObject {
         connectionError = nil
         if let matched, let savedKey = try? KeyStore.load(account: "remote." + matched.id.uuidString) {
             viewerCode = savedKey.code
-            connect(savedRelayRoute: nil)
+            return prepareSessionLaunch(savedRelayRoute: nil)
+        }
+        return nil
+    }
+
+    func connectOrFillDiscoveredHost(_ discovered: DiscoveredLANHost) {
+        guard mode == .viewer, !active, !working else { return }
+        if let launch = prepareDiscoveredHostLaunch(discovered) {
+            startLaunchedSession(launch)
         }
     }
 
@@ -3180,6 +3380,7 @@ final class DeskModel: ObservableObject {
         updated[index].wakeOnLAN = configuration
         try ConnectionStore.save(updated)
         connections = updated
+        services.notifyConnectionsChanged(excluding: self)
         if let configuration {
             wakeStatusNotice = "已为「\(ConnectionEntryPresentation.title(updated[index]))」保存网络唤醒配置（\(configuration.macAddress.formatted)）"
         } else {
@@ -4594,7 +4795,10 @@ final class DeskModel: ObservableObject {
               || connections[index].chromaSubsampling != savedChromaPreference else { return }
         connections[index].videoSettings = settings
         connections[index].chromaSubsampling = savedChromaPreference
-        do { try ConnectionStore.save(connections) }
+        do {
+            try ConnectionStore.save(connections)
+            services.notifyConnectionsChanged(excluding: self)
+        }
         catch { videoSettingsStatus = "画质已生效，但保存记录失败：\(error.localizedDescription)" }
     }
 
@@ -5182,7 +5386,9 @@ final class DeskModel: ObservableObject {
         guard clipboardEnabled != enabled else { return }
         clipboardEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "clipboardEnabled")
-        sibling?.setClipboardEnabled(enabled)
+        for other in services.otherModels(excluding: self) {
+            other.setClipboardEnabled(enabled)
+        }
         if supportsClipboard, let peer {
             do { try sendClipboardPreference(to: peer) }
             catch { clipboardStatus = error.localizedDescription }
@@ -5375,7 +5581,9 @@ final class DeskModel: ObservableObject {
         guard disableIdleAutoPause != disabled else { return }
         disableIdleAutoPause = disabled
         UserDefaults.standard.set(disabled, forKey: "disableIdleAutoPause")
-        sibling?.setDisableIdleAutoPause(disabled)
+        for other in services.otherModels(excluding: self) {
+            other.setDisableIdleAutoPause(disabled)
+        }
         let resumed = idlePolicy.setEnabled(activeRouteBenchmarkOverride == nil && !disabled, now: SessionClock.now)
         if mode == .viewer, disabled,
            resumed || pauseTransmission.desiredPaused || reconnectDeferredForIdle {
@@ -5606,7 +5814,16 @@ final class DeskModel: ObservableObject {
     }
 
     private func clearSession() {
-        if mode == .viewer { portMappings.stopSessionMappings() }
+        if mode == .viewer {
+            let clearingRecordID = currentRecordID
+            let remainingConnected = services.connectedViewerRecordIDs(excluding: self)
+            for deviceID in MultiSessionPolicy.deviceIDsToStopSessionMappings(
+                disconnectedDeviceID: clearingRecordID,
+                remainingConnectedDeviceIDs: remainingConnected
+            ) {
+                portMappings.stopSessionMappings(forDeviceID: deviceID)
+            }
+        }
         // Only a session whose video ran on a path that is not the local network says what the route carries.
         if let route = viewerSession.startingBitrateRoute, viewerSession.mediaCommitted,
            let quality = viewerSession.mediaQuality, !quality.isLocalNetwork, let settled = quality.settledMegabits {
@@ -6050,9 +6267,6 @@ final class DeskModel: ObservableObject {
     }
 
     func resolveRouteBenchmarkPairingKey(for record: ConnectionRecord? = nil) throws -> PairingKey {
-        if sibling?.hasIncomingControlConnection == true {
-            throw DeskError.invalid("这台 Mac 正在被另一台 Mac 控制；对方断开后才能测试其他 Mac 的线路质量")
-        }
         if let record {
             if let key = try KeyStore.load(account: "remote." + record.id.uuidString) {
                 return key
@@ -6096,9 +6310,6 @@ final class DeskModel: ObservableObject {
         guard routeBenchmarkRunID == runID else { throw CancellationError() }
         guard !active, !working, !connected, !reconnecting else {
             throw DeskError.invalid("当前已有活动连接，请先断开后再执行线路测速")
-        }
-        if sibling?.hasIncomingControlConnection == true {
-            throw DeskError.invalid("这台 Mac 正在被另一台 Mac 控制；对方断开后才能测试其他 Mac 的线路质量")
         }
 
         let attemptTarget: Target
@@ -6207,15 +6418,15 @@ final class DeskModel: ObservableObject {
         )
     }
 
-    func connectUsingBenchmarkCandidate(_ candidate: RouteBenchmarkCandidate, record: ConnectionRecord?) {
-        guard !isRunningRouteBenchmark, !active, !working else { return }
+    func prepareBenchmarkCandidateLaunch(_ candidate: RouteBenchmarkCandidate, record: ConnectionRecord?) -> SessionLaunch? {
+        guard !isRunningRouteBenchmark else { return nil }
         let resolvedRecord = resolveConnectionRecordForBenchmarkCandidate(candidate, preferredRecord: record)
         do {
             let key = try resolveRouteBenchmarkPairingKey(for: resolvedRecord)
             viewerCode = key.code
         } catch {
             connectionError = error.localizedDescription
-            return
+            return nil
         }
 
         if let resolvedRecord {
@@ -6234,14 +6445,19 @@ final class DeskModel: ObservableObject {
             relayStrategy = .relay
             UserDefaults.standard.set(RelayConnectionStrategy.relay.rawValue, forKey: "relayStrategy")
             UserDefaults.standard.set(targetRelayDeviceID, forKey: "targetRelayDeviceID")
-            connect()
         } else {
             address = candidate.address
             port = String(candidate.port)
             relayStrategy = .direct
             UserDefaults.standard.set(RelayConnectionStrategy.direct.rawValue, forKey: "relayStrategy")
-            connect()
         }
+        return prepareSessionLaunch(savedRelayRoute: nil)
+    }
+
+    func connectUsingBenchmarkCandidate(_ candidate: RouteBenchmarkCandidate, record: ConnectionRecord?) {
+        guard !isRunningRouteBenchmark, !active, !working else { return }
+        guard let launch = prepareBenchmarkCandidateLaunch(candidate, record: record) else { return }
+        startLaunchedSession(launch)
     }
 
     deinit {

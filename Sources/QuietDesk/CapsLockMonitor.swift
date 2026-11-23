@@ -38,6 +38,15 @@ final class CapsLockMonitor {
         self.restoreTap = restoreTap
     }
 
+    static func shouldConsumeKeyboardEvent(
+        keyCode: Int64,
+        sourcePID: Int64,
+        localPID: Int64 = Int64(getpid()),
+        isActive: Bool
+    ) -> Bool {
+        keyCode == 57 && sourcePID != localPID && isActive
+    }
+
     func handleTapInterruption(_ type: CGEventType) {
         reset()
         // A slow main-loop turn can disable a healthy tap. Restore only this transient
@@ -72,8 +81,11 @@ final class CapsLockMonitor {
                         monitor.handleTapInterruption(type)
                         return Unmanaged.passUnretained(event)
                     }
-                    guard event.getIntegerValueField(.keyboardEventKeycode) == 57,
-                          monitor.isActive() else { return Unmanaged.passUnretained(event) }
+                    guard CapsLockMonitor.shouldConsumeKeyboardEvent(
+                        keyCode: event.getIntegerValueField(.keyboardEventKeycode),
+                        sourcePID: event.getIntegerValueField(.eventSourceUnixProcessID),
+                        isActive: monitor.isActive()
+                    ) else { return Unmanaged.passUnretained(event) }
                     guard AXIsProcessTrusted(), IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else {
                         monitor.reset()
                         monitor.onFailure?("Caps Lock 权限已失效，请检查公司 Mac 的辅助功能和输入监控")

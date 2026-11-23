@@ -1,5 +1,17 @@
 # 构建与检查记录
 
+## macOS 共享端仅在接入外部电源时阻止空闲睡眠（2026-11-23，`2168980`）
+
+- **做了什么**：
+  - `Sources/QuietDeskCore/HostSleepPolicy.swift`：新增 `HostPowerEnvironment`、`HostActivityMode` 与 `HostSleepPolicy`，将共享端 `ProcessInfo` 活动策略收敛为仅在共享开启且接入外部电源（AC Power）时启用 `[.idleSystemSleepDisabled, .idleDisplaySleepDisabled, .userInitiated, .latencyCritical]`；未接外部电源（含盒盖电池供电、开盖电池供电及断电 UPS 供电）时切换为 `[.userInitiatedAllowingIdleSystemSleep, .latencyCritical]`（显式避开自带 `.idleSystemSleepDisabled` 的 `.userInitiated`），保持防 App Nap 调度响应的同时允许系统与显示器正常进入睡眠；停止共享或收到系统睡眠通知时释放全部活动声明。
+  - `Sources/QuietDesk/HostPowerMonitor.swift`、`Sources/QuietDesk/DeskModel.swift`：新增 `HostPowerMonitor`（通过 `IOPSCopyPowerSourcesInfo`/`IOPSGetProvidingPowerSourceType`、`IOPSCreateLimitedPowerNotification`、`IOPSNotificationCreateRunLoopSource`、`IOPMrootDomain` `AppleClamshellState` 及 `com.apple.system.powermanagement.clamshellstate` 通知实时感知供电与盒盖状态）和 `HostActivityController`，接入 `DeskModel` 的共享开启、供电/盒盖/屏幕参数切换、睡眠/唤醒与停止清理路径；控制端（`.viewer`）原有的 `.userInitiatedAllowingIdleSystemSleep` 及自动解锁瞬时点亮逻辑保持不变。
+  - `Sources/QuietDesk/SharingView.swift`、`docs/usage.md`、`Checks/HostSleepPolicyChecks.swift`、`AppChecks/HostPowerChecks.swift`、`scripts/run-host-power-checks.sh`、`scripts/run-all-checks.sh`：同步后台共享边界说明，并接入核心与应用层专项检查。
+- **跑了什么与结果**：
+  - `./scripts/run-host-power-checks.sh` 通过（`4 passed, 0 failed`，覆盖 AC 防睡眠、拔电合盖立即释放防睡眠令牌、睡眠唤醒处于电池合盖态不重新阻止睡眠、`deinit` 释放及 `HostPowerMonitor` 启停）。
+  - `QuietDeskChecks` 全量通过（`441 passed, 0 failed`，含新增 `HostSleepPolicyChecks` 3 项）；Python 脚本检查通过（`64 passed`）。
+  - 从干净提交 `2168980` 构建并校验 Universal 产物（`outputs/host-sleep-power-20261123/`，`0.7.3` build `25`，`arm64` + `x86_64`，签名及证书固定检查通过）：`QuietDesk-0.7.3-macOS-universal.dmg`（SHA-256 `347f85e7...`，`hdiutil verify` 有效）、`QuietDesk-0.7.3-macOS-universal.zip`（SHA-256 `a791246c...`）、`QuietDesk-0.7.3-Source.zip`（SHA-256 `9ea97e48...`，438 项受管文件，不含构建缓存与私有配置）。
+- **没验证什么**：本轮未启动或改动本机生产版连接与系统权限；笔记本真机在拔插电源适配器、合盖外接显示器与无外接显示器合盖场景下的实际系统睡眠时机仍待实机确认（注：macOS 无外接显示器且未用管理员 `pmset` 禁用睡眠时，即使接电源合盖，系统硬件级 Clamshell Sleep 仍由 `powerd` 控制，用户态普通防空闲睡眠断言只能阻止空闲睡眠与外接屏幕合盖桌面模式下的自动睡眠）。
+
 ## 任务 C：Windows 端 UDP 媒体通道加固（2026-11-23，`9ae029c`、`571840b`、`b1e6cfe`）
 
 - **做了什么**：

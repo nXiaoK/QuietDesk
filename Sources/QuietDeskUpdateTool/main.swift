@@ -49,12 +49,26 @@ private struct AppMetadata {
 
 private func arguments() throws -> (String, [String: String]) {
     let items = Array(CommandLine.arguments.dropFirst())
-    guard let command = items.first else { throw ToolError.invalid("用法: QuietDeskUpdateTool generate-key|sign|verify|check-key [选项]") }
+    guard let command = items.first else {
+        throw ToolError.invalid("用法: QuietDeskUpdateTool generate-key|sign|verify|sign-windows|verify-windows|check-key [选项]")
+    }
     let allowed: Set<String>
     switch command {
     case "generate-key": allowed = ["--out"]
     case "sign": allowed = ["--app", "--archive", "--tag", "--repository", "--notes-file", "--out"]
     case "verify": allowed = ["--app", "--archive", "--manifest"]
+    case "sign-windows":
+        allowed = [
+            "--config", "--app-id", "--version", "--build", "--revision", "--tag", "--repository",
+            "--x64-zip", "--x64-installer", "--arm64-zip", "--arm64-installer", "--require-installers",
+            "--notes-file", "--out"
+        ]
+    case "verify-windows":
+        allowed = [
+            "--config", "--app-id", "--version", "--build", "--revision", "--repository",
+            "--x64-zip", "--x64-installer", "--arm64-zip", "--arm64-installer", "--require-installers",
+            "--manifest"
+        ]
     case "check-key": allowed = ["--config"]
     default: throw ToolError.invalid("未知子命令")
     }
@@ -207,6 +221,171 @@ private func verify(_ options: [String: String]) throws {
     print("更新签名、应用元数据与归档校验通过")
 }
 
+private struct FeedConfig: Decodable {
+    let feedURL: String?
+    let publicKeys: [UpdatePublicKey]
+
+    var repository: String? {
+        guard let feed = feedURL, let url = URL(string: feed), url.host == "github.com" else { return nil }
+        let parts = url.path.split(separator: "/")
+        guard parts.count == 6, parts[2] == "releases", parts[3] == "latest", parts[4] == "download" else { return nil }
+        return "\(parts[0])/\(parts[1])"
+    }
+}
+
+private func parseRequireInstallers(_ options: [String: String]) throws -> Bool {
+    guard let raw = options["--require-installers"] else { return true }
+    switch raw {
+    case "true": return true
+    case "false": return false
+    default: throw ToolError.invalid("--require-installers 必须为 true 或 false")
+    }
+}
+
+private func buildWindowsArchive(path: String, expectedName: String, repository: String, tag: String) throws -> UpdateArchive {
+    let url = URL(fileURLWithPath: path)
+    guard url.lastPathComponent == expectedName else {
+        throw ToolError.invalid("Windows 归档文件名不匹配，期望 \(expectedName)，实际为 \(url.lastPathComponent)")
+    }
+    let (size, digest) = try archiveDigest(url)
+    let downloadURL = URL(string: "https://github.com/\(repository)/releases/download/\(tag)/\(expectedName)")!
+    return UpdateArchive(url: downloadURL, size: size, sha256: digest)
+}
+
+private func signWindows(_ options: [String: String]) throws {
+    let configURL = URL(fileURLWithPath: options["--config"] ?? "Resources/update-feed.json")
+    let config = try JSONDecoder().decode(FeedConfig.self, from: Data(contentsOf: configURL))
+    let appId = options["--app-id"] ?? WindowsUpdateManifest.productionAppID
+    let version = try required("--version", in: options)
+    _ = try UpdateVersion(version)
+    let buildString = try required("--build", in: options)
+    guard let build = Int(buildString), build > 0, String(build) == buildString else {
+        throw ToolError.invalid("构建号无效")
+    }
+    let revision = options["--revision"] ?? ""
+    let tag = try required("--tag", in: options)
+    let repository = try required("--repository", in: options)
+    guard repository.range(of: #"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"#, options: .regularExpression) != nil,
+          tag == "v" + version else {
+        throw ToolError.invalid("仓库或版本标签不一致")
+    }
+    if let configuredRepo = config.repository, configuredRepo != repository {
+        throw ToolError.invalid("仓库与更新源配置不一致")
+    }
+    let requireInstallers = try parseRequireInstallers(options)
+    if requireInstallers && (options["--x64-installer"] == nil || options["--arm64-installer"] == nil) {
+        throw ToolError.invalid("缺少 Windows Setup 安装包参数（--x64-installer / --arm64-installer）")
+    }
+    let key = try signingKey()
+    let trusted = try matchedKey(key, in: config.publicKeys)
+    let x64Portable = try buildWindowsArchive(
+        path: required("--x64-zip", in: options),
+        expectedName: "QuietDesk-\(version)-Windows-x64.zip",
+        repository: repository,
+        tag: tag
+    )
+    let x64Installer = try options["--x64-installer"].map {
+        try buildWindowsArchive(
+            path: $0,
+            expectedName: "QuietDesk-\(version)-Windows-x64-Setup.exe",
+            repository: repository,
+            tag: tag
+        )
+    }
+    let arm64Portable = try buildWindowsArchive(
+        path: required("--arm64-zip", in: options),
+        expectedName: "QuietDesk-\(version)-Windows-arm64.zip",
+        repository: repository,
+        tag: tag
+    )
+    let arm64Installer = try options["--arm64-installer"].map {
+        try buildWindowsArchive(
+            path: $0,
+            expectedName: "QuietDesk-\(version)-Windows-arm64-Setup.exe",
+            repository: repository,
+            tag: tag
+        )
+    }
+    let notes = try options["--notes-file"].map { path in
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        return String(String.UnicodeScalarView(text.unicodeScalars.prefix(4_000)))
+    }
+    let manifest = WindowsUpdateManifest(
+        appId: appId,
+        version: version,
+        build: build,
+        publishedAt: ISO8601DateFormatter().string(from: Date()),
+        revision: revision,
+        releaseNotesURL: URL(string: "https://github.com/\(repository)/releases/tag/\(tag)")!,
+        notes: notes,
+        packages: [
+            "x64": WindowsArchPackages(portable: x64Portable, installer: x64Installer),
+            "arm64": WindowsArchPackages(portable: arm64Portable, installer: arm64Installer)
+        ]
+    )
+    try manifest.validate(appId: appId, repository: repository)
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    let payload = try encoder.encode(manifest)
+    let signature = try key.signature(for: WindowsUpdateManifestVerifier.signingPrefix + payload)
+    let envelope = SignedUpdateEnvelope(keyID: trusted.id, payload: payload.base64EncodedString(), signature: signature.base64EncodedString())
+    let data = try encoder.encode(envelope)
+    guard data.count <= UpdateManifestVerifier.maximumEnvelopeBytes else { throw ToolError.invalid("Windows 更新清单超过 64 KiB") }
+    try data.write(to: URL(fileURLWithPath: required("--out", in: options)), options: .atomic)
+    print("已签名 Windows 更新清单")
+}
+
+private func verifyWindows(_ options: [String: String]) throws {
+    let configURL = URL(fileURLWithPath: options["--config"] ?? "Resources/update-feed.json")
+    let config = try JSONDecoder().decode(FeedConfig.self, from: Data(contentsOf: configURL))
+    let appId = options["--app-id"] ?? WindowsUpdateManifest.productionAppID
+    let version = try required("--version", in: options)
+    let buildString = try required("--build", in: options)
+    guard let build = Int(buildString), build > 0, String(build) == buildString else {
+        throw ToolError.invalid("构建号无效")
+    }
+    let expectedRevision = options["--revision"]
+    let repository = options["--repository"] ?? config.repository ?? "nXiaoK/QuietDesk"
+    let requireInstallers = try parseRequireInstallers(options)
+    let manifestURL = URL(fileURLWithPath: try required("--manifest", in: options))
+    let handle = try FileHandle(forReadingFrom: manifestURL)
+    defer { try? handle.close() }
+    let data = try handle.read(upToCount: UpdateManifestVerifier.maximumEnvelopeBytes + 1) ?? Data()
+    let result = try WindowsUpdateManifestVerifier.verify(data, publicKeys: config.publicKeys, appId: appId, repository: repository)
+    guard case .supported(let manifest) = result,
+          manifest.version == version,
+          manifest.build == build,
+          expectedRevision == nil || manifest.revision == expectedRevision,
+          let x64 = manifest.packages["x64"],
+          let arm64 = manifest.packages["arm64"] else {
+        throw ToolError.invalid("Windows 清单与期望版本、构建号或架构表不一致")
+    }
+    let x64Zip = try archiveDigest(URL(fileURLWithPath: required("--x64-zip", in: options)))
+    let arm64Zip = try archiveDigest(URL(fileURLWithPath: required("--arm64-zip", in: options)))
+    guard x64Zip.0 == x64.portable.size, x64Zip.1 == x64.portable.sha256,
+          arm64Zip.0 == arm64.portable.size, arm64Zip.1 == arm64.portable.sha256 else {
+        throw ToolError.invalid("Windows 便携包大小或 SHA-256 不匹配")
+    }
+    if requireInstallers && (x64.installer == nil || arm64.installer == nil || options["--x64-installer"] == nil || options["--arm64-installer"] == nil) {
+        throw ToolError.invalid("Windows 清单或校验参数缺少 Setup 安装包")
+    }
+    if let x64InstallerPath = options["--x64-installer"] {
+        guard let recorded = x64.installer else { throw ToolError.invalid("Windows 清单缺少 x64 安装包记录") }
+        let actual = try archiveDigest(URL(fileURLWithPath: x64InstallerPath))
+        guard actual.0 == recorded.size, actual.1 == recorded.sha256 else {
+            throw ToolError.invalid("Windows x64 安装包大小或 SHA-256 不匹配")
+        }
+    }
+    if let arm64InstallerPath = options["--arm64-installer"] {
+        guard let recorded = arm64.installer else { throw ToolError.invalid("Windows 清单缺少 arm64 安装包记录") }
+        let actual = try archiveDigest(URL(fileURLWithPath: arm64InstallerPath))
+        guard actual.0 == recorded.size, actual.1 == recorded.sha256 else {
+            throw ToolError.invalid("Windows arm64 安装包大小或 SHA-256 不匹配")
+        }
+    }
+    print("Windows 更新签名、版本元数据与全部安装包校验通过")
+}
+
 private func checkKey(_ options: [String: String]) -> Int32 {
     do {
         struct Configuration: Decodable { let publicKeys: [UpdatePublicKey] }
@@ -229,6 +408,8 @@ do {
     case "generate-key": try generateKey(to: required("--out", in: options))
     case "sign": try sign(options)
     case "verify": try verify(options)
+    case "sign-windows": try signWindows(options)
+    case "verify-windows": try verifyWindows(options)
     case "check-key": exit(checkKey(options))
     default: break
     }

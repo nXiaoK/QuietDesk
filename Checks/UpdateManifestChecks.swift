@@ -261,6 +261,66 @@ func runUpdateManifestChecks() {
         try check(availability(readOnly: true) == .manualRequired(.readOnlyVolume), "Read-only volume could install")
         try check(availability(writable: false) == .manualRequired(.directoryNotWritable), "Non-writable parent could install")
     }
+
+    run("Windows update manifests use domain-separated Ed25519 signatures and multi-arch packages") {
+        let key = Curve25519.Signing.PrivateKey()
+        let keys = updateCheckKeys(key)
+        let x64Zip = UpdateArchive(
+            url: URL(string: "https://github.com/nXiaoK/QuietDesk/releases/download/v0.8.0/QuietDesk-0.8.0-Windows-x64.zip")!,
+            size: 4_123_456, sha256: String(repeating: "b", count: 64)
+        )
+        let x64Setup = UpdateArchive(
+            url: URL(string: "https://github.com/nXiaoK/QuietDesk/releases/download/v0.8.0/QuietDesk-0.8.0-Windows-x64-Setup.exe")!,
+            size: 5_234_567, sha256: String(repeating: "c", count: 64)
+        )
+        let arm64Zip = UpdateArchive(
+            url: URL(string: "https://github.com/nXiaoK/QuietDesk/releases/download/v0.8.0/QuietDesk-0.8.0-Windows-arm64.zip")!,
+            size: 3_987_654, sha256: String(repeating: "d", count: 64)
+        )
+        let arm64Setup = UpdateArchive(
+            url: URL(string: "https://github.com/nXiaoK/QuietDesk/releases/download/v0.8.0/QuietDesk-0.8.0-Windows-arm64-Setup.exe")!,
+            size: 5_012_345, sha256: String(repeating: "e", count: 64)
+        )
+        let manifest = WindowsUpdateManifest(
+            version: "0.8.0", build: 31, publishedAt: "2026-11-23T08:00:00Z",
+            revision: String(repeating: "a", count: 40),
+            releaseNotesURL: URL(string: "https://github.com/nXiaoK/QuietDesk/releases/tag/v0.8.0")!,
+            notes: "Windows 更新说明",
+            packages: [
+                "x64": WindowsArchPackages(portable: x64Zip, installer: x64Setup),
+                "arm64": WindowsArchPackages(portable: arm64Zip, installer: arm64Setup)
+            ]
+        )
+        let payload = try JSONEncoder().encode(manifest)
+        let envelope = SignedUpdateEnvelope(
+            keyID: "checks",
+            payload: payload.base64EncodedString(),
+            signature: try key.signature(for: WindowsUpdateManifestVerifier.signingPrefix + payload).base64EncodedString()
+        )
+        let encoded = try JSONEncoder().encode(envelope)
+        try check(try WindowsUpdateManifestVerifier.verify(encoded, publicKeys: keys) == .supported(manifest),
+                  "Valid Windows manifest did not verify")
+        try rejects("Windows manifest accepted by macOS verifier despite domain separation") {
+            _ = try UpdateManifestVerifier.verify(encoded, publicKeys: keys, bundleIdentifier: "local.quietdesk.app")
+        }
+        let macSigned = try signedUpdateCheckData(payload, key: key)
+        try rejects("macOS signature prefix accepted by Windows verifier") {
+            _ = try WindowsUpdateManifestVerifier.verify(macSigned, publicKeys: keys)
+        }
+        try check(try manifest.assess(currentVersion: "0.7.3", currentBuild: 25, architecture: "x64") == .available, "x64 update not offered")
+        try check(try manifest.assess(currentVersion: "0.7.3", currentBuild: 25, architecture: "arm64") == .available, "arm64 update not offered")
+        try check(try manifest.assess(currentVersion: "0.7.3", currentBuild: 25, architecture: "mips") == .upToDate, "Unknown arch was offered")
+        try UpdateURLPolicy.validateWindowsFeedURL(
+            URL(string: "https://github.com/nXiaoK/QuietDesk/releases/latest/download/QuietDesk-windows-update.json")!,
+            appId: WindowsUpdateManifest.productionAppID
+        )
+        try rejects("macOS feed URL accepted as Windows feed") {
+            try UpdateURLPolicy.validateWindowsFeedURL(
+                URL(string: "https://github.com/nXiaoK/QuietDesk/releases/latest/download/QuietDesk-update.json")!,
+                appId: WindowsUpdateManifest.productionAppID
+            )
+        }
+    }
 }
 
 private func updateCheckManifest() -> UpdateManifest {

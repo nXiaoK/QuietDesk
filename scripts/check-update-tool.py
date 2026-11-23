@@ -86,6 +86,71 @@ def check(tool, work):
         metadata["CFBundleVersion"] = "32"
         plist.write_bytes(plistlib.dumps(metadata))
         run(*verify_arguments, succeeds=False)
+
+        win_config = fixture / "win-feed.json"
+        win_config.write_text(
+            json.dumps(
+                {
+                    "feedURL": "https://github.com/nXiaoK/QuietDesk/releases/latest/download/QuietDesk-update.json",
+                    "publicKeys": [public_keys[0]],
+                }
+            )
+        )
+        x64_zip = fixture / "QuietDesk-0.8.0-Windows-x64.zip"
+        x64_setup = fixture / "QuietDesk-0.8.0-Windows-x64-Setup.exe"
+        arm64_zip = fixture / "QuietDesk-0.8.0-Windows-arm64.zip"
+        arm64_setup = fixture / "QuietDesk-0.8.0-Windows-arm64-Setup.exe"
+        x64_zip.write_bytes(b"Synthetic Windows x64 portable zip\n")
+        x64_setup.write_bytes(b"Synthetic Windows x64 setup exe\n")
+        arm64_zip.write_bytes(b"Synthetic Windows arm64 portable zip\n")
+        arm64_setup.write_bytes(b"Synthetic Windows arm64 setup exe\n")
+        win_manifest = fixture / "QuietDesk-windows-update.json"
+        run(
+            "sign-windows",
+            "--config", win_config,
+            "--version", "0.8.0",
+            "--build", "31",
+            "--revision", "a" * 40,
+            "--tag", "v0.8.0",
+            "--repository", "nXiaoK/QuietDesk",
+            "--x64-zip", x64_zip,
+            "--x64-installer", x64_setup,
+            "--arm64-zip", arm64_zip,
+            "--arm64-installer", arm64_setup,
+            "--notes-file", notes,
+            "--out", win_manifest,
+            secret=known_secrets[0],
+        )
+        win_verify = (
+            "verify-windows",
+            "--config", win_config,
+            "--version", "0.8.0",
+            "--build", "31",
+            "--revision", "a" * 40,
+            "--repository", "nXiaoK/QuietDesk",
+            "--x64-zip", x64_zip,
+            "--x64-installer", x64_setup,
+            "--arm64-zip", arm64_zip,
+            "--arm64-installer", arm64_setup,
+            "--manifest", win_manifest,
+        )
+        run(*win_verify)
+        # Missing installer when --require-installers defaults to true must fail.
+        run(
+            "sign-windows",
+            "--config", win_config,
+            "--version", "0.8.0",
+            "--build", "31",
+            "--tag", "v0.8.0",
+            "--repository", "nXiaoK/QuietDesk",
+            "--x64-zip", x64_zip,
+            "--arm64-zip", arm64_zip,
+            "--out", fixture / "rejected-win.json",
+            secret=known_secrets[0],
+            succeeds=False,
+        )
+        arm64_setup.write_bytes(arm64_setup.read_bytes() + b"tampered")
+        run(*win_verify, succeeds=False)
     print("Update publishing checks passed (temporary keys, synthetic metadata).")
 
 

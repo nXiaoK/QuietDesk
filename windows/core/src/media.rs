@@ -604,6 +604,15 @@ impl HostMedia {
         self.transaction.as_ref().map(|t| t.route).or(self.active).map_or(MediaPath::Shared, |r| r.path)
     }
 
+    pub(crate) fn udp_frame_stream(&self) -> Option<MediaStreamId> {
+        self.transaction
+            .as_ref()
+            .map(|tx| tx.route)
+            .or(self.active.filter(|_| !self.hold))
+            .filter(|route| route.path == MediaPath::Udp)
+            .map(|route| route.stream)
+    }
+
     pub fn set_video_bound(&mut self, bound: bool) -> (usize, Vec<MediaControl>) {
         let interrupted = self.video_bound && !bound && self.frame_path() == MediaPath::Tcp;
         self.video_bound = bound;

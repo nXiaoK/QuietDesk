@@ -736,6 +736,7 @@ private final class MacViewer: @unchecked Sendable {
         udp.start()
         try until("fresh echoes measure the authenticated path") { echoes.get() >= 3 }
 
+        var retiredFrame: MediaFrameHeader?
         for epoch in UInt32(1)...2 {
             let fast = modern && epoch == 2
             let stream = MediaStreamID(sessionID: session, transportEpoch: epoch, codecEpoch: epoch), transaction = UUID()
@@ -757,6 +758,10 @@ private final class MacViewer: @unchecked Sendable {
             try until("Windows sends the correlated ready") { responses().contains(.ready) }
             if fast {
                 try until("the fast transaction issues a fresh nonce") { !gate.get().pongs.isEmpty }
+                if let retiredFrame {
+                    let expired = try MediaFeedback(kind: .expired, header: retiredFrame)
+                    try require(udp.send(Data([4]) + expired.encode()), "The previous stream's expired feedback did not leave the viewer")
+                }
                 usleep(45_000)
                 try require(try !records.get().contains { try MediaFragment.decode(Data($0.dropFirst())).header.stream == stream },
                             "The host released the candidate IDR before the new nonce was returned")
@@ -829,6 +834,7 @@ private final class MacViewer: @unchecked Sendable {
                 let count = limit + 1 + (queued ? 1 : 0), resumed = SessionClock.uptime + 2
                 while frames.count < count && SessionClock.uptime < resumed { try poll(); usleep(500) }
                 try require(frames.count == count, "The next access unit did not match the available capture credit")
+                if modern { retiredFrame = frames.last }
                 try probe.send(["command": "observeCaptureWindow", "enabled": false])
             } else {
                 let by = SessionClock.uptime + 4

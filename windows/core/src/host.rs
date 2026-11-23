@@ -5,7 +5,7 @@ use crate::audio_session::{AudioCapture, HostAudio};
 use crate::auxiliary::{Accepted, Auxiliary, AuxiliaryEvent};
 use crate::clipboard_session::SessionClipboard;
 use crate::cursor::{CursorControl, CursorImage, CursorOperation, CursorPosition, CursorReason, CursorShape};
-use crate::datagram_frames::DatagramFrames;
+use crate::datagram_frames::{DatagramFrames, LossHistory};
 use crate::datagram_path::{DatagramPath, PathEvent};
 use crate::display::{DisplayControl, DisplaySwitch, HostDisplays, RemoteDisplayInfo};
 use crate::error::{DeskError, Result};
@@ -320,6 +320,7 @@ struct HostSession<'a, P: HostPlatform> {
     auxiliary: Auxiliary,
     datagrams: DatagramPath,
     udp_frames: Option<DatagramFrames>,
+    udp_loss: LossHistory,
     fragment_features: Option<FragmentFeatures>,
     displays: Option<HostDisplays>,
     display_subscribed: bool,
@@ -400,6 +401,7 @@ pub async fn run_with_auxiliary<P: HostPlatform>(
         auxiliary: Auxiliary::host(connections.auxiliary),
         datagrams: DatagramPath::new(connections.datagram),
         udp_frames: None,
+        udp_loss: LossHistory::default(),
         fragment_features: None,
         clipboard,
         peer: &peer,
@@ -451,6 +453,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
         };
         let start_by = Instant::now() + INITIAL_SETTINGS_GRACE;
         loop {
+            if self.udp_frames.as_ref().is_some_and(|frames| Some(frames.stream) != self.media.udp_frame_stream()) {
+                self.retire_datagram_frames();
+            }
             self.datagrams.probe_transaction(self.media.pending_fast_challenge());
             if self.media.take_fast_keyframe() {
                 if let Err(error) = self.request_opening_frame().await {
@@ -460,9 +465,6 @@ impl<P: HostPlatform> HostSession<'_, P> {
             }
             let media_deadline = self.media.deadline().into_iter().chain(self.media.recovery().map(|_| self.recover_after)).min();
             let gesture_check = self.platform.gesture_check_at();
-            if self.media.frame_path() != MediaPath::Udp {
-                self.udp_frames = None;
-            }
             let udp_by = self.udp_frames.as_ref().map(DatagramFrames::deadline);
             let bulk = self.auxiliary.peer(AuxiliaryRole::Bulk).cloned();
             let outcome = tokio::select! {
@@ -620,9 +622,10 @@ impl<P: HostPlatform> HostSession<'_, P> {
             HostFrame::Datagram(frame) => {
                 self.media_credits.push_back(captured.credit);
                 let now = Instant::now();
-                if self.udp_frames.as_ref().is_none_or(|frames| frames.stream != frame.header.stream) {
+                if self.udp_frames.is_none() {
                     let settings = self.state.map_or(self.options.preferred, |state| state.settings);
-                    let mut queue = DatagramFrames::new(frame.header.stream, settings, self.fragment_features.unwrap_or_default(), now, self.udp_frames.take());
+                    let mut queue =
+                        DatagramFrames::new(frame.header.stream, settings, self.fragment_features.unwrap_or_default(), now, std::mem::take(&mut self.udp_loss));
                     if self.media.capture_limits.dynamic {
                         queue.set_capacity(window::MAX_DYNAMIC_FRAMES);
                     }
@@ -655,14 +658,21 @@ impl<P: HostPlatform> HostSession<'_, P> {
         self.media_credits.drain(..count);
     }
 
+    fn retire_datagram_frames(&mut self) {
+        if let Some(frames) = self.udp_frames.take() {
+            self.udp_loss = frames.into_loss_history();
+        }
+    }
+
     fn interrupt_datagram_stream(&mut self) -> Result<()> {
-        self.udp_frames = None;
+        self.retire_datagram_frames();
         self.interrupt_media()
     }
 
     fn lose_datagrams(&mut self) -> Result<()> {
         self.datagrams.retire();
         self.udp_frames = None;
+        self.udp_loss = LossHistory::default();
         let update = self.media.set_udp_verified(false);
         self.apply_media_update(update)
     }
@@ -695,9 +705,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
                     self.receive_control(control).await?;
                 }
             }
-            PathEvent::Record(4, data) if self.media.frame_path() == MediaPath::Udp => {
-                let Ok(feedback) = MediaFeedback::decode(&data[1..]) else { return Ok(()) };
+            PathEvent::Record(4, data) => {
                 let Some(frames) = &mut self.udp_frames else { return Ok(()) };
+                let Ok(feedback) = MediaFeedback::decode(&data[1..]) else { return Ok(()) };
                 if feedback.header.stream != frames.stream
                     || (matches!(feedback.kind, FeedbackKind::Reassembled | FeedbackKind::Decoded) && !frames.fully_submitted(feedback.header))
                 {

@@ -148,6 +148,9 @@ pub trait ViewerPlatform {
     }
     /// A legacy frame. The platform reports its sequence once the decoder has taken it.
     fn video(&mut self, packet: VideoPacket) -> Result<()>;
+    /// Retire work for the previous media receiver before delivering any commands for its replacement.
+    /// Receiving a candidate stream leaves the last committed picture visible.
+    fn media_receiving(&mut self, _stream: Option<MediaStreamId>) {}
     /// Media feedback confirms decoded output. A buffering decoder must report this sequence only
     /// when it produces the corresponding picture, including the keyframe that opens the stream.
     fn media_video(&mut self, packet: VideoPacket, stream: MediaStreamId, first_in_stream: bool) -> Result<()>;
@@ -676,6 +679,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
     }
 
     fn apply_media_events(&mut self, events: Vec<ViewerMediaEvent>) -> Result<()> {
+        self.platform.media_receiving(self.media.as_ref().and_then(ViewerMedia::receiving_stream));
         self.sync_datagram_receiver();
         let mut after_commit = Vec::new();
         for event in events {

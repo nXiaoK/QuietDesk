@@ -8,7 +8,8 @@ use crate::media::fragment::{BYTE_BUDGET, MAX_RECORD_BYTES, OutgoingFragment, PA
 use crate::media::{FeedbackKind, FragmentFeatures, MediaFeedback, MediaFrame, MediaFrameHeader, MediaStreamId};
 use crate::messages::StreamSettings;
 use crate::video_pacing::ByteCredit;
-use fec_policy::{FrameLoad, LossHistory};
+use fec_policy::FrameLoad;
+pub(crate) use fec_policy::LossHistory;
 use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -50,7 +51,7 @@ pub(crate) struct DatagramFrames {
 }
 
 impl DatagramFrames {
-    pub fn new(stream: MediaStreamId, settings: StreamSettings, features: FragmentFeatures, now: Instant, previous: Option<Self>) -> Self {
+    pub fn new(stream: MediaStreamId, settings: StreamSettings, features: FragmentFeatures, now: Instant, loss: LossHistory) -> Self {
         let settings = StreamSettings { megabits: settings.megabits.max(1), frames_per_second: settings.frames_per_second.max(1), ..settings };
         let rate = (settings.megabits as f64 * 200_000.0).max(250_000.0);
         let burst = (rate * 0.008).clamp(((MAX_RECORD_BYTES + 1) * 4) as f64, 32_768.0);
@@ -64,8 +65,12 @@ impl DatagramFrames {
             next_poll: now,
             settings,
             features,
-            loss: previous.map(|queue| queue.loss).unwrap_or_default(),
+            loss,
         }
+    }
+
+    pub fn into_loss_history(self) -> LossHistory {
+        self.loss
     }
 
     pub fn set_capacity(&mut self, capacity: usize) {
@@ -232,7 +237,7 @@ mod tests {
                 StreamSettings::new(1920, 30, 1),
                 FragmentFeatures { marked_repairs: marked, ..FragmentFeatures::default() },
                 now,
-                None,
+                LossHistory::default(),
             );
             queue.insert(frame.clone(), now, Duration::ZERO).unwrap();
             let total = queue.pending.len();
@@ -271,7 +276,7 @@ mod tests {
         let settings = StreamSettings::new(1920, 60, 8);
         let features = FragmentFeatures { marked_repairs: true, xor: true, block_limit: 4096 };
         let now = Instant::now();
-        let mut queue = DatagramFrames::new(stream, settings, features, now, None);
+        let mut queue = DatagramFrames::new(stream, settings, features, now, LossHistory::default());
         let size: usize = 14 * PAYLOAD - 200;
         let mut avcc = (size as u32).to_be_bytes().to_vec();
         avcc.push(0x65);

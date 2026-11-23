@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 #[derive(Default)]
-pub(super) struct LossHistory {
+pub(crate) struct LossHistory {
     last: Option<Instant>,
     missing: VecDeque<(Instant, usize)>,
 }

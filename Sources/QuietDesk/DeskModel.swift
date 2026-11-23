@@ -2396,7 +2396,7 @@ final class DeskModel: ObservableObject, Identifiable {
         }
     }
 
-    private func configureViewerMedia(peer: Peer, settings: StreamSettings, preferred: StreamSettings, relayRouting: Bool) throws {
+    private func configureViewerMedia(peer: Peer, settings: StreamSettings, hostDefault: StreamSettings, preferred: StreamSettings, relayRouting: Bool) throws {
         guard let target, let channel = dataChannel else { return }
         let viewer = viewerSession
         let renderer = canvas.makeMediaReceiver(diagnostics: performanceDiagnostics)
@@ -2431,8 +2431,9 @@ final class DeskModel: ObservableObject, Identifiable {
         }
         supportsMediaTransport = true
         // Keep the saved preference for reconnects; this session's ceiling must fit the host's capabilities.
-        viewer.mediaQuality = try MediaQualityPolicy(hostDefault: preferred, preferred: viewerQualityPolicy.preferred == nil ? nil : preferred,
-                                                   applied: settings, bitRates: supportsAdaptiveVideo ? StreamSettings.adaptiveBitRates : viewerBitRates,
+        let bitRates = supportsAdaptiveVideo ? StreamSettings.adaptiveBitRates : viewerBitRates + [hostDefault.megabits]
+        viewer.mediaQuality = try MediaQualityPolicy(hostDefault: hostDefault, preferred: viewerQualityPolicy.preferred == nil ? nil : preferred,
+                                                   applied: settings, bitRates: bitRates,
                                                    appliedSize: activeVideoState.map { ($0.width, $0.height) }, now: SessionClock.now)
         channel.configureMedia { [weak media] in media?.receive($0) ?? false }
         channel.configureReliableData { [weak media] in media?.sendReliableData($0) }
@@ -3728,7 +3729,7 @@ final class DeskModel: ObservableObject, Identifiable {
                 if hello.mediaTransportV1 == true {
                     // Media adaptation replaces the old RTT shortcut; a compatibility fallback still must not be saved.
                     viewerQualityPolicy.chooseManually(savePreference: viewerQualityPolicy.maySaveCurrentChoice)
-                    try configureViewerMedia(peer: peer, settings: state.settings, preferred: preferred,
+                    try configureViewerMedia(peer: peer, settings: state.settings, hostDefault: hostDefault, preferred: preferred,
                                              relayRouting: hello.relayTransportV1 == true && target?.relay != nil)
                     // Start non-LAN and relayed sessions from a conservative bitrate so the initial keyframe
                     // and refinement burst cannot overflow unknown WAN uplinks; healthy paths climb quickly.
@@ -3746,7 +3747,8 @@ final class DeskModel: ObservableObject, Identifiable {
                         guard let route = viewerSession.startingBitrateRoute else { return fallback }
                         return startingBitrates.maximum(route: route, fallback: fallback, now: SessionClock.now)
                     }
-                    if supportsAdaptiveVideo, let maximumMegabits = initialMaxMegabits, var tuning = videoTuning,
+                    if supportsAdaptiveVideo || hello.initialStreamNegotiationV1 == true,
+                       let maximumMegabits = initialMaxMegabits, var tuning = videoTuning,
                        let start = viewerSession.mediaQuality?.startingSettings(maximumMegabits: maximumMegabits), start != tuning.desired {
                         try tuning.choose(start)
                         videoTuning = tuning

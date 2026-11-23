@@ -802,6 +802,25 @@ func runMediaPathPolicyChecks() {
         }
     }
 
+    run("A compatibility session can start below its advertised Windows quality") {
+        let advertised = StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 50)
+        let legacy = advertised.legacyCompatible
+        let rates = StreamSettings.bitRates + [advertised.megabits]
+        var quality = try MediaQualityPolicy(hostDefault: advertised, applied: legacy, bitRates: rates, now: 0)
+        let start = quality.startingSettings(maximumMegabits: 10)
+        try check(start == StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 8),
+                  "Compatibility startup did not retain pixels while capping the rate")
+        let applied = VideoStreamState(settings: start, width: 2560, height: 1440)
+        quality.receiveSettingsResult(StreamSettingsResult(id: UUID(), state: applied, error: nil), for: start, now: 1)
+        for time in 2...120 {
+            if let next = quality.observe(sample(received: Double(quality.effective.megabits)), now: Double(time)) {
+                _ = quality.confirmApplied(next, now: Double(time))
+            }
+        }
+        try check(quality.effective == advertised && quality.preferred == nil,
+                  "The conservative start displaced the advertised quality or persisted a preference")
+    }
+
     run("Compatibility quality recovers to a host's confirmed 20 or 50 Mbps rate") {
         for rate in [20, 50] {
             let active = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: rate)

@@ -15,9 +15,84 @@ concurrency:
 jobs:
   relay-docker:
     uses: ./.github/workflows/relay-docker.yml
+
+  windows-cross:
+    runs-on: macos-26
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
+        with:
+          xcode-version: latest-stable
+      - name: Install pinned Rust toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' windows/rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          rustup target add --toolchain "$channel" x86_64-pc-windows-gnullvm aarch64-pc-windows-gnullvm
+      - name: Run Windows Rust and macOS interop checks
+        run: |
+          source scripts/windows-toolchain.sh
+          (cd windows && cargo fmt --check)
+          (cd windows && cargo clippy --locked --all-targets -- -D warnings)
+          (cd windows && cargo clippy --locked --target x86_64-pc-windows-gnullvm -p quietdesk-app --all-targets -- -D warnings)
+          (cd windows && cargo clippy --locked --target aarch64-pc-windows-gnullvm -p quietdesk-app --all-targets -- -D warnings)
+          ./scripts/run-windows-interop-checks.sh
+      - name: Build Windows x64 and ARM64 portable packages
+        run: ./scripts/build-windows.sh all
+      - name: Upload Windows portable packages for installer build
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: QuietDesk-Windows-CI
+          path: |
+            outputs/windows/QuietDesk-*-Windows-x64.zip
+            outputs/windows/QuietDesk-*-Windows-arm64.zip
+            outputs/windows/SHA256SUMS-*-Windows.txt
+          if-no-files-found: error
+
+  windows-installer:
+    needs: windows-cross
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Download cross-built Windows portable packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path outputs/windows | Out-Null
+          gh run download "$env:GITHUB_RUN_ID" --repo "$env:GITHUB_REPOSITORY" --name QuietDesk-Windows-CI --dir outputs/windows
+      - name: Package Windows x64 and ARM64 Inno Setup installers
+        shell: pwsh
+        run: python scripts/package-windows-installer.py --dist-dir outputs/windows
+      - name: Verify silent install and uninstall on Windows x64
+        shell: pwsh
+        run: |
+          $version = (python scripts/version.py current)[0].Trim()
+          $setup = Resolve-Path "outputs/windows/QuietDesk-$version-Windows-x64-Setup.exe"
+          $armSetup = Resolve-Path "outputs/windows/QuietDesk-$version-Windows-arm64-Setup.exe"
+          if ((Get-Item $armSetup).Length -le 0) { throw "Empty ARM64 installer" }
+          $installDir = Join-Path $env:RUNNER_TEMP "quietdesk-ci-install"
+          $proc = Start-Process -FilePath $setup -ArgumentList @("/SP-", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL", "/DIR=$installDir") -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "Installer exited with $($proc.ExitCode)" }
+          foreach ($file in @("QuietDesk.exe", "LICENSE", "THIRD-PARTY-OPUS.txt", "unins000.exe")) {
+            if (-not (Test-Path (Join-Path $installDir $file))) { throw "Missing installed file: $file" }
+          }
+          $unins = Start-Process -FilePath (Join-Path $installDir "unins000.exe") -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
+          if ($unins.ExitCode -ne 0) { throw "Uninstaller exited with $($unins.ExitCode)" }
+          if (Test-Path (Join-Path $installDir "QuietDesk.exe")) { throw "QuietDesk.exe remained after uninstall" }
+
   check:
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:

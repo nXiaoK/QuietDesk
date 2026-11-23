@@ -76,9 +76,14 @@ class UpdateReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("echo 'skip=true'", value)
         self.assertIn("if: steps.draft.outputs.skip != 'true' &&", value)
         self.assertLess(value.index('"$tool" verify'), value.index("name: Publish verified release"))
-        self.assertIn("dist/QuietDesk-update.json", value[value.index("name: Save packages"):value.index("name: Publish verified release")])
+        self.assertLess(value.index('"$tool" verify-windows'), value.index("name: Publish verified release"))
+        saved = value[value.index("name: Save packages"):value.index("name: Publish verified release")]
+        self.assertIn("dist/QuietDesk-update.json", saved)
+        self.assertIn("dist/QuietDesk-windows-update.json", saved)
+        self.assertIn("outputs/windows/*-Setup.exe", saved)
         publish = value[value.index("name: Publish verified release"):]
         self.assertNotIn("QUIETDESK_UPDATE_SIGNING_KEY", publish)
+        self.assertIn("dist/QuietDesk-windows-update.json", publish)
         self.assertLess(publish.index("gh release upload"), publish.index("--draft=false"))
 
     def test_release_never_sets_test_source_overrides(self):
@@ -86,6 +91,8 @@ class UpdateReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("QUIETDESK_UPDATE_FEED_URL:", value)
         self.assertNotIn("QUIETDESK_UPDATE_PUBLIC_KEYS:", value)
         self.assertNotIn("QUIETDESK_BUNDLE_IDENTIFIER:", value)
+        self.assertNotIn("QUIETDESK_WINDOWS_UPDATE_FEED_URL:", value)
+        self.assertNotIn("QUIETDESK_WINDOWS_APP_ID:", value)
 
     def test_code_signing_keychain_lifecycle_and_secret_scoping(self):
         value = (ROOT / ".github/workflows/release.yml").read_text()

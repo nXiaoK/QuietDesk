@@ -1,4 +1,4 @@
-name: Build and release macOS
+name: Build and release macOS and Windows
 
 on:
   push:
@@ -27,13 +27,118 @@ jobs:
       contents: read
       packages: write
     uses: ./.github/workflows/relay-image.yml
+  windows-portable:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
+        with:
+          xcode-version: latest-stable
+      - name: Install pinned Rust toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' windows/rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt
+          rustup target add --toolchain "$channel" x86_64-pc-windows-gnullvm aarch64-pc-windows-gnullvm
+      - name: Compute Windows release version
+        id: win-version
+        env:
+          INCREMENT: ${{ inputs.increment || 'auto' }}
+        run: python3 scripts/version.py next --increment "$INCREMENT" --github-output
+      - name: Run Windows Rust and macOS interop checks
+        run: |
+          source scripts/windows-toolchain.sh
+          (cd windows && cargo fmt --check)
+          (cd windows && cargo clippy --locked --all-targets -- -D warnings)
+          (cd windows && cargo clippy --locked --target x86_64-pc-windows-gnullvm -p quietdesk-app --all-targets -- -D warnings)
+          (cd windows && cargo clippy --locked --target aarch64-pc-windows-gnullvm -p quietdesk-app --all-targets -- -D warnings)
+          ./scripts/run-windows-interop-checks.sh
+      - name: Build Windows x64 and ARM64 portable packages
+        env:
+          QUIETDESK_VERSION: ${{ steps.win-version.outputs.version }}
+          QUIETDESK_BUILD_NUMBER: ${{ steps.win-version.outputs.build }}
+        run: ./scripts/build-windows.sh all
+      - name: Upload Windows portable packages
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: QuietDesk-Windows-Portable-${{ steps.win-version.outputs.version }}
+          path: |
+            outputs/windows/QuietDesk-${{ steps.win-version.outputs.version }}-Windows-x64.zip
+            outputs/windows/QuietDesk-${{ steps.win-version.outputs.version }}-Windows-arm64.zip
+          if-no-files-found: error
+  windows-installer:
+    needs: windows-portable
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Compute Windows installer version
+        id: win-ver
+        env:
+          INCREMENT: ${{ inputs.increment || 'auto' }}
+        shell: pwsh
+        run: python scripts/version.py next --increment "$env:INCREMENT" --github-output
+      - name: Download cross-built Windows portable packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WIN_VERSION: ${{ steps.win-ver.outputs.version }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path outputs/windows | Out-Null
+          gh run download "$env:GITHUB_RUN_ID" --repo "$env:GITHUB_REPOSITORY" --name "QuietDesk-Windows-Portable-$env:WIN_VERSION" --dir outputs/windows
+      - name: Build Windows x64 and ARM64 Setup installers
+        env:
+          WIN_VERSION: ${{ steps.win-ver.outputs.version }}
+          WIN_BUILD: ${{ steps.win-ver.outputs.build }}
+        shell: pwsh
+        run: python scripts/package-windows-installer.py --dist-dir outputs/windows --version "$env:WIN_VERSION" --build "$env:WIN_BUILD"
+      - name: Verify silent install and uninstall on Windows x64
+        env:
+          WIN_VERSION: ${{ steps.win-ver.outputs.version }}
+        shell: pwsh
+        run: |
+          $setup = Resolve-Path "outputs/windows/QuietDesk-$env:WIN_VERSION-Windows-x64-Setup.exe"
+          $installDir = Join-Path $env:RUNNER_TEMP "quietdesk-release-install-check"
+          $proc = Start-Process -FilePath $setup -ArgumentList @("/SP-", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL", "/DIR=$installDir") -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "Installer exited with $($proc.ExitCode)" }
+          foreach ($file in @("QuietDesk.exe", "LICENSE", "THIRD-PARTY-OPUS.txt", "unins000.exe")) {
+            if (-not (Test-Path (Join-Path $installDir $file))) { throw "Missing installed file: $file" }
+          }
+          $unins = Start-Process -FilePath (Join-Path $installDir "unins000.exe") -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
+          if ($unins.ExitCode -ne 0) { throw "Uninstaller exited with $($unins.ExitCode)" }
+      - name: Upload verified Windows packages and installers
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: QuietDesk-Windows-Packages-${{ steps.win-ver.outputs.version }}
+          path: |
+            outputs/windows/QuietDesk-${{ steps.win-ver.outputs.version }}-Windows-x64.zip
+            outputs/windows/QuietDesk-${{ steps.win-ver.outputs.version }}-Windows-x64-Setup.exe
+            outputs/windows/QuietDesk-${{ steps.win-ver.outputs.version }}-Windows-arm64.zip
+            outputs/windows/QuietDesk-${{ steps.win-ver.outputs.version }}-Windows-arm64-Setup.exe
+            outputs/windows/SHA256SUMS-${{ steps.win-ver.outputs.version }}-Windows.txt
+          if-no-files-found: error
   release:
-    needs: relay-docker
+    needs: [relay-docker, windows-installer]
     if: github.ref == 'refs/heads/main'
     runs-on: macos-26
     timeout-minutes: 45
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -112,6 +217,14 @@ jobs:
         env:
           QUIETDESK_VERSION: ${{ steps.version.outputs.version }}
         run: ./scripts/build-relay.sh
+      - name: Download verified Windows packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p outputs/windows
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "QuietDesk-Windows-Packages-$RELEASE_VERSION" --dir outputs/windows
+          (cd outputs/windows && shasum -a 256 -c "SHA256SUMS-$RELEASE_VERSION-Windows.txt")
       - name: Create draft release and upload packages
         id: draft
         env:
@@ -142,6 +255,11 @@ jobs:
             "dist/QuietDesk-$RELEASE_VERSION-macOS-universal.zip" \
             "dist/QuietDesk-$RELEASE_VERSION-Source.zip" \
             "dist/SHA256SUMS-$RELEASE_VERSION.txt" \
+            "outputs/windows/QuietDesk-$RELEASE_VERSION-Windows-x64.zip" \
+            "outputs/windows/QuietDesk-$RELEASE_VERSION-Windows-x64-Setup.exe" \
+            "outputs/windows/QuietDesk-$RELEASE_VERSION-Windows-arm64.zip" \
+            "outputs/windows/QuietDesk-$RELEASE_VERSION-Windows-arm64-Setup.exe" \
+            "outputs/windows/SHA256SUMS-$RELEASE_VERSION-Windows.txt" \
             outputs/relay/*.tar.gz outputs/relay/SHA256SUMS.txt
       - name: Sign update manifest
         if: steps.draft.outputs.skip != 'true' && steps.update-signing.outputs.enabled == 'true'
@@ -149,14 +267,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           QUIETDESK_UPDATE_SIGNING_KEY: ${{ secrets.QUIETDESK_UPDATE_SIGNING_KEY }}
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_BUILD: ${{ steps.version.outputs.build }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$RUNNER_TEMP/quietdesk-release-notes.txt"
+          revision="$(git rev-parse HEAD)"
           swift build --product QuietDeskUpdateTool
           tool="$(swift build --show-bin-path)/QuietDeskUpdateTool"
           "$tool" sign --app dist/QuietDesk.app --archive "dist/QuietDesk-$RELEASE_VERSION-macOS-universal.zip" \
             --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/quietdesk-release-notes.txt" --out dist/QuietDesk-update.json
           "$tool" verify --app dist/QuietDesk.app --archive "dist/QuietDesk-$RELEASE_VERSION-macOS-universal.zip" --manifest dist/QuietDesk-update.json
+          "$tool" sign-windows --config Resources/update-feed.json --version "$RELEASE_VERSION" --build "$RELEASE_BUILD" --revision "$revision" \
+            --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" \
+            --x64-zip "outputs/windows/QuietDesk-$RELEASE_VERSION-Windows-x64.zip" \
+            --x64-installer "outputs/windows/QuietDesk-$RELEASE_VERSION-Windows-x64-Setup.exe" \
+            --arm64-zip "outputs/windows/QuietDesk-$RELEASE_VERSION-Windows-arm64.zip" \
+            --arm64-installer "outputs/windows/QuietDesk-$RELEASE_VERSION-Windows-arm64-Setup.exe" \
+            --notes-file "$RUNNER_TEMP/quietdesk-release-notes.txt" --out dist/QuietDesk-windows-update.json
+          "$tool" verify-windows --config Resources/update-feed.json --version "$RELEASE_VERSION" --build "$RELEASE_BUILD" --revision "$revision" \
+            --repository "$GITHUB_REPOSITORY" \
+            --x64-zip "outputs/windows/QuietDesk-$RELEASE_VERSION-Windows-x64.zip" \
+            --x64-installer "outputs/windows/QuietDesk-$RELEASE_VERSION-Windows-x64-Setup.exe" \
+            --arm64-zip "outputs/windows/QuietDesk-$RELEASE_VERSION-Windows-arm64.zip" \
+            --arm64-installer "outputs/windows/QuietDesk-$RELEASE_VERSION-Windows-arm64-Setup.exe" \
+            --manifest dist/QuietDesk-windows-update.json
       - name: Save packages
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -165,7 +299,11 @@ jobs:
             dist/*.dmg
             dist/*.zip
             dist/QuietDesk-update.json
+            dist/QuietDesk-windows-update.json
             dist/SHA256SUMS-*.txt
+            outputs/windows/*.zip
+            outputs/windows/*-Setup.exe
+            outputs/windows/SHA256SUMS-*.txt
             outputs/relay/*.tar.gz
             outputs/relay/SHA256SUMS.txt
           if-no-files-found: error
@@ -178,7 +316,8 @@ jobs:
           UPDATE_SIGNING_ENABLED: ${{ steps.update-signing.outputs.enabled }}
         run: |
           if [[ "$UPDATE_SIGNING_ENABLED" == true ]]; then
-            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber dist/QuietDesk-update.json
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+              dist/QuietDesk-update.json dist/QuietDesk-windows-update.json
           fi
           if [[ "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" == true ]]; then
             gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest="$RELEASE_LATEST"

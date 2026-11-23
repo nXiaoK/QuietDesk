@@ -59,16 +59,22 @@ async fn unverified_sources_have_bounded_slots_and_absolute_deadlines() {
     openssl::rand::rand_bytes(&mut key).unwrap();
     let id = Uuid::new_v4();
     let mut server = host(addr, key, id).unwrap();
-    let dummy = UdpSocket::bind(loopback()).await.unwrap();
-    let sender = viewer(dummy.local_addr().unwrap(), key, id).unwrap();
+    let client_ctx = context(false, key, id, Arc::new(Mutex::new(None))).unwrap();
     let mut buffer = [0; WIRE_LIMIT];
-    let (length, _) = timeout(Duration::from_secs(1), dummy.recv_from(&mut buffer)).await.unwrap().unwrap();
-    drop(sender);
-    let hello = buffer[..length].to_vec();
     let mut candidates = Vec::new();
     for index in 0..3 {
         let candidate = UdpSocket::bind(loopback()).await.unwrap();
+        let mut peer = Peer::new(addr, &client_ctx, false).unwrap();
+        // Send bare ClientHello, receive stateless HelloVerifyRequest, then stop after sending cookie ClientHello.
+        let Err(_) = peer.ssl.do_handshake() else { panic!("expected WANT_READ") };
+        let hello = peer.ssl.get_mut().flight.pop_front().unwrap();
         candidate.send_to(&hello, addr).await.unwrap();
+        let (hvr_len, _) = timeout(Duration::from_secs(1), candidate.recv_from(&mut buffer)).await.unwrap().unwrap();
+        peer.ssl.get_mut().received.extend_from_slice(&buffer[..hvr_len]);
+        let Err(_) = peer.ssl.do_handshake() else { panic!("expected WANT_READ after cookie") };
+        let verified_hello = peer.ssl.get_mut().flight.pop_front().unwrap();
+        candidate.send_to(&verified_hello, addr).await.unwrap();
+
         let wait = if index < 2 { Duration::from_secs(1) } else { Duration::from_millis(150) };
         let reply = timeout(wait, candidate.recv_from(&mut buffer)).await;
         assert_eq!(reply.is_ok(), index < 2);
@@ -106,4 +112,45 @@ fn congested_application_datagrams_do_not_accumulate_old_audio() {
     drain.try_recv().unwrap();
     drain.try_recv().unwrap();
     assert!(sender.try_send(vec![crate::audio::DATAGRAM_KIND]));
+}
+
+#[tokio::test]
+async fn spoofed_client_hellos_cannot_starve_a_real_viewer_handshake() {
+    let addr = std::net::UdpSocket::bind(loopback()).unwrap().local_addr().unwrap();
+    let mut key = [0; 32];
+    openssl::rand::rand_bytes(&mut key).unwrap();
+    let id = Uuid::new_v4();
+    let mut server = host(addr, key, id).unwrap();
+
+    // Capture a bare ClientHello without continuing the DTLS handshake.
+    let dummy = UdpSocket::bind(loopback()).await.unwrap();
+    let probe = viewer(dummy.local_addr().unwrap(), key, id).unwrap();
+    let mut buffer = [0; WIRE_LIMIT];
+    let (length, _) = timeout(Duration::from_secs(1), dummy.recv_from(&mut buffer)).await.unwrap().unwrap();
+    drop(probe);
+    let bare_hello = buffer[..length].to_vec();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut floods = Vec::new();
+    for _ in 0..6 {
+        let sock = UdpSocket::bind(loopback()).await.unwrap();
+        let flag = stop.clone();
+        let pkt = bare_hello.clone();
+        floods.push(tokio::spawn(async move {
+            while !flag.load(Ordering::Relaxed) {
+                let _ = sock.send_to(&pkt, addr).await;
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        }));
+    }
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let mut client = viewer(addr, key, id).unwrap();
+    let result = timeout(Duration::from_millis(1500), async { tokio::join!(server.next(), client.next()) }).await;
+    stop.store(true, Ordering::Relaxed);
+    for task in floods {
+        let _ = task.await;
+    }
+    let (a, b) = result.expect("real viewer was starved by spoofed unverified ClientHellos");
+    assert!(matches!((a, b), (DatagramEvent::Ready, DatagramEvent::Ready)));
 }

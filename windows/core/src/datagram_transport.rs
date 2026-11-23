@@ -2,19 +2,49 @@
 use crate::error::{DeskError, Result};
 use foreign_types::ForeignTypeRef;
 use openssl::error::ErrorStack;
-use openssl::ex_data::Index;
+use openssl::hash::MessageDigest;
+use openssl::pkey::{PKey, Private};
+use openssl::sign::Signer;
 use openssl::ssl::{ErrorCode, Ssl, SslContext, SslMethod, SslOptions, SslSessionCacheMode, SslStream, SslVersion};
 use std::collections::VecDeque;
+use std::ffi::{c_int, c_void};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout_at};
 use uuid::Uuid;
+
+unsafe extern "C" {
+    fn BIO_ADDR_new() -> *mut c_void;
+    fn BIO_ADDR_free(ap: *mut c_void);
+    fn DTLSv1_listen(s: *mut openssl_sys::SSL, client: *mut c_void) -> c_int;
+}
+
+struct BioAddr(*mut c_void);
+
+impl BioAddr {
+    fn new() -> Option<Self> {
+        let ptr = unsafe { BIO_ADDR_new() };
+        (!ptr.is_null()).then_some(Self(ptr))
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.0
+    }
+}
+
+impl Drop for BioAddr {
+    fn drop(&mut self) {
+        unsafe { BIO_ADDR_free(self.0) };
+    }
+}
+
+type CookiePeer = Arc<Mutex<Option<SocketAddr>>>;
 
 pub const MAX_DATAGRAM: usize = 1 + crate::media::fragment::MAX_RECORD_BYTES;
 const WIRE_LIMIT: usize = 2048;
@@ -88,7 +118,8 @@ pub fn viewer(remote: SocketAddr, key: [u8; 32], id: Uuid) -> Result<DatagramTra
 }
 
 fn start(local: SocketAddr, remote: Option<SocketAddr>, key: [u8; 32], id: Uuid) -> Result<DatagramTransport> {
-    let context = context(remote.is_none(), key, id).map_err(|_| DeskError::platform("无法配置媒体 DTLS"))?;
+    let cookie_peer: CookiePeer = Arc::new(Mutex::new(None));
+    let context = context(remote.is_none(), key, id, cookie_peer.clone()).map_err(|_| DeskError::platform("无法配置媒体 DTLS"))?;
     let socket = std::net::UdpSocket::bind(local)?;
     socket.set_nonblocking(true)?;
     let socket = UdpSocket::from_std(socket)?;
@@ -97,13 +128,34 @@ fn start(local: SocketAddr, remote: Option<SocketAddr>, key: [u8; 32], id: Uuid)
     let ready = Arc::new(AtomicBool::new(false));
     let run_state = ready.clone();
     let task = tokio::spawn(async move {
-        run(socket, context, remote, &events, send, &run_state).await;
+        run(socket, context, cookie_peer, remote, &events, send, &run_state).await;
         run_state.store(false, Ordering::Release);
     });
     Ok(DatagramTransport { events: received, sender: DatagramSender { outgoing, ready }, task })
 }
 
-fn context(server: bool, key: [u8; 32], id: Uuid) -> std::result::Result<SslContext, openssl::error::ErrorStack> {
+fn cookie_digest(mac_key: &PKey<Private>, addr: SocketAddr) -> std::result::Result<[u8; 16], ErrorStack> {
+    let mut signer = Signer::new(MessageDigest::sha256(), mac_key)?;
+    match addr {
+        SocketAddr::V4(v4) => {
+            signer.update(&[4])?;
+            signer.update(&v4.ip().octets())?;
+            signer.update(&v4.port().to_be_bytes())?;
+        }
+        SocketAddr::V6(v6) => {
+            signer.update(&[6])?;
+            signer.update(&v6.ip().octets())?;
+            signer.update(&v6.port().to_be_bytes())?;
+        }
+    }
+    let mut full = [0u8; 64];
+    let len = signer.sign(&mut full)?;
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..len.min(16)]);
+    Ok(out)
+}
+
+fn context(server: bool, key: [u8; 32], id: Uuid, cookie_peer: CookiePeer) -> std::result::Result<SslContext, openssl::error::ErrorStack> {
     let method = if server { SslMethod::dtls_server() } else { SslMethod::dtls_client() };
     let mut builder = SslContext::builder(method)?;
     builder.set_min_proto_version(Some(SslVersion::DTLS1_2))?;
@@ -113,22 +165,31 @@ fn context(server: bool, key: [u8; 32], id: Uuid) -> std::result::Result<SslCont
     builder.set_session_cache_mode(SslSessionCacheMode::OFF);
     let identity = id.hyphenated().encode_upper(&mut Uuid::encode_buffer()).as_bytes().to_owned();
     if server {
-        type CookieSlot = std::result::Result<Index<Ssl, [u8; 16]>, ErrorStack>;
-        static SLOT: OnceLock<CookieSlot> = OnceLock::new();
-        let slot = SLOT.get_or_init(Ssl::new_ex_index).clone()?;
+        let mut secret = [0u8; 32];
+        openssl::rand::rand_bytes(&mut secret)?;
+        let mac_key = PKey::hmac(&secret)?;
         builder.set_options(SslOptions::COOKIE_EXCHANGE);
-        builder.set_cookie_generate_cb(move |ssl, dest| {
-            if ssl.ex_data(slot).is_none() {
-                let mut cookie = [0; 16];
-                openssl::rand::rand_bytes(&mut cookie)?;
-                ssl.set_ex_data(slot, cookie);
+        let gen_peer = cookie_peer.clone();
+        let gen_key = mac_key.clone();
+        builder.set_cookie_generate_cb(move |_, dest| {
+            let Some(addr) = *gen_peer.lock().unwrap() else {
+                return Err(ErrorStack::get());
+            };
+            let cookie = cookie_digest(&gen_key, addr)?;
+            if dest.len() < cookie.len() {
+                return Err(ErrorStack::get());
             }
-            let cookie = ssl.ex_data(slot).expect("the cookie belongs to this source's SSL object");
-            dest[..cookie.len()].copy_from_slice(cookie);
+            dest[..cookie.len()].copy_from_slice(&cookie);
             Ok(cookie.len())
         });
-        builder.set_cookie_verify_cb(move |ssl, offered| {
-            ssl.ex_data(slot).is_some_and(|cookie| offered.len() == cookie.len() && openssl::memcmp::eq(offered, cookie))
+        builder.set_cookie_verify_cb(move |_, offered| {
+            let Some(addr) = *cookie_peer.lock().unwrap() else {
+                return false;
+            };
+            let Ok(expected) = cookie_digest(&mac_key, addr) else {
+                return false;
+            };
+            offered.len() == expected.len() && openssl::memcmp::eq(offered, &expected)
         });
         builder.set_psk_server_callback(move |_, offered, psk| {
             if offered != Some(&identity) || psk.len() < key.len() {
@@ -239,7 +300,7 @@ impl Peer {
         Some(())
     }
 
-    async fn advance(&mut self, socket: &UdpSocket, events: &mpsc::Sender<DatagramEvent>, ready: &AtomicBool) -> Option<()> {
+    async fn advance(&mut self, socket: &UdpSocket, events: &mpsc::Sender<DatagramEvent>, ready: &AtomicBool, cookie_peer: &CookiePeer) -> Option<()> {
         let now = Instant::now();
         if !self.authenticated && now >= self.expires {
             return None;
@@ -248,7 +309,13 @@ impl Peer {
             return None;
         }
         if !self.authenticated {
-            match self.ssl.do_handshake() {
+            let handshake = {
+                *cookie_peer.lock().unwrap() = Some(self.addr);
+                let res = self.ssl.do_handshake();
+                *cookie_peer.lock().unwrap() = None;
+                res
+            };
+            match handshake {
                 Ok(()) => {
                     self.flush(socket).await?;
                     self.authenticated = true;
@@ -278,23 +345,62 @@ impl Peer {
     }
 }
 
-// Only a DTLS ClientHello can allocate a server-side SSL object. OpenSSL verifies its contents and the PSK.
+// Only a DTLS ClientHello can run stateless cookie listen. OpenSSL verifies the cookie, then the handshake and PSK.
 fn initial_hello(packet: &[u8]) -> bool {
     packet.len() >= 25 && packet[0] == 22 && packet[1] == 0xfe && matches!(packet[2], 0xfd | 0xff) && packet[3..5] == [0, 0] && packet[13] == 1
+}
+
+fn new_server_stream(ctx: &SslContext) -> Option<SslStream<Wire>> {
+    let mut ssl = Ssl::new(ctx).ok()?;
+    ssl.set_mtu(LINK_MTU).ok()?;
+    ssl.set_accept_state();
+    SslStream::new(ssl, Wire::default()).ok()
+}
+
+async fn flush_flight(socket: &UdpSocket, addr: SocketAddr, flight: &mut VecDeque<Vec<u8>>) -> Option<()> {
+    let deadline = Instant::now() + Duration::from_millis(20);
+    while let Some(packet) = flight.pop_front() {
+        let len = timeout_at(deadline, socket.send_to(&packet, addr)).await.ok()?.ok()?;
+        if len != packet.len() {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn dtls_listen(listen_ssl: &mut SslStream<Wire>, cookie_peer: &CookiePeer, packet: &[u8], addr: SocketAddr) -> Option<c_int> {
+    let mut client_addr = BioAddr::new()?;
+    let received = &mut listen_ssl.get_mut().received;
+    received.clear();
+    received.extend_from_slice(packet);
+    *cookie_peer.lock().unwrap() = Some(addr);
+    // DTLSv1_listen reads the buffered ClientHello via Wire::read without retaining state
+    // across sources when returning 0 (initial or invalid cookie -> HelloVerifyRequest).
+    let res = unsafe { DTLSv1_listen(listen_ssl.ssl().as_ptr(), client_addr.as_mut_ptr()) };
+    *cookie_peer.lock().unwrap() = None;
+    listen_ssl.get_mut().received.clear();
+    Some(res)
 }
 
 async fn run(
     socket: UdpSocket,
     context: SslContext,
+    cookie_peer: CookiePeer,
     remote: Option<SocketAddr>,
     events: &mpsc::Sender<DatagramEvent>,
     mut outgoing: mpsc::Receiver<Box<[u8]>>,
     ready: &AtomicBool,
 ) {
     let mut peers = Vec::with_capacity(MAX_CANDIDATES);
+    let mut listener = if remote.is_none() {
+        let Some(stream) = new_server_stream(&context) else { return };
+        Some(stream)
+    } else {
+        None
+    };
     if let Some(addr) = remote {
         let Some(mut first) = Peer::new(addr, &context, false) else { return };
-        if first.advance(&socket, events, ready).await.is_none() {
+        if first.advance(&socket, events, ready, &cookie_peer).await.is_none() {
             return;
         }
         peers.push(first);
@@ -302,6 +408,7 @@ async fn run(
     // A full-sized receive buffer distinguishes an oversized UDP message from a truncated valid one on WinSock.
     let mut wire = vec![0; u16::MAX as usize + 1];
     let mut admissions = VecDeque::<(Instant, IpAddr)>::new();
+    let mut stateless_replies = VecDeque::<Instant>::new();
     loop {
         let next = peers.iter().filter_map(Peer::deadline).min();
         let index = tokio::select! {
@@ -312,21 +419,47 @@ async fn run(
                     Err(error) if remote.is_none() && matches!(error.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset) => continue,
                     Err(_) => return,
                 };
-                let index = if let Some(i) = peers.iter().position(|p| p.addr == addr) { i } else {
-                    if remote.is_some() || ready.load(Ordering::Acquire) || peers.len() >= MAX_CANDIDATES || !initial_hello(&wire[..len]) { continue; }
+                if let Some(i) = peers.iter().position(|p| p.addr == addr) {
+                    let received = &mut peers[i].ssl.get_mut().received;
+                    received.clear();
+                    received.extend_from_slice(&wire[..len]);
+                    i
+                } else {
+                    if remote.is_some() || ready.load(Ordering::Acquire) || !initial_hello(&wire[..len]) { continue; }
+                    let Some(listen_ssl) = listener.as_mut() else { continue };
+                    let Some(listen_res) = dtls_listen(listen_ssl, &cookie_peer, &wire[..len], addr) else { return };
+                    if listen_res < 0 {
+                        listen_ssl.get_mut().flight.clear();
+                        let Some(fresh) = new_server_stream(&context) else { return };
+                        listener = Some(fresh);
+                        continue;
+                    }
+                    if listen_res == 0 {
+                        let now = Instant::now();
+                        while stateless_replies.front().is_some_and(|time| now.duration_since(*time) >= Duration::from_secs(1)) {
+                            stateless_replies.pop_front();
+                        }
+                        if stateless_replies.len() < 1024 && !listen_ssl.get_mut().flight.is_empty() {
+                            stateless_replies.push_back(now);
+                            let _ = flush_flight(&socket, addr, &mut listen_ssl.get_mut().flight).await;
+                        } else {
+                            listen_ssl.get_mut().flight.clear();
+                        }
+                        continue;
+                    }
+                    // Cookie return trip passed; enforce candidate slot and rate limits before promoting to Peer.
                     let now = Instant::now();
                     while admissions.front().is_some_and(|(time, _)| now.duration_since(*time) >= Duration::from_secs(1)) { admissions.pop_front(); }
-                    if admissions.len() >= 16 || admissions.iter().filter(|(_, ip)| *ip == addr.ip()).count() >= 4 ||
+                    let Some(fresh) = new_server_stream(&context) else { return };
+                    let promoted = std::mem::replace(listen_ssl, fresh);
+                    if peers.len() >= MAX_CANDIDATES || admissions.len() >= 16 || admissions.iter().filter(|(_, ip)| *ip == addr.ip()).count() >= 4 ||
                         peers.iter().filter(|p| p.addr.ip() == addr.ip()).count() >= 2 { continue; }
+                    // DTLSv1_listen resets the SSL object via SSL_clear, so re-apply LINK_MTU before do_handshake.
+                    if unsafe { openssl::ssl::SslRef::from_ptr_mut(promoted.ssl().as_ptr()) }.set_mtu(LINK_MTU).is_err() { continue; }
                     admissions.push_back((now, addr.ip()));
-                    let Some(peer) = Peer::new(addr, &context, true) else { continue };
-                    peers.push(peer);
+                    peers.push(Peer { addr, ssl: promoted, expires: now + HANDSHAKE, timer: None, authenticated: false });
                     peers.len() - 1
-                };
-                let received = &mut peers[index].ssl.get_mut().received;
-                received.clear();
-                received.extend_from_slice(&wire[..len]);
-                index
+                }
             }
             _ = async {
                 match next { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await }
@@ -343,7 +476,7 @@ async fn run(
             }
         };
         let previously_ready = peers[index].authenticated;
-        if peers[index].advance(&socket, events, ready).await.is_none() {
+        if peers[index].advance(&socket, events, ready, &cookie_peer).await.is_none() {
             if remote.is_some() || peers[index].authenticated {
                 return;
             }

@@ -65,6 +65,7 @@ private func requireRequests(_ feed: UpdateCheckFeed, _ expected: Int, _ message
 // No filesystem installation or application termination is performed by this fixture.
 private final class UpdateCheckInstaller: UpdateInstalling, @unchecked Sendable {
     private let directory: URL
+    private let progressCheckpoints: AsyncStream<Void>?
     private let lock = NSLock()
     private var verifying: (@Sendable () -> Void)?
     private var downloads = 0
@@ -82,8 +83,9 @@ private final class UpdateCheckInstaller: UpdateInstalling, @unchecked Sendable 
     var abortCount: Int { lock.withLock { aborts } }
     var lastLaunchOptions: UpdateInstaller.LaunchOptions? { lock.withLock { recordedOptions } }
 
-    init(directory: URL, result: UpdateInstaller.InstallationResult? = nil) {
+    init(directory: URL, result: UpdateInstaller.InstallationResult? = nil, progressCheckpoints: AsyncStream<Void>? = nil) {
         self.directory = directory; self.result = result
+        self.progressCheckpoints = progressCheckpoints
     }
     func consumeResult() -> UpdateInstaller.InstallationResult? {
         lock.withLock { defer { result = nil }; return result }
@@ -92,9 +94,17 @@ private final class UpdateCheckInstaller: UpdateInstalling, @unchecked Sendable 
                           progress: @escaping @Sendable (Int64, Int64?) -> Void,
                           onVerifying: @escaping @Sendable () -> Void) async throws -> UpdateInstaller.PreparedUpdate {
         lock.withLock { downloads += 1; verifying = onVerifying }
+        var checkpoints = progressCheckpoints?.makeAsyncIterator()
         progress(8, nil)
-        try await Task.sleep(for: .milliseconds(150))
+        if checkpoints != nil {
+            guard await checkpoints?.next() != nil else { throw CancellationError() }
+        } else {
+            try await Task.sleep(for: .milliseconds(150))
+        }
         progress(16, 16)
+        if checkpoints != nil {
+            guard await checkpoints?.next() != nil else { throw CancellationError() }
+        }
         onVerifying()
         try await Task.sleep(for: .milliseconds(50))
         return .init(applicationURL: directory.appendingPathComponent("QuietDesk.app"),
@@ -242,15 +252,19 @@ private struct UpdateControllerChecks {
 
         await run("Progress uses received bytes, unknown lengths remain unknown and late callbacks preserve ready state") { directory in
             let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
-            let installer = UpdateCheckInstaller(directory: directory)
+            let (checkpoints, proceed) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingOldest(1))
+            let installer = UpdateCheckInstaller(directory: directory, progressCheckpoints: checkpoints)
             let controller = fixture.controller(installer: installer)
-            defer { controller.shutdown(); controller.later() }
+            defer { controller.shutdown(); controller.later(); proceed.finish() }
             controller.check(manual: false)
             try await settled(controller)
             controller.download()
-            await drain()
-            try requireUpdate(controller.state == .downloading && controller.receivedBytes == 8 && controller.totalBytes == nil,
-                              "Unknown response length was estimated or real bytes were lost")
+            try await expectDownloadProgress(controller, received: 8, total: nil,
+                                             message: "Unknown response length was estimated or real bytes were lost")
+            proceed.yield(())
+            try await expectDownloadProgress(controller, received: 16, total: 16,
+                                             message: "The final download progress did not report both real byte counts")
+            proceed.yield(())
             try await settled(controller)
             try requireUpdate(controller.state == .ready && controller.receivedBytes == 16 && controller.totalBytes == 16,
                               "Verified download did not become ready with its byte count")
@@ -711,6 +725,17 @@ private struct UpdateControllerChecks {
             signature: signing.signature(for: UpdateManifestVerifier.signingPrefix + payload).base64EncodedString()))
     }
     private static func drain() async { try? await Task.sleep(for: .milliseconds(30)) }
+
+    private static func expectDownloadProgress(_ controller: UpdateController, received: Int64, total: Int64?,
+                                               message: String) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(5)
+        while controller.state == .downloading && controller.receivedBytes != received && clock.now < deadline {
+            await drain()
+        }
+        try requireUpdate(controller.state == .downloading && controller.receivedBytes == received && controller.totalBytes == total, message)
+    }
+
     private static func settled(_ controller: UpdateController, timeout: TimeInterval = 5) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while controller.busy && Date() < deadline { await drain() }

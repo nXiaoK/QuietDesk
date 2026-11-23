@@ -577,7 +577,7 @@ struct DeskView: View {
                 }
             }
         }
-        .toolbar(sessionLayout && !immersive ? .visible : .hidden, for: .windowToolbar)
+        .toolbar(immersive ? .hidden : .visible, for: .windowToolbar)
         .onChange(of: viewerHasSession) { _, activeSession in
             if activeSession, models.workspaceSection != .connect {
                 models.workspaceSection = .connect
@@ -1558,14 +1558,21 @@ private struct WindowReader: NSViewRepresentable {
             guard let window, !window.styleMask.contains(.fullScreen) else { return }
             if window.isRestorable != restorable { window.isRestorable = restorable }
             if sessionChrome {
+                if window.styleMask.contains(.fullSizeContentView) {
+                    window.styleMask.remove(.fullSizeContentView)
+                }
                 if window.titleVisibility != .visible { window.titleVisibility = .visible }
                 if window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = false }
+                if window.titlebarSeparatorStyle != .automatic { window.titlebarSeparatorStyle = .automatic }
+                if window.toolbar?.isVisible == false { window.toolbar?.isVisible = true }
             } else {
                 if !window.styleMask.contains(.fullSizeContentView) {
                     window.styleMask.insert(.fullSizeContentView)
                 }
                 if window.titleVisibility != .hidden { window.titleVisibility = .hidden }
                 if !window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = true }
+                if window.titlebarSeparatorStyle != .none { window.titlebarSeparatorStyle = .none }
+                if window.toolbar?.isVisible == true { window.toolbar?.isVisible = false }
             }
         }
         override func viewDidMoveToWindow() {

@@ -730,7 +730,10 @@ public final class MediaSession: @unchecked Sendable {
             guard value.transportEpoch == active?.stream.transportEpoch,
                   value.codecEpoch == active?.stream.codecEpoch else { return }
             if side == .viewer {
-                let deliveryFailed = hasDeliveryFailureEvidence && relayRoutingNegotiated && value.mediaFailure == true
+                let hostReportedFailure = relayRoutingNegotiated && value.mediaFailure == true
+                // A direct host may give up before the viewer's own incomplete frame expires.
+                let incompleteUDPRepair = active?.path == .udp && receiver?.stream == active?.stream && receiver?.hasIncompleteRepair == true
+                let deliveryFailed = hasDeliveryFailureEvidence && (hostReportedFailure || incompleteUDPRepair)
                 if deliveryFailed, active?.path != .udp { reliableDeliveryFailed() }
                 requestRecovery(mediaFailure: deliveryFailed)
             }

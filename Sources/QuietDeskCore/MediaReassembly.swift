@@ -102,6 +102,13 @@ public final class MediaFrameReassembler {
     public private(set) var requiresRecovery = false
     public private(set) var bufferedBytes = 0
     public var pendingFrameCount: Int { assemblies.count }
+    var hasIncompleteRepair: Bool {
+        if let assembly = assemblies[expectedFrameID] {
+            return assembly.frame == nil && assembly.lastNackAt != nil
+                && (assembly.exposedCount == assembly.fragmentCount || assembly.requestedThroughTail)
+        }
+        return missingFrames[expectedFrameID]?.requested == true
+    }
     private var limits: MediaBufferLimits
     private let clock: () -> TimeInterval
     private var lastNow: TimeInterval

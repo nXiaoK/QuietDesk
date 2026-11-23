@@ -499,7 +499,7 @@ mod tests {
         let mut frame = [0; 6 * 2 * 4];
         nv12_to_bgra(luma, chroma, 6, 2, Nv12Color::DisplayP3, &mut frame);
         let expected = [[0, 95, 244, 255], [35, 91, 231, 255], [128, 128, 128, 255]];
-        for (index, pixel) in frame.chunks_exact(4).enumerate() {
+        for (index, pixel) in frame.as_chunks::<4>().0.iter().enumerate() {
             assert!(largest_difference(pixel, &expected[index % 6 / 2]) <= 2, "pixel {index}: {pixel:?}");
         }
     }

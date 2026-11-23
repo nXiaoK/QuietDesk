@@ -83,21 +83,44 @@ impl DatagramTransport {
 #[derive(Clone)]
 pub(crate) struct DatagramSender {
     outgoing: mpsc::Sender<Box<[u8]>>,
+    audio: mpsc::Sender<Box<[u8]>>,
     ready: Arc<AtomicBool>,
 }
 
+struct OutgoingDatagrams {
+    audio: mpsc::Receiver<Box<[u8]>>,
+    other: mpsc::Receiver<Box<[u8]>>,
+}
+
+impl OutgoingDatagrams {
+    async fn recv(&mut self) -> Option<Box<[u8]>> {
+        tokio::select! {
+            biased;
+            packet = self.audio.recv() => packet,
+            packet = self.other.recv() => packet,
+        }
+    }
+}
+
 impl DatagramSender {
+    fn channel(ready: Arc<AtomicBool>) -> (Self, OutgoingDatagrams) {
+        let (audio, audio_rx) = mpsc::channel(AUDIO_BACKLOG);
+        let (outgoing, other_rx) = mpsc::channel(QUEUE - AUDIO_BACKLOG);
+        (Self { outgoing, audio, ready }, OutgoingDatagrams { audio: audio_rx, other: other_rx })
+    }
+
     pub(crate) fn authenticated(&self) -> bool {
         self.ready.load(Ordering::Acquire) && !self.outgoing.is_closed()
     }
 
     /// Returns true for an enqueued application datagram.
     pub(crate) fn try_send(&self, data: Vec<u8>) -> bool {
-        // Five 20 ms packets already span the playback queue. Skip audio while the socket is this far behind.
-        if data.first() == Some(&crate::audio::DATAGRAM_KIND) && self.outgoing.max_capacity() - self.outgoing.capacity() >= AUDIO_BACKLOG {
+        if !self.authenticated() || !(1..=MAX_DATAGRAM).contains(&data.len()) {
             return false;
         }
-        self.authenticated() && (1..=MAX_DATAGRAM).contains(&data.len()) && self.outgoing.try_send(data.into_boxed_slice()).is_ok()
+        // Audio gets five 20 ms slots within the existing datagram budget.
+        let destination = if data[0] == crate::audio::DATAGRAM_KIND { &self.audio } else { &self.outgoing };
+        destination.try_send(data.into_boxed_slice()).is_ok()
     }
 }
 
@@ -143,14 +166,13 @@ fn start_with_socket<S: PacketSocket>(socket: S, remote: Option<SocketAddr>, key
     let cookie_peer: CookiePeer = Arc::new(Mutex::new(None));
     let context = context(remote.is_none(), key, id, cookie_peer.clone()).map_err(|_| DeskError::platform("无法配置媒体 DTLS"))?;
     let (events, received) = mpsc::channel(QUEUE);
-    let (outgoing, send) = mpsc::channel(QUEUE);
     let ready = Arc::new(AtomicBool::new(false));
-    let run_state = ready.clone();
+    let (sender, outgoing) = DatagramSender::channel(ready.clone());
     let task = tokio::spawn(async move {
-        run(socket, context, cookie_peer, remote, &events, send, &run_state).await;
-        run_state.store(false, Ordering::Release);
+        run(socket, context, cookie_peer, remote, &events, outgoing, &ready).await;
+        ready.store(false, Ordering::Release);
     });
-    Ok(DatagramTransport { events: received, sender: DatagramSender { outgoing, ready }, task })
+    Ok(DatagramTransport { events: received, sender, task })
 }
 
 fn cookie_digest(mac_key: &PKey<Private>, addr: SocketAddr) -> std::result::Result<[u8; 16], ErrorStack> {
@@ -416,7 +438,7 @@ async fn run<S: PacketSocket>(
     cookie_peer: CookiePeer,
     remote: Option<SocketAddr>,
     events: &mpsc::Sender<DatagramEvent>,
-    mut outgoing: mpsc::Receiver<Box<[u8]>>,
+    mut outgoing: OutgoingDatagrams,
     ready: &AtomicBool,
 ) {
     let mut peers = Vec::with_capacity(MAX_CANDIDATES);

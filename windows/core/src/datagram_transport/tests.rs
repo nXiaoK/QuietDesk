@@ -100,18 +100,24 @@ async fn the_authenticated_endpoint_remains_bound_for_the_session() {
     assert!(matches!(timeout(Duration::from_secs(1), server.next()).await.unwrap(), DatagramEvent::Data(bytes) if bytes == [6, 24]));
 }
 
-#[test]
-fn congested_application_datagrams_do_not_accumulate_old_audio() {
-    let (outgoing, mut drain) = mpsc::channel(QUEUE);
-    let sender = DatagramSender { outgoing, ready: Arc::new(AtomicBool::new(true)) };
-    for _ in 0..AUDIO_BACKLOG {
-        assert!(sender.try_send(vec![crate::audio::DATAGRAM_KIND]));
+#[tokio::test]
+async fn video_backlog_leaves_bounded_priority_capacity_for_audio() {
+    let (sender, mut outgoing) = DatagramSender::channel(Arc::new(AtomicBool::new(true)));
+    for sequence in 0..QUEUE - AUDIO_BACKLOG {
+        assert!(sender.try_send(vec![3, sequence as u8]));
     }
-    assert!(!sender.try_send(vec![crate::audio::DATAGRAM_KIND]));
-    assert!(sender.try_send(vec![2]));
-    drain.try_recv().unwrap();
-    drain.try_recv().unwrap();
-    assert!(sender.try_send(vec![crate::audio::DATAGRAM_KIND]));
+    assert!(!sender.try_send(vec![3, u8::MAX]));
+
+    for sequence in 0..AUDIO_BACKLOG {
+        assert!(sender.try_send(vec![crate::audio::DATAGRAM_KIND, sequence as u8]));
+    }
+    assert!(!sender.try_send(vec![crate::audio::DATAGRAM_KIND, u8::MAX]));
+    for sequence in 0..AUDIO_BACKLOG {
+        assert_eq!(outgoing.recv().await.unwrap().as_ref(), [crate::audio::DATAGRAM_KIND, sequence as u8]);
+    }
+    for sequence in 0..QUEUE - AUDIO_BACKLOG {
+        assert_eq!(outgoing.recv().await.unwrap().as_ref(), [3, sequence as u8]);
+    }
 }
 
 #[tokio::test]

@@ -738,6 +738,69 @@ func runMediaPathPolicyChecks() {
                   "Applied settings were not confirmed")
         try check(quality.preferred == .highest, "Confirmation persisted an automatic reduction")
     }
+
+    run("A matched quality reply with a host clamp lets congestion adaptation continue") {
+        let limit = StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 30)
+        let requested = StreamSettings(longestEdge: 3840, framesPerSecond: 60, megabits: 100)
+        let state = VideoStreamState(settings: limit, width: 2560, height: 1440)
+        var tuning = try VideoTuningSession(applied: state)
+        var quality = try MediaQualityPolicy(hostDefault: limit, now: 0)
+        try tuning.choose(requested)
+        _ = try quality.chooseManually(requested, now: 1)
+        guard let request = tuning.nextRequest() else { throw CheckFailure("No quality request") }
+        let result = StreamSettingsResult(id: request.id, state: state, error: nil)
+        guard let completed = try tuning.completeRequest(result) else { throw CheckFailure("The host's capped reply was not accepted") }
+        quality.receiveSettingsResult(result, for: completed.settings, now: 2)
+        try check(quality.pending == nil && quality.preferred == requested && quality.upperBound == limit,
+                  "The reply did not settle the request and learn the host limit")
+        try quality.synchronizeApplied(limit, size: (1920, 1080), now: 3)
+        try check(quality.upperBound == limit, "A smaller display changed the configured limit")
+        try check(quality.reduceLoad(for: .network, severe: true, now: 12)?.megabits == 12,
+                  "Congestion could not reduce the capped bitrate")
+        try quality.synchronizeApplied(requested, now: 13)
+        try check(quality.upperBound == requested, "The host later reported supporting the higher settings")
+    }
+
+    run("An older quality reply preserves a newer choice until it is applied") {
+        let initial = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 30)
+        let requested = StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 60)
+        let newer = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 8)
+        let state = VideoStreamState(settings: initial, width: 1920, height: 1080)
+        for applied in [initial, newer] {
+            var tuning = try VideoTuningSession(applied: state, preferred: requested)
+            var quality = try MediaQualityPolicy(hostDefault: initial, now: 0)
+            _ = try quality.chooseManually(requested, now: 1)
+            guard let request = tuning.nextRequest() else { throw CheckFailure("No quality request") }
+            try tuning.choose(newer)
+            _ = try quality.chooseManually(newer, now: 2)
+            let result = StreamSettingsResult(id: request.id, state: VideoStreamState(settings: applied, width: 1920, height: 1080),
+                                              error: applied == initial ? "调整失败" : nil)
+            guard let completed = try tuning.completeRequest(result) else { throw CheckFailure("No completed request") }
+            quality.receiveSettingsResult(result, for: completed.settings, now: 3)
+            let next = tuning.nextRequest()?.settings
+            try check(quality.pending == next && quality.effective == applied, "The policy disagreed with the queued choice")
+        }
+    }
+
+    run("Compatibility quality recovers to a host's confirmed 20 or 50 Mbps rate") {
+        for rate in [20, 50] {
+            let active = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: rate)
+            let initial = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 12)
+            var quality = try MediaQualityPolicy(hostDefault: active, applied: initial, now: 0)
+            let state = VideoStreamState(settings: active, width: 1920, height: 1080)
+            quality.receiveSettingsResult(StreamSettingsResult(id: UUID(), state: state, error: nil), for: active, now: 1)
+            guard let lower = quality.reduceLoad(for: .network, now: 3) else { throw CheckFailure("No bitrate reduction") }
+            try check(lower.megabits == (rate == 20 ? 12 : 30), "The compatibility range did not reduce bitrate")
+            _ = quality.confirmApplied(lower, now: 3)
+            for time in 4...120 {
+                if let next = quality.observe(sample(received: Double(quality.effective.megabits)), now: Double(time)) {
+                    _ = quality.confirmApplied(next, now: Double(time))
+                }
+            }
+            try check(quality.effective == active, "Recovery stalled before the host's \(rate) Mbps setting")
+        }
+    }
+
     run("Quality keeps actual applied settings separate from its ceiling and preserves newer pending recommendations") {
         let initial = StreamSettings(longestEdge: 1920, framesPerSecond: 15, megabits: 3)
         let initialQuality = try MediaQualityPolicy(hostDefault: .highest, preferred: .highest, applied: initial, now: 0)

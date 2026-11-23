@@ -657,13 +657,17 @@ public struct MediaQualityPolicy: Sendable {
     private enum UpgradeKind { case bitrate, pixels }
 
     public private(set) var preferred: StreamSettings?
-    public private(set) var upperBound: StreamSettings
+    public var upperBound: StreamSettings { Self.limited(preferred ?? hostDefault, to: hostLimit) }
     public private(set) var effective: StreamSettings
     public private(set) var pending: StreamSettings?
     public private(set) var isLocalNetwork = false
     public private(set) var upgradeHold = MediaQualityPolicy.initialUpgradeHold
     public private(set) var bitrateHold = MediaQualityPolicy.initialBitrateHold
-    private let bitRates: [Int]
+    private let hostDefault: StreamSettings
+    private var hostLimit = StreamSettings(longestEdge: StreamSettings.nativeLongestEdge,
+                                           framesPerSecond: StreamSettings.frameRates.last!,
+                                           megabits: StreamSettings.adaptiveBitRates.last!)
+    private var bitRates: [Int]
     private var sourceLongestEdge: Int?
     private var aspect = 0.625
     private var lastNow: TimeInterval
@@ -729,12 +733,13 @@ public struct MediaQualityPolicy: Sendable {
         try hostDefault.validateControlValues()
         if let preferred { try preferred.validateControlValues() }
         if let applied { try applied.validateControlValues() }
-        let ladder = Array(Set(bitRates.filter { StreamSettings.adaptiveBitRates.contains($0) })).sorted()
+        let ladder = Set(bitRates.filter { StreamSettings.adaptiveBitRates.contains($0) })
         guard !ladder.isEmpty else { throw DeskError.invalid("画质码率档位无效") }
+        let initial = applied ?? preferred ?? hostDefault
+        self.hostDefault = hostDefault
         self.preferred = preferred
-        upperBound = preferred ?? hostDefault
-        effective = applied ?? upperBound
-        self.bitRates = ladder
+        effective = initial
+        self.bitRates = ladder.union([applied?.megabits ?? hostDefault.megabits]).sorted()
         self.sourceLongestEdge = sourceLongestEdge.flatMap { (2...8192).contains($0) ? $0 : nil }
         lastNow = now.isFinite ? now : 0
         lastObservationAt = lastNow; lastChangeAt = lastNow
@@ -751,7 +756,7 @@ public struct MediaQualityPolicy: Sendable {
     public mutating func chooseManually(_ settings: StreamSettings, now: TimeInterval) throws -> StreamSettings? {
         try settings.validateControlValues()
         guard accept(now) else { return nil }
-        preferred = settings; upperBound = settings
+        preferred = settings
         resetEvidence(); lastObservationAt = now; lastChangeAt = now
         upgradeHold = Self.initialUpgradeHold; bitrateHold = Self.initialBitrateHold
         bitrateUpgradedAt = nil; pixelsUpgradedAt = nil
@@ -783,9 +788,7 @@ public struct MediaQualityPolicy: Sendable {
         let spacing: TimeInterval = cause != .network ? 3 : severe ? 1 : 2
         guard accept(now), !isLocalNetwork, pending == nil, now - lastChangeAt + mediaPolicyTimeTolerance >= spacing else { return nil }
         settleUpgrade(now: now)
-        var next = StreamSettings(longestEdge: min(effective.longestEdge, upperBound.longestEdge),
-                                  framesPerSecond: min(effective.framesPerSecond, upperBound.framesPerSecond),
-                                  megabits: min(effective.megabits, upperBound.megabits))
+        var next = withinCeiling(effective)
         let adjustment: Adjustment = cause == .network ? .network : .compute(cause, milliseconds: computeMilliseconds)
         if next != effective { return recommendReduction(next, adjustment: adjustment, now: now) }
         if cause == .network {
@@ -861,9 +864,7 @@ public struct MediaQualityPolicy: Sendable {
                 healthyDuration = 0; activeDuration = 0; filledDuration = 0
                 guard sustainedRoundTrip || congestedDuration + mediaPolicyTimeTolerance >= Self.localReductionDelay else { return nil }
                 congestedDuration = 0; localRoundTripCongestedDuration = 0
-                let current = StreamSettings(longestEdge: min(effective.longestEdge, upperBound.longestEdge),
-                                             framesPerSecond: min(effective.framesPerSecond, upperBound.framesPerSecond),
-                                             megabits: min(effective.megabits, upperBound.megabits))
+                let current = withinCeiling(effective)
                 let next = networkReduction(from: current, factor: 0.75)
                 guard next != effective else { return nil }
                 localLatencyLimited = true
@@ -1017,9 +1018,13 @@ public struct MediaQualityPolicy: Sendable {
     }
 
     private func withinCeiling(_ settings: StreamSettings) -> StreamSettings {
-        StreamSettings(longestEdge: min(settings.longestEdge, upperBound.longestEdge),
-                       framesPerSecond: min(settings.framesPerSecond, upperBound.framesPerSecond),
-                       megabits: min(settings.megabits, upperBound.megabits))
+        Self.limited(settings, to: upperBound)
+    }
+
+    private static func limited(_ settings: StreamSettings, to limit: StreamSettings) -> StreamSettings {
+        StreamSettings(longestEdge: min(settings.longestEdge, limit.longestEdge),
+                       framesPerSecond: min(settings.framesPerSecond, limit.framesPerSecond),
+                       megabits: min(settings.megabits, limit.megabits))
     }
 
     private mutating func forgetLoss() {
@@ -1049,16 +1054,37 @@ public struct MediaQualityPolicy: Sendable {
     @discardableResult
     public mutating func confirmApplied(_ settings: StreamSettings, now: TimeInterval) -> Bool {
         guard accept(now), pending == settings else { return false }
-        effective = settings; pending = nil; lastChangeAt = now; lastObservationAt = now
-        if let pendingUpgrade {
+        finishPending(appliedAsRequested: true, now: now)
+        updateApplied(settings, now: now)
+        return true
+    }
+
+    /// Completes a reply whose request ID and stream state were accepted by `VideoTuningSession.completeRequest`.
+    public mutating func receiveSettingsResult(_ result: StreamSettingsResult, for request: StreamSettings, now: TimeInterval) {
+        guard accept(now) else { return }
+        let applied = result.state.settings
+        if result.error == nil {
+            if applied.longestEdge < request.longestEdge { hostLimit.longestEdge = applied.longestEdge }
+            if applied.framesPerSecond < request.framesPerSecond { hostLimit.framesPerSecond = applied.framesPerSecond }
+            if applied.megabits < request.megabits { hostLimit.megabits = applied.megabits }
+        }
+        if pending == request {
+            finishPending(appliedAsRequested: result.error == nil && applied == request, now: now)
+        } else if pending == applied {
+            finishPending(appliedAsRequested: true, now: now)
+        }
+        updateApplied(applied, size: (result.state.width, result.state.height), now: now)
+    }
+
+    private mutating func finishPending(appliedAsRequested: Bool, now: TimeInterval) {
+        if appliedAsRequested, let pendingUpgrade {
             switch pendingUpgrade {
             case .bitrate: bitrateUpgradedAt = now
             case .pixels: pixelsUpgradedAt = now
             }
         }
-        pendingUpgrade = nil
-        resetEvidence()
-        return true
+        if !appliedAsRequested { lossProbe = nil }
+        pending = nil; pendingUpgrade = nil
     }
 
     /// The host's actual settings and, when known, the output size they produced.
@@ -1066,16 +1092,28 @@ public struct MediaQualityPolicy: Sendable {
                                             now: TimeInterval) throws {
         try settings.validateControlValues()
         guard accept(now) else { return }
-        effective = settings
-        if let size { learn(size, for: settings) }
         if pending == settings { pending = nil; pendingUpgrade = nil }
+        updateApplied(settings, size: size, now: now)
+    }
+
+    private mutating func updateApplied(_ settings: StreamSettings, size: (width: Int, height: Int)? = nil, now: TimeInterval) {
+        effective = settings
+        hostLimit.longestEdge = max(hostLimit.longestEdge, settings.longestEdge)
+        hostLimit.framesPerSecond = max(hostLimit.framesPerSecond, settings.framesPerSecond)
+        hostLimit.megabits = max(hostLimit.megabits, settings.megabits)
+        if let size { learn(size, for: settings) }
+        if !bitRates.contains(settings.megabits) {
+            bitRates.append(settings.megabits)
+            bitRates.sort()
+        }
         lastChangeAt = now; lastObservationAt = now
         resetEvidence()
     }
 
     public mutating func rejectPending(now: TimeInterval) {
         guard accept(now) else { return }
-        pending = nil; pendingUpgrade = nil; lossProbe = nil; lastChangeAt = now; lastObservationAt = now
+        finishPending(appliedAsRequested: false, now: now)
+        lastChangeAt = now; lastObservationAt = now
         resetEvidence()
     }
 

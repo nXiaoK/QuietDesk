@@ -126,7 +126,10 @@ public struct VideoTuningSession {
         return request
     }
     public mutating func receive(_ result: StreamSettingsResult, maximumFrameRate: Int = StreamSettings.frameRates.last!) throws -> Bool {
-        guard let pending, pending.id == result.id else { return false }
+        try completeRequest(result, maximumFrameRate: maximumFrameRate) != nil
+    }
+    public mutating func completeRequest(_ result: StreamSettingsResult, maximumFrameRate: Int = StreamSettings.frameRates.last!) throws -> StreamSettingsRequest? {
+        guard let pending, pending.id == result.id else { return nil }
         try result.state.validate()
         guard result.state.settings.framesPerSecond <= maximumFrameRate else { throw DeskError.invalid("画质回复超过已协商的帧率上限") }
         applied = result.state
@@ -138,7 +141,7 @@ public struct VideoTuningSession {
         if desiredChroma == (pending.chromaSubsampling ?? .yuv420) { desiredChroma = appliedChroma }
         if desiredCodec == .h264 { desiredChroma = .yuv420 }
         self.pending = nil
-        return true
+        return pending
     }
 
     /// Updates the confirmed host stream state when a display switch or screen mode hot-update changes dimensions.

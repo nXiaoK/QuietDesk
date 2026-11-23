@@ -3913,7 +3913,7 @@ final class DeskModel: ObservableObject, Identifiable {
             let previous = tuning.applied.settings
             let previousCodec = tuning.appliedCodec
             let previousChroma = tuning.appliedChroma
-            guard try tuning.receive(result, maximumFrameRate: supportsHigherFrameRateVideo ? StreamSettings.frameRates.last! : 60) else { return }
+            guard let request = try tuning.completeRequest(result, maximumFrameRate: supportsHigherFrameRateVideo ? StreamSettings.frameRates.last! : 60) else { return }
             viewerSession.videoRequestTimeout?.cancel()
             videoTuning = tuning
             activeVideoState = result.state
@@ -3927,13 +3927,10 @@ final class DeskModel: ObservableObject, Identifiable {
                     && previousCodec == tuning.appliedCodec
                     && previousChroma == tuning.appliedChroma))
             viewerSession.media?.updateSettings(result.state.settings, restartsStream: !inPlace)
-            if result.error == nil {
-                _ = viewerSession.mediaQuality?.confirmApplied(result.state.settings, now: SessionClock.now)
-            } else { viewerSession.mediaQuality?.rejectPending(now: SessionClock.now) }
-            try viewerSession.mediaQuality?.synchronizeApplied(result.state.settings, size: (result.state.width, result.state.height),
-                                                               now: SessionClock.now)
-            let adjustment = viewerSession.automaticVideoSettings == result.state.settings ? viewerSession.automaticVideoAdjustment : nil
-            if viewerSession.automaticVideoSettings == result.state.settings || result.error != nil {
+            viewerSession.mediaQuality?.receiveSettingsResult(result, for: request.settings, now: SessionClock.now)
+            let wasAutomatic = viewerSession.automaticVideoSettings == request.settings
+            let adjustment = wasAutomatic && result.error == nil ? viewerSession.automaticVideoAdjustment : nil
+            if wasAutomatic {
                 viewerSession.automaticVideoSettings = nil
                 viewerSession.automaticVideoAdjustment = nil
             }

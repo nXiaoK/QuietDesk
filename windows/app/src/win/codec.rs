@@ -81,7 +81,18 @@ unsafe fn take_output(transform: &IMFTransform) -> windows::core::Result<Option<
     }
 }
 
-/// The Microsoft software H.264 encoder in low-latency mode: one access unit out per frame in.
+fn drain_access_units<T>(
+    mut next: impl FnMut() -> Result<Option<T>>,
+    mut assemble: impl FnMut(T) -> Result<Option<EncodedFrame>>,
+    frames: &mut Vec<EncodedFrame>,
+) -> Result<()> {
+    while let Some(sample) = next()? {
+        frames.extend(assemble(sample)?);
+    }
+    Ok(())
+}
+
+/// The Microsoft software H.264 encoder in low-latency mode.
 pub struct H264Encoder {
     transform: IMFTransform,
     control: Option<ICodecAPI>,
@@ -174,8 +185,9 @@ impl H264Encoder {
         Ok(())
     }
 
-    /// Encodes one NV12 frame of the configured size. `Ok(None)` when the encoder produced nothing for it.
-    pub fn encode(&mut self, nv12: &[u8]) -> Result<Option<EncodedFrame>> {
+    /// Encodes one NV12 frame and replaces the output buffer with all access units available in order.
+    pub fn encode(&mut self, nv12: &[u8], frames: &mut Vec<EncodedFrame>) -> Result<()> {
+        frames.clear();
         unsafe {
             if std::mem::take(&mut self.key_frame_wanted) && self.frames > 0 {
                 let request = VARIANT::from(1u32);
@@ -192,37 +204,66 @@ impl H264Encoder {
             self.frames += 1;
             self.transform.ProcessInput(0, &sample, 0).map_err(failed("提交编码输入"))?;
             self.pending += 1;
-            let mut frame = None;
-            while let Some(output) = take_output(&self.transform).map_err(failed("读取编码输出"))? {
-                let buffer = output.ConvertToContiguousBuffer().map_err(failed("读取编码输出"))?;
-                let (mut data, mut length) = (std::ptr::null_mut(), 0);
-                buffer.Lock(&mut data, None, Some(&mut length)).map_err(failed("读取编码输出"))?;
-                let stream = std::slice::from_raw_parts(data, length as usize);
-                let assembled = self.assembler.assemble(stream).or_else(|_| {
-                    // Some encoders announce the parameter sets in the output type instead of the stream.
-                    self.announce_parameter_sets();
-                    self.assembler.assemble(stream)
-                });
-                let _ = buffer.Unlock();
-                if let Some(assembled) = assembled? {
-                    self.pending = self.pending.saturating_sub(1);
-                    frame = Some(assembled);
-                }
+            let transform = &self.transform;
+            let assembler = &mut self.assembler;
+            let result = drain_access_units(
+                || take_output(transform).map_err(failed("读取编码输出")),
+                |output| {
+                    let buffer = output.ConvertToContiguousBuffer().map_err(failed("读取编码输出"))?;
+                    let (mut data, mut length) = (std::ptr::null_mut(), 0);
+                    buffer.Lock(&mut data, None, Some(&mut length)).map_err(failed("读取编码输出"))?;
+                    let stream = std::slice::from_raw_parts(data, length as usize);
+                    let assembled = assembler.assemble(stream).or_else(|_| {
+                        // Some encoders announce the parameter sets in the output type instead of the stream.
+                        Self::announce_parameter_sets(transform, assembler);
+                        assembler.assemble(stream)
+                    });
+                    let _ = buffer.Unlock();
+                    assembled
+                },
+                frames,
+            );
+            self.pending = self.pending.saturating_sub(frames.len() as u32);
+            if result.is_err() {
+                frames.clear();
             }
-            Ok(frame)
+            result
         }
     }
 
-    unsafe fn announce_parameter_sets(&mut self) {
+    unsafe fn announce_parameter_sets(transform: &IMFTransform, assembler: &mut H264FrameAssembler) {
         unsafe {
             let (mut data, mut length) = (std::ptr::null_mut(), 0);
-            if let Ok(current) = self.transform.GetOutputCurrentType(0)
+            if let Ok(current) = transform.GetOutputCurrentType(0)
                 && current.GetAllocatedBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut data, &mut length).is_ok()
             {
-                self.assembler.set_parameter_sets(std::slice::from_raw_parts(data, length as usize));
+                assembler.set_parameter_sets(std::slice::from_raw_parts(data, length as usize));
                 CoTaskMemFree(Some(data.cast()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_batched_encoder_output_retains_the_idr_and_each_prediction_in_order() {
+        let metadata: &[u8] = &[0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2];
+        let idr: &[u8] = &[0, 0, 1, 0x65, 3];
+        let first_prediction: &[u8] = &[0, 0, 1, 0x41, 4];
+        let next_prediction: &[u8] = &[0, 0, 1, 0x41, 5];
+        let mut samples = [metadata, idr, first_prediction, next_prediction].into_iter();
+        let mut assembler = H264FrameAssembler::default();
+        let mut frames = Vec::new();
+
+        drain_access_units(|| Ok(samples.next()), |sample| assembler.assemble(sample), &mut frames).unwrap();
+
+        assert_eq!(frames.iter().map(|frame| frame.avcc[5]).collect::<Vec<_>>(), [3, 4, 5]);
+        assert!(frames[0].is_key_frame());
+        assert_eq!(frames[0].sps, [0x67, 1]);
+        assert_eq!(frames[0].pps, [0x68, 2]);
     }
 }
 

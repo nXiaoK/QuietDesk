@@ -86,6 +86,7 @@ fn main() {
             let mut decoder = H264Decoder::new().unwrap_or_else(|error| fail("create decoder", error));
             let converter = Nv12Converter::new((width, height), (width, height));
             let mut nv12 = vec![0u8; converter.output_bytes()];
+            let mut outputs = Vec::new();
             // Windows' own encoder answers every frame at once; other implementations may hold frames back first.
             let frames = option("--frames").and_then(|frames| frames.parse().ok()).unwrap_or(30usize);
             let (mut encoded, mut keys, mut decoded, mut bytes) = (0, 0, 0, 0);
@@ -97,23 +98,26 @@ fn main() {
                 if frame == frames / 2 {
                     encoder.request_key_frame();
                 }
-                let Some(output) = encoder.encode(&nv12).unwrap_or_else(|error| fail("encode", error)) else { continue };
-                if first_output.is_none() {
-                    first_output = Some(frame);
-                    first_is_key = output.is_key_frame();
+                encoder.encode(&nv12, &mut outputs).unwrap_or_else(|error| fail("encode", error));
+                for output in outputs.drain(..) {
+                    if first_output.is_none() {
+                        first_output = Some(frame);
+                        first_is_key = output.is_key_frame();
+                    }
+                    let packet_sequence = encoded as u32;
+                    encoded += 1;
+                    keys += usize::from(output.is_key_frame());
+                    key_after_request |= output.is_key_frame() && frame >= frames / 2;
+                    bytes += output.avcc.len();
+                    let packet = quietdesk_core::video::VideoPacket::h264(packet_sequence, output);
+                    let stream = packet.annex_b().unwrap_or_else(|error| fail("annex b", error));
+                    decoder
+                        .decode(&stream, |picture| {
+                            decoded += 1;
+                            size = (picture.width, picture.height);
+                        })
+                        .unwrap_or_else(|error| fail("decode", error));
                 }
-                encoded += 1;
-                keys += usize::from(output.is_key_frame());
-                key_after_request |= output.is_key_frame() && frame >= frames / 2;
-                bytes += output.avcc.len();
-                let packet = quietdesk_core::video::VideoPacket::h264(frame as u32, output);
-                let stream = packet.annex_b().unwrap_or_else(|error| fail("annex b", error));
-                decoder
-                    .decode(&stream, |picture| {
-                        decoded += 1;
-                        size = (picture.width, picture.height);
-                    })
-                    .unwrap_or_else(|error| fail("decode", error));
             }
             println!(
                 "codec frames={frames} encoded={encoded} first output at frame {first_output:?} keyframes={keys} bytes={bytes} decoded={decoded} size={}x{}",

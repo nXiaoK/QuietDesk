@@ -107,6 +107,7 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
     let media = MediaFoundation::start();
     let mut capture: Option<ScreenCapture> = None;
     let mut stream: Option<Stream> = None;
+    let mut outputs = Vec::new();
     let mut sampler: Option<CursorWorker> = None;
     let mut paused = false;
     let mut selected = None;
@@ -304,47 +305,53 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
             stats.convert.record(start.elapsed());
         }
         let start = Instant::now();
-        let encoded = active.encoder.encode(&active.nv12);
+        let encoded = active.encoder.encode(&active.nv12, &mut outputs);
         stats.encoded(start.elapsed(), !current);
+        if let Err(error) = encoded {
+            log::error!("encoding failed, ending the stream: {error}");
+            stream = None;
+            continue;
+        }
         active.fed += 1;
         // A one-in-one-out encoder holds nothing and needs no repeats. One that delays its output would
         // keep the newest picture, and the pointer in it, until the screen changes again.
         active.flush = if current { active.encoder.pending() } else { active.flush - 1 };
-        match encoded {
-            Ok(Some(frame)) => {
-                // After a pause or a restart only a keyframe may open the stream.
-                if !active.fresh || frame.is_key_frame() {
-                    if active.fresh {
-                        log::info!("the stream opens with a keyframe of {} bytes after {} captured frames", frame.avcc.len(), active.fed);
-                        if active.encoder.pending() > 0 {
-                            log::warn!("the encoder holds {} frames back; the picture is repeated after each change to let it out", active.encoder.pending());
-                        }
-                    }
-                    active.fresh = false;
-                    active.refused_key_frames = 0;
-                    let submission = active.sink.try_submit(frame);
-                    stats.output(submission);
-                    match submission {
-                        FrameSubmission::Queued => {}
-                        FrameSubmission::Dropped => active.restart_from_key_frame(),
-                        FrameSubmission::Closed => stream = None,
-                    }
-                } else {
-                    // The encoder took the request for a keyframe and still produced a dependent frame.
-                    stats.output(FrameSubmission::Dropped);
-                    active.refused_key_frames += 1;
-                    if active.refused_key_frames >= 3
-                        && let Err(error) = active.encoder.restart()
-                    {
-                        log::error!("the encoder could not be restarted for a keyframe, ending the stream: {error}");
-                        stream = None;
-                    }
-                }
+        let produced = !outputs.is_empty();
+        let mut submission = FrameSubmission::Queued;
+        for frame in outputs.drain(..) {
+            if submission != FrameSubmission::Queued {
+                // A rejected reference frame may be needed by later outputs of this encoding call.
+                stats.output(FrameSubmission::Dropped);
+                continue;
             }
-            Ok(None) => {}
-            Err(error) => {
-                log::error!("encoding failed, ending the stream: {error}");
-                stream = None;
+            if active.fresh && !frame.is_key_frame() {
+                stats.output(FrameSubmission::Dropped);
+                active.refused_key_frames += 1;
+                continue;
+            }
+            let bytes = frame.avcc.len();
+            submission = active.sink.try_submit(frame);
+            stats.output(submission);
+            if active.fresh && submission == FrameSubmission::Queued {
+                log::info!("the stream opens with a keyframe of {bytes} bytes after {} captured frames", active.fed);
+                if active.encoder.pending() > 0 {
+                    log::warn!("the encoder holds {} frames back; the picture is repeated after each change to let it out", active.encoder.pending());
+                }
+                active.fresh = false;
+                active.refused_key_frames = 0;
+            }
+        }
+        match submission {
+            FrameSubmission::Dropped => active.restart_from_key_frame(),
+            FrameSubmission::Closed => stream = None,
+            FrameSubmission::Queued => {
+                if produced
+                    && active.refused_key_frames >= 3
+                    && let Err(error) = active.encoder.restart()
+                {
+                    log::error!("the encoder could not be restarted for a keyframe, ending the stream: {error}");
+                    stream = None;
+                }
             }
         }
     }

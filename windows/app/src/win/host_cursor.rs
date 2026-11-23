@@ -7,6 +7,8 @@ use quietdesk_core::cursor_pixels::from_black_and_white;
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::host::HostCursorSample;
 use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use windows::Win32::Foundation::{POINT, RECT};
@@ -105,41 +107,140 @@ struct CachedShape {
     retry: Instant,
 }
 
-pub(super) struct CursorSampler {
+#[derive(Clone, Copy)]
+pub(super) enum CursorTarget {
+    Active(RECT),
+    Paused,
+    Unavailable,
+}
+
+enum CursorCommand {
+    Bind(watch::Sender<Option<HostCursorSample>>, CursorTarget, Sender<Result<()>>),
+    Target(CursorTarget, Sender<Result<()>>),
+    Stop,
+}
+
+/// A session owns a single sampling thread while independent cursor display is enabled.
+pub(super) struct CursorWorker {
+    commands: SyncSender<CursorCommand>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl CursorWorker {
+    pub(super) fn start(output: watch::Sender<Option<HostCursorSample>>, target: CursorTarget) -> Result<Self> {
+        Self::spawn(output, target, cursor_info)
+    }
+
+    fn spawn(
+        output: watch::Sender<Option<HostCursorSample>>,
+        mut target: CursorTarget,
+        read_cursor: impl Fn() -> Result<CURSORINFO> + Send + 'static,
+    ) -> Result<Self> {
+        let (commands, incoming) = mpsc::sync_channel(0);
+        let (started, ready) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("cursor".into())
+            .spawn(move || {
+                let mut sampler = match CursorSampler::new(output, target, &read_cursor) {
+                    Ok(sampler) => sampler,
+                    Err(error) => {
+                        let _ = started.send(Err(error));
+                        return;
+                    }
+                };
+                if started.send(Ok(())).is_err() {
+                    return;
+                }
+                loop {
+                    let command = match target {
+                        CursorTarget::Active(bounds) => match incoming.recv_timeout(sampler.next_poll.saturating_duration_since(Instant::now())) {
+                            Err(RecvTimeoutError::Timeout) => {
+                                sampler.sample(bounds, &read_cursor);
+                                continue;
+                            }
+                            result => result,
+                        },
+                        _ => incoming.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                    };
+                    match command {
+                        Ok(CursorCommand::Bind(output, scope, reply)) => {
+                            let result = CursorSampler::new(output, scope, &read_cursor).map(|next| {
+                                sampler = next;
+                                target = scope;
+                            });
+                            let _ = reply.send(result);
+                        }
+                        Ok(CursorCommand::Target(scope, reply)) => {
+                            target = scope;
+                            match target {
+                                CursorTarget::Active(bounds) => sampler.sample(bounds, &read_cursor),
+                                CursorTarget::Paused => {}
+                                CursorTarget::Unavailable => sampler.publish(None),
+                            }
+                            let _ = reply.send(Ok(()));
+                        }
+                        Ok(CursorCommand::Stop) | Err(_) => return,
+                    }
+                }
+            })
+            .map_err(|error| DeskError::platform(format!("无法启动光标采集线程：{error}")))?;
+        let worker = Self { commands, thread: Some(thread) };
+        ready.recv().map_err(|_| stopped())??;
+        Ok(worker)
+    }
+
+    pub(super) fn set_target(&self, target: CursorTarget) -> Result<()> {
+        self.request(|reply| CursorCommand::Target(target, reply))
+    }
+
+    pub(super) fn rebind(&self, output: watch::Sender<Option<HostCursorSample>>, target: CursorTarget) -> Result<()> {
+        self.request(|reply| CursorCommand::Bind(output, target, reply))
+    }
+
+    fn request(&self, command: impl FnOnce(Sender<Result<()>>) -> CursorCommand) -> Result<()> {
+        let (reply, answer) = mpsc::channel();
+        self.commands.send(command(reply)).map_err(|_| stopped())?;
+        answer.recv().map_err(|_| stopped())?
+    }
+}
+
+impl Drop for CursorWorker {
+    fn drop(&mut self) {
+        let _ = self.commands.send(CursorCommand::Stop);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn stopped() -> DeskError {
+    DeskError::platform("光标采集已停止")
+}
+
+struct CursorSampler {
     output: watch::Sender<Option<HostCursorSample>>,
     cached: Option<CachedShape>,
-    pub(super) next_poll: Instant,
+    next_poll: Instant,
 }
 
 impl CursorSampler {
-    pub(super) fn new(output: watch::Sender<Option<HostCursorSample>>, bounds: RECT, paused: bool) -> Result<Self> {
-        let info = cursor_info()?;
+    fn new(output: watch::Sender<Option<HostCursorSample>>, target: CursorTarget, read_cursor: impl FnOnce() -> Result<CURSORINFO>) -> Result<Self> {
+        let info = read_cursor()?;
         let mut sampler = Self { output, cached: None, next_poll: Instant::now() };
-        if !paused {
-            sampler.publish(Some(info), bounds);
+        if let CursorTarget::Active(bounds) = target {
+            sampler.publish(Some((info, bounds)));
         }
         Ok(sampler)
     }
 
-    pub(super) fn poll(&mut self, bounds: RECT) {
-        if Instant::now() >= self.next_poll {
-            self.publish(cursor_info().ok(), bounds);
-        }
+    fn sample(&mut self, bounds: RECT, read_cursor: impl FnOnce() -> Result<CURSORINFO>) {
+        self.publish(read_cursor().ok().map(|info| (info, bounds)));
     }
 
-    pub(super) fn display_changed(&mut self, bounds: RECT, paused: bool) {
-        self.next_poll = Instant::now();
-        if paused {
-            self.output.send_replace(None);
-        } else {
-            self.poll(bounds);
-        }
-    }
-
-    fn publish(&mut self, info: Option<CURSORINFO>, bounds: RECT) {
+    fn publish(&mut self, observation: Option<(CURSORINFO, RECT)>) {
         let now = Instant::now();
         self.next_poll = now + Duration::from_nanos(16_666_667);
-        let sample = if let Some(info) = info {
+        let sample = if let Some((info, bounds)) = observation {
             let (inside, x, y) = location(info.ptScreenPos, bounds);
             let inside_display = info.flags == CURSOR_SHOWING && inside;
             let image = if inside_display { self.image(&info, now) } else { None };
@@ -189,6 +290,7 @@ impl CursorSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicI32, Ordering};
 
     #[test]
     fn cursor_coordinates_follow_a_monitor_left_of_and_above_the_primary() {
@@ -197,5 +299,49 @@ mod tests {
         assert_eq!(icon_origin(point, bounds, (11, 20)), POINT { x: 389, y: 430 });
         assert_eq!(location(point, bounds), (true, 0.25, 0.5));
         assert_eq!(location(POINT { x: 0, y: -200 }, bounds), (false, 1.0, 0.0));
+    }
+
+    #[tokio::test]
+    async fn cursor_worker_polls_independently_and_preserves_the_active_binding() {
+        let (sender, mut updates) = watch::channel(None);
+        let position = Arc::new(AtomicI32::new(10));
+        let read_position = position.clone();
+        let caller = thread::current().id();
+        let bounds = RECT { left: 0, top: 0, right: 100, bottom: 100 };
+        let worker = CursorWorker::spawn(sender, CursorTarget::Active(bounds), move || {
+            assert_ne!(thread::current().id(), caller);
+            let x = read_position.load(Ordering::Relaxed);
+            if x < 0 {
+                return Err(DeskError::platform("synthetic cursor failure"));
+            }
+            Ok(CURSORINFO { ptScreenPos: POINT { x, y: 25 }, ..Default::default() })
+        })
+        .unwrap();
+
+        position.store(25, Ordering::Relaxed);
+        let _ = tokio::time::timeout(Duration::from_secs(2), updates.wait_for(|sample| sample.as_ref().is_some_and(|sample| sample.x == 0.25)))
+            .await
+            .unwrap()
+            .unwrap();
+        worker.set_target(CursorTarget::Paused).unwrap();
+        std::mem::drop(updates.borrow_and_update());
+        position.store(50, Ordering::Relaxed);
+        assert!(tokio::time::timeout(Duration::from_millis(60), updates.changed()).await.is_err());
+
+        let (replacement, replacement_updates) = watch::channel(None);
+        position.store(-1, Ordering::Relaxed);
+        assert!(worker.rebind(replacement, CursorTarget::Paused).is_err());
+        assert!(replacement_updates.has_changed().is_err());
+        position.store(100, Ordering::Relaxed);
+        worker.set_target(CursorTarget::Active(RECT { left: 50, right: 150, ..bounds })).unwrap();
+        assert_eq!(updates.borrow().as_ref().unwrap().x, 0.5);
+        worker.set_target(CursorTarget::Unavailable).unwrap();
+        {
+            let hidden = updates.borrow();
+            let cursor = hidden.as_ref().unwrap();
+            assert_eq!((cursor.inside_display, cursor.x, cursor.y), (false, 0.0, 0.0));
+        }
+        drop(worker);
+        assert!(updates.has_changed().is_err());
     }
 }

@@ -4,7 +4,7 @@ use super::capture::ScreenCapture;
 use super::codec::{H264Encoder, MediaFoundation};
 use super::displays::{self, Display};
 use super::gesture_host::GestureHost;
-use super::host_cursor::CursorSampler;
+use super::host_cursor::{CursorTarget, CursorWorker};
 use super::util::Com;
 use super::video_stats::VideoStats;
 use super::{clipboard, inject};
@@ -107,17 +107,22 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
     let media = MediaFoundation::start();
     let mut capture: Option<ScreenCapture> = None;
     let mut stream: Option<Stream> = None;
-    let mut sampler: Option<CursorSampler> = None;
+    let mut sampler: Option<CursorWorker> = None;
     let mut paused = false;
     let mut selected = None;
-    let open = |capture: &mut Option<ScreenCapture>, selected: &mut Option<u32>, independent| -> Result<(usize, usize)> {
+    let open = |capture: &mut Option<ScreenCapture>, selected: &mut Option<u32>, cursor: Option<&CursorWorker>, paused: bool| -> Result<(usize, usize)> {
         if capture.is_none() {
             let outputs = displays::outputs()?;
             let target = displays::preferred(&outputs, selected.or(preferred));
             if selected.is_some_and(|id| id != target.info.id) {
                 return Err(DeskError::platform("原共享显示器已断开，正在重新选择"));
             }
-            let opened = ScreenCapture::for_cursor_mode(target, independent)?;
+            let opened = ScreenCapture::for_cursor_mode(target, cursor.is_some())?;
+            if let Some(cursor) = cursor
+                && !paused
+            {
+                cursor.set_target(CursorTarget::Active(opened.display.bounds))?;
+            }
             *selected = Some(target.info.id);
             *input_display.lock().unwrap() = Some(opened.display.clone());
             *capture = Some(opened);
@@ -129,14 +134,13 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
         let active = stream.as_ref().filter(|_| !paused && capture.is_some());
         let now = Instant::now();
         let video_wait = active.map(|active| if active.sink.has_credit() { active.cadence.wait(now) } else { Duration::from_millis(2) });
-        let cursor_wait = sampler.as_ref().filter(|_| !paused && capture.is_some()).map(|cursor| cursor.next_poll.saturating_duration_since(now));
-        let command = match video_wait.into_iter().chain(cursor_wait).min() {
+        let command = match video_wait {
             Some(wait) => commands.recv_timeout(wait),
             None => commands.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         match command {
             Ok(Command::Size(reply)) => {
-                let _ = reply.send(open(&mut capture, &mut selected, sampler.is_some()).map(|(width, height)| (width as u32, height as u32)));
+                let _ = reply.send(open(&mut capture, &mut selected, sampler.as_ref(), paused).map(|(width, height)| (width as u32, height as u32)));
             }
             Ok(Command::Displays(reply)) => {
                 let snapshot = displays::outputs().map(|outputs| {
@@ -169,16 +173,16 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
                     })();
                     match opened {
                         Ok((replacement, (new_stream, state), display)) => {
+                            if let Some(sampler) = &sampler {
+                                let target = if paused { CursorTarget::Unavailable } else { CursorTarget::Active(display.bounds) };
+                                sampler.set_target(target)?;
+                            }
                             if let Some(replacement) = replacement {
                                 capture = Some(replacement);
                             }
                             selected = Some(id);
                             stream = Some(new_stream);
-                            let area = display.bounds;
                             *input_display.lock().unwrap() = Some(display);
-                            if let Some(sampler) = &mut sampler {
-                                sampler.display_changed(area, paused);
-                            }
                             Ok(DisplaySwitch::Applied(state))
                         }
                         Err(error) if capture.as_ref().is_some_and(|s| s.display.still_at_bounds() && outputs.iter().any(|d| d.same_surface(&s.display))) => {
@@ -192,7 +196,7 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
             Ok(Command::Configure(settings, sink, reply)) => {
                 stream = None;
                 let opened = match &media {
-                    Ok(_) => open(&mut capture, &mut selected, sampler.is_some()).and_then(|source| open_stream(source, settings, sink)),
+                    Ok(_) => open(&mut capture, &mut selected, sampler.as_ref(), paused).and_then(|source| open_stream(source, settings, sink)),
                     Err(error) => Err(DeskError::platform(error.to_string())),
                 };
                 let _ = reply.send(opened.map(|(opened, state)| {
@@ -201,11 +205,18 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
                 }));
             }
             Ok(Command::Pause(pause, reply)) => {
-                paused = pause;
-                if let Some(stream) = &mut stream {
-                    stream.restart_from_key_frame();
-                }
-                let _ = reply.send(Ok(()));
+                let target = match (pause, &capture) {
+                    (true, _) => CursorTarget::Paused,
+                    (false, Some(screen)) => CursorTarget::Active(screen.display.bounds),
+                    (false, None) => CursorTarget::Unavailable,
+                };
+                let result = sampler.as_ref().map_or(Ok(()), |sampler| sampler.set_target(target));
+                let _ = reply.send(result.map(|()| {
+                    paused = pause;
+                    if let Some(stream) = &mut stream {
+                        stream.restart_from_key_frame();
+                    }
+                }));
             }
             Ok(Command::KeyFrame(reply)) => {
                 let result = stream.as_mut().ok_or_else(stopped).and_then(|stream| {
@@ -220,11 +231,15 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
             }
             Ok(Command::Cursor(output, reply)) => {
                 let result = (|| {
-                    let independent = output.is_some();
                     let screen = capture.as_mut().ok_or_else(stopped)?;
-                    let next_sampler = output.map(|tx| CursorSampler::new(tx, screen.display.bounds, paused)).transpose()?;
-                    if independent != sampler.is_some() {
-                        screen.set_cursor_mode(independent)?;
+                    let target = if paused { CursorTarget::Paused } else { CursorTarget::Active(screen.display.bounds) };
+                    let next_sampler = match (sampler.as_ref(), output) {
+                        (Some(sampler), Some(output)) => return sampler.rebind(output, target),
+                        (None, Some(output)) => Some(CursorWorker::start(output, target)?),
+                        (_, None) => None,
+                    };
+                    if next_sampler.is_some() != sampler.is_some() {
+                        screen.set_cursor_mode(next_sampler.is_some())?;
                         if let Some(stream) = &mut stream {
                             stream.restart_from_key_frame();
                         }
@@ -236,9 +251,6 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
             }
             Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {}
-        }
-        if !paused && let (Some(sampler), Some(screen)) = (&mut sampler, &capture) {
-            sampler.poll(screen.display.bounds);
         }
         let (Some(active), Some(screen), false) = (&mut stream, &mut capture, paused) else {
             if let Some(active) = &mut stream {
@@ -263,6 +275,9 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
                 log::warn!("screen capture was interrupted: {error}");
                 capture = None;
                 *input_display.lock().unwrap() = None;
+                if let Some(sampler) = &sampler {
+                    let _ = sampler.set_target(CursorTarget::Unavailable);
+                }
                 // Keep the sink alive while the session reconciles the current display topology.
                 if !capture_lost() {
                     stream = None;

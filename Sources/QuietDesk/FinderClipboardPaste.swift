@@ -9,10 +9,15 @@ struct FinderPasteUnavailable: Error {
     let reason: String
 }
 
+@MainActor
+protocol FinderPasteWatching: AnyObject {
+    func stop()
+}
+
 /// Watches only Finder, and only between publishing a remote file copy and its first paste.
 /// No event is intercepted, retained or replayed.
 @MainActor
-private final class FinderPasteIntent {
+private final class FinderPasteIntent: FinderPasteWatching {
     private let finder: NSRunningApplication
     private let app: AXUIElement
     private let paste: () -> Void
@@ -170,15 +175,22 @@ final class FinderClipboardPaste: @unchecked Sendable {
     private var intentUntil: TimeInterval = 0
     private var began = false
     private let onFailure: @MainActor (String) -> Void
+    private let isTrusted: @Sendable () -> Bool
     private var reportedFailure = false
     private var materialized = false // confined to the serial presenter queue
     private var readers: [PromisedFinderRoot] = []
-    @MainActor private var monitor: FinderPasteIntent?
+    @MainActor private var monitor: FinderPasteWatching?
 
     /// Throws `FinderPasteUnavailable` when Finder's Paste cannot be watched, and leaves nothing behind then.
-    @MainActor init(names: [String], promise: ClipboardFilePromise, isTrusted: () -> Bool = { AXIsProcessTrusted() },
-                    onFailure: @escaping @MainActor (String) -> Void = { _ in }) throws {
+    @MainActor init(
+        names: [String],
+        promise: ClipboardFilePromise,
+        isTrusted: @escaping @Sendable () -> Bool = { AXIsProcessTrusted() },
+        watchPaste: (@MainActor (@escaping () -> Void) throws -> FinderPasteWatching)? = nil,
+        onFailure: @escaping @MainActor (String) -> Void = { _ in }
+    ) throws {
         self.onFailure = onFailure
+        self.isTrusted = isTrusted
         self.promise = promise
         let staging = FileManager.default.temporaryDirectory.appendingPathComponent("QuietDesk-\(UUID().uuidString).noindex", isDirectory: true)
         directory = staging
@@ -196,7 +208,12 @@ final class FinderClipboardPaste: @unchecked Sendable {
                 guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
                 _ = Darwin.close(fd)
             }
-            monitor = try FinderPasteIntent(isTrusted: isTrusted) { [weak self] in self?.recordPaste() }
+            if let watchPaste {
+                guard isTrusted() else { throw FinderPasteUnavailable(reason: "辅助功能权限未生效") }
+                monitor = try watchPaste { [weak self] in self?.recordPaste() }
+            } else {
+                monitor = try FinderPasteIntent(isTrusted: isTrusted) { [weak self] in self?.recordPaste() }
+            }
             readers = urls.map { url in
                 PromisedFinderRoot(url: url, queue: queue, failed: { [weak self] in
                     self?.reportFailure("Finder 的临时文件不可用，请在对端重新复制")
@@ -230,7 +247,7 @@ final class FinderClipboardPaste: @unchecked Sendable {
             return true
         }
         guard accepted else {
-            if !AXIsProcessTrusted() { reportFailure("QuietDesk 的辅助功能权限已失效，请允许后在对端重新复制文件") }
+            if !isTrusted() { reportFailure("QuietDesk 的辅助功能权限已失效，请允许后在对端重新复制文件") }
             return false
         }
         DispatchQueue.main.async { [weak self] in self?.monitor?.stop() }

@@ -213,16 +213,22 @@ private final class LazyClipboardItemProvider: NSObject, NSPasteboardItemDataPro
 @MainActor
 final class SystemClipboardPasteboard: ClipboardPasteboard {
     private let pasteboard: NSPasteboard
-    private let isFinderTrusted: () -> Bool
+    private let isFinderTrusted: @Sendable () -> Bool
+    private let watchFinderPaste: (@MainActor (@escaping () -> Void) throws -> FinderPasteWatching)?
     private var activeLazyProvider: LazyClipboardItemProvider?
     private var fileProviders: [FileURLProvider] = []
     private var finderFiles: FinderClipboardPaste?
     private var finderMarker: String?
     private static let marker = NSPasteboard.PasteboardType("local.quietdesk.clipboard-session")
 
-    init(pasteboard: NSPasteboard = .general, isFinderTrusted: @escaping () -> Bool = { AXIsProcessTrusted() }) {
+    init(
+        pasteboard: NSPasteboard = .general,
+        isFinderTrusted: @escaping @Sendable () -> Bool = { AXIsProcessTrusted() },
+        watchFinderPaste: (@MainActor (@escaping () -> Void) throws -> FinderPasteWatching)? = nil
+    ) {
         self.pasteboard = pasteboard
         self.isFinderTrusted = isFinderTrusted
+        self.watchFinderPaste = watchFinderPaste
     }
 
     var changeCount: Int { pasteboard.changeCount }
@@ -285,7 +291,13 @@ final class SystemClipboardPasteboard: ClipboardPasteboard {
     func writeFinderFiles(names: [String], marker: String, onFailure: @escaping @MainActor (String) -> Void, request: @escaping @MainActor () -> Bool) throws -> ClipboardFilePromise? {
         guard (1...ClipboardTransfer.maximumPromisedFileRoots).contains(names.count) else { throw DeskError.invalid("对端文件清单无效，请重新复制") }
         let promise = ClipboardFilePromise(count: names.count, request: request)
-        let offered = try FinderClipboardPaste(names: names, promise: promise, isTrusted: isFinderTrusted, onFailure: onFailure)
+        let offered = try FinderClipboardPaste(
+            names: names,
+            promise: promise,
+            isTrusted: isFinderTrusted,
+            watchPaste: watchFinderPaste,
+            onFailure: onFailure
+        )
         let items = offered.urls.map { url in
             let item = NSPasteboardItem()
             item.setString(marker, forType: Self.marker)

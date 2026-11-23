@@ -385,6 +385,9 @@ private struct ClipboardFocusChecks {
         }
 
         run("Non-Finder reads of Finder paste placeholders never receive empty files") { folder in
+            final class SyntheticFinderWatcher: FinderPasteWatching {
+                func stop() {}
+            }
             var finishPromise: ClipboardFilePromise?
             let promise = ClipboardFilePromise(count: 2) {
                 DispatchQueue.global().async {
@@ -404,7 +407,12 @@ private struct ClipboardFocusChecks {
                 return true
             }
             finishPromise = promise
-            let offered = try FinderClipboardPaste(names: ["report.txt", "bundle"], promise: promise, isTrusted: { true })
+            let offered = try FinderClipboardPaste(
+                names: ["report.txt", "bundle"],
+                promise: promise,
+                isTrusted: { true },
+                watchPaste: { _ in SyntheticFinderWatcher() }
+            )
             defer { offered.stop() }
             let stubURL = offered.urls[0]
 
@@ -446,9 +454,14 @@ private struct ClipboardFocusChecks {
                 }
             }
             print("  (b) NSFileCoordinator: coordErr=\(String(describing: coordErr)), inner=\(coordInnerDesc)")
-            let afterCoordFd = Darwin.open(stubURL.path, O_RDONLY)
-            let afterCoordErrno = afterCoordFd >= 0 ? 0 : errno
-            if afterCoordFd >= 0 { Darwin.close(afterCoordFd) }
+            var afterCoordFd: Int32 = -1
+            var afterCoordErrno: Int32 = 0
+            try eventually("Coordinator reacquire did not restore unreadable placeholder") {
+                afterCoordFd = Darwin.open(stubURL.path, O_RDONLY)
+                afterCoordErrno = afterCoordFd >= 0 ? 0 : errno
+                if afterCoordFd >= 0 { Darwin.close(afterCoordFd); return true }
+                return afterCoordErrno == EACCES
+            }
 
             // (c) NSPasteboard.readObjects([NSURL.self]) followed by read
             let readURLs = board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
@@ -470,14 +483,25 @@ private struct ClipboardFocusChecks {
             try require(!pbSucceeded, "Pasteboard readObjects URL read succeeded instead of failing: \(pbDesc)")
 
             // Verify Finder coordinated read after paste intent materializes both file and folder, preserving mode & mtime.
+            // Run NSFileCoordinator off the main thread just as external Finder.app does, so RunLoop.main
+            // remains free to service ClipboardFilePromise's @MainActor request callback without deadlocking.
             offered.recordPaste()
-            var readErr: NSError?
-            var materializedBytes: Data?
-            NSFileCoordinator().coordinate(readingItemAt: offered.urls[0], options: [], error: &readErr) { url in
-                materializedBytes = try? Data(contentsOf: url)
+            let coordOutcome = ChannelSafeBox<(done: Bool, error: String?, bytes: Data?)>((false, nil, nil))
+            let targetURL = offered.urls[0]
+            DispatchQueue.global(qos: .userInitiated).async {
+                var coordReadError: NSError?
+                var bytes: Data?
+                NSFileCoordinator().coordinate(readingItemAt: targetURL, options: [], error: &coordReadError) { url in
+                    bytes = try? Data(contentsOf: url)
+                }
+                coordOutcome.set((true, coordReadError?.description, bytes))
             }
-            try require(readErr == nil && materializedBytes == Data("full-payload".utf8),
-                        "Coordinated Finder read did not obtain materialized file: \(String(describing: readErr))")
+            try eventually("Coordinated Finder read did not complete") {
+                coordOutcome.read().done
+            }
+            let outcome = coordOutcome.read()
+            try require(outcome.error == nil && outcome.bytes == Data("full-payload".utf8),
+                        "Coordinated Finder read did not obtain materialized file: \(String(describing: outcome.error))")
             let attrs = try FileManager.default.attributesOfItem(atPath: offered.urls[0].path)
             let perms = (attrs[.posixPermissions] as? NSNumber)?.intValue
             let mtime = attrs[.modificationDate] as? Date
@@ -489,7 +513,11 @@ private struct ClipboardFocusChecks {
             // Verify ClipboardSync + SystemClipboardPasteboard status tells users to paste into a Finder folder.
             let syncPB = NSPasteboard(name: NSPasteboard.Name(filePasteBoardPrefix + UUID().uuidString))
             defer { syncPB.releaseGlobally() }
-            let sysPB = SystemClipboardPasteboard(pasteboard: syncPB, isFinderTrusted: { true })
+            let sysPB = SystemClipboardPasteboard(
+                pasteboard: syncPB,
+                isFinderTrusted: { true },
+                watchFinderPaste: { _ in SyntheticFinderWatcher() }
+            )
             let sync = ClipboardSync(session: UUID(), allowsFileSending: true, allowsAutomaticSending: false,
                                      allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true, usesFinderFilePaste: true,
                                      pasteboard: sysPB, storage: folder.appendingPathComponent("sync-status")) { _ in }

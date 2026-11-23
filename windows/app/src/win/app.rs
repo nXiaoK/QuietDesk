@@ -33,12 +33,74 @@ pub enum HostNotice {
     Ended(String),
 }
 
+#[derive(Default)]
+pub struct HostActivity(Mutex<HostActivityState>);
+
+#[derive(Default, PartialEq, Eq)]
+enum HostActivityState {
+    #[default]
+    Idle,
+    Connected,
+    Restarting,
+}
+
+impl HostActivity {
+    pub(super) fn connected(&self) -> bool {
+        *self.0.lock().unwrap() == HostActivityState::Connected
+    }
+
+    fn start_session(&self) -> Option<HostActivitySession<'_>> {
+        self.claim(HostActivityState::Connected).then(|| HostActivitySession(self))
+    }
+
+    pub(super) fn begin_restart(&self) -> bool {
+        self.claim(HostActivityState::Restarting)
+    }
+
+    pub(super) fn cancel_restart(&self) {
+        *self.0.lock().unwrap() = HostActivityState::Idle;
+    }
+
+    fn claim(&self, next: HostActivityState) -> bool {
+        let mut current = self.0.lock().unwrap();
+        if *current != HostActivityState::Idle {
+            return false;
+        }
+        *current = next;
+        true
+    }
+}
+
+struct HostActivitySession<'a>(&'a HostActivity);
+
+impl Drop for HostActivitySession<'_> {
+    fn drop(&mut self) {
+        *self.0.0.lock().unwrap() = HostActivityState::Idle;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn updater_and_incoming_sessions_claim_the_host_exclusively() {
+    let activity = HostActivity::default();
+    let session = activity.start_session().unwrap();
+    assert!(activity.connected());
+    assert!(!activity.begin_restart());
+    drop(session);
+
+    assert!(activity.begin_restart());
+    assert!(activity.start_session().is_none());
+    activity.cancel_restart();
+    assert!(activity.start_session().is_some());
+}
+
 /// Shares this PC on `port` until `commands` closes. One viewer is served at a time.
 pub async fn serve_host(
     port: u16,
     key: PairingKey,
     options: Arc<Mutex<HostOptions>>,
     mut commands: mpsc::UnboundedReceiver<HostCommand>,
+    activity: Arc<HostActivity>,
     notify: impl Fn(HostNotice) + Clone + Send + 'static,
 ) {
     let listener = match TcpListener::bind(("0.0.0.0", port)).await {
@@ -97,6 +159,7 @@ pub async fn serve_host(
             }
         };
         drop(waiting);
+        let Some(session_activity) = activity.start_session() else { continue };
         let mut active = tls::PendingHandshakes::new(&acceptor);
         let (auxiliary, accepted) = mpsc::channel(4);
         let connections = HostConnections { auxiliary: Some(accepted), datagram: stream.get_ref().local_addr().ok() };
@@ -146,6 +209,7 @@ pub async fn serve_host(
         };
         drop(active);
         peer.finished().await;
+        drop(session_activity);
         notify(HostNotice::Ended(reason.to_string()));
         if stopping {
             return;

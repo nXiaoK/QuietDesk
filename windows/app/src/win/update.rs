@@ -1203,7 +1203,7 @@ impl WindowUpdater {
     }
 
     /// Returns `Ok(true)` when the installer process is ready and the main window must exit now.
-    pub fn execute_install(&mut self, automatic: bool, ctx: WindowUpdateContext) -> Result<bool, String> {
+    pub fn execute_install(&mut self, automatic: bool, ctx: WindowUpdateContext, host: &super::app::HostActivity) -> Result<bool, String> {
         if self.state != UpdaterState::Ready || self.busy() {
             return Ok(false);
         }
@@ -1227,6 +1227,10 @@ impl WindowUpdater {
         let exe = std::env::current_exe().map_err(|e| format!("无法获取当前程序路径：{e}"))?;
         let launch_options =
             LaunchOptions { automatic, resume_host_sharing: ctx.is_sharing_enabled, minimize_on_launch: automatic && ctx.window_minimized_or_hidden };
+        let elevated = prepared.requires_elevation();
+        if elevated && !host.begin_restart() {
+            return self.defer_install_for_host(automatic);
+        }
         self.state = UpdaterState::Installing;
         self.status_text = if automatic {
             format!("正在自动安装 {}，QuietDesk 即将重新启动…", prepared.version)
@@ -1236,17 +1240,9 @@ impl WindowUpdater {
         let cancel = AtomicBool::new(false);
         match launch_detached_installer(prepared, &exe, &updates_directory(), launch_options, &cancel) {
             Ok(pending) => {
-                // Re-verify session remained idle during helper startup.
-                if automatic {
-                    let recheck = self.evaluate_auto_decision(true, ctx.has_host_connection, ctx.viewer_count, ctx.has_blocking_prompt);
-                    if let policy::AutoInstallDecision::Blocked(reason) = recheck {
-                        pending.abort();
-                        self.state = UpdaterState::Ready;
-                        self.status_text = reason
-                            .deferral_message(self.manifest.as_ref().map(|m| m.version.as_str()), true)
-                            .unwrap_or_else(|| "检测到活动会话，自动安装已推迟".into());
-                        return Ok(false);
-                    }
+                if !host.begin_restart() {
+                    pending.abort();
+                    return self.defer_install_for_host(automatic);
                 }
                 self.installation_handed_off = true;
                 Ok(true)
@@ -1256,11 +1252,20 @@ impl WindowUpdater {
                 Ok(true)
             }
             Err(err) => {
+                if elevated {
+                    host.cancel_restart();
+                }
                 self.state = UpdaterState::Ready;
                 self.status_text = err.clone();
                 Err(err)
             }
         }
+    }
+
+    fn defer_install_for_host(&mut self, automatic: bool) -> Result<bool, String> {
+        self.state = UpdaterState::Ready;
+        self.status_text = "检测到活动被控会话，安装更新已推迟".into();
+        if automatic { Ok(false) } else { Err(self.status_text.clone()) }
     }
 
     pub fn handle_worker_event(&mut self, event: WorkerEvent, settings: &mut super::settings::Settings) -> (bool, bool) {
@@ -1379,7 +1384,14 @@ impl WindowUpdater {
         (save_settings, trigger_immediate_install)
     }
 
-    pub fn tick(&mut self, window: HWND, wm_event: u32, settings: &super::settings::Settings, ctx: WindowUpdateContext) -> bool {
+    pub fn tick(
+        &mut self,
+        window: HWND,
+        wm_event: u32,
+        settings: &super::settings::Settings,
+        ctx: WindowUpdateContext,
+        host: &super::app::HostActivity,
+    ) -> bool {
         self.observe_remote_sessions(ctx.has_host_connection, ctx.viewer_count);
         if !self.config.enabled() || self.busy() {
             return false;
@@ -1411,7 +1423,7 @@ impl WindowUpdater {
         match self.evaluate_auto_decision(settings.auto_install_updates, ctx.has_host_connection, ctx.viewer_count, ctx.has_blocking_prompt) {
             policy::AutoInstallDecision::Proceed => {
                 if self.state == UpdaterState::Ready {
-                    self.execute_install(true, ctx).unwrap_or(false)
+                    self.execute_install(true, ctx, host).unwrap_or(false)
                 } else {
                     self.start_download_and_stage(window, wm_event, true, false);
                     false

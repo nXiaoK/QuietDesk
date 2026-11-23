@@ -140,7 +140,7 @@ fn main() {
                 preferred_display: None,
             };
             let (_commands, queue) = tokio::sync::mpsc::unbounded_channel::<HostCommand>();
-            network_runtime().spawn(serve_host(port, key, Arc::new(Mutex::new(options)), queue, |notice| println!("host {notice:?}")));
+            network_runtime().spawn(serve_host(port, key, Arc::new(Mutex::new(options)), queue, Arc::default(), |notice| println!("host {notice:?}")));
             std::thread::sleep(std::time::Duration::from_secs(option("--seconds").and_then(|seconds| seconds.parse().ok()).unwrap_or(3600)));
         }
         Some("viewer") => {

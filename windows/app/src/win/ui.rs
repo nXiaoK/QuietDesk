@@ -1,6 +1,6 @@
 //! The main window: connect to another machine, or share this PC.
 
-use super::app::{HostNotice, computer_name, network_runtime, serve_host, start_logging};
+use super::app::{HostActivity, HostNotice, computer_name, network_runtime, serve_host, start_logging};
 use super::canvas::{self, WM_CANVAS_CLOSED, WM_CANVAS_CONNECTED, WM_CAPS_PREFERENCE};
 use super::clipboard;
 use super::displays;
@@ -61,15 +61,15 @@ struct Main {
     session_status: String,
     displays: Vec<RemoteDisplayInfo>,
     active_display: Option<u32>,
-    has_host_connection: bool,
+    host_activity: Arc<HostActivity>,
     modal_prompt_open: AtomicBool,
     auto_reconnect: watch::Sender<bool>,
     runtime: tokio::runtime::Handle,
     /// Present while this PC is shared; closing it stops the listener and ends the session.
     sharing: Option<UnboundedSender<HostCommand>>,
     notices: Arc<Mutex<VecDeque<HostNotice>>>,
-    /// Save an explicitly opened connection once. Retrying must not restore a forgotten record.
-    viewers: Vec<(canvas::ViewerWindow, Connection)>,
+    /// Keep each window registered; consume its history entry on the first connection.
+    viewers: Vec<(canvas::ViewerWindow, Option<Connection>)>,
     updater: super::update::WindowUpdater,
 }
 
@@ -100,7 +100,7 @@ impl Main {
 
     fn refresh_update_controls(&self) {
         self.set_text(UPDATE_STATUS, &self.updater.status_text);
-        self.set_text(UPDATE_ACTION, self.updater.action_button_label(self.has_host_connection));
+        self.set_text(UPDATE_ACTION, self.updater.action_button_label(self.host_activity.connected()));
         let enabled = self.updater.config.enabled();
         let can_click_action = enabled && self.updater.state != super::update::UpdaterState::Installing;
         unsafe {
@@ -118,7 +118,6 @@ impl Main {
 
     fn finish_for_update_restart(&mut self) {
         self.sharing = None;
-        self.has_host_connection = false;
         unsafe {
             let _ = KillTimer(Some(self.window), TIMER_UPDATE_TICK);
             let _ = DestroyWindow(self.window);
@@ -127,7 +126,7 @@ impl Main {
 
     fn update_context(&self) -> super::update::WindowUpdateContext {
         super::update::WindowUpdateContext {
-            has_host_connection: self.has_host_connection,
+            has_host_connection: self.host_activity.connected(),
             viewer_count: self.viewers.len(),
             has_blocking_prompt: self.modal_prompt_open.load(Ordering::Acquire),
             is_sharing_enabled: self.sharing.is_some(),
@@ -136,7 +135,7 @@ impl Main {
     }
 
     fn trigger_manual_install(&mut self) {
-        if self.has_host_connection {
+        if self.host_activity.connected() {
             return self.alert("这台电脑正被远程控制。为避免远端失联，请先停止共享或等待会话结束后安装更新。");
         }
         if !self.viewers.is_empty() || !self.settings.auto_install_updates {
@@ -157,7 +156,7 @@ impl Main {
         }
         let mut ctx = self.update_context();
         ctx.window_minimized_or_hidden = false;
-        match self.updater.execute_install(false, ctx) {
+        match self.updater.execute_install(false, ctx, &self.host_activity) {
             Ok(true) => self.finish_for_update_restart(),
             Ok(false) => self.refresh_update_controls(),
             Err(err) => {
@@ -213,7 +212,7 @@ impl Main {
 
     fn tick_updater(&mut self) {
         let ctx = self.update_context();
-        if self.updater.tick(self.window, WM_UPDATE_EVENT, &self.settings, ctx) {
+        if self.updater.tick(self.window, WM_UPDATE_EVENT, &self.settings, ctx, &self.host_activity) {
             self.finish_for_update_restart();
         } else {
             self.refresh_update_controls();
@@ -318,7 +317,7 @@ impl Main {
             self.local_identity.clone(),
             self.auto_reconnect.subscribe(),
         ) {
-            Ok(window) => self.viewers.push((window, Connection { address, port, name: String::new(), code: stored, device_id: None })),
+            Ok(window) => self.viewers.push((window, Some(Connection { address, port, name: String::new(), code: stored, device_id: None }))),
             Err(error) => self.alert(&format!("无法打开远程窗口：{error}")),
         }
     }
@@ -326,12 +325,11 @@ impl Main {
     fn toggle_sharing(&mut self) {
         self.viewer_name = None;
         if self.sharing.take().is_some() {
-            self.has_host_connection = false;
             self.active_display = None;
             self.refresh_displays();
             self.set_text(SHARE, "开始共享");
             self.set_text(HOST_STATUS, "未共享");
-            self.updater.observe_remote_sessions(false, self.viewers.len());
+            self.updater.observe_remote_sessions(self.host_activity.connected(), self.viewers.len());
             self.refresh_update_controls();
             return;
         }
@@ -356,7 +354,7 @@ impl Main {
             notices.lock().unwrap().push_back(notice);
             let _ = unsafe { PostMessageW(Some(HWND(window as _)), WM_HOST_NOTICE, WPARAM(0), LPARAM(0)) };
         };
-        self.runtime.spawn(serve_host(port, key, Arc::new(Mutex::new(options)), queue, notify));
+        self.runtime.spawn(serve_host(port, key, Arc::new(Mutex::new(options)), queue, self.host_activity.clone(), notify));
         self.sharing = Some(commands);
         self.set_text(SHARE, "停止共享");
         self.set_text(HOST_STATUS, "正在开启共享…");
@@ -370,17 +368,15 @@ impl Main {
             HostNotice::Listening(port) => self.set_text(HOST_STATUS, &format!("等待连接 · 端口 {port}（首次共享时请在防火墙提示中允许访问）")),
             HostNotice::Failed(reason) => {
                 self.sharing = None;
-                self.has_host_connection = false;
                 self.set_text(SHARE, "开始共享");
                 self.set_text(HOST_STATUS, &format!("共享未开启：{reason}"));
-                self.updater.observe_remote_sessions(false, self.viewers.len());
+                self.updater.observe_remote_sessions(self.host_activity.connected(), self.viewers.len());
                 self.refresh_update_controls();
             }
             HostNotice::Connected => {
-                self.has_host_connection = true;
                 self.viewer_name = None;
                 self.update_session_status("控制端已连接，正在准备画面…".into());
-                self.updater.observe_remote_sessions(true, self.viewers.len());
+                self.updater.observe_remote_sessions(self.host_activity.connected(), self.viewers.len());
                 self.refresh_update_controls();
             }
             HostNotice::Session(HostEvent::ViewerIdentity(device)) => {
@@ -406,12 +402,11 @@ impl Main {
             HostNotice::Session(HostEvent::Paused(true)) => self.update_session_status("控制端已暂停画面，连接保持".into()),
             HostNotice::Session(_) => {}
             HostNotice::Ended(reason) => {
-                self.has_host_connection = false;
                 self.viewer_name = None;
                 self.active_display = None;
                 self.refresh_displays();
                 self.set_text(HOST_STATUS, &format!("等待重新连接 · {reason}"));
-                self.updater.observe_remote_sessions(false, self.viewers.len());
+                self.updater.observe_remote_sessions(self.host_activity.connected(), self.viewers.len());
                 self.refresh_update_controls();
             }
         }
@@ -544,7 +539,7 @@ impl Main {
                                 self.alert(&err);
                             }
                         } else {
-                            let immediate = !self.has_host_connection;
+                            let immediate = !self.host_activity.connected();
                             self.updater.start_download_and_stage(self.window, WM_UPDATE_EVENT, false, immediate);
                             self.refresh_update_controls();
                         }
@@ -573,7 +568,7 @@ impl Main {
                     self.settings.auto_check_updates = true;
                 }
                 self.save();
-                if enabled && self.updater.manifest.is_none() && !self.updater.busy() && !self.has_host_connection && self.viewers.is_empty() {
+                if enabled && self.updater.manifest.is_none() && !self.updater.busy() && !self.host_activity.connected() && self.viewers.is_empty() {
                     self.updater.start_check(self.window, WM_UPDATE_EVENT, false);
                 }
                 self.tick_updater();
@@ -727,10 +722,10 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 }
             }
             WM_CANVAS_CONNECTED => {
-                if let Some(index) = main.viewers.iter().position(|(viewer, _)| viewer.window.0 as usize == wparam.0)
-                    && let Some(host) = main.viewers[index].0.connected.take()
+                if let Some((viewer, history)) = main.viewers.iter_mut().find(|(viewer, _)| viewer.window.0 as usize == wparam.0)
+                    && let Some(host) = viewer.connected.take()
+                    && let Some(mut connection) = history.take()
                 {
-                    let (_, mut connection) = main.viewers.remove(index);
                     connection.name = host.name;
                     connection.device_id = host.id;
                     main.settings.remember(connection);
@@ -740,7 +735,7 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
             }
             WM_CANVAS_CLOSED => {
                 main.viewers.retain(|(viewer, _)| viewer.window.0 as usize != wparam.0);
-                main.updater.observe_remote_sessions(main.has_host_connection, main.viewers.len());
+                main.updater.observe_remote_sessions(main.host_activity.connected(), main.viewers.len());
                 main.refresh_update_controls();
             }
             WM_CAPS_PREFERENCE => {
@@ -821,7 +816,7 @@ unsafe fn run_window() -> windows::core::Result<()> {
             settings,
             displays: Vec::new(),
             active_display: None,
-            has_host_connection: false,
+            host_activity: Arc::default(),
             modal_prompt_open: AtomicBool::new(false),
             runtime: network_runtime(),
             sharing: None,

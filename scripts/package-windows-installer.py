@@ -101,7 +101,8 @@ def write_checksums(output_dir: Path, version: str):
         for name in names
     ]
     checksum_path = output_dir / f"SHA256SUMS-{version}-Windows.txt"
-    checksum_path.write_text("".join(lines), encoding="utf-8")
+    # Keep LF line endings on Windows for shasum verification on macOS.
+    checksum_path.write_bytes("".join(lines).encode("utf-8"))
     return checksum_path
 
 

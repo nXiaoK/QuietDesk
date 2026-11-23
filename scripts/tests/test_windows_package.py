@@ -6,6 +6,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -81,19 +82,28 @@ class WindowsInstallerPackagingTests(unittest.TestCase):
         self.make_portable_zip(dist, "0.8.0", "x64", synthetic_pe(0x8664))
         self.make_portable_zip(dist, "0.8.0", "arm64", synthetic_pe(0xAA64))
         fake_iscc = self.make_fake_iscc()
-        installers, checksum_file = module.build_installers(
-            root=ROOT,
-            dist_dir=dist,
-            version="0.8.0",
-            build=31,
-            arches=("x64", "arm64"),
-            iscc_path=fake_iscc,
-        )
+
+        def write_windows_text(path, data, *, encoding):
+            with path.open("w", encoding=encoding, newline="\r\n") as stream:
+                return stream.write(data)
+
+        with patch.object(Path, "write_text", write_windows_text):
+            installers, checksum_file = module.build_installers(
+                root=ROOT,
+                dist_dir=dist,
+                version="0.8.0",
+                build=31,
+                arches=("x64", "arm64"),
+                iscc_path=fake_iscc,
+            )
         self.assertEqual(
             [p.name for p in installers],
             ["QuietDesk-0.8.0-Windows-x64-Setup.exe", "QuietDesk-0.8.0-Windows-arm64-Setup.exe"],
         )
-        lines = checksum_file.read_text(encoding="utf-8").strip().splitlines()
+        checksum_bytes = checksum_file.read_bytes()
+        self.assertNotIn(b"\r", checksum_bytes)
+        self.assertTrue(checksum_bytes.endswith(b"\n"))
+        lines = checksum_bytes.decode("utf-8").splitlines()
         self.assertEqual(len(lines), 4)
         recorded = {}
         for line in lines:

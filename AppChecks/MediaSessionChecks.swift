@@ -722,26 +722,16 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
    run("Authenticated UDP interactive fast lane delivers cursor positions and sequenced pointer moves with TCP fallback") {
        let key = try PairingKey.generate()
        let queue = DispatchQueue(label: "checks.interactive-fast-lane")
-       var udpReservation = socket(AF_INET, SOCK_DGRAM, 0)
-       guard udpReservation >= 0 else { throw Failure(message: "Could not reserve UDP socket") }
+       let reservation = try reserveMediaPort()
+       let port = reservation.port
+       var udpReservation = reservation.socket
        defer { if udpReservation >= 0 { close(udpReservation) } }
-       var addr = sockaddr_in()
-       addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-       addr.sin_family = sa_family_t(AF_INET)
-       addr.sin_port = 0
-       addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-       let bound = withUnsafePointer(to: &addr) {
-           $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(udpReservation, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
-       }
-       guard bound == 0 else { throw Failure(message: "Could not bind UDP reservation") }
-       var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-       _ = withUnsafeMutablePointer(to: &addr) {
-           $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(udpReservation, $0, &len) }
-       }
-       let port = UInt16(bigEndian: addr.sin_port)
-       let listener = try NWListener(using: MediaSecureTransport.tlsParameters(key: key, roles: MediaChannelRole.allCases),
-                                     on: NWEndpoint.Port(rawValue: port)!)
+       let parameters = try MediaSecureTransport.tlsParameters(key: key, roles: MediaChannelRole.allCases)
+       parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!)
+       let listener = try NWListener(using: parameters)
+       defer { listener.cancel() }
        let listenReady = DispatchSemaphore(value: 0)
+       let listenError = Box<NWError?>(nil)
        let committed = DispatchSemaphore(value: 0)
        let cursorDone = DispatchSemaphore(value: 0)
        let inputDone = DispatchSemaphore(value: 0)
@@ -769,9 +759,20 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
            }
            peer.start()
        }
-       listener.stateUpdateHandler = { if case .ready = $0 { listenReady.signal() } }
+       listener.stateUpdateHandler = { state in
+           switch state {
+           case .ready:
+               listenReady.signal()
+           case .failed(let error):
+               listenError.update { $0 = error }
+               listenReady.signal()
+           default:
+               break
+           }
+       }
        listener.start(queue: queue)
        try wait(listenReady, "Interactive listener ready")
+       if let error = listenError.get() { throw error }
        close(udpReservation); udpReservation = -1
        let client = Peer(connection: NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!,
                                                   using: try MediaSecureTransport.tlsParameters(key: key, roles: [.control])))
@@ -787,7 +788,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
        }
        defer {
            viewerBox.get()?.stop(); hostBox.get()?.stop()
-           client.close("done"); peers.get().forEach { $0.close("done") }; listener.cancel()
+           client.close("done"); peers.get().forEach { $0.close("done") }
        }
        client.start()
        try wait(committed, "Interactive UDP stream did not commit", seconds: 8)

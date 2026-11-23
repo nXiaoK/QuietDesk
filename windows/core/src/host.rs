@@ -628,7 +628,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                     }
                     self.udp_frames = Some(queue);
                 }
-                if self.udp_frames.as_mut().expect("active UDP stream").insert(frame, now, self.datagrams.rtt).is_err() {
+                if self.udp_frames.as_mut().expect("active UDP stream").insert(frame, now, self.datagrams.rtt()).is_err() {
                     self.interrupt_datagram_stream()?;
                 }
             }
@@ -644,7 +644,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
 
     fn sync_gate(&mut self) {
         let rtt =
-            self.round_trips.effective(Instant::now(), self.media.frame_path() == MediaPath::Udp, self.datagrams.verified().then_some(self.datagrams.rtt));
+            self.round_trips.effective(Instant::now(), self.media.frame_path() == MediaPath::Udp, self.datagrams.verified().then_some(self.datagrams.rtt()));
         let fps = self.state.map_or(self.options.preferred, |state| state.settings).frames_per_second;
         let mut window = self.window.lock().unwrap();
         window.limit = self.media.capture_limits.credits(fps, rtt);
@@ -703,7 +703,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 {
                     return Ok(());
                 }
-                if !frames.feedback(&feedback, Instant::now(), self.datagrams.rtt) {
+                if !frames.feedback(&feedback, Instant::now(), self.datagrams.rtt()) {
                     return self.interrupt_datagram_stream();
                 }
                 let update = self.media.feedback(&feedback);
@@ -754,7 +754,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
             // The reliable opening handshake also proves that the first frame was decoded.
             let header = MediaFrameHeader { stream: frames.stream, frame_id: 1, is_idr: true };
             let ack = MediaFeedback::new(FeedbackKind::Decoded, header)?;
-            frames.feedback(&ack, Instant::now(), self.datagrams.rtt);
+            frames.feedback(&ack, Instant::now(), self.datagrams.rtt());
         }
         if control.operation == MediaOperation::Recover {
             self.recover_after = Instant::now() + Duration::from_secs(1);
@@ -966,7 +966,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
             && let Some(header) = fast_opening
             && let Some(frames) = &mut self.udp_frames
         {
-            frames.feedback(&MediaFeedback::new(FeedbackKind::Decoded, header)?, Instant::now(), self.datagrams.rtt);
+            frames.feedback(&MediaFeedback::new(FeedbackKind::Decoded, header)?, Instant::now(), self.datagrams.rtt());
         }
         self.sync_gate();
         Ok(())

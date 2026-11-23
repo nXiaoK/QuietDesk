@@ -630,7 +630,7 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         let Some(receiver) = &mut self.udp_receiver else { return Ok(()) };
         let now = Instant::now();
         receiver.poll_at = now + Duration::from_millis(10);
-        receiver.frames.set_round_trip(self.datagrams.rtt);
+        receiver.frames.set_round_trip(self.datagrams.rtt());
         let events = receiver.frames.poll(now);
         self.receive_datagrams(events)
     }
@@ -1369,7 +1369,7 @@ mod tests {
                 if let Some(previous) = buffered.replace(sequence) {
                     decoder.send(DecodeReceipt::Media(stream, previous)).unwrap();
                     let ack = feedback(&mut path, FeedbackKind::Decoded, source.header.frame_id - 1).await;
-                    cache.feedback(&ack, Instant::now(), path.rtt);
+                    cache.feedback(&ack, Instant::now(), path.rtt());
                     assert_eq!(media.feedback(&ack), (1, vec![]));
                 }
             }

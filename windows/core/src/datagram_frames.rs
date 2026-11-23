@@ -152,7 +152,7 @@ impl DatagramFrames {
     pub fn pump(&mut self, path: &DatagramPath, now: Instant) -> bool {
         if now >= self.next_poll {
             self.next_poll = now + Duration::from_millis(20);
-            let event = self.cache.poll(now, path.rtt);
+            let event = self.cache.poll(now, path.rtt());
             if !self.update(event, now, true) {
                 return false;
             }

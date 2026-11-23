@@ -91,7 +91,7 @@ pub(crate) struct DatagramPath {
     started: bool,
     paused: bool,
     verified: bool,
-    pub rtt: Duration,
+    rtt: Duration,
 }
 
 impl DatagramPath {
@@ -159,6 +159,10 @@ impl DatagramPath {
 
     pub fn verified(&self) -> bool {
         self.verified
+    }
+
+    pub fn rtt(&self) -> Duration {
+        self.driver.as_ref().map_or(self.rtt, |io| *io.rtt.borrow())
     }
 
     pub fn authenticated(&self) -> bool {
@@ -381,6 +385,8 @@ mod tests {
             assert!(matches!(host.next().await, PathEvent::Verified));
             // Neither session reads events while the encoder is reconfiguring.
             tokio::time::sleep(NONCE_LIFETIME * 2).await;
+            assert!(host.rtt() < Duration::from_millis(50));
+            assert!(viewer.rtt() < Duration::from_millis(50));
             assert!(viewer.send(vec![3, 123]));
             assert!(matches!(host.next().await, PathEvent::Record(3, bytes) if bytes == [3, 123]));
         })

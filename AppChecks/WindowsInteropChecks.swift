@@ -132,6 +132,8 @@ private final class InteropMediaRoute: @unchecked Sendable {
     private let pongDelay: Double
     private let delayed = DispatchQueue(label: "interop.delayed-probes", attributes: .concurrent)
     private var forwarding: Bool
+    private var holdingProbes = false
+    private var heldProbes: [(NWConnection, Data)] = []
     private var peers: [NWConnection] = []
 
     init(target: UInt16, forwardUDP: Bool, pongDelay: Double = 0) throws {
@@ -185,14 +187,33 @@ private final class InteropMediaRoute: @unchecked Sendable {
                     forward = false
                 }
             }
-            if forward, video, self.pongDelay > 0, data.first == 23, data.count == Self.overhead + 1024 {
-                self.delayed.async {
+            let isProbe = data.first == 23 && data.count == Self.overhead + 1024
+            if forward, video, self.pongDelay > 0, isProbe {
+                self.delayed.async { [weak self] in
+                    guard let self else { return }
                     Thread.sleep(forTimeInterval: self.pongDelay)
-                    target.send(content: data, completion: .idempotent)
+                    self.queue.async {
+                        guard self.forwarding else { return }
+                        if self.holdingProbes { self.heldProbes.append((target, data)) }
+                        else { target.send(content: data, completion: .idempotent) }
+                    }
                 }
+            } else if forward, isProbe, self.holdingProbes {
+                self.heldProbes.append((target, data))
             } else if forward { target.send(content: data, completion: .idempotent) }
             else { self.dropped.update { $0 += 1 } }
             self.receive(from: source, to: target, video: video)
+        }
+    }
+
+    func holdProbes(_ enabled: Bool) {
+        queue.sync {
+            holdingProbes = enabled
+            if !enabled {
+                let pending = heldProbes
+                heldProbes.removeAll()
+                for (target, data) in pending { target.send(content: data, completion: .idempotent) }
+            }
         }
     }
 
@@ -691,20 +712,19 @@ private final class MacViewer: @unchecked Sendable {
         let nonce = ping
         let echoes = Shared(0), records = Shared<[Data]>([])
         let gate = Shared((closed: false, pongs: [Data]()))
-        let response = DispatchQueue(label: "interop.delayed-nonce")
+        let response = DispatchQueue(label: "interop.delayed-nonce", attributes: .concurrent)
         udp.onDatagram = { [weak udp] data in
             if data.first == 1, data.count == 1024 {
                 var bytes = data; bytes[bytes.startIndex] = 2
                 let pong = bytes
-                let hold = gate.update { value in
-                    if value.closed { value.pongs.append(pong) }
-                    return value.closed
-                }
-                if !hold {
-                    response.async { [weak udp] in
-                        if pongDelay > 0 { Thread.sleep(forTimeInterval: pongDelay) }
-                        _ = udp?.send(pong); _ = udp?.send(nonce)
+                response.async { [weak udp] in
+                    if pongDelay > 0 { Thread.sleep(forTimeInterval: pongDelay) }
+                    let hold = gate.update { value -> Bool in
+                        if value.closed { value.pongs.append(pong) }
+                        return value.closed
                     }
+                    if !hold { _ = udp?.send(pong) }
+                    _ = udp?.send(nonce)
                 }
             } else if data.first == 2, data.dropFirst() == nonce.dropFirst() { echoes.update { $0 += 1 } }
             else if data.first == 3 || data.first == 5 { records.update { $0.append(data) } }
@@ -764,6 +784,10 @@ private final class MacViewer: @unchecked Sendable {
                                 try until("Windows sends the full protocol commit") { responses().contains(.commit) }
                             }
                             if epoch == 1 {
+                                if pongDelay < 0.2 {
+                                    gate.update { $0.closed = true }
+                                    usleep(5_000)
+                                }
                                 try probe.send(["command": "observeCaptureWindow", "enabled": true])
                                 _ = try probe.next("captureWindowArmed")
                             }
@@ -2574,7 +2598,7 @@ private struct WindowsInteropChecks {
             }
         }
 
-        func verifyWindowsViewerWindow(_ host: MacHost, _ probe: Probe, expected: Int) throws {
+        func verifyWindowsViewerWindow(_ host: MacHost, _ probe: Probe, expected: Int, onWindowVerified: () -> Void = {}) throws {
             try probe.send(["command": "holdAcknowledgements", "hold": true])
             let snapshot = host.state.get()
             let window = VideoFrameFlow.maximumOutstandingFrames(for: snapshot.applied.settings, receiverLimit: snapshot.receiverLimit)
@@ -2590,6 +2614,7 @@ private struct WindowsInteropChecks {
             let frames = probe.all("frame")
             try require(frames.filter { $0["held"] as? Bool == true }.count == sequences.count
                         && host.state.get().waiting == Set(sequences), "The host exceeded or prematurely released its decode window")
+            onWindowVerified()
             try probe.send(["command": "holdAcknowledgements", "hold": false])
             for sequence in sequences { try probe.send(["command": "acknowledge", "sequence": Int(sequence)]) }
             try until("decode receipts reopen the Mac capture window") { probe.all("frame").count > frames.count + 6 }
@@ -2604,11 +2629,22 @@ private struct WindowsInteropChecks {
                     route = relay
                     return relay.port
                 }) { host, probe in
+                    let maximum = MediaBufferLimits.maximumDynamicFrameWindow
+                    let matchesLimit: (Int?) -> Bool = { limit in
+                        guard let limit else { return false }
+                        return window == maximum ? limit == maximum : (window..<maximum).contains(limit)
+                    }
                     try until("the measured path selects \(window) credits", seconds: 15) {
                         let state = host.state.get()
-                        return state.commits.last?.path == "udp" && state.receiverLimit == window
+                        return state.commits.last?.path == "udp" && matchesLimit(state.receiverLimit)
                     }
-                    try verifyWindowsViewerWindow(host, probe, expected: window)
+                    route?.holdProbes(true)
+                    defer { route?.holdProbes(false) }
+                    usleep(5_000)
+                    guard let negotiated = host.state.get().receiverLimit, matchesLimit(negotiated) else {
+                        throw Failure("The delayed UDP route lost its negotiated window: \(String(describing: host.state.get().receiverLimit))")
+                    }
+                    try verifyWindowsViewerWindow(host, probe, expected: negotiated, onWindowVerified: { route?.holdProbes(false) })
                 }
             }
         }

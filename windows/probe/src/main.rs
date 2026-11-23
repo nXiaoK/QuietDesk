@@ -350,10 +350,11 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
                 replay.next = (replay.next + 1) % frames.len();
             }
             // No await separates admission from observation on the probe's current-thread runtime.
-            if check == WindowCheck::Filling && queued && sink.outstanding() >= sink.credit_limit() {
+            let limit = sink.credit_limit();
+            if check == WindowCheck::Filling && sink.outstanding() >= limit {
                 let held = sink.outstanding();
                 let excess = sink.try_submit(frames[replay.next].clone());
-                emit(json!({"event":"captureWindowFull","limit":sink.credit_limit(),"outstanding":held,"excessDropped":excess == FrameSubmission::Dropped}));
+                emit(json!({"event":"captureWindowFull","limit":limit,"outstanding":held,"excessDropped":excess == FrameSubmission::Dropped}));
                 replay.window_check = WindowCheck::Full(held);
             } else if matches!(check, WindowCheck::Full(_)) {
                 emit(json!({"event":"captureCreditReleased","remaining":outstanding,"limit":sink.credit_limit(),"queued":queued}));

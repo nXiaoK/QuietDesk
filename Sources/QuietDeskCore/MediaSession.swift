@@ -27,6 +27,30 @@ private final class MediaTrafficRelay: @unchecked Sendable {
     }
 }
 
+package struct MediaDatagramChallenges {
+    private static let lifetime: TimeInterval = 1
+    private static let maximumOutstanding = 20
+    private var outstanding: [(nonce: Data, sentAt: TimeInterval)] = []
+
+    package init() {}
+
+    package mutating func sent(_ nonce: Data, at now: TimeInterval) {
+        outstanding.removeAll { now - $0.sentAt >= Self.lifetime }
+        if outstanding.count == Self.maximumOutstanding { outstanding.removeFirst() }
+        outstanding.append((nonce, now))
+    }
+
+    package mutating func answer(_ nonce: Data, at now: TimeInterval) -> (sentAt: TimeInterval, roundTrip: TimeInterval)? {
+        guard let index = outstanding.firstIndex(where: { $0.nonce == nonce }) else { return nil }
+        let sentAt = outstanding.remove(at: index).sentAt
+        let roundTrip = now - sentAt
+        guard roundTrip >= 0, roundTrip < Self.lifetime else { return nil }
+        return (sentAt, roundTrip)
+    }
+
+    package mutating func clear() { outstanding.removeAll(keepingCapacity: true) }
+}
+
 // One queue owns negotiation, transport selection, frame credit and cutover transactions.
 public final class MediaSession: @unchecked Sendable {
     public struct DatagramEndpoint: Sendable {
@@ -213,14 +237,13 @@ public final class MediaSession: @unchecked Sendable {
     private var pendingDatagramPeers: [ObjectIdentifier: BoundedDatagramPeer] = [:]
     private var udpVerified = false
     private var receivedChallenge = false
-    private var challenge: Data?
-    private var challengeSentAt: TimeInterval = 0
+    private var challenges = MediaDatagramChallenges()
     private var lastPingAt: TimeInterval = 0
     private var lastPongAt: TimeInterval = 0
     private var livenessResumedAt: TimeInterval = 0
     private var livenessGrace = LocalSchedulingGrace()
     private var roundTrip: TimeInterval = 0.01
-    // When the challenge of the latest answered ping was first sent.
+    // Send time of the newest answered challenge.
     private var lastAnsweredChallengeAt: TimeInterval = 0
     private var controlRoundTrip: (milliseconds: Double, at: TimeInterval)?
     private var reportedLocalNetwork: Bool?
@@ -500,6 +523,7 @@ public final class MediaSession: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, !self.stopped, self.paused != value else { return }
             self.paused = value
+            self.challenges.clear()
             self.refreshInteractiveDatagramAvailability()
             self.reliableDeliveryFailures = 0; self.reliableFailureNotified = false
             if !value { self.livenessResumedAt = SessionClock.uptime }
@@ -523,7 +547,7 @@ public final class MediaSession: @unchecked Sendable {
             self.controlRoundTrip = nil
             self.udpJitter.reset()
             self.receivedChallenge = false
-            self.challenge = nil
+            self.challenges.clear()
             self.udpPeer?.close("媒体网络路径变化，需要重新验证")
             self.clearDatagrams()
         }
@@ -537,7 +561,7 @@ public final class MediaSession: @unchecked Sendable {
             let usingAlternate = self.udpPeer != nil && self.udpRelayed && !self.initialDatagramRelayed
             self.alternateEndpoint = nil; self.alternateProbePending = false; self.alternateRequested = false
             guard usingAlternate else { return }
-            self.udpVerified = false; self.receivedChallenge = false; self.challenge = nil
+            self.udpVerified = false; self.receivedChallenge = false; self.challenges.clear()
             self.refreshInteractiveDatagramAvailability()
             self.udpJitter.reset()
             self.udpPeer?.close("中继媒体路径已关闭")
@@ -602,6 +626,7 @@ public final class MediaSession: @unchecked Sendable {
             self.pathMonitor?.cancel(); self.pathMonitor = nil
             self.udpListener?.cancel(); self.udpListener = nil
             self.udpPeer?.close(); self.udpPeer = nil
+            self.challenges.clear()
             for peer in self.pendingDatagramPeers.values { peer.close() }
             self.pendingDatagramPeers.removeAll()
             self.videoPeer?.close(); self.videoPeer = nil
@@ -744,7 +769,7 @@ public final class MediaSession: @unchecked Sendable {
             pending.awaitingUDPVerification = canAwaitUDP
             if pending.fast, path == .udp, !canAwaitUDP {
                 pending.awaitingLiveness = true; pending.livenessFrom = SessionClock.uptime
-                challenge = nil
+                challenges.clear(); lastAnsweredChallengeAt = 0
                 sendPing()
             }
             transaction = pending
@@ -1041,7 +1066,8 @@ public final class MediaSession: @unchecked Sendable {
 
     private func installDatagram(_ peer: BoundedDatagramPeer, hostBinding: ((Data) -> Void)? = nil, start: Bool = true, release: @escaping () -> Void = {}) {
         if side == .host { hostAssist = hostBinding; udpRelayed = hostBinding != nil }
-        udpPeer = peer; udpVerified = false; receivedChallenge = false; challenge = nil; lastPongAt = 0
+        udpPeer = peer; udpVerified = false; receivedChallenge = false; challenges.clear(); lastPongAt = 0
+        lastAnsweredChallengeAt = 0
         refreshInteractiveDatagramAvailability()
         udpJitter.reset()
         peer.onReady = { [weak self, weak peer] in
@@ -1059,6 +1085,7 @@ public final class MediaSession: @unchecked Sendable {
             release()
             guard let self, let peer, self.udpPeer === peer else { return }
             self.udpPeer = nil; self.udpVerified = false
+            self.challenges.clear()
             self.refreshInteractiveDatagramAvailability()
             self.clearDatagrams()
             if self.side == .host, self.pendingDatagramPeers.isEmpty,
@@ -1090,18 +1117,11 @@ public final class MediaSession: @unchecked Sendable {
     }
 
     private func sendPing() {
-        guard !paused, udpPeer != nil else { return }
+        guard !paused, udpPeer != nil, let nonce = try? randomBytes(16) else { return }
         let now = SessionClock.uptime
-        // Retransmit the outstanding challenge without invalidating a pong taking
-        // longer than the 200 ms send interval, but never extend its one-second lifetime.
-        if challenge == nil || now - challengeSentAt >= 1 {
-            guard let nonce = try? randomBytes(16) else { return }
-            challenge = nonce; challengeSentAt = now
-        }
-        guard let nonce = challenge else { return }
         lastPingAt = now
         var payload = Data([1]); payload.append(nonce); payload.append(Data(count: 1024 - payload.count))
-        sendDatagram(payload)
+        if sendDatagram(payload) { challenges.sent(nonce, at: now) }
     }
 
     private func receiveDatagram(_ data: Data) {
@@ -1114,18 +1134,17 @@ public final class MediaSession: @unchecked Sendable {
                 receivedChallenge = true
                 var response = data; response[response.startIndex] = 2
                 sendDatagram(response)
-                if !udpVerified, lastPongAt > 0, SessionClock.uptime - lastPongAt < 1 {
+                if !paused, !udpVerified, lastPongAt > 0, SessionClock.uptime - lastPongAt < 1 {
                     verifiedUDP(receivedPong: false)
                 }
             case 2:
-                guard data.count == 1024, let challenge, data.dropFirst().prefix(16) == challenge else { return }
+                guard !paused, data.count == 1024 else { return }
                 let now = SessionClock.uptime
-                let measured = now - challengeSentAt
-                guard measured >= 0, measured < 1 else { return }
-                self.challenge = nil
-                lastAnsweredChallengeAt = challengeSentAt
+                guard let sample = challenges.answer(data.dropFirst().prefix(16), at: now) else { return }
+                let measured = sample.roundTrip
+                lastAnsweredChallengeAt = max(lastAnsweredChallengeAt, sample.sentAt)
                 lastPongAt = now
-                roundTrip = max(0.001, min(2, measured))
+                roundTrip = max(0.001, measured)
                 hasMeasuredRoundTrip = true
                 udpJitter.observeRoundTrip(measured)
                 if side == .viewer { receiver?.updateLimits(bufferLimits) }
@@ -1854,7 +1873,7 @@ public final class MediaSession: @unchecked Sendable {
         if livenessGrace.observe(now: SessionClock.uptime, interval: 0.01, allowance: 1), negotiated, !paused, !configurationSuspended {
             // A queued packet may run before the timer after a stall. Neither can prove delivery failure
             // from an old deadline, or accept a pre-stall nonce as a fresh RTT sample.
-            challenge = nil
+            challenges.clear()
             udpJitter.reset()
             sendPing()
             policy.allowLivenessRecovery(now: SessionClock.now)
@@ -2031,7 +2050,7 @@ public final class MediaSession: @unchecked Sendable {
 
     private func retireDatagramPath() {
         let previous = udpPeer
-        udpPeer = nil; udpVerified = false; receivedChallenge = false; challenge = nil; lastPongAt = 0
+        udpPeer = nil; udpVerified = false; receivedChallenge = false; challenges.clear(); lastPongAt = 0
         refreshInteractiveDatagramAvailability()
         udpJitter.reset()
         previous?.close("媒体路径失活，需要重新握手")

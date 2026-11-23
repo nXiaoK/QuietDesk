@@ -13,6 +13,26 @@ func runMediaPathPolicyChecks() {
                         isLocalNetwork: local, roundTripMilliseconds: roundTrip)
     }
 
+    run("UDP probes measure their own send time after loss and keep delayed answers in flight") {
+        var challenges = MediaDatagramChallenges()
+        let lost = Data([1]), next = Data([2]), slow = Data([3]), newer = Data([4])
+        challenges.sent(lost, at: 0)
+        challenges.sent(next, at: 0.2)
+        try check(challenges.answer(Data([5]), at: 0.205) == nil, "A different nonce supplied a sample")
+        try check(abs((challenges.answer(next, at: 0.205)?.roundTrip ?? 0) - 0.005) < 0.000_001,
+                  "The second probe inherited the first probe's delay")
+        try check(challenges.answer(next, at: 0.206) == nil, "A replayed echo supplied another sample")
+
+        challenges.sent(slow, at: 0.4)
+        challenges.sent(newer, at: 0.6)
+        let delayed = challenges.answer(slow, at: 0.67)
+        try check(delayed?.sentAt == 0.4 && abs((delayed?.roundTrip ?? 0) - 0.27) < 0.000_001,
+                  "A subsequent probe invalidated a 270 ms response")
+        try check(challenges.answer(lost, at: 1.125) == nil, "An expired nonce supplied a sample")
+        challenges.clear()
+        try check(challenges.answer(newer, at: 1.25) == nil, "A previous generation supplied a sample after reset")
+    }
+
     run("Local links keep the chosen native high frame rate despite codec load, loss or direct reduction requests") {
         let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 120, megabits: 100)
         var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (3024, 1964), now: 0)

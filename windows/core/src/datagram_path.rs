@@ -4,6 +4,7 @@ use crate::datagram_transport::{self, DatagramEvent, DatagramSender, DatagramTra
 use crate::media::{MediaControl, MediaOperation};
 use openssl::rand::rand_bytes;
 use retry::Recovery;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -12,7 +13,9 @@ use tokio::time::Instant;
 
 const PROBE_SIZE: usize = 1024;
 const PROBE_INTERVAL: Duration = Duration::from_millis(200);
+const FAST_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 const NONCE_LIFETIME: Duration = Duration::from_secs(1);
+const MAX_OUTSTANDING_PROBES: usize = (NONCE_LIFETIME.as_millis() / FAST_PROBE_INTERVAL.as_millis()) as usize;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) enum PathEvent {
@@ -24,33 +27,41 @@ pub(crate) enum PathEvent {
 
 #[derive(Default)]
 struct Challenge {
-    outstanding: Option<([u8; 16], Instant)>,
+    outstanding: VecDeque<([u8; 16], Instant)>,
     received: bool,
     last_pong: Option<Instant>,
 }
 
 impl Challenge {
-    fn ping(&mut self, now: Instant) -> Option<Vec<u8>> {
-        if self.outstanding.is_none_or(|(_, sent)| now.duration_since(sent) >= NONCE_LIFETIME) {
-            let mut nonce = [0; 16];
-            rand_bytes(&mut nonce).ok()?;
-            self.outstanding = Some((nonce, now));
+    fn ping(&mut self, now: Instant, send: impl FnOnce(Vec<u8>) -> bool) {
+        let mut nonce = [0; 16];
+        if rand_bytes(&mut nonce).is_err() {
+            return;
         }
         let mut bytes = vec![0; PROBE_SIZE];
         bytes[0] = 1;
-        bytes[1..17].copy_from_slice(&self.outstanding?.0);
-        Some(bytes)
+        bytes[1..17].copy_from_slice(&nonce);
+        if send(bytes) {
+            self.outstanding.retain(|(_, sent)| now.duration_since(*sent) < NONCE_LIFETIME);
+            if self.outstanding.len() == MAX_OUTSTANDING_PROBES {
+                self.outstanding.pop_front();
+            }
+            self.outstanding.push_back((nonce, now));
+        }
     }
 
     fn pong(&mut self, bytes: &[u8], now: Instant) -> Option<Duration> {
-        let (nonce, sent) = self.outstanding?;
-        let elapsed = now.duration_since(sent);
-        if bytes.len() != PROBE_SIZE || bytes[1..17] != nonce || elapsed >= NONCE_LIFETIME {
+        if bytes.len() != PROBE_SIZE {
             return None;
         }
-        self.outstanding = None;
+        let matched = self.outstanding.iter().position(|(nonce, _)| bytes[1..17] == *nonce)?;
+        let (_, sent) = self.outstanding.remove(matched)?;
+        let elapsed = now.checked_duration_since(sent)?;
+        if elapsed >= NONCE_LIFETIME {
+            return None;
+        }
         self.last_pong = Some(now);
-        Some(elapsed.clamp(Duration::from_millis(1), Duration::from_secs(2)))
+        Some(elapsed.max(Duration::from_millis(1)))
     }
 
     fn verified(&self, now: Instant) -> bool {
@@ -286,7 +297,7 @@ async fn drive(
                 if changed.is_err() { return }
                 pending_probe = *probes.borrow_and_update();
                 if pending_probe.is_some() {
-                    challenge.outstanding = None;
+                    challenge.outstanding.clear();
                     next_ping = Instant::now();
                 }
                 continue;
@@ -301,8 +312,8 @@ async fn drive(
             }
             _ = tokio::time::sleep_until(next_ping), if ready && !paused => {
                 let now = Instant::now();
-                next_ping = now + if pending_probe.is_some() { Duration::from_millis(50) } else { PROBE_INTERVAL };
-                if let Some(ping) = challenge.ping(now) { io.try_send(ping); }
+                next_ping = now + if pending_probe.is_some() { FAST_PROBE_INTERVAL } else { PROBE_INTERVAL };
+                challenge.ping(now, |ping| io.try_send(ping));
                 let last = challenge.last_pong.unwrap_or(resumed).max(resumed);
                 if (verified && now.duration_since(last) >= NONCE_LIFETIME) || (!verified && now.duration_since(resumed) >= PROBE_TIMEOUT) {
                     log::info!("media UDP challenge timed out");
@@ -330,11 +341,10 @@ async fn drive(
                         io.try_send(bytes);
                         challenge.received = true;
                     }
-                    Some(2) => {
+                    Some(2) if !paused => {
                         if let Some(rtt) = challenge.pong(&bytes, now) {
                             measured_rtt.send_replace(rtt);
-                            if !paused
-                                && let Some(id) = pending_probe
+                            if let Some(id) = pending_probe
                                 && events.try_send(PathEvent::FreshPong(id)).is_ok()
                             {
                                 pending_probe = None;
@@ -429,25 +439,44 @@ mod tests {
 
     #[test]
     fn both_directions_and_a_fresh_matching_nonce_are_required() {
+        fn send_probe(challenge: &mut Challenge, at: Instant) -> Vec<u8> {
+            let mut pong = None;
+            challenge.ping(at, |mut data| {
+                assert_eq!(data.len(), PROBE_SIZE);
+                assert_eq!(data[0], 1);
+                data[0] = 2;
+                pong = Some(data);
+                true
+            });
+            pong.unwrap()
+        }
+
         let now = Instant::now();
         let mut challenge = Challenge::default();
-        let ping = challenge.ping(now).unwrap();
-        assert_eq!(ping.len(), PROBE_SIZE);
-        assert_eq!(challenge.ping(now + PROBE_INTERVAL).unwrap(), ping);
-        let mut reply = ping.clone();
-        reply[0] = 2;
+        let lost = send_probe(&mut challenge, now);
+        let second_at = now + PROBE_INTERVAL;
+        let mut reply = send_probe(&mut challenge, second_at);
+        assert_ne!(reply, lost);
+        let answered = second_at + Duration::from_millis(5);
         reply[5] ^= 1;
-        assert_eq!(challenge.pong(&reply, now), None);
+        assert_eq!(challenge.pong(&reply, answered), None);
         reply[5] ^= 1;
-        assert_eq!(challenge.pong(&reply, now + PROBE_INTERVAL), Some(PROBE_INTERVAL));
-        assert!(!challenge.verified(now + PROBE_INTERVAL));
+        assert_eq!(challenge.pong(&reply, answered), Some(Duration::from_millis(5)));
+        assert!(!challenge.verified(answered));
         challenge.received = true;
-        assert!(challenge.verified(now + PROBE_INTERVAL));
-        assert_eq!(challenge.pong(&reply, now + PROBE_INTERVAL), None);
-        let later = now + PROBE_INTERVAL + NONCE_LIFETIME;
-        assert!(!challenge.verified(later));
-        let late_reply = challenge.ping(later).unwrap();
-        assert_eq!(challenge.pong(&late_reply, later + NONCE_LIFETIME), None);
+        assert!(challenge.verified(answered));
+        assert_eq!(challenge.pong(&reply, answered), None);
+
+        let delayed_at = second_at + PROBE_INTERVAL;
+        let delayed = send_probe(&mut challenge, delayed_at);
+        let newer = send_probe(&mut challenge, delayed_at + PROBE_INTERVAL);
+        assert_ne!(delayed, newer);
+        let delayed_rtt = Duration::from_millis(270);
+        let later = delayed_at + delayed_rtt;
+        assert_eq!(challenge.pong(&delayed, later), Some(delayed_rtt));
+        let expired = later + NONCE_LIFETIME;
+        assert!(!challenge.verified(expired));
+        assert_eq!(challenge.pong(&newer, expired), None);
     }
 
     #[tokio::test]

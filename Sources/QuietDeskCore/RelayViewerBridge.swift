@@ -46,7 +46,7 @@ public final class RelayViewerBridge: @unchecked Sendable {
     public var lastFailure: Error? { failureLock.withLock { failure } }
     public var failedBeforeDesktopStream: Bool { failureLock.withLock { serviceSetupFailure } }
 
-    /// `preferredLoopbackPort` only chooses the first loopback port tried; a taken UDP number still moves to a free pair.
+    /// `preferredLoopbackPort` only chooses the first loopback port tried; a taken TCP or UDP number still moves to a free pair.
     public init(endpoint: RelayEndpoint, accessKey: Data, deviceID: UUID, udpEnabled: Bool = true,
                 certificateAuthorities: [Data] = [], trustedCertificate: RelayNodeCertificate? = nil,
                 preferredLoopbackPort: UInt16? = nil, peerAssist: RelayPeerAssistMode = .off,
@@ -94,12 +94,15 @@ public final class RelayViewerBridge: @unchecked Sendable {
                 case .ready:
                     guard let port = listener.port else { self.fail(RelayTransportError.network); return }
                     if self.udpEnabled { self.startUDPListener(port: port) } else { self.publish(port.rawValue) }
-                case .failed, .cancelled: self.fail(RelayTransportError.network)
+                case .failed:
+                    if self.published { self.fail(RelayTransportError.network) } else { self.tcpBindFailed() }
+                case .cancelled:
+                    self.fail(RelayTransportError.network)
                 default: break
                 }
             }
             listener.start(queue: queue)
-        } catch { fail(RelayTransportError.network) }
+        } catch { tcpBindFailed() }
     }
 
     private func startUDPListener(port: NWEndpoint.Port) {
@@ -122,6 +125,13 @@ public final class RelayViewerBridge: @unchecked Sendable {
             }
             listener.start(queue: queue)
         } catch { udpBindFailed(port) }
+    }
+
+    private func tcpBindFailed() {
+        listener?.stateUpdateHandler = nil; listener?.newConnectionHandler = nil; listener?.cancel(); listener = nil
+        guard !published, !stopped else { return }
+        guard bindAttempts < 4 else { fail(RelayTransportError.network); return }
+        startTCPListener()
     }
 
     // The desktop session dials one port number for TCP and UDP. When another socket holds the UDP

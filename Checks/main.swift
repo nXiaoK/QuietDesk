@@ -30,9 +30,16 @@ final class Box<Value>: @unchecked Sendable {
     func update(_ body: (inout Value) -> Void) { lock.withLock { body(&value) } }
 }
 
+let checkFilter: String? = {
+    let arguments = CommandLine.arguments
+    if let index = arguments.firstIndex(of: "--filter"), index + 1 < arguments.count { return arguments[index + 1] }
+    if let value = ProcessInfo.processInfo.environment["QUIETDESK_CHECK_FILTER"], !value.isEmpty { return value }
+    return nil
+}()
 var failures = 0
 var successes = 0
 func run(_ name: String, _ body: () throws -> Void) {
+    if let filter = checkFilter, !name.localizedCaseInsensitiveContains(filter) { return }
     do { try body(); successes += 1; print("PASS \(name)") }
     catch { failures += 1; print("FAIL \(name): \(error)") }
 }

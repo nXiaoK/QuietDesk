@@ -89,34 +89,68 @@ func runRelayProtocolChecks() {
         cooldown.reset()
         try check(cooldown.allows(now: 0) && cooldown.failures == 0, "A successful relay session did not clear the cooldown")
     }
-    run("A taken loopback UDP number moves the viewer bridge to a fresh TCP/UDP pair instead of dropping relay UDP") {
-        func bindUDP(_ port: UInt16) -> (Int32, UInt16)? {
-            let socket = Darwin.socket(AF_INET, SOCK_DGRAM, 0)
-            guard socket >= 0 else { return nil }
-            var address = sockaddr_in(); address.sin_family = sa_family_t(AF_INET)
-            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-            address.sin_port = port.bigEndian; address.sin_addr.s_addr = inet_addr("127.0.0.1")
-            var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-            let bound = withUnsafeMutablePointer(to: &address) { pointer in
-                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.bind(socket, $0, length) == 0 && getsockname(socket, $0, &length) == 0
-                }
+    func bindLoopback(_ type: Int32, port: UInt16, listen: Bool = false) -> (fd: Int32, port: UInt16, error: Int32) {
+        let socket = Darwin.socket(AF_INET, type, 0)
+        guard socket >= 0 else { return (-1, 0, errno) }
+        var address = sockaddr_in(); address.sin_family = sa_family_t(AF_INET)
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_port = port.bigEndian; address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let bound = withUnsafeMutablePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(socket, $0, length) == 0 && getsockname(socket, $0, &length) == 0 && (!listen || Darwin.listen(socket, 1) == 0)
             }
-            guard bound else { close(socket); return nil }
-            return (socket, UInt16(bigEndian: address.sin_port))
         }
+        let error = bound ? 0 : errno
+        guard bound else { close(socket); return (-1, 0, error) }
+        return (socket, UInt16(bigEndian: address.sin_port), 0)
+    }
+    func bindUDP(_ port: UInt16) -> (Int32, UInt16)? {
+        let result = bindLoopback(SOCK_DGRAM, port: port)
+        return result.fd >= 0 ? (result.fd, result.port) : nil
+    }
+    func verifyBoundPair(_ port: UInt16) throws {
+        let tcpProbe = bindLoopback(SOCK_STREAM, port: port)
+        if tcpProbe.fd >= 0 { close(tcpProbe.fd); throw CheckFailure("The published port has no relay TCP listener") }
+        if let (udpProbe, _) = bindUDP(port) { close(udpProbe); throw CheckFailure("The published port has no relay UDP listener") }
+    }
+    run("A taken loopback UDP number moves the viewer bridge to a fresh TCP/UDP pair instead of dropping relay UDP") {
         guard let (squatter, taken) = bindUDP(0) else { throw CheckFailure("Could not reserve a loopback UDP port") }
         defer { close(squatter) }
         let bridge = try RelayViewerBridge(endpoint: RelayEndpoint(address: "tls://127.0.0.1:9"), accessKey: Data(count: 32),
                                            deviceID: UUID(), preferredLoopbackPort: taken)
-        let published = Box<UInt16?>(nil), ready = DispatchSemaphore(value: 0)
+        let published = Box<UInt16?>(nil), closeError = Box<Error?>(nil), ready = DispatchSemaphore(value: 0)
         bridge.onReady = { published.set($0); ready.signal() }
-        bridge.onClose = { _ in ready.signal() }
+        bridge.onClose = { closeError.set($0); ready.signal() }
         bridge.start()
         defer { bridge.stop() }
         try wait(ready, seconds: 5, "The bridge did not publish a loopback port")
-        guard let port = published.read() else { throw CheckFailure("The bridge closed instead of choosing another port") }
+        guard let port = published.read() else {
+            let probe = bindLoopback(SOCK_STREAM, port: taken)
+            if probe.fd >= 0 { close(probe.fd) }
+            let reason = closeError.read().map { String(describing: $0) } ?? "nil"
+            throw CheckFailure("The bridge closed instead of choosing another port (error: \(reason), port: \(taken), tcpBindErrno: \(probe.error))")
+        }
         try check(port != taken, "The bridge published a port whose UDP number another socket holds")
-        if let (probe, _) = bindUDP(port) { close(probe); throw CheckFailure("The published port has no relay UDP listener") }
+        try verifyBoundPair(port)
+    }
+    run("A taken loopback TCP preferred port moves the viewer bridge to a fresh TCP/UDP pair instead of closing") {
+        let tcp = bindLoopback(SOCK_STREAM, port: 0, listen: true)
+        guard tcp.fd >= 0 else { throw CheckFailure("Could not reserve a loopback TCP port (\(tcp.error))") }
+        defer { close(tcp.fd) }
+        let bridge = try RelayViewerBridge(endpoint: RelayEndpoint(address: "tls://127.0.0.1:9"), accessKey: Data(count: 32),
+                                           deviceID: UUID(), preferredLoopbackPort: tcp.port)
+        let published = Box<UInt16?>(nil), closeError = Box<Error?>(nil), ready = DispatchSemaphore(value: 0)
+        bridge.onReady = { published.set($0); ready.signal() }
+        bridge.onClose = { closeError.set($0); ready.signal() }
+        bridge.start()
+        defer { bridge.stop() }
+        try wait(ready, seconds: 5, "The bridge did not publish a loopback port")
+        guard let port = published.read() else {
+            let reason = closeError.read().map { String(describing: $0) } ?? "nil"
+            throw CheckFailure("The bridge closed instead of choosing another port (error: \(reason), preferredTCP: \(tcp.port))")
+        }
+        try check(port != tcp.port, "The bridge published a TCP port another socket already holds")
+        try verifyBoundPair(port)
     }
 }

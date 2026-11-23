@@ -552,3 +552,54 @@ mod display_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod datagram_tests {
+    use quietdesk_core::datagram_transport::{DatagramEvent, host, viewer};
+    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    #[test]
+    fn viewer_handshakes_after_sending_to_unlistening_local_port() {
+        let probe = UdpSocket::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap();
+        let closed_addr = UdpSocket::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap().local_addr().unwrap();
+        probe.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+        let _ = probe.send_to(b"\x00", closed_addr);
+        let mut buf = [0u8; 64];
+        let probe_res = probe.recv_from(&mut buf);
+        println!("wine/winsock closed-udp std recv probe: {probe_res:?}");
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let tokio_probe = tokio::net::UdpSocket::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)).await.unwrap();
+            let _ = tokio_probe.send_to(b"\x00", closed_addr).await;
+            let mut tbuf = [0u8; 64];
+            let tprobe_res = tokio::time::timeout(Duration::from_millis(150), tokio_probe.recv_from(&mut tbuf)).await;
+            println!("wine/winsock closed-udp tokio recv probe: {tprobe_res:?}");
+
+            let key = [0x5Au8; 32];
+            let id = Uuid::new_v4();
+            let mut completed = false;
+            for _ in 0..3 {
+                let addr = UdpSocket::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).unwrap().local_addr().unwrap();
+                let mut client = viewer(addr, key, id).unwrap();
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                let Ok(mut server) = host(addr, key, id) else {
+                    continue;
+                };
+                let (a, b) = tokio::join!(
+                    tokio::time::timeout(Duration::from_millis(2500), server.next()),
+                    tokio::time::timeout(Duration::from_millis(2500), client.next()),
+                );
+                assert!(matches!((a, b), (Ok(DatagramEvent::Ready), Ok(DatagramEvent::Ready))));
+                assert!(client.try_send(vec![42, 7]));
+                let event = tokio::time::timeout(Duration::from_secs(1), server.next()).await.unwrap();
+                assert!(matches!(event, DatagramEvent::Data(bytes) if bytes == [42, 7]));
+                completed = true;
+                break;
+            }
+            assert!(completed, "could not bind test listener after transient delay");
+        });
+    }
+}

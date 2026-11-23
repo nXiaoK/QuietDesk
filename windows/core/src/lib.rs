@@ -16,7 +16,7 @@ pub mod cursor;
 pub mod cursor_pixels;
 mod datagram_frames;
 mod datagram_path;
-mod datagram_transport;
+pub mod datagram_transport;
 pub mod display;
 pub mod error;
 pub mod host;

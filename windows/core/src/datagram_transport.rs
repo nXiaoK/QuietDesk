@@ -117,12 +117,31 @@ pub fn viewer(remote: SocketAddr, key: [u8; 32], id: Uuid) -> Result<DatagramTra
     start(SocketAddr::new(any, 0), Some(remote), key, id)
 }
 
+trait PacketSocket: Send + Sync + 'static {
+    fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> impl std::future::Future<Output = io::Result<(usize, SocketAddr)>> + Send + 'a;
+    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr) -> impl std::future::Future<Output = io::Result<usize>> + Send + 'a;
+}
+
+impl PacketSocket for UdpSocket {
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        UdpSocket::recv_from(self, buf).await
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        UdpSocket::send_to(self, buf, target).await
+    }
+}
+
 fn start(local: SocketAddr, remote: Option<SocketAddr>, key: [u8; 32], id: Uuid) -> Result<DatagramTransport> {
-    let cookie_peer: CookiePeer = Arc::new(Mutex::new(None));
-    let context = context(remote.is_none(), key, id, cookie_peer.clone()).map_err(|_| DeskError::platform("无法配置媒体 DTLS"))?;
     let socket = std::net::UdpSocket::bind(local)?;
     socket.set_nonblocking(true)?;
     let socket = UdpSocket::from_std(socket)?;
+    start_with_socket(socket, remote, key, id)
+}
+
+fn start_with_socket<S: PacketSocket>(socket: S, remote: Option<SocketAddr>, key: [u8; 32], id: Uuid) -> Result<DatagramTransport> {
+    let cookie_peer: CookiePeer = Arc::new(Mutex::new(None));
+    let context = context(remote.is_none(), key, id, cookie_peer.clone()).map_err(|_| DeskError::platform("无法配置媒体 DTLS"))?;
     let (events, received) = mpsc::channel(QUEUE);
     let (outgoing, send) = mpsc::channel(QUEUE);
     let ready = Arc::new(AtomicBool::new(false));
@@ -289,7 +308,7 @@ impl Peer {
         Some(())
     }
 
-    async fn flush(&mut self, socket: &UdpSocket) -> Option<()> {
+    async fn flush<S: PacketSocket>(&mut self, socket: &S) -> Option<()> {
         let deadline = Instant::now() + Duration::from_millis(20);
         while let Some(packet) = self.ssl.get_mut().flight.pop_front() {
             let len = timeout_at(deadline, socket.send_to(&packet, self.addr)).await.ok()?.ok()?;
@@ -300,7 +319,7 @@ impl Peer {
         Some(())
     }
 
-    async fn advance(&mut self, socket: &UdpSocket, events: &mpsc::Sender<DatagramEvent>, ready: &AtomicBool, cookie_peer: &CookiePeer) -> Option<()> {
+    async fn advance<S: PacketSocket>(&mut self, socket: &S, events: &mpsc::Sender<DatagramEvent>, ready: &AtomicBool, cookie_peer: &CookiePeer) -> Option<()> {
         let now = Instant::now();
         if !self.authenticated && now >= self.expires {
             return None;
@@ -357,7 +376,7 @@ fn new_server_stream(ctx: &SslContext) -> Option<SslStream<Wire>> {
     SslStream::new(ssl, Wire::default()).ok()
 }
 
-async fn flush_flight(socket: &UdpSocket, addr: SocketAddr, flight: &mut VecDeque<Vec<u8>>) -> Option<()> {
+async fn flush_flight<S: PacketSocket>(socket: &S, addr: SocketAddr, flight: &mut VecDeque<Vec<u8>>) -> Option<()> {
     let deadline = Instant::now() + Duration::from_millis(20);
     while let Some(packet) = flight.pop_front() {
         let len = timeout_at(deadline, socket.send_to(&packet, addr)).await.ok()?.ok()?;
@@ -366,6 +385,17 @@ async fn flush_flight(socket: &UdpSocket, addr: SocketAddr, flight: &mut VecDequ
         }
     }
     Some(())
+}
+
+fn send_hello_verify(ctx: &SslContext, cookie_peer: &CookiePeer, packet: &[u8], addr: SocketAddr) -> VecDeque<Vec<u8>> {
+    let Some(mut verifier) = new_server_stream(ctx) else {
+        return VecDeque::new();
+    };
+    verifier.get_mut().received.extend_from_slice(packet);
+    *cookie_peer.lock().unwrap() = Some(addr);
+    let _ = verifier.do_handshake();
+    *cookie_peer.lock().unwrap() = None;
+    std::mem::take(&mut verifier.get_mut().flight)
 }
 
 fn dtls_listen(listen_ssl: &mut SslStream<Wire>, cookie_peer: &CookiePeer, packet: &[u8], addr: SocketAddr) -> Option<c_int> {
@@ -382,8 +412,8 @@ fn dtls_listen(listen_ssl: &mut SslStream<Wire>, cookie_peer: &CookiePeer, packe
     Some(res)
 }
 
-async fn run(
-    socket: UdpSocket,
+async fn run<S: PacketSocket>(
+    socket: S,
     context: SslContext,
     cookie_peer: CookiePeer,
     remote: Option<SocketAddr>,
@@ -416,7 +446,7 @@ async fn run(
                 let (len, addr) = match datagram {
                     Ok((len, addr)) if (1..=WIRE_LIMIT).contains(&len) => (len, addr),
                     Ok(_) => continue,
-                    Err(error) if remote.is_none() && matches!(error.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset) => continue,
+                    Err(error) if matches!(error.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset) => continue,
                     Err(_) => return,
                 };
                 if let Some(i) = peers.iter().position(|p| p.addr == addr) {
@@ -435,15 +465,23 @@ async fn run(
                         continue;
                     }
                     if listen_res == 0 {
+                        let mut hvr_flight = std::mem::take(&mut listen_ssl.get_mut().flight);
                         let now = Instant::now();
                         while stateless_replies.front().is_some_and(|time| now.duration_since(*time) >= Duration::from_secs(1)) {
                             stateless_replies.pop_front();
                         }
-                        if stateless_replies.len() < 1024 && !listen_ssl.get_mut().flight.is_empty() {
-                            stateless_replies.push_back(now);
-                            let _ = flush_flight(&socket, addr, &mut listen_ssl.get_mut().flight).await;
-                        } else {
-                            listen_ssl.get_mut().flight.clear();
+                        if stateless_replies.len() < 1024 {
+                            // DTLSv1_listen echoes a retransmitted ClientHello record sequence (e.g. 1) into
+                            // HelloVerifyRequest while resetting the promoted server write sequence to 1, which
+                            // trips the client's replay window on ServerHello. Fresh server handshake state uses 0.
+                            let fresh_hvr = send_hello_verify(&context, &cookie_peer, &wire[..len], addr);
+                            if fresh_hvr.front().is_some_and(|pkt| pkt.first() == Some(&22)) {
+                                hvr_flight = fresh_hvr;
+                            }
+                            if !hvr_flight.is_empty() {
+                                stateless_replies.push_back(now);
+                                let _ = flush_flight(&socket, addr, &mut hvr_flight).await;
+                            }
                         }
                         continue;
                     }

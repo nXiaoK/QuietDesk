@@ -154,3 +154,84 @@ async fn spoofed_client_hellos_cannot_starve_a_real_viewer_handshake() {
     let (a, b) = result.expect("real viewer was starved by spoofed unverified ClientHellos");
     assert!(matches!((a, b), (DatagramEvent::Ready, DatagramEvent::Ready)));
 }
+
+struct TransientUnreachableSocket {
+    inner: UdpSocket,
+    recv_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl PacketSocket for TransientUnreachableSocket {
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        match self.recv_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => Err(io::Error::from(io::ErrorKind::ConnectionReset)),
+            1 => Err(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            _ => self.inner.recv_from(buf).await,
+        }
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.inner.send_to(buf, target).await
+    }
+}
+
+struct FatalRecvSocket {
+    inner: UdpSocket,
+    recv_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PacketSocket for FatalRecvSocket {
+    async fn recv_from(&self, _buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.recv_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(io::Error::other("injected socket fault"))
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        self.inner.send_to(buf, target).await
+    }
+}
+
+#[tokio::test]
+async fn viewer_ignores_transient_icmp_unreachable_and_closes_on_fatal_socket_error() {
+    let addr = std::net::UdpSocket::bind(loopback()).unwrap().local_addr().unwrap();
+    let mut key = [0; 32];
+    openssl::rand::rand_bytes(&mut key).unwrap();
+    let id = Uuid::new_v4();
+    let mut server = host(addr, key, id).unwrap();
+
+    let inner = UdpSocket::bind(loopback()).await.unwrap();
+    let faulty = TransientUnreachableSocket { inner, recv_calls: std::sync::atomic::AtomicUsize::new(0) };
+    let mut client = start_with_socket(faulty, Some(addr), key, id).unwrap();
+    let (a, b) = timeout(Duration::from_secs(3), async { tokio::join!(server.next(), client.next()) }).await.unwrap();
+    assert!(matches!((a, b), (DatagramEvent::Ready, DatagramEvent::Ready)));
+    assert!(client.try_send(vec![9, 42]));
+    assert!(matches!(timeout(Duration::from_secs(1), server.next()).await.unwrap(), DatagramEvent::Data(bytes) if bytes == [9, 42]));
+
+    let fatal_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fatal_socket = FatalRecvSocket { inner: UdpSocket::bind(loopback()).await.unwrap(), recv_calls: fatal_calls.clone() };
+    let mut fatal_client = start_with_socket(fatal_socket, Some(addr), key, id).unwrap();
+    assert!(matches!(timeout(Duration::from_millis(500), fatal_client.next()).await.unwrap(), DatagramEvent::Closed));
+    assert_eq!(fatal_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn viewer_completes_handshake_when_host_binds_after_initial_client_hello() {
+    let mut key = [0; 32];
+    openssl::rand::rand_bytes(&mut key).unwrap();
+    let id = Uuid::new_v4();
+    let mut completed = false;
+    for _ in 0..3 {
+        let addr = std::net::UdpSocket::bind(loopback()).unwrap().local_addr().unwrap();
+        let mut client = viewer(addr, key, id).unwrap();
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let Ok(mut server) = host(addr, key, id) else {
+            continue;
+        };
+        let (a, b) = timeout(Duration::from_millis(2500), async { tokio::join!(server.next(), client.next()) }).await.unwrap();
+        assert!(matches!((a, b), (DatagramEvent::Ready, DatagramEvent::Ready)));
+        assert!(client.try_send(vec![7, 19]));
+        assert!(matches!(timeout(Duration::from_secs(1), server.next()).await.unwrap(), DatagramEvent::Data(bytes) if bytes == [7, 19]));
+        completed = true;
+        break;
+    }
+    assert!(completed, "could not bind test listener after transient delay");
+}

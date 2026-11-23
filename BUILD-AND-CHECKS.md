@@ -1,5 +1,25 @@
 # 构建与检查记录
 
+## 任务 C：Windows 端 UDP 媒体通道加固（2026-11-23，`9ae029c`、`571840b`、`b1e6cfe`）
+
+- **做了什么**：
+  - `9ae029c`（`windows/core/src/datagram_transport.rs`、`/tests.rs`）：引入 `DTLSv1_listen` 与基于“对端 `SocketAddr` + 每通道随机密钥”的无状态 HMAC-SHA256 cookie 校验（无状态回复上限 `1024/s`），源地址通过 cookie 往返验证后才计入 `MAX_CANDIDATES = 4` 与接纳限流；为 `DTLSv1_listen` 调用后的对象恢复 `LINK_MTU` 并保持校验回调上下文。
+  - `571840b`（`windows/core/src/lib.rs`、`/datagram_transport.rs`、`/tests.rs`、`windows/app/src/win/app.rs`）：引入私有 `PacketSocket` 测试接缝，移除 `recv_from` 对 `ConnectionRefused` / `ConnectionReset` 的 `remote.is_none()` 限制，使控制端同样忽略瞬时端口不可达错误（真实套接字错误仍立即结束且不忙循环）；同时修复 `ClientHello` 重传时 `DTLSv1_listen` 按重传序号回显 `HelloVerifyRequest` 与促进态 `ServerHello` 记录序号同为 `1` 导致防重放窗口丢包的隐患（未携带有效 cookie 的初始应答统一按序列号 `0` 发出）。在 `win::app::datagram_tests` 加入控制端先于被控端启动的 Windows 原生测试并接入 Wine 检查。
+  - `b1e6cfe`（`windows/core/src/datagram_transport.rs`、`/tests.rs`）：统一 `Peer::flush` 与 `flush_flight`，当 20 ms 发送超时发生时清空当前 `flight` 并返回 `Some(())`（按丢包交由 DTLS 重传与媒体补传/FEC 恢复），仅真实发送 `io::Error` 或短写继续返回 `None` 结束通道。
+  - `docs/security.md`：按无状态 cookie 校验、候选限流及发送超时行为更新 Windows 一节说明。
+- **跑了什么与结果**：
+  - 修复前失败复现：
+    - C.1：`spoofed_client_hellos_cannot_starve_a_real_viewer_handshake` 在修复前稳定失败（`4 passed; 1 failed`：`real viewer was starved by spoofed unverified ClientHellos: Elapsed(())`）。
+    - C.2：`viewer_ignores_transient_icmp_unreachable_and_closes_on_fatal_socket_error` 在修复前失败（`5 passed; 1 failed`：`Elapsed(())`，`ConnectionReset` 直接结束了控制端）；Wine 探测中亦实际观察到延迟绑定被控端导致重传 `record_seq=1` 防重放碰撞超时失败。
+    - C.3：`send_timeout_drops_stalled_flight_without_closing_the_channel` 在修复前失败（`7 passed; 1 failed`：`Elapsed(())`，握手 20 ms 发送超时导致 `Peer::flush` 关闭通道）。
+  - 修复后验证：
+    - `(cd windows && cargo fmt --check)`、本机目标及 `--target x86_64-pc-windows-gnullvm -p quietdesk-app` 两处 `cargo clippy --locked --all-targets -- -D warnings` 均无警告。
+    - `cargo test --locked -p quietdesk-core` 全过：**208 项单元测试 + 19 项回环测试全过**。
+    - `./scripts/run-windows-interop-checks.sh` 连续 **3 次全过**（每次均 `57 passed, 0 failed`，含 UDP 黑洞回退、冷却重探、丢片补传、XOR/RS 纠错、光标与音频数据报）。
+    - `./scripts/run-windows-wine-checks.sh` 通过：**40 项原生测试通过**（含 `win::app::datagram_tests::viewer_handshakes_after_sending_to_unlistening_local_port`，6 个环境专用测例按既有安排经 `--ignored` 单独跑完：5 项 OLE 剪贴板通过、1 项 WASAPI 通过）、`capture`/`displays`/`cursor`/`codec` 240 帧与 `wincheck` DTLS UDP 视频（`pictures=541 after_commit=539`、`33` 个 `host video stats` 窗口）通过。在 Wine 下对未监听回环 UDP 端口探测 `std::net::UdpSocket::recv_from` 返回 `Os { code: 10060, kind: TimedOut }`、`tokio::net::UdpSocket` 超时 `Elapsed(())`，**Wine 未产生 `WSAECONNRESET (10054)`**。
+    - `./scripts/build-windows.sh` 生成 `outputs/windows/QuietDesk-0.7.3-Windows-x64.zip`（SHA-256 `d795b81fc0233f38fbb77ea1c47776d413c5a2e8398cdc0cc62a7892f4da47c8`）。
+- **没验证什么**：真实 Windows Winsock 是否对同一 `sendto`→`recvfrom` 序列返回 `WSAECONNRESET (10054)` 及其被控制端忽略的行为仅通过 `quietdesk-core` 替身与延迟监听回归覆盖，因 Wine 未生成 `10054`，**仍待真实物理 Windows 主机确认**；公网高丢包与拥塞退避表现待真机确认。
+
 ## 任务 B：消除向 Finder 以外应用粘贴时静默得到空文件的可能（2026-11-23，`3066595`）
 
 - **做了什么**：

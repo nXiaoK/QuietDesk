@@ -309,14 +309,7 @@ impl Peer {
     }
 
     async fn flush<S: PacketSocket>(&mut self, socket: &S) -> Option<()> {
-        let deadline = Instant::now() + Duration::from_millis(20);
-        while let Some(packet) = self.ssl.get_mut().flight.pop_front() {
-            let len = timeout_at(deadline, socket.send_to(&packet, self.addr)).await.ok()?.ok()?;
-            if len != packet.len() {
-                return None;
-            }
-        }
-        Some(())
+        flush_flight(socket, self.addr, &mut self.ssl.get_mut().flight).await
     }
 
     async fn advance<S: PacketSocket>(&mut self, socket: &S, events: &mpsc::Sender<DatagramEvent>, ready: &AtomicBool, cookie_peer: &CookiePeer) -> Option<()> {
@@ -379,9 +372,14 @@ fn new_server_stream(ctx: &SslContext) -> Option<SslStream<Wire>> {
 async fn flush_flight<S: PacketSocket>(socket: &S, addr: SocketAddr, flight: &mut VecDeque<Vec<u8>>) -> Option<()> {
     let deadline = Instant::now() + Duration::from_millis(20);
     while let Some(packet) = flight.pop_front() {
-        let len = timeout_at(deadline, socket.send_to(&packet, addr)).await.ok()?.ok()?;
-        if len != packet.len() {
-            return None;
+        match timeout_at(deadline, socket.send_to(&packet, addr)).await {
+            Ok(Ok(len)) if len == packet.len() => {}
+            Ok(_) => return None,
+            Err(_) => {
+                // Treat send backpressure past the 20 ms bound as packet loss; DTLS timers and media NACK/FEC recover.
+                flight.clear();
+                return Some(());
+            }
         }
     }
     Some(())

@@ -235,3 +235,72 @@ async fn viewer_completes_handshake_when_host_binds_after_initial_client_hello()
     }
     assert!(completed, "could not bind test listener after transient delay");
 }
+
+struct StallingSendSocket {
+    inner: UdpSocket,
+    stall_remaining: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PacketSocket for StallingSendSocket {
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.inner.recv_from(buf).await
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        if self.stall_remaining.try_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1)).is_ok() {
+            std::future::pending::<()>().await;
+        }
+        self.inner.send_to(buf, target).await
+    }
+}
+
+struct FailingSendSocket {
+    inner: UdpSocket,
+    fail_sends: Arc<AtomicBool>,
+}
+
+impl PacketSocket for FailingSendSocket {
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.inner.recv_from(buf).await
+    }
+
+    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> io::Result<usize> {
+        if self.fail_sends.load(Ordering::SeqCst) {
+            return Err(io::Error::other("injected send fault"));
+        }
+        self.inner.send_to(buf, target).await
+    }
+}
+
+#[tokio::test]
+async fn send_timeout_drops_stalled_flight_without_closing_the_channel() {
+    let addr = std::net::UdpSocket::bind(loopback()).unwrap().local_addr().unwrap();
+    let mut key = [0; 32];
+    openssl::rand::rand_bytes(&mut key).unwrap();
+    let id = Uuid::new_v4();
+    let mut server = host(addr, key, id).unwrap();
+
+    let stall_remaining = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let stalling_socket = StallingSendSocket { inner: UdpSocket::bind(loopback()).await.unwrap(), stall_remaining: stall_remaining.clone() };
+    let mut client = start_with_socket(stalling_socket, Some(addr), key, id).unwrap();
+    let (a, b) = timeout(Duration::from_secs(3), async { tokio::join!(server.next(), client.next()) }).await.unwrap();
+    assert!(matches!((a, b), (DatagramEvent::Ready, DatagramEvent::Ready)));
+
+    // Trigger a send timeout on an application datagram, then verify subsequent traffic still arrives.
+    stall_remaining.store(1, Ordering::SeqCst);
+    assert!(client.try_send(vec![1, 2, 3]));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(client.try_send(vec![9, 8, 7]));
+    assert!(matches!(timeout(Duration::from_secs(1), server.next()).await.unwrap(), DatagramEvent::Data(bytes) if bytes == [9, 8, 7]));
+
+    // A genuine send io::Error must still close the channel.
+    let addr2 = std::net::UdpSocket::bind(loopback()).unwrap().local_addr().unwrap();
+    let mut server2 = host(addr2, key, id).unwrap();
+    let fail_sends = Arc::new(AtomicBool::new(false));
+    let failing_socket = FailingSendSocket { inner: UdpSocket::bind(loopback()).await.unwrap(), fail_sends: fail_sends.clone() };
+    let mut failing_client = start_with_socket(failing_socket, Some(addr2), key, id).unwrap();
+    connected(&mut server2, &mut failing_client).await;
+    fail_sends.store(true, Ordering::SeqCst);
+    assert!(failing_client.try_send(vec![4, 5, 6]));
+    assert!(matches!(timeout(Duration::from_millis(500), failing_client.next()).await.unwrap(), DatagramEvent::Closed));
+}

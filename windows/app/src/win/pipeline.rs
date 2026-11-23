@@ -29,14 +29,33 @@ enum Command {
     Cursor(Option<watch::Sender<Option<HostCursorSample>>>, oneshot::Sender<Result<()>>),
 }
 
+struct CaptureCadence {
+    interval: Duration,
+    due: Instant,
+}
+
+impl CaptureCadence {
+    fn wait(&self, now: Instant) -> Duration {
+        self.due.saturating_duration_since(now)
+    }
+
+    fn take_slot(&mut self, now: Instant) -> bool {
+        if now < self.due {
+            return false;
+        }
+        // Capture and encoding share the interval. A late start schedules only one capture.
+        self.due = now + self.interval;
+        true
+    }
+}
+
 struct Stream {
     stats: Option<VideoStats>,
     converter: Nv12Converter,
     encoder: H264Encoder,
     nv12: Vec<u8>,
     sink: FrameSink,
-    interval: Duration,
-    due: Instant,
+    cadence: CaptureCadence,
     /// The viewer has nothing to predict from: the next frame is a keyframe of the screen as it is.
     fresh: bool,
     /// Frames in a row that were encoded while a keyframe was wanted and were not one.
@@ -70,8 +89,8 @@ fn open_stream(source: (usize, usize), settings: StreamSettings, sink: FrameSink
                 let converter = Nv12Converter::new(source, (width as usize, height as usize));
                 let nv12 = vec![0; converter.output_bytes()];
                 let interval = Duration::from_secs_f64(1.0 / applied.frames_per_second.clamp(1, 60) as f64);
-                let stream =
-                    Stream { stats: None, converter, encoder, nv12, sink, interval, due: Instant::now(), fresh: true, refused_key_frames: 0, fed: 0, flush: 0 };
+                let cadence = CaptureCadence { interval, due: Instant::now() };
+                let stream = Stream { stats: None, converter, encoder, nv12, sink, cadence, fresh: true, refused_key_frames: 0, fed: 0, flush: 0 };
                 return Ok((stream, VideoStreamState { settings: applied, width: i64::from(width), height: i64::from(height) }));
             }
             Err(error) => {
@@ -109,7 +128,7 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
     loop {
         let active = stream.as_ref().filter(|_| !paused && capture.is_some());
         let now = Instant::now();
-        let video_wait = active.map(|active| if active.sink.has_credit() { active.due.saturating_duration_since(now) } else { Duration::from_millis(2) });
+        let video_wait = active.map(|active| if active.sink.has_credit() { active.cadence.wait(now) } else { Duration::from_millis(2) });
         let cursor_wait = sampler.as_ref().filter(|_| !paused && capture.is_some()).map(|cursor| cursor.next_poll.saturating_duration_since(now));
         let command = match video_wait.into_iter().chain(cursor_wait).min() {
             Some(wait) => commands.recv_timeout(wait),
@@ -230,13 +249,12 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
         let now = Instant::now();
         let stats = active.stats.get_or_insert_with(|| VideoStats::new(now, screen.backend()));
         stats.report_if_due(now, screen.backend());
-        if !active.sink.has_credit() || now < active.due {
+        let start = Instant::now();
+        if !active.sink.has_credit() || !active.cadence.take_slot(start) {
             continue;
         }
-        let use_cached = screen.has_frame() && (active.fresh || active.flush > 0);
-        let start = Instant::now();
         let mut waited = Duration::ZERO;
-        let captured = screen.grab_timed(if use_cached { 0 } else { 50 }, &mut waited);
+        let captured = screen.grab_timed(0, &mut waited);
         stats.captured(screen.backend(), start.elapsed(), waited, matches!(captured, Ok(true)));
         let changed = match captured {
             Ok(changed) => changed,
@@ -277,8 +295,6 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
         // A one-in-one-out encoder holds nothing and needs no repeats. One that delays its output would
         // keep the newest picture, and the pointer in it, until the screen changes again.
         active.flush = if current { active.encoder.pending() } else { active.flush - 1 };
-        // Every attempt uses its frame interval, also one the encoder answers with nothing.
-        active.due = Instant::now() + active.interval;
         match encoded {
             Ok(Some(frame)) => {
                 // After a pause or a restart only a keyframe may open the stream.
@@ -456,6 +472,23 @@ impl HostPlatform for WindowsHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_cadence_counts_processing_time_and_skips_missed_slots() {
+        let start = Instant::now();
+        let interval = Duration::from_nanos(16_666_667);
+        let work = Duration::from_millis(8);
+        let mut cadence = CaptureCadence { interval, due: start };
+        assert!(cadence.take_slot(start));
+        assert_eq!(cadence.wait(start + work), interval - work);
+        assert!(!cadence.take_slot(start + work));
+        assert!(cadence.take_slot(start + interval));
+
+        let resumed = start + 4 * interval;
+        assert!(cadence.take_slot(resumed));
+        assert!(!cadence.take_slot(resumed + work));
+        assert!(cadence.take_slot(resumed + interval));
+    }
 
     #[tokio::test]
     async fn slow_display_enumeration_yields_the_network_thread_and_preserves_worker_errors() {

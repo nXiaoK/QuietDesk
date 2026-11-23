@@ -12,6 +12,7 @@ use quietdesk_core::keymap::{MacModifierMapping, PcModifierMapping};
 use quietdesk_core::messages::{DeviceIdentity, device_display_name};
 use quietdesk_core::pairing::PairingKey;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
@@ -19,10 +20,13 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, CreateFontIndirectW, HBRUSH, HFONT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 const WM_HOST_NOTICE: u32 = WM_APP + 10;
+const WM_UPDATE_EVENT: u32 = WM_APP + 40;
+const TIMER_UPDATE_TICK: usize = 1;
 const ADDRESS: usize = 1001;
 const PORT: usize = 1002;
 const CODE: usize = 1003;
@@ -43,6 +47,11 @@ const ALLOW_CLIPBOARD: usize = 1108;
 const QUALITY_LIMIT: usize = 1109;
 const MAC_MODIFIERS: usize = 1110;
 const SHARED_DISPLAY: usize = 1111;
+const UPDATE_STATUS: usize = 1201;
+const UPDATE_ACTION: usize = 1202;
+const UPDATE_NOTES: usize = 1203;
+const AUTO_CHECK_UPDATES: usize = 1204;
+const AUTO_INSTALL_UPDATES: usize = 1205;
 
 struct Main {
     window: HWND,
@@ -52,6 +61,8 @@ struct Main {
     session_status: String,
     displays: Vec<RemoteDisplayInfo>,
     active_display: Option<u32>,
+    has_host_connection: bool,
+    modal_prompt_open: AtomicBool,
     auto_reconnect: watch::Sender<bool>,
     runtime: tokio::runtime::Handle,
     /// Present while this PC is shared; closing it stops the listener and ends the session.
@@ -59,6 +70,7 @@ struct Main {
     notices: Arc<Mutex<VecDeque<HostNotice>>>,
     /// Save an explicitly opened connection once. Retrying must not restore a forgotten record.
     viewers: Vec<(canvas::ViewerWindow, Connection)>,
+    updater: super::update::WindowUpdater,
 }
 
 impl Main {
@@ -81,7 +93,131 @@ impl Main {
     }
 
     fn alert(&self, text: &str) {
+        self.modal_prompt_open.store(true, Ordering::Release);
         unsafe { MessageBoxW(Some(self.window), PCWSTR(wide(text).as_ptr()), w!("QuietDesk"), MB_OK | MB_ICONWARNING) };
+        self.modal_prompt_open.store(false, Ordering::Release);
+    }
+
+    fn refresh_update_controls(&self) {
+        self.set_text(UPDATE_STATUS, &self.updater.status_text);
+        self.set_text(UPDATE_ACTION, self.updater.action_button_label(self.has_host_connection));
+        let enabled = self.updater.config.enabled();
+        let can_click_action = enabled && self.updater.state != super::update::UpdaterState::Installing;
+        unsafe {
+            let _ = EnableWindow(self.item(UPDATE_ACTION), can_click_action);
+            let _ = EnableWindow(self.item(AUTO_CHECK_UPDATES), enabled);
+            let _ = EnableWindow(self.item(AUTO_INSTALL_UPDATES), enabled);
+        }
+        self.message(AUTO_CHECK_UPDATES, BM_SETCHECK, usize::from(self.settings.auto_check_updates), 0);
+        self.message(AUTO_INSTALL_UPDATES, BM_SETCHECK, usize::from(self.settings.auto_install_updates), 0);
+    }
+
+    fn window_is_minimized_or_hidden(&self) -> bool {
+        unsafe { IsIconic(self.window).as_bool() || !IsWindowVisible(self.window).as_bool() }
+    }
+
+    fn finish_for_update_restart(&mut self) {
+        self.sharing = None;
+        self.has_host_connection = false;
+        unsafe {
+            let _ = KillTimer(Some(self.window), TIMER_UPDATE_TICK);
+            let _ = DestroyWindow(self.window);
+        }
+    }
+
+    fn update_context(&self) -> super::update::WindowUpdateContext {
+        super::update::WindowUpdateContext {
+            has_host_connection: self.has_host_connection,
+            viewer_count: self.viewers.len(),
+            has_blocking_prompt: self.modal_prompt_open.load(Ordering::Acquire),
+            is_sharing_enabled: self.sharing.is_some(),
+            window_minimized_or_hidden: self.window_is_minimized_or_hidden(),
+        }
+    }
+
+    fn trigger_manual_install(&mut self) {
+        if self.has_host_connection {
+            return self.alert("这台电脑正被远程控制。为避免远端失联，请先停止共享或等待会话结束后安装更新。");
+        }
+        if !self.viewers.is_empty() || !self.settings.auto_install_updates {
+            let mut prompt = String::from("QuietDesk 将退出、安装更新并自动重新启动。");
+            if !self.viewers.is_empty() {
+                prompt.push_str("\n当前打开的远程控制窗口将会断开。");
+            }
+            if self.sharing.is_some() {
+                prompt.push_str("\n重启后会自动恢复本机共享。");
+            }
+            self.modal_prompt_open.store(true, Ordering::Release);
+            let choice =
+                unsafe { MessageBoxW(Some(self.window), PCWSTR(wide(&prompt).as_ptr()), w!("安装更新并重新启动"), MB_OKCANCEL | MB_ICONQUESTION) };
+            self.modal_prompt_open.store(false, Ordering::Release);
+            if choice != IDOK {
+                return;
+            }
+        }
+        let mut ctx = self.update_context();
+        ctx.window_minimized_or_hidden = false;
+        match self.updater.execute_install(false, ctx) {
+            Ok(true) => self.finish_for_update_restart(),
+            Ok(false) => self.refresh_update_controls(),
+            Err(err) => {
+                self.refresh_update_controls();
+                self.alert(&err);
+            }
+        }
+    }
+
+    fn show_update_notes(&mut self) {
+        if let Some(url) = self.updater.manual_release_url.clone() {
+            if let Err(err) = super::update::open_verified_release_url(&url) {
+                self.alert(&err);
+            }
+            return;
+        }
+        if let Some(manifest) = self.updater.manifest.clone() {
+            let notes = manifest.notes.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or("（无详细更新说明）");
+            let body = format!(
+                "新版本：{}（Build {}）\n发布时间：{}\n\n{}\n\n点击“是”在浏览器查看 GitHub Release，“否”跳过此版本自动提醒，“取消”关闭窗口。",
+                manifest.version, manifest.build, manifest.published_at, notes
+            );
+            self.modal_prompt_open.store(true, Ordering::Release);
+            let choice =
+                unsafe { MessageBoxW(Some(self.window), PCWSTR(wide(&body).as_ptr()), w!("QuietDesk 更新说明"), MB_YESNOCANCEL | MB_ICONINFORMATION) };
+            self.modal_prompt_open.store(false, Ordering::Release);
+            if choice == IDYES {
+                if let Err(err) = super::update::open_verified_release_url(&manifest.release_notes_url) {
+                    self.alert(&err);
+                }
+            } else if choice == IDNO && !self.updater.busy() {
+                self.settings.skipped_update_version = Some(manifest.version);
+                self.save();
+                self.updater.manifest = None;
+                self.updater.state = super::update::UpdaterState::Idle;
+                self.updater.status_text = format!("已跳过该版本 · 当前版本 {}", self.updater.config.current_version);
+                self.refresh_update_controls();
+            }
+            return;
+        }
+        let summary = format!(
+            "当前版本：{}（Build {} · {}）\n更新校验：内置 Ed25519 公钥验签 + SHA-256 完整性校验\n自动更新规则：开启“非远程控制空闲时自动下载并安装”后，仅在未控制其他电脑且未被其他电脑控制时后台下载、替换并自动重启（原已开启的本机共享会在重启后自动恢复）。",
+            self.updater.config.current_version,
+            self.updater.config.current_build,
+            self.updater.config.arch.map_or("unknown", |a| a.as_str())
+        );
+        self.modal_prompt_open.store(true, Ordering::Release);
+        unsafe {
+            MessageBoxW(Some(self.window), PCWSTR(wide(&summary).as_ptr()), w!("QuietDesk 软件更新说明"), MB_OK | MB_ICONINFORMATION);
+        }
+        self.modal_prompt_open.store(false, Ordering::Release);
+    }
+
+    fn tick_updater(&mut self) {
+        let ctx = self.update_context();
+        if self.updater.tick(self.window, WM_UPDATE_EVENT, &self.settings, ctx) {
+            self.finish_for_update_restart();
+        } else {
+            self.refresh_update_controls();
+        }
     }
 
     fn save(&self) {
@@ -190,10 +326,13 @@ impl Main {
     fn toggle_sharing(&mut self) {
         self.viewer_name = None;
         if self.sharing.take().is_some() {
+            self.has_host_connection = false;
             self.active_display = None;
             self.refresh_displays();
             self.set_text(SHARE, "开始共享");
             self.set_text(HOST_STATUS, "未共享");
+            self.updater.observe_remote_sessions(false, self.viewers.len());
+            self.refresh_update_controls();
             return;
         }
         let Ok(port) = self.text(HOST_PORT).parse::<u16>() else { return self.alert("端口应为 1 到 65535 的数字") };
@@ -231,12 +370,18 @@ impl Main {
             HostNotice::Listening(port) => self.set_text(HOST_STATUS, &format!("等待连接 · 端口 {port}（首次共享时请在防火墙提示中允许访问）")),
             HostNotice::Failed(reason) => {
                 self.sharing = None;
+                self.has_host_connection = false;
                 self.set_text(SHARE, "开始共享");
                 self.set_text(HOST_STATUS, &format!("共享未开启：{reason}"));
+                self.updater.observe_remote_sessions(false, self.viewers.len());
+                self.refresh_update_controls();
             }
             HostNotice::Connected => {
+                self.has_host_connection = true;
                 self.viewer_name = None;
                 self.update_session_status("控制端已连接，正在准备画面…".into());
+                self.updater.observe_remote_sessions(true, self.viewers.len());
+                self.refresh_update_controls();
             }
             HostNotice::Session(HostEvent::ViewerIdentity(device)) => {
                 self.viewer_name = Some(device.name);
@@ -261,10 +406,13 @@ impl Main {
             HostNotice::Session(HostEvent::Paused(true)) => self.update_session_status("控制端已暂停画面，连接保持".into()),
             HostNotice::Session(_) => {}
             HostNotice::Ended(reason) => {
+                self.has_host_connection = false;
                 self.viewer_name = None;
                 self.active_display = None;
                 self.refresh_displays();
                 self.set_text(HOST_STATUS, &format!("等待重新连接 · {reason}"));
+                self.updater.observe_remote_sessions(false, self.viewers.len());
+                self.refresh_update_controls();
             }
         }
     }
@@ -338,6 +486,7 @@ impl Main {
                 if self.sharing.is_some() {
                     return self.alert("请先停止共享，再重新生成配对码");
                 }
+                self.modal_prompt_open.store(true, Ordering::Release);
                 let confirm = unsafe {
                     MessageBoxW(
                         Some(self.window),
@@ -346,6 +495,7 @@ impl Main {
                         MB_OKCANCEL | MB_ICONQUESTION,
                     )
                 };
+                self.modal_prompt_open.store(false, Ordering::Release);
                 if confirm == IDOK {
                     self.new_host_key();
                 }
@@ -379,6 +529,54 @@ impl Main {
             (MAC_MODIFIERS, CBN_SELCHANGE) => {
                 self.settings.mac_modifiers = if chosen(self, id) == 0 { MacModifierMapping::CommandAsControl } else { MacModifierMapping::Standard };
                 self.save();
+            }
+            (UPDATE_ACTION, BN_CLICKED) => {
+                use super::update::UpdaterState;
+                match self.updater.state {
+                    UpdaterState::Checking | UpdaterState::Downloading | UpdaterState::Verifying => {
+                        self.updater.cancel();
+                        self.refresh_update_controls();
+                    }
+                    UpdaterState::Ready => self.trigger_manual_install(),
+                    UpdaterState::Available => {
+                        if let Some(url) = self.updater.manual_release_url.clone() {
+                            if let Err(err) = super::update::open_verified_release_url(&url) {
+                                self.alert(&err);
+                            }
+                        } else {
+                            let immediate = !self.has_host_connection;
+                            self.updater.start_download_and_stage(self.window, WM_UPDATE_EVENT, false, immediate);
+                            self.refresh_update_controls();
+                        }
+                    }
+                    UpdaterState::Idle | UpdaterState::UpToDate | UpdaterState::Failed => {
+                        self.updater.start_check(self.window, WM_UPDATE_EVENT, true);
+                        self.refresh_update_controls();
+                    }
+                    UpdaterState::Installing => {}
+                }
+            }
+            (UPDATE_NOTES, BN_CLICKED) => self.show_update_notes(),
+            (AUTO_CHECK_UPDATES, BN_CLICKED) => {
+                let enabled = checked(self, id);
+                self.settings.auto_check_updates = enabled;
+                if !enabled && self.settings.auto_install_updates {
+                    self.settings.auto_install_updates = false;
+                }
+                self.save();
+                self.refresh_update_controls();
+            }
+            (AUTO_INSTALL_UPDATES, BN_CLICKED) => {
+                let enabled = checked(self, id);
+                self.settings.auto_install_updates = enabled;
+                if enabled && !self.settings.auto_check_updates {
+                    self.settings.auto_check_updates = true;
+                }
+                self.save();
+                if enabled && self.updater.manifest.is_none() && !self.updater.busy() && !self.has_host_connection && self.viewers.is_empty() {
+                    self.updater.start_check(self.window, WM_UPDATE_EVENT, false);
+                }
+                self.tick_updater();
             }
             _ => {}
         }
@@ -446,6 +644,13 @@ impl Main {
             add(label, "Mac 键盘", 0, false, 24, 500, 64, 20, 0)?;
             add(combo, "", drop, false, 92, 496, 446, 240, MAC_MODIFIERS)?;
 
+            add(button, "软件更新", group, false, 10, 538, 540, 86, 0)?;
+            add(label, &self.updater.status_text, 0, false, 24, 564, 326, 20, UPDATE_STATUS)?;
+            add(button, "检查更新", push, false, 356, 558, 96, 26, UPDATE_ACTION)?;
+            add(button, "更新说明", push, false, 458, 558, 80, 26, UPDATE_NOTES)?;
+            add(button, "自动检查更新（每天一次）", check, false, 24, 594, 216, 22, AUTO_CHECK_UPDATES)?;
+            add(button, "非远程控制空闲时自动下载并安装", check, false, 248, 594, 290, 22, AUTO_INSTALL_UPDATES)?;
+
             let fill = |id: usize, labels: &[&str], selected: usize| {
                 for label in labels {
                     self.message(id, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
@@ -474,6 +679,7 @@ impl Main {
                 self.set_text(HOST_CODE, "首次开始共享时生成");
             }
             self.refresh_recent();
+            self.refresh_update_controls();
             Ok(())
         }
     }
@@ -494,6 +700,26 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                     main.host_notice(notice);
                 }
             }
+            WM_UPDATE_EVENT => {
+                let events = std::mem::take(&mut *main.updater.events.lock().unwrap());
+                let mut should_save = false;
+                let mut immediate_install = false;
+                for event in events {
+                    let (save, install_now) = main.updater.handle_worker_event(event, &mut main.settings);
+                    should_save |= save;
+                    immediate_install |= install_now;
+                }
+                if should_save {
+                    main.save();
+                }
+                main.refresh_update_controls();
+                if immediate_install {
+                    main.trigger_manual_install();
+                } else {
+                    main.tick_updater();
+                }
+            }
+            WM_TIMER if wparam.0 == TIMER_UPDATE_TICK => main.tick_updater(),
             WM_DISPLAYCHANGE => {
                 main.refresh_displays();
                 if let Some(sharing) = &main.sharing {
@@ -512,13 +738,19 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                     main.refresh_recent();
                 }
             }
-            WM_CANVAS_CLOSED => main.viewers.retain(|(viewer, _)| viewer.window.0 as usize != wparam.0),
+            WM_CANVAS_CLOSED => {
+                main.viewers.retain(|(viewer, _)| viewer.window.0 as usize != wparam.0);
+                main.updater.observe_remote_sessions(main.has_host_connection, main.viewers.len());
+                main.refresh_update_controls();
+            }
             WM_CAPS_PREFERENCE => {
                 main.settings.caps_forwarding = wparam.0 != 0;
                 main.save();
             }
             WM_DESTROY => {
+                let _ = KillTimer(Some(window), TIMER_UPDATE_TICK);
                 main.sharing = None;
+                main.updater.shutdown();
                 PostQuitMessage(0);
             }
             _ => return DefWindowProcW(window, message, wparam, lparam),
@@ -557,7 +789,7 @@ unsafe fn run_window() -> windows::core::Result<()> {
         RegisterClassExW(&definition);
         let scale = GetDpiForSystem() as f32 / 96.0;
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        let mut frame = RECT { left: 0, top: 0, right: (560.0 * scale) as i32, bottom: (540.0 * scale) as i32 };
+        let mut frame = RECT { left: 0, top: 0, right: (560.0 * scale) as i32, bottom: (634.0 * scale) as i32 };
         AdjustWindowRectEx(&mut frame, style, false, WINDOW_EX_STYLE(0))?;
         let title = wide(&format!("QuietDesk {}", env!("QUIETDESK_VERSION")));
         let window = CreateWindowExW(
@@ -578,6 +810,8 @@ unsafe fn run_window() -> windows::core::Result<()> {
         SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, metrics.cbSize, Some(std::ptr::from_mut(&mut metrics).cast()), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0))?;
         let font = CreateFontIndirectW(&metrics.lfMessageFont);
         let settings = Settings::load();
+        let mut updater = super::update::WindowUpdater::new();
+        let post_update_options = updater.apply_startup_result();
         let main = Box::into_raw(Box::new(Main {
             window,
             local_identity: local_device_id().map(|id| DeviceIdentity { id, name: device_display_name(&computer_name()) }),
@@ -587,14 +821,26 @@ unsafe fn run_window() -> windows::core::Result<()> {
             settings,
             displays: Vec::new(),
             active_display: None,
+            has_host_connection: false,
+            modal_prompt_open: AtomicBool::new(false),
             runtime: network_runtime(),
             sharing: None,
             notices: Arc::new(Mutex::new(VecDeque::new())),
             viewers: Vec::new(),
+            updater,
         }));
         (*main).build(font, scale)?;
         SetWindowLongPtrW(window, GWLP_USERDATA, main as isize);
-        let _ = ShowWindow(window, SW_SHOW);
+        let _ = SetTimer(Some(window), TIMER_UPDATE_TICK, 5_000, None);
+        if let Some(opts) = post_update_options {
+            if opts.resume_host_sharing {
+                (*main).toggle_sharing();
+            }
+            let show_cmd = if opts.minimize_on_launch { SW_SHOWMINNOACTIVE } else { SW_SHOW };
+            let _ = ShowWindow(window, show_cmd);
+        } else {
+            let _ = ShowWindow(window, SW_SHOW);
+        }
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
             // Tab and Enter work in the main window; viewer windows receive their keys untouched.

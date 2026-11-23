@@ -3,6 +3,9 @@
 
 #[cfg(windows)]
 fn main() {
+    if quietdesk_windows::win::update::run_special_mode_if_requested() {
+        return;
+    }
     quietdesk_windows::win::ui::run();
 }
 

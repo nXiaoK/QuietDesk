@@ -434,6 +434,8 @@ dependencies = [
 name = "quietdesk-core"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
+ "flate2",
  "foreign-types",
  "libc",
  "log",

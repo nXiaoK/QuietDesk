@@ -43,6 +43,10 @@ pub struct Connection {
     pub code: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -56,6 +60,16 @@ pub struct Settings {
     pub viewer_quality: usize,
     pub auto_reconnect: bool,
     pub caps_forwarding: bool,
+    #[serde(default = "default_true")]
+    pub auto_check_updates: bool,
+    #[serde(default)]
+    pub auto_install_updates: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_update_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_update_check: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failed_update_check: Option<u64>,
     pub mac_modifiers: MacModifierMapping,
     pub pc_modifiers: PcModifierMapping,
     pub connections: Vec<Connection>,
@@ -73,6 +87,11 @@ impl Default for Settings {
             viewer_quality: 2,
             auto_reconnect: true,
             caps_forwarding: false,
+            auto_check_updates: true,
+            auto_install_updates: false,
+            skipped_update_version: None,
+            last_update_check: None,
+            last_failed_update_check: None,
             mac_modifiers: MacModifierMapping::default(),
             pc_modifiers: PcModifierMapping::default(),
             connections: Vec::new(),

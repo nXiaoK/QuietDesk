@@ -20,4 +20,5 @@ pub mod pipeline;
 mod relative_mouse;
 pub mod settings;
 pub mod ui;
+pub mod update;
 pub mod util;

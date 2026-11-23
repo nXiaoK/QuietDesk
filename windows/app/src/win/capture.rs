@@ -1,18 +1,19 @@
 //! The pixels of one display: desktop duplication where the system offers it, GDI otherwise.
 
 use super::displays::{self, Display};
-use super::host_cursor::CursorIcon;
+use super::host_cursor::{CursorIcon, cursor_info, location};
 use super::util::failed;
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::pixel::{PointerKind, PointerShape};
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{HMODULE, POINT};
+use windows::Win32::Foundation::{HMODULE, POINT, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_UNSPECIFIED, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::WindowsAndMessaging::{CURSOR_SHOWING, CURSORINFO};
 use windows::core::Interface;
 
 /// A pointer image and where its top-left corner is on the display.
@@ -28,11 +29,58 @@ struct Duplication {
     staging: ID3D11Texture2D,
     shape: Option<PointerShape>,
     position: Option<POINT>,
+    fallback: Option<Gdi>,
+    frame_from_gdi: bool,
 }
 
 struct Gdi {
     screen: HDC,
     surface: DibSurface,
+}
+
+impl Gdi {
+    fn open(bounds: RECT) -> Result<Self> {
+        let surface = DibSurface::new(bounds.right - bounds.left, bounds.bottom - bounds.top)?;
+        let screen = unsafe { GetDC(None) };
+        if screen.is_invalid() {
+            return Err(DeskError::platform("无法获取桌面设备上下文"));
+        }
+        Ok(Self { screen, surface })
+    }
+
+    fn grab(&mut self, display: &Display, independent: bool, first: bool, frame: &mut [u8]) -> Result<bool> {
+        let bounds = display.bounds;
+        unsafe {
+            BitBlt(
+                self.surface.dc,
+                0,
+                0,
+                bounds.right - bounds.left,
+                bounds.bottom - bounds.top,
+                Some(self.screen),
+                bounds.left,
+                bounds.top,
+                SRCCOPY | CAPTUREBLT,
+            )
+            .map_err(failed("复制屏幕"))?;
+        }
+        if !display.still_at_bounds() {
+            return Err(DeskError::platform("共享显示器的位置或尺寸已改变"));
+        }
+        if !independent {
+            CursorIcon::draw_embedded(self.surface.dc, bounds);
+        }
+        let captured = self.surface.pixels()?;
+        if !first && captured == frame {
+            return Ok(false);
+        }
+        frame.copy_from_slice(captured);
+        Ok(true)
+    }
+}
+
+fn needs_cursorless_capture(independent: bool, dxgi_pointer: Option<POINT>, bounds: RECT, system_cursor: impl FnOnce() -> Option<CURSORINFO>) -> bool {
+    independent && dxgi_pointer.is_none() && system_cursor().is_some_and(|info| info.flags == CURSOR_SHOWING && location(info.ptScreenPos, bounds).0)
 }
 
 /// A top-down 32-bit DIB selected into its own memory DC.
@@ -146,47 +194,28 @@ impl ScreenCapture {
     pub(super) fn for_cursor_mode(display: &Display, independent: bool) -> Result<Self> {
         let mut screen = Self::open_display(display)?;
         if independent {
-            if matches!(screen.source, Source::Duplication(_)) {
-                screen.grab_source(100, false, &mut Duration::default())?;
-            }
             screen.set_cursor_mode(true)?;
         }
         Ok(screen)
     }
 
-    /// A mode switch on a still desktop also needs a fresh surface. BitBlt supplies the clean
-    /// opening picture while a duplication that reports a hardware pointer keeps future capture on DXGI.
+    /// A mode switch on a still desktop also needs a fresh surface.
     pub(super) fn set_cursor_mode(&mut self, independent: bool) -> Result<()> {
-        if matches!(self.source, Source::Duplication(_))
-            && self.grab_source(0, true, &mut Duration::default())?
-            && matches!(&self.source, Source::Duplication(source) if !independent || source.position.is_some())
-        {
-            self.independent = independent;
-            return Ok(());
-        }
-        let keep_duplication = matches!(&self.source, Source::Duplication(source) if !independent || source.position.is_some());
-        if keep_duplication {
-            let clean = Self::open_gdi(&self.display, true)?.first_picture()?;
-            self.frame = clean.frame;
-            self.has_frame = true;
-            self.independent = independent;
+        if !independent && matches!(self.source, Source::Gdi(_)) {
+            *self = Self::open_display(&self.display)?.ready()?;
         } else {
-            let next = if independent { Self::open_gdi(&self.display, true)? } else { Self::open_display(&self.display)? };
-            *self = next.first_picture()?;
+            self.grab_source(0, true, independent, &mut Duration::default())?;
+            self.independent = independent;
         }
         Ok(())
     }
 
     fn first_picture(self) -> Result<Self> {
-        self.first_picture_timed(&mut Duration::default())
-    }
-
-    fn first_picture_timed(mut self, waited: &mut Duration) -> Result<Self> {
-        self.grab_source(250, true, waited)?;
-        if !self.has_frame {
+        let mut capture = self;
+        if !capture.grab_source(250, true, capture.independent, &mut Duration::default())? {
             return Err(DeskError::platform("尚未收到所选显示器的桌面画面"));
         }
-        Ok(self)
+        Ok(capture)
     }
 
     pub(super) fn ready(self) -> Result<Self> {
@@ -255,7 +284,8 @@ impl ScreenCapture {
                     let mut staging = None;
                     device.CreateTexture2D(&layout, None, Some(&mut staging)).map_err(failed("创建回读纹理"))?;
                     let staging = staging.ok_or_else(|| DeskError::platform("没有回读纹理"))?;
-                    let source = Source::Duplication(Duplication { context, duplication, staging, shape: None, position: None });
+                    let source =
+                        Source::Duplication(Duplication { context, duplication, staging, shape: None, position: None, fallback: None, frame_from_gdi: false });
                     return Ok(Self { source, display: display.clone(), frame: vec![0; (width * height * 4) as usize], has_frame: false, independent: false });
                 }
             }
@@ -264,18 +294,9 @@ impl ScreenCapture {
     }
 
     fn open_gdi(display: &Display, independent: bool) -> Result<Self> {
-        unsafe {
-            let bounds = display.bounds;
-            let (width, height) = (bounds.right - bounds.left, bounds.bottom - bounds.top);
-            let surface = DibSurface::new(width, height)?;
-            let frame = vec![0; surface.bytes];
-            let screen = GetDC(None);
-            if screen.is_invalid() {
-                return Err(DeskError::platform("无法获取桌面设备上下文"));
-            }
-            let source = Source::Gdi(Gdi { screen, surface });
-            Ok(Self { source, display: display.clone(), frame, has_frame: false, independent })
-        }
+        let gdi = Gdi::open(display.bounds)?;
+        let frame = vec![0; gdi.surface.bytes];
+        Ok(Self { source: Source::Gdi(gdi), display: display.clone(), frame, has_frame: false, independent })
     }
 
     /// Waits up to `wait_milliseconds` for the screen or pointer to change. `Ok(true)` means `frame` or the
@@ -286,22 +307,16 @@ impl ScreenCapture {
 
     pub(super) fn backend(&self) -> &'static str {
         match self.source {
-            Source::Duplication(_) => "dxgi",
-            Source::Gdi(_) => "gdi",
+            Source::Duplication(ref source) if !source.frame_from_gdi => "dxgi",
+            _ => "gdi",
         }
     }
 
     pub(super) fn grab_timed(&mut self, wait_milliseconds: u32, waited: &mut Duration) -> Result<bool> {
-        let changed = self.grab_source(wait_milliseconds, false, waited)?;
-        // An adapter can switch from hardware overlay to a pointer baked into its desktop surface.
-        if self.independent && matches!(&self.source, Source::Duplication(source) if source.position.is_none()) {
-            *self = Self::open_gdi(&self.display, true)?.first_picture_timed(waited)?;
-            return Ok(true);
-        }
-        Ok(changed)
+        self.grab_source(wait_milliseconds, false, self.independent, waited)
     }
 
-    fn grab_source(&mut self, wait_milliseconds: u32, refresh_surface: bool, waited: &mut Duration) -> Result<bool> {
+    fn grab_source(&mut self, wait_milliseconds: u32, refresh_surface: bool, independent: bool, waited: &mut Duration) -> Result<bool> {
         let (width, height) = (self.width(), self.height());
         let first = !self.has_frame || refresh_surface;
         match &mut self.source {
@@ -311,17 +326,17 @@ impl ScreenCapture {
                 let start = Instant::now();
                 let acquired = source.duplication.AcquireNextFrame(wait_milliseconds, &mut info, &mut resource);
                 *waited += start.elapsed();
-                match acquired {
-                    Ok(()) => {}
-                    Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
+                let acquired = match acquired {
+                    Ok(()) => true,
+                    Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => false,
                     Err(error) => return Err(failed("获取桌面画面")(error)),
-                }
+                };
                 let mut changed = false;
-                if info.LastMouseUpdateTime != 0 {
+                if acquired && info.LastMouseUpdateTime != 0 {
                     source.position = info.PointerPosition.Visible.as_bool().then_some(info.PointerPosition.Position);
-                    changed = !self.independent;
+                    changed = !independent;
                 }
-                if info.PointerShapeBufferSize > 0 {
+                if acquired && info.PointerShapeBufferSize > 0 {
                     let mut data = vec![0u8; info.PointerShapeBufferSize as usize];
                     let (mut used, mut shape) = (0, DXGI_OUTDUPL_POINTER_SHAPE_INFO::default());
                     if source.duplication.GetFramePointerShape(data.len() as u32, data.as_mut_ptr().cast(), &mut used, &mut shape).is_ok() {
@@ -337,7 +352,9 @@ impl ScreenCapture {
                         source.shape = image.filter(PointerShape::is_complete);
                     }
                 }
-                let copied = if info.LastPresentTime != 0 || first {
+                // An invisible hardware pointer can be hidden, on another output, or drawn into the surface.
+                let cursorless = needs_cursorless_capture(independent, source.position, self.display.bounds, || cursor_info().ok());
+                let copied = if acquired && !cursorless && (info.LastPresentTime != 0 || first || source.frame_from_gdi) {
                     resource.and_then(|resource| resource.cast::<ID3D11Texture2D>().ok()).map(|texture| {
                         source.context.CopyResource(&source.staging, &texture);
                         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -352,9 +369,22 @@ impl ScreenCapture {
                 } else {
                     None
                 };
-                source.duplication.ReleaseFrame().map_err(failed("释放桌面画面"))?;
+                if acquired {
+                    source.duplication.ReleaseFrame().map_err(failed("释放桌面画面"))?;
+                }
+                if cursorless || (refresh_surface && copied.is_none()) {
+                    let fallback = match &mut source.fallback {
+                        Some(fallback) => fallback,
+                        None => source.fallback.insert(Gdi::open(self.display.bounds)?),
+                    };
+                    let changed = fallback.grab(&self.display, independent, first || !source.frame_from_gdi, &mut self.frame)?;
+                    source.frame_from_gdi = true;
+                    self.has_frame = true;
+                    return Ok(changed);
+                }
                 match copied {
                     Some(Ok(())) => {
+                        source.frame_from_gdi = false;
                         self.has_frame = true;
                         Ok(true)
                     }
@@ -362,29 +392,16 @@ impl ScreenCapture {
                     None => Ok(changed && !refresh_surface),
                 }
             },
-            Source::Gdi(source) => unsafe {
+            Source::Gdi(source) => {
                 if wait_milliseconds != 0 {
                     let start = Instant::now();
                     std::thread::sleep(Duration::from_millis(u64::from(wait_milliseconds.min(15))));
                     *waited += start.elapsed();
                 }
-                let bounds = self.display.bounds;
-                BitBlt(source.surface.dc, 0, 0, width as i32, height as i32, Some(source.screen), bounds.left, bounds.top, SRCCOPY | CAPTUREBLT)
-                    .map_err(failed("复制屏幕"))?;
-                if !self.display.still_at_bounds() {
-                    return Err(DeskError::platform("共享显示器的位置或尺寸已改变"));
-                }
-                if !self.independent {
-                    CursorIcon::draw_embedded(source.surface.dc, bounds);
-                }
-                let captured = source.surface.pixels()?;
-                if !first && captured == &self.frame[..] {
-                    return Ok(false);
-                }
-                self.frame.copy_from_slice(captured);
+                let changed = source.grab(&self.display, independent, first, &mut self.frame)?;
                 self.has_frame = true;
-                Ok(true)
-            },
+                Ok(changed)
+            }
         }
     }
 
@@ -394,8 +411,31 @@ impl ScreenCapture {
             return None;
         }
         let Source::Duplication(source) = &self.source else { return None };
+        if source.frame_from_gdi {
+            return None;
+        }
         // Desktop duplication reports where the shape's top-left corner is, not where its hot spot is.
         let position = source.position?;
         Some(Pointer { shape: source.shape.clone()?, x: position.x, y: position.y })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{CURSOR_SUPPRESSED, CURSORINFO_FLAGS};
+
+    #[test]
+    fn only_a_shown_cursor_on_the_shared_output_can_require_cursorless_capture() {
+        let bounds = RECT { left: -1600, top: -200, right: 0, bottom: 700 };
+        let inside = POINT { x: -10, y: 250 };
+        let check = |flags, point| needs_cursorless_capture(true, None, bounds, || Some(CURSORINFO { flags, ptScreenPos: point, ..Default::default() }));
+
+        assert!(check(CURSOR_SHOWING, inside));
+        assert!(!check(CURSOR_SHOWING, POINT { x: 0, ..inside }));
+        assert!(!check(CURSORINFO_FLAGS(0), inside));
+        assert!(!check(CURSOR_SUPPRESSED, inside));
+        assert!(!needs_cursorless_capture(true, None, bounds, || None));
+        assert!(!needs_cursorless_capture(true, Some(inside), bounds, || unreachable!("DXGI reported the hardware pointer")));
     }
 }

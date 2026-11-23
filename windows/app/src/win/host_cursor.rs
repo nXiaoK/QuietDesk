@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-fn cursor_info() -> Result<CURSORINFO> {
+pub(super) fn cursor_info() -> Result<CURSORINFO> {
     let mut info = CURSORINFO { cbSize: size_of::<CURSORINFO>() as u32, ..Default::default() };
     unsafe { GetCursorInfo(&mut info) }.map_err(failed("读取系统光标"))?;
     Ok(info)
@@ -26,7 +26,7 @@ fn icon_origin(point: POINT, bounds: RECT, hotspot: (u32, u32)) -> POINT {
     POINT { x: point.x - bounds.left - hotspot.0 as i32, y: point.y - bounds.top - hotspot.1 as i32 }
 }
 
-fn location(point: POINT, bounds: RECT) -> (bool, f64, f64) {
+pub(super) fn location(point: POINT, bounds: RECT) -> (bool, f64, f64) {
     let inside = (bounds.left..bounds.right).contains(&point.x) && (bounds.top..bounds.bottom).contains(&point.y);
     let fraction = |pixel: i32, origin: i32, end: i32| ((f64::from(pixel) - f64::from(origin)) / (f64::from(end) - f64::from(origin))).clamp(0.0, 1.0);
     (inside, fraction(point.x, bounds.left, bounds.right), fraction(point.y, bounds.top, bounds.bottom))

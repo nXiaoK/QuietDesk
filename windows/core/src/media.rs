@@ -429,6 +429,16 @@ impl MediaControl {
         Self { session_id: Some(session), token: Some(token.to_vec()), role: Some(role.to_owned()), ..Self::new(operation) }
     }
 
+    pub(crate) fn stats(session: Uuid, encode_milliseconds: Option<f64>, delivery_milliseconds: Option<f64>) -> Self {
+        Self {
+            session_id: Some(session),
+            encode_milliseconds: Some(encode_milliseconds.unwrap_or(0.0)),
+            encode_idle: encode_milliseconds.is_none().then_some(true),
+            delivery_milliseconds,
+            ..Self::new(MediaOperation::Stats)
+        }
+    }
+
     /// A step of the exchange that opens `stream`.
     fn transaction(operation: MediaOperation, id: Uuid, stream: MediaStreamId, path: &str) -> Self {
         Self {
@@ -600,6 +610,14 @@ pub struct HostMedia {
 }
 
 impl HostMedia {
+    pub(crate) fn session_id(&self) -> Option<Uuid> {
+        self.session
+    }
+
+    pub(crate) fn last_media_frame(&self) -> Option<MediaFrameHeader> {
+        self.unsettled.back().map(|frame| frame.header)
+    }
+
     pub fn frame_path(&self) -> MediaPath {
         self.transaction.as_ref().map(|t| t.route).or(self.active).map_or(MediaPath::Shared, |r| r.path)
     }
@@ -1099,6 +1117,11 @@ impl ViewerMedia {
 
     pub fn receiving_stream(&self) -> Option<MediaStreamId> {
         self.receiving.as_ref().map(|receiver| receiver.stream)
+    }
+
+    pub(crate) fn quality_route(&self) -> Option<(MediaStreamId, MediaPath)> {
+        let active = self.active?;
+        (!self.paused && self.transaction.is_none() && self.receiving_stream() == Some(active.stream)).then_some((active.stream, active.path))
     }
 
     /// Set before consuming the offer, once the endpoint and the local transport are available.

@@ -24,15 +24,18 @@ public struct StreamSettingsRequest: Codable, Sendable {
     // Sent only during initial startup negotiation when the host advertised initialCursorNegotiationV1.
     public let cursorRequestID: UUID?
     public let independentCursor: Bool?
+    // A viewer that can keep decoding after an in-place bitrate change opts in.
+    public let inPlaceBitrateV1: Bool?
     public init(id: UUID = UUID(), settings: StreamSettings, codec: VideoCodec? = nil,
                 chromaSubsampling: VideoChromaSubsampling? = nil,
-                cursorRequestID: UUID? = nil, independentCursor: Bool? = nil) {
+                cursorRequestID: UUID? = nil, independentCursor: Bool? = nil, inPlaceBitrateV1: Bool? = nil) {
         self.id = id
         self.settings = settings
         self.codec = codec
         self.chromaSubsampling = chromaSubsampling
         self.cursorRequestID = cursorRequestID
         self.independentCursor = independentCursor
+        self.inPlaceBitrateV1 = inPlaceBitrateV1
     }
     public func validate() throws {
         try settings.validateControlValues()
@@ -73,11 +76,13 @@ public struct VideoTuningSession {
     public private(set) var appliedChroma: VideoChromaSubsampling = .yuv420
     public private(set) var desiredChroma: VideoChromaSubsampling = .yuv420
     private var pendingInitialCursor: (requestID: UUID, enabled: Bool)?
-    public init(applied: VideoStreamState, preferred: StreamSettings? = nil) throws {
+    private let supportsInPlaceBitrate: Bool
+    public init(applied: VideoStreamState, preferred: StreamSettings? = nil, supportsInPlaceBitrate: Bool = false) throws {
         try applied.validate()
         if let preferred { try preferred.validateControlValues() }
         self.applied = applied
         self.desired = preferred ?? applied.settings
+        self.supportsInPlaceBitrate = supportsInPlaceBitrate
     }
     public mutating func choose(_ settings: StreamSettings) throws {
         try settings.validateControlValues()
@@ -120,7 +125,8 @@ public struct VideoTuningSession {
             codec: desiredCodec == .h264 && appliedCodec == .h264 ? nil : desiredCodec,
             chromaSubsampling: effectiveChroma == .yuv420 && appliedChroma == .yuv420 ? nil : effectiveChroma,
             cursorRequestID: initialCursor?.requestID,
-            independentCursor: initialCursor?.enabled
+            independentCursor: initialCursor?.enabled,
+            inPlaceBitrateV1: supportsInPlaceBitrate ? true : nil
         )
         pending = request
         return request

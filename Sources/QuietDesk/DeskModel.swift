@@ -3702,7 +3702,7 @@ final class DeskModel: ObservableObject, Identifiable {
                 let preferred = viewerQualityPolicy.settingsForConnection(hostDefault: hostDefault, supportsExtended: supportsExtendedVideoSettings,
                                                                          supportsHighRefresh: supportsHighRefreshVideoSettings,
                                                                          supportsHigherFrameRate: supportsHigherFrameRateVideo)
-                videoTuning = try VideoTuningSession(applied: state, preferred: preferred)
+                videoTuning = try VideoTuningSession(applied: state, preferred: preferred, supportsInPlaceBitrate: supportsAdaptiveVideo)
                 // HEVC needs the host's hardware encoder and this Mac's hardware decoder; either missing keeps H.264.
                 if hevcSupported {
                     videoTuning?.chooseCodec(.hevc)

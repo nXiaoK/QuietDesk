@@ -6,6 +6,7 @@ use quietdesk_core::messages::StreamSettings;
 use quietdesk_core::pixel::{Nv12Color, Plane};
 use quietdesk_core::video::{EncodedFrame, H264FrameAssembler, h264_sps_is_display_p3};
 use std::mem::ManuallyDrop;
+use windows::Win32::Foundation::S_OK;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::Variant::VARIANT;
@@ -168,6 +169,20 @@ impl H264Encoder {
                 settings,
             })
         }
+    }
+
+    pub fn set_bitrate(&mut self, megabits: i64) -> Result<()> {
+        let control = self.control.as_ref().ok_or_else(|| DeskError::platform("编码器不支持动态码率"))?;
+        let value = VARIANT::from((megabits * 1_000_000) as u32);
+        let status = unsafe {
+            // SetValue may return S_FALSE for a read-only property.
+            (control.vtable().SetValue)(control.as_raw(), &CODECAPI_AVEncCommonMeanBitRate, &value)
+        };
+        if status != S_OK {
+            return Err(DeskError::platform(format!("编码器未接受动态码率：{status:?}")));
+        }
+        self.settings.megabits = megabits;
+        Ok(())
     }
 
     pub fn request_key_frame(&mut self) {

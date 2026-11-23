@@ -117,6 +117,10 @@ impl RepairCache {
         self.frames.get(&header.frame_id).is_some_and(|cached| cached.header == header && cached.submitted == cached.count)
     }
 
+    pub(crate) fn needed_no_repair(&self, header: MediaFrameHeader) -> bool {
+        self.frames.get(&header.frame_id).is_some_and(|cached| cached.header == header && cached.rounds == 0 && cached.probes == 0)
+    }
+
     pub fn submitted(&mut self, header: MediaFrameHeader, index: u16, now: Instant) {
         if let Some(c) = self.frames.get_mut(&header.frame_id)
             && c.header == header

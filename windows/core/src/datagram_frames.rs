@@ -43,6 +43,8 @@ pub(crate) struct DatagramFrames {
     pending: VecDeque<Pending>,
     pending_bytes: usize,
     pacing: ByteCredit,
+    // Frames queued under the previous setting keep their submission deadlines.
+    pace_change_after: Option<u64>,
     next_send: Instant,
     next_poll: Instant,
     settings: StreamSettings,
@@ -51,12 +53,18 @@ pub(crate) struct DatagramFrames {
 }
 
 impl DatagramFrames {
+    fn pacing_limits(megabits: i64) -> (f64, f64) {
+        let rate = (megabits as f64 * 200_000.0).max(250_000.0);
+        let burst = (rate * 0.008).clamp(((MAX_RECORD_BYTES + 1) * 4) as f64, 32_768.0);
+        (rate, burst)
+    }
+
     pub fn new(stream: MediaStreamId, settings: StreamSettings, features: FragmentFeatures, now: Instant, loss: LossHistory) -> Self {
         let settings = StreamSettings { megabits: settings.megabits.max(1), frames_per_second: settings.frames_per_second.max(1), ..settings };
-        let rate = (settings.megabits as f64 * 200_000.0).max(250_000.0);
-        let burst = (rate * 0.008).clamp(((MAX_RECORD_BYTES + 1) * 4) as f64, 32_768.0);
+        let (rate, burst) = Self::pacing_limits(settings.megabits);
         Self {
             pacing: ByteCredit::new(rate, burst, now),
+            pace_change_after: None,
             stream,
             cache: RepairCache::new(stream),
             pending: VecDeque::new(),
@@ -77,7 +85,17 @@ impl DatagramFrames {
         self.cache.set_capacity(capacity);
     }
 
-    pub fn insert(&mut self, frame: MediaFrame, now: Instant, rtt: Duration) -> Result<()> {
+    pub fn set_bitrate(&mut self, megabits: i64, now: Instant) {
+        self.settings.megabits = megabits;
+        self.pace_change_after = self.pending.back().map(|item| item.header().frame_id);
+        if self.pace_change_after.is_none() {
+            let (rate, burst) = Self::pacing_limits(megabits);
+            self.pacing.retarget(rate, burst, now);
+            self.next_send = now;
+        }
+    }
+
+    pub fn insert(&mut self, frame: MediaFrame, now: Instant, rtt: Duration) -> Result<Duration> {
         let header = frame.header;
         let load = FrameLoad { key: header.is_idr, payload_bytes: frame.packet.encoded_len(), queued: self.pending_bytes, rtt };
         let protection = self.loss.protection(self.features, self.settings, load, now);
@@ -89,7 +107,9 @@ impl DatagramFrames {
         if bytes > BYTE_BUDGET - self.pending_bytes {
             return Err(DeskError::invalid("媒体数据报发送队列已满"));
         }
-        let wire_time = self.pacing.duration(self.pending_bytes + bytes);
+        let rate = Self::pacing_limits(self.settings.megabits).0;
+        let serialization = Duration::from_secs_f64(bytes as f64 / rate);
+        let wire_time = self.pacing.duration(self.pending_bytes).max(Duration::from_secs_f64(self.pending_bytes as f64 / rate)) + serialization;
         let minimum = if header.is_idr { Duration::from_secs(1) } else { Duration::from_millis(250) };
         let ttl = (wire_time + rtt * 3 + Duration::from_millis(80)).clamp(minimum, Duration::from_secs(5));
         let fragments = self.cache.insert(&frame, now, now + ttl)?;
@@ -107,7 +127,7 @@ impl DatagramFrames {
             }
         }
         self.pending_bytes += bytes;
-        Ok(())
+        Ok(serialization)
     }
 
     pub fn deadline(&self) -> Instant {
@@ -135,6 +155,10 @@ impl DatagramFrames {
 
     pub fn fully_submitted(&self, header: MediaFrameHeader) -> bool {
         self.stream == header.stream && self.cache.fully_submitted(header)
+    }
+
+    pub fn needed_no_repair(&self, header: MediaFrameHeader) -> bool {
+        self.cache.needed_no_repair(header)
     }
 
     pub fn feedback(&mut self, feedback: &MediaFeedback, now: Instant, rtt: Duration) -> bool {
@@ -181,6 +205,11 @@ impl DatagramFrames {
                 encoded_block = true;
             }
             let Some(pending) = self.pending.front() else { break };
+            if self.pace_change_after.is_some_and(|previous| pending.header().frame_id > previous) {
+                self.pace_change_after = None;
+                let (rate, burst) = Self::pacing_limits(self.settings.megabits);
+                self.pacing.retarget(rate, burst, now);
+            }
             if matches!(pending, Pending::Block { .. }) {
                 self.next_send = now + Duration::from_micros(200);
                 break;
@@ -220,6 +249,34 @@ mod tests {
     use crate::media::FragmentRange;
     use crate::video::{EncodedFrame, VideoPacket};
     use uuid::Uuid;
+
+    #[test]
+    fn bitrate_change_paces_new_frames_without_delaying_already_queued_originals() {
+        let now = Instant::now();
+        let stream = MediaStreamId { session_id: Uuid::new_v4(), transport_epoch: 1, codec_epoch: 1 };
+        let mut queue = DatagramFrames::new(stream, StreamSettings::new(1920, 60, 12), FragmentFeatures::default(), now, LossHistory::default());
+        let frame = |id, nal, sps, pps| {
+            let mut avcc = 8_400_u32.to_be_bytes().to_vec();
+            avcc.push(nal);
+            avcc.resize(8_404, 1);
+            let packet = VideoPacket::h264(id as u32, EncodedFrame { avcc, sps, pps });
+            MediaFrame::new(stream, id, packet).unwrap()
+        };
+        let old = frame(1, 0x65, vec![0x67], vec![0x68]);
+        let next = frame(2, 0x41, vec![], vec![]);
+        let (old_header, next_header) = (old.header, next.header);
+        let old_serialization = queue.insert(old, now, Duration::ZERO).unwrap();
+        queue.set_bitrate(1, now);
+        let next_serialization = queue.insert(next, now, Duration::ZERO).unwrap();
+        assert!(next_serialization > old_serialization * 8);
+        queue.send_batch(now, |_| true);
+        assert!(queue.fully_submitted(old_header));
+        assert!(!queue.fully_submitted(next_header));
+        while !queue.pending.is_empty() {
+            queue.send_batch(queue.next_send, |_| true);
+        }
+        assert!(queue.fully_submitted(next_header));
+    }
 
     #[test]
     fn a_full_socket_retries_originals_and_only_accepted_fragments_can_be_acknowledged() {

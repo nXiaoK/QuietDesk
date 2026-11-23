@@ -24,6 +24,7 @@ enum Command {
     Displays(oneshot::Sender<Result<HostDisplays>>),
     SwitchDisplay(u32, StreamSettings, FrameSink, oneshot::Sender<Result<DisplaySwitch>>),
     Configure(StreamSettings, FrameSink, oneshot::Sender<Result<VideoStreamState>>),
+    Bitrate(i64, oneshot::Sender<Result<()>>),
     Pause(bool, oneshot::Sender<Result<()>>),
     KeyFrame(oneshot::Sender<Result<()>>),
     Cursor(Option<watch::Sender<Option<HostCursorSample>>>, oneshot::Sender<Result<()>>),
@@ -205,6 +206,10 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
                     state
                 }));
             }
+            Ok(Command::Bitrate(megabits, reply)) => {
+                let result = stream.as_mut().ok_or_else(stopped).and_then(|stream| stream.encoder.set_bitrate(megabits));
+                let _ = reply.send(result);
+            }
             Ok(Command::Pause(pause, reply)) => {
                 let target = match (pause, &capture) {
                     (true, _) => CursorTarget::Paused,
@@ -306,7 +311,11 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
         }
         let start = Instant::now();
         let encoded = active.encoder.encode(&active.nv12, &mut outputs);
-        stats.encoded(start.elapsed(), !current);
+        let elapsed = start.elapsed();
+        stats.encoded(elapsed, !current);
+        if encoded.is_ok() {
+            active.sink.record_encode_time(elapsed);
+        }
         if let Err(error) = encoded {
             log::error!("encoding failed, ending the stream: {error}");
             stream = None;
@@ -458,6 +467,16 @@ impl HostPlatform for WindowsHost {
     async fn configure(&mut self, settings: StreamSettings, frames: FrameSink) -> Result<VideoStreamState> {
         let (reply, answer) = oneshot::channel();
         self.commands.send(Command::Configure(settings, frames, reply)).map_err(|_| stopped())?;
+        answer.await.map_err(|_| stopped())?
+    }
+
+    fn supports_adaptive_video(&self) -> bool {
+        true
+    }
+
+    async fn set_bitrate(&mut self, megabits: i64) -> Result<()> {
+        let (reply, answer) = oneshot::channel();
+        self.commands.send(Command::Bitrate(megabits, reply)).map_err(|_| stopped())?;
         answer.await.map_err(|_| stopped())?
     }
 

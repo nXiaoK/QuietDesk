@@ -20,7 +20,11 @@ func runLiveSettingsChecks() {
         let request = StreamSettingsRequest(settings: medium)
         let message = try Wire.json(.streamSettingsRequest, request)
         let decoded = try Wire.readJSON(StreamSettingsRequest.self, message.payload)
-        try check(decoded.id == request.id && decoded.settings == medium, "Request changed over wire")
+        try check(decoded.id == request.id && decoded.settings == medium && decoded.inPlaceBitrateV1 == nil, "Request changed over wire")
+        var adaptive = try VideoTuningSession(applied: initial, preferred: medium, supportsInPlaceBitrate: true)
+        guard let optedIn = adaptive.nextRequest() else { throw CheckFailure("Missing adaptive request") }
+        let adaptiveWire = try Wire.readJSON(StreamSettingsRequest.self, Wire.json(.streamSettingsRequest, optedIn).payload)
+        try check(adaptiveWire.inPlaceBitrateV1 == true, "Adaptive viewer did not send the bitrate opt-in")
         let result = StreamSettingsResult(id: request.id, state: state(medium))
         let decodedResult = try Wire.readJSON(StreamSettingsResult.self, Wire.json(.streamSettingsResult, result).payload)
         try check(decodedResult.state == result.state, "Applied state changed over wire")

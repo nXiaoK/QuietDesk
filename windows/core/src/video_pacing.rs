@@ -21,10 +21,21 @@ impl ByteCredit {
         Duration::from_secs_f64(bytes as f64 / self.rate)
     }
 
-    pub fn wait(&mut self, bytes: usize, now: Instant) -> Option<Duration> {
+    fn replenish(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.updated);
         self.credit = (self.credit + elapsed.as_secs_f64() * self.rate).min(self.burst);
         self.updated = now.max(self.updated);
+    }
+
+    pub fn retarget(&mut self, rate: f64, burst: f64, now: Instant) {
+        self.replenish(now);
+        self.rate = rate;
+        self.burst = burst;
+        self.credit = self.credit.min(burst);
+    }
+
+    pub fn wait(&mut self, bytes: usize, now: Instant) -> Option<Duration> {
+        self.replenish(now);
         (self.credit + 1.0 < bytes as f64).then(|| Duration::from_secs_f64((bytes as f64 - self.credit) / self.rate))
     }
 
@@ -45,9 +56,11 @@ impl VideoPacer {
     }
 
     pub fn set_target(&mut self, target: u32, now: Instant) {
-        if self.0.rate != Self::rate(target) {
-            *self = Self::at(target, now);
-        }
+        self.0.retarget(Self::rate(target), BURST as f64, now);
+    }
+
+    pub fn duration(target: u32, bytes: usize) -> Duration {
+        Duration::from_secs_f64(bytes as f64 / Self::rate(target))
     }
 
     fn next(&mut self, remaining: usize, now: Instant) -> Result<usize, Duration> {
@@ -77,6 +90,17 @@ impl VideoPacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changing_the_tcp_target_does_not_mint_a_second_burst() {
+        let now = Instant::now();
+        let mut pacing = VideoPacer::at(50, now);
+        for _ in 0..BURST / SLICE {
+            assert_eq!(pacing.next(BURST, now), Ok(SLICE));
+        }
+        pacing.set_target(5, now);
+        assert_eq!(pacing.next(BURST, now), Err(VideoPacer::duration(5, SLICE)));
+    }
 
     #[test]
     fn limits_rate_burst_and_slices_across_frame_boundaries() {

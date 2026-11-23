@@ -533,7 +533,7 @@ private final class MacViewer: @unchecked Sendable {
                 try clipboard.greet(peer, id: UUID())
             }
             let applied = VideoStreamState(settings: hello.settings, width: hello.width, height: hello.height)
-            var tuning = try VideoTuningSession(applied: applied, preferred: preferred)
+            var tuning = try VideoTuningSession(applied: applied, preferred: preferred, supportsInPlaceBitrate: hello.adaptiveVideoV1 == true)
             if hello.sessionTerminationV1 == true { peer.send(try SessionTermination(.subscribe).message()) }
             if hello.deviceIdentityExchange == true, let identity { peer.send(try Wire.json(.deviceIdentity, identity)) }
             if hello.controlStatusUpdates == true { peer.send(Message(.controlStatus)) }
@@ -625,6 +625,9 @@ private final class MacViewer: @unchecked Sendable {
             let result = try Wire.readJSON(StreamSettingsResult.self, message.payload)
             let next = try state.update { state -> StreamSettingsRequest? in
                 guard var tuning = state.tuning, try tuning.receive(result, maximumFrameRate: 60) else { return nil }
+                if let restarts = result.restartsStream {
+                    state.media?.updateSettings(result.state.settings, restartsStream: restarts)
+                }
                 state.results.append(result)
                 let next = tuning.nextRequest()
                 state.tuning = tuning
@@ -1530,7 +1533,11 @@ private final class MacHost: @unchecked Sendable {
             let applied = VideoStreamState(settings: request.settings, width: dimensions.0, height: dimensions.1)
             let restart = state.update { state -> Bool in
                 state.requests.append(request)
-                let restart = state.streaming && state.applied != applied
+                let inPlace = request.inPlaceBitrateV1 == true &&
+                    state.applied.settings.longestEdge == applied.settings.longestEdge &&
+                    state.applied.settings.framesPerSecond == applied.settings.framesPerSecond &&
+                    state.applied.width == applied.width && state.applied.height == applied.height
+                let restart = state.streaming && state.applied != applied && !inPlace
                 state.applied = applied
                 if restart {
                     state.next = 0
@@ -1827,6 +1834,36 @@ private struct WindowsInteropChecks {
                 let starts = probe.all("configured").map(settings)
                 try require(starts == [[2560, 60, 20, 640, 360]], "Unexpected capture configurations at first commit: \(starts)")
                 try until("control status arrives") { viewer.state.get().control == [true] }
+            }
+        }
+
+        run("Windows keeps the UDP epoch for a supported bitrate change and restarts after the encoder refuses one") {
+            try withWindowsHost(["--synthetic-live-bitrate", "--refuse-bitrate", "6"], udp: true) { probe, viewer in
+                try until("Windows commits UDP and sends predicted frames") {
+                    let state = viewer.state.get()
+                    return state.commitPaths.last == "udp" && state.mediaFrames.count >= 6
+                }
+                let original = viewer.state.get()
+                try require(original.hello?.adaptiveVideoV1 == true, "Windows did not advertise bitrate adaptation")
+                guard let frame = original.mediaFrames.last else { throw Failure("No opening Windows stream") }
+                try viewer.choose(StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 5))
+                let applied = try probe.next("bitrateApplied")
+                try require(applied["megabits"] as? Int == 5, "The running Windows encoder used a different bitrate")
+                try until("The in-place result arrives and more pictures use the original stream") {
+                    let state = viewer.state.get()
+                    return state.results.last?.restartsStream == false && state.results.last?.state.settings.megabits == 5
+                        && state.mediaFrames.contains { $0.header.stream == frame.header.stream && $0.header.frameID > frame.header.frameID + 5 }
+                }
+                try require(viewer.state.get().commits == original.commits && probe.all("configured").count == 1,
+                            "The accepted bitrate change restarted capture or renegotiated the stream")
+                try viewer.choose(StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 6))
+                try until("the refused live bitrate is applied by restarting from a keyframe") {
+                    let state = viewer.state.get()
+                    return state.results.last?.restartsStream == true && state.results.last?.state.settings.megabits == 6
+                        && state.commits.count > original.commits.count
+                        && state.mediaFrames.contains { $0.header.stream != frame.header.stream && $0.header.isIDR }
+                }
+                try require(probe.all("configured").count == 2, "The fallback restarted capture more than once")
             }
         }
 
@@ -2533,6 +2570,44 @@ private struct WindowsInteropChecks {
             try body(host, probe)
             let failures = host.state.get().failures
             try require(failures.isEmpty, "The macOS host rejected what the Windows viewer sent: \(failures)")
+        }
+
+        run("A Windows viewer adapts the bitrate from media delivery telemetry on the same TCP stream") {
+            try withMacHost(prepareHello: { message in
+                guard var hello = try JSONSerialization.jsonObject(with: message.payload) as? [String: Any] else {
+                    throw Failure("Missing Mac hello fields")
+                }
+                hello["adaptiveVideoV1"] = true
+                return Message(.hello, try JSONSerialization.data(withJSONObject: hello))
+            }) { host, probe in
+                try until("the Mac commits TCP and the Windows viewer receives pictures") {
+                    host.state.get().commits.last?.path == "tcp" && probe.all("frame").count >= 12
+                }
+                let before = host.state.get()
+                guard let peer = before.peer, let session = before.commits.last?.sessionID else {
+                    throw Failure("Missing committed Mac media session")
+                }
+                let slow = try MediaControl(.stats, sessionID: session, encodeMilliseconds: 0, deliveryMilliseconds: 650, encodeIdle: true).message()
+                var lastSent = -Double.infinity
+                try until("the Windows viewer reacts to sustained delivery delay", seconds: 8) {
+                    let now = SessionClock.now
+                    if now - lastSent >= 0.3 {
+                        lastSent = now
+                        peer.send(slow)
+                    }
+                    return host.state.get().requests.dropFirst(before.requests.count).contains { $0.settings.megabits < before.applied.settings.megabits }
+                }
+                let adapted = host.state.get()
+                guard let request = adapted.requests.dropFirst(before.requests.count).first else { throw Failure("No adaptive quality request") }
+                try require(request.inPlaceBitrateV1 == true
+                            && request.settings.longestEdge == before.applied.settings.longestEdge
+                            && request.settings.framesPerSecond == before.applied.settings.framesPerSecond,
+                            "The Windows viewer requested something other than a hot bitrate change")
+                let pictures = probe.all("frame").count
+                try until("the original TCP stream continues after the bitrate change") { probe.all("frame").count > pictures + 5 }
+                try require(host.state.get().commits.map(\.transactionID) == before.commits.map(\.transactionID),
+                            "Adaptation renegotiated the TCP video stream")
+            }
         }
 
         for windowsHost in [true, false] {

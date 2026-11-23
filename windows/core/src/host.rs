@@ -12,7 +12,7 @@ use crate::error::{DeskError, Result};
 use crate::input::{HostInputTranslator, InjectOp};
 use crate::keymap::MacModifierMapping;
 use crate::media::window::{self, RoundTrips};
-use crate::media::{FeedbackKind, FragmentFeatures, MediaFrameHeader, MediaPath};
+use crate::media::{FeedbackKind, FragmentFeatures, MediaFrameHeader, MediaPath, MediaStreamId};
 use crate::media::{Gate, HostFrame, HostMedia, HostMediaEvent, MediaControl, MediaFeedback, MediaOperation};
 use crate::messages::{
     ControlStatus, DeviceIdentity, HOST_ENDED_REASON, Hello, InputAction, InputFeedback, InputKind, RemoteInput, SessionPauseRequest, SessionPauseResult,
@@ -21,6 +21,7 @@ use crate::messages::{
 use crate::peer::{PeerEvent, PeerHandle};
 use crate::tls::AuxiliaryRole;
 use crate::video::EncodedFrame;
+use crate::video_pacing::VideoPacer;
 use crate::wire::{self, Message, MessageKind};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -35,6 +36,79 @@ use uuid::Uuid;
 /// How long a host that announced `initialStreamNegotiationV1` waits for the viewer's first settings
 /// before it starts with the ones in its hello.
 const INITIAL_SETTINGS_GRACE: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct Timing {
+    count: u32,
+    total: Duration,
+    minimum: Option<Duration>,
+}
+
+impl Timing {
+    fn record(&mut self, sample: Duration) {
+        self.count += 1;
+        self.total += sample;
+        self.minimum = Some(self.minimum.map_or(sample, |minimum| minimum.min(sample)));
+    }
+
+    fn mean(&self) -> Option<Duration> {
+        (self.count != 0).then(|| self.total / self.count)
+    }
+}
+
+struct DeliveryProbe {
+    header: MediaFrameHeader,
+    started: Instant,
+    serialization: Duration,
+}
+
+#[derive(Default)]
+struct DeliverySamples {
+    stream: Option<MediaStreamId>,
+    pending: VecDeque<DeliveryProbe>,
+    timings: Timing,
+    floors: VecDeque<(Instant, Duration)>,
+}
+
+impl DeliverySamples {
+    fn submitted(&mut self, header: MediaFrameHeader, started: Instant, serialization: Duration) {
+        if self.stream != Some(header.stream) {
+            *self = Self { stream: Some(header.stream), ..Self::default() };
+        }
+        if !header.is_idr {
+            self.pending.push_back(DeliveryProbe { header, started, serialization });
+        }
+    }
+
+    fn feedback(&mut self, feedback: &MediaFeedback, pristine: bool, now: Instant) {
+        if self.stream != Some(feedback.header.stream) || !matches!(feedback.kind, FeedbackKind::Reassembled | FeedbackKind::Decoded) {
+            return;
+        }
+        if let Some(index) = self.pending.iter().position(|probe| probe.header == feedback.header) {
+            let probe = self.pending.remove(index).expect("matched a delivery probe");
+            if pristine {
+                let elapsed = now.saturating_duration_since(probe.started);
+                self.timings.record(elapsed.saturating_sub(probe.serialization));
+            }
+        }
+        if feedback.kind == FeedbackKind::Decoded {
+            self.pending.retain(|probe| probe.header.frame_id > feedback.header.frame_id);
+        }
+    }
+
+    fn take_window(&mut self, now: Instant) -> Option<f64> {
+        let timings = std::mem::take(&mut self.timings);
+        self.floors.retain(|(at, _)| now.saturating_duration_since(*at) <= Duration::from_secs(30));
+        if let Some(minimum) = timings.minimum {
+            self.floors.push_back((now, minimum));
+        }
+        if timings.count < 3 {
+            return None;
+        }
+        let floor = self.floors.iter().map(|(_, minimum)| *minimum).min()?;
+        Some(timings.mean()?.saturating_sub(floor).as_secs_f64() * 1_000.0)
+    }
+}
 
 struct CapturedFrame {
     generation: u64,
@@ -62,11 +136,12 @@ struct FrameWindow {
     gate: Gate,
     generation: u64,
     key_submitted: bool,
+    encode_time: Timing,
 }
 
 impl FrameWindow {
     fn new(gate: Gate) -> Self {
-        Self { outstanding: 0, bytes: 0, limit: FrameSink::WINDOW, gate, generation: 0, key_submitted: false }
+        Self { outstanding: 0, bytes: 0, limit: FrameSink::WINDOW, gate, generation: 0, key_submitted: false, encode_time: Timing::default() }
     }
 
     fn set_gate(&mut self, gate: Gate) {
@@ -116,6 +191,10 @@ impl FrameSink {
     /// Frames queued at capture or waiting for the viewer to acknowledge them.
     pub fn outstanding(&self) -> usize {
         self.window.lock().unwrap().outstanding
+    }
+
+    pub fn record_encode_time(&self, elapsed: Duration) {
+        self.window.lock().unwrap().encode_time.record(elapsed);
     }
 
     /// Hands over one frame; false once the stream it belongs to has been replaced or the session ended.
@@ -213,6 +292,13 @@ pub trait HostPlatform {
     /// Starts or restarts capture and encoding with these settings, delivering to `frames` from a keyframe on.
     /// Returns the size actually encoded and the settings actually in effect.
     fn configure(&mut self, settings: StreamSettings, frames: FrameSink) -> impl Future<Output = Result<VideoStreamState>> + Send;
+    fn supports_adaptive_video(&self) -> bool {
+        false
+    }
+    /// Changes only the running encoder's bitrate, preserving its prediction state.
+    fn set_bitrate(&mut self, _megabits: i64) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(Err(DeskError::platform("当前编码器不支持动态码率")))
+    }
     /// Finishes any in-progress encode and arms a keyframe of the current screen before the gate opens.
     fn request_key_frame(&mut self) -> impl Future<Output = Result<()>> + Send;
     fn supports_independent_cursor(&self) -> bool {
@@ -343,6 +429,8 @@ struct HostSession<'a, P: HostPlatform> {
     unacknowledged: VecDeque<(u32, FrameCredit)>,
     media_credits: VecDeque<FrameCredit>,
     round_trips: RoundTrips,
+    adaptive_viewer: bool,
+    delivery: DeliverySamples,
     sequence: u32,
     paused: bool,
     control_subscribed: bool,
@@ -428,6 +516,8 @@ pub async fn run_with_auxiliary<P: HostPlatform>(
         unacknowledged: VecDeque::new(),
         media_credits: VecDeque::new(),
         round_trips: RoundTrips::default(),
+        adaptive_viewer: false,
+        delivery: DeliverySamples::default(),
         sequence: 0,
         paused: false,
         control_subscribed: false,
@@ -452,6 +542,8 @@ impl<P: HostPlatform> HostSession<'_, P> {
             Err(error) => return error,
         };
         let start_by = Instant::now() + INITIAL_SETTINGS_GRACE;
+        let mut statistics = tokio::time::interval(Duration::from_secs(1));
+        statistics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             if self.udp_frames.as_ref().is_some_and(|frames| Some(frames.stream) != self.media.udp_frame_stream()) {
                 self.retire_datagram_frames();
@@ -479,6 +571,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                     None => Err(DeskError::Network("连接已关闭".to_string())),
                 },
                 _ = tokio::time::sleep_until(start_by), if self.state.is_none() => self.start(initial, events).await.map(drop),
+                _ = statistics.tick() => self.report_statistics(),
                 _ = tokio::time::sleep_until(media_deadline.unwrap_or(start_by)), if !self.paused && media_deadline.is_some() => self.tick_media(),
                 _ = tokio::time::sleep_until(gesture_check.unwrap_or(start_by)), if gesture_check.is_some() => { self.platform.check_gestures(); Ok(()) }
                 audio = self.audio.next() => self.audio.deliver(audio, self.paused, self.peer, self.media.datagram_audio.then_some(&self.datagrams)),
@@ -555,6 +648,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 preferred_settings: Some(preferred.extended_compatible()),
                 high_refresh_video_settings: Some(true),
                 preferred_high_refresh_settings: Some(preferred.high_refresh_compatible()),
+                adaptive_video_v1: self.platform.supports_adaptive_video().then_some(true),
                 session_pause: Some(true),
                 media_transport_v1: Some(true),
                 independent_cursor_v1: self.platform.supports_independent_cursor().then_some(true),
@@ -606,17 +700,24 @@ impl<P: HostPlatform> HostSession<'_, P> {
             }
             HostFrame::Media(message) => {
                 self.media_credits.push_back(captured.credit);
-                match self.media.frame_path() {
+                let path = self.media.frame_path();
+                let target = self.state.map_or(self.options.preferred, |state| state.settings).megabits as u32;
+                match path {
                     MediaPath::Shared => self.peer.send(&message)?,
                     MediaPath::Udp => return Err(DeskError::platform("UDP 帧被错误地放入可靠通道")),
                     MediaPath::Tcp => {
-                        let settings = self.state.map_or(self.options.preferred, |state| state.settings);
-                        if !self.auxiliary.peer(AuxiliaryRole::Video).is_some_and(|video| video.send_video(&message, settings.megabits as u32).is_ok()) {
+                        if !self.auxiliary.peer(AuxiliaryRole::Video).is_some_and(|video| video.send_video(&message, target).is_ok()) {
                             self.auxiliary.close(AuxiliaryRole::Video);
                             let update = self.media.set_video_bound(false);
                             self.apply_media_update(update)?;
+                            return Ok(());
                         }
                     }
+                }
+                if self.adaptive_viewer {
+                    let header = self.media.last_media_frame().expect("the reliable media frame was recorded");
+                    let paced = if path == MediaPath::Tcp { VideoPacer::duration(target, message.payload.len()) } else { Duration::ZERO };
+                    self.delivery.submitted(header, Instant::now(), paced);
                 }
             }
             HostFrame::Datagram(frame) => {
@@ -631,8 +732,11 @@ impl<P: HostPlatform> HostSession<'_, P> {
                     }
                     self.udp_frames = Some(queue);
                 }
-                if self.udp_frames.as_mut().expect("active UDP stream").insert(frame, now, self.datagrams.rtt()).is_err() {
-                    self.interrupt_datagram_stream()?;
+                let header = frame.header;
+                match self.udp_frames.as_mut().expect("active UDP stream").insert(frame, now, self.datagrams.rtt()) {
+                    Ok(serialization) if self.adaptive_viewer => self.delivery.submitted(header, now, serialization),
+                    Ok(_) => {}
+                    Err(_) => self.interrupt_datagram_stream()?,
                 }
             }
             HostFrame::Dropped => {}
@@ -643,6 +747,19 @@ impl<P: HostPlatform> HostSession<'_, P> {
 
     fn capture_gate(&self) -> Gate {
         if self.paused { Gate::Closed } else { self.media.gate() }
+    }
+
+    fn report_statistics(&mut self) -> Result<()> {
+        let encode = std::mem::take(&mut self.window.lock().unwrap().encode_time).mean().map(|time| (time.as_secs_f64() * 1_000.0).min(10_000.0));
+        let delivery = self.delivery.take_window(Instant::now()).map(|milliseconds| milliseconds.min(60_000.0));
+        if self.adaptive_viewer
+            && self.capture_gate() == Gate::Open
+            && (encode.is_some() || delivery.is_some())
+            && let Some(session) = self.media.session_id()
+        {
+            self.peer.send(&MediaControl::stats(session, encode, delivery).message()?)?;
+        }
+        Ok(())
     }
 
     fn sync_gate(&mut self) {
@@ -713,7 +830,9 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 {
                     return Ok(());
                 }
-                if !frames.feedback(&feedback, Instant::now(), self.datagrams.rtt()) {
+                let now = Instant::now();
+                self.delivery.feedback(&feedback, frames.needed_no_repair(feedback.header), now);
+                if !frames.feedback(&feedback, now, self.datagrams.rtt()) {
                     return self.interrupt_datagram_stream();
                 }
                 let update = self.media.feedback(&feedback);
@@ -983,6 +1102,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
     }
 
     fn prepare_media(&mut self) -> Result<()> {
+        self.delivery = DeliverySamples::default();
         self.sync_gate();
         self.unacknowledged.clear();
         if self.state.is_some() {
@@ -1001,6 +1121,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
     }
 
     fn interrupt_media(&mut self) -> Result<()> {
+        self.delivery = DeliverySamples::default();
         let update = self.media.interrupted();
         self.apply_media_update(update)
     }
@@ -1185,6 +1306,7 @@ impl<P: HostPlatform> HostSession<'_, P> {
                 if self.media.frame_path() == MediaPath::Udp {
                     return Ok(());
                 }
+                self.delivery.feedback(&feedback, true, Instant::now());
                 let update = self.media.feedback(&feedback);
                 self.apply_media_update(update)?;
             }
@@ -1263,37 +1385,65 @@ impl<P: HostPlatform> HostSession<'_, P> {
     }
 
     async fn apply_settings(&mut self, request: StreamSettingsRequest, events: &impl Fn(HostEvent)) -> Result<()> {
+        let old_window = self.window.clone();
         if self.state.is_some() {
             self.change_display(DisplayChange::Refresh, events).await?;
         }
-        let reply = |state: VideoStreamState, error: Option<String>| StreamSettingsResult {
+        let display_restarted = !Arc::ptr_eq(&old_window, &self.window);
+        let adaptive = self.platform.supports_adaptive_video();
+        let reply = |state: VideoStreamState, error: Option<String>, restarted: bool| StreamSettingsResult {
             id: request.id,
             state,
             error,
             // This host encodes H.264 only; a viewer that named a codec hears which one it gets.
             codec: request.codec.map(|_| VideoCodec::H264),
             chroma_subsampling: request.chroma_subsampling.map(|_| crate::messages::ChromaSubsampling::Yuv420),
+            restarts_stream: adaptive.then_some(restarted),
         };
         let requested = match request.settings.validate_control_values() {
             Ok(()) => request.settings.limited_to(&self.options.limit),
             Err(error) => {
                 // Before the stream exists there is no state to report; the request is answered once it does.
+                let restarted = self.state.is_none() || display_restarted;
                 let state = match self.state {
                     Some(state) => state,
                     None => self.start(self.options.preferred.limited_to(&self.options.limit).legacy_compatible(), events).await?,
                 };
-                return self.peer.send(&Message::json(MessageKind::StreamSettingsResult, &reply(state, Some(error.to_string())))?);
+                return self.peer.send(&Message::json(MessageKind::StreamSettingsResult, &reply(state, Some(error.to_string()), restarted))?);
             }
         };
+        let in_place = adaptive && request.in_place_bitrate_v1 == Some(true);
+        self.adaptive_viewer |= in_place;
+        if let Some(mut state) = self.state
+            && in_place
+            && !display_restarted
+            && self.media.gate() == Gate::Open
+            && state.settings.megabits != requested.megabits
+            && state.settings.longest_edge == requested.longest_edge
+            && state.settings.frames_per_second == requested.frames_per_second
+        {
+            match self.platform.set_bitrate(requested.megabits).await {
+                Ok(()) => {
+                    state.settings = requested;
+                    self.state = Some(state);
+                    if let Some(frames) = &mut self.udp_frames {
+                        frames.set_bitrate(requested.megabits, Instant::now());
+                    }
+                    events(HostEvent::Streaming(state));
+                    return self.peer.send(&Message::json(MessageKind::StreamSettingsResult, &reply(state, None, false))?);
+                }
+                Err(error) => log::info!("encoder could not change bitrate in place: {error}"),
+            }
+        }
         let result = match self.state {
-            Some(state) if state.settings == requested => reply(state, None),
+            Some(state) if state.settings == requested => reply(state, None, display_restarted),
             previous => match self.start(requested, events).await {
-                Ok(state) => reply(state, None),
+                Ok(state) => reply(state, None, true),
                 Err(error) => {
                     // The failed attempt stopped the stream. Return to what worked, or end the session.
                     let Some(previous) = previous else { return Err(error) };
                     log::warn!("stream settings {requested:?} failed, restoring {:?}: {error}", previous.settings);
-                    reply(self.start(previous.settings, events).await?, Some(error.to_string()))
+                    reply(self.start(previous.settings, events).await?, Some(error.to_string()), true)
                 }
             },
         };
@@ -1311,6 +1461,33 @@ async fn next_frame(frames: &mut Option<mpsc::UnboundedReceiver<CapturedFrame>>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_delay_excludes_repaired_frames_and_relearns_the_baseline_on_switch() {
+        let now = Instant::now();
+        let stream = MediaStreamId { session_id: Uuid::new_v4(), transport_epoch: 1, codec_epoch: 1 };
+        let mut samples = DeliverySamples::default();
+        let probe = |samples: &mut DeliverySamples, stream, frame_id, delay, pristine| {
+            let header = MediaFrameHeader { stream, frame_id, is_idr: false };
+            samples.submitted(header, now, Duration::from_millis(5));
+            let feedback = MediaFeedback::new(FeedbackKind::Reassembled, header).unwrap();
+            samples.feedback(&feedback, pristine, now + Duration::from_millis(delay));
+        };
+        for frame in 2..=4 {
+            probe(&mut samples, stream, frame, 25, true);
+        }
+        assert_eq!(samples.take_window(now), Some(0.0));
+        for frame in 5..=7 {
+            probe(&mut samples, stream, frame, 65, true);
+        }
+        probe(&mut samples, stream, 8, 1_000, false);
+        assert_eq!(samples.take_window(now + Duration::from_secs(1)), Some(40.0));
+        let replacement = MediaStreamId { transport_epoch: 2, codec_epoch: 2, ..stream };
+        for frame in 2..=4 {
+            probe(&mut samples, replacement, frame, 80, true);
+        }
+        assert_eq!(samples.take_window(now + Duration::from_secs(2)), Some(0.0));
+    }
 
     #[test]
     fn a_gate_change_fences_queued_frames_and_only_one_keyframe_consumes_the_permit() {

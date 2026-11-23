@@ -1,6 +1,8 @@
 //! The viewer side of a session: the role of `DeskModel.handleViewer` in the macOS application, for a
 //! viewer that negotiates its media paths and platform capabilities with the host.
 
+mod quality;
+
 use crate::audio::{self, AudioPacket};
 use crate::audio_session::{AudioPlayback, ViewerAudio};
 use crate::auxiliary::{Auxiliary, AuxiliaryEvent};
@@ -13,14 +15,15 @@ use crate::media::fragment::{ReceiveEvent, Receiver};
 use crate::media::{DecodeReceipt, MediaControl, MediaStreamId, ViewerMedia, ViewerMediaEvent};
 use crate::media::{FeedbackKind, MediaFeedback, MediaOperation, MediaPath};
 use crate::messages::{
-    ControlStatus, DeviceIdentity, HOST_ENDED_REASON, Hello, InputFeedback, RemoteInput, SessionPauseRequest, SessionPauseResult, SessionTermination,
-    StreamSettings, StreamSettingsRequest, StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState, device_display_name,
+    ChromaSubsampling, ControlStatus, DeviceIdentity, HOST_ENDED_REASON, Hello, InputFeedback, RemoteInput, SessionPauseRequest, SessionPauseResult,
+    SessionTermination, StreamSettings, StreamSettingsRequest, StreamSettingsResult, TerminationOperation, VideoCodec, VideoStreamState, device_display_name,
 };
 use crate::peer::{PeerEvent, PeerHandle, input_echo};
 use crate::reliability::{Attempt, AttemptProgress};
 use crate::tls::AuxiliaryRole;
 use crate::video::VideoPacket;
 use crate::wire::{self, Message, MessageKind};
+use quality::AdaptiveQuality;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,6 +170,13 @@ struct ReceivingDatagrams {
     poll_at: Instant,
 }
 
+struct SettingsRequest {
+    id: Uuid,
+    sent: Instant,
+    settings: StreamSettings,
+    automatic: bool,
+}
+
 struct ViewerSession<'a, P: ViewerPlatform> {
     peer: &'a PeerHandle,
     platform: &'a mut P,
@@ -177,12 +187,12 @@ struct ViewerSession<'a, P: ViewerPlatform> {
     pending_cursor: Option<(Uuid, Instant)>,
     stream: Option<VideoStreamState>,
     desired: StreamSettings,
+    adaptive: Option<AdaptiveQuality>,
     displays: Vec<RemoteDisplayInfo>,
     selected_display: Option<u32>,
     display_revision: u64,
     display_request: Option<(Uuid, u32, Instant)>,
-    /// The request in flight: its identifier, when it was sent and what it asked for.
-    pending_settings: Option<(Uuid, Instant, StreamSettings)>,
+    pending_settings: Option<SettingsRequest>,
     pending_pause: Option<Uuid>,
     paused: bool,
     input_reply_deadline: Option<Instant>,
@@ -231,6 +241,7 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
         pending_cursor: None,
         stream: None,
         desired: quality,
+        adaptive: None,
         displays: Vec::new(),
         selected_display: None,
         display_revision: 0,
@@ -254,8 +265,9 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
     };
     let hello_by = Instant::now() + HELLO_TIMEOUT;
     let end = loop {
-        let settings_by = session.pending_settings.map(|(_, sent, _)| sent + SETTINGS_REPLY_TIMEOUT);
+        let settings_by = session.pending_settings.as_ref().map(|request| request.sent + SETTINGS_REPLY_TIMEOUT);
         let media_by = session.media.as_ref().and_then(ViewerMedia::deadline);
+        let quality_by = session.adaptive.as_ref().and_then(AdaptiveQuality::deadline);
         let cursor_by = session.pending_cursor.map(|(_, deadline)| deadline);
         let display_by = session.display_request.map(|(_, _, deadline)| deadline);
         let input_by = session.input_reply_deadline;
@@ -264,7 +276,12 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
         let outcome = tokio::select! {
             event = incoming.recv() => match event {
                 Some(PeerEvent::Message(message)) => session.receive(message),
-                Some(PeerEvent::RoundTrip(milliseconds)) => { session.platform.event(ViewerEvent::RoundTrip(milliseconds)); Ok(()) }
+                Some(PeerEvent::RoundTrip(milliseconds)) => {
+                    if let Some(quality) = &mut session.adaptive {
+                        quality.control_round_trip(milliseconds, Instant::now());
+                    }
+                    session.platform.event(ViewerEvent::RoundTrip(milliseconds)); Ok(())
+                }
                 Some(PeerEvent::Closed(reason)) => Err(reason),
                 None => Err(DeskError::Network("连接已关闭".to_string())),
             },
@@ -293,6 +310,9 @@ pub(crate) async fn run_attempt<P: ViewerPlatform>(
             }
             _ = tokio::time::sleep_until(media_by.unwrap_or(hello_by)), if media_by.is_some() => {
                 session.update_media(|media| media.tick(Instant::now()))
+            }
+            _ = tokio::time::sleep_until(quality_by.unwrap_or(hello_by)), if quality_by.is_some() => {
+                session.sample_quality()
             }
             _ = tokio::time::sleep_until(cursor_by.unwrap_or(hello_by)), if cursor_by.is_some() => {
                 Err(DeskError::Network("光标模式切换超时，重新建立会话".into()))
@@ -348,6 +368,15 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             }
             MessageKind::MediaControl => {
                 let control = MediaControl::read(&message)?;
+                if control.operation == MediaOperation::Stats {
+                    if self.media.is_none() {
+                        return Err(DeskError::invalid("当前连接未协商媒体会话"));
+                    }
+                    if let Some(quality) = &mut self.adaptive {
+                        quality.host_stats(&control);
+                    }
+                    return Ok(());
+                }
                 if control.operation == MediaOperation::Offer {
                     let media = self.media.as_mut().ok_or_else(|| DeskError::invalid("当前连接未协商媒体会话"))?;
                     if !media.has_offer() {
@@ -367,12 +396,33 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             MessageKind::StreamSettingsResult if hello.live_settings == Some(true) => {
                 let result: StreamSettingsResult = message.read_json()?;
                 // A reply to a request this viewer no longer waits for changes nothing.
-                let Some((_, _, requested)) = self.pending_settings.filter(|(id, _, _)| *id == result.id) else { return Ok(()) };
+                let Some(request) = self.pending_settings.take_if(|pending| pending.id == result.id) else { return Ok(()) };
+                let requested = request.settings;
                 result.state.validate()?;
-                if result.state.settings.frames_per_second > 60 || result.codec.is_some_and(|codec| codec != VideoCodec::H264) {
+                if result.state.settings.frames_per_second > 60
+                    || result.codec.is_some_and(|codec| codec != VideoCodec::H264)
+                    || result.chroma_subsampling.is_some_and(|chroma| chroma != ChromaSubsampling::Yuv420)
+                {
                     return Err(DeskError::invalid("画质回复超出已协商的范围"));
                 }
-                self.pending_settings = None;
+                if let Some(quality) = &mut self.adaptive {
+                    let previous = self.stream.expect("host hello initializes the video state");
+                    let now = Instant::now();
+                    let in_place = result.restarts_stream == Some(false)
+                        && (previous.width, previous.height) == (result.state.width, result.state.height)
+                        && StreamSettings { megabits: previous.settings.megabits, ..result.state.settings } == previous.settings;
+                    quality.confirm(
+                        requested.megabits,
+                        previous.settings.megabits,
+                        result.state.settings.megabits,
+                        request.automatic,
+                        result.error.is_none(),
+                        now,
+                    );
+                    if !in_place {
+                        quality.use_stream(None, now);
+                    }
+                }
                 self.stream = Some(result.state);
                 // The host decides what it can do: asking again for what it just lowered or declined would loop.
                 // A choice the user made while this request was in flight is still sent.
@@ -513,10 +563,14 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
             self.peer.send(&request.message()?)?;
         }
         let confirm = live_settings && hello.initial_stream_negotiation_v1 == Some(true);
+        let adaptive = live_settings && hello.adaptive_video_v1 == Some(true) && self.media.is_some();
         self.hello = Some(hello);
+        if adaptive {
+            self.adaptive = Some(AdaptiveQuality::new(self.supported(self.desired).megabits, Instant::now()));
+        }
         if confirm && self.supported(self.desired) == stream.settings {
             // The host holds its first frame until it hears the viewer's choice, even an unchanged one.
-            return self.send_settings(stream.settings);
+            return self.send_settings(stream.settings, false);
         }
         self.request_settings()
     }
@@ -663,6 +717,11 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                 ReceiveEvent::Frame(frame) => self.update_media(|media| media.assembled_frame(frame, Instant::now()))?,
                 ReceiveEvent::Feedback(feedback) => {
                     self.send_datagram_feedback(&feedback);
+                    if feedback.kind == FeedbackKind::Nack
+                        && let Some(quality) = &mut self.adaptive
+                    {
+                        quality.repair_requested(feedback.header.stream);
+                    }
                     if feedback.kind == FeedbackKind::Expired {
                         return self.update_media(|media| media.udp_delivery_failed(Instant::now()));
                     }
@@ -680,6 +739,9 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
 
     fn apply_media_events(&mut self, events: Vec<ViewerMediaEvent>) -> Result<()> {
         self.platform.media_receiving(self.media.as_ref().and_then(ViewerMedia::receiving_stream));
+        if let Some(quality) = &mut self.adaptive {
+            quality.use_stream(self.media.as_ref().and_then(ViewerMedia::quality_route), Instant::now());
+        }
         self.sync_datagram_receiver();
         let mut after_commit = Vec::new();
         for event in events {
@@ -697,7 +759,14 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
                         self.receive_datagrams(ready)?;
                     }
                 }
-                ViewerMediaEvent::Video(packet, stream, first_in_stream) => self.platform.media_video(packet, stream, first_in_stream)?,
+                ViewerMediaEvent::Video(packet, stream, first_in_stream) => {
+                    if !packet.is_key_frame()
+                        && let Some(quality) = &mut self.adaptive
+                    {
+                        quality.received(stream, packet.avcc.len());
+                    }
+                    self.platform.media_video(packet, stream, first_in_stream)?;
+                }
                 ViewerMediaEvent::Committed(stream) => {
                     if self.cursor.commit(stream) {
                         self.platform.event(ViewerEvent::Cursor(Arc::new(self.cursor.clone())));
@@ -793,19 +862,42 @@ impl<P: ViewerPlatform> ViewerSession<'_, P> {
         if !live || self.pending_settings.is_some() || self.stream.is_some_and(|stream| stream.settings == desired) {
             return Ok(());
         }
-        self.send_settings(desired)
+        self.send_settings(desired, false)
     }
 
-    fn send_settings(&mut self, settings: StreamSettings) -> Result<()> {
-        let request = StreamSettingsRequest::new(settings);
-        self.pending_settings = Some((request.id, Instant::now(), settings));
+    fn send_settings(&mut self, settings: StreamSettings, automatic: bool) -> Result<()> {
+        let mut request = StreamSettingsRequest::new(settings);
+        request.in_place_bitrate_v1 = self.adaptive.is_some().then_some(true);
+        self.pending_settings = Some(SettingsRequest { id: request.id, sent: Instant::now(), settings, automatic });
         self.peer.send(&Message::json(MessageKind::StreamSettingsRequest, &request)?)
+    }
+
+    fn sample_quality(&mut self) -> Result<()> {
+        let stream = self.stream.expect("adaptive samples belong to a committed video stream");
+        let quality = self.adaptive.as_mut().expect("only an adaptive session schedules quality samples");
+        let udp_rtt = if self.datagrams.verified() && self.media.as_ref().is_some_and(|media| media.frame_path() == MediaPath::Udp) {
+            Some(self.datagrams.rtt())
+        } else {
+            None
+        };
+        let ready = self.pending_settings.is_none() && self.display_request.is_none() && self.pending_pause.is_none();
+        if let Some(megabits) = quality.sample(stream.settings, udp_rtt, ready, Instant::now()) {
+            let settings = StreamSettings { megabits, ..stream.settings };
+            self.desired = settings;
+            log::info!("viewer adapting video bitrate: {} to {megabits} Mbps", stream.settings.megabits);
+            return self.send_settings(settings, true);
+        }
+        Ok(())
     }
 
     fn command(&mut self, command: ViewerCommand) -> Result<()> {
         match command {
             ViewerCommand::Quality(settings) => {
                 settings.validate_control_values()?;
+                let supported = self.supported(settings);
+                if let Some(quality) = &mut self.adaptive {
+                    quality.choose(supported.megabits, Instant::now());
+                }
                 self.desired = settings;
                 self.request_settings()
             }

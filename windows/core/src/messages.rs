@@ -119,6 +119,8 @@ pub struct Hello {
     pub high_refresh_video_settings: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_high_refresh_settings: Option<StreamSettings>,
+    #[serde(rename = "adaptiveVideoV1", default, skip_serializing_if = "Option::is_none")]
+    pub adaptive_video_v1: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_pause: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -242,11 +244,13 @@ pub struct StreamSettingsRequest {
     pub codec: Option<VideoCodec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chroma_subsampling: Option<ChromaSubsampling>,
+    #[serde(rename = "inPlaceBitrateV1", default, skip_serializing_if = "Option::is_none")]
+    pub in_place_bitrate_v1: Option<bool>,
 }
 
 impl StreamSettingsRequest {
     pub fn new(settings: StreamSettings) -> Self {
-        Self { id: Uuid::new_v4(), settings, codec: None, chroma_subsampling: None }
+        Self { id: Uuid::new_v4(), settings, codec: None, chroma_subsampling: None, in_place_bitrate_v1: None }
     }
 }
 
@@ -262,6 +266,8 @@ pub struct StreamSettingsResult {
     pub codec: Option<VideoCodec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chroma_subsampling: Option<ChromaSubsampling>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restarts_stream: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,6 +593,7 @@ mod tests {
             preferred_settings: None,
             high_refresh_video_settings: None,
             preferred_high_refresh_settings: None,
+            adaptive_video_v1: None,
             session_pause: None,
             media_transport_v1: None,
             independent_cursor_v1: None,

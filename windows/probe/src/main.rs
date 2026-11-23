@@ -116,6 +116,8 @@ struct ReplayHost {
     clipboard: Option<String>,
     synthetic_clipboard: Option<SyntheticClipboard>,
     refuse_edge: Option<i64>,
+    live_bitrate: bool,
+    refuse_bitrate: Option<i64>,
     synthetic_cursor: bool,
     synthetic_displays: bool,
     synthetic_audio: bool,
@@ -128,6 +130,18 @@ struct ReplayHost {
 }
 
 impl HostPlatform for ReplayHost {
+    fn supports_adaptive_video(&self) -> bool {
+        self.live_bitrate
+    }
+
+    async fn set_bitrate(&mut self, megabits: i64) -> Result<()> {
+        if self.refuse_bitrate == Some(megabits) {
+            return Err(DeskError::platform("Synthetic encoder rejected the bitrate"));
+        }
+        emit(json!({ "event": "bitrateApplied", "megabits": megabits }));
+        Ok(())
+    }
+
     fn open_clipboard(&mut self, enabled: bool) -> Option<SessionClipboard> {
         self.synthetic_clipboard.as_ref()?.open(Role::Host, enabled)
     }
@@ -392,6 +406,8 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
             clipboard: Some("probe host clipboard 剪贴板".to_string()),
             synthetic_clipboard: clipboard.clone(),
             refuse_edge,
+            live_bitrate: arguments.contains_key("synthetic-live-bitrate"),
+            refuse_bitrate: arguments.get("refuse-bitrate").and_then(|value| value.parse().ok()),
             synthetic_cursor: arguments.contains_key("synthetic-cursor"),
             synthetic_displays,
             synthetic_audio: arguments.contains_key("synthetic-audio"),

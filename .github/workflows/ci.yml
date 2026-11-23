@@ -88,6 +88,9 @@ jobs:
           }
           $unins = Start-Process -FilePath (Join-Path $installDir "unins000.exe") -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
           if ($unins.ExitCode -ne 0) { throw "Uninstaller exited with $($unins.ExitCode)" }
+          for ($i = 0; $i -lt 50 -and (Test-Path (Join-Path $installDir "QuietDesk.exe")); $i++) {
+            Start-Sleep -Milliseconds 200
+          }
           if (Test-Path (Join-Path $installDir "QuietDesk.exe")) { throw "QuietDesk.exe remained after uninstall" }
 
   check:

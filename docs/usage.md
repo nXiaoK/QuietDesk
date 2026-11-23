@@ -74,7 +74,7 @@
 
 ## 应用内更新
 
-旧版 0.7.x 没有更新器，首次安装带更新器的版本仍需从 [GitHub Releases](https://github.com/nXiaoK/QuietDesk/releases/latest) 手动下载并替换。当前仓库的 `Resources/update-feed.json` 公钥表为空，因此应用隐藏更新入口，也不询问或访问更新源。只有维护者配置公钥并发布启用的构建后，以下功能才可用。
+首次安装请从 [GitHub Releases](https://github.com/nXiaoK/QuietDesk/releases/latest) 下载安装。仓库已在 `Resources/update-feed.json` 内置 Ed25519 更新验签公钥（当 `publicKeys` 为空时应用会自动隐藏更新入口）；正式发布配置对应的 `QUIETDESK_UPDATE_SIGNING_KEY` 后，客户端即可直接验签获取更新清单，无需手动打开 GitHub 下载。Windows 端的应用内更新见 [Windows 版说明](windows.md#安装与应用内更新)。
 
 首次启动会询问“自动检查并更新？”，可选择“自动检查”“开启自动更新”或“不检查”。主窗口不可见、应用不在前台、正在控制、全屏、这台 Mac 正被远程控制或已有其他弹窗时，会推迟询问。选择保存后不再询问，可随时在「键盘、防窥与偏好 → 软件更新」、「本机共享」、应用菜单或菜单栏修改“自动检查更新”与“非远程控制时自动更新”。未作选择前不做自动检查；手动检查不会替你作选择。启用检查后，启动约两分钟起可以自动检查，成功后至少间隔 24 小时，网络失败按 1 小时退避重试。
 

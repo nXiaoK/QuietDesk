@@ -1,5 +1,20 @@
 # 构建与检查记录
 
+## Windows WP14 · x64/ARM64 安装包自动发布与应用内更新（2026-11-23，`c7ef032`、`2e19294`、`34f7dab`、`99ce018`）
+
+- **做了什么**：
+  - `c7ef032`（`scripts/build-windows.sh`、`scripts/windows-toolchain.sh`、`scripts/windows-openssl-arm64.sh`、`scripts/package-windows-installer.py`、`scripts/tests/test_windows_package.py`、`windows/installer/QuietDesk.iss`、`windows/core/Cargo.toml`、`windows/Cargo.lock`）：支持在 macOS 上同时交叉编译 `x86_64-pc-windows-gnullvm`（x64）与 `aarch64-pc-windows-gnullvm`（ARM64，从锁定的 `openssl-src` 构建静态 `mingwarm64` OpenSSL 并启用 ARM64 NEON 静态编译 `libopus`），严格核对两架构 PE32+ GUI 头与 Windows 10/11 系统 DLL 导入白名单；新增 Inno Setup 6 安装器配置 `QuietDesk.iss`（默认当前用户目录免管理员权限、支持开始菜单快捷方式及可选桌面快捷方式与登录自动启动）与打包校验脚本。
+  - `2e19294`（`Sources/QuietDeskCore/UpdateManifest.swift`、`Sources/QuietDeskUpdateTool/main.swift`、`Checks/UpdateManifestChecks.swift`、`scripts/check-update-tool.py`）：保持 macOS 既有 `QuietDesk-update.json` 格式不变以兼容已发布客户端，新增域分隔前缀 `QuietDesk-windows-update-v1\n` 的 `WindowsUpdateManifest`（含 `x64` / `arm64` 便携包与 `Setup.exe` 安装包大小及 SHA-256）以及 `QuietDeskUpdateTool sign-windows` / `verify-windows` 子命令。
+  - `34f7dab`（`windows/core/src/update.rs`、`windows/app/build.rs`、`windows/app/src/win/update.rs`、`windows/app/src/win/ui.rs`、`windows/app/src/win/settings.rs`、`windows/app/src/main.rs`）：新增 Windows 应用内更新与空闲自动更新能力，编译期从 `Resources/update-feed.json` 注入 Ed25519 公钥与更新源（禁止正式版环境变量覆盖），使用系统 `WinHTTP`（禁用 Cookie、校验 HTTPS GitHub Release 重定向目标与大小上限）拉取清单并验签，校验 SHA-256、ZIP CRC-32 与 PE 架构头，兼容 `Setup.exe` 静默升级与单文件绿色版独立辅助进程原子替换（失败自动回滚备份），在主窗口提供“软件更新”状态、手动检查/立即更新、每日自动检查与“非远程控制空闲时自动下载并安装”开关，活动远控期间自动推迟并在升级重启后自动恢复本机共享。
+  - `99ce018`（`.github/workflows/ci.yml`、`.github/workflows/release.yml`、`scripts/tests/test_update_release.py`）：PR 与手动触发 CI 新增 Windows `x64`/`ARM64` 交叉构建、互通检查、`windows-latest` Inno Setup 安装包构建及静默安装/卸载实机冒烟测试；推送 `main` 发布时统一分配版本号，自动上传 `QuietDesk-<版本>-Windows-{x64,arm64}.zip` 与 `QuietDesk-<版本>-Windows-{x64,arm64}-Setup.exe`，并签发校验 `QuietDesk-windows-update.json` 一同发布。
+  - 更新 `README.md`、`README.en.md`、`docs/usage.md`、`docs/windows.md`、`docs/security.md`、`docs/windows-plan.md`，同步修正已启用更新公钥表的说明。
+- **跑了什么与结果**：
+  - Rust 检查：`(cd windows && cargo fmt --check)`、本机目标、`x86_64-pc-windows-gnullvm` 与 `aarch64-pc-windows-gnullvm` 三处严格 `cargo clippy --locked --all-targets -- -D warnings` 全部零警告通过；`cargo test --locked -p quietdesk-core` 通过（**212 项单元测试 + 19 项回环测试**）；`python3 scripts/check-cargo-lock-age.py` 通过（99 个锁定依赖包，未引入新外部 crate）。
+  - 双向互通与 Wine 容器检查：`./scripts/run-windows-interop-checks.sh` 通过（**`57 passed, 0 failed`**）；`./scripts/run-windows-wine-checks.sh` 通过（**41 项原生测试**，含新增 `win::update::tests::winhttp_stages_signed_loopback_update_and_performs_atomic_swap_with_rollback` 在 Wine `winhttp.dll` 下完成签名清单拉取、302 安全重定向、非安全重定向拒绝、SHA-256 + ZIP 解压、原子替换、损坏镜像自动回滚与启动结果消费，另有 5 项 OLE 剪贴板、1 项 WASAPI、`capture`/`displays`/`cursor`/`codec` 与 DTLS UDP 视频会话 550 帧通过）。
+  - macOS 与发布脚本检查：`QuietDeskChecks` 全量通过（**`447 passed, 0 failed`**，含新增 Windows 域分隔签名清单检查）；`./scripts/run-update-checks.sh` 全过；`./scripts/run-update-controller-checks.sh` 全过（**`22 passed, 0 failed`**）；`python3 scripts/check-update-tool.py` 全过；Python 单元测试全过（**`67 passed`**，含 `test_windows_package.py` 与更新后的 `test_update_release.py`）。
+  - 产物构建与完整性校验：`./scripts/build-windows.sh all` 生成并通过 PE32+ GUI 头与系统 DLL 白名单检查（`QuietDesk-0.7.3-Windows-x64.zip`、`QuietDesk-0.7.3-Windows-arm64.zip`）；macOS Universal 构建、代码签名、DMG/ZIP 与干净源码包校验全部通过。
+- **没验证什么**：本机未安装 Windows 专属 Inno Setup 编译器 `ISCC.exe`（本地通过 `test_windows_package.py` 验证打包脚本与 `.iss` 配置，真实 `ISCC.exe` 编译及静默安装/卸载将在 GitHub Actions `windows-latest` 运行器上执行）；Windows `ARM64` 二进制仅完成交叉编译、PE 头与系统 DLL 导入表静态校验，尚未在真实 Windows 11 ARM64 / x64 物理机上实测 GUI 更新交互与跨版本自更新重启；按协作约束未执行远端 `git push`。
+
 ## macOS 多设备并发远控与共享/外连同时运行 + 防空闲睡眠开关（2026-11-23，`6164235`、`db20ac5`）
 
 - **做了什么**：

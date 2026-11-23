@@ -61,13 +61,14 @@
 
 配对码等同控制凭据，请仅通过可信渠道传递。[权限与常见问题 →](docs/usage.md#permissions)
 
-**Mac 与 Windows 互控（第一版）**：仓库包含可在 macOS 上交叉编译的 Windows 版，支持 Mac 控制 Windows 与 Windows 控制 Mac，使用同样的配对码，macOS 版无需升级。该版本尚未在真实 Windows 电脑上验收，范围与限制见 [Windows 版说明](docs/windows.md)。
+**Mac 与 Windows 互控**：GitHub Releases 同时提供 macOS Universal 安装包与 Windows `x64` / `ARM64` 安装程序（`Setup.exe`）及绿色便携包（`.zip`），支持 Mac 控制 Windows 与 Windows 控制 Mac，共用同一套配对码。范围与限制见 [Windows 版说明](docs/windows.md)。
 
 ## 更新应用
 
-首次安装带更新器的版本仍需从 [Releases](https://github.com/nXiaoK/QuietDesk/releases/latest) 手动下载。当前仓库的更新公钥表为空，应用内更新入口保持关闭；维护者配置公钥并发布后，才会启用此功能。
+首次安装请从 [Releases](https://github.com/nXiaoK/QuietDesk/releases/latest) 下载对应系统的安装包。仓库已在 `Resources/update-feed.json` 内置 Ed25519 更新验签公钥；GitHub Actions 发布时会自动签发 `QuietDesk-update.json`（macOS）与 `QuietDesk-windows-update.json`（Windows），后续升级可直接在软件内完成，无需手动前往 GitHub 下载。
 
-启用后，首次启动会询问是否自动检查或直接开启自动更新；也可随时在「键盘、防窥与偏好 → 软件更新」、「本机共享」、应用菜单或菜单栏切换「自动检查更新」与「非远程控制时自动更新」。开启自动更新后，发现新版本会在不处于远程控制或活动连接时自动下载校验、替换应用并重启（原已开启的本机共享在重启后自动恢复；若正处于远程控制中，则推迟到会话结束稳定空闲后再执行）。无法替换应用时提供手动安装入口。[更新与权限说明 →](docs/usage.md#应用内更新)
+- **macOS**：首次启动可选择自动检查或直接开启自动更新；也可随时在「键盘、防窥与偏好 → 软件更新」、「本机共享」、应用菜单或菜单栏切换「自动检查更新」与「非远程控制时自动更新」。开启自动更新后，发现新版本会在不处于远程控制或活动连接时自动下载校验、替换应用并重启（原已开启的本机共享在重启后自动恢复；若正处于远程控制中，则推迟到会话结束稳定空闲后再执行）。无法直接替换时提供手动安装入口。[更新与权限说明 →](docs/usage.md#应用内更新)
+- **Windows**：主窗口底部「软件更新」支持手动检查更新、一键下载升级、每天自动检查，以及开启「非远程控制空闲时自动下载并安装」（自动识别 `x64` / `ARM64` 与安装版 / 绿色版，空闲时完成验签替换重启并自动恢复原共享状态）。[Windows 安装与更新说明 →](docs/windows.md#安装与应用内更新)
 
 发布版继续使用临时签名，**每次更新后都需要在本机重新授予屏幕录制、辅助功能和输入监控权限**，请安排能在被控 Mac 本机操作时更新。
 

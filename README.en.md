@@ -60,13 +60,14 @@ These are UI demonstrations, not evidence of real-device performance or permissi
 
 Treat the pairing code as a remote-control credential and share it only through a trusted channel. [Permissions and troubleshooting (Chinese) →](docs/usage.md#permissions)
 
-**Mac and Windows (first version):** the repository contains a Windows build that is cross-compiled on macOS. A Mac can control a Windows PC and a Windows PC can control a Mac with the same pairing codes, and the macOS app needs no update. It has not been validated on a real Windows PC yet; see [the Windows notes (Chinese)](docs/windows.md) for scope and limits.
+**Mac and Windows interoperability:** GitHub Releases publish macOS Universal packages alongside Windows `x64` and `ARM64` installers (`Setup.exe`) and portable `.zip` archives. A Mac can control a Windows PC and a Windows PC can control a Mac using the same pairing codes. See [the Windows notes (Chinese)](docs/windows.md) for scope and limits.
 
 ## Updating QuietDesk
 
-The first version with the updater must still be installed manually from [Releases](https://github.com/nXiaoK/QuietDesk/releases/latest). The repository currently has an empty update public-key table, so update controls remain hidden until the maintainer configures a public key and publishes an enabled build.
+Install QuietDesk once from [Releases](https://github.com/nXiaoK/QuietDesk/releases/latest). `Resources/update-feed.json` ships the pinned Ed25519 public key used to verify signed release manifests (`QuietDesk-update.json` for macOS and `QuietDesk-windows-update.json` for Windows), allowing both platforms to check, verify, and install updates directly inside the app without manually downloading from GitHub.
 
-Once enabled, QuietDesk asks whether to check automatically or enable automatic updates. You can toggle **自动检查更新** (Automatic Update Checks) and **非远程控制时自动更新** (Auto-Update When Not in Remote Control) anytime in **键盘、防窥与偏好 → 软件更新**, **本机共享**, the app menu, or the menu bar. When auto-update is enabled, QuietDesk downloads, verifies, installs, and restarts automatically whenever it is not in an active remote-control session or port-mapping tunnel (deferring during active sessions and resuming host sharing after restart). A manual-install option remains available when automatic replacement cannot proceed. [Update guide (Chinese) →](docs/usage.md#应用内更新)
+- **macOS:** QuietDesk asks whether to check automatically or enable automatic updates, and you can toggle **自动检查更新** (Automatic Update Checks) and **非远程控制时自动更新** (Auto-Update When Not in Remote Control) anytime in **键盘、防窥与偏好 → 软件更新**, **本机共享**, the app menu, or the menu bar. When auto-update is enabled, QuietDesk downloads, verifies, installs, and restarts automatically whenever it is not in an active remote-control session or port-mapping tunnel (deferring during active sessions and resuming host sharing after restart). [Update guide (Chinese) →](docs/usage.md#应用内更新)
+- **Windows:** The main window includes a **软件更新** (Software Update) section supporting manual checks, one-click upgrades, daily automatic checks, and idle automatic updates across both `Setup.exe` installations and portable `.zip` copies (`x64` and `ARM64`), resuming active host sharing after restart. [Windows update notes (Chinese) →](docs/windows.md#安装与应用内更新)
 
 Release builds remain ad-hoc signed. **After every update, grant Screen Recording, Accessibility and Input Monitoring again on the local Mac.** Arrange updates when someone can operate the host Mac locally.
 

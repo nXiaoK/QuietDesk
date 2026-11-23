@@ -61,7 +61,7 @@
 - 远端声音只在控制端请求后开始采集。Opus 编解码使用随程序静态构建的 libopus，其许可证随安装包附带。
 - 本机配对码与最近连接的配对码用 DPAPI 按当前 Windows 账户加密后写入 `%APPDATA%\QuietDesk\settings.json`；同一账户下运行的其他程序仍可请求解密。已保存的配对码无法解密时不会自动更换，需要用户明确重新生成。
 - 被控端以当前用户权限运行，无法操作 UAC 提示、锁屏和管理员权限窗口。日志不记录配对码、地址、剪贴板内容或按键。
-- 可执行文件未做代码签名。范围、限制与尚未进行的实机验收见 [Windows 版说明](windows.md)。
+- 可执行文件未做商业 Authenticode 代码签名。Windows 应用内更新复用 `Resources/update-feed.json` 的内置 Ed25519 公钥，通过系统 `WinHTTP` 获取独立签名清单 `QuietDesk-windows-update.json`（使用域分隔前缀 `QuietDesk-windows-update-v1\n`，与 macOS 清单互不混用），先验签再解析版本、构建号与 `x64` / `arm64` 包摘要，仅允许配置仓库的 HTTPS GitHub Release 下载地址并校验重定向目标、文件大小、SHA-256、ZIP 条目及 PE 架构头；正被远程控制时禁止安装，非可写目录不静默提权。范围、限制与尚未进行的实机验收见 [Windows 版说明](windows.md)。
 
 ## 自托管中继
 

@@ -4,13 +4,41 @@ QuietDesk for Windows 让 Mac 可以远程控制 Windows 电脑，也让 Windows
 
 > 第一版已在 Windows 被控端试用。此次更新的独立光标、控制连接上的媒体会话及编码器启动延迟仍待 Windows 10/11 实机确认。
 
-## 获取
+## 获取、安装与应用内更新
+
+### 下载安装包（推荐）
+
+GitHub Actions 在每次发布时会同时生成 **x64** 与 **ARM64** 两种架构的 Windows 安装包和绿色便携包，可从 [GitHub Releases](https://github.com/nXiaoK/QuietDesk/releases/latest) 下载首次安装：
+
+| 架构 | 安装程序（Inno Setup） | 绿色便携包 |
+| --- | --- | --- |
+| Windows 10 / 11 x64（Intel / AMD） | `QuietDesk-<版本>-Windows-x64-Setup.exe` | `QuietDesk-<版本>-Windows-x64.zip` |
+| Windows 11 ARM64（骁龙 / ARM） | `QuietDesk-<版本>-Windows-arm64-Setup.exe` | `QuietDesk-<版本>-Windows-arm64.zip` |
+
+- **安装程序（`Setup.exe`）**：默认安装到当前用户目录 `%LOCALAPPDATA%\Programs\QuietDesk`，不需要管理员权限弹窗，自动创建开始菜单快捷方式与系统“已安装的应用”卸载项，并可在安装向导中按需勾选“创建桌面快捷方式”与“登录 Windows 后自动启动 QuietDesk”。卸载时不会删除已保存的连接记录与本机配对码。
+- **绿色便携包（`.zip`）**：解压后即可直接运行单个 `QuietDesk.exe`，仅依赖 Windows 10/11 系统自带组件，无需安装运行库。
+- 程序暂未配置商业代码签名证书，首次运行时 Windows SmartScreen 可能提示“未知发布者”（点“更多信息 → 仍要运行”即可）。
+
+### 在 macOS 本地交叉构建
 
 ```sh
-./scripts/build-windows.sh
+./scripts/build-windows.sh          # 同时交叉构建 x64 与 arm64 便携 ZIP
+./scripts/build-windows.sh x64      # 仅构建 x64
+./scripts/build-windows.sh arm64    # 仅构建 arm64
 ```
 
-在 macOS 上生成 `outputs/windows/QuietDesk-<版本>-Windows-x64.zip`（内含 `QuietDesk.exe` 与许可证）及其 SHA-256。首次构建会下载并校验固定版本的 llvm-mingw。构建 Opus 需要 CMake 3.16 或更高版本；缺少时脚本会把经校验的 CMake 3.31.10 Universal 也缓存到 `work/toolchains/`。程序面向 Windows 10 / 11 x64，只依赖系统自带的库；未做代码签名，首次运行时 SmartScreen 可能提示“未知发布者”。
+在 macOS 上生成 `outputs/windows/QuietDesk-<版本>-Windows-x64.zip`、`QuietDesk-<版本>-Windows-arm64.zip`（内含 `QuietDesk.exe` 与许可证）及 `SHA256SUMS-<版本>-Windows.txt`。首次构建会下载并校验固定版本的 llvm-mingw 与 CMake 3.31.10 Universal 到 `work/toolchains/`。若在装有 Inno Setup 6（`ISCC.exe`）的 Windows 环境中运行 `python scripts/package-windows-installer.py`，还会生成对应的 `Setup.exe` 安装包。
+
+<a id="安装与应用内更新"></a>
+
+### 应用内更新
+
+主窗口底部的 **“软件更新”** 区域支持直接在应用内检查、下载、校验并完成升级，无需再去 GitHub 手动下载：
+
+- **签名与完整性校验**：客户端通过系统原生 `WinHTTP` 获取 GitHub Release 上的 `QuietDesk-windows-update.json`，先用编译期内置的 `Resources/update-feed.json` Ed25519 公钥（域分隔前缀 `QuietDesk-windows-update-v1\n`）校验签名，再按当前程序架构（`x64` 或 `arm64`）下载对应更新包并严格核对文件大小、SHA-256 摘要、ZIP CRC-32 与 PE 头架构。
+- **自动检查与空闲自动更新**：“自动检查更新（每天一次）”默认开启（启动满 2 分钟后每 24 小时最多检查一次）；勾选“非远程控制空闲时自动下载并安装”后，发现新版本且当前未处于远程控制（无连入控制端、无打开的远程控制窗口，且度过会话结束 10 秒稳定期）时，会自动在后台下载校验、静默完成升级重启，并在原已开启“共享这台电脑”时自动恢复共享监听。
+- **兼容安装版与绿色版**：通过 `Setup.exe` 安装在用户目录时，调用已校验的新版安装器静默覆盖并同步系统已安装版本号与原有快捷方式/自启项；绿色便携版由独立更新辅助进程在原进程退出后原子替换 `QuietDesk.exe`（失败自动回滚原版本）；若程序位于需要管理员权限的只读目录（如 `C:\Program Files`），后台不会擅自弹出 UAC，待点击“授权安装”确认后再提权升级。
+- **活动会话保护**：这台电脑正被远程控制时只允许提前下载暂存，禁止直接安装重启，以免中断远端连接。点击“更新说明”可查看发布说明、跳转 GitHub Release 页面或跳过当前版本提醒。
 
 ## Mac 控制 Windows
 
@@ -97,8 +125,9 @@ Windows 通过控制连接按序发送剪贴板设置和复制通知。支持辅
 | 键鼠 | 键盘、鼠标移动/点击/拖拽/双击、滚轮与触控板滚动、侧键；失去焦点时释放按键 |
 | 其他 | 断线自动重连、空闲暂停、被控端结束通知、允许控制开关即时生效 |
 | 剪贴板 | 手动文字、按需文字和图片、经接收端确认的双向文件粘贴 |
+| 安装与更新 | GitHub Actions 自动构建 `x64` / `ARM64` Inno Setup 安装包与便携 ZIP；应用内支持 Ed25519 签名清单验签、一键升级与非远控空闲时自动下载替换重启（自动恢复共享） |
 
-暂不包含（对端提供时也不会启用）：自托管中继、HEVC、端口映射、模拟键入、自动解锁、黑屏遮罩与静音、应用内更新。
+暂不包含（对端提供时也不会启用）：自托管中继、HEVC、端口映射、模拟键入、自动解锁、黑屏遮罩与静音。
 
 这些功能的实施顺序、协议依据与验收方法见 [Windows 版后续实施方案](windows-plan.md)。
 

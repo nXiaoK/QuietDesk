@@ -112,7 +112,7 @@ fn main() {
                     let packet = quietdesk_core::video::VideoPacket::h264(packet_sequence, output);
                     let stream = packet.annex_b().unwrap_or_else(|error| fail("annex b", error));
                     decoder
-                        .decode(&stream, |picture| {
+                        .decode(&stream, &packet.sps, |picture| {
                             decoded += 1;
                             size = (picture.width, picture.height);
                         })

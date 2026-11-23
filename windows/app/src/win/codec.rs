@@ -3,8 +3,8 @@
 use super::util::failed;
 use quietdesk_core::error::{DeskError, Result};
 use quietdesk_core::messages::StreamSettings;
-use quietdesk_core::pixel::Plane;
-use quietdesk_core::video::{EncodedFrame, H264FrameAssembler};
+use quietdesk_core::pixel::{Nv12Color, Plane};
+use quietdesk_core::video::{EncodedFrame, H264FrameAssembler, h264_sps_is_display_p3};
 use std::mem::ManuallyDrop;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
@@ -274,6 +274,7 @@ pub struct Picture<'a> {
     pub chroma: Plane<'a>,
     pub width: usize,
     pub height: usize,
+    pub color: Nv12Color,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -282,6 +283,50 @@ struct Layout {
     height: usize,
     coded_height: usize,
     stride: usize,
+    color: Option<Nv12Color>,
+}
+
+// MFVideoPrimaries_Display_P3 in mfobjects.h is newer than the pinned windows metadata.
+const MF_VIDEO_PRIMARIES_DISPLAY_P3: u32 = 13;
+
+fn decoded_nv12_color(output: &IMFMediaType) -> Option<Nv12Color> {
+    let mut complete = true;
+    for (key, expected) in [
+        (&MF_MT_VIDEO_PRIMARIES, MF_VIDEO_PRIMARIES_DISPLAY_P3),
+        (&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_sRGB.0 as u32),
+        (&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32),
+        (&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32),
+    ] {
+        match unsafe { output.GetUINT32(key).ok() } {
+            None | Some(0) => complete = false,
+            Some(value) if value == expected => {}
+            Some(_) => return Some(Nv12Color::Bt709),
+        }
+    }
+    // A partial type permits the in-band SPS hint only when each reported attribute agrees with it.
+    complete.then_some(Nv12Color::DisplayP3)
+}
+
+#[cfg(test)]
+mod decoder_tests {
+    use super::*;
+
+    #[test]
+    fn output_color_requires_matching_display_p3_metadata() {
+        let _com = super::super::util::Com::enter();
+        let _media = MediaFoundation::start().unwrap();
+        unsafe {
+            let output = video_type(&MFVideoFormat_NV12).unwrap();
+            assert_eq!(decoded_nv12_color(&output), None);
+            output.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MF_VIDEO_PRIMARIES_DISPLAY_P3).unwrap();
+            output.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_sRGB.0 as u32).unwrap();
+            output.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32).unwrap();
+            output.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32).unwrap();
+            assert_eq!(decoded_nv12_color(&output), Some(Nv12Color::DisplayP3));
+            output.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32).unwrap();
+            assert_eq!(decoded_nv12_color(&output), Some(Nv12Color::Bt709));
+        }
+    }
 }
 
 /// The Microsoft H.264 decoder in low-latency mode, producing NV12 in system memory.
@@ -289,6 +334,8 @@ pub struct H264Decoder {
     transform: IMFTransform,
     layout: Layout,
     next_sample_time: i64,
+    sps: Vec<u8>,
+    sps_color: Nv12Color,
 }
 
 // Used by the decode thread alone.
@@ -315,7 +362,7 @@ impl H264Decoder {
             let input = video_type(&MFVideoFormat_H264).map_err(failed("配置 H.264 解码器"))?;
             input.SetUINT64(&MF_MT_FRAME_RATE, pack(Self::CLOCK_RATE, 1)).map_err(failed("配置解码时间基准"))?;
             transform.SetInputType(0, &input, 0).map_err(failed("配置 H.264 解码器"))?;
-            let mut decoder = Self { transform, layout: Layout::default(), next_sample_time: 0 };
+            let mut decoder = Self { transform, layout: Layout::default(), next_sample_time: 0, sps: Vec::new(), sps_color: Nv12Color::Bt709 };
             decoder.choose_output().map_err(failed("配置 H.264 解码输出"))?;
             decoder.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0).map_err(failed("启动 H.264 解码器"))?;
             decoder.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0).map_err(failed("启动 H.264 解码器"))?;
@@ -335,6 +382,8 @@ impl H264Decoder {
                 index += 1;
             };
             self.transform.SetOutputType(0, &output, 0)?;
+            let current_type = self.transform.GetOutputCurrentType(0);
+            let color = decoded_nv12_color(current_type.as_ref().unwrap_or(&output));
             let size = output.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
             let (coded_width, coded_height) = ((size >> 32) as usize, (size & 0xFFFF_FFFF) as usize);
             // The coded size is padded to whole macroblocks; the aperture is the picture inside it.
@@ -349,7 +398,7 @@ impl H264Decoder {
                 _ => (coded_width, coded_height),
             };
             let stride = output.GetUINT32(&MF_MT_DEFAULT_STRIDE).map_or(coded_width, |stride| (stride as i32).unsigned_abs() as usize);
-            self.layout = Layout { width: width / 2 * 2, height: height / 2 * 2, coded_height, stride: stride.max(coded_width) };
+            self.layout = Layout { width: width / 2 * 2, height: height / 2 * 2, coded_height, stride: stride.max(coded_width), color };
             Ok(())
         }
     }
@@ -358,8 +407,16 @@ impl H264Decoder {
         self.next_sample_time
     }
 
+    fn observe_sps(&mut self, sps: &[u8]) {
+        if !sps.is_empty() && sps != self.sps {
+            self.sps_color = if h264_sps_is_display_p3(sps) { Nv12Color::DisplayP3 } else { Nv12Color::Bt709 };
+            self.sps.clear();
+            self.sps.extend_from_slice(sps);
+        }
+    }
+
     /// Decodes one access unit and hands every picture it completes to `picture`.
-    pub fn decode(&mut self, annex_b: &[u8], mut picture: impl FnMut(Picture)) -> Result<()> {
+    pub fn decode(&mut self, annex_b: &[u8], sps: &[u8], mut picture: impl FnMut(Picture)) -> Result<()> {
         unsafe {
             let sample = sample_with(annex_b, self.next_sample_time, Self::SAMPLE_DURATION).map_err(failed("准备解码输入"))?;
             self.next_sample_time += Self::SAMPLE_DURATION;
@@ -367,7 +424,10 @@ impl H264Decoder {
             loop {
                 if !submitted {
                     match self.transform.ProcessInput(0, &sample, 0) {
-                        Ok(()) => submitted = true,
+                        Ok(()) => {
+                            submitted = true;
+                            self.observe_sps(sps);
+                        }
                         // The decoder first wants its finished pictures collected.
                         Err(error) if error.code() == MF_E_NOTACCEPTING => {}
                         Err(error) => return Err(failed("提交解码输入")(error)),
@@ -400,6 +460,7 @@ impl H264Decoder {
                         chroma: Plane { data: &bytes[chroma_start..], stride: layout.stride },
                         width: layout.width,
                         height: layout.height,
+                        color: layout.color.unwrap_or(self.sps_color),
                     });
                 } else {
                     log::warn!(

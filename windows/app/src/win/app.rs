@@ -255,7 +255,7 @@ impl Frame {
         self.width = picture.width;
         self.height = picture.height;
         self.bgra.resize(self.width * self.height * 4, 0);
-        nv12_to_bgra(picture.luma, picture.chroma, self.width, self.height, &mut self.bgra);
+        nv12_to_bgra(picture.luma, picture.chroma, self.width, self.height, picture.color, &mut self.bgra);
     }
 
     fn present(&mut self, next: &mut Self) {
@@ -476,7 +476,7 @@ fn decode<S: ViewerSink>(packets: &DecodeQueue, acknowledgements: mpsc::Unbounde
                     Some(decoder) => decoder,
                     None => legacy_decoder.insert(H264Decoder::new()?),
                 };
-                decoder.decode(&packet.annex_b()?, |picture| {
+                decoder.decode(&packet.annex_b()?, &packet.sps, |picture| {
                     {
                         let mut visible = frame.lock().unwrap();
                         visible.stream = None;
@@ -510,7 +510,7 @@ fn decode<S: ViewerSink>(packets: &DecodeQueue, acknowledgements: mpsc::Unbounde
                     return Ok(());
                 }
                 pending.push_back((decoder.next_sample_time(), receipt));
-                decoder.decode(&annex_b, |picture| {
+                decoder.decode(&annex_b, &packet.sps, |picture| {
                     let Some(time) = picture.sample_time else { return };
                     let Some(position) = pending.iter().position(|(tag, _)| *tag == time) else { return };
                     let (_, completed) = pending.remove(position).expect("a picture with this sample time is pending");

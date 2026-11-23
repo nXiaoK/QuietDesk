@@ -8,6 +8,9 @@ use crate::error::{DeskError, Result};
 use crate::messages::VideoCodec;
 use crate::wire::{ByteReader, MAXIMUM_MESSAGE_BYTES};
 
+mod h264_sps;
+pub use h264_sps::h264_sps_is_display_p3;
+
 const H264_HEADER_BYTES: usize = 8;
 const HEVC_FLAG: u16 = 0x8000;
 const MAXIMUM_PARAMETER_SET_BYTES: usize = 4096;

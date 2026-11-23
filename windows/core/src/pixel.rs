@@ -1,7 +1,9 @@
 //! Pixel work the Windows roles do in software: scaling and converting captured BGRA frames to the NV12
 //! an H.264 encoder takes, converting decoded NV12 back for display, and drawing the pointer into a
-//! captured frame. Colours follow BT.709 with video range, which is what the macOS encoder signals.
+//! captured frame. NV12 uses BT.709 coefficients and video range. Tagged Display P3 uses those same
+//! coefficients and additionally maps its RGB primaries to the viewer's sRGB output.
 
+use std::sync::OnceLock;
 use std::thread;
 
 /// Weights of the source samples that one output sample averages, in 1/4096 units.
@@ -169,13 +171,78 @@ pub struct Plane<'a> {
     pub stride: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Nv12Color {
+    #[default]
+    Bt709,
+    DisplayP3,
+}
+
+const LINEAR_LEVELS: usize = 4096;
+const LINEAR_FRACTION_BITS: u32 = 8;
+const LINEAR_FRACTION: i32 = 1 << LINEAR_FRACTION_BITS;
+
+struct DisplayP3ToSrgb {
+    red: [[i32; 3]; 256],
+    green: [[i32; 3]; 256],
+    blue: [i32; 256],
+    encoded: [u8; LINEAR_LEVELS],
+}
+
+impl DisplayP3ToSrgb {
+    fn shared() -> &'static Self {
+        static CONVERSION: OnceLock<DisplayP3ToSrgb> = OnceLock::new();
+        CONVERSION.get_or_init(|| {
+            let linear: [f64; 256] = std::array::from_fn(|code| {
+                let value = code as f64 / 255.0;
+                if value <= 0.04045 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+            });
+            let contribution = |value: f64, coefficient: f64| (value * coefficient * (LINEAR_LEVELS - 1) as f64 * f64::from(LINEAR_FRACTION)).round() as i32;
+            // CSS Color 4: linear Display P3 -> XYZ (D65) -> linear sRGB. The two
+            // linear matrices are combined and tabulated by input channel.
+            Self {
+                red: linear.map(|value| [1.224_940_176, -0.042_056_955, -0.019_637_555].map(|c| contribution(value, c))),
+                green: linear.map(|value| [-0.224_940_176, 1.042_056_955, -0.078_636_046].map(|c| contribution(value, c))),
+                blue: linear.map(|value| contribution(value, 1.098_273_600)),
+                encoded: std::array::from_fn(|code| {
+                    let value = code as f64 / (LINEAR_LEVELS - 1) as f64;
+                    let srgb = if value <= 0.0031308 { 12.92 * value } else { 1.055 * value.powf(1.0 / 2.4) - 0.055 };
+                    (srgb * 255.0).round() as u8
+                }),
+            }
+        })
+    }
+
+    #[inline]
+    fn convert(&self, [blue, green, red]: [u8; 3]) -> [u8; 3] {
+        let r = self.red[usize::from(red)];
+        let g = self.green[usize::from(green)];
+        let encode = |value: i32| {
+            let level = ((value + LINEAR_FRACTION / 2) >> LINEAR_FRACTION_BITS).clamp(0, (LINEAR_LEVELS - 1) as i32);
+            self.encoded[level as usize]
+        };
+        [encode(r[2] + g[2] + self.blue[usize::from(blue)]), encode(r[1] + g[1]), encode(r[0] + g[0])]
+    }
+}
+
 /// Converts a decoded NV12 picture to BGRA rows of `width * 4` bytes with opaque alpha.
-pub fn nv12_to_bgra(luma_plane: Plane, chroma_plane: Plane, width: usize, height: usize, bgra: &mut [u8]) {
+pub fn nv12_to_bgra(luma_plane: Plane, chroma_plane: Plane, width: usize, height: usize, color: Nv12Color, bgra: &mut [u8]) {
     assert!(width.is_multiple_of(2) && height.is_multiple_of(2), "NV12 needs even dimensions");
     assert!(luma_plane.stride >= width && luma_plane.data.len() >= luma_plane.stride * (height - 1) + width, "luma plane is too small");
     assert!(chroma_plane.stride >= width && chroma_plane.data.len() >= chroma_plane.stride * (height / 2 - 1) + width, "chroma plane is too small");
     assert_eq!(bgra.len(), width * height * 4, "output frame has the wrong size");
+    match color {
+        Nv12Color::Bt709 => convert_nv12(luma_plane, chroma_plane, width, height, bgra, |pixel| pixel),
+        Nv12Color::DisplayP3 => {
+            let conversion = DisplayP3ToSrgb::shared();
+            convert_nv12(luma_plane, chroma_plane, width, height, bgra, |pixel| conversion.convert(pixel));
+        }
+    }
+}
+
+fn convert_nv12(luma_plane: Plane, chroma_plane: Plane, width: usize, height: usize, bgra: &mut [u8], map_rgb: impl Fn([u8; 3]) -> [u8; 3] + Sync) {
     let band_rows = (height / worker_count(height)).div_ceil(2) * 2;
+    let map_rgb = &map_rgb;
     thread::scope(|scope| {
         for (band, output) in bgra.chunks_mut(band_rows * width * 4).enumerate() {
             scope.spawn(move || {
@@ -190,10 +257,8 @@ pub fn nv12_to_bgra(luma_plane: Plane, chroma_plane: Plane, width: usize, height
                         let (red, green, blue) = (459 * e + 128, -55 * d - 136 * e + 128, 541 * d + 128);
                         for (pixel, value) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(luma_pair) {
                             let c = 298 * (i32::from(*value) - 16);
-                            pixel[0] = ((c + blue) >> 8).clamp(0, 255) as u8;
-                            pixel[1] = ((c + green) >> 8).clamp(0, 255) as u8;
-                            pixel[2] = ((c + red) >> 8).clamp(0, 255) as u8;
-                            pixel[3] = 255;
+                            let [b, g, r] = map_rgb([blue, green, red].map(|component| ((c + component) >> 8).clamp(0, 255) as u8));
+                            *pixel = [b, g, r, 255];
                         }
                     }
                 }
@@ -422,9 +487,21 @@ mod tests {
             padded_chroma[row * stride..][..width].copy_from_slice(&nv12[width * height + row * width..][..width]);
         }
         let mut decoded = vec![0u8; width * height * 4];
-        nv12_to_bgra(Plane { data: &padded_luma, stride }, Plane { data: &padded_chroma, stride }, width, height, &mut decoded);
+        nv12_to_bgra(Plane { data: &padded_luma, stride }, Plane { data: &padded_chroma, stride }, width, height, Nv12Color::Bt709, &mut decoded);
         assert!(largest_difference(&decoded, &blocks) <= 4);
         assert!(decoded.chunks(4).all(|pixel| pixel[3] == 255));
+    }
+
+    #[test]
+    fn tagged_display_p3_maps_colors_to_srgb_and_keeps_neutral_gray() {
+        let luma = Plane { data: &[124, 124, 120, 120, 126, 126, 124, 124, 120, 120, 126, 126], stride: 6 };
+        let chroma = Plane { data: &[88, 184, 96, 180, 128, 128], stride: 6 };
+        let mut frame = [0; 6 * 2 * 4];
+        nv12_to_bgra(luma, chroma, 6, 2, Nv12Color::DisplayP3, &mut frame);
+        let expected = [[0, 95, 244, 255], [35, 91, 231, 255], [128, 128, 128, 255]];
+        for (index, pixel) in frame.chunks_exact(4).enumerate() {
+            assert!(largest_difference(pixel, &expected[index % 6 / 2]) <= 2, "pixel {index}: {pixel:?}");
+        }
     }
 
     #[test]

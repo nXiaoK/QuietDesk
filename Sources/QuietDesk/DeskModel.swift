@@ -399,6 +399,8 @@ final class DeskModel: ObservableObject {
     private var startingBitrates = MediaStartingBitrate()
     private var generation = UUID()
     private var activity: NSObjectProtocol?
+    private var hostPowerMonitor: HostPowerMonitor?
+    private var hostActivity: HostActivityController?
     private var metricsTimer: Timer?
     private var performanceDiagnostics: PerformanceDiagnostics?
     private let performanceQueue = DispatchQueue(label: "quietdesk.performance", qos: .utility)
@@ -521,6 +523,18 @@ final class DeskModel: ObservableObject {
         }
         displayID = preferredDisplayID
         if mode == .host {
+            let powerMonitor = HostPowerMonitor()
+            let activityController = HostActivityController(
+                readPowerEnvironment: { [weak powerMonitor] in
+                    powerMonitor?.readEnvironment() ?? HostPowerMonitor.currentEnvironment()
+                }
+            )
+            powerMonitor.onChange = { [weak self] in
+                self?.refreshHostActivity()
+            }
+            powerMonitor.start()
+            hostPowerMonitor = powerMonitor
+            hostActivity = activityController
             portMappings.onApprovalVisibilityChanged = { [weak self] pending in
                 guard let self else { return }
                 self.syncHostInputGate()
@@ -541,16 +555,24 @@ final class DeskModel: ObservableObject {
                     self.displayRefreshTask = Task { [weak self] in
                         do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
                         self?.refreshDisplays()
+                        self?.refreshHostActivity()
                         self?.displayRefreshTask = nil
                     }
                 }
             }
 
-        powerObservers = [NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification].map { name in
+        let workspacePowerNotifications: [Notification.Name] = mode == .host
+            ? [NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification,
+               NSWorkspace.screensDidSleepNotification, NSWorkspace.screensDidWakeNotification]
+            : [NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification]
+        powerObservers = workspacePowerNotifications.map { name in
             NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    if name == NSWorkspace.willSleepNotification { self?.systemWillSleep() }
-                    else { self?.systemDidWake() }
+                    switch name {
+                    case NSWorkspace.willSleepNotification: self?.systemWillSleep()
+                    case NSWorkspace.didWakeNotification: self?.systemDidWake()
+                    default: self?.refreshHostActivity()
+                    }
                 }
             }
         }
@@ -1382,10 +1404,8 @@ final class DeskModel: ObservableObject {
                     try self.ensureHostListener(key: key, port: port)
                     self.active = true
                     self.updateHostBonjourService()
-                    // Keep hidden sharing responsive; a clock alone cannot exempt App Nap scheduling delays.
-                    self.activity = ProcessInfo.processInfo.beginActivity(
-                        options: [.idleSystemSleepDisabled, .idleDisplaySleepDisabled, .userInitiated, .latencyCritical],
-                        reason: "远程桌面共享")
+                    // Keep hidden sharing responsive; prevent idle sleep only while connected to external power.
+                    self.refreshHostActivity()
                     self.beginMetrics()
                     if self.hostListenerReady { self.desktopListenerReady(port: port) }
                 } catch {
@@ -5465,8 +5485,14 @@ final class DeskModel: ObservableObject {
         }
     }
 
+    private func refreshHostActivity() {
+        guard mode == .host else { return }
+        hostActivity?.update(hostingActive: active, systemSleeping: systemSleeping)
+    }
+
     private func systemWillSleep() {
         systemSleeping = true
+        refreshHostActivity()
         reconnectTask?.cancel()
         reconnectWait = nil
         hostRetryTask?.cancel()
@@ -5840,6 +5866,7 @@ final class DeskModel: ObservableObject {
         peer?.close()
         clearSession()
         clipboardHandledChange = nil
+        hostActivity?.stop()
         if let activity { ProcessInfo.processInfo.endActivity(activity); self.activity = nil }
         metricsTimer?.invalidate()
         metricsTimer = nil
@@ -6206,6 +6233,7 @@ final class DeskModel: ObservableObject {
     }
 
     deinit {
+        if let activity { ProcessInfo.processInfo.endActivity(activity) }
         performanceTimer?.cancel()
         performanceDiagnostics?.setEnabled(false)
         permissionTimer?.invalidate()

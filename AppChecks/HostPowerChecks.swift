@@ -148,6 +148,58 @@ struct HostPowerChecks {
             try require(fake.activeTokens.isEmpty, "Deinit leaked activity token")
         }
 
+        run("Toggling preventSleepEnabled live releases and restores sleep prevention without restarting sharing") {
+            let fake = FakeProcessActivity()
+            var power = HostPowerEnvironment(hasExternalPower: true, isClamshellClosed: false)
+            var reads = 0
+            let controller = HostActivityController(processActivity: fake) {
+                reads += 1
+                return power
+            }
+
+            try require(
+                controller.update(hostingActive: true, systemSleeping: false, preventSleepEnabled: true) == .preventingSleep,
+                "Expected preventingSleep when switch is on and AC connected"
+            )
+            let readsAfterEnable = reads
+            guard let initialToken = fake.activeTokens.values.first else {
+                throw CheckFailure(message: "Missing initial preventingSleep token")
+            }
+
+            // Turning the switch off live on AC power drops sleep prevention immediately without needing IOKit power reads.
+            try require(
+                controller.update(hostingActive: true, systemSleeping: false, preventSleepEnabled: false) == .allowingSleep,
+                "Turning off switch on AC did not switch to allowingSleep"
+            )
+            try require(reads == readsAfterEnable, "Disabled switch still queried power source unnecessarily")
+            try require(fake.activeTokens.count == 1 && fake.activeTokens[initialToken.id] == nil, "Previous AC token leaked")
+            guard let disabledToken = fake.activeTokens.values.first else {
+                throw CheckFailure(message: "Missing allowingSleep token while switch disabled")
+            }
+            try require(
+                !disabledToken.options.contains(.idleSystemSleepDisabled)
+                    && !disabledToken.options.contains(.idleDisplaySleepDisabled),
+                "Disabled switch token still blocked sleep"
+            )
+
+            // Turning the switch back on while on AC power immediately restores sleep prevention.
+            try require(
+                controller.update(hostingActive: true, systemSleeping: false, preventSleepEnabled: true) == .preventingSleep,
+                "Re-enabling switch on AC did not restore preventingSleep"
+            )
+            try require(fake.activeTokens.count == 1 && fake.activeTokens[disabledToken.id] == nil, "Disabled token leaked")
+
+            // Turning the switch on while on battery + closed lid still allows sleep.
+            power = HostPowerEnvironment(hasExternalPower: false, isClamshellClosed: true)
+            try require(
+                controller.update(hostingActive: true, systemSleeping: false, preventSleepEnabled: true) == .allowingSleep,
+                "Enabled switch on battery closed-lid prevented sleep"
+            )
+
+            controller.stop()
+            try require(fake.activeTokens.isEmpty, "Stop left active tokens")
+        }
+
         run("HostPowerMonitor starts, reads environment, restarts and stops cleanly") {
             let monitor = HostPowerMonitor()
             monitor.start()

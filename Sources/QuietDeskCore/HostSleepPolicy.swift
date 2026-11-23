@@ -40,7 +40,7 @@ public enum HostActivityMode: Equatable, Sendable {
         case .none:
             return nil
         case .allowingSleep:
-            return "远程桌面共享（未接外部电源，允许系统睡眠）"
+            return "远程桌面共享（允许系统睡眠）"
         case .preventingSleep:
             return "远程桌面共享（已接外部电源，阻止空闲睡眠）"
         }
@@ -48,15 +48,18 @@ public enum HostActivityMode: Equatable, Sendable {
 }
 
 public enum HostSleepPolicy {
-    /// Prevents system and display idle sleep only when sharing is active (and not entering system sleep)
-    /// while connected to external AC power. Whenever running without external power — including when
+    /// Prevents system and display idle sleep only when sharing is active (and not entering system sleep),
+    /// sleep prevention is enabled by user preference, and the Mac is connected to external AC power.
+    /// Whenever the preference is turned off or the Mac runs without external power — including when
     /// the lid is closed on battery or open on battery — sleep prevention is disabled.
     public static func activityMode(
         hostingActive: Bool,
         systemSleeping: Bool = false,
+        preventSleepEnabled: Bool = true,
         power: HostPowerEnvironment
     ) -> HostActivityMode {
         guard hostingActive, !systemSleeping else { return .none }
+        guard preventSleepEnabled else { return .allowingSleep }
         if power.isClamshellClosed && !power.hasExternalPower {
             return .allowingSleep
         }

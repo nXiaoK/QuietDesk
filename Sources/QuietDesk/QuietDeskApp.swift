@@ -1315,6 +1315,7 @@ private struct TrayView: View {
         Button(host.active || host.working ? "停止共享" : "开启共享") {
             if host.active || host.working { host.stop() } else { host.startHosting() }
         }
+        Toggle("共享时接通电源阻止空闲睡眠", isOn: $host.preventHostSleepOnExternalPower)
         if viewer.isControllingAnotherMac { Button("断开远程连接") { viewer.stop() } }
         Divider()
         if updates.enabled {

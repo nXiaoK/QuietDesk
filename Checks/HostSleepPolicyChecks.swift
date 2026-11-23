@@ -77,4 +77,29 @@ func runHostSleepPolicyChecks() {
             }
         }
     }
+
+    run("Disabling the host sleep-prevention switch allows sleep even while connected to external power") {
+        for closed in [false, true] {
+            let acDisabled = HostSleepPolicy.activityMode(
+                hostingActive: true,
+                systemSleeping: false,
+                preventSleepEnabled: false,
+                power: HostPowerEnvironment(hasExternalPower: true, isClamshellClosed: closed)
+            )
+            try check(
+                acDisabled == .allowingSleep && !acDisabled.preventsSystemSleep,
+                "Disabled sleep-prevention switch still prevented sleep on AC (clamshellClosed=\(closed))"
+            )
+            guard let options = acDisabled.activityOptions else {
+                throw CheckFailure("Disabled sleep-prevention switch dropped responsive scheduling activity")
+            }
+            try check(
+                !options.contains(.idleSystemSleepDisabled)
+                    && !options.contains(.idleDisplaySleepDisabled)
+                    && options.contains(.userInitiatedAllowingIdleSystemSleep)
+                    && options.contains(.latencyCritical),
+                "Disabled sleep-prevention switch retained sleep-blocking flags"
+            )
+        }
+    }
 }

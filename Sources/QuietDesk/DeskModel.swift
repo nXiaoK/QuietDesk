@@ -363,6 +363,14 @@ final class DeskModel: ObservableObject {
     @Published var minimizeAtLogin = UserDefaults.standard.object(forKey: "minimizeAtLogin") as? Bool ?? true {
         didSet { UserDefaults.standard.set(minimizeAtLogin, forKey: "minimizeAtLogin") }
     }
+    private static let preventHostSleepKey = "preventHostSleepOnExternalPower"
+    @Published var preventHostSleepOnExternalPower = UserDefaults.standard.object(forKey: DeskModel.preventHostSleepKey) as? Bool ?? true {
+        didSet {
+            guard preventHostSleepOnExternalPower != oldValue else { return }
+            UserDefaults.standard.set(preventHostSleepOnExternalPower, forKey: Self.preventHostSleepKey)
+            refreshHostActivity()
+        }
+    }
     @Published var lanDiscoveryAdvertiseEnabled = UserDefaults.standard.bool(forKey: "lanDiscoveryAdvertise") {
         didSet {
             UserDefaults.standard.set(lanDiscoveryAdvertiseEnabled, forKey: "lanDiscoveryAdvertise")
@@ -5487,7 +5495,11 @@ final class DeskModel: ObservableObject {
 
     private func refreshHostActivity() {
         guard mode == .host else { return }
-        hostActivity?.update(hostingActive: active, systemSleeping: systemSleeping)
+        hostActivity?.update(
+            hostingActive: active,
+            systemSleeping: systemSleeping,
+            preventSleepEnabled: preventHostSleepOnExternalPower
+        )
     }
 
     private func systemWillSleep() {

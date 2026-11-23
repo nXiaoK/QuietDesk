@@ -597,7 +597,7 @@ struct SharingView: View {
                         lines: [
                             "应用运行于用户态，macOS 登录前或 FileVault 解锁前无法共享。",
                             "关闭主窗口后共享仍在菜单栏后台运行；完全退出 QuietDesk 会停止共享。",
-                            "共享开启期间仅在接入外部电源时阻止系统空闲睡眠；使用电池（含未接电源适配器合盖）时不阻止睡眠。",
+                            "开启「共享且接通外部电源时阻止系统空闲睡眠」后，仅在外部供电时阻止空闲睡眠；使用电池（含未接电源适配器合盖）或关闭该开关时均允许系统正常睡眠。",
                             "开启共享后仍可在「远程桌面」连接其他 Mac，外连期间本机暂不接受连入。",
                             "启用局域网零配置发现后，仅在共享开启期间广播设备名称与匿名标识，不含配对码；控制端仍须凭配对码完成加密认证。"
                         ]
@@ -611,6 +611,7 @@ struct SharingView: View {
                     )
                     Toggle("启动后自动开启本机共享", isOn: $model.autoStartSharing)
                     Toggle("登录自动启动时最小化主窗口", isOn: $model.minimizeAtLogin)
+                    Toggle("开启共享且接通外部电源时阻止系统空闲睡眠", isOn: $model.preventHostSleepOnExternalPower)
                     Toggle("开启共享时允许局域网零配置发现（Bonjour）", isOn: $model.lanDiscoveryAdvertiseEnabled)
                     if let updates, updates.enabled {
                         SharingAutoUpdateToggleRow(updates: updates)

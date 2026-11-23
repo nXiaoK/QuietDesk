@@ -30,6 +30,7 @@ final class HostActivityController {
     private(set) var currentMode: HostActivityMode = .none
     private var hostingActive = false
     private var systemSleeping = false
+    private var preventSleepEnabled = true
 
     init(
         processActivity: ProcessActivityControlling = SystemProcessActivityControl(),
@@ -40,23 +41,27 @@ final class HostActivityController {
     }
 
     @discardableResult
-    func update(hostingActive: Bool, systemSleeping: Bool) -> HostActivityMode {
+    func update(hostingActive: Bool, systemSleeping: Bool, preventSleepEnabled: Bool = true) -> HostActivityMode {
         self.hostingActive = hostingActive
         self.systemSleeping = systemSleeping
+        self.preventSleepEnabled = preventSleepEnabled
         return refresh()
     }
 
     @discardableResult
     func refresh() -> HostActivityMode {
         let desired: HostActivityMode
-        if hostingActive, !systemSleeping {
+        if !hostingActive || systemSleeping {
+            desired = .none
+        } else if !preventSleepEnabled {
+            desired = .allowingSleep
+        } else {
             desired = HostSleepPolicy.activityMode(
                 hostingActive: true,
                 systemSleeping: false,
+                preventSleepEnabled: true,
                 power: readPowerEnvironment()
             )
-        } else {
-            desired = .none
         }
         guard desired != currentMode else { return currentMode }
         if let existing = currentToken {

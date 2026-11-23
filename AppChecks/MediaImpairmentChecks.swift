@@ -118,7 +118,10 @@ private func listenOnFreePair(queue: DispatchQueue, parameters: () throws -> NWP
 // Forwards TLS and DTLS ciphertext between the viewer and the host. Each UDP direction applies
 // its armed impairment in arrival order; TCP can share the downlink's serialization rate.
 private final class ImpairmentProxy: @unchecked Sendable {
-    struct Counts { var forwarded = 0, dropped = 0, bytes = 0, promptCopies = 0 }
+    struct Counts {
+        var forwarded = 0, dropped = 0, bytes = 0, promptCopies = 0
+        var reliableBytes = 0
+    }
     private enum CopyReceipt { case dropped(at: TimeInterval), repeated }
     private struct Direction {
         var random: SplitMix64
@@ -141,6 +144,7 @@ private final class ImpairmentProxy: @unchecked Sendable {
     private var toViewer: Direction, toHost: Direction
     private var downlink: Impairment?, uplink: Impairment?
     private var armedAt: TimeInterval = 0
+    private var measurementEndsAt: TimeInterval = 0
     private var stopped = false
     // One-way delay of the TCP legs, which carry the control connection.
     private var controlDelay: TimeInterval = 0
@@ -172,13 +176,16 @@ private final class ImpairmentProxy: @unchecked Sendable {
     }
 
     /// `downlink` shapes host-to-viewer datagrams (video), `uplink` the viewer's feedback.
-    func arm(downlink: Impairment?, uplink: Impairment?, controlDelay: TimeInterval = 0, limitTCPDownlink: Bool = false) {
+    func arm(downlink: Impairment?, uplink: Impairment?, controlDelay: TimeInterval,
+             limitTCPDownlink: Bool, measurementDuration: TimeInterval) {
         queue.sync {
             self.controlDelay = controlDelay
             self.limitTCPDownlink = limitTCPDownlink
             self.downlink = downlink; self.uplink = uplink
             armedAt = SessionClock.now
+            measurementEndsAt = armedAt + measurementDuration
             toViewer.index = 0; toHost.index = 0
+            toViewer.counts.reliableBytes = 0
             toViewer.copiesBySize.removeAll(); toHost.copiesBySize.removeAll()
         }
     }
@@ -213,19 +220,21 @@ private final class ImpairmentProxy: @unchecked Sendable {
     private func relayTCP(_ incoming: NWConnection) {
         let upstream = NWConnection(host: "127.0.0.1", port: hostPort, using: plainTCP())
         pair(incoming, upstream) { [weak self] in
-            self?.copyStream(from: incoming, lane: Lane(upstream), towardViewer: false)
-            self?.copyStream(from: upstream, lane: Lane(incoming), towardViewer: true)
+            self?.copyStream(from: incoming, lane: Lane(upstream))
+            self?.copyStream(from: upstream, lane: Lane(incoming, reliableDownlink: true))
         }
     }
 
-    private func copyStream(from source: NWConnection, lane: Lane, towardViewer: Bool) {
-        source.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1_024) { [weak self] data, _, complete, error in
+    static let maximumTCPChunk = 64 * 1_024
+
+    private func copyStream(from source: NWConnection, lane: Lane) {
+        source.receive(minimumIncompleteLength: 1, maximumLength: Self.maximumTCPChunk) { [weak self] data, _, complete, error in
             guard let self, !self.stopped, error == nil, let data, !data.isEmpty, !complete else {
                 source.cancel(); lane.destination.cancel()
                 return
             }
             let now = SessionClock.now
-            let serializedAt = if towardViewer, self.limitTCPDownlink, let rate = self.downlink?.bytesPerSecond {
+            let serializedAt = if lane.reliableDownlink, self.limitTCPDownlink, let rate = self.downlink?.bytesPerSecond {
                 self.toViewer.serialize(bytes: data.count, arrivedAt: now, rate: rate)
             } else { now }
             lane.pending.append((serializedAt + self.controlDelay, data))
@@ -233,10 +242,10 @@ private final class ImpairmentProxy: @unchecked Sendable {
             if serializedAt > now {
                 // Let TCP backpressure the source rather than queuing its unserved bytes in the proxy.
                 self.queue.asyncAfter(deadline: .now() + (serializedAt - now)) { [weak self] in
-                    self?.copyStream(from: source, lane: lane, towardViewer: towardViewer)
+                    self?.copyStream(from: source, lane: lane)
                 }
             } else {
-                self.copyStream(from: source, lane: lane, towardViewer: towardViewer)
+                self.copyStream(from: source, lane: lane)
             }
         }
     }
@@ -244,10 +253,13 @@ private final class ImpairmentProxy: @unchecked Sendable {
     // One lane per relayed direction: data leaves in arrival order even when its timers are late.
     private final class Lane {
         let destination: NWConnection
+        let reliableDownlink: Bool
         var pending: [(release: TimeInterval, data: Data)] = []
         var head = 0
         var scheduled = false
-        init(_ destination: NWConnection) { self.destination = destination }
+        init(_ destination: NWConnection, reliableDownlink: Bool = false) {
+            self.destination = destination; self.reliableDownlink = reliableDownlink
+        }
     }
 
     private func relayUDP(_ incoming: NWConnection) {
@@ -273,7 +285,9 @@ private final class ImpairmentProxy: @unchecked Sendable {
         guard !stopped else { return }
         let now = SessionClock.now
         while lane.head < lane.pending.count, lane.pending[lane.head].release <= now + 0.000_2 {
-            lane.destination.send(content: lane.pending[lane.head].data, completion: .idempotent)
+            let data = lane.pending[lane.head].data
+            lane.destination.send(content: data, completion: .idempotent)
+            if lane.reliableDownlink, now < measurementEndsAt { toViewer.counts.reliableBytes += data.count }
             lane.head += 1
         }
         if lane.head == lane.pending.count { lane.pending.removeAll(keepingCapacity: true); lane.head = 0; return }
@@ -392,7 +406,7 @@ private struct Outcome {
         "decoded=\(decoded)/\(submitted) blocked=\(creditBlocked) recoveries=\(recoveries) reductions=\(reductions) "
             + "final=\(finalSettings.summary) latency p50/p95/max=\(latency(0.5))/\(latency(0.95))/\(latency(1))ms "
             + "longestGap=\(Int(longestGap * 1_000))ms loss=\(String(format: "%.3f", highestLoss)) "
-            + "linkDropped=\(toViewer.dropped)/\(toViewer.dropped + toViewer.forwarded) tcp=\(usedTCP) switches=\(switches) "
+            + "linkDropped=\(toViewer.dropped)/\(toViewer.dropped + toViewer.forwarded) tcp=\(usedTCP) tcpBytes=\(toViewer.reliableBytes) switches=\(switches) "
             + "recoveryMs=\(recoveryTimes.map { Int($0 * 1_000) }) timeline=\(timeline.joined(separator: " "))"
     }
 }
@@ -580,7 +594,7 @@ private func play(_ scenario: Scenario) throws -> Outcome {
         throw FixtureUnavailable(description: "Clean loopback did not start on UDP: \(outcome.get().states)")
     }
     proxy.arm(downlink: scenario.downlink, uplink: scenario.uplink, controlDelay: scenario.controlDelay,
-              limitTCPDownlink: scenario.limitTCPDownlink)
+              limitTCPDownlink: scenario.limitTCPDownlink, measurementDuration: scenario.seconds)
     armedAt.update { $0 = SessionClock.now }
     Thread.sleep(forTimeInterval: scenario.seconds)
     let toViewer = proxy.counts().toViewer
@@ -665,27 +679,31 @@ private struct MediaImpairmentChecks {
         }
 
         var narrow = Scenario(name: "A bottleneck a third of the stream still lowers the bitrate to what it carries")
+        let bottleneckRate = 500_000.0
         narrow.seconds = 12
         // A new path needs some low-queue frames to measure its baseline before full-motion video.
         narrow.restartFramePatternAfterKeyframe = true
         narrow.frameBytes = { settings, index in
             index < 12 ? 256 : settings.megabits * 125_000 / settings.framesPerSecond
         }
-        narrow.downlink = Impairment(delay: 0.015, bytesPerSecond: 500_000)
+        narrow.downlink = Impairment(delay: 0.015, bytesPerSecond: bottleneckRate)
         narrow.uplink = Impairment(delay: 0.015)
         narrow.limitTCPDownlink = true
-        func verifyBottleneck(_ outcome: Outcome) throws {
+        run(narrow) { outcome in
             try expect(outcome.finalSettings.megabits <= 6, "Real congestion did not lower the bitrate")
             try expect(outcome.decoded >= 150, "Video stopped flowing through the bottleneck")
         }
-        run(narrow, verifyBottleneck)
 
         var fallback = narrow
         fallback.name = "The shared bottleneck remains after UDP video falls back to TCP"
         fallback.downlink?.outage = 0...5
         run(fallback) { outcome in
             try expect(outcome.usedTCP, "The UDP outage did not exercise TCP fallback")
-            try verifyBottleneck(outcome)
+            try expect(outcome.decoded >= 150, "Video stopped flowing after TCP fallback")
+            // Allow one chunk at the measurement boundary for the proxy's scheduled sends.
+            let budget = Int(bottleneckRate * fallback.seconds) + ImpairmentProxy.maximumTCPChunk
+            try expect((1...budget).contains(outcome.toViewer.reliableBytes),
+                       "TCP forwarded \(outcome.toViewer.reliableBytes) bytes under a \(budget)-byte bottleneck budget")
         }
 
         // Mark every sixth frame with a unique payload length. DTLS-GCM preserves the size difference,

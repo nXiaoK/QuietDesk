@@ -24,13 +24,40 @@ pub struct Pointer {
 }
 
 struct Duplication {
+    device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
     staging: ID3D11Texture2D,
+    gpu: Option<GpuCapture>,
     shape: Option<PointerShape>,
     position: Option<POINT>,
     fallback: Option<Gdi>,
     frame_from_gdi: bool,
+}
+
+struct GpuCapture {
+    texture: ID3D11Texture2D,
+    current: bool,
+}
+
+impl Duplication {
+    fn read_bgra(&self, frame: &mut [u8], row_bytes: usize) -> Result<()> {
+        unsafe {
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context.Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map_err(failed("读取桌面画面"))?;
+            let pitch = mapped.RowPitch as usize;
+            if pitch < row_bytes || mapped.pData.is_null() {
+                self.context.Unmap(&self.staging, 0);
+                return Err(DeskError::platform("GPU 返回的 BGRA 布局无效"));
+            }
+            for (row, target) in frame.chunks_exact_mut(row_bytes).enumerate() {
+                let line = std::slice::from_raw_parts(mapped.pData.cast::<u8>().add(row * pitch), row_bytes);
+                target.copy_from_slice(line);
+            }
+            self.context.Unmap(&self.staging, 0);
+            Ok(())
+        }
+    }
 }
 
 struct Gdi {
@@ -247,18 +274,22 @@ impl ScreenCapture {
                         continue;
                     }
                     let (mut device, mut context) = (None, None);
-                    D3D11CreateDevice(
-                        &adapter,
-                        D3D_DRIVER_TYPE_UNKNOWN,
-                        HMODULE::default(),
-                        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                        None,
-                        D3D11_SDK_VERSION,
-                        Some(&mut device),
-                        None,
-                        Some(&mut context),
-                    )
-                    .map_err(failed("创建 Direct3D 设备"))?;
+                    let mut create = |flags| {
+                        D3D11CreateDevice(
+                            &adapter,
+                            D3D_DRIVER_TYPE_UNKNOWN,
+                            HMODULE::default(),
+                            flags,
+                            None,
+                            D3D11_SDK_VERSION,
+                            Some(&mut device),
+                            None,
+                            Some(&mut context),
+                        )
+                    };
+                    create(D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT)
+                        .or_else(|_| create(D3D11_CREATE_DEVICE_BGRA_SUPPORT))
+                        .map_err(failed("创建 Direct3D 设备"))?;
                     let (device, context) =
                         (device.ok_or_else(|| DeskError::platform("没有 Direct3D 设备"))?, context.ok_or_else(|| DeskError::platform("没有 Direct3D 上下文"))?);
                     let duplication = output.cast::<IDXGIOutput1>().map_err(failed("读取显示器接口"))?.DuplicateOutput(&device).map_err(failed("复制桌面"))?;
@@ -284,8 +315,17 @@ impl ScreenCapture {
                     let mut staging = None;
                     device.CreateTexture2D(&layout, None, Some(&mut staging)).map_err(failed("创建回读纹理"))?;
                     let staging = staging.ok_or_else(|| DeskError::platform("没有回读纹理"))?;
-                    let source =
-                        Source::Duplication(Duplication { context, duplication, staging, shape: None, position: None, fallback: None, frame_from_gdi: false });
+                    let source = Source::Duplication(Duplication {
+                        device,
+                        context,
+                        duplication,
+                        staging,
+                        gpu: None,
+                        shape: None,
+                        position: None,
+                        fallback: None,
+                        frame_from_gdi: false,
+                    });
                     return Ok(Self { source, display: display.clone(), frame: vec![0; (width * height * 4) as usize], has_frame: false, independent: false });
                 }
             }
@@ -312,12 +352,60 @@ impl ScreenCapture {
         }
     }
 
+    pub(super) fn gpu_device(&self) -> Option<&ID3D11Device> {
+        let Source::Duplication(source) = &self.source else { return None };
+        Some(&source.device)
+    }
+
+    pub(super) fn gpu_scaling_device(&self) -> Option<&ID3D11Device> {
+        self.gpu_device().filter(|_| self.independent)
+    }
+
+    pub(super) fn enable_gpu_capture(&mut self) -> Result<()> {
+        let row_bytes = self.width() as u32 * 4;
+        let Source::Duplication(source) = &mut self.source else { return Err(DeskError::platform("GPU 处理需要 DXGI 桌面采集")) };
+        if source.gpu.is_some() {
+            return Ok(());
+        }
+        unsafe {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            source.staging.GetDesc(&mut desc);
+            desc.Usage = D3D11_USAGE_DEFAULT;
+            desc.CPUAccessFlags = 0;
+            // Seed a still desktop from the opening picture; DXGI may have nothing newer to give us.
+            let initial = D3D11_SUBRESOURCE_DATA { pSysMem: self.frame.as_ptr().cast(), SysMemPitch: row_bytes, ..Default::default() };
+            let mut texture = None;
+            source.device.CreateTexture2D(&desc, self.has_frame.then_some(&initial as *const _), Some(&mut texture)).map_err(failed("创建设备桌面纹理"))?;
+            let texture = texture.ok_or_else(|| DeskError::platform("没有设备桌面纹理"))?;
+            source.gpu = Some(GpuCapture { texture, current: self.has_frame });
+        }
+        Ok(())
+    }
+
+    pub(super) fn gpu_frame(&self) -> Option<&ID3D11Texture2D> {
+        let Source::Duplication(source) = &self.source else { return None };
+        source.gpu.as_ref().filter(|gpu| gpu.current).map(|gpu| &gpu.texture)
+    }
+
+    pub(super) fn disable_gpu_capture(&mut self) -> Result<()> {
+        let row_bytes = self.width() * 4;
+        let Source::Duplication(source) = &mut self.source else { return Ok(()) };
+        if let Some(gpu) = source.gpu.take().filter(|gpu| gpu.current) {
+            unsafe { source.context.CopyResource(&source.staging, &gpu.texture) };
+            if let Err(error) = source.read_bgra(&mut self.frame, row_bytes) {
+                self.has_frame = false;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn grab_timed(&mut self, wait_milliseconds: u32, waited: &mut Duration) -> Result<bool> {
         self.grab_source(wait_milliseconds, false, self.independent, waited)
     }
 
     fn grab_source(&mut self, wait_milliseconds: u32, refresh_surface: bool, independent: bool, waited: &mut Duration) -> Result<bool> {
-        let (width, height) = (self.width(), self.height());
+        let row_bytes = self.width() * 4;
         let first = !self.has_frame || refresh_surface;
         match &mut self.source {
             Source::Duplication(source) => unsafe {
@@ -356,15 +444,17 @@ impl ScreenCapture {
                 let cursorless = needs_cursorless_capture(independent, source.position, self.display.bounds, || cursor_info().ok());
                 let copied = if acquired && !cursorless && (info.LastPresentTime != 0 || first || source.frame_from_gdi) {
                     resource.and_then(|resource| resource.cast::<ID3D11Texture2D>().ok()).map(|texture| {
+                        if let Some(gpu) = source.gpu.as_mut().filter(|_| independent) {
+                            source.context.CopyResource(&gpu.texture, &texture);
+                            gpu.current = true;
+                            return Ok(());
+                        }
                         source.context.CopyResource(&source.staging, &texture);
-                        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                        source.context.Map(&source.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map(|()| {
-                            for row in 0..height {
-                                let line = std::slice::from_raw_parts((mapped.pData as *const u8).add(row * mapped.RowPitch as usize), width * 4);
-                                self.frame[row * width * 4..][..width * 4].copy_from_slice(line);
-                            }
-                            source.context.Unmap(&source.staging, 0);
-                        })
+                        source.read_bgra(&mut self.frame, row_bytes)?;
+                        if let Some(gpu) = &mut source.gpu {
+                            gpu.current = false;
+                        }
+                        Ok(())
                     })
                 } else {
                     None
@@ -379,6 +469,9 @@ impl ScreenCapture {
                     };
                     let changed = fallback.grab(&self.display, independent, first || !source.frame_from_gdi, &mut self.frame)?;
                     source.frame_from_gdi = true;
+                    if let Some(gpu) = &mut source.gpu {
+                        gpu.current = false;
+                    }
                     self.has_frame = true;
                     return Ok(changed);
                 }
@@ -388,7 +481,7 @@ impl ScreenCapture {
                         self.has_frame = true;
                         Ok(true)
                     }
-                    Some(Err(error)) => Err(failed("读取桌面画面")(error)),
+                    Some(Err(error)) => Err(error),
                     None => Ok(changed && !refresh_surface),
                 }
             },

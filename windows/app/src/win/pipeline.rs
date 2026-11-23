@@ -4,6 +4,7 @@ use super::capture::ScreenCapture;
 use super::codec::{H264Encoder, MediaFoundation};
 use super::displays::{self, Display};
 use super::gesture_host::GestureHost;
+use super::gpu_video::GpuScaler;
 use super::host_cursor::{CursorTarget, CursorWorker};
 use super::util::Com;
 use super::video_stats::VideoStats;
@@ -50,11 +51,69 @@ impl CaptureCadence {
     }
 }
 
+struct PictureConversion {
+    cpu: Nv12Converter,
+    gpu: Option<GpuScaler>,
+    gpu_unavailable: bool,
+    size: (u32, u32),
+    fps: u32,
+    nv12: Vec<u8>,
+}
+
+impl PictureConversion {
+    fn new(source: (usize, usize), size: (u32, u32), fps: u32) -> Self {
+        let cpu = Nv12Converter::new(source, (size.0 as usize, size.1 as usize));
+        let nv12 = vec![0; cpu.output_bytes()];
+        Self { cpu, gpu: None, gpu_unavailable: false, size, fps, nv12 }
+    }
+
+    fn prepare(&mut self, screen: &mut ScreenCapture) -> Result<()> {
+        if self.gpu_unavailable || self.gpu.is_some() {
+            return Ok(());
+        }
+        let Some(device) = screen.gpu_scaling_device() else { return Ok(()) };
+        let source = (screen.width() as u32, screen.height() as u32);
+        match GpuScaler::new(device, source, self.size, self.fps).and_then(|scaler| {
+            screen.enable_gpu_capture()?;
+            Ok(scaler)
+        }) {
+            Ok(scaler) => self.gpu = Some(scaler),
+            Err(error) => {
+                self.gpu_unavailable = true;
+                log::info!("GPU scaling is unavailable; using CPU conversion: {error}");
+                screen.disable_gpu_capture()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn convert(&mut self, screen: &mut ScreenCapture) -> Result<()> {
+        if let Some(texture) = screen.gpu_frame() {
+            let scaler = self.gpu.as_mut().expect("GPU capture follows scaler setup");
+            match scaler.convert(texture).and_then(|()| scaler.read_nv12(&mut self.nv12)) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    log::warn!("GPU scaling failed; using CPU conversion: {error}");
+                    self.gpu = None;
+                    self.gpu_unavailable = true;
+                    screen.disable_gpu_capture()?;
+                }
+            }
+        }
+        let (width, height) = (screen.width(), screen.height());
+        let patch = screen.pointer().and_then(|pointer| draw_pointer(&mut screen.frame, width * 4, (width, height), &pointer.shape, pointer.x, pointer.y));
+        self.cpu.convert(&screen.frame, width * 4, &mut self.nv12);
+        if let Some(patch) = patch {
+            patch.restore(&mut screen.frame, width * 4);
+        }
+        Ok(())
+    }
+}
+
 struct Stream {
     stats: Option<VideoStats>,
-    converter: Nv12Converter,
+    picture: PictureConversion,
     encoder: H264Encoder,
-    nv12: Vec<u8>,
     sink: FrameSink,
     cadence: CaptureCadence,
     /// The viewer has nothing to predict from: the next frame is a keyframe of the screen as it is.
@@ -87,11 +146,10 @@ fn open_stream(source: (usize, usize), settings: StreamSettings, sink: FrameSink
         let (width, height) = applied.dimensions(source.0 as u32, source.1 as u32);
         match H264Encoder::new(width, height, applied) {
             Ok(encoder) => {
-                let converter = Nv12Converter::new(source, (width as usize, height as usize));
-                let nv12 = vec![0; converter.output_bytes()];
+                let picture = PictureConversion::new(source, (width, height), applied.frames_per_second.clamp(1, 60) as u32);
                 let interval = Duration::from_secs_f64(1.0 / applied.frames_per_second.clamp(1, 60) as f64);
                 let cadence = CaptureCadence { interval, due: Instant::now() };
-                let stream = Stream { stats: None, converter, encoder, nv12, sink, cadence, fresh: true, refused_key_frames: 0, fed: 0, flush: 0 };
+                let stream = Stream { stats: None, picture, encoder, sink, cadence, fresh: true, refused_key_frames: 0, fed: 0, flush: 0 };
                 return Ok((stream, VideoStreamState { settings: applied, width: i64::from(width), height: i64::from(height) }));
             }
             Err(error) => {
@@ -267,15 +325,24 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
         let now = Instant::now();
         let stats = active.stats.get_or_insert_with(|| VideoStats::new(now, screen.backend()));
         stats.report_if_due(now, screen.backend());
-        let start = Instant::now();
-        if !active.sink.has_credit() || !active.cadence.take_slot(start) {
+        if !active.sink.has_credit() || !active.cadence.take_slot(Instant::now()) {
             continue;
         }
-        let mut waited = Duration::ZERO;
-        let captured = screen.grab_timed(0, &mut waited);
-        stats.captured(screen.backend(), start.elapsed(), waited, matches!(captured, Ok(true)));
-        let changed = match captured {
-            Ok(changed) => changed,
+        let current = match active.picture.prepare(screen).and_then(|()| {
+            let start = Instant::now();
+            let mut waited = Duration::ZERO;
+            let captured = screen.grab_timed(0, &mut waited);
+            stats.captured(screen.backend(), start.elapsed(), waited, matches!(captured, Ok(true)));
+            let changed = captured?;
+            if !screen.has_frame() || !(changed || active.fresh) {
+                return Ok(false);
+            }
+            let start = Instant::now();
+            active.picture.convert(screen)?;
+            stats.convert.record(start.elapsed());
+            Ok(true)
+        }) {
+            Ok(current) => current,
             Err(error) => {
                 // The desktop was switched (lock screen, elevation prompt) or the display mode changed.
                 log::warn!("screen capture was interrupted: {error}");
@@ -295,22 +362,11 @@ fn run(commands: Receiver<Command>, input_display: Arc<Mutex<Option<Display>>>, 
         if !screen.has_frame() {
             continue;
         }
-        let current = changed || active.fresh;
         if !current && active.flush == 0 {
             continue;
         }
-        if current {
-            let start = Instant::now();
-            let (width, height) = (screen.width(), screen.height());
-            let patch = screen.pointer().and_then(|pointer| draw_pointer(&mut screen.frame, width * 4, (width, height), &pointer.shape, pointer.x, pointer.y));
-            active.converter.convert(&screen.frame, width * 4, &mut active.nv12);
-            if let Some(patch) = patch {
-                patch.restore(&mut screen.frame, width * 4);
-            }
-            stats.convert.record(start.elapsed());
-        }
         let start = Instant::now();
-        let encoded = active.encoder.encode(&active.nv12, &mut outputs);
+        let encoded = active.encoder.encode(&active.picture.nv12, &mut outputs);
         let elapsed = start.elapsed();
         stats.encoded(elapsed, !current);
         if encoded.is_ok() {

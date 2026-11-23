@@ -10,6 +10,7 @@ pub mod clipboard_storage;
 pub mod codec;
 pub mod displays;
 mod gesture_host;
+mod gpu_video;
 mod host_cursor;
 mod video_stats;
 mod viewer_cursor;

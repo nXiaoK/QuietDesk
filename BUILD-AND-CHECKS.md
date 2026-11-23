@@ -1,5 +1,19 @@
 # 构建与检查记录
 
+## macOS 多设备并发远控与共享/外连同时运行 + 防空闲睡眠开关（2026-11-23，`6164235`、`db20ac5`）
+
+- **做了什么**：
+  - `6164235`（`Sources/QuietDeskCore/HostSleepPolicy.swift`、`Sources/QuietDesk/HostPowerMonitor.swift`、`Sources/QuietDesk/DeskModel.swift`、`Sources/QuietDesk/SharingView.swift`、`Sources/QuietDesk/QuietDeskApp.swift`、`docs/usage.md`、`Checks/HostSleepPolicyChecks.swift`、`AppChecks/HostPowerChecks.swift`）：新增可实时生效的防空闲睡眠配置开关 `preventHostSleepOnExternalPower`（默认开启，持久化于 `UserDefaults`，在「本机共享」与菜单栏菜单中均可随时切换）；开启时仅在接通外部电源期间阻止空闲睡眠，关闭或使用电池（含未接电源合盖）时均不阻止系统睡眠。
+  - `db20ac5`（`Sources/QuietDeskCore/MultiSessionPolicy.swift`、`Sources/QuietDesk/DeskModels.swift`、`Sources/QuietDesk/DeskModel.swift`、`Sources/QuietDesk/QuietDeskApp.swift`、`Sources/QuietDesk/ConnectionEntryView.swift`、`Sources/QuietDesk/ConnectionView.swift`、`Sources/QuietDesk/ConnectionRecoveryView.swift`、`Sources/QuietDesk/PortMappingManager.swift`、`Sources/QuietDesk/PortMappingView.swift`、`Sources/QuietDesk/CapsLockMonitor.swift`、`Sources/QuietDesk/ClipboardSync.swift`、`Sources/QuietDesk/SharingView.swift`、`Sources/QuietDesk/WorkspaceHubViews.swift`、`docs/usage.md`）：
+    - 解除本机共享（`.host`）与外连控制（`.viewer`）之间的双向互斥限制，支持 `A -> B` 控制进行中 `B` 同时连接并控制 `D`（以及 `B -> D` 期间接受 `A -> B` 连入）；主机仍保持同一时刻仅接受一个连入控制端。
+    - 升级 `DeskServices` / `DeskModels` 支持同时发起并保持任意数量的外连远控会话（如 `A` 同时控制 `B` 与 `C`）：每个远端桌面会话在独立原生 `WindowGroup` 窗口中运行，拥有独立画布、全屏、画质、远端声音、仅观看防误触与窗口空闲暂停跟踪；主窗口保持侧边栏解锁，连接页顶部与菜单栏实时展示所有活动远控会话（支持一键切到窗口、按设备去重聚焦已有窗口、单独断开或全部断开），菜单栏「远程控制」命令自动跟随当前聚焦会话窗口。
+    - 隔离多会话共享边界：`PortMappingManager` 增加按设备清理随会话映射 `stopSessionMappings(forDeviceID:)`（断开 `B` 不误停 `C` 的随会话映射）；`CapsLockMonitor` 放行本进程 `InputInjector` 合成事件（保障 `A -> B -> D` 串联控制时不吞合成按键）；`ClipboardSync` 通过 `hasContentMarker` 与跨会话 `:lazy:` 标记识别，防止并发会话后台轮询触发对端按需拉取或形成回环。
+- **跑了什么与结果**：
+  - `QuietDeskChecks` 全量通过（`446 passed, 0 failed`，含 `HostSleepPolicyChecks` 4 项及新增 `MultiSessionPolicyChecks` 4 项，覆盖 `A -> {B, C}` 与 `B -> D` 四节点加密回环并发收发无串扰）。
+  - `./scripts/run-multi-session-checks.sh`（`3 passed, 0 failed`）、`./scripts/run-host-power-checks.sh`（`5 passed, 0 failed`）、`./scripts/run-connection-entry-checks.sh`（`16 passed, 0 failed`）、`./scripts/run-connection-recovery-checks.sh`（`10 passed, 0 failed`）、`PortMappingRuleChecks`（`25 passed`）、`PortMappingChecks` 回环套件（`3 passed`）、`CapsLockMonitorChecks` / `InputSourcesChecks` / `InputContextRefreshChecks`（`23 passed, 0 failed`）及 Python 脚本测试（`64 passed`）全部通过；`ClipboardFocusChecks` 在终端沙盒内除 10 项需连接系统 `pbs` 命名剪贴板服务的用例受沙盒拦截外，其余 73 项内存剪贴板与零预读按需检查全部通过。
+  - 从干净提交 `db20ac5` 构建并校验 Universal 产物（`outputs/multi-session-20261123/`，`0.7.3` build `25`，`arm64` + `x86_64`，签名与证书固定检查通过）：`QuietDesk-0.7.3-macOS-universal.dmg`（SHA-256 `21d90b42...`，`hdiutil verify` 有效）、`QuietDesk-0.7.3-macOS-universal.zip`（SHA-256 `d064c9bc...`）、`QuietDesk-0.7.3-Source.zip`（SHA-256 `aa3cb580...`，442 项受管文件，不含构建缓存与私有配置）。
+- **没验证什么**：本轮未启动或中断本机生产版 QuietDesk 连接与系统权限；多台物理 Mac 实机下同时打开多个全屏远控窗口、`A -> B -> D` 串联画面帧率及真实系统剪贴板跨窗口交互仍待多机实测确认。
+
 ## macOS 共享端仅在接入外部电源时阻止空闲睡眠（2026-11-23，`2168980`）
 
 - **做了什么**：

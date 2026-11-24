@@ -228,10 +228,14 @@ struct DeskInfoPopoverButton: View {
                 }
                 .font(.caption.weight(.medium))
                 .foregroundStyle(DeskPalette.accent)
+                .padding(.horizontal, 4)
+                .frame(minHeight: 26)
+                .contentShape(Rectangle())
             } else {
                 Image(systemName: "info.circle")
                     .font(.system(size: 12.5))
                     .foregroundStyle(DeskPalette.secondary)
+                    .frame(width: 28, height: 26)
                     .contentShape(Rectangle())
             }
         }

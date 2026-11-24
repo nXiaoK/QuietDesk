@@ -891,7 +891,7 @@ struct DeskView: View {
                         }
                     }
                 )
-                .frame(width: geometry.size.width >= 1000 ? 248 : 192)
+                .frame(width: min(248, max(192, geometry.size.width * 0.22)))
                 .padding(8)
                 .background(models.workspaceSection == .connect ? DeskPalette.cardBackground : DeskPalette.canvasBackground)
 
@@ -908,7 +908,7 @@ struct DeskView: View {
                     }
                     workspacePage
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    statusBar
+                    if workspaceShowsStatus { statusBar }
                 }
                 .padding(.top, models.workspaceSection == .connect ? 8 : 0)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -923,6 +923,11 @@ struct DeskView: View {
                 self.workspaceDeviceID = nil
             }
         }
+    }
+
+    private var workspaceShowsStatus: Bool {
+        (models.workspaceSection == .sharing && (model.active || model.working))
+            || models.viewer.working || !models.viewerSessions.isEmpty
     }
 
     @ViewBuilder
@@ -1061,7 +1066,7 @@ struct DeskView: View {
 
     private var statusBar: some View {
         HStack(spacing: 12) {
-            if models.workspaceSection == .sharing && !sessionLayout {
+            if models.workspaceSection == .sharing && !sessionLayout && (model.active || model.working) {
                 Circle()
                     .fill(model.active ? DeskPalette.emerald : model.working ? DeskPalette.amber : .secondary)
                     .frame(width: 6.5, height: 6.5)
@@ -1106,9 +1111,6 @@ struct DeskView: View {
                 if models.viewer.working {
                     ProgressView().controlSize(.mini)
                     Text(models.viewer.status).lineLimit(1)
-                } else if models.workspaceSection == .connect {
-                    Text(models.viewer.connectionFailure == nil ? "QuietDesk" : "上次连接未成功")
-                        .lineLimit(1)
                 }
                 Spacer(minLength: 8)
                 if !models.viewerSessions.isEmpty {
@@ -1305,12 +1307,6 @@ private struct DeskWorkspaceSidebar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("QuietDesk")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(DeskPalette.ink)
-                .padding(.leading, 86)
-                .frame(height: 38)
-
             HStack(spacing: 5) {
                 Text("我的设备")
                     .font(.system(size: 12, weight: .medium))
@@ -1326,7 +1322,7 @@ private struct DeskWorkspaceSidebar: View {
                 .accessibilityLabel("新建连接")
             }
             .padding(.leading, 10)
-            .padding(.top, 12)
+            .padding(.top, 50)
             .padding(.bottom, 6)
 
             GeometryReader { geometry in
@@ -1379,13 +1375,13 @@ private struct DeskWorkspaceSidebar: View {
     private func deviceRow(_ record: ConnectionRecord) -> some View {
         let session = models.existingSession(for: record)
         let selected = models.workspaceSection == .connect && workspaceDeviceID == record.id
-        let title = record.name.isEmpty ? record.address : record.name
+        let title = ConnectionEntryPresentation.title(record)
         return Button {
             workspaceDeviceID = record.id
             models.workspaceSection = .connect
         } label: {
             HStack(spacing: 6) {
-                rowLabel(title, symbol: "desktopcomputer")
+                rowLabel(title, symbol: ConnectionEntryPresentation.deviceSymbol(record))
                     .foregroundStyle(DeskPalette.ink)
                 if let session, session.connected || session.working || session.reconnecting {
                     Circle()
@@ -1474,11 +1470,11 @@ private struct DeskWorkspaceSidebar: View {
             }
             .font(.system(size: 11))
             .foregroundStyle(DeskPalette.muted)
-            .frame(minHeight: 21)
+            .frame(maxWidth: .infinity, minHeight: 26, alignment: .leading)
             .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
+        .menuIndicator(.visible)
         .tint(DeskPalette.muted)
         .help("共享快捷操作")
     }
@@ -1659,15 +1655,13 @@ private struct WindowReader: NSViewRepresentable {
                 if window.titleVisibility != .visible { window.titleVisibility = .visible }
                 if window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = false }
                 if window.titlebarSeparatorStyle != .automatic { window.titlebarSeparatorStyle = .automatic }
-                if window.toolbar?.isVisible == false { window.toolbar?.isVisible = true }
             } else {
                 if !window.styleMask.contains(.fullSizeContentView) {
                     window.styleMask.insert(.fullSizeContentView)
                 }
-                if window.titleVisibility != .hidden { window.titleVisibility = .hidden }
+                if window.titleVisibility != .visible { window.titleVisibility = .visible }
                 if !window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = true }
                 if window.titlebarSeparatorStyle != .none { window.titlebarSeparatorStyle = .none }
-                if window.toolbar?.isVisible == true { window.toolbar?.isVisible = false }
             }
         }
         override func viewDidMoveToWindow() {

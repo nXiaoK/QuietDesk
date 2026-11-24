@@ -1938,15 +1938,20 @@ private struct WindowReader: NSViewRepresentable {
         return view
     }
     func updateNSView(_ view: Probe, context: Context) {
+        let chromeChanged = view.sessionChrome != sessionChrome
+            || view.immersiveFullScreen != immersiveFullScreen
+            || view.restorable != restorable
         view.sessionChrome = sessionChrome
         view.immersiveFullScreen = immersiveFullScreen
         view.restorable = restorable
         view.resolved = resolved
         view.fullScreen = fullScreen
         view.willClose = willClose
-        view.applyWindowChrome()
-        DispatchQueue.main.async { [weak view] in
-            view?.applyWindowChrome()
+        if chromeChanged {
+            view.applyWindowChrome()
+            DispatchQueue.main.async { [weak view] in
+                view?.applyWindowChrome()
+            }
         }
     }
     final class Probe: NSView {
@@ -1972,14 +1977,8 @@ private struct WindowReader: NSViewRepresentable {
                     if window.titlebarSeparatorStyle != .none { window.titlebarSeparatorStyle = .none }
                     if window.toolbar?.isVisible == true { window.toolbar?.isVisible = false }
                     if window.backgroundColor != .black { window.backgroundColor = .black }
-                    if window.appearance?.name != .darkAqua {
-                        window.appearance = NSAppearance(named: .darkAqua)
-                    }
                 }
                 return
-            }
-            if window.appearance != nil {
-                window.appearance = nil
             }
             if window.backgroundColor == .black {
                 window.backgroundColor = .windowBackgroundColor

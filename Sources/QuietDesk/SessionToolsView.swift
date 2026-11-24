@@ -166,6 +166,7 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
                 .accessibilityLabel("收起会话设置")
                 .help("收起会话设置")
             }
+            .padding(.horizontal, 15)
 
             HStack(spacing: 6) {
                 Image(systemName: presentation.control.symbol)
@@ -180,6 +181,7 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
             }
             .font(.system(size: 11, weight: .medium))
             .foregroundStyle(presentation.control.state == .controlling ? DeskPalette.emerald : DeskPalette.secondary)
+            .padding(.horizontal, 15)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 11) {
@@ -225,6 +227,7 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 15)
                 .padding(.vertical, 2)
             }
             .scrollBounceBehavior(.basedOnSize)
@@ -246,10 +249,11 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
                         .disabled(!presentation.isEnabled(.endSession))
                         .help(SessionToolAction.endSession.help)
                 }
+                .padding(.horizontal, 15)
             }
         }
         .font(.system(size: 12.5))
-        .padding(15)
+        .padding(.vertical, 15)
         .frame(width: 396)
         .frame(idealHeight: 704, maxHeight: 720)
         .foregroundStyle(DeskPalette.ink)

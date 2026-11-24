@@ -6,10 +6,10 @@ import QuietDeskCore
 struct FullScreenStatusOverlay<Content: View>: View {
     @Binding var position: CGPoint?
     let backgroundOpacity: Double?
+    let reduceTransparency: Bool
     let beginDrag: () -> Void
     var capsule: Bool = false
     @ViewBuilder let content: Content
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var statusSize: CGSize = .zero
     @State private var dragOrigin: CGPoint?
     @State private var translation: CGSize = .zero

@@ -867,6 +867,7 @@ struct DeskView: View {
                 FullScreenStatusOverlay(
                     position: $model.fullScreenStatusPosition,
                     backgroundOpacity: model.fullScreenStatusBackgroundOpacity,
+                    reduceTransparency: reduceTransparency,
                     beginDrag: { model.canvas.releaseControl() },
                     capsule: model.fullScreenStatusCompact
                 ) {

@@ -470,6 +470,7 @@ private struct RemoteCanvasChecks {
             canvas.onInput = { inputs.append($0) }
             let hosting = NSHostingView(rootView: CanvasView(canvas: canvas).overlay {
                 FullScreenStatusOverlay(position: Binding(get: { position }, set: { position = $0 }), backgroundOpacity: 0.6,
+                    reduceTransparency: false,
                     beginDrag: { canvas.releaseControl() }) {
                     Text("0:49"); Text("中继 UDP 视频"); Text("30 fps"); Text("14 ms"); Text("1920 × 1246")
                 }
@@ -531,14 +532,15 @@ private struct RemoteCanvasChecks {
 
         run("Status text stays white while only its background follows the chosen opacity") {
             // Rendered over a white picture, where the earlier brightness-following text turned black.
-            @MainActor func render(_ opacity: Double?) throws -> (background: Double, brightest: Double) {
+            @MainActor func render(_ opacity: Double?, reduceTransparency: Bool = false) throws -> (background: Double, brightest: Double) {
                 let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 200), styleMask: .borderless,
                                       backing: .buffered, defer: false)
                 window.isReleasedWhenClosed = false
                 defer { window.close() }
                 let hosting = NSHostingView(rootView: ZStack {
                     Color.white
-                    FullScreenStatusOverlay(position: .constant(nil), backgroundOpacity: opacity, beginDrag: {}) {
+                    FullScreenStatusOverlay(position: .constant(nil), backgroundOpacity: opacity,
+                        reduceTransparency: reduceTransparency, beginDrag: {}) {
                         Text("0:49"); Text("30 fps"); Text("14 ms")
                     }
                 }.frame(width: 300, height: 200))
@@ -579,6 +581,9 @@ private struct RemoteCanvasChecks {
             try require(clear.background > 0.95, "A fully transparent background still darkened the picture: \(clear)")
             try require(abs(standard.background - (1 - FullScreenStatusPlacement.defaultBackgroundOpacity)) < 0.05,
                         "The default background opacity was not applied: \(standard)")
+            let reduced = try render(0.4, reduceTransparency: true)
+            try require(reduced.background < 0.05 && reduced.brightest > 0.9,
+                        "Reduce Transparency did not show white text on an opaque black background: \(reduced)")
         }
 
         run("Capsule status mode defaults to top-center and consumes only its own bounds") {
@@ -588,7 +593,8 @@ private struct RemoteCanvasChecks {
             defer { window.close() }
             canvas.canControl = true
             let hosting = NSHostingView(rootView: CanvasView(canvas: canvas).overlay {
-                FullScreenStatusOverlay(position: .constant(nil), backgroundOpacity: 0.65, beginDrag: {}, capsule: true) {
+                FullScreenStatusOverlay(position: .constant(nil), backgroundOpacity: 0.65,
+                    reduceTransparency: false, beginDrag: {}, capsule: true) {
                     Text("控制中"); Text("UDP 1.8 ms"); Text("60 fps")
                 }
             }.frame(width: 900, height: 600))

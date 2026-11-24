@@ -18,6 +18,9 @@ struct RouteQualityBenchmarkView: View {
     let onConnectCandidate: (RouteBenchmarkCandidate, ConnectionRecord?) -> Void
     let onClose: () -> Void
     var embedded: Bool = false
+    var availableRecords: [ConnectionRecord] = []
+    var selectedTargetRecord: ConnectionRecord? = nil
+    var onSelectTargetRecord: ((ConnectionRecord?) -> Void)? = nil
 
     @State private var expandedRunIDs: Set<UUID> = []
     @State private var didSeedInitialExpansion = false
@@ -145,12 +148,34 @@ struct RouteQualityBenchmarkView: View {
                 }
 
                 Spacer()
-                if !runner.isRunning {
-                    Button(runner.completedOrFailedCount > 0 ? "重新实测" : "开始实测") {
-                        runner.start()
+                HStack(spacing: 8) {
+                    if let onSelectTargetRecord, !availableRecords.isEmpty {
+                        Menu {
+                            Button("使用连接页当前填写目标") {
+                                onSelectTargetRecord(nil)
+                            }
+                            Divider()
+                            ForEach(availableRecords) { record in
+                                Button("\(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record))") {
+                                    onSelectTargetRecord(record)
+                                }
+                            }
+                        } label: {
+                            Label(
+                                selectedTargetRecord.map { "目标：\(ConnectionEntryPresentation.title($0))" } ?? "切换测速目标",
+                                systemImage: "desktopcomputer"
+                            )
+                        }
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .disabled(runner.isRunning)
                     }
-                    .buttonStyle(DeskButtonStyle(.primary))
-                    .disabled(runner.selectedCount == 0)
+                    if !runner.isRunning {
+                        Button(runner.completedOrFailedCount > 0 ? "重新实测" : "开始实测") {
+                            runner.start()
+                        }
+                        .buttonStyle(DeskButtonStyle(.primary))
+                        .disabled(runner.selectedCount == 0)
+                    }
                 }
             }
 

@@ -5,44 +5,60 @@ import SwiftUI
 struct DeskSettingsPageTabs<Tab: Hashable, Content: View>: View {
     let tabs: [(id: Tab, title: String)]
     @Binding var selection: Tab
+    var badge: (Tab) -> (text: String, tint: Color)? = { _ in nil }
     var canSelect: (Tab) -> Bool = { _ in true }
     @ViewBuilder let content: () -> Content
 
     var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            VStack(alignment: .leading, spacing: 3) {
-                ForEach(tabs, id: \.id) { tab in
-                    let isSelected = selection == tab.id
-                    let isEnabled = canSelect(tab.id)
-                    Button {
-                        selection = tab.id
-                    } label: {
-                        Text(tab.title)
-                            .font(.callout.weight(isSelected ? .semibold : .regular))
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 4) {
+                    ForEach(tabs, id: \.id) { tab in
+                        let isSelected = selection == tab.id
+                        let isEnabled = canSelect(tab.id)
+                        Button {
+                            selection = tab.id
+                        } label: {
+                            HStack(spacing: 6) {
+                                Text(tab.title)
+                                    .font(.system(size: 12.5, weight: isSelected ? .semibold : .medium))
+                                    .lineLimit(1)
+                                if let tag = badge(tab.id) {
+                                    Circle()
+                                        .fill(tag.tint)
+                                        .frame(width: 6, height: 6)
+                                        .accessibilityLabel(tag.text)
+                                }
+                            }
                             .foregroundStyle(isSelected ? DeskPalette.ink : DeskPalette.secondary)
-                            .multilineTextAlignment(.leading)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 8)
+                            .padding(.horizontal, 13)
+                            .padding(.vertical, 6.5)
                             .background(
-                                isSelected ? DeskPalette.selection : Color.clear,
-                                in: RoundedRectangle(cornerRadius: 7)
+                                isSelected ? DeskPalette.cardBackground : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
                             )
-                            .contentShape(Rectangle())
+                            .overlay {
+                                if isSelected {
+                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                        .strokeBorder(DeskPalette.hairline, lineWidth: 0.8)
+                                }
+                            }
+                            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!isEnabled)
+                        .opacity(isEnabled ? 1 : 0.52)
+                        .accessibilityAddTraits(isSelected ? .isSelected : [])
                     }
-                    .buttonStyle(.plain)
-                    .disabled(!isEnabled)
-                    .opacity(isEnabled ? 1 : 0.55)
-                    .accessibilityAddTraits(isSelected ? .isSelected : [])
                 }
-                Spacer(minLength: 0)
+                .padding(3)
+                .background(DeskPalette.subtleFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
             }
-            .padding(10)
-            .frame(width: 151, alignment: .leading)
-            .frame(maxHeight: .infinity, alignment: .topLeading)
-            .background(DeskPalette.sidebarBackground, in: RoundedRectangle(cornerRadius: 11))
-            .padding(.leading, 12)
-            .padding(.vertical, 12)
+            .padding(.horizontal, 28)
+            .padding(.top, 8)
+            .padding(.bottom, 12)
+
+            Divider()
 
             content()
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -53,12 +69,28 @@ struct DeskSettingsPageTabs<Tab: Hashable, Content: View>: View {
 
 struct DeskSettingsPageHeading: View {
     let title: String
+    var detail: String? = nil
+    var badgeText: String? = nil
+    var badgeTint: Color = DeskPalette.emerald
 
     var body: some View {
-        Text(title)
-            .font(.system(size: 24, weight: .bold))
-            .foregroundStyle(DeskPalette.ink)
-            .accessibilityAddTraits(.isHeader)
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .center, spacing: 10) {
+                Text(title)
+                    .font(.system(size: 23, weight: .bold))
+                    .foregroundStyle(DeskPalette.ink)
+                    .accessibilityAddTraits(.isHeader)
+                if let badgeText {
+                    DeskPillBadge(text: badgeText, symbol: "circle.fill", tint: badgeTint)
+                }
+            }
+            if let detail, !detail.isEmpty {
+                Text(detail)
+                    .font(.system(size: 13))
+                    .foregroundStyle(DeskPalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }
 
@@ -85,11 +117,11 @@ private enum NetworkWorkspacePage: Hashable {
     case diagnostics(DiagnosticsWorkspaceSubTab)
 
     static let tabs: [(id: Self, title: String)] = [
-        (.network(.viewerMappings), "TCP 端口映射"),
+        (.network(.viewerMappings), "端口映射"),
         (.network(.relayNodes), "自托管中继"),
         (.network(.hostApprovals), "本机映射授权"),
         (.diagnostics(.benchmark), "线路实测"),
-        (.diagnostics(.traffic), "地址历史流量")
+        (.diagnostics(.traffic), "地址流量")
     ]
 }
 
@@ -133,10 +165,16 @@ struct NetworkWorkspaceView: View {
                     case .diagnostics(let tab): openDiagnostics(tab)
                     }
                 }
-            )
+            ),
+            badge: { page in
+                if page == .network(.hostApprovals) && host.portMappings.hostApprovalPending {
+                    return ("待确认请求", DeskPalette.amber)
+                }
+                return nil
+            }
         ) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 20) {
                     switch subTab {
                     case .viewerMappings:
                         PortMappingView(
@@ -149,7 +187,10 @@ struct NetworkWorkspaceView: View {
                             deviceRouteSummaryCard(for: record)
                         }
                     case .relayNodes:
-                        DeskSettingsPageHeading(title: "自托管中继")
+                        DeskSettingsPageHeading(
+                            title: "自托管中继",
+                            detail: "两端主动连接同一自建节点；配置在下次共享或连接时生效"
+                        )
                         RelaySettingsView(
                             enabled: viewer.relayEnabled,
                             nodes: viewer.relayNodes,
@@ -171,9 +212,9 @@ struct NetworkWorkspaceView: View {
                         )
                     }
                 }
-                .padding(.horizontal, 26)
-                .padding(.vertical, 24)
-                .frame(maxWidth: 1080, alignment: .leading)
+                .padding(.horizontal, 28)
+                .padding(.vertical, 22)
+                .frame(maxWidth: 920, alignment: .leading)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
             }
         }
@@ -186,7 +227,7 @@ struct NetworkWorkspaceView: View {
         let runs = descriptor.hasIdentity ? benchmarkStore.archive.runs(matching: descriptor) : []
         let assessment = RouteBenchmarkHistoryEvaluator.assess(runs: runs, targetOverride: descriptor)
 
-        DeskSurfaceCard(padding: 15, cornerRadius: 9) {
+        DeskSurfaceCard(padding: 15, cornerRadius: 10) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .center, spacing: 12) {
                     if let assessment {
@@ -207,14 +248,14 @@ struct NetworkWorkspaceView: View {
                                 .frame(width: 42, height: 42)
                             Image(systemName: "speedometer")
                                 .font(.system(size: 18))
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(DeskPalette.secondary)
                         }
                     }
 
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 8) {
-                            Text("「\(ConnectionEntryPresentation.title(record))」线路质量档案")
-                                .font(.system(size: 13.5, weight: .bold))
+                            Text("\(ConnectionEntryPresentation.title(record)) · 线路质量档案")
+                                .font(.system(size: 13.5, weight: .semibold))
                             if let assessment {
                                 DeskPillBadge(
                                     text: "累计 \(assessment.runCount) 次实测 · \(assessment.overallGrade.title)",
@@ -225,12 +266,12 @@ struct NetworkWorkspaceView: View {
                         if let assessment, let best = assessment.recommendedRoute {
                             Text("长期推荐：\(best.candidate.title) — \(assessment.recommendationReason)")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(DeskPalette.secondary)
                                 .lineLimit(2)
                         } else {
                             Text("尚未执行过线路质量实测；实测可对比直连与各中继节点的真实帧率、延迟与 UDP 丢包。")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(DeskPalette.secondary)
                         }
                     }
 
@@ -244,7 +285,7 @@ struct NetworkWorkspaceView: View {
                 }
 
                 if let assessment, !assessment.routeSummaries.isEmpty {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 164), alignment: .leading)], alignment: .leading, spacing: 10) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 168), alignment: .leading)], alignment: .leading, spacing: 10) {
                         ForEach(Array(assessment.routeSummaries.prefix(3).enumerated()), id: \.element.id) { idx, item in
                             let isBest = idx == 0 && item.overallGrade != .unreachable
                             VStack(alignment: .leading, spacing: 5) {
@@ -271,7 +312,7 @@ struct NetworkWorkspaceView: View {
                                     }
                                 }
                                 .font(.system(size: 10.5, design: .monospaced))
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(DeskPalette.secondary)
                                 .lineLimit(1)
                             }
                             .padding(10)
@@ -313,62 +354,47 @@ struct DiagnosticsWorkspaceView: View {
                     }
                 }
             ),
+            badge: { page in
+                if page == .network(.hostApprovals) && models.host.portMappings.hostApprovalPending {
+                    return ("待确认请求", DeskPalette.amber)
+                }
+                return nil
+            },
             canSelect: { !viewer.isRunningRouteBenchmark || $0 == .diagnostics(subTab) }
         ) {
-            VStack(alignment: .leading, spacing: 0) {
-                if subTab == .benchmark, !viewer.connections.isEmpty {
-                    HStack {
-                        Spacer()
-                        Menu {
-                            Button("使用连接页当前填写目标") {
-                                rebuildRunner(for: nil)
+            switch subTab {
+            case .benchmark:
+                if let runner = inlineRunner {
+                    RouteQualityBenchmarkView(
+                        runner: runner,
+                        onConnectCandidate: { candidate, record in
+                            runner.shutdown()
+                            DispatchQueue.main.async {
+                                _ = models.connectUsingBenchmarkCandidate(candidate, record: record)
                             }
-                            Divider()
-                            ForEach(viewer.connections) { record in
-                                Button("\(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record))") {
-                                    rebuildRunner(for: record)
-                                }
-                            }
-                        } label: {
-                            Label(
-                                benchmarkTargetRecord.map { "目标：\(ConnectionEntryPresentation.title($0))" } ?? "切换测速目标",
-                                systemImage: "desktopcomputer"
-                            )
-                        }
-                        .controlSize(.small)
-                        .disabled(inlineRunner?.isRunning == true || viewer.active || viewer.working)
-                    }
-                    .padding(.horizontal, 26)
-                    .padding(.top, 14)
+                        },
+                        onClose: {
+                            runner.shutdown()
+                        },
+                        embedded: true,
+                        availableRecords: viewer.connections,
+                        selectedTargetRecord: benchmarkTargetRecord,
+                        onSelectTargetRecord: { rebuildRunner(for: $0) }
+                    )
+                } else {
+                    ProgressView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                switch subTab {
-                case .benchmark:
-                    if let runner = inlineRunner {
-                        RouteQualityBenchmarkView(
-                            runner: runner,
-                            onConnectCandidate: { candidate, record in
-                                runner.shutdown()
-                                DispatchQueue.main.async {
-                                    _ = models.connectUsingBenchmarkCandidate(candidate, record: record)
-                                }
-                            },
-                            onClose: {
-                                runner.shutdown()
-                            },
-                            embedded: true
-                        )
-                    } else {
-                        ProgressView()
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    }
-                case .traffic:
-                    TrafficStatisticsView(model: viewer, history: history, done: {}, embedded: true)
-                }
+            case .traffic:
+                TrafficStatisticsView(model: viewer, history: history, done: {}, embedded: true)
             }
         }
         .background(DeskPalette.canvasBackground)
         .onAppear {
             if inlineRunner == nil {
+                if benchmarkTargetRecord == nil, viewer.address.trimmingCharacters(in: .whitespaces).isEmpty {
+                    benchmarkTargetRecord = viewer.connections.first
+                }
                 inlineRunner = RouteQualityBenchmarkRunner(model: viewer, record: benchmarkTargetRecord)
             }
         }
@@ -406,12 +432,18 @@ struct PreferencesWorkspaceView: View {
                 (.keyboard, "键盘与快捷键"),
                 (.connectionDefaults, "连接默认项"),
                 (.privacy, "隐私偏好"),
-                (.updates, updates.manifest != nil ? "软件更新 · 新版本" : "软件更新")
+                (.updates, "软件更新")
             ],
-            selection: $subTab
+            selection: $subTab,
+            badge: { tab in
+                if tab == .updates && (updates.manifest != nil || updates.manualReleaseURL != nil) {
+                    return ("有新版本", DeskPalette.accent)
+                }
+                return nil
+            }
         ) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 20) {
                     switch subTab {
                     case .keyboard:
                         DeskSettingsPageHeading(title: "键盘与快捷键")
@@ -434,9 +466,9 @@ struct PreferencesWorkspaceView: View {
                         UpdateSettingsPanel(controller: updates)
                     }
                 }
-                .padding(.horizontal, 26)
-                .padding(.vertical, 24)
-                .frame(maxWidth: 1080, alignment: .leading)
+                .padding(.horizontal, 28)
+                .padding(.vertical, 22)
+                .frame(maxWidth: 880, alignment: .leading)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
             }
         }
@@ -445,24 +477,18 @@ struct PreferencesWorkspaceView: View {
 
     @ViewBuilder
     private var privacyContent: some View {
-        if viewer.connected || connectedSessions.isEmpty {
-            SessionEffectsView(model: viewer, done: {}, embedded: true)
-        } else {
-            Text("防窥和自动解锁按设备管理。在对应窗口中打开「会话设置」，再选择「被控端隐私与安全」。")
-                .font(.callout)
-                .foregroundStyle(DeskPalette.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            DeskSettingsGroup(title: "已连接的会话") {
+        if !viewer.connected && !connectedSessions.isEmpty {
+            DeskSettingsGroup(title: "当前已连接会话（可在对应会话窗口即时调整）") {
                 ForEach(connectedSessions) { session in
                     if session.id != connectedSessions.first?.id { Divider() }
                     DeskSettingsRow(title: session.title, detail: session.endpointLabel) {
-                        Button("打开会话") { openSession(session.id) }
+                        Button("切到会话窗口") { openSession(session.id) }
                             .buttonStyle(DeskButtonStyle(.secondary))
-                            .accessibilityLabel("打开 \(session.title) 的会话")
+                            .accessibilityLabel("切到 \(session.title) 的会话窗口")
                     }
                 }
             }
         }
+        SessionEffectsView(model: viewer, done: {}, embedded: true)
     }
 }

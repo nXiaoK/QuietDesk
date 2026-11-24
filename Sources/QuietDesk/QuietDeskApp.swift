@@ -69,7 +69,7 @@ struct QuietDeskApp: App {
                     updates.start()
                 }
         }
-        .defaultSize(width: 1080, height: 760)
+        .defaultSize(width: 1100, height: 760)
         .windowToolbarStyle(.unified)
         .commands {
             CommandGroup(replacing: .newItem) {}
@@ -87,7 +87,7 @@ struct QuietDeskApp: App {
         WindowGroup("远程桌面", id: "remote-session", for: UUID.self) { $sessionID in
             RemoteSessionSceneView(models: models, updates: updates, sessionID: sessionID)
         }
-        .defaultSize(width: 1200, height: 800)
+        .defaultSize(width: 1220, height: 800)
         .windowToolbarStyle(.unified)
         MenuBarExtra("QuietDesk", systemImage: "display.2") {
             TrayView(models: models, viewer: models.viewer, host: models.host, updates: updates)
@@ -144,25 +144,47 @@ private struct RemoteControlCommands: Commands {
 
     var body: some Commands {
         CommandMenu("远程控制") {
-            Button(activeViewer.isFullScreen ? "退出全屏" : "进入全屏") { activeViewer.toggleFullScreen() }
-                .keyboardShortcut("f", modifiers: [.control, .command])
-            Button("释放键盘鼠标") {
+            Button("释放控制") {
                 activeViewer.cancelRemoteTypedText()
                 activeViewer.canvas.releaseControl()
             }
-                .keyboardShortcut(.escape, modifiers: [.control, .option])
+            .keyboardShortcut(.escape, modifiers: [.control, .option])
+
+            Button(activeViewer.isFullScreen ? "退出全屏" : "进入全屏") { activeViewer.toggleFullScreen() }
+                .keyboardShortcut("f", modifiers: [.control, .command])
+
             Toggle("仅观看防误触（锁定键鼠发送）", isOn: Binding(
                 get: { activeViewer.viewerViewOnlyLock },
                 set: { activeViewer.setViewerViewOnlyLock($0) }
             ))
-            Button("模拟键入本机剪贴板文字") { activeViewer.typeLocalClipboardText() }
+
+            Divider()
+
+            Button("发送本机剪贴板文字") {
+                activeViewer.canvas.releaseControl()
+                activeViewer.pushClipboard()
+            }
+            .disabled(!activeViewer.connected)
+
+            Button("获取远端剪贴板文字") {
+                activeViewer.canvas.releaseControl()
+                activeViewer.pullClipboard()
+            }
+            .disabled(!activeViewer.connected)
+
+            Button("模拟键入剪贴板文字") { activeViewer.typeLocalClipboardText() }
                 .disabled(activeViewer.remoteTypingUnavailableReason != nil)
+
             if activeViewer.remoteTypingWorking {
                 Button("停止模拟键入") { activeViewer.cancelRemoteTypedText() }
             }
+
             Button("截取远端画面到剪贴板") { activeViewer.copyRemoteFrame() }
                 .keyboardShortcut("s", modifiers: [.control, .command])
                 .disabled(!activeViewer.connected)
+
+            Divider()
+
             Button("断开远程连接") {
                 if activeViewer !== models.viewer {
                     models.disconnectViewerSession(activeViewer)
@@ -171,11 +193,13 @@ private struct RemoteControlCommands: Commands {
                 }
             }
             .disabled(!activeViewer.active && !activeViewer.working && !activeViewer.reconnecting)
+
             if models.viewerSessions.count > 1 {
                 Button("断开全部远程连接（\(models.viewerSessions.count)）") {
                     models.disconnectAllViewerSessions()
                 }
             }
+
             Divider()
             Button("断开控制端") { host.disconnectController() }.disabled(!host.hasIncomingControlConnection)
             Button("停止共享") { host.stop() }.disabled(!host.active && !host.working)
@@ -193,12 +217,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func showConnectionReport(_ report: ConnectionDiagnosticReport) {
         let window = NSWindow(contentViewController: NSHostingController(rootView: ConnectionDiagnosticReportView(report: report)))
-        window.title = "连接诊断 · " + report.remoteName
+        window.title = "连接诊断报告"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.isReleasedWhenClosed = false
         window.isRestorable = false
         window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
-        window.setContentSize(NSSize(width: 800, height: 720))
+        window.setContentSize(NSSize(width: 820, height: 680))
         window.contentMinSize = NSSize(width: 620, height: 440)
         if let previous = reportWindows.first(where: { $0.isVisible }) {
             window.cascadeTopLeft(from: NSPoint(x: previous.frame.minX, y: previous.frame.maxY))
@@ -279,6 +303,7 @@ struct DeskView: View {
     @ObservedObject var model: DeskModel
     @ObservedObject var updates: UpdateController
     var isDedicatedSessionWindow: Bool = false
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var showCapsSettings = false
     @State private var showOptions = false
     @State private var showFullScreenMenu = false
@@ -296,6 +321,7 @@ struct DeskView: View {
     @State private var workspaceDeviceID: UUID?
     @State private var workspaceDeviceListInitialized = false
     @State private var showNewConnection = false
+    @State private var sidebarCollapsed = false
     @State private var dismissedClipboardStatus = ""
     @State private var dismissedReceptionID: UUID?
     @State private var clipboardNoticeRevision: UInt64 = 0
@@ -309,7 +335,16 @@ struct DeskView: View {
     private var immersive: Bool { model.isFullScreen && model.mode == .viewer }
     private var remoteTitle: String { model.sessionWindowTitle }
     private var remoteSubtitle: String {
-        let phase = model.connected ? "已连接" : model.reconnecting ? "正在重连" : model.working ? "正在连接" : "未连接"
+        let phase: String
+        if model.connected {
+            phase = !model.effectiveViewerCanControl ? "仅观看" : (model.controlling ? "控制中" : "已连接")
+        } else if model.reconnecting {
+            phase = "正在重连"
+        } else if model.working {
+            phase = "正在连接"
+        } else {
+            phase = "未连接"
+        }
         return "\(phase) · \(model.sessionEndpointSubtitle)"
     }
     private var showClipboardActivity: Bool { model.fileTransferNotice != nil || showClipboardStatus }
@@ -374,35 +409,14 @@ struct DeskView: View {
             .frame(width: 0, height: 0)
         )
         .focusedSceneValue(\.viewerSession, isDedicatedSessionWindow ? model : nil)
-        .frame(minWidth: 880, minHeight: 580)
+        .frame(minWidth: 820, minHeight: 580)
         .ignoresSafeArea(immersive ? .container : (!sessionLayout ? .container : []), edges: immersive ? .all : .top)
         .navigationTitle(sessionLayout ? remoteTitle : "QuietDesk")
         .navigationSubtitle(sessionLayout ? remoteSubtitle : "")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 if sessionLayout {
-                    // Group 1: Remote Screen & Audio
-                    if model.supportsDisplaySwitching, model.remoteDisplays.count > 1 {
-                        Menu {
-                            ForEach(model.remoteDisplays) { display in
-                                Button {
-                                    model.canvas.releaseControl()
-                                    model.selectRemoteDisplay(display.id)
-                                } label: {
-                                    if display.id == model.remoteSelectedDisplayID {
-                                        Label(display.summary, systemImage: "checkmark")
-                                    } else {
-                                        Text(display.summary)
-                                    }
-                                }
-                                .disabled(display.id == model.remoteSelectedDisplayID || model.displaySwitchWorking)
-                            }
-                        } label: {
-                            Label("切换屏幕", systemImage: "display.2")
-                        }
-                        .help("在远端多台显示器之间无缝切换")
-                        .disabled(!model.connected || model.displaySwitchWorking)
-                    }
+                    sessionScreenAndSpacesMenu
                     if model.supportsLiveSettings {
                         sessionQualityMenu
                     }
@@ -419,139 +433,25 @@ struct DeskView: View {
                         .disabled(!model.connected)
                     }
 
-                    // Group 2: Spaces & Input Mode Menu
-                    Menu {
-                        Button {
-                            model.sendDesktopAction(.previousSpace)
-                        } label: {
-                            Label(RemoteDesktopAction.previousSpace.title, systemImage: RemoteDesktopAction.previousSpace.toolbarSymbol)
-                        }
-                        .disabled(model.desktopActionUnavailableReason != nil)
+                    sessionClipboardMenu
 
-                        Button {
-                            model.sendDesktopAction(.missionControl)
-                        } label: {
-                            Label(RemoteDesktopAction.missionControl.title, systemImage: RemoteDesktopAction.missionControl.toolbarSymbol)
-                        }
-                        .disabled(model.desktopActionUnavailableReason != nil)
-
-                        Button {
-                            model.sendDesktopAction(.nextSpace)
-                        } label: {
-                            Label(RemoteDesktopAction.nextSpace.title, systemImage: RemoteDesktopAction.nextSpace.toolbarSymbol)
-                        }
-                        .disabled(model.desktopActionUnavailableReason != nil)
-
-                        Divider()
-
-                        Button {
-                            model.setViewerViewOnlyLock(!model.viewerViewOnlyLock)
-                        } label: {
-                            Label(
-                                model.viewerViewOnlyLock ? "关闭仅观看防误触（恢复键鼠控制）" : "开启仅观看防误触（锁定键鼠发送）",
-                                systemImage: model.viewerViewOnlyLock ? "hand.raised.fill" : "hand.raised"
-                            )
-                        }
-
-                        if model.supportsRelativeMouse {
-                            Button {
-                                model.canvas.releaseControl()
-                                model.setRelativeMouseEnabled(!model.relativeMouseEnabled)
-                            } label: {
-                                Label(
-                                    model.relativeMouseEnabled ? "关闭相对鼠标视角锁定" : "开启相对鼠标（3D 视角锁定）",
-                                    systemImage: model.relativeMouseCaptured ? "scope" : "cursorarrow.motionlines"
-                                )
-                            }
-                            .disabled(!model.connected || !model.effectiveViewerCanControl)
-                        }
-
-                        Button {
-                            model.canvas.releaseControl()
-                            showCapsSettings = true
-                        } label: {
-                            Label(SessionToolAction.keyboard.title(), systemImage: SessionToolAction.keyboard.symbol())
-                        }
+                    Button {
+                        model.canvas.releaseControl()
+                        model.toggleFullScreen()
                     } label: {
-                        Label(
-                            model.relativeMouseCaptured ? "视角已锁" : "空间与输入",
-                            systemImage: model.relativeMouseCaptured ? "scope" : "rectangle.3.group"
-                        )
+                        Label(SessionToolAction.fullScreen.title(), systemImage: SessionToolAction.fullScreen.symbol())
                     }
-                    .help(model.desktopActionUnavailableReason ?? "远端调度中心、桌面空间切换、3D 相对鼠标与键盘设置")
+                    .help(SessionToolAction.fullScreen.help)
 
-                    // Group 3: Clipboard & Frame Capture
-                    Menu {
-                        Button {
-                            model.canvas.releaseControl()
-                            model.pushClipboard()
-                        } label: {
-                            Label(SessionToolAction.sendText.title(), systemImage: SessionToolAction.sendText.symbol())
-                        }
-                        .disabled(!model.connected)
+                    sessionMoreMenu
 
-                        Button {
-                            model.canvas.releaseControl()
-                            model.pullClipboard()
-                        } label: {
-                            Label(SessionToolAction.receiveText.title(), systemImage: SessionToolAction.receiveText.symbol())
-                        }
-                        .disabled(!model.connected)
-
-                        Divider()
-
-                        Button {
-                            model.typeLocalClipboardText()
-                        } label: {
-                            Label("模拟键入本机剪贴板文字", systemImage: "keyboard.badge.ellipsis")
-                        }
-                        .disabled(model.remoteTypingUnavailableReason != nil)
-
-                        Button {
-                            model.canvas.releaseControl()
-                            showTypeTextSheet = true
-                        } label: {
-                            Label("输入文字/密码模拟键入…", systemImage: "ellipsis.rectangle")
-                        }
-                        .disabled(model.remoteTypingUnavailableReason != nil)
-
-                        if model.remoteTypingWorking {
-                            Button(role: .destructive) {
-                                model.cancelRemoteTypedText()
-                            } label: {
-                                Label("停止模拟键入", systemImage: "xmark.circle")
-                            }
-                        }
-
-                        Divider()
-
-                        Button {
-                            model.canvas.releaseControl()
-                            model.copyRemoteFrame()
-                        } label: {
-                            Label("截取远端画面（⌃⌘S）", systemImage: SessionToolAction.captureFrame.symbol())
-                        }
-                        .disabled(!model.connected)
-
-                        Button {
-                            model.canvas.releaseControl()
-                            model.openReceivedFiles()
-                        } label: {
-                            Label("打开接收文件目录", systemImage: "folder")
-                        }
-                    } label: {
-                        Label("剪贴板与截图", systemImage: "doc.on.clipboard")
-                    }
-                    .help("发送/获取剪贴板文字、截取远端画面（⌃⌘S）与接收文件目录")
-
-                    // Group 4: Unified Session Controls & Settings Popover
                     Button {
                         model.canvas.releaseControl()
                         showOptions.toggle()
                     } label: {
                         Label("会话设置", systemImage: "gearshape")
                     }
-                    .help("画质、防窥安全、光标、音频与端口映射；与全屏共用面板")
+                    .help("画质、光标与声音、网络同步及全屏共用控制面板")
                     .popover(isPresented: $showOptions, arrowEdge: .top) {
                         SessionControlsView(
                             model: model,
@@ -561,32 +461,10 @@ struct DeskView: View {
                             openPortMapping: openPortMapping
                         )
                     }
-
-                    // Group 5: Full Screen & Disconnect
-                    Button {
-                        model.canvas.releaseControl()
-                        model.toggleFullScreen()
-                    } label: {
-                        Label(SessionToolAction.fullScreen.title(), systemImage: SessionToolAction.fullScreen.symbol())
-                    }
-                    .help(SessionToolAction.fullScreen.help)
-
-                    Divider()
-
-                    Button {
-                        if isDedicatedSessionWindow {
-                            models.disconnectViewerSession(model)
-                        } else {
-                            model.stop()
-                        }
-                    } label: {
-                        Label("断开", systemImage: "xmark.circle")
-                    }
-                    .help("断开远程连接")
                 }
             }
         }
-        .toolbar(immersive ? .hidden : .visible, for: .windowToolbar)
+        .toolbar(immersive || !sessionLayout ? .hidden : .visible, for: .windowToolbar)
         .onChange(of: viewerHasSession) { _, activeSession in
             if activeSession, models.workspaceSection != .connect {
                 models.workspaceSection = .connect
@@ -677,6 +555,205 @@ struct DeskView: View {
         .onDisappear { updates.interfacePromptVisible = false }
     }
 
+    private var sessionScreenAndSpacesMenu: some View {
+        let selectedDisplayTitle: String = {
+            if model.supportsDisplaySwitching, !model.remoteDisplays.isEmpty {
+                if let index = model.remoteDisplays.firstIndex(where: { $0.id == model.remoteSelectedDisplayID }) {
+                    return model.remoteDisplays.count > 1 ? "屏幕 \(index + 1)" : model.remoteDisplays[index].name
+                }
+            }
+            return "屏幕与空间"
+        }()
+
+        return Menu {
+            if model.supportsDisplaySwitching, !model.remoteDisplays.isEmpty {
+                Section("屏幕与远端空间") {
+                    ForEach(model.remoteDisplays) { display in
+                        Button {
+                            model.canvas.releaseControl()
+                            model.selectRemoteDisplay(display.id)
+                        } label: {
+                            if display.id == model.remoteSelectedDisplayID {
+                                Label(display.summary, systemImage: "checkmark")
+                            } else {
+                                Text(display.summary)
+                            }
+                        }
+                        .disabled(display.id == model.remoteSelectedDisplayID || model.displaySwitchWorking || !model.connected)
+                    }
+                }
+                Divider()
+            }
+
+            Button {
+                model.sendDesktopAction(.previousSpace)
+            } label: {
+                Label(RemoteDesktopAction.previousSpace.title, systemImage: RemoteDesktopAction.previousSpace.toolbarSymbol)
+            }
+            .disabled(model.desktopActionUnavailableReason != nil)
+
+            Button {
+                model.sendDesktopAction(.missionControl)
+            } label: {
+                Label("调度中心…", systemImage: RemoteDesktopAction.missionControl.toolbarSymbol)
+            }
+            .disabled(model.desktopActionUnavailableReason != nil)
+
+            Button {
+                model.sendDesktopAction(.nextSpace)
+            } label: {
+                Label(RemoteDesktopAction.nextSpace.title, systemImage: RemoteDesktopAction.nextSpace.toolbarSymbol)
+            }
+            .disabled(model.desktopActionUnavailableReason != nil)
+        } label: {
+            Label(selectedDisplayTitle, systemImage: "display")
+        }
+        .help(model.desktopActionUnavailableReason ?? "切换远端显示器、桌面空间与调度中心")
+    }
+
+    private var sessionClipboardMenu: some View {
+        Menu {
+            Section("剪贴板与截图") {
+                Button {
+                    model.canvas.releaseControl()
+                    model.pushClipboard()
+                } label: {
+                    Label("发送本机文字", systemImage: SessionToolAction.sendText.symbol())
+                }
+                .disabled(!model.connected)
+
+                Button {
+                    model.canvas.releaseControl()
+                    model.pullClipboard()
+                } label: {
+                    Label("获取远端文字", systemImage: SessionToolAction.receiveText.symbol())
+                }
+                .disabled(!model.connected)
+
+                Button {
+                    model.typeLocalClipboardText()
+                } label: {
+                    Label("模拟键入剪贴板", systemImage: "keyboard.badge.ellipsis")
+                }
+                .disabled(model.remoteTypingUnavailableReason != nil)
+
+                Button {
+                    model.canvas.releaseControl()
+                    showTypeTextSheet = true
+                } label: {
+                    Label("输入文字 / 密码…", systemImage: "ellipsis.rectangle")
+                }
+                .disabled(model.remoteTypingUnavailableReason != nil)
+
+                if model.remoteTypingWorking {
+                    Button(role: .destructive) {
+                        model.cancelRemoteTypedText()
+                    } label: {
+                        Label("停止模拟键入", systemImage: "xmark.circle")
+                    }
+                }
+
+                Divider()
+
+                Button {
+                    model.canvas.releaseControl()
+                    model.copyRemoteFrame()
+                } label: {
+                    Label("截取当前远端画面（⌃⌘S）", systemImage: SessionToolAction.captureFrame.symbol())
+                }
+                .disabled(!model.connected)
+
+                Button {
+                    model.canvas.releaseControl()
+                    model.openReceivedFiles()
+                } label: {
+                    Label("打开接收文件目录", systemImage: "folder")
+                }
+            }
+        } label: {
+            Label("剪贴板与截图", systemImage: "doc.on.clipboard")
+        }
+        .help("发送/获取剪贴板文字、模拟键入、截取远端画面（⌃⌘S）与接收文件目录")
+    }
+
+    private var sessionMoreMenu: some View {
+        Menu {
+            Button {
+                model.cancelRemoteTypedText()
+                model.canvas.releaseControl()
+            } label: {
+                Label("释放控制（⌃⌥Esc）", systemImage: "cursorarrow")
+            }
+
+            Button {
+                model.setViewerViewOnlyLock(!model.viewerViewOnlyLock)
+            } label: {
+                Label(
+                    model.viewerViewOnlyLock ? "关闭仅观看防误触" : "仅观看防误触（锁定键鼠发送）",
+                    systemImage: model.viewerViewOnlyLock ? "eye.fill" : "eye"
+                )
+            }
+
+            if model.supportsRelativeMouse {
+                Button {
+                    model.canvas.releaseControl()
+                    model.setRelativeMouseEnabled(!model.relativeMouseEnabled)
+                } label: {
+                    Label(
+                        model.relativeMouseEnabled ? "关闭相对鼠标视角锁定" : "开启相对鼠标 · 3D 视角",
+                        systemImage: model.relativeMouseCaptured ? "scope" : "cursorarrow.motionlines"
+                    )
+                }
+                .disabled(!model.connected || !model.effectiveViewerCanControl)
+            }
+
+            Divider()
+
+            Button {
+                model.canvas.releaseControl()
+                showCapsSettings = true
+            } label: {
+                Label("键盘与快捷键…", systemImage: "keyboard")
+            }
+
+            Button {
+                openSessionEffects()
+            } label: {
+                Label("被控端隐私与安全…", systemImage: "lock.shield")
+            }
+
+            Button {
+                openPortMapping()
+            } label: {
+                Label("TCP 端口映射…", systemImage: "point.3.connected.trianglepath.dotted")
+            }
+
+            Button {
+                openTrafficStatistics()
+            } label: {
+                Label("地址历史流量…", systemImage: "chart.bar.xaxis")
+            }
+
+            Divider()
+
+            Button(role: .destructive) {
+                if isDedicatedSessionWindow {
+                    models.disconnectViewerSession(model)
+                } else {
+                    model.stop()
+                }
+            } label: {
+                Label("断开远程连接", systemImage: "xmark.circle")
+            }
+        } label: {
+            Label(
+                model.relativeMouseCaptured ? "视角已锁" : "更多操作",
+                systemImage: model.relativeMouseCaptured ? "scope" : "ellipsis.circle"
+            )
+        }
+        .help("释放控制、防误触、键盘设置、隐私安全、端口映射、流量与断开连接")
+    }
+
     private var sessionQualityMenu: some View {
         let activePreset = model.activeVideoState.flatMap { state in
             SessionQualityPreset.allCases.first { preset in
@@ -699,7 +776,7 @@ struct DeskView: View {
                 }
             }
             Divider()
-            Button("高级画质设置…") {
+            Button("高级设置…") {
                 model.canvas.releaseControl()
                 showOptions = true
             }
@@ -716,25 +793,37 @@ struct DeskView: View {
             CanvasView(canvas: model.canvas)
                 .opacity(model.connected ? 1 : 0)
             if model.connected && model.sessionInputSuspended {
-                VStack(spacing: 12) {
-                    Image(systemName: model.sessionPauseWorking ? "arrow.triangle.2.circlepath" : "pause.circle")
-                        .font(.system(size: 28)).foregroundStyle(DeskPalette.secondary)
-                    Text("空闲暂停")
-                        .font(.title3.weight(.semibold))
-                    Text(model.sessionPauseStatus.isEmpty ? "QuietDesk 窗口离开前台或不可见已满 10 分钟，已暂停画面与自动剪贴板。" : model.sessionPauseStatus)
-                        .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                    Text("加密连接保持；已确认的文件传输继续。窗口在前台且可见时不会暂停；切回窗口或在窗口操作即可恢复，首次操作不会发送到旧画面。")
-                        .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 10) {
+                        Image(systemName: model.sessionPauseWorking ? "arrow.triangle.2.circlepath" : "pause.circle")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(DeskPalette.secondary)
+                        Text(model.sessionPauseWorking ? "画面恢复中" : "空闲暂停")
+                            .font(.system(size: 18, weight: .semibold))
+                    }
+                    Text(model.sessionPauseStatus.isEmpty ? "窗口离开前台已满 10 分钟，已暂停画面与自动剪贴板。" : model.sessionPauseStatus)
+                        .font(.system(size: 13))
+                        .foregroundStyle(DeskPalette.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("加密连接保持，暂不发送键鼠；返回窗口后继续连接，首次操作不会发往旧画面。")
+                        .font(.caption)
+                        .foregroundStyle(DeskPalette.muted)
+                        .fixedSize(horizontal: false, vertical: true)
                     if !model.sessionPauseWorking {
-                        Button("恢复画面") { model.resumeSession() }
-                            .buttonStyle(DeskButtonStyle(.primary))
+                        HStack {
+                            Spacer()
+                            Button("恢复画面") { model.resumeSession() }
+                                .buttonStyle(DeskButtonStyle(.primary))
+                        }
+                        .padding(.top, 4)
                     }
                 }
-                .padding(24).frame(maxWidth: 400)
+                .padding(24)
+                .frame(maxWidth: 420)
                 .foregroundStyle(DeskPalette.ink)
-                .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 12))
-                .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(DeskPalette.hairline) }
-                .shadow(color: .black.opacity(0.16), radius: 14, y: 6)
+                .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay { RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(DeskPalette.hairline) }
+                .shadow(color: reduceTransparency ? .clear : .black.opacity(0.16), radius: 14, y: 6)
             }
             if !model.connected {
                 ConnectionRecoveryView(
@@ -791,7 +880,6 @@ struct DeskView: View {
                 if let notice = model.unlockNotice {
                     sessionNotice(notice, symbol: model.unlockWorking ? "lock" : "lock.open")
                 }
-                // While 控制与设置 is open, its inline desktop row shows the status; otherwise show a top notice.
                 if !(immersive ? showFullScreenMenu : showOptions), let notice = model.desktopActionNotice {
                     sessionNotice(notice, symbol: "exclamationmark.triangle")
                 }
@@ -815,13 +903,13 @@ struct DeskView: View {
                             SessionControlsView(model: model, close: { showFullScreenMenu = false },
                                                 openTraffic: openTrafficStatistics, openEffects: openSessionEffects,
                                                 openPortMapping: openPortMapping)
-                                .frame(height: min(540, max(0, geometry.size.height - 32)))
-                                .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
+                                .frame(height: min(560, max(0, geometry.size.height - 32)))
+                                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                                 .overlay {
-                                    RoundedRectangle(cornerRadius: 15, style: .continuous)
-                                        .strokeBorder(Color.white.opacity(0.22), lineWidth: 0.9)
+                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                        .strokeBorder(DeskPalette.hairline, lineWidth: 1)
                                 }
-                                .shadow(color: .black.opacity(0.32), radius: 20, y: 8)
+                                .shadow(color: reduceTransparency ? .clear : .black.opacity(0.28), radius: 20, y: 8)
                         }
                         Button {
                             model.canvas.releaseControl()
@@ -830,7 +918,7 @@ struct DeskView: View {
                             Image(systemName: showFullScreenMenu ? "chevron.right" : "slider.horizontal.3")
                                 .font(.system(size: 13.5, weight: .semibold))
                                 .frame(width: 26, height: 66)
-                                .foregroundStyle(showFullScreenMenu ? Color.white : Color.primary)
+                                .foregroundStyle(showFullScreenMenu ? Color.white : DeskPalette.ink)
                                 .background {
                                     if showFullScreenMenu {
                                         Capsule().fill(DeskPalette.actionFill)
@@ -838,11 +926,11 @@ struct DeskView: View {
                                         Capsule().fill(DeskPalette.cardBackground)
                                     }
                                 }
-                                .overlay(Capsule().strokeBorder(.white.opacity(0.24), lineWidth: 0.8))
+                                .overlay(Capsule().strokeBorder(DeskPalette.hairline, lineWidth: 1))
                                 .contentShape(Capsule())
                         }
                         .buttonStyle(.plain)
-                        .opacity(model.controlling && !hoveringFullScreenTrigger && !showFullScreenMenu ? 0.42 : 1.0)
+                        .opacity(model.controlling && !hoveringFullScreenTrigger && !showFullScreenMenu ? 0.45 : 1.0)
                         .onHover { hoveringFullScreenTrigger = $0 }
                         .animation(.easeOut(duration: 0.16), value: hoveringFullScreenTrigger)
                         .help(showFullScreenMenu ? "收起控制与设置" : "展开控制与设置")
@@ -861,59 +949,68 @@ struct DeskView: View {
             .foregroundStyle(DeskPalette.ink)
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
-            .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 8))
-            .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(DeskPalette.hairline) }
-            .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+            .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay { RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(DeskPalette.hairline) }
+            .shadow(color: reduceTransparency ? .clear : .black.opacity(0.12), radius: 8, y: 3)
     }
 
     private var workspaceShell: some View {
         GeometryReader { geometry in
+            let autoCompact = geometry.size.width < 760
+            let isSidebarVisible = !sidebarCollapsed && !autoCompact
             HStack(spacing: 0) {
-                DeskWorkspaceSidebar(
-                    models: models,
-                    viewer: models.viewer,
-                    host: models.host,
-                    portMappings: models.viewer.portMappings,
-                    updates: updates,
-                    workspaceDeviceID: $workspaceDeviceID,
-                    roleLocked: roleLocked,
-                    newConnection: {
-                        models.workspaceSection = .connect
-                        showNewConnection = true
-                    },
-                    showNetwork: {
-                        guard !roleLocked else { return }
-                        if models.viewer.portMappings.hostApprovalPending {
-                            networkSubTab = .hostApprovals
-                            models.workspaceSection = .network
-                        } else if models.workspaceSection != .benchmark {
-                            models.workspaceSection = .network
+                if isSidebarVisible {
+                    DeskWorkspaceSidebar(
+                        models: models,
+                        viewer: models.viewer,
+                        host: models.host,
+                        portMappings: models.viewer.portMappings,
+                        updates: updates,
+                        workspaceDeviceID: $workspaceDeviceID,
+                        roleLocked: roleLocked,
+                        toggleSidebar: {
+                            withAnimation(.snappy(duration: 0.18)) {
+                                sidebarCollapsed.toggle()
+                            }
+                        },
+                        newConnection: {
+                            models.workspaceSection = .connect
+                            showNewConnection = true
+                        },
+                        showNetwork: {
+                            guard !roleLocked else { return }
+                            if models.viewer.portMappings.hostApprovalPending || models.host.portMappings.hostApprovalPending {
+                                networkSubTab = .hostApprovals
+                                models.workspaceSection = .network
+                            } else if models.workspaceSection != .benchmark {
+                                models.workspaceSection = .network
+                            }
                         }
-                    }
-                )
-                .frame(width: min(248, max(192, geometry.size.width * 0.22)))
-                .padding(8)
-                .background(models.workspaceSection == .connect ? DeskPalette.cardBackground : DeskPalette.canvasBackground)
+                    )
+                    .frame(width: min(236, max(204, geometry.size.width * 0.22)))
+
+                    Rectangle()
+                        .fill(DeskPalette.hairline)
+                        .frame(width: 1)
+                        .accessibilityHidden(true)
+                }
 
                 VStack(spacing: 0) {
-                    if models.workspaceSection != .connect {
-                        Text(models.workspaceSection == .benchmark ? DeskWorkspaceSection.network.title : models.workspaceSection.title)
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(DeskPalette.muted)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 37)
-                    }
+                    workspaceTopBar(sidebarVisible: isSidebarVisible, canExpandSidebar: !autoCompact)
                     if updates.showBanner {
                         UpdateBanner(controller: updates)
                     }
                     workspacePage
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    if workspaceShowsStatus { statusBar }
+                    if workspaceShowsStatus {
+                        Divider()
+                        statusBar
+                    }
                 }
-                .padding(.top, models.workspaceSection == .connect ? 8 : 0)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(workspaceContentBackground)
             }
-            .background(models.workspaceSection == .connect ? DeskPalette.cardBackground : DeskPalette.canvasBackground)
+            .background(DeskPalette.canvasBackground)
         }
         .onChange(of: models.viewer.connections.map(\.id), initial: true) { _, ids in
             if !workspaceDeviceListInitialized {
@@ -922,6 +1019,78 @@ struct DeskView: View {
             } else if let workspaceDeviceID, !ids.contains(workspaceDeviceID) {
                 self.workspaceDeviceID = nil
             }
+        }
+    }
+
+    private var workspaceContentBackground: Color {
+        if models.workspaceSection == .connect, workspaceDeviceID != nil {
+            return DeskPalette.cardBackground
+        }
+        return DeskPalette.canvasBackground
+    }
+
+    @ViewBuilder
+    private func workspaceTopBar(sidebarVisible: Bool, canExpandSidebar: Bool) -> some View {
+        if !sidebarVisible || models.workspaceSection != .connect {
+            HStack(spacing: 10) {
+                if !sidebarVisible {
+                    HStack(spacing: 8) {
+                        if canExpandSidebar {
+                            Button {
+                                withAnimation(.snappy(duration: 0.18)) {
+                                    sidebarCollapsed = false
+                                }
+                            } label: {
+                                Image(systemName: "sidebar.left")
+                                    .font(.system(size: 13, weight: .medium))
+                            }
+                            .buttonStyle(DeskButtonStyle(.quiet))
+                            .help("展开侧边栏")
+                            .accessibilityLabel("展开侧边栏")
+                        }
+                        Text("QuietDesk")
+                            .font(.system(size: 13.5, weight: .semibold))
+                            .foregroundStyle(DeskPalette.ink)
+                    }
+                    .padding(.leading, 78)
+                }
+
+                Spacer(minLength: 0)
+
+                if models.workspaceSection != .connect {
+                    Text(models.workspaceSection.title)
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(DeskPalette.muted)
+                }
+
+                Spacer(minLength: 0)
+
+                if !sidebarVisible {
+                    Menu {
+                        ForEach(models.viewer.connections) { record in
+                            Button(ConnectionEntryPresentation.title(record)) {
+                                workspaceDeviceID = record.id
+                                models.workspaceSection = .connect
+                            }
+                        }
+                        if !models.viewer.connections.isEmpty { Divider() }
+                        Button("全部设备") {
+                            workspaceDeviceID = nil
+                            models.workspaceSection = .connect
+                        }
+                        Button("本机共享") { models.workspaceSection = .sharing }
+                        Button("网络与线路") { models.workspaceSection = .network }
+                        Button("设置") { models.workspaceSection = .preferences }
+                    } label: {
+                        Label(models.workspaceSection.title, systemImage: models.workspaceSection.symbol)
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .padding(.trailing, 16)
+                }
+            }
+            .frame(height: 42)
         }
     }
 
@@ -1081,15 +1250,20 @@ struct DeskView: View {
                 HStack(spacing: 6) {
                     Circle()
                         .fill(model.controlling ? DeskPalette.emerald : model.reconnecting ? DeskPalette.amber : DeskPalette.muted)
-                        .frame(width: 6, height: 6)
+                        .frame(width: 6.5, height: 6.5)
                         .accessibilityHidden(true)
-                    Text(model.relativeMouseCaptured ? "相对鼠标锁定（⌃⌥Esc 释放）" : controlStatus)
+                    Text(sessionStatusHeadline)
                         .lineLimit(1)
                 }
-                .fontWeight(model.controlling ? .semibold : .regular)
+                .fontWeight(model.controlling ? .semibold : .medium)
                 .foregroundStyle(model.controlling ? DeskPalette.emerald : DeskPalette.secondary)
                 .fixedSize(horizontal: true, vertical: false)
                 .help(model.status)
+
+                if model.connected && !model.resolution.isEmpty {
+                    Text(model.resolution)
+                        .foregroundStyle(DeskPalette.muted)
+                }
 
                 Spacer(minLength: 8)
 
@@ -1097,13 +1271,23 @@ struct DeskView: View {
                     Label("1 个文件待确认", systemImage: "doc.on.doc")
                         .foregroundStyle(DeskPalette.amber)
                 }
+
                 ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 12) { metrics }
-                        .fixedSize(horizontal: true, vertical: false)
+                    HStack(spacing: 12) {
+                        metrics
+                        if model.controlling {
+                            Text("释放控制 Ctrl + Option + Esc")
+                                .foregroundStyle(DeskPalette.muted)
+                        }
+                    }
+                    .fixedSize(horizontal: true, vertical: false)
+
                     HStack(spacing: 10) {
-                        Text(model.resolution)
                         Text(model.latency)
                         Text(model.frameRate)
+                        if model.controlling {
+                            Text("⌃⌥Esc 释放")
+                        }
                         SessionMetricsPopover {
                             metrics
                         }
@@ -1116,17 +1300,46 @@ struct DeskView: View {
                 }
                 Spacer(minLength: 8)
                 if !models.viewerSessions.isEmpty {
-                    Text("\(models.viewerSessions.count) 个会话")
+                    Button {
+                        workspaceDeviceID = nil
+                        models.workspaceSection = .connect
+                    } label: {
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(DeskPalette.emerald)
+                                .frame(width: 6, height: 6)
+                            Text("\(models.viewerSessions.count) 个活动会话")
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(DeskPalette.secondary)
                 }
             }
         }
         .font(.system(size: 11))
         .monospacedDigit()
         .foregroundStyle(DeskPalette.muted)
-        .padding(.horizontal, sessionLayout ? 16 : 25)
+        .padding(.horizontal, sessionLayout ? 16 : 24)
         .frame(height: 30)
-        .background(sessionLayout ? DeskPalette.insetBackground : .clear)
+        .background(sessionLayout ? DeskPalette.insetBackground : DeskPalette.canvasBackground)
         .help(sessionLayout ? "⌃⌥Esc 释放键鼠 · ⌃⌘F 全屏 · ⌃⌘S 远端截图 · Esc 发送到远端" : "")
+    }
+
+    private var sessionStatusHeadline: String {
+        if model.relativeMouseCaptured {
+            return "相对鼠标锁定（⌃⌥Esc 释放）"
+        }
+        if model.connected {
+            let route = shortTransportLabel.hasPrefix("中继") ? "中继" : "直连"
+            if model.controlling {
+                return "\(route) · 控制中"
+            }
+            if !model.effectiveViewerCanControl {
+                return "\(route) · 仅观看"
+            }
+            return "\(route) · 已释放"
+        }
+        return controlStatus
     }
 
     private func statusPill(_ value: String) -> some View {
@@ -1155,10 +1368,10 @@ struct DeskView: View {
                 Circle()
                     .fill(model.controlling ? DeskPalette.emerald : DeskPalette.muted)
                     .frame(width: 6.5, height: 6.5)
-                Text(!model.effectiveViewerCanControl ? "仅观看" : (model.controlling ? "控制中" : "已释放"))
+                Text(model.remoteName.isEmpty ? (!model.effectiveViewerCanControl ? "仅观看" : (model.controlling ? "控制中" : "已释放")) : model.remoteName)
             }
             Text("·").foregroundStyle(DeskPalette.muted)
-            Text("\(shortTransportLabel) \(model.latency)")
+            Text(model.latency.isEmpty ? shortTransportLabel : model.latency)
             if !model.mediaLoss.isEmpty {
                 if model.mediaLossHigh {
                     Text(model.mediaLoss).foregroundStyle(DeskPalette.coral)
@@ -1167,10 +1380,7 @@ struct DeskView: View {
                 }
             }
             Text("·").foregroundStyle(DeskPalette.muted)
-            if !model.activeVideoFormatBadge.isEmpty {
-                Text(model.activeVideoFormatBadge)
-            }
-            Text("\(model.frameRate) · \(model.traffic)")
+            Text(model.frameRate)
             if let since = model.connectedSince {
                 Text("·").foregroundStyle(DeskPalette.muted)
                 Text(since, style: .timer)
@@ -1192,7 +1402,6 @@ struct DeskView: View {
             if let since = model.connectedSince {
                 Text("已连接 \(Text(since, style: .timer))").help("本次连接已持续的时间；断线自动重连后重新计时")
             }
-            if !model.resolution.isEmpty { Text(model.resolution) }
             if !model.videoQualitySummary.isEmpty { Text(model.videoQualitySummary).help(model.videoQualityHelp) }
             Text(model.mediaTransportStatus)
             if !model.mediaLoss.isEmpty {
@@ -1254,11 +1463,12 @@ struct DeskView: View {
                                   if model.fileTransferNotice == nil { dismissClipboardActivity() }
                                   else { dismissClipboardStatus() }
                               })
-            .padding(16).frame(width: 330)
+            .padding(16)
+            .frame(width: 336)
             .foregroundStyle(DeskPalette.ink)
-            .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 10))
-            .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(DeskPalette.hairline) }
-            .shadow(color: .black.opacity(0.16), radius: 12, y: 4)
+            .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay { RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(DeskPalette.hairline) }
+            .shadow(color: reduceTransparency ? .clear : .black.opacity(0.15), radius: 14, y: 4)
     }
 }
 
@@ -1295,6 +1505,7 @@ private struct DeskWorkspaceSidebar: View {
     @ObservedObject var updates: UpdateController
     @Binding var workspaceDeviceID: UUID?
     let roleLocked: Bool
+    let toggleSidebar: () -> Void
     let newConnection: () -> Void
     let showNetwork: () -> Void
     @State private var copiedHostCode = false
@@ -1309,69 +1520,100 @@ private struct DeskWorkspaceSidebar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Text("QuietDesk")
+                    .font(.system(size: 13.5, weight: .semibold))
+                    .foregroundStyle(DeskPalette.ink)
+                    .padding(.leading, 78)
+                Spacer(minLength: 0)
+                Button(action: toggleSidebar) {
+                    Image(systemName: "sidebar.left")
+                        .font(.system(size: 12.5, weight: .medium))
+                }
+                .buttonStyle(DeskButtonStyle(.quiet))
+                .help("收起设备栏")
+                .accessibilityLabel("收起设备栏")
+            }
+            .frame(height: 42)
+            .padding(.trailing, 8)
+
             HStack(spacing: 5) {
                 Text("我的设备")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(DeskPalette.muted)
                     .accessibilityAddTraits(.isHeader)
                 Spacer(minLength: 0)
                 Button(action: newConnection) {
                     Image(systemName: "plus")
+                        .font(.system(size: 12, weight: .medium))
                 }
                 .buttonStyle(DeskButtonStyle(.quiet))
                 .disabled(roleLocked)
                 .help("新建连接")
                 .accessibilityLabel("新建连接")
             }
-            .padding(.leading, 10)
-            .padding(.top, 50)
-            .padding(.bottom, 6)
+            .padding(.leading, 18)
+            .padding(.trailing, 10)
+            .padding(.top, 8)
+            .padding(.bottom, 5)
 
-            GeometryReader { geometry in
-                ScrollView {
-                    VStack(spacing: 3) {
-                        ForEach(viewer.connections) { record in
-                            deviceRow(record)
-                        }
-                        Button(action: newConnection) {
-                            rowLabel("新建连接", symbol: "plus")
-                                .foregroundStyle(DeskPalette.muted)
-                        }
-                        .buttonStyle(DeskSidebarRowStyle(selected: false))
-                        .disabled(roleLocked)
+            ScrollView {
+                VStack(spacing: 2) {
+                    ForEach(viewer.connections) { record in
+                        deviceRow(record)
                     }
-                    .frame(maxWidth: .infinity)
+                    Button(action: newConnection) {
+                        rowLabel("新建连接", symbol: "plus")
+                            .foregroundStyle(DeskPalette.muted)
+                    }
+                    .buttonStyle(DeskSidebarRowStyle(selected: false))
+                    .disabled(roleLocked)
                 }
-                .scrollBounceBehavior(.basedOnSize)
-                .frame(maxHeight: geometry.size.height)
+                .padding(.horizontal, 10)
+                .frame(maxWidth: .infinity)
             }
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(maxHeight: .infinity)
 
-            VStack(spacing: 3) {
+            VStack(spacing: 2) {
                 navigationRow(.connect, selected: models.workspaceSection == .connect && workspaceDeviceID == nil) {
                     workspaceDeviceID = nil
                     models.workspaceSection = .connect
                 }
-                navigationRow(.sharing) { models.workspaceSection = .sharing }
-                navigationRow(.network, selected: models.workspaceSection == .network || models.workspaceSection == .benchmark,
-                              accessory: portMappings.hostApprovalPending ? "待确认" : nil, tint: DeskPalette.amber,
-                              action: showNetwork)
-                navigationRow(.preferences, accessory: updates.manifest != nil || updates.manualReleaseURL != nil ? "有更新" : nil,
-                              tint: DeskPalette.accent) {
+                navigationRow(
+                    .sharing,
+                    accessory: host.connected ? "被控中" : (host.active ? "已开启" : nil),
+                    tint: host.connected ? DeskPalette.amber : DeskPalette.emerald
+                ) {
+                    models.workspaceSection = .sharing
+                }
+                navigationRow(
+                    .network,
+                    selected: models.workspaceSection == .network || models.workspaceSection == .benchmark,
+                    accessory: (portMappings.hostApprovalPending || host.portMappings.hostApprovalPending) ? "待确认" : nil,
+                    tint: DeskPalette.amber,
+                    action: showNetwork
+                )
+                navigationRow(
+                    .preferences,
+                    accessory: updates.manifest != nil || updates.manualReleaseURL != nil ? "有更新" : nil,
+                    tint: DeskPalette.accent
+                ) {
                     models.workspaceSection = .preferences
                 }
             }
+            .padding(.horizontal, 10)
             .padding(.top, 8)
 
-            VStack(spacing: 5) {
+            VStack(spacing: 6) {
                 Rectangle().fill(DeskPalette.hairline).frame(height: 1)
                 sharingMenu
             }
-            .padding(.horizontal, 10)
-            .padding(.top, 12)
-            .padding(.bottom, 6)
+            .padding(.horizontal, 18)
+            .padding(.top, 10)
+            .padding(.bottom, 10)
         }
-        .padding(.horizontal, 11)
-        .background(DeskPalette.sidebarBackground, in: RoundedRectangle(cornerRadius: 13))
+        .background(DeskPalette.sidebarBackground)
     }
 
     private func deviceRow(_ record: ConnectionRecord) -> some View {
@@ -1411,7 +1653,7 @@ private struct DeskWorkspaceSidebar: View {
                 rowLabel(section.title, symbol: section.symbol)
                 if let accessory {
                     Text(accessory)
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(tint)
                         .fixedSize()
                 }
@@ -1462,21 +1704,23 @@ private struct DeskWorkspaceSidebar: View {
             }
         } label: {
             HStack(spacing: 7) {
-                Circle()
-                    .fill(host.connected || host.working ? DeskPalette.amber : host.active || host.mappingHosting ? DeskPalette.emerald : DeskPalette.muted)
-                    .frame(width: 6, height: 6)
-                    .accessibilityHidden(true)
+                if host.active || host.working || host.mappingHosting {
+                    Circle()
+                        .fill(host.connected || host.working ? DeskPalette.amber : DeskPalette.emerald)
+                        .frame(width: 6.5, height: 6.5)
+                        .accessibilityHidden(true)
+                }
                 Text(sharingStatus)
                     .lineLimit(1)
                 Spacer(minLength: 0)
             }
-            .font(.system(size: 11))
+            .font(.system(size: 11.5))
             .foregroundStyle(DeskPalette.muted)
-            .frame(maxWidth: .infinity, minHeight: 26, alignment: .leading)
+            .frame(maxWidth: .infinity, minHeight: 24, alignment: .leading)
             .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
-        .menuIndicator(.visible)
+        .menuIndicator(.hidden)
         .tint(DeskPalette.muted)
         .help("共享快捷操作")
     }
@@ -1497,10 +1741,10 @@ private struct DeskSidebarRowStyle: ButtonStyle {
         @State private var hovered = false
 
         var body: some View {
-            let shape = RoundedRectangle(cornerRadius: 8)
+            let shape = RoundedRectangle(cornerRadius: 8, style: .continuous)
             configuration.label
                 .padding(.horizontal, 10)
-                .frame(minHeight: 37)
+                .frame(minHeight: 35)
                 .background(fill, in: shape)
                 .overlay { shape.strokeBorder(isFocused ? DeskPalette.accent : .clear, lineWidth: 2) }
                 .contentShape(shape)
@@ -1522,25 +1766,15 @@ private struct TrayView: View {
     @ObservedObject var updates: UpdateController
     @Environment(\.openWindow) private var openWindow
     @State private var exportingLogs = false
+
+    private var hostHeadline: String {
+        if host.connected { return "本机共享 · 正在被控制" }
+        if host.working { return "本机共享 · 正在启动" }
+        if host.active { return "本机共享 · 运行中" }
+        return "本机共享 · 已停止"
+    }
+
     var body: some View {
-        Text("共享：" + (host.active || host.working ? host.status : "未开启"))
-            .onAppear {
-                let open = openWindow
-                models.openSessionWindow = { id in
-                    open(id: "remote-session", value: id)
-                }
-            }
-        if !models.viewerSessions.isEmpty {
-            ForEach(models.activeSessionSummaries) { summary in
-                Menu("远控 · \(summary.title)（\(summary.connected ? "已连接" : summary.reconnecting ? "重连中" : summary.working ? "连接中" : "未连接")）") {
-                    Text(summary.endpointLabel)
-                    Button("切到窗口") { models.focusViewerSession(id: summary.id) }
-                    Button("断开此连接", role: .destructive) { models.disconnectViewerSession(id: summary.id) }
-                }
-            }
-        } else if viewer.isControllingAnotherMac {
-            Text("远程连接：" + viewer.status)
-        }
         Button("打开主窗口") {
             models.prepareShowWindow()
             openWindow(id: "main")
@@ -1548,35 +1782,69 @@ private struct TrayView: View {
             models.mainWindow?.deminiaturize(nil)
             models.mainWindow?.makeKeyAndOrderFront(nil)
         }
-        if host.hasIncomingControlConnection { Button("断开控制端") { host.disconnectController() } }
-        Button(host.active || host.working ? "停止共享" : "开启共享") {
+        .onAppear {
+            let open = openWindow
+            models.openSessionWindow = { id in
+                open(id: "remote-session", value: id)
+            }
+        }
+
+        Divider()
+
+        Text(hostHeadline)
+        if host.hasIncomingControlConnection {
+            Button("断开控制端") { host.disconnectController() }
+        }
+        Button(host.active || host.working ? "停止本机共享" : "开启本机共享") {
             if host.active || host.working { host.stop() } else { host.startHosting() }
         }
-        Toggle("共享时接通电源阻止空闲睡眠", isOn: $host.preventHostSleepOnExternalPower)
-        if models.viewerSessions.count == 1, let only = models.viewerSessions.first {
-            Button("断开远程连接（\(only.sessionWindowTitle)）") { models.disconnectViewerSession(only) }
-        } else if models.viewerSessions.count > 1 {
-            Button("断开全部远程连接（\(models.viewerSessions.count)）") { models.disconnectAllViewerSessions() }
+
+        if !models.viewerSessions.isEmpty {
+            Divider()
+            ForEach(models.activeSessionSummaries) { summary in
+                let state = summary.connected ? summary.statusLabel
+                    : summary.reconnecting ? "重连中"
+                    : summary.working ? "连接中" : "未连接"
+                Text("\(summary.title) · \(state)")
+                Button("切到远控窗口") { models.focusViewerSession(id: summary.id) }
+                Button("断开 \(summary.title)", role: .destructive) { models.disconnectViewerSession(id: summary.id) }
+            }
+            if models.viewerSessions.count > 1 {
+                Button("断开全部远程连接（\(models.viewerSessions.count)）", role: .destructive) {
+                    models.disconnectAllViewerSessions()
+                }
+            }
         } else if viewer.isControllingAnotherMac {
-            Button("断开远程连接") { viewer.stop() }
+            Divider()
+            Text("远程连接：" + viewer.status)
+            Button("断开远程连接", role: .destructive) { viewer.stop() }
         }
+
         Divider()
+
         if updates.enabled {
             Button(updates.menuTitle) { updates.check() }
             if updates.autoInstallDeferredBySession {
                 Text("自动更新已待命（远控结束后安装）")
             }
-            Toggle("自动检查更新", isOn: Binding(get: { updates.autoCheckPreference == true },
-                set: { updates.setAutomaticChecks($0) }))
-            Toggle("非远程控制时自动更新", isOn: Binding(get: { updates.autoInstallPreference },
-                set: { updates.setAutomaticInstall($0) }))
-            Divider()
         }
-        Toggle("性能诊断", isOn: Binding(get: { viewer.performanceDiagnosticsEnabled },
-            set: { models.setPerformanceDiagnosticsEnabled($0) }))
-            .help("记录视频与传输耗时，导出诊断日志后发送两端日志")
-        Button(exportingLogs ? "正在导出日志…" : "导出诊断日志…") { exportLogs() }
+
+        Button(exportingLogs ? "正在导出日志…" : "导出日志…") { exportLogs() }
             .disabled(exportingLogs)
+
+        Menu("后台与诊断偏好") {
+            Toggle("共享时接通电源阻止空闲睡眠", isOn: $host.preventHostSleepOnExternalPower)
+            if updates.enabled {
+                Toggle("自动检查更新", isOn: Binding(get: { updates.autoCheckPreference == true },
+                    set: { updates.setAutomaticChecks($0) }))
+                Toggle("非远程控制时自动更新", isOn: Binding(get: { updates.autoInstallPreference },
+                    set: { updates.setAutomaticInstall($0) }))
+            }
+            Divider()
+            Toggle("性能诊断", isOn: Binding(get: { viewer.performanceDiagnosticsEnabled },
+                set: { models.setPerformanceDiagnosticsEnabled($0) }))
+        }
+
         Divider()
         Button("退出 QuietDesk") { NSApp.terminate(nil) }
     }
@@ -1585,7 +1853,7 @@ private struct TrayView: View {
         viewer.canvas.releaseControl()
         NSApp.activate(ignoringOtherApps: true)
         let panel = NSSavePanel()
-        panel.title = "导出 QuietDesk 诊断日志"
+        panel.title = "导出 QuietDesk 日志"
         panel.message = "导出最近的运行日志，方便排查连接、画质和剪贴板问题。日志不包含配对码或剪贴板内容。"
         panel.allowedContentTypes = [.plainText]
         panel.canCreateDirectories = true
@@ -1661,7 +1929,7 @@ private struct WindowReader: NSViewRepresentable {
                 if !window.styleMask.contains(.fullSizeContentView) {
                     window.styleMask.insert(.fullSizeContentView)
                 }
-                if window.titleVisibility != .visible { window.titleVisibility = .visible }
+                if window.titleVisibility != .hidden { window.titleVisibility = .hidden }
                 if !window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = true }
                 if window.titlebarSeparatorStyle != .none { window.titlebarSeparatorStyle = .none }
             }
@@ -1671,7 +1939,7 @@ private struct WindowReader: NSViewRepresentable {
             for observer in observers { NotificationCenter.default.removeObserver(observer) }
             observers.removeAll()
             guard let window else { return }
-            window.minSize = NSSize(width: 880, height: 620)
+            window.minSize = NSSize(width: 820, height: 600)
             applyWindowChrome()
             resolved?(window)
             fullScreen?(window.styleMask.contains(.fullScreen))

@@ -15,6 +15,14 @@ final class PermissionGuide: NSWindowController {
             }
         }
 
+        var symbol: String {
+            switch self {
+            case .screenRecording: return "display"
+            case .accessibility: return "figure.wave.circle"
+            case .inputMonitoring: return "keyboard"
+            }
+        }
+
         var purpose: String {
             switch self {
             case .screenRecording: return "用于被控 Mac 传送画面；生效后请返回“共享这台 Mac”点“开启共享”，不会自动开始。"
@@ -56,7 +64,7 @@ final class PermissionGuide: NSWindowController {
         state = PermissionGuideState(bundleURL: bundleURL)
         self.permissionCheck = permissionCheck
         self.onRefresh = onRefresh
-        let panel = PermissionGuidePanel(contentRect: NSRect(x: 0, y: 0, width: 520, height: 345),
+        let panel = PermissionGuidePanel(contentRect: NSRect(x: 0, y: 0, width: 520, height: 370),
             styleMask: [.titled, .closable, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
         panel.isFloatingPanel = true
@@ -128,6 +136,32 @@ private final class PermissionGuideHostingView: NSHostingView<PermissionGuideVie
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
+private enum GuidePalette {
+    static let accent = adaptive(0x0A74E6, 0x68B3FF)
+    static let actionFill = adaptive(0x0A74E6, 0x0A68D0)
+    static let ink = adaptive(0x1D232A, 0xEEF1F6)
+    static let secondary = adaptive(0x525E6B, 0xAEB9C6)
+    static let canvas = adaptive(0xF5F6F8, 0x1E2228)
+    static let card = adaptive(0xFFFFFF, 0x272C34)
+    static let inset = adaptive(0xECEFF3, 0x2A303A)
+    static let hairline = adaptive(0xDFE3E8, 0x3D444F)
+    static let emerald = adaptive(0x127A50, 0x5CD6A5)
+    static let amber = adaptive(0x94540F, 0xF3BC6E)
+
+    private static func adaptive(_ light: UInt32, _ dark: UInt32) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let hex = isDark ? dark : light
+            return NSColor(
+                srgbRed: CGFloat((hex >> 16) & 255) / 255,
+                green: CGFloat((hex >> 8) & 255) / 255,
+                blue: CGFloat(hex & 255) / 255,
+                alpha: 1
+            )
+        })
+    }
+}
+
 @MainActor
 private struct PermissionGuideView: View {
     @ObservedObject var state: PermissionGuideState
@@ -136,91 +170,139 @@ private struct PermissionGuideView: View {
     let done: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 13) {
+        VStack(alignment: .leading, spacing: 15) {
             Text("允许" + state.kind.title)
-                .font(.title3.bold())
+                .font(.system(size: 20, weight: .bold))
+                .foregroundStyle(GuidePalette.ink)
                 .accessibilityAddTraits(.isHeader)
-            Text(state.kind.purpose)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(alignment: .top, spacing: 11) {
+                Image(systemName: state.kind.symbol)
+                    .font(.system(size: 22, weight: .light))
+                    .foregroundStyle(GuidePalette.secondary)
+                    .frame(width: 28, alignment: .center)
+                    .padding(.top, 1)
+                    .accessibilityHidden(true)
+                Text(state.kind.purpose + " 系统设置中已勾选不等于当前进程实际生效。")
+                    .font(.system(size: 13))
+                    .foregroundStyle(GuidePalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             applicationCard
 
-            HStack(spacing: 9) {
-                Button("打开\(state.kind.title)系统设置…") { openSettings(state.kind) }
-                if let applicationURL = state.applicationURL {
-                    Button("在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([applicationURL]) }
+            HStack(spacing: 10) {
+                guideButton("打开\(state.kind.title)系统设置…", primary: false) {
+                    openSettings(state.kind)
                 }
+                if let applicationURL = state.applicationURL {
+                    guideButton("在访达中显示", primary: false) {
+                        NSWorkspace.shared.activateFileViewerSelecting([applicationURL])
+                    }
+                }
+                Spacer(minLength: 0)
             }
-            .controlSize(.small)
 
-            Label {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: state.effective ? "checkmark.circle" : "info.circle")
+                    .font(.system(size: 13.5, weight: .medium))
+                    .foregroundStyle(state.effective ? GuidePalette.emerald : GuidePalette.amber)
+                    .padding(.top, 2)
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(state.effective ? "系统权限已生效" : "尚未生效")
-                        .font(.callout.weight(.semibold))
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(state.effective ? GuidePalette.emerald : GuidePalette.amber)
                     if !state.effective {
-                        Text("系统设置中已开启但尚未生效时，请完全退出 QuietDesk 后重开，再返回检测。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        Text("完全退出后重开，再返回检测；此面板不会替你开启权限。")
+                            .font(.system(size: 12))
+                            .foregroundStyle(GuidePalette.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-            } icon: {
-                Image(systemName: state.effective ? "checkmark.circle" : "info.circle")
-                    .foregroundStyle(state.effective ? Color.green : Color.orange)
+                Spacer(minLength: 0)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(10)
-            .background((state.effective ? Color.green : Color.orange).opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+            .padding(12)
+            .background(
+                (state.effective ? GuidePalette.emerald : GuidePalette.amber).opacity(0.09),
+                in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder((state.effective ? GuidePalette.emerald : GuidePalette.amber).opacity(0.25), lineWidth: 1)
+            }
 
             Text("\(state.applicationURL == nil ? "运行目录" : "当前应用")：\(state.bundleURL.path)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                .font(.system(size: 12))
+                .foregroundStyle(GuidePalette.secondary)
                 .lineLimit(2)
                 .truncationMode(.middle)
                 .help(state.bundleURL.path)
 
-            HStack(spacing: 9) {
+            HStack(spacing: 10) {
                 Spacer()
-                Button("重新检测", action: onRefresh)
-                Button("完成", action: done)
-                    .buttonStyle(.borderedProminent)
+                guideButton("重新检测", primary: false, action: onRefresh)
+                guideButton("完成", primary: true, action: done)
             }
+            .padding(.top, 4)
         }
-        .tint(.blue)
-        .padding(22)
+        .tint(GuidePalette.accent)
+        .padding(24)
         .frame(width: 520)
         .fixedSize(horizontal: false, vertical: true)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(GuidePalette.canvas)
+    }
+
+    private func guideButton(_ title: String, primary: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 12.5, weight: primary ? .semibold : .medium))
+                .foregroundStyle(primary ? Color.white : GuidePalette.ink)
+                .padding(.horizontal, 14)
+                .frame(minHeight: 31)
+                .background(
+                    primary ? GuidePalette.actionFill : GuidePalette.card,
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(primary ? .clear : GuidePalette.hairline, lineWidth: 1)
+                }
+        }
+        .buttonStyle(.plain)
     }
 
     private var applicationCard: some View {
-        HStack(spacing: 13) {
+        HStack(spacing: 14) {
             if let applicationURL = state.applicationURL {
                 PermissionApplicationIcon(applicationURL: applicationURL)
-                    .frame(width: 62, height: 62)
+                    .frame(width: 56, height: 56)
                     .help("将当前正在运行的应用拖到系统设置的权限列表")
             } else {
                 Image(systemName: "app.dashed")
-                    .font(.system(size: 30))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 62, height: 62)
+                    .font(.system(size: 28, weight: .light))
+                    .foregroundStyle(GuidePalette.secondary)
+                    .frame(width: 56, height: 56)
             }
             VStack(alignment: .leading, spacing: 5) {
                 Text(state.applicationURL?.lastPathComponent ?? "当前运行目录")
-                    .font(.headline)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(GuidePalette.ink)
                 Text(state.applicationURL == nil
                      ? "请先打开已打包的 QuietDesk.app，再从应用中前往授权。"
-                     : "拖入系统隐私列表，或通过「+」选择当前应用，再开启开关。")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                     : "拖入系统隐私列表，或通过「+」选择当前应用。")
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(GuidePalette.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
         }
-        .padding(10)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 9))
+        .padding(14)
+        .background(GuidePalette.inset, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(GuidePalette.hairline, lineWidth: 1)
+        }
     }
 }
 
@@ -260,7 +342,7 @@ private final class PermissionApplicationDragView: NSView, NSDraggingSource {
     }
 
     private var iconRect: NSRect {
-        let edge = min(60, bounds.width, bounds.height)
+        let edge = min(54, bounds.width, bounds.height)
         return NSRect(x: bounds.midX - edge / 2, y: bounds.midY - edge / 2, width: edge, height: edge)
     }
 

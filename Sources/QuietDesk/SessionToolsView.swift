@@ -155,11 +155,12 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
                     .accessibilityLabel("返回会话设置")
                 }
                 Text(title)
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.system(size: 16, weight: .bold))
                     .accessibilityAddTraits(.isHeader)
                 Spacer(minLength: 5)
                 Button(action: close) {
                     Image(systemName: "xmark")
+                        .font(.system(size: 11.5, weight: .semibold))
                 }
                 .buttonStyle(DeskButtonStyle(.quiet))
                 .accessibilityLabel("收起会话设置")
@@ -170,7 +171,8 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
                 Image(systemName: presentation.control.symbol)
                     .accessibilityHidden(true)
                 Text(presentation.control.title)
-                    .lineLimit(2)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                 Spacer(minLength: 6)
                 Text(presentation.connectionSummary)
                     .monospacedDigit()
@@ -180,7 +182,7 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
             .foregroundStyle(presentation.control.state == .controlling ? DeskPalette.emerald : DeskPalette.secondary)
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 13) {
+                VStack(alignment: .leading, spacing: 14) {
                     switch page {
                     case .keyboard:
                         keyboard
@@ -188,63 +190,68 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
                         settings
 
                         Divider()
-                        DeskSectionHeading(title: "远程操作")
-                        ViewThatFits(in: .horizontal) {
-                            HStack(spacing: 5) {
+
+                        VStack(alignment: .leading, spacing: 7) {
+                            Text("远端空间与快捷操作")
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(DeskPalette.secondary)
+
+                            HStack(spacing: 6) {
                                 quickAction(.releaseControl)
                                 quickAction(.fullScreen)
-                                quickAction(.captureFrame)
+                                quickAction(.captureFrame, shortLabel: "截图")
                             }
-                            .fixedSize(horizontal: true, vertical: false)
-                            VStack(spacing: 5) {
-                                HStack(spacing: 5) {
-                                    quickAction(.releaseControl)
-                                    quickAction(.fullScreen)
-                                }
-                                quickAction(.captureFrame)
+                            HStack(spacing: 6) {
+                                quickAction(.sendText)
+                                quickAction(.receiveText)
                             }
+                            desktop
                         }
-                        HStack(spacing: 5) {
-                            quickAction(.sendText)
-                            quickAction(.receiveText)
-                        }
-                        desktop
 
-                        Divider()
-                        VStack(spacing: 2) {
+                        VStack(spacing: 0) {
                             navigationRow(.keyboard, detail: presentation.keyboardSummary)
+                            Divider().padding(.leading, 32)
                             navigationRow(.privacy)
+                            Divider().padding(.leading, 32)
                             navigationRow(.portMapping)
+                            Divider().padding(.leading, 32)
                             navigationRow(.traffic)
+                        }
+                        .background(DeskPalette.insetBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .strokeBorder(DeskPalette.hairline, lineWidth: 1)
                         }
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.vertical, 1)
+                .padding(.vertical, 2)
             }
             .scrollBounceBehavior(.basedOnSize)
             .frame(minHeight: 0)
 
             if page == .main {
+                Divider()
                 HStack {
                     if !presentation.remoteName.isEmpty {
                         Text(presentation.remoteName)
-                            .foregroundStyle(DeskPalette.muted)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(DeskPalette.secondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
                     }
                     Spacer(minLength: 6)
-                    Button(presentation.hasSession ? "断开" : "返回连接") { activate(.endSession) }
+                    Button(presentation.hasSession ? "断开连接" : "返回连接") { activate(.endSession) }
                         .buttonStyle(DeskButtonStyle(presentation.hasSession ? .danger : .secondary))
                         .disabled(!presentation.isEnabled(.endSession))
                         .help(SessionToolAction.endSession.help)
                 }
             }
         }
-        .font(.system(size: 12))
-        .padding(15)
-        .frame(width: 372)
-        .frame(maxHeight: 540)
+        .font(.system(size: 12.5))
+        .padding(16)
+        .frame(width: 392)
+        .frame(maxHeight: 560)
         .foregroundStyle(DeskPalette.ink)
         .background(DeskPalette.cardBackground)
         .tint(DeskPalette.accent)
@@ -257,9 +264,9 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
         if action == .keyboard { page = .keyboard }
     }
 
-    private func quickAction(_ action: SessionToolAction) -> some View {
+    private func quickAction(_ action: SessionToolAction, shortLabel: String? = nil) -> some View {
         Button { activate(action) } label: {
-            Label(action.title(fullScreen: presentation.fullScreen),
+            Label(shortLabel ?? action.title(fullScreen: presentation.fullScreen),
                   systemImage: action.symbol(fullScreen: presentation.fullScreen))
                 .lineLimit(1)
                 .frame(maxWidth: .infinity)
@@ -273,25 +280,25 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
         Button { activate(action) } label: {
             HStack(spacing: 8) {
                 Image(systemName: action.symbol())
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 12))
+                    .foregroundStyle(DeskPalette.secondary)
                     .frame(width: 16)
                 Text(action.title())
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(DeskPalette.ink)
                 Spacer(minLength: 0)
                 if let detail {
                     Text(detail)
-                        .font(.system(size: 10.5))
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 11))
+                        .foregroundStyle(DeskPalette.secondary)
                 }
                 Image(systemName: "chevron.right")
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(DeskPalette.muted)
             }
-            .padding(.horizontal, 8)
-            .frame(minHeight: 28)
-            .background(DeskPalette.insetBackground, in: RoundedRectangle(cornerRadius: 7))
-            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .padding(.horizontal, 10)
+            .frame(minHeight: 34)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help(action.help)

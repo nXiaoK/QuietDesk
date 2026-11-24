@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct PermissionNextStep: Equatable {
@@ -93,30 +94,49 @@ struct PermissionNextStepView: View {
     let compact: Bool
     let perform: (PermissionNextStep.Action) -> Void
 
+    private static let amber = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0xF3 / 255.0, green: 0xBC / 255.0, blue: 0x6E / 255.0, alpha: 1)
+            : NSColor(srgbRed: 0x94 / 255.0, green: 0x54 / 255.0, blue: 0x0F / 255.0, alpha: 1)
+    })
+
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "info.circle")
-                .font(.system(size: 12))
-                .foregroundStyle(step.action == nil ? Color.secondary : Color.orange)
+        let needsAction = step.action != nil
+        let shape = RoundedRectangle(cornerRadius: 9, style: .continuous)
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: needsAction ? "exclamationmark.circle" : "info.circle")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(needsAction ? Self.amber : Color.secondary)
+                .padding(.top, 1.5)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 6) {
-                Text(step.title).font(.system(size: compact ? 11 : 12, weight: .semibold))
+            VStack(alignment: .leading, spacing: 5) {
+                Text(step.title)
+                    .font(.system(size: compact ? 11.5 : 12.5, weight: .semibold))
+                    .foregroundStyle(needsAction ? Self.amber : Color.primary)
                 Text(step.detail)
-                    .font(.caption)
+                    .font(.system(size: compact ? 11 : 12))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let action = step.action, let title = step.actionTitle {
                     Button(title) { perform(action) }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                        .padding(.top, 2)
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(compact ? 10 : 12)
+        .padding(.horizontal, compact ? 11 : 14)
+        .padding(.vertical, compact ? 10 : 11)
         .background(
-            step.action == nil ? Color.secondary.opacity(0.07) : Color.orange.opacity(0.09),
-            in: RoundedRectangle(cornerRadius: 8)
+            needsAction ? Self.amber.opacity(0.09) : Color.secondary.opacity(0.07),
+            in: shape
         )
+        .overlay {
+            shape.strokeBorder(
+                needsAction ? Self.amber.opacity(0.26) : Color.secondary.opacity(0.16),
+                lineWidth: 1
+            )
+        }
     }
 }

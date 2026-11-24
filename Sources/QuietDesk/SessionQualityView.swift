@@ -111,17 +111,26 @@ struct SessionQualityView: View {
     @State private var showFineTuning = false
     @State private var showHelpPopover = false
 
+    private var activePresetTitle: String? {
+        guard let state = presentation.applied else { return nil }
+        return SessionQualityPreset.allCases.first { preset in
+            preset.resolvedSettings(longestEdges: longestEdges, frameRates: frameRates, bitRates: bitRates) == state.settings
+                && (!supportsTrueColor || preset.prefersTrueColor == (appliedChroma == .yuv444))
+        }?.title
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: compact ? 8 : 10) {
-            HStack(spacing: 7) {
-                DeskSectionHeading(title: "画质预设")
-                Spacer(minLength: 0)
+        VStack(alignment: .leading, spacing: compact ? 8 : 11) {
+            HStack(spacing: 6) {
+                Text(presentation.applied != nil ? "当前已生效" : "画质预设")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(DeskPalette.secondary)
                 Button {
                     showHelpPopover.toggle()
                 } label: {
                     Image(systemName: "info.circle")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(DeskPalette.muted)
                 }
                 .buttonStyle(.plain)
                 .help("查看画质调节与自适应说明")
@@ -129,6 +138,7 @@ struct SessionQualityView: View {
                     VStack(alignment: .leading, spacing: 7) {
                         Text("连接画质与自适应上限说明")
                             .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(DeskPalette.ink)
                         Text("手动选择确认后按连接记录保存，不修改共享端默认；自动降档不会覆盖已保存选择。")
                         Text("帧率为上限、码率为目标而非实测吞吐，实际受屏幕刷新率、硬件与网络限制；超过 60 fps 需两端更新。")
                         if !qualityHelp.isEmpty {
@@ -136,25 +146,27 @@ struct SessionQualityView: View {
                         }
                     }
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(DeskPalette.secondary)
                     .padding(14)
-                    .frame(width: 310, alignment: .leading)
+                    .frame(width: 316, alignment: .leading)
                     .background(DeskPalette.cardBackground)
                 }
-            }
 
-            if let state = presentation.applied {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text("当前已生效")
-                        .foregroundStyle(DeskPalette.secondary)
-                    Spacer(minLength: 4)
-                    Text("\(state.settings.summary) · \(state.width) × \(state.height)")
-                        .foregroundStyle(DeskPalette.emerald)
-                        .monospacedDigit()
-                    Text(appliedCodec == .hevc ? (appliedChroma == .yuv444 ? "HEVC 4:4:4" : "HEVC 4:2:0") : "H.264")
-                        .foregroundStyle(DeskPalette.muted)
+                Spacer(minLength: 4)
+
+                if let state = presentation.applied {
+                    HStack(spacing: 6) {
+                        Text(activePresetTitle ?? state.settings.summary)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(DeskPalette.emerald)
+                        Circle()
+                            .fill(DeskPalette.emerald)
+                            .frame(width: 6, height: 6)
+                            .accessibilityHidden(true)
+                    }
+                    .font(.system(size: 12))
+                    .help("\(state.settings.summary) · \(state.width)×\(state.height) · \(appliedCodec == .hevc ? (appliedChroma == .yuv444 ? "HEVC 4:4:4" : "HEVC 4:2:0") : "H.264")")
                 }
-                .font(.system(size: 11))
             }
 
             VStack(spacing: 2) {
@@ -172,7 +184,8 @@ struct SessionQualityView: View {
                     } label: {
                         HStack {
                             Text(preset.title)
-                                .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
+                                .font(.system(size: 12.5, weight: isSelected ? .semibold : .regular))
+                                .foregroundStyle(DeskPalette.ink)
                             Spacer(minLength: 6)
                             if isSelected {
                                 Image(systemName: "checkmark")
@@ -181,9 +194,12 @@ struct SessionQualityView: View {
                                     .accessibilityHidden(true)
                             }
                         }
-                        .padding(.horizontal, 9)
-                        .frame(minHeight: 29)
-                        .background(isSelected ? DeskPalette.subtleFill : .clear, in: RoundedRectangle(cornerRadius: 6))
+                        .padding(.horizontal, 10)
+                        .frame(minHeight: 31)
+                        .background(
+                            isSelected ? DeskPalette.accent.opacity(0.11) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        )
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -192,31 +208,39 @@ struct SessionQualityView: View {
                 }
             }
             .disabled(presentation.availability != .ready)
-            .opacity(presentation.availability == .ready ? 1 : 0.58)
-
-            if supportsTrueColor, let trueColor {
-                Toggle(isOn: trueColor) {
-                    VStack(alignment: .leading, spacing: 1.5) {
-                        Text("4:4:4 真彩模式")
-                            .font(.system(size: compact ? 11.5 : 12.5, weight: .semibold))
-                        Text("硬件 HEVC Main 4:4:4，消除彩色代码色度模糊")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .disabled(presentation.availability != .ready)
-            }
+            .opacity(presentation.availability == .ready ? 1 : 0.56)
 
             if compact {
-                DisclosureGroup("高级画质设置（\(settings.summary)）", isExpanded: $showFineTuning) {
-                    parameterGrid
-                        .padding(.top, 6)
+                Divider()
+                Button {
+                    withAnimation(.snappy(duration: 0.16)) {
+                        showFineTuning.toggle()
+                    }
+                } label: {
+                    HStack {
+                        Text("高级设置")
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(DeskPalette.ink)
+                        Spacer()
+                        Text(settings.summary)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(DeskPalette.muted)
+                            .monospacedDigit()
+                        Image(systemName: showFineTuning ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(DeskPalette.muted)
+                    }
+                    .padding(.vertical, 4)
+                    .contentShape(Rectangle())
                 }
-                .font(.system(size: 11, weight: .medium))
+                .buttonStyle(.plain)
+
+                if showFineTuning {
+                    parameterGrid
+                        .padding(.top, 4)
+                }
             } else {
+                Divider()
                 parameterGrid
             }
 
@@ -224,9 +248,9 @@ struct SessionQualityView: View {
             case .disconnected:
                 Text("连接建立后可即时调整画质，无需重启共享。")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(DeskPalette.secondary)
             case .unsupported:
-                Label("共享端版本较旧，不支持会话中动态调画质", systemImage: "exclamationmark.circle")
+                Label("共享端版本较旧，不支持会话中动态调画质；保留当前状态。", systemImage: "exclamationmark.circle")
                     .font(.caption)
                     .foregroundStyle(DeskPalette.amber)
             case .ready:
@@ -242,34 +266,47 @@ struct SessionQualityView: View {
                     .help(message)
                 }
             }
-
         }
-        .font(.system(size: compact ? 11.5 : 12))
+        .font(.system(size: compact ? 12 : 12.5))
         .help(qualityHelp)
     }
 
     private var parameterGrid: some View {
-        Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: compact ? 5 : 7) {
-            GridRow {
-                Text("最长边").foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: compact ? 7 : 9) {
+            parameterRow("最长边") {
                 Picker("最长边", selection: $settings.longestEdge) {
                     ForEach(longestEdges, id: \.self) { Text(StreamSettings.resolutionLabel($0)).tag($0) }
                 }
-                .labelsHidden().frame(maxWidth: .infinity)
+                .labelsHidden()
+                .frame(width: 152)
             }
-            GridRow {
-                Text("帧率上限").foregroundStyle(.secondary)
+            parameterRow("帧率上限") {
                 Picker("帧率上限", selection: $settings.framesPerSecond) {
                     ForEach(frameRates, id: \.self) { Text("\($0) fps").tag($0) }
                 }
-                .labelsHidden().frame(maxWidth: .infinity)
+                .labelsHidden()
+                .frame(width: 152)
             }
-            GridRow {
-                Text("目标码率").foregroundStyle(.secondary)
+            parameterRow("目标码率") {
                 Picker("目标码率", selection: $settings.megabits) {
                     ForEach(bitRates, id: \.self) { Text("\($0) Mbps").tag($0) }
                 }
-                .labelsHidden().frame(maxWidth: .infinity)
+                .labelsHidden()
+                .frame(width: 152)
+            }
+            if supportsTrueColor, let trueColor {
+                HStack {
+                    Text("真彩格式")
+                        .foregroundStyle(DeskPalette.secondary)
+                    Spacer()
+                    Text("4:4:4")
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .foregroundStyle(DeskPalette.muted)
+                    Toggle("4:4:4 真彩模式", isOn: trueColor)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                }
             }
         }
         .pickerStyle(.menu)
@@ -277,18 +314,27 @@ struct SessionQualityView: View {
         .disabled(presentation.availability != .ready)
     }
 
+    private func parameterRow<Control: View>(_ label: String, @ViewBuilder control: () -> Control) -> some View {
+        HStack {
+            Text(label)
+                .foregroundStyle(DeskPalette.secondary)
+            Spacer(minLength: 8)
+            control()
+        }
+    }
+
     @ViewBuilder private var updateStatus: some View {
         switch presentation.update {
         case .idle:
             EmptyView()
         case .preparing(let desired):
-            progress("准备请求共享端：\(desired.summary)")
+            progress("准备参数：请求 \(desired.summary)")
         case .awaiting(let requested, let latest):
-            progress("等待共享端确认：\(requested.summary)")
+            progress("等待远端生效：\(requested.summary)")
             if let latest {
                 Text("最新待合并：\(latest.summary)")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(DeskPalette.secondary)
                     .monospacedDigit()
             }
         }
@@ -299,7 +345,7 @@ struct SessionQualityView: View {
             ProgressView().controlSize(.mini)
             Text(title)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(DeskPalette.secondary)
                 .monospacedDigit()
         }
     }

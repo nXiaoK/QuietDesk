@@ -56,13 +56,13 @@ struct ConnectionView: View {
     private var preFlightSummary: ConnectionPreFlightSummary {
         let capsTitle = !model.capsLockEnabled
             ? "未启用"
-            : (model.capsLockRunning ? "本机监听已就绪" : "待权限或重检")
+            : (model.capsLockRunning ? "已就绪" : "尚未就绪")
         let shortcutsTitle = model.localAccessibility && model.localInputMonitoring
-            ? "权限已生效"
-            : "待授予本机权限"
+            ? "已就绪"
+            : "尚未就绪"
         let clipboardTitle = model.clipboardEnabled
-            ? "⌘V 按需拉取 · 零空闲流量"
-            : "已关闭自动同步"
+            ? "已开启"
+            : "已关闭"
         return ConnectionPreFlightSummary(
             capsLockTitle: capsTitle,
             capsLockReady: model.capsLockEnabled && model.capsLockRunning,
@@ -141,6 +141,9 @@ struct ConnectionView: View {
             toggleLANScan: { model.toggleLANScan() },
             dismissLANScan: { model.stopLANScan(clearResults: true) },
             hasSavedCredentialForDiscovered: { model.hasSavedCredential(for: $0) },
+            hasSavedCredentialForRecord: { record in
+                (try? KeyStore.load(account: "remote." + record.id.uuidString)) != nil
+            },
             selectDiscoveredHost: { discovered in
                 performAttempt {
                     model.viewerCode = ""
@@ -160,6 +163,47 @@ struct ConnectionView: View {
                 guard let existing = models.existingSession(for: record),
                       existing.active || existing.working || existing.reconnecting else { return nil }
                 return existing.activeSessionSummary
+            },
+            liveSessionForRecord: { record in
+                guard let existing = models.existingSession(for: record), existing.connected else { return nil }
+                let badge: String
+                if !existing.effectiveViewerCanControl {
+                    badge = "仅观看"
+                } else if existing.controlling {
+                    badge = "控制中"
+                } else {
+                    badge = "已连接"
+                }
+                return LiveDeviceSessionOverview(
+                    sessionID: existing.sessionID,
+                    badgeTitle: badge,
+                    connected: existing.connected,
+                    controlling: existing.controlling,
+                    viewOnlyLocked: existing.viewerViewOnlyLock,
+                    effectiveCanControl: existing.effectiveViewerCanControl,
+                    resolution: existing.resolution,
+                    qualitySummary: existing.videoQualitySummary,
+                    frameRate: existing.frameRate,
+                    latency: existing.latency,
+                    transportLabel: existing.mediaTransportStatus,
+                    toggleViewOnly: {
+                        existing.setViewerViewOnlyLock(!existing.viewerViewOnlyLock)
+                    },
+                    enterFullScreen: {
+                        models.focusViewerSession(existing)
+                        if !existing.isFullScreen {
+                            existing.toggleFullScreen()
+                        }
+                    }
+                )
+            },
+            openReceivedFiles: {
+                model.canvas.releaseControl()
+                model.openReceivedFiles()
+            },
+            viewerViewOnlyLocked: model.viewerViewOnlyLock,
+            toggleViewerViewOnly: {
+                model.setViewerViewOnlyLock(!model.viewerViewOnlyLock)
             }
         )
         .sheet(isPresented: $showRelaySettings) {
@@ -231,6 +275,7 @@ struct ConnectionView: View {
 }
 
 private struct WakeOnLANConfigurationSheet: View {
+    private enum Field: Hashable { case mac, broadcast, port }
     let record: ConnectionRecord
     let save: (WakeOnLANConfiguration?) throws -> Void
     let sendWakeNow: (WakeOnLANConfiguration) throws -> Void
@@ -240,6 +285,7 @@ private struct WakeOnLANConfigurationSheet: View {
     @State private var broadcastAddress: String
     @State private var port: String
     @State private var errorMessage: String?
+    @FocusState private var focusedField: Field?
 
     init(
         record: ConnectionRecord,
@@ -255,58 +301,60 @@ private struct WakeOnLANConfigurationSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("配置网络唤醒")
-                .font(.system(size: 19, weight: .semibold))
-                .accessibilityAddTraits(.isHeader)
-            Text("目标设备：\(ConnectionEntryPresentation.title(record))（\(ConnectionEntryPresentation.endpoint(record))）")
-                .font(.caption)
-                .foregroundStyle(DeskPalette.secondary)
+        VStack(alignment: .leading, spacing: 15) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("配置网络唤醒")
+                    .font(.system(size: 20, weight: .bold))
+                    .accessibilityAddTraits(.isHeader)
+                Text("目标设备 \(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record))")
+                    .font(.system(size: 13))
+                    .foregroundStyle(DeskPalette.secondary)
+            }
 
-            VStack(alignment: .leading, spacing: 10) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("有线网卡物理 MAC 地址")
-                        .font(.caption.weight(.medium))
+            VStack(alignment: .leading, spacing: 13) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("有线网卡 MAC 地址")
+                        .font(.system(size: 12.5, weight: .medium))
                         .foregroundStyle(DeskPalette.secondary)
                     TextField("例如 AA:BB:CC:DD:EE:FF", text: $macAddress)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.body, design: .monospaced))
+                        .font(.system(size: 13, design: .monospaced))
+                        .focused($focusedField, equals: .mac)
+                        .deskInputBox(focused: focusedField == .mac)
                         .accessibilityLabel("有线网卡物理 MAC 地址")
                 }
 
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("广播地址（可选，留空自动匹配子网）")
-                            .font(.caption.weight(.medium))
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("广播地址（可选）")
+                            .font(.system(size: 12.5, weight: .medium))
                             .foregroundStyle(DeskPalette.secondary)
-                        TextField("默认自动发送至活跃子网广播与 255.255.255.255", text: $broadcastAddress)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(.body, design: .monospaced))
+                        TextField("留空自动匹配活跃子网", text: $broadcastAddress)
+                            .font(.system(size: 13, design: .monospaced))
+                            .focused($focusedField, equals: .broadcast)
+                            .deskInputBox(focused: focusedField == .broadcast)
                             .accessibilityLabel("广播地址，可留空")
                     }
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: 6) {
                         Text("UDP 端口")
-                            .font(.caption.weight(.medium))
+                            .font(.system(size: 12.5, weight: .medium))
                             .foregroundStyle(DeskPalette.secondary)
                         TextField("9", text: $port)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(.body, design: .monospaced))
-                            .frame(width: 86)
+                            .font(.system(size: 13, design: .monospaced))
+                            .focused($focusedField, equals: .port)
+                            .deskInputBox(focused: focusedField == .port)
+                            .frame(width: 98)
                             .accessibilityLabel("网络唤醒 UDP 端口")
                     }
                 }
             }
 
-            Text("通常需要目标 Mac 使用有线以太网，并在「系统设置 → 节能」开启「唤醒以供网络访问」。")
-                .font(.callout)
+            Text("通常需要有线以太网，并在目标 Mac 开启「唤醒以供网络访问」。发送魔术包不保证实际唤醒。")
+                .font(.system(size: 12.5))
                 .foregroundStyle(DeskPalette.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             if let errorMessage {
-                Text(errorMessage)
-                    .font(.caption)
-                    .foregroundStyle(DeskPalette.coral)
-                    .fixedSize(horizontal: false, vertical: true)
+                DeskCalloutBox(message: errorMessage, symbol: "exclamationmark.circle", tone: .danger)
             }
 
             HStack(spacing: 10) {
@@ -347,11 +395,12 @@ private struct WakeOnLANConfigurationSheet: View {
                 .buttonStyle(DeskButtonStyle(.primary))
                 .keyboardShortcut(.defaultAction)
             }
+            .padding(.top, 6)
         }
-        .padding(24)
+        .padding(26)
         .frame(width: 520)
-        .controlSize(.large)
         .deskSurface()
+        .onAppear { focusedField = .mac }
     }
 
     private func parsedConfiguration() throws -> WakeOnLANConfiguration {

@@ -2107,6 +2107,23 @@ final class DeskModel: ObservableObject, Identifiable {
         connectionError = nil
     }
 
+    var hubConnectionDraft: ConnectionEntryDraft {
+        get {
+            ConnectionEntryDraft(
+                address: address, port: port, code: viewerCode, strategy: relayStrategy,
+                deviceID: targetRelayDeviceID, recordID: selectedConnectionID
+            )
+        }
+        set {
+            address = newValue.address
+            port = newValue.port
+            viewerCode = newValue.code
+            relayStrategy = newValue.strategy
+            targetRelayDeviceID = newValue.deviceID
+            selectedConnectionID = newValue.recordID
+        }
+    }
+
     var canRetryLastSessionLaunch: Bool {
         mode == .viewer && lastSessionLaunch != nil && !active && !working && !reconnecting
     }

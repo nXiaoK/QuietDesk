@@ -12,7 +12,7 @@ struct ConnectionView: View {
     let openEffects: () -> Void
     let openBenchmark: (ConnectionRecord?) -> Void
     var openRelayWorkspace: (() -> Void)? = nil
-    var openPortMappingWorkspace: ((ConnectionRecord) -> Void)? = nil
+    var openPortMappingWorkspace: ((ConnectionRecord?) -> Void)? = nil
     let selectedRecord: ConnectionRecord?
     @Binding var showNewConnection: Bool
     @State private var showRelaySettings = false
@@ -27,7 +27,7 @@ struct ConnectionView: View {
         openEffects: @escaping () -> Void,
         openBenchmark: @escaping (ConnectionRecord?) -> Void,
         openRelayWorkspace: (() -> Void)? = nil,
-        openPortMappingWorkspace: ((ConnectionRecord) -> Void)? = nil,
+        openPortMappingWorkspace: ((ConnectionRecord?) -> Void)? = nil,
         selectedRecord: ConnectionRecord? = nil,
         showNewConnection: Binding<Bool> = .constant(false)
     ) {
@@ -46,7 +46,12 @@ struct ConnectionView: View {
         self._showNewConnection = showNewConnection
     }
 
-    private var locked: Bool { model.active || model.working }
+    private var locked: Bool { model.active || model.working || model.isRunningRouteBenchmark }
+
+    private var pageFailure: String? {
+        guard selectedRecord == nil || selectedRecord?.id == model.selectedConnectionID else { return nil }
+        return model.connectionFailure
+    }
 
     private var preFlightSummary: ConnectionPreFlightSummary {
         let capsTitle = !model.capsLockEnabled
@@ -74,27 +79,30 @@ struct ConnectionView: View {
             selectedRecord: selectedRecord,
             showNewConnection: $showNewConnection,
             locked: locked,
-            failure: model.connectionFailure,
+            failure: pageFailure,
             status: model.status,
             relayEnabled: model.relayEnabled,
-            address: $model.address,
-            port: $model.port,
-            code: $model.viewerCode,
-            strategy: $model.relayStrategy,
-            deviceID: $model.targetRelayDeviceID,
+            defaultStrategy: model.relayStrategy,
+            retryDraft: { model.hubConnectionDraft },
             nodePicker: RelayNodePicker(model: model),
             showOptions: $showOptions,
-            options: ConnectionSettingsView(
-                model: model,
-                openCaps: { showOptions = false; openCaps() },
-                openTraffic: openTraffic,
-                openEffects: openEffects,
-                openBenchmark: { showOptions = false; openBenchmark(nil) }
-            ),
-            connect: { models.connectFromHub() != nil },
+            options: { benchmark in
+                ConnectionSettingsView(
+                    model: model,
+                    openCaps: { showOptions = false; openCaps() },
+                    openTraffic: openTraffic,
+                    openEffects: openEffects,
+                    openBenchmark: { showOptions = false; benchmark() }
+                )
+            },
+            connect: { draft in
+                performAttempt(with: draft) { models.connectFromHub() != nil }
+            },
             cancel: { model.stop() },
             clearFailure: model.clearConnectionError,
-            quickConnect: { models.quickConnect($0) != nil },
+            quickConnect: { record in
+                performAttempt { models.quickConnect(record) != nil }
+            },
             remove: model.removeConnection,
             openOptions: { model.canvas.releaseControl(); showOptions = true },
             openCaps: openCaps,
@@ -106,10 +114,21 @@ struct ConnectionView: View {
                     showRelaySettings = true
                 }
             },
-            openBenchmark: { openBenchmark(nil) },
+            openBenchmarkDraft: { draft in
+                model.hubConnectionDraft = draft
+                model.clearConnectionError()
+                openBenchmark(nil)
+            },
             benchmarkRecord: { openBenchmark($0) },
             openPortMappingRecord: { record in
                 openPortMappingWorkspace?(record)
+            },
+            openPortMappingDraft: openPortMappingWorkspace.map { open in
+                { draft in
+                    model.hubConnectionDraft = draft
+                    model.clearConnectionError()
+                    open(nil)
+                }
             },
             qualityBadge: historicalQualityBadge(for:),
             runningMappingsCount: { record in
@@ -122,7 +141,13 @@ struct ConnectionView: View {
             toggleLANScan: { model.toggleLANScan() },
             dismissLANScan: { model.stopLANScan(clearResults: true) },
             hasSavedCredentialForDiscovered: { model.hasSavedCredential(for: $0) },
-            selectDiscoveredHost: { models.connectOrFillDiscoveredHost($0) != nil },
+            selectDiscoveredHost: { discovered in
+                performAttempt {
+                    model.viewerCode = ""
+                    model.targetRelayDeviceID = ""
+                    return models.connectOrFillDiscoveredHost(discovered) != nil
+                }
+            },
             wakeRecord: { model.sendWakeOnLAN(for: $0) },
             configureWakeRecord: { wakeConfigurationRecord = $0 },
             wakeNotice: model.wakeStatusNotice,
@@ -160,6 +185,21 @@ struct ConnectionView: View {
             showRelaySettings = false
             wakeConfigurationRecord = nil
         }
+    }
+
+    private func performAttempt(with draft: ConnectionEntryDraft? = nil, _ start: () -> Bool) -> ConnectionEntryAttemptFailure? {
+        let previous = model.hubConnectionDraft
+        if let draft { model.hubConnectionDraft = draft }
+        model.clearConnectionError()
+        guard !start() else { return nil }
+        // Failed inputs stay in this sheet. The hub's last accepted inputs still serve mapping and diagnostics.
+        let failure = ConnectionEntryAttemptFailure(
+            draft: model.hubConnectionDraft,
+            message: model.connectionFailure ?? "暂时无法发起连接，请稍后重试。"
+        )
+        model.hubConnectionDraft = previous
+        model.clearConnectionError()
+        return failure
     }
 
     private func historicalQualityBadge(for record: ConnectionRecord) -> ConnectionRecordCardBadge? {
@@ -231,6 +271,7 @@ private struct WakeOnLANConfigurationSheet: View {
                     TextField("例如 AA:BB:CC:DD:EE:FF", text: $macAddress)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.body, design: .monospaced))
+                        .accessibilityLabel("有线网卡物理 MAC 地址")
                 }
 
                 HStack(spacing: 12) {
@@ -241,6 +282,7 @@ private struct WakeOnLANConfigurationSheet: View {
                         TextField("默认自动发送至活跃子网广播与 255.255.255.255", text: $broadcastAddress)
                             .textFieldStyle(.roundedBorder)
                             .font(.system(.body, design: .monospaced))
+                            .accessibilityLabel("广播地址，可留空")
                     }
                     VStack(alignment: .leading, spacing: 4) {
                         Text("UDP 端口")
@@ -250,6 +292,7 @@ private struct WakeOnLANConfigurationSheet: View {
                             .textFieldStyle(.roundedBorder)
                             .font(.system(.body, design: .monospaced))
                             .frame(width: 86)
+                            .accessibilityLabel("网络唤醒 UDP 端口")
                     }
                 }
             }

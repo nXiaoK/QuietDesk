@@ -951,7 +951,7 @@ struct DeskView: View {
                     models.workspaceSection = .network
                 },
                 openPortMappingWorkspace: { record in
-                    preferredMappingDeviceID = record.id
+                    preferredMappingDeviceID = record?.id
                     networkSubTab = .viewerMappings
                     models.workspaceSection = .network
                 },

@@ -136,29 +136,32 @@ struct DeskButtonStyle: ButtonStyle {
     enum Kind { case primary, secondary, danger, quiet }
 
     var kind: Kind
+    var compact: Bool
 
-    init(_ kind: Kind) {
+    init(_ kind: Kind, compact: Bool = false) {
         self.kind = kind
+        self.compact = compact
     }
 
     func makeBody(configuration: Configuration) -> some View {
-        StyledLabel(configuration: configuration, kind: kind)
+        StyledLabel(configuration: configuration, kind: kind, compact: compact)
     }
 
     private struct StyledLabel: View {
         let configuration: Configuration
         let kind: Kind
+        let compact: Bool
         @Environment(\.isEnabled) private var isEnabled
         @Environment(\.isFocused) private var isFocused
         @State private var hovering = false
 
         var body: some View {
-            let shape = RoundedRectangle(cornerRadius: 8, style: .continuous)
+            let shape = RoundedRectangle(cornerRadius: compact ? 7 : 8, style: .continuous)
             configuration.label
-                .font(.system(size: 12.5, weight: kind == .primary ? .semibold : .medium))
+                .font(.system(size: compact ? 12 : 12.5, weight: kind == .primary ? .semibold : .medium))
                 .foregroundStyle(foreground)
-                .padding(.horizontal, kind == .quiet ? 9 : 13)
-                .frame(minHeight: kind == .quiet ? 28 : 31)
+                .padding(.horizontal, kind == .quiet ? 9 : (compact ? 10 : 13))
+                .frame(minHeight: (kind == .quiet || compact) ? 28 : 31)
                 .background(background, in: shape)
                 .overlay {
                     shape.strokeBorder(isFocused ? DeskPalette.accent : border, lineWidth: isFocused ? 2 : 1)
@@ -246,18 +249,21 @@ struct DeskSurfaceCard<Content: View>: View {
         content()
             .padding(padding)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(DeskPalette.cardBackground, in: shape)
+            .background {
+                shape
+                    .fill(DeskPalette.cardBackground)
+                    .shadow(
+                        color: reduceTransparency ? .clear : .black.opacity(0.028),
+                        radius: 3,
+                        y: 1
+                    )
+            }
             .overlay {
                 shape.strokeBorder(
                     highlightColor.map { $0.opacity(0.42) } ?? DeskPalette.hairline,
                     lineWidth: 1
                 )
             }
-            .shadow(
-                color: reduceTransparency ? .clear : .black.opacity(0.025),
-                radius: 3,
-                y: 1
-            )
     }
 }
 

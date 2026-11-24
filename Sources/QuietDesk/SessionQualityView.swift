@@ -195,7 +195,7 @@ struct SessionQualityView: View {
                             }
                         }
                         .padding(.horizontal, 10)
-                        .frame(minHeight: 31)
+                        .frame(minHeight: 28)
                         .background(
                             isSelected ? DeskPalette.accent.opacity(0.11) : Color.clear,
                             in: RoundedRectangle(cornerRadius: 7, style: .continuous)

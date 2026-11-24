@@ -55,8 +55,7 @@ struct DeskSettingsPageTabs<Tab: Hashable, Content: View>: View {
                 .background(DeskPalette.subtleFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
             }
             .padding(.horizontal, 28)
-            .padding(.top, 8)
-            .padding(.bottom, 12)
+            .frame(minHeight: 46)
 
             Divider()
 

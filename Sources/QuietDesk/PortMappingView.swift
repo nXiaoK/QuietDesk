@@ -270,11 +270,11 @@ struct PortMappingView<DeviceProfile: View>: View {
     private func mappingColumns(compact: Bool) -> some View {
         HStack(spacing: 10) {
             Text("名称").frame(maxWidth: .infinity, alignment: .leading)
-            portColumn(Text("本地端口"))
-            addressColumn(Text(compact ? "目标地址与端口" : "目标地址"))
-            if !compact { portColumn(Text("目标端口")) }
+            portColumn(Text("本地端口"), compact: compact)
+            addressColumn(Text(compact ? "目标地址与端口" : "目标地址"), compact: compact)
+            if !compact { portColumn(Text("目标端口"), compact: false) }
             statusColumn(Text("映射状态"), compact: compact)
-            Text("操作").frame(width: 74, alignment: .leading)
+            Text("操作").frame(width: 72, alignment: .leading)
         }
         .accessibilityHidden(true)
     }
@@ -297,7 +297,8 @@ struct PortMappingView<DeviceProfile: View>: View {
 
             portColumn(
                 Text(rule.localPort.formatted(.number.grouping(.never)))
-                    .font(.system(size: 13, design: .monospaced))
+                    .font(.system(size: 13, design: .monospaced)),
+                compact: compact
             )
             .accessibilityLabel("本地端口 \(rule.localPort)")
 
@@ -305,7 +306,8 @@ struct PortMappingView<DeviceProfile: View>: View {
                 Text(verbatim: targetAddress)
                     .font(.system(size: 13, design: .monospaced))
                     .lineLimit(1)
-                    .truncationMode(.middle)
+                    .truncationMode(.middle),
+                compact: compact
             )
             .help(targetAddress)
             .textSelection(.enabled)
@@ -314,7 +316,8 @@ struct PortMappingView<DeviceProfile: View>: View {
             if !compact {
                 portColumn(
                     Text(rule.target.port.formatted(.number.grouping(.never)))
-                        .font(.system(size: 13, design: .monospaced))
+                        .font(.system(size: 13, design: .monospaced)),
+                    compact: false
                 )
                 .accessibilityLabel("目标端口 \(rule.target.port)")
             }
@@ -346,23 +349,23 @@ struct PortMappingView<DeviceProfile: View>: View {
                 .fixedSize()
                 .accessibilityLabel("\(rule.name)的更多操作")
             }
-            .frame(width: 74, alignment: .leading)
+            .frame(width: 72, alignment: .leading)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .frame(minHeight: 46)
     }
 
-    private func portColumn(_ content: some View) -> some View {
-        content.frame(width: 68, alignment: .leading)
+    private func portColumn(_ content: some View, compact: Bool) -> some View {
+        content.frame(width: compact ? 62 : 68, alignment: .leading)
     }
 
-    private func addressColumn(_ content: some View) -> some View {
-        content.frame(width: 112, alignment: .leading)
+    private func addressColumn(_ content: some View, compact: Bool) -> some View {
+        content.frame(width: compact ? 140 : 114, alignment: .leading)
     }
 
     private func statusColumn(_ content: some View, compact: Bool) -> some View {
-        content.frame(width: compact ? 120 : 158, alignment: .leading)
+        content.frame(width: compact ? 104 : 156, alignment: .leading)
     }
 
     @ViewBuilder

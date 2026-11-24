@@ -409,7 +409,7 @@ struct DeskView: View {
             .frame(width: 0, height: 0)
         )
         .focusedSceneValue(\.viewerSession, isDedicatedSessionWindow ? model : nil)
-        .frame(minWidth: 820, minHeight: 580)
+        .frame(minWidth: 700, minHeight: 560)
         .ignoresSafeArea(immersive ? .container : (!sessionLayout ? .container : []), edges: immersive ? .all : .top)
         .navigationTitle(sessionLayout ? remoteTitle : "QuietDesk")
         .navigationSubtitle(sessionLayout ? remoteSubtitle : "")
@@ -821,9 +821,12 @@ struct DeskView: View {
                 .padding(24)
                 .frame(maxWidth: 420)
                 .foregroundStyle(DeskPalette.ink)
-                .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .background {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(DeskPalette.cardBackground)
+                        .shadow(color: reduceTransparency ? .clear : .black.opacity(0.16), radius: 14, y: 6)
+                }
                 .overlay { RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(DeskPalette.hairline) }
-                .shadow(color: reduceTransparency ? .clear : .black.opacity(0.16), radius: 14, y: 6)
             }
             if !model.connected {
                 ConnectionRecoveryView(
@@ -903,13 +906,17 @@ struct DeskView: View {
                             SessionControlsView(model: model, close: { showFullScreenMenu = false },
                                                 openTraffic: openTrafficStatistics, openEffects: openSessionEffects,
                                                 openPortMapping: openPortMapping)
-                                .frame(height: min(560, max(0, geometry.size.height - 32)))
+                                .frame(height: min(708, max(0, geometry.size.height - 32)))
                                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                .background {
+                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                        .fill(DeskPalette.cardBackground)
+                                        .shadow(color: reduceTransparency ? .clear : .black.opacity(0.28), radius: 20, y: 8)
+                                }
                                 .overlay {
                                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                                         .strokeBorder(DeskPalette.hairline, lineWidth: 1)
                                 }
-                                .shadow(color: reduceTransparency ? .clear : .black.opacity(0.28), radius: 20, y: 8)
                         }
                         Button {
                             model.canvas.releaseControl()
@@ -949,14 +956,17 @@ struct DeskView: View {
             .foregroundStyle(DeskPalette.ink)
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
-            .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .background {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(DeskPalette.cardBackground)
+                    .shadow(color: reduceTransparency ? .clear : .black.opacity(0.12), radius: 8, y: 3)
+            }
             .overlay { RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(DeskPalette.hairline) }
-            .shadow(color: reduceTransparency ? .clear : .black.opacity(0.12), radius: 8, y: 3)
     }
 
     private var workspaceShell: some View {
         GeometryReader { geometry in
-            let autoCompact = geometry.size.width < 760
+            let autoCompact = geometry.size.width < 780
             let isSidebarVisible = !sidebarCollapsed && !autoCompact
             HStack(spacing: 0) {
                 if isSidebarVisible {
@@ -1031,66 +1041,55 @@ struct DeskView: View {
 
     @ViewBuilder
     private func workspaceTopBar(sidebarVisible: Bool, canExpandSidebar: Bool) -> some View {
-        if !sidebarVisible || models.workspaceSection != .connect {
+        if !sidebarVisible {
             HStack(spacing: 10) {
-                if !sidebarVisible {
-                    HStack(spacing: 8) {
-                        if canExpandSidebar {
-                            Button {
-                                withAnimation(.snappy(duration: 0.18)) {
-                                    sidebarCollapsed = false
-                                }
-                            } label: {
-                                Image(systemName: "sidebar.left")
-                                    .font(.system(size: 13, weight: .medium))
+                HStack(spacing: 8) {
+                    if canExpandSidebar {
+                        Button {
+                            withAnimation(.snappy(duration: 0.18)) {
+                                sidebarCollapsed = false
                             }
-                            .buttonStyle(DeskButtonStyle(.quiet))
-                            .help("展开侧边栏")
-                            .accessibilityLabel("展开侧边栏")
+                        } label: {
+                            Image(systemName: "sidebar.left")
+                                .font(.system(size: 13, weight: .medium))
                         }
-                        Text("QuietDesk")
-                            .font(.system(size: 13.5, weight: .semibold))
-                            .foregroundStyle(DeskPalette.ink)
+                        .buttonStyle(DeskButtonStyle(.quiet))
+                        .help("展开侧边栏")
+                        .accessibilityLabel("展开侧边栏")
                     }
-                    .padding(.leading, 78)
+                    Text("QuietDesk")
+                        .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundStyle(DeskPalette.ink)
                 }
+                .padding(.leading, 78)
 
                 Spacer(minLength: 0)
 
-                if models.workspaceSection != .connect {
-                    Text(models.workspaceSection.title)
-                        .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(DeskPalette.muted)
-                }
-
-                Spacer(minLength: 0)
-
-                if !sidebarVisible {
-                    Menu {
-                        ForEach(models.viewer.connections) { record in
-                            Button(ConnectionEntryPresentation.title(record)) {
-                                workspaceDeviceID = record.id
-                                models.workspaceSection = .connect
-                            }
-                        }
-                        if !models.viewer.connections.isEmpty { Divider() }
-                        Button("全部设备") {
-                            workspaceDeviceID = nil
+                Menu {
+                    ForEach(models.viewer.connections) { record in
+                        Button(ConnectionEntryPresentation.title(record)) {
+                            workspaceDeviceID = record.id
                             models.workspaceSection = .connect
                         }
-                        Button("本机共享") { models.workspaceSection = .sharing }
-                        Button("网络与线路") { models.workspaceSection = .network }
-                        Button("设置") { models.workspaceSection = .preferences }
-                    } label: {
-                        Label(models.workspaceSection.title, systemImage: models.workspaceSection.symbol)
-                            .font(.system(size: 12, weight: .medium))
                     }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                    .padding(.trailing, 16)
+                    if !models.viewer.connections.isEmpty { Divider() }
+                    Button("全部设备") {
+                        workspaceDeviceID = nil
+                        models.workspaceSection = .connect
+                    }
+                    Button("本机共享") { models.workspaceSection = .sharing }
+                    Button("网络与线路") { models.workspaceSection = .network }
+                    Button("设置") { models.workspaceSection = .preferences }
+                } label: {
+                    Label(models.workspaceSection.title, systemImage: models.workspaceSection.symbol)
+                        .font(.system(size: 12, weight: .medium))
                 }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .padding(.trailing, 16)
             }
-            .frame(height: 42)
+            .frame(height: 44)
+            Divider()
         }
     }
 
@@ -1534,7 +1533,7 @@ private struct DeskWorkspaceSidebar: View {
                 .help("收起设备栏")
                 .accessibilityLabel("收起设备栏")
             }
-            .frame(height: 42)
+            .frame(height: 46)
             .padding(.trailing, 8)
 
             HStack(spacing: 5) {
@@ -1939,7 +1938,7 @@ private struct WindowReader: NSViewRepresentable {
             for observer in observers { NotificationCenter.default.removeObserver(observer) }
             observers.removeAll()
             guard let window else { return }
-            window.minSize = NSSize(width: 820, height: 600)
+            window.minSize = NSSize(width: 720, height: 580)
             applyWindowChrome()
             resolved?(window)
             fullScreen?(window.styleMask.contains(.fullScreen))

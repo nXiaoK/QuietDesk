@@ -221,20 +221,17 @@ struct RouteQualityBenchmarkView: View {
             .frame(maxWidth: 340, alignment: .leading)
 
             if runner.selectedTab == .currentRun {
-                HStack(spacing: 8) {
+                HStack(spacing: 10) {
                     Text("单条时长")
                         .font(.caption)
                         .foregroundStyle(DeskPalette.secondary)
                         .accessibilityHidden(true)
 
-                    Picker("每条线路测试时长", selection: $runner.duration) {
-                        ForEach(RouteBenchmarkDuration.allCases) { item in
-                            Text(item.shortTitle).tag(item)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .fixedSize()
+                    DeskSegmentedTabs(
+                        tabs: RouteBenchmarkDuration.allCases.map { ($0, $0.shortTitle) },
+                        selection: $runner.duration
+                    )
+                    .frame(maxWidth: 210, alignment: .leading)
                     .disabled(runner.isRunning)
 
                     if runner.selectedCount > 0 {
@@ -348,8 +345,8 @@ struct RouteQualityBenchmarkView: View {
                 benchmarkTableHeader {
                     Text("候选线路").frame(maxWidth: .infinity, alignment: .leading)
                     Text("选择").frame(width: 44, alignment: .leading)
-                    Text("状态").frame(width: 105, alignment: .leading)
-                    Text("操作").frame(width: 104, alignment: .leading)
+                    Text("状态").frame(width: 98, alignment: .leading)
+                    Text("操作").frame(width: 132, alignment: .leading)
                 }
                 ForEach(runner.results) { item in
                     Divider().padding(.horizontal, 13)
@@ -588,19 +585,23 @@ struct RouteQualityBenchmarkView: View {
                 .frame(width: 44, alignment: .leading)
 
                 statusBadge(for: item)
-                    .frame(width: 105, alignment: .leading)
+                    .frame(width: 98, alignment: .leading)
 
                 Group {
                     if !runner.isRunning, canConnect(item) {
-                        Button("使用此线路连接") {
+                        Button {
                             connectWith(item.candidate)
+                        } label: {
+                            Text("使用此线路连接")
+                                .lineLimit(1)
                         }
-                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .buttonStyle(DeskButtonStyle(.secondary, compact: true))
+                        .fixedSize(horizontal: true, vertical: false)
                     } else {
                         Color.clear.frame(height: 0).accessibilityHidden(true)
                     }
                 }
-                .frame(width: 104, alignment: .leading)
+                .frame(width: 132, alignment: .leading)
             }
 
             if case let .failed(reason) = item.status {

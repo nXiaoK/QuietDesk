@@ -173,9 +173,12 @@ struct ConnectionRecoveryView: View {
             .padding(24)
             .frame(maxWidth: 430)
             .foregroundStyle(DeskPalette.ink)
-            .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .background {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(DeskPalette.cardBackground)
+                    .shadow(color: reduceTransparency ? .clear : .black.opacity(0.09), radius: 15, y: 5)
+            }
             .overlay { RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(DeskPalette.hairline) }
-            .shadow(color: reduceTransparency ? .clear : .black.opacity(0.09), radius: 15, y: 5)
         }
     }
 }

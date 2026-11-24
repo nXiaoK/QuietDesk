@@ -100,6 +100,18 @@ struct PermissionNextStepView: View {
             : NSColor(srgbRed: 0x94 / 255.0, green: 0x54 / 255.0, blue: 0x0F / 255.0, alpha: 1)
     })
 
+    private static let cardFill = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0x26 / 255.0, green: 0x2A / 255.0, blue: 0x33 / 255.0, alpha: 1)
+            : NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
+    })
+
+    private static let cardBorder = Color(nsColor: NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor.white.withAlphaComponent(0.14)
+            : NSColor.black.withAlphaComponent(0.12)
+    })
+
     var body: some View {
         let needsAction = step.action != nil
         let shape = RoundedRectangle(cornerRadius: 9, style: .continuous)
@@ -109,7 +121,7 @@ struct PermissionNextStepView: View {
                 .foregroundStyle(needsAction ? Self.amber : Color.secondary)
                 .padding(.top, 1.5)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 5) {
+            VStack(alignment: .leading, spacing: 6) {
                 Text(step.title)
                     .font(.system(size: compact ? 11.5 : 12.5, weight: .semibold))
                     .foregroundStyle(needsAction ? Self.amber : Color.primary)
@@ -118,10 +130,22 @@ struct PermissionNextStepView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let action = step.action, let title = step.actionTitle {
-                    Button(title) { perform(action) }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .padding(.top, 2)
+                    Button {
+                        perform(action)
+                    } label: {
+                        Text(title)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.primary)
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 5)
+                            .background(Self.cardFill, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                            .overlay {
+                                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .strokeBorder(Self.cardBorder, lineWidth: 1)
+                            }
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 2)
                 }
             }
         }

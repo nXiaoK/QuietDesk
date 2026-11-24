@@ -151,12 +151,21 @@ struct ClipboardFilePromptView: View {
                     Text("关闭或按 Esc 即拒绝；90 秒未确认自动拒绝。")
                         .font(.system(size: 12))
                         .foregroundStyle(DeskPalette.secondary)
-                    ProgressView(value: min(remaining, 90), total: 90)
-                        .progressViewStyle(.linear)
-                        .tint(DeskPalette.accent)
-                        .padding(.top, 2)
-                        .accessibilityLabel("剩余确认时间")
-                        .accessibilityValue(remaining > 0 ? "约 \(Int(ceil(remaining))) 秒" : "等待请求清理")
+                    GeometryReader { proxy in
+                        let fraction = max(0, min(1, remaining / 90))
+                        ZStack(alignment: .leading) {
+                            Capsule()
+                                .fill(DeskPalette.subtleFill)
+                            Capsule()
+                                .fill(remaining <= 20 ? DeskPalette.amber : DeskPalette.accent)
+                                .frame(width: proxy.size.width * fraction)
+                        }
+                    }
+                    .frame(height: 6)
+                    .padding(.top, 3)
+                    .accessibilityElement()
+                    .accessibilityLabel("剩余确认时间")
+                    .accessibilityValue(remaining > 0 ? "约 \(Int(ceil(remaining))) 秒" : "等待请求清理")
                 }
             }
 

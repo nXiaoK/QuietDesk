@@ -765,11 +765,14 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                     .font(.system(size: 12.5, weight: .medium))
                     .foregroundStyle(DeskPalette.ink)
             }
-            .frame(maxWidth: .infinity, minHeight: 44)
+            .padding(.horizontal, 10)
+            .frame(minHeight: 44)
             .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
+        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: .infinity, minHeight: 44)
     }
 
     private func deviceFooterMetadata(
@@ -841,10 +844,10 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
         DeskSurfaceCard(padding: 0, cornerRadius: 10) {
             VStack(spacing: 0) {
                 HStack(spacing: 12) {
-                    tableCell("设备", width: 156)
+                    tableCell("设备", width: 152)
                     tableCell("连接端点")
-                    tableCell(inManagementSheet ? "凭据" : "最近连接", width: inManagementSheet ? 88 : 120)
-                    tableCell("操作", width: 108)
+                    tableCell(inManagementSheet ? "凭据" : "最近连接", width: inManagementSheet ? 88 : 162)
+                    tableCell("操作", width: 112)
                 }
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(DeskPalette.secondary)
@@ -866,7 +869,7 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                             tableCell(ConnectionEntryPresentation.title(record))
                                 .fontWeight(.medium)
                         }
-                        .frame(width: 156, alignment: .leading)
+                        .frame(width: 152, alignment: .leading)
 
                         VStack(alignment: .leading, spacing: 2) {
                             if let relay = record.relay {
@@ -897,20 +900,21 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                                 record.lastConnected == .distantPast
                                     ? (credentialSaved ? "尚未远控" : "待补录")
                                     : record.lastConnected.formatted(date: .abbreviated, time: .shortened),
-                                width: 120
+                                width: 162
                             )
                             .font(.system(size: 12))
+                            .monospacedDigit()
                             .foregroundStyle(!credentialSaved ? DeskPalette.amber : DeskPalette.secondary)
                         }
 
-                        HStack(spacing: 4) {
+                        HStack(spacing: 6) {
                             Button(session != nil ? "切到窗口" : (credentialSaved ? "连接" : "补录")) {
                                 connectSavedDevice(record)
                             }
-                            .buttonStyle(DeskButtonStyle(.quiet))
+                            .buttonStyle(DeskButtonStyle(.secondary, compact: true))
                             recordMenu(record, session: session, inManagementSheet: inManagementSheet)
                         }
-                        .frame(width: 108, alignment: .leading)
+                        .frame(width: 112, alignment: .leading)
                         .disabled(locked)
                     }
                     .font(.system(size: 13))

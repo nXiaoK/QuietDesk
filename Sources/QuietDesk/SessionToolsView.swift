@@ -182,7 +182,7 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
             .foregroundStyle(presentation.control.state == .controlling ? DeskPalette.emerald : DeskPalette.secondary)
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 11) {
                     switch page {
                     case .keyboard:
                         keyboard
@@ -191,7 +191,7 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
 
                         Divider()
 
-                        VStack(alignment: .leading, spacing: 7) {
+                        VStack(alignment: .leading, spacing: 6) {
                             Text("远端空间与快捷操作")
                                 .font(.system(size: 11.5, weight: .medium))
                                 .foregroundStyle(DeskPalette.secondary)
@@ -249,9 +249,9 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
             }
         }
         .font(.system(size: 12.5))
-        .padding(16)
-        .frame(width: 392)
-        .frame(maxHeight: 560)
+        .padding(15)
+        .frame(width: 396)
+        .frame(idealHeight: 704, maxHeight: 720)
         .foregroundStyle(DeskPalette.ink)
         .background(DeskPalette.cardBackground)
         .tint(DeskPalette.accent)
@@ -271,7 +271,7 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
                 .lineLimit(1)
                 .frame(maxWidth: .infinity)
         }
-        .buttonStyle(DeskButtonStyle(.secondary))
+        .buttonStyle(DeskButtonStyle(.secondary, compact: true))
         .help(action.shortcut.map { action.help + " · " + $0 } ?? action.help)
         .disabled(!presentation.isEnabled(action))
     }
@@ -297,7 +297,7 @@ struct SessionToolsView<Settings: View, Keyboard: View, Desktop: View>: View {
                     .foregroundStyle(DeskPalette.muted)
             }
             .padding(.horizontal, 10)
-            .frame(minHeight: 34)
+            .frame(minHeight: 31)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

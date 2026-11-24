@@ -74,7 +74,7 @@ struct RemoteDesktopActionsView: View {
                     .help(action.helpText(unavailableReason: unavailableReason, privacyEnabled: privacyEnabled))
                 }
             }
-            .buttonStyle(DeskButtonStyle(.secondary))
+            .buttonStyle(DeskButtonStyle(.secondary, compact: true))
             .disabled(unavailableReason != nil)
             if let detail = Self.detailText(unavailableReason: unavailableReason, status: status, privacyEnabled: privacyEnabled) {
                 Text(detail)

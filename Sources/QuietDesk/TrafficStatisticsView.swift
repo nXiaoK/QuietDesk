@@ -168,8 +168,8 @@ struct TrafficStatisticsView: View {
             }
 
             HStack {
-                if selectedRecord == nil {
-                    Text(history.records.isEmpty ? "从建立连接开始自动记录。" : "点选地址行可查看首次统计与最近连接时间。")
+                if selectedRecord == nil && !history.records.isEmpty {
+                    Text("点选地址行可查看首次统计与最近连接时间。")
                         .font(.caption)
                         .foregroundStyle(DeskPalette.secondary)
                 }

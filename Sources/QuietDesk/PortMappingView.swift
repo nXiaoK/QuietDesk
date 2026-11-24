@@ -12,19 +12,47 @@ private struct MappingEditorSelection: Identifiable {
     }
 }
 
-struct PortMappingView: View {
+struct PortMappingView<DeviceProfile: View>: View {
     @ObservedObject var model: DeskModel
     @ObservedObject var manager: PortMappingManager
     let done: () -> Void
-    var embedded: Bool = false
-    var preferredDeviceID: UUID? = nil
-    @State private var deviceID: UUID?
+    let embedded: Bool
+    @Binding private var workspaceDeviceID: UUID?
+    @ViewBuilder let deviceProfile: (ConnectionRecord) -> DeviceProfile
+    @State private var sheetDeviceID: UUID?
     @State private var editor: MappingEditorSelection?
     @State private var deleting: PortMappingRule?
     @State private var error: String?
 
-    private var selected: ConnectionRecord? { model.connections.first { $0.id == deviceID } }
-    private var rules: [PortMappingRule] { manager.rules.filter { $0.deviceID == deviceID } }
+    init(
+        model: DeskModel,
+        manager: PortMappingManager,
+        done: @escaping () -> Void,
+        embedded: Bool = false,
+        workspaceDeviceID: Binding<UUID?> = .constant(nil),
+        @ViewBuilder deviceProfile: @escaping (ConnectionRecord) -> DeviceProfile = { _ in EmptyView() }
+    ) {
+        self.model = model
+        self.manager = manager
+        self.done = done
+        self.embedded = embedded
+        self._workspaceDeviceID = workspaceDeviceID
+        self.deviceProfile = deviceProfile
+    }
+
+    private var selected: ConnectionRecord? {
+        let candidates = [embedded ? workspaceDeviceID : sheetDeviceID,
+                          model.preferredMappingRecordID, model.selectedConnectionID]
+        for case let id? in candidates {
+            if let record = model.connections.first(where: { $0.id == id }) { return record }
+        }
+        return model.connections.first
+    }
+
+    private var rules: [PortMappingRule] {
+        let id = selected?.id
+        return manager.rules.filter { $0.deviceID == id }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -60,29 +88,27 @@ struct PortMappingView: View {
             .font(.caption)
             .foregroundStyle(DeskPalette.secondary)
             .fixedSize(horizontal: false, vertical: true)
+
+            if let selected { deviceProfile(selected) }
         }
         .padding(embedded ? 0 : 24)
         .frame(width: embedded ? nil : 740, height: embedded ? nil : 500)
         .frame(maxWidth: embedded ? .infinity : nil, alignment: .leading)
         .background(embedded ? Color.clear : DeskPalette.canvasBackground)
         .tint(DeskPalette.accent)
-        .onAppear {
-            let preferred = preferredDeviceID.flatMap { id in model.connections.first { $0.id == id } }
-            let selectedRecord = model.connections.first { $0.id == model.selectedConnectionID }
-            deviceID = preferred?.id ?? model.preferredMappingRecordID ?? selectedRecord?.id ?? model.connections.first?.id
-        }
-        .onChange(of: preferredDeviceID) { _, newID in
-            if let newID, model.connections.contains(where: { $0.id == newID }) {
-                deviceID = newID
-            }
-        }
+        .onChange(of: selected?.id) { _, _ in error = nil }
         .sheet(item: $editor) { item in
-            PortMappingEditor(item: item, sessionAvailable: model.hasConnectedDesktopSession(for: item.device.id)) { rule, enable in
-                try manager.saveRule(rule)
-                if enable { try model.startPortMapping(rule) }
-                error = nil
-                editor = nil
-            }
+            PortMappingEditor(
+                item: item,
+                sessionAvailable: model.hasConnectedDesktopSession(for: item.device.id),
+                save: { rule in try manager.saveRule(rule); error = nil },
+                enable: { rule in
+                    try model.startPortMapping(rule)
+                    if case let .failed(reason) = manager.states[rule.id] {
+                        throw DeskError.invalid(reason)
+                    }
+                }
+            )
         }
         .confirmationDialog("删除「\(deleting?.name ?? "")」？",
             isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
@@ -112,7 +138,7 @@ struct PortMappingView: View {
             }
 
             HStack(spacing: 10) {
-                Picker("目标设备", selection: $deviceID) {
+                Picker("目标设备", selection: Binding(get: { selected?.id }, set: selectDevice)) {
                     if model.connections.isEmpty { Text("尚无已存设备").tag(nil as UUID?) }
                     ForEach(model.connections) { record in
                         Text("\(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record))")
@@ -123,16 +149,21 @@ struct PortMappingView: View {
                 .accessibilityLabel("目标设备")
                 .frame(maxWidth: 350)
                 if !model.connected && !model.working {
-                    Button("导入连接页当前配置") {
-                        do { deviceID = try model.savePortMappingDevice(); error = nil }
+                    Button("导入连接草稿") {
+                        do { selectDevice(try model.savePortMappingDevice()) }
                         catch { self.error = error.localizedDescription }
                     }
                     .buttonStyle(DeskButtonStyle(.secondary))
-                    .help("将连接页填写的地址、端口和配对码保存并用于端口映射")
+                    .help("在「新建连接」填写连接信息，并选择「用于端口映射…」后导入")
                 }
                 Spacer(minLength: 0)
             }
         }
+    }
+
+    private func selectDevice(_ id: UUID?) {
+        if embedded { workspaceDeviceID = id } else { sheetDeviceID = id }
+        error = nil
     }
 
     private var mappingTable: some View {
@@ -204,7 +235,7 @@ struct PortMappingView: View {
             Text(selected == nil ? "请先添加或选择目标 Mac" : "尚无 TCP 端口映射规则")
                 .font(.headline)
             Text(selected == nil
-                 ? "可在「远程桌面」连接一次目标 Mac，或填写地址与配对码后点击上方「导入连接页当前配置」。"
+                 ? "先连接一次目标设备，或在「新建连接」填写连接信息后选择「用于端口映射…」，再导入草稿。"
                  : "添加规则后可通过本机端口安全访问远端服务。曾远控过该 Mac 时免确认直通；未曾远控的设备首次启用需被控端确认。")
                 .font(.callout)
                 .foregroundStyle(DeskPalette.secondary)
@@ -320,7 +351,8 @@ struct PortMappingView: View {
 private struct PortMappingEditor: View {
     let item: MappingEditorSelection
     let sessionAvailable: Bool
-    let save: (PortMappingRule, Bool) throws -> Void
+    let save: (PortMappingRule) throws -> Void
+    let enable: (PortMappingRule) throws -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var name: String
     @State private var localPort: String
@@ -328,11 +360,14 @@ private struct PortMappingEditor: View {
     @State private var remotePort: String
     @State private var scope: PortMappingScope
     @State private var error: String?
+    @State private var enableError: String?
 
-    init(item: MappingEditorSelection, sessionAvailable: Bool, save: @escaping (PortMappingRule, Bool) throws -> Void) {
+    init(item: MappingEditorSelection, sessionAvailable: Bool, save: @escaping (PortMappingRule) throws -> Void,
+         enable: @escaping (PortMappingRule) throws -> Void) {
         self.item = item
         self.sessionAvailable = sessionAvailable
         self.save = save
+        self.enable = enable
         _name = State(initialValue: item.rule?.name ?? "")
         _localPort = State(initialValue: item.rule.map { String($0.localPort) } ?? "")
         _host = State(initialValue: item.rule?.target.host ?? "127.0.0.1")
@@ -346,15 +381,19 @@ private struct PortMappingEditor: View {
             VStack(alignment: .leading, spacing: 11) {
                 editorField("名称") {
                     TextField("名称", text: $name, prompt: Text("例如：Web 开发服务"))
+                        .accessibilityLabel("映射名称")
                 }
                 editorField("本地端口") {
                     TextField("本地端口", text: $localPort, prompt: Text("3000"))
+                        .accessibilityLabel("本地端口")
                 }
                 editorField("目标地址") {
                     TextField("目标地址", text: $host, prompt: Text("回环 127.0.0.1 或私有局域网 IP"))
+                        .accessibilityLabel("目标地址")
                 }
                 editorField("目标端口") {
                     TextField("目标端口", text: $remotePort, prompt: Text(localPort.isEmpty ? "留空默认同本地端口" : localPort))
+                        .accessibilityLabel("目标端口")
                 }
                 editorField("运行方式") {
                     Picker("运行方式", selection: $scope) {
@@ -374,15 +413,22 @@ private struct PortMappingEditor: View {
             }
             .font(.caption)
             .foregroundStyle(DeskPalette.secondary)
+            if let enableError {
+                Label("规则已保存，但未启用。\(enableError)", systemImage: "exclamationmark.circle")
+                    .font(.callout)
+                    .foregroundStyle(DeskPalette.amber)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("mapping.savedWithoutEnabling")
+            }
             if let error { Text(error).foregroundStyle(DeskPalette.coral).font(.callout) }
             HStack(spacing: 10) {
-                Button("取消") { dismiss() }
+                Button(enableError == nil ? "取消" : "关闭") { dismiss() }
                     .buttonStyle(DeskButtonStyle(.secondary))
                     .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button(item.rule == nil ? "仅保存" : "保存并停用") { submit(enable: false) }
                     .buttonStyle(DeskButtonStyle(.secondary))
-                Button("保存并启用") { submit(enable: true) }
+                Button(enableError == nil ? "保存并启用" : "保存并重试启用") { submit(enable: true) }
                     .buttonStyle(DeskButtonStyle(.primary))
                     .disabled(scope == .session && !sessionAvailable)
             }
@@ -411,7 +457,13 @@ private struct PortMappingEditor: View {
             let label = name.trimmingCharacters(in: .whitespacesAndNewlines)
             let rule = PortMappingRule(id: item.id, deviceID: item.device.id, name: label.isEmpty ? target.mappingAddress : label,
                                        localPort: port, target: target, scope: scope)
-            try save(rule, enable)
+            try save(rule)
+            error = nil
+            if enable {
+                do { try self.enable(rule) }
+                catch { enableError = error.localizedDescription; return }
+            }
+            dismiss()
         } catch { self.error = error.localizedDescription }
     }
 }

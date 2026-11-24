@@ -6,6 +6,19 @@ struct PortMappingHostView: View {
     @ObservedObject var manager: PortMappingManager
     let done: () -> Void
     var embedded: Bool = false
+    @State private var pendingRevocation: Revocation?
+
+    private enum Revocation {
+        case device(TrustedRemoteMappingDevice)
+        case target(PortMappingTarget)
+
+        var name: String {
+            switch self {
+            case .device(let device): return device.name
+            case .target(let target): return target.mappingAddress
+            }
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -28,6 +41,22 @@ struct PortMappingHostView: View {
         .background(embedded ? Color.clear : DeskPalette.canvasBackground)
         .tint(DeskPalette.accent)
         .onAppear { model.prepareHostCode() }
+        .confirmationDialog(
+            "撤回「\(pendingRevocation?.name ?? "")」的授权？",
+            isPresented: Binding(get: { pendingRevocation != nil }, set: { if !$0 { pendingRevocation = nil } }),
+            titleVisibility: .visible,
+            presenting: pendingRevocation
+        ) { revocation in
+            Button("撤回授权", role: .destructive) {
+                switch revocation {
+                case .device(let device): manager.revokeRemoteDevice(device.id)
+                case .target(let target): manager.revoke(target)
+                }
+            }
+            Button("取消", role: .cancel) {}
+        } message: { _ in
+            Text("撤回后会立即断开对应的活动映射。")
+        }
     }
 
     private var authorizationGroups: some View {
@@ -122,7 +151,7 @@ struct PortMappingHostView: View {
                                 .foregroundStyle(DeskPalette.secondary)
                         }
                         Spacer()
-                        Button("撤回授权", role: .destructive) { manager.revokeRemoteDevice(device.id) }
+                        Button("撤回授权…", role: .destructive) { pendingRevocation = .device(device) }
                             .buttonStyle(DeskButtonStyle(.danger))
                             .accessibilityLabel("撤回 \(device.name) 的授权")
                     }
@@ -140,7 +169,7 @@ struct PortMappingHostView: View {
                             Text("手动允许的目标").font(.caption).foregroundStyle(DeskPalette.secondary)
                         }
                         Spacer()
-                        Button("撤回", role: .destructive) { manager.revoke(target) }
+                        Button("撤回…", role: .destructive) { pendingRevocation = .target(target) }
                             .buttonStyle(DeskButtonStyle(.danger))
                             .accessibilityLabel("撤回 \(target.mappingAddress) 的授权")
                     }

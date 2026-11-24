@@ -974,7 +974,7 @@ struct DeskView: View {
                 host: models.host,
                 portMappings: models.viewer.portMappings,
                 subTab: $networkSubTab,
-                preferredDeviceID: preferredMappingDeviceID,
+                preferredDeviceID: $preferredMappingDeviceID,
                 openBenchmarkForRecord: { record in
                     inlineBenchmarkRecord = record
                     diagnosticsSubTab = .benchmark

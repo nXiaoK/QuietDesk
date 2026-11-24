@@ -99,7 +99,7 @@ struct NetworkWorkspaceView: View {
     @ObservedObject var portMappings: PortMappingManager
     @ObservedObject private var benchmarkStore: RouteQualityBenchmarkStore
     @Binding var subTab: NetworkWorkspaceSubTab
-    var preferredDeviceID: UUID? = nil
+    @Binding var preferredDeviceID: UUID?
     let openBenchmarkForRecord: (ConnectionRecord?) -> Void
     let openDiagnostics: (DiagnosticsWorkspaceSubTab) -> Void
 
@@ -108,7 +108,7 @@ struct NetworkWorkspaceView: View {
         host: DeskModel,
         portMappings: PortMappingManager,
         subTab: Binding<NetworkWorkspaceSubTab>,
-        preferredDeviceID: UUID? = nil,
+        preferredDeviceID: Binding<UUID?>,
         openBenchmarkForRecord: @escaping (ConnectionRecord?) -> Void,
         openDiagnostics: @escaping (DiagnosticsWorkspaceSubTab) -> Void
     ) {
@@ -117,16 +117,9 @@ struct NetworkWorkspaceView: View {
         self.portMappings = portMappings
         self._benchmarkStore = ObservedObject(wrappedValue: viewer.routeBenchmarkStore)
         self._subTab = subTab
-        self.preferredDeviceID = preferredDeviceID
+        self._preferredDeviceID = preferredDeviceID
         self.openBenchmarkForRecord = openBenchmarkForRecord
         self.openDiagnostics = openDiagnostics
-    }
-
-    private var activeDeviceRecord: ConnectionRecord? {
-        if let preferredDeviceID, let match = viewer.connections.first(where: { $0.id == preferredDeviceID }) {
-            return match
-        }
-        return viewer.connections.first { $0.id == viewer.selectedConnectionID } ?? viewer.connections.first
     }
 
     var body: some View {
@@ -151,10 +144,8 @@ struct NetworkWorkspaceView: View {
                             manager: portMappings,
                             done: {},
                             embedded: true,
-                            preferredDeviceID: preferredDeviceID
-                        )
-
-                        if let record = activeDeviceRecord {
+                            workspaceDeviceID: $preferredDeviceID
+                        ) { record in
                             deviceRouteSummaryCard(for: record)
                         }
                     case .relayNodes:
@@ -199,14 +190,15 @@ struct NetworkWorkspaceView: View {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .center, spacing: 12) {
                     if let assessment {
+                        let tint = assessment.overallGrade.deskTint
                         ZStack {
                             RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(DeskPalette.emerald.opacity(0.14))
+                                .fill(tint.opacity(0.14))
                                 .frame(width: 42, height: 42)
                             Text("\(assessment.overallScore)")
                                 .font(.system(size: 16, weight: .bold, design: .rounded))
                                 .monospacedDigit()
-                                .foregroundStyle(DeskPalette.emerald)
+                                .foregroundStyle(tint)
                         }
                     } else {
                         ZStack {
@@ -226,7 +218,7 @@ struct NetworkWorkspaceView: View {
                             if let assessment {
                                 DeskPillBadge(
                                     text: "累计 \(assessment.runCount) 次实测 · \(assessment.overallGrade.title)",
-                                    tint: DeskPalette.emerald
+                                    tint: assessment.overallGrade.deskTint
                                 )
                             }
                         }
@@ -252,7 +244,7 @@ struct NetworkWorkspaceView: View {
                 }
 
                 if let assessment, !assessment.routeSummaries.isEmpty {
-                    HStack(spacing: 10) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 164), alignment: .leading)], alignment: .leading, spacing: 10) {
                         ForEach(Array(assessment.routeSummaries.prefix(3).enumerated()), id: \.element.id) { idx, item in
                             let isBest = idx == 0 && item.overallGrade != .unreachable
                             VStack(alignment: .leading, spacing: 5) {
@@ -321,10 +313,7 @@ struct DiagnosticsWorkspaceView: View {
                     }
                 }
             ),
-            canSelect: { page in
-                if case .network = page { return !viewer.isRunningRouteBenchmark }
-                return true
-            }
+            canSelect: { !viewer.isRunningRouteBenchmark || $0 == .diagnostics(subTab) }
         ) {
             VStack(alignment: .leading, spacing: 0) {
                 if subTab == .benchmark, !viewer.connections.isEmpty {

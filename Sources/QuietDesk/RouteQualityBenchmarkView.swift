@@ -2,6 +2,17 @@ import AppKit
 import QuietDeskCore
 import SwiftUI
 
+extension RouteBenchmarkEvaluation.Grade {
+    var deskTint: Color {
+        switch self {
+        case .excellent: return DeskPalette.emerald
+        case .good: return .teal
+        case .fair: return DeskPalette.amber
+        case .poor, .unreachable: return DeskPalette.coral
+        }
+    }
+}
+
 struct RouteQualityBenchmarkView: View {
     @ObservedObject var runner: RouteQualityBenchmarkRunner
     let onConnectCandidate: (RouteBenchmarkCandidate, ConnectionRecord?) -> Void
@@ -673,7 +684,7 @@ struct RouteQualityBenchmarkView: View {
     }
 
     private func overallAssessmentCard(_ assessment: RouteBenchmarkOverallAssessment) -> some View {
-        let color = gradeColor(assessment.overallGrade)
+        let color = assessment.overallGrade.deskTint
         return VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 14) {
                 VStack(spacing: 2) {
@@ -1175,7 +1186,7 @@ struct RouteQualityBenchmarkView: View {
     }
 
     private func scorePill(score: Int, grade: RouteBenchmarkEvaluation.Grade) -> some View {
-        let color = gradeColor(grade)
+        let color = grade.deskTint
         return Text("\(score) 分 · \(grade.title)")
             .font(.caption.weight(.semibold).monospacedDigit())
             .padding(.horizontal, 8)
@@ -1202,15 +1213,6 @@ struct RouteQualityBenchmarkView: View {
             .padding(.vertical, 2)
             .background(color.opacity(0.14), in: Capsule())
             .foregroundStyle(color)
-    }
-
-    private func gradeColor(_ grade: RouteBenchmarkEvaluation.Grade) -> Color {
-        switch grade {
-        case .excellent: return DeskPalette.emerald
-        case .good: return .teal
-        case .fair: return DeskPalette.amber
-        case .poor, .unreachable: return DeskPalette.coral
-        }
     }
 
     private func metricsGrid(candidate: RouteBenchmarkCandidate, metrics: RouteBenchmarkMetrics) -> some View {

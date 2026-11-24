@@ -70,7 +70,6 @@ struct QuietDeskApp: App {
                 }
         }
         .defaultSize(width: 1100, height: 760)
-        .windowToolbarStyle(.unified)
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .appInfo) {
@@ -124,11 +123,25 @@ private struct StaleSessionWindowCloser: NSViewRepresentable {
     func makeNSView(context: Context) -> CloserView { CloserView() }
     func updateNSView(_ nsView: CloserView, context: Context) {}
     final class CloserView: NSView {
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            wantsLayer = true
+            layer?.backgroundColor = NSColor.black.cgColor
+        }
+        required init?(coder: NSCoder) {
+            super.init(coder: coder)
+            wantsLayer = true
+            layer?.backgroundColor = NSColor.black.cgColor
+        }
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             guard let window else { return }
             window.isRestorable = false
-            DispatchQueue.main.async { [weak window] in window?.close() }
+            guard !window.styleMask.contains(.fullScreen) else { return }
+            DispatchQueue.main.async { [weak window] in
+                guard let window, !window.styleMask.contains(.fullScreen) else { return }
+                window.close()
+            }
         }
     }
 }
@@ -381,11 +394,12 @@ struct DeskView: View {
                 workspaceShell
             }
         }
-        .background(DeskPalette.canvasBackground)
+        .background(immersive ? Color.black : DeskPalette.canvasBackground)
         .tint(DeskPalette.accent)
         .background(
             WindowReader(
                 sessionChrome: sessionLayout && !immersive,
+                immersiveFullScreen: model.mode == .viewer,
                 restorable: !isDedicatedSessionWindow,
                 resolved: { window in
                     if isDedicatedSessionWindow {
@@ -410,12 +424,12 @@ struct DeskView: View {
         )
         .focusedSceneValue(\.viewerSession, isDedicatedSessionWindow ? model : nil)
         .frame(minWidth: 700, minHeight: 560)
-        .ignoresSafeArea(immersive ? .container : (!sessionLayout ? .container : []), edges: immersive ? .all : .top)
-        .navigationTitle(sessionLayout ? remoteTitle : "QuietDesk")
+        .ignoresSafeArea(.all, edges: immersive ? .all : (!sessionLayout ? .top : []))
+        .navigationTitle(sessionLayout ? remoteTitle : "")
         .navigationSubtitle(sessionLayout ? remoteSubtitle : "")
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                if sessionLayout {
+                if sessionLayout && !immersive {
                     sessionScreenAndSpacesMenu
                     if model.supportsLiveSettings {
                         sessionQualityMenu
@@ -458,13 +472,14 @@ struct DeskView: View {
                             close: { showOptions = false },
                             openTraffic: openTrafficStatistics,
                             openEffects: openSessionEffects,
-                            openPortMapping: openPortMapping
+                            openPortMapping: openPortMapping,
+                            endSession: endCurrentSessionAction
                         )
                     }
                 }
             }
         }
-        .toolbar(immersive || !sessionLayout ? .hidden : .visible, for: .windowToolbar)
+        .toolbar(immersive ? .hidden : .visible, for: .windowToolbar)
         .onChange(of: viewerHasSession) { _, activeSession in
             if activeSession, models.workspaceSection != .connect {
                 models.workspaceSection = .connect
@@ -787,9 +802,21 @@ struct DeskView: View {
         .help("当前生效的画质预设，或切换到另一项预设")
     }
 
+    private var endCurrentSessionAction: () -> Void {
+        {
+            if isDedicatedSessionWindow {
+                models.disconnectViewerSession(model)
+            } else if model.active || model.working || model.reconnecting {
+                model.stop()
+            } else if model.isFullScreen {
+                model.toggleFullScreen()
+            }
+        }
+    }
+
     private var remoteContent: some View {
         ZStack {
-            if model.connected { Color.black } else { DeskPalette.insetBackground }
+            if model.connected || immersive { Color.black } else { DeskPalette.insetBackground }
             CanvasView(canvas: model.canvas)
                 .opacity(model.connected ? 1 : 0)
             if model.connected && model.sessionInputSuspended {
@@ -852,6 +879,7 @@ struct DeskView: View {
                     connecting: model.working && !model.reconnecting,
                     failure: model.connectionFailure,
                     disconnectedActionTitle: isDedicatedSessionWindow ? "关闭窗口" : "返回连接",
+                    isDedicatedSessionWindow: isDedicatedSessionWindow,
                     retry: (isDedicatedSessionWindow && model.canRetryLastSessionLaunch)
                         ? { model.retryLastSessionLaunch() }
                         : nil
@@ -906,7 +934,8 @@ struct DeskView: View {
                         if showFullScreenMenu {
                             SessionControlsView(model: model, close: { showFullScreenMenu = false },
                                                 openTraffic: openTrafficStatistics, openEffects: openSessionEffects,
-                                                openPortMapping: openPortMapping)
+                                                openPortMapping: openPortMapping,
+                                                endSession: endCurrentSessionAction)
                                 .frame(height: min(708, max(0, geometry.size.height - 32)))
                                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                                 .background {
@@ -1339,7 +1368,13 @@ struct DeskView: View {
             }
             return "\(route) · 已释放"
         }
-        return controlStatus
+        if model.reconnecting {
+            return controlStatus
+        }
+        if model.working {
+            return "正在建立加密连接…"
+        }
+        return model.connectionFailure ?? "未连接"
     }
 
     private func statusPill(_ value: String) -> some View {
@@ -1522,7 +1557,7 @@ private struct DeskWorkspaceSidebar: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
                 Text("QuietDesk")
-                    .font(.system(size: 13.5, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(DeskPalette.ink)
                     .padding(.leading, 78)
                 Spacer(minLength: 0)
@@ -1534,7 +1569,7 @@ private struct DeskWorkspaceSidebar: View {
                 .help("收起设备栏")
                 .accessibilityLabel("收起设备栏")
             }
-            .frame(height: 46)
+            .frame(height: 38)
             .padding(.trailing, 8)
 
             HStack(spacing: 5) {
@@ -1887,6 +1922,7 @@ private struct TrayView: View {
 
 private struct WindowReader: NSViewRepresentable {
     let sessionChrome: Bool
+    var immersiveFullScreen: Bool = false
     var restorable: Bool = true
     let resolved: (NSWindow) -> Void
     let fullScreen: (Bool) -> Void
@@ -1894,6 +1930,7 @@ private struct WindowReader: NSViewRepresentable {
     func makeNSView(context: Context) -> Probe {
         let view = Probe()
         view.sessionChrome = sessionChrome
+        view.immersiveFullScreen = immersiveFullScreen
         view.restorable = restorable
         view.resolved = resolved
         view.fullScreen = fullScreen
@@ -1902,22 +1939,51 @@ private struct WindowReader: NSViewRepresentable {
     }
     func updateNSView(_ view: Probe, context: Context) {
         view.sessionChrome = sessionChrome
+        view.immersiveFullScreen = immersiveFullScreen
         view.restorable = restorable
         view.resolved = resolved
         view.fullScreen = fullScreen
         view.willClose = willClose
         view.applyWindowChrome()
+        DispatchQueue.main.async { [weak view] in
+            view?.applyWindowChrome()
+        }
     }
     final class Probe: NSView {
         var sessionChrome = false
+        var immersiveFullScreen = false
         var restorable = true
         var resolved: ((NSWindow) -> Void)?
         var fullScreen: ((Bool) -> Void)?
         var willClose: (() -> Void)?
+        private var enteringFullScreen = false
         private var observers: [NSObjectProtocol] = []
         func applyWindowChrome() {
-            guard let window, !window.styleMask.contains(.fullScreen) else { return }
+            guard let window else { return }
             if window.isRestorable != restorable { window.isRestorable = restorable }
+            let inFullScreen = enteringFullScreen || window.styleMask.contains(.fullScreen)
+            if inFullScreen {
+                if immersiveFullScreen {
+                    if !window.styleMask.contains(.fullSizeContentView) {
+                        window.styleMask.insert(.fullSizeContentView)
+                    }
+                    if window.titleVisibility != .hidden { window.titleVisibility = .hidden }
+                    if !window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = true }
+                    if window.titlebarSeparatorStyle != .none { window.titlebarSeparatorStyle = .none }
+                    if window.toolbar?.isVisible == true { window.toolbar?.isVisible = false }
+                    if window.backgroundColor != .black { window.backgroundColor = .black }
+                    if window.appearance?.name != .darkAqua {
+                        window.appearance = NSAppearance(named: .darkAqua)
+                    }
+                }
+                return
+            }
+            if window.appearance != nil {
+                window.appearance = nil
+            }
+            if window.backgroundColor == .black {
+                window.backgroundColor = .windowBackgroundColor
+            }
             if sessionChrome {
                 if window.styleMask.contains(.fullSizeContentView) {
                     window.styleMask.remove(.fullSizeContentView)
@@ -1925,6 +1991,7 @@ private struct WindowReader: NSViewRepresentable {
                 if window.titleVisibility != .visible { window.titleVisibility = .visible }
                 if window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = false }
                 if window.titlebarSeparatorStyle != .automatic { window.titlebarSeparatorStyle = .automatic }
+                if window.toolbar?.isVisible == false { window.toolbar?.isVisible = true }
             } else {
                 if !window.styleMask.contains(.fullSizeContentView) {
                     window.styleMask.insert(.fullSizeContentView)
@@ -1932,6 +1999,13 @@ private struct WindowReader: NSViewRepresentable {
                 if window.titleVisibility != .hidden { window.titleVisibility = .hidden }
                 if !window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = true }
                 if window.titlebarSeparatorStyle != .none { window.titlebarSeparatorStyle = .none }
+                if window.toolbar?.isVisible == true { window.toolbar?.isVisible = false }
+            }
+            for buttonType: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
+                if let button = window.standardWindowButton(buttonType) {
+                    if button.isHidden { button.isHidden = false }
+                    if button.superview?.isHidden == true { button.superview?.isHidden = false }
+                }
             }
         }
         override func viewDidMoveToWindow() {
@@ -1940,17 +2014,39 @@ private struct WindowReader: NSViewRepresentable {
             observers.removeAll()
             guard let window else { return }
             window.minSize = NSSize(width: 720, height: 580)
+            enteringFullScreen = window.styleMask.contains(.fullScreen)
             applyWindowChrome()
+            DispatchQueue.main.async { [weak self] in
+                self?.applyWindowChrome()
+            }
             resolved?(window)
             fullScreen?(window.styleMask.contains(.fullScreen))
-            for name in [NSWindow.didEnterFullScreenNotification, NSWindow.didExitFullScreenNotification] {
-                observers.append(NotificationCenter.default.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
-                    MainActor.assumeIsolated {
-                        self?.fullScreen?(self?.window?.styleMask.contains(.fullScreen) == true)
-                        self?.applyWindowChrome()
-                    }
-                })
-            }
+            observers.append(NotificationCenter.default.addObserver(forName: NSWindow.willEnterFullScreenNotification, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.enteringFullScreen = true
+                    self?.fullScreen?(true)
+                    self?.applyWindowChrome()
+                }
+            })
+            observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.enteringFullScreen = false
+                    self?.fullScreen?(self?.window?.styleMask.contains(.fullScreen) == true)
+                    self?.applyWindowChrome()
+                }
+            })
+            observers.append(NotificationCenter.default.addObserver(forName: NSWindow.willExitFullScreenNotification, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.enteringFullScreen = false
+                }
+            })
+            observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didExitFullScreenNotification, object: window, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.enteringFullScreen = false
+                    self?.fullScreen?(self?.window?.styleMask.contains(.fullScreen) == true)
+                    self?.applyWindowChrome()
+                }
+            })
             observers.append(NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
                     self?.willClose?()

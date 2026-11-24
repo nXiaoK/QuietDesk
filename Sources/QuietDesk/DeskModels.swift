@@ -275,12 +275,10 @@ final class DeskModels: ObservableObject {
 
     func disconnectViewerSession(_ session: DeskModel) {
         let id = session.sessionID
-        let window = session.mainWindow
-        let wasFullScreen = window?.styleMask.contains(.fullScreen) == true
-        session.stop()
-        unregisterViewerSession(id: id)
-        guard let window else { return }
-        if wasFullScreen {
+        let window = session.mainWindow ?? session.canvas.window
+        let wasFullScreen = window?.styleMask.contains(.fullScreen) == true || session.isFullScreen
+        let hadFullScreenFlag = session.isFullScreen
+        if wasFullScreen, let window {
             if let prior = fullScreenCloseObservers.removeValue(forKey: id) {
                 NotificationCenter.default.removeObserver(prior)
             }
@@ -294,9 +292,18 @@ final class DeskModels: ObservableObject {
                         NotificationCenter.default.removeObserver(removed)
                     }
                     window?.close()
+                    self?.mainWindow?.makeKeyAndOrderFront(nil)
                 }
             }
             fullScreenCloseObservers[id] = observer
+        }
+        session.stop()
+        unregisterViewerSession(id: id)
+        guard let window else { return }
+        if wasFullScreen {
+            if !hadFullScreenFlag, window.styleMask.contains(.fullScreen) {
+                window.toggleFullScreen(nil)
+            }
         } else {
             window.close()
         }

@@ -41,7 +41,8 @@ struct ConnectionRecoveryPresentation {
         now: TimeInterval,
         connecting: Bool = false,
         failure: String? = nil,
-        disconnectedActionTitle: String = "返回连接"
+        disconnectedActionTitle: String = "返回连接",
+        isDedicatedSessionWindow: Bool = false
     ) {
         if reconnecting && paused {
             state = .paused
@@ -71,6 +72,12 @@ struct ConnectionRecoveryPresentation {
             state = .disconnected
             title = "连接未建立或已断开"
             detail = failure
+            reason = nil
+            actionTitle = disconnectedActionTitle
+        } else if isDedicatedSessionWindow {
+            state = .disconnected
+            title = "远程连接已结束"
+            detail = "可关闭此窗口返回主界面，或重新连接此设备。"
             reason = nil
             actionTitle = disconnectedActionTitle
         } else {
@@ -104,6 +111,7 @@ struct ConnectionRecoveryView: View {
     var connecting: Bool = false
     var failure: String? = nil
     var disconnectedActionTitle: String = "返回连接"
+    var isDedicatedSessionWindow: Bool = false
     var retry: (() -> Void)? = nil
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
@@ -117,7 +125,8 @@ struct ConnectionRecoveryView: View {
                 now: now(),
                 connecting: connecting,
                 failure: failure,
-                disconnectedActionTitle: disconnectedActionTitle
+                disconnectedActionTitle: disconnectedActionTitle,
+                isDedicatedSessionWindow: isDedicatedSessionWindow
             )
             VStack(alignment: .leading, spacing: 11) {
                 HStack(spacing: 10) {

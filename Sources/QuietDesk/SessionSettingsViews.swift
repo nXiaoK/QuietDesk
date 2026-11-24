@@ -583,6 +583,7 @@ struct SessionControlsView: View {
     let openTraffic: () -> Void
     let openEffects: () -> Void
     let openPortMapping: () -> Void
+    var endSession: (() -> Void)? = nil
 
     private var presentation: SessionToolsPresentation {
         SessionToolsPresentation(connected: model.connected, reconnecting: model.reconnecting,
@@ -622,8 +623,13 @@ struct SessionControlsView: View {
             case .traffic: openTraffic()
             case .endSession:
                 close()
-                if model.active || model.working || model.reconnecting { model.stop() }
-                else if model.isFullScreen { model.toggleFullScreen() }
+                if let endSession {
+                    endSession()
+                } else if model.active || model.working || model.reconnecting {
+                    model.stop()
+                } else if model.isFullScreen {
+                    model.toggleFullScreen()
+                }
             }
         }
     }

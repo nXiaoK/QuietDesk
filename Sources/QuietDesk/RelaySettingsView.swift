@@ -48,69 +48,50 @@ struct RelaySettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             if !embedded {
-                HStack(spacing: 12) {
-                    Image(systemName: "network")
-                        .font(.system(size: 22))
-                        .foregroundStyle(Color.accentColor)
-                        .frame(width: 42, height: 42)
-                        .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("自托管中继").font(.system(size: 17, weight: .bold))
-                        Text("两台 Mac 主动连接同一自建节点，无需路由器公网端口映射。")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }
+                DeskSectionHeading(
+                    title: "自托管中继",
+                    symbol: nil,
+                    detail: "两台 Mac 主动连接同一自建节点。配置在下次共享或连接时生效。"
+                )
             }
 
-            let inner = VStack(alignment: .leading, spacing: 14) {
-                DeskSurfaceCard(padding: 16, cornerRadius: 13) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("启用自托管中继功能")
-                                .font(.system(size: 13.5, weight: .bold))
-                            Text("共享时在全部已添加节点登记；连接时自动探测延迟并优先选最快节点，接不通自动回退下一节点。")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Toggle("启用中继功能", isOn: $enabled)
-                            .labelsHidden()
-                            .toggleStyle(.switch)
+            let inner = VStack(alignment: .leading, spacing: 18) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("启用自托管中继")
+                            .font(.callout.weight(.medium))
+                        Text("共享时在全部节点登记，连接时优先尝试延迟最低的节点。")
+                            .font(.caption)
+                            .foregroundStyle(DeskPalette.secondary)
                     }
+                    Spacer()
+                    Toggle("启用中继功能", isOn: $enabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
                 }
 
                 if enabled {
-                    DeskSurfaceCard(padding: 16, cornerRadius: 13) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            nodeList
-                            if editing != nil { nodeEditor }
-                        }
-                    }
+                    nodeList
 
-                    DeskSurfaceCard(padding: 16, cornerRadius: 13) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Label("本机中继设备标识（保存后生效）", systemImage: "person.text.rectangle")
-                                    .font(.system(size: 13.5, weight: .bold))
-                                Spacer()
-                                Button("更换标识") {
-                                    deviceID = UUID().uuidString.lowercased()
-                                }
-                                .controlSize(.small)
-                            }
-
+                    VStack(alignment: .leading, spacing: 9) {
+                        Text("本机中继设备标识（保存后生效）")
+                            .font(.caption)
+                            .foregroundStyle(DeskPalette.secondary)
+                        DeskSurfaceCard(padding: 10, cornerRadius: 6) {
                             Text(deviceID)
-                                .font(.system(size: 12.5, weight: .medium, design: .monospaced))
+                                .font(.system(.callout, design: .monospaced))
                                 .textSelection(.enabled)
-                                .padding(9)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(DeskPalette.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-
-                            Text("开启共享后，控制端凭此设备标识和本机配对码即可经任一节点连入。更换标识后需同步更新另一台 Mac 保存的目标标识，不影响配对码。")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
                         }
+                        Button("更换标识") {
+                            deviceID = UUID().uuidString.lowercased()
+                        }
+                        .buttonStyle(DeskButtonStyle(.secondary))
+
+                        Text("开启共享后，控制端凭此设备标识和本机配对码即可经任一节点连入。更换标识后需同步更新另一台 Mac 保存的目标标识，不影响配对码。")
+                            .font(.caption)
+                            .foregroundStyle(DeskPalette.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 3)
                     }
                 }
             }
@@ -121,7 +102,7 @@ struct RelaySettingsView: View {
                 inner
             } else {
                 ScrollView { inner }
-                    .frame(height: enabled ? 440 : 100)
+                    .frame(maxHeight: enabled ? 385 : 66)
             }
 
             if locked {
@@ -129,10 +110,10 @@ struct RelaySettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if let failure {
+            if editing == nil, let failure {
                 Label(failure, systemImage: "exclamationmark.triangle.fill")
                     .font(.callout)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(DeskPalette.coral)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -142,7 +123,9 @@ struct RelaySettingsView: View {
                     .foregroundStyle(savedFeedback ? DeskPalette.emerald : .secondary)
                 Spacer()
                 if !embedded {
-                    Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
+                    Button("取消") { dismiss() }
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .keyboardShortcut(.cancelAction)
                 }
                 Button(embedded ? "保存中继配置" : "保存") {
                     do {
@@ -161,7 +144,7 @@ struct RelaySettingsView: View {
                         failure = error.localizedDescription
                     }
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(DeskButtonStyle(.primary))
                 .keyboardShortcut(embedded ? nil : .defaultAction)
                 .disabled(locked || (enabled && editing != nil))
                 .help(editing != nil ? "请先保存或取消正在编辑的节点" : "")
@@ -170,7 +153,8 @@ struct RelaySettingsView: View {
         .padding(embedded ? 0 : 22)
         .frame(width: embedded ? nil : 560)
         .frame(maxWidth: embedded ? .infinity : nil, alignment: .leading)
-        .background(embedded ? Color.clear : Color(nsColor: .windowBackgroundColor))
+        .background(embedded ? Color.clear : DeskPalette.canvasBackground)
+        .tint(DeskPalette.accent)
         .onChange(of: address) { _, _ in if editing != nil { reloadTrust() } }
         .onChange(of: enabled) { _, value in
             if !value { cancelEditing() }
@@ -181,85 +165,126 @@ struct RelaySettingsView: View {
         }
         .onAppear { if editing != nil { reloadTrust() } }
         .onDisappear { requestID = UUID(); probe?.cancel(); probe = nil }
+        .sheet(isPresented: Binding(
+            get: { editing != nil },
+            set: { if !$0 { cancelEditing() } }
+        )) {
+            nodeEditor
+        }
     }
 
     private var nodeList: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Label("已配置中继节点", systemImage: "server.rack")
-                    .font(.system(size: 13.5, weight: .bold))
+                Text("中继节点").font(.headline)
                 Spacer()
                 if editing == nil {
-                    Button {
-                        beginEditing("")
-                    } label: {
-                        Label("添加节点…", systemImage: "plus")
-                    }
-                    .controlSize(.small)
+                    Button("添加节点…") { beginEditing("") }
+                        .buttonStyle(DeskButtonStyle(.secondary))
                 }
             }
 
-            if nodes.isEmpty, editing == nil {
-                Text("尚未添加中继节点，点击右上角「添加节点…」配置首个服务地址。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            DeskSurfaceCard(padding: 0, cornerRadius: 9) {
+                VStack(alignment: .leading, spacing: 0) {
+                    if nodes.isEmpty {
+                        Text("尚未添加中继节点。")
+                            .font(.callout)
+                            .foregroundStyle(DeskPalette.secondary)
+                            .padding(14)
+                    } else {
+                        nodeColumns {
+                            Text("节点").frame(maxWidth: .infinity, alignment: .leading)
+                            Text("探测结果").frame(width: 124, alignment: .leading)
+                            Text("操作").frame(width: 108, alignment: .leading)
+                        }
+                        .font(.caption)
+                        .foregroundStyle(DeskPalette.secondary)
+                        .background(DeskPalette.insetBackground)
+                        .accessibilityHidden(true)
 
-            ForEach(nodes, id: \.self) { node in
-                HStack(spacing: 10) {
-                    Image(systemName: "server.rack")
-                        .foregroundStyle(Color.accentColor)
-                    Text(node)
-                        .font(.system(size: 12.5, weight: .medium, design: .monospaced))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    if let label = RelayNodeLabel.latency(measurements[node]) {
-                        DeskPillBadge(text: label, tint: label == "不可达" ? DeskPalette.coral : DeskPalette.emerald, monospaced: true)
+                        ForEach(nodes, id: \.self) { node in
+                            Divider().padding(.horizontal, 14)
+                            nodeRow(node)
+                        }
                     }
-                    Spacer()
-                    Button("编辑") { beginEditing(node) }
-                        .controlSize(.small)
-                    Button("移除", role: .destructive) { nodes.removeAll { $0 == node } }
-                        .controlSize(.small)
                 }
-                .disabled(editing != nil)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .background(DeskPalette.subtleFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
             }
+            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
         }
     }
 
+    private func nodeRow(_ node: String) -> some View {
+        nodeColumns {
+            Text(node)
+                .font(.system(.callout, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(node)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            let latency = RelayNodeLabel.latency(measurements[node])
+            Text(latency ?? "—")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(latency == "不可达" ? DeskPalette.coral : DeskPalette.secondary)
+                .frame(width: 124, alignment: .leading)
+            HStack(spacing: 7) {
+                Button("编辑") { beginEditing(node) }
+                    .buttonStyle(DeskButtonStyle(.quiet))
+                    .accessibilityLabel("编辑 \(node)")
+                Button("移除", role: .destructive) { nodes.removeAll { $0 == node } }
+                    .buttonStyle(DeskButtonStyle(.danger))
+                    .accessibilityLabel("移除 \(node)")
+            }
+            .frame(width: 108, alignment: .leading)
+        }
+        .disabled(editing != nil)
+    }
+
+    private func nodeColumns(@ViewBuilder _ content: () -> some View) -> some View {
+        HStack(spacing: 10, content: content)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+    }
+
     private var nodeEditor: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(editing?.isEmpty == true ? "添加新中继节点" : "编辑中继节点")
-                .font(.subheadline.weight(.bold))
-            VStack(alignment: .leading, spacing: 5) {
-                Text("中继服务地址").font(.caption.weight(.medium)).foregroundStyle(.secondary)
-                TextField("tls://服务器IP:7443 或 tls://域名:7443", text: $address)
-                    .font(.system(size: 12.5, design: .monospaced))
-                    .accessibilityLabel("中继服务地址")
+        VStack(alignment: .leading, spacing: 16) {
+            DeskSectionHeading(title: editing?.isEmpty == true ? "添加中继节点" : "编辑中继节点", symbol: nil, detail: nil)
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("中继服务地址").font(.caption).foregroundStyle(DeskPalette.secondary)
+                    TextField("tls://服务器IP:7443 或 tls://域名:7443", text: $address)
+                        .font(.system(.callout, design: .monospaced))
+                        .accessibilityLabel("中继服务地址")
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("节点接入码（与 Mac 配对码不同）").font(.caption).foregroundStyle(DeskPalette.secondary)
+                    SecureField("首次必填；编辑时留空保留已保存接入码", text: $accessCode)
+                        .accessibilityLabel("中继接入码，与 Mac 配对码不同")
+                }
+                Divider()
+                certificateSettings
             }
-            VStack(alignment: .leading, spacing: 5) {
-                Text("节点接入码（与 Mac 配对码不同）").font(.caption.weight(.medium)).foregroundStyle(.secondary)
-                SecureField("首次必填；编辑时留空保留已保存接入码", text: $accessCode)
-                    .accessibilityLabel("中继接入码，与 Mac 配对码不同")
+            .disabled(locked)
+            if let failure {
+                Label(failure, systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(DeskPalette.coral)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            certificateSettings
-            HStack {
+            HStack(spacing: 10) {
                 Spacer()
                 Button("取消") { cancelEditing() }
+                    .buttonStyle(DeskButtonStyle(.secondary))
+                    .keyboardShortcut(.cancelAction)
                 Button("保存节点") { saveEditedNode() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(address.trimmingCharacters(in: .whitespaces).isEmpty || probe != nil || !trustLoaded || candidate != nil)
+                    .buttonStyle(DeskButtonStyle(.primary))
+                    .disabled(locked || address.trimmingCharacters(in: .whitespaces).isEmpty || probe != nil || !trustLoaded || candidate != nil)
             }
+            .padding(.top, 7)
         }
-        .padding(14)
-        .background(DeskPalette.subtleFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(Color.accentColor.opacity(0.3), lineWidth: 1)
-        }
+        .textFieldStyle(.roundedBorder)
+        .padding(24)
+        .frame(width: 525)
+        .deskSurface()
     }
 
     private func beginEditing(_ node: String) {
@@ -290,7 +315,7 @@ struct RelaySettingsView: View {
     private var certificateSettings: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("TLS 节点证书信任").font(.caption.weight(.semibold))
+                Text("TLS 节点证书信任").font(.headline)
                 Spacer()
                 DeskInfoPopoverButton(
                     title: "自签证书 SHA-256 指纹信任说明",
@@ -307,14 +332,14 @@ struct RelaySettingsView: View {
                 Text("当前使用 macOS 系统受信任 CA 证书").font(.caption).foregroundStyle(.secondary)
             }
             HStack(spacing: 8) {
-                Button("导入证书文件…") { importCertificate() }
-                    .controlSize(.small)
+                Button("导入 PEM / DER 证书…") { importCertificate() }
+                    .buttonStyle(DeskButtonStyle(.secondary))
                 Button(probe == nil ? "在线获取并核对指纹…" : "正在获取…") { fetchCertificate() }
-                    .controlSize(.small)
+                    .buttonStyle(DeskButtonStyle(.secondary))
                     .disabled(probe != nil)
                 if probe != nil {
                     Button("取消获取") { requestID = UUID(); probe?.cancel(); probe = nil }
-                        .controlSize(.small)
+                        .buttonStyle(DeskButtonStyle(.quiet))
                 }
                 if certificate != nil || candidate != nil {
                     Button("改用系统信任") {
@@ -333,19 +358,25 @@ struct RelaySettingsView: View {
                     if let expires = candidate.expires { Text("有效期至 \(expires.formatted())").font(.caption) }
                     Toggle("我已与服务器终端输出的 SHA-256 指纹核对一致", isOn: $fingerprintChecked)
                         .font(.caption)
-                    HStack {
+                    Label("请核对指纹后再确认信任。", systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(DeskPalette.amber)
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(DeskPalette.amber.opacity(0.09), in: RoundedRectangle(cornerRadius: 6))
+                    HStack(spacing: 8) {
                         Button("信任此证书") {
                             certificate = candidate; self.candidate = nil; trustLoaded = true; failure = nil
                         }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(DeskButtonStyle(.primary))
                         .controlSize(.small)
                         .disabled(!fingerprintChecked)
                         Button("放弃") { self.candidate = nil; fingerprintChecked = false }
-                            .controlSize(.small)
+                            .buttonStyle(DeskButtonStyle(.secondary))
                     }
                 }
                 .padding(10)
-                .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(DeskPalette.insetBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
         }
     }

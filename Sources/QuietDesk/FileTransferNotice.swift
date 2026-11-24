@@ -44,19 +44,21 @@ struct ClipboardActivityView: View {
             if let status {
                 HStack(alignment: .top, spacing: 10) {
                     Image(systemName: pendingOffer ? "doc.on.doc" : "arrow.triangle.2.circlepath")
-                        .foregroundStyle(pendingOffer ? Color.orange : Color.accentColor)
+                        .foregroundStyle(pendingOffer ? DeskPalette.amber : DeskPalette.accent)
                     VStack(alignment: .leading, spacing: 7) {
-                        Text(pendingOffer ? "1 个文件请求待确认" : "剪贴板与文件").font(.headline)
+                        Text(pendingOffer ? "1 个文件请求待确认" : "剪贴板与文件").font(.system(size: 14, weight: .semibold))
                         Text(status).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                         if let keptFilesMessage {
                             Text(keptFilesMessage).font(.caption).foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                         if let cancelReception {
-                            Button("中断接收", role: .destructive, action: cancelReception).controlSize(.small)
+                            Button("中断接收", role: .destructive, action: cancelReception)
+                                .buttonStyle(DeskButtonStyle(.danger))
                         }
                         if keptFilesMessage != nil {
-                            Button("打开接收文件目录", action: openFolder).controlSize(.small)
+                            Button("打开接收文件目录", action: openFolder)
+                                .buttonStyle(DeskButtonStyle(.secondary))
                         }
                     }.frame(maxWidth: .infinity, alignment: .leading)
                     Button(action: dismissStatus) { Image(systemName: "xmark") }
@@ -77,15 +79,16 @@ struct FileTransferResultView: View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: notice.result.outcome == .completed ? "checkmark.circle.fill"
                   : notice.result.outcome == .cancelled ? "minus.circle" : "exclamationmark.triangle.fill")
-                .foregroundStyle(notice.result.outcome == .completed ? Color.green : Color.orange)
+                .foregroundStyle(notice.result.outcome == .completed ? DeskPalette.emerald : DeskPalette.amber)
             VStack(alignment: .leading, spacing: 7) {
-                Text(notice.title).font(.headline)
+                Text(notice.title).font(.system(size: 14, weight: .semibold))
                 Text(notice.result.message).font(.callout).textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
                 Text(notice.nextStep).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if notice.canOpenFolder {
-                    Button("打开接收文件目录", action: openFolder).controlSize(.small)
+                    Button("打开接收文件目录", action: openFolder)
+                        .buttonStyle(DeskButtonStyle(.secondary))
                 }
             }.frame(maxWidth: .infinity, alignment: .leading)
             Button(action: dismiss) { Image(systemName: "xmark") }

@@ -118,34 +118,56 @@ struct ConnectionRecoveryView: View {
                 failure: failure,
                 disconnectedActionTitle: disconnectedActionTitle
             )
-            VStack(spacing: 14) {
-                if presentation.showsActivity { ProgressView().controlSize(.small) }
-                else { Image(systemName: presentation.symbol).font(.system(size: 28)).foregroundStyle(.secondary) }
-                Text(presentation.title).font(.title3.weight(.semibold))
-                    .multilineTextAlignment(.center)
-                Text(presentation.detail).font(.callout).foregroundStyle(.secondary)
-                    .monospacedDigit().multilineTextAlignment(.center)
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 11) {
+                    if presentation.showsActivity {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: presentation.symbol)
+                            .font(.system(size: 17))
+                            .foregroundStyle(DeskPalette.secondary)
+                            .accessibilityHidden(true)
+                    }
+                    Text(presentation.title)
+                        .font(.system(size: 18, weight: .semibold))
+                        .accessibilityAddTraits(.isHeader)
+                }
+                Text(presentation.detail)
+                    .font(.system(size: 13))
+                    .foregroundStyle(DeskPalette.secondary)
+                    .monospacedDigit()
+                    .fixedSize(horizontal: false, vertical: true)
                 if let reason = presentation.reason {
-                    Text(reason).font(.caption).foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center).textSelection(.enabled)
+                    Text(reason).font(.caption).foregroundStyle(DeskPalette.secondary)
+                        .textSelection(.enabled)
                 }
                 if reconnecting {
-                    Text("重连期间不发送键盘鼠标").font(.caption).foregroundStyle(.secondary)
-                    Button(presentation.actionTitle, action: stop)
-                } else if connecting {
-                    Button(presentation.actionTitle, action: stop)
-                } else if let retry {
-                    HStack(spacing: 10) {
-                        Button("重新连接", action: retry)
-                            .buttonStyle(.borderedProminent)
-                        Button(presentation.actionTitle, action: returnToConnection)
-                    }
-                } else {
-                    Button(presentation.actionTitle, action: returnToConnection)
+                    Text("重连期间不发送键盘鼠标")
+                        .font(.caption)
+                        .foregroundStyle(DeskPalette.muted)
                 }
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    if reconnecting || connecting {
+                        Button(presentation.actionTitle, action: stop)
+                            .buttonStyle(DeskButtonStyle(.secondary))
+                    } else {
+                        Button(presentation.actionTitle, action: returnToConnection)
+                            .buttonStyle(DeskButtonStyle(retry == nil ? .primary : .secondary))
+                        if let retry {
+                            Button("重新连接", action: retry)
+                                .buttonStyle(DeskButtonStyle(.primary))
+                        }
+                    }
+                }
+                .padding(.top, 7)
             }
-            .padding(24).frame(maxWidth: 420)
-            .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+            .padding(24)
+            .frame(maxWidth: 420)
+            .foregroundStyle(DeskPalette.ink)
+            .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 12))
+            .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(DeskPalette.hairline) }
+            .shadow(color: .black.opacity(0.09), radius: 15, y: 5)
         }
     }
 }

@@ -74,17 +74,18 @@ struct ClipboardFilePromptView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .top, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
                 Image(systemName: "doc.on.doc")
-                    .font(.system(size: 20, weight: .medium))
-                    .foregroundStyle(Color.accentColor)
-                    .frame(width: 40, height: 44)
-                    .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                    .font(.system(size: 17))
+                    .foregroundStyle(DeskPalette.secondary)
+                    .padding(.top, 2)
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 5) {
                     Text(peerName.isEmpty ? "接收对端的文件？" : "接收来自「\(peerName)」的文件？")
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(.system(size: 18, weight: .semibold))
                         .lineLimit(3)
                         .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityAddTraits(.isHeader)
                     Text("确认接收后开始下载文件。")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
@@ -130,8 +131,8 @@ struct ClipboardFilePromptView: View {
                     .padding(.vertical, 9)
             }
             .font(.system(size: 13))
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
+            .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 8))
+            .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(DeskPalette.hairline) }
 
             VStack(alignment: .leading, spacing: 5) {
                 Label("保存到接收文件目录", systemImage: "folder")
@@ -152,11 +153,14 @@ struct ClipboardFilePromptView: View {
                         .monospacedDigit()
                     ProgressView(value: min(remaining, 90), total: 90)
                         .progressViewStyle(.linear)
-                        .tint(Color.accentColor)
+                        .tint(DeskPalette.accent)
                         .accessibilityLabel("剩余确认时间")
                         .accessibilityValue(remaining > 0 ? "约 \(Int(ceil(remaining))) 秒" : "等待请求清理")
                 }
             }
+            .foregroundStyle(DeskPalette.amber)
+            .padding(10)
+            .background(DeskPalette.amber.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
 
             HStack(spacing: 10) {
                 Text("关闭或按 Esc = 拒绝\n每次发送都需确认")
@@ -165,17 +169,15 @@ struct ClipboardFilePromptView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer()
                 Button("拒绝") { decide(false) }
+                    .buttonStyle(DeskButtonStyle(.secondary))
                     .keyboardShortcut(.cancelAction)
-                    .frame(minWidth: 56)
                 Button("接收") { decide(true) }
-                    .buttonStyle(.borderedProminent)
-                    .frame(minWidth: 56)
+                    .buttonStyle(DeskButtonStyle(.primary))
             }
         }
         .padding(24)
         .frame(width: 440)
-        .foregroundStyle(.primary)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .deskSurface()
         .fixedSize(horizontal: false, vertical: true)
     }
 }

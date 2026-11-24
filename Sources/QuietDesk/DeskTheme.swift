@@ -1,12 +1,6 @@
 import AppKit
 import SwiftUI
 
-enum DeskWorkspaceGroup: String, CaseIterable {
-    case workspace = "工作台"
-    case network = "网络与诊断"
-    case system = "系统与安全"
-}
-
 enum DeskWorkspaceSection: String, CaseIterable, Identifiable {
     case connect
     case sharing
@@ -16,80 +10,165 @@ enum DeskWorkspaceSection: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    var group: DeskWorkspaceGroup {
-        switch self {
-        case .connect, .sharing: return .workspace
-        case .network, .benchmark: return .network
-        case .preferences: return .system
-        }
-    }
-
     var title: String {
         switch self {
-        case .connect: return "远程桌面"
+        case .connect: return "全部设备"
         case .sharing: return "本机共享"
-        case .network: return "端口映射与中继"
+        case .network: return "网络与线路"
         case .benchmark: return "线路实测与流量"
-        case .preferences: return "键盘、防窥与偏好"
-        }
-    }
-
-    var pageTitle: String {
-        switch self {
-        case .connect: return "远程桌面"
-        case .sharing: return "本机共享控制台"
-        case .network: return "端口映射与自托管中继"
-        case .benchmark: return "线路实测与历史流量"
-        case .preferences: return "键盘、防窥与连接偏好"
-        }
-    }
-
-    var subtitle: String {
-        switch self {
-        case .connect: return "从已保存的书桌一键继续工作，或发起新的加密连接"
-        case .sharing: return "管理被控状态、配对凭据、macOS 实际生效权限与默认编码档位"
-        case .network: return "统一管理 TCP 端口映射隧道、自托管中继节点与本机被控映射授权"
-        case .benchmark: return "执行实际视频流质量对比，查看历史总评估与按地址累计收发流量"
-        case .preferences: return "Caps Lock 远端输入法切换、系统快捷键实效权限、被控端防窥记忆、连接默认项与自动更新"
+        case .preferences: return "设置"
         }
     }
 
     var symbol: String {
         switch self {
-        case .connect: return "desktopcomputer"
-        case .sharing: return "dot.radiowaves.left.and.right"
-        case .network: return "point.3.connected.trianglepath.dotted"
+        case .connect: return "square.grid.2x2"
+        case .sharing: return "square.and.arrow.up"
+        case .network: return "point.3.filled.connected.trianglepath.dotted"
         case .benchmark: return "speedometer"
-        case .preferences: return "keyboard.badge.eye"
+        case .preferences: return "gearshape"
         }
     }
 }
 
 enum DeskPalette {
-    static let emerald = Color(red: 0.07, green: 0.64, blue: 0.44)
-    static let amber = Color(red: 0.88, green: 0.52, blue: 0.08)
-    static let coral = Color(red: 0.86, green: 0.22, blue: 0.24)
+    static let accent = adaptive(0x0875E1, 0x72B6FF, contrast: 0x005DBB)
+    static let actionFill = adaptive(0x0875E1, 0x0865CC, contrast: 0x005AB6)
+    static let ink = adaptive(0x222830, 0xEBEEF3, contrast: 0x11161B)
+    static let secondary = adaptive(0x515E6A, 0xB2BEC9, contrast: 0x36404A)
+    static let muted = adaptive(0x65717D, 0x9DAABA, contrast: 0x48525D)
+    static let canvasBackground = adaptive(0xF4F5F7, 0x21252B)
+    static let cardBackground = adaptive(0xFFFFFF, 0x2B3038)
+    static let sidebarBackground = adaptive(0xEFF0F2, 0x262B32)
+    static let insetBackground = adaptive(0xF6F7F9, 0x242932)
+    static let subtleFill = adaptive(0xECEFF3, 0x363D47)
+    static let selection = adaptive(0xE1E5EA, 0x3C4653, contrast: 0xC9D7E8)
+    static let hairline = adaptive(0xDCE1E7, 0x484F59, contrast: 0x9BA8B6, darkContrast: 0x778494)
+    static let emerald = adaptive(0x137A51, 0x6DDAB0)
+    static let amber = adaptive(0x925511, 0xF3BC70)
+    static let coral = adaptive(0xB6303B, 0xFF9298)
 
-    static var canvasBackground: Color {
-        Color(nsColor: .windowBackgroundColor)
+    private static func adaptive(
+        _ light: UInt32, _ dark: UInt32, contrast: UInt32? = nil, darkContrast: UInt32? = nil
+    ) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let match = appearance.bestMatch(from: [
+                .accessibilityHighContrastDarkAqua, .accessibilityHighContrastAqua, .darkAqua, .aqua
+            ])
+            let hex: UInt32
+            switch match {
+            case .accessibilityHighContrastDarkAqua: hex = darkContrast ?? dark
+            case .accessibilityHighContrastAqua: hex = contrast ?? light
+            case .darkAqua: hex = dark
+            default: hex = light
+            }
+            return NSColor(
+                srgbRed: CGFloat((hex >> 16) & 255) / 255,
+                green: CGFloat((hex >> 8) & 255) / 255,
+                blue: CGFloat(hex & 255) / 255,
+                alpha: 1
+            )
+        })
+    }
+}
+
+extension View {
+    func deskSurface() -> some View {
+        background(DeskPalette.canvasBackground)
+            .foregroundStyle(DeskPalette.ink)
+            .tint(DeskPalette.accent)
+    }
+}
+
+struct DeskButtonStyle: ButtonStyle {
+    enum Kind { case primary, secondary, danger, quiet }
+
+    var kind: Kind
+
+    init(_ kind: Kind) {
+        self.kind = kind
     }
 
-    static var cardBackground: Color {
-        Color(nsColor: .controlBackgroundColor)
+    func makeBody(configuration: Configuration) -> some View {
+        StyledLabel(configuration: configuration, kind: kind)
     }
 
-    static var subtleFill: Color {
-        Color.primary.opacity(0.045)
-    }
+    private struct StyledLabel: View {
+        let configuration: Configuration
+        let kind: Kind
+        @Environment(\.isEnabled) private var isEnabled
+        @Environment(\.isFocused) private var isFocused
+        @State private var hovering = false
 
-    static var hairline: Color {
-        Color(nsColor: .separatorColor).opacity(0.65)
+        var body: some View {
+            let shape = RoundedRectangle(cornerRadius: 7)
+            configuration.label
+                .font(.system(size: 12, weight: kind == .primary ? .semibold : .medium))
+                .foregroundStyle(foreground)
+                .padding(.horizontal, 11)
+                .frame(minHeight: 29)
+                .background(background, in: shape)
+                .overlay {
+                    shape.strokeBorder(isFocused ? DeskPalette.accent : border, lineWidth: isFocused ? 2 : 1)
+                }
+                .contentShape(shape)
+                .opacity(isEnabled ? 1 : 0.48)
+                .onHover { hovering = $0 }
+        }
+
+        private var foreground: Color {
+            switch kind {
+            case .primary: return .white
+            case .secondary: return DeskPalette.ink
+            case .danger: return DeskPalette.coral
+            case .quiet: return DeskPalette.secondary
+            }
+        }
+
+        private var background: Color {
+            if kind == .primary { return DeskPalette.actionFill.opacity(configuration.isPressed ? 0.82 : 1) }
+            if isEnabled && (configuration.isPressed || hovering) { return DeskPalette.subtleFill }
+            return kind == .quiet ? .clear : DeskPalette.cardBackground
+        }
+
+        private var border: Color {
+            kind == .primary || kind == .quiet ? .clear : DeskPalette.hairline
+        }
+    }
+}
+
+struct DeskSectionHeading: View {
+    let title: String
+    var symbol: String? = nil
+    var detail: String? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 9) {
+                if let symbol {
+                    Image(systemName: symbol)
+                        .font(.system(size: 14))
+                        .foregroundStyle(DeskPalette.secondary)
+                        .accessibilityHidden(true)
+                }
+                Text(title)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(DeskPalette.ink)
+                    .accessibilityAddTraits(.isHeader)
+            }
+            if let detail {
+                Text(detail)
+                    .font(.system(size: 12))
+                    .foregroundStyle(DeskPalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }
 
 struct DeskSurfaceCard<Content: View>: View {
     var padding: CGFloat = 16
-    var cornerRadius: CGFloat = 13
+    var cornerRadius: CGFloat = 10
     var highlightColor: Color? = nil
     @ViewBuilder let content: () -> Content
 
@@ -102,7 +181,7 @@ struct DeskSurfaceCard<Content: View>: View {
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                     .strokeBorder(
                         highlightColor.map { $0.opacity(0.42) } ?? DeskPalette.hairline,
-                        lineWidth: highlightColor == nil ? 0.8 : 1.3
+                        lineWidth: 1
                     )
             }
     }
@@ -126,8 +205,8 @@ struct DeskPillBadge: View {
                 .lineLimit(1)
         }
         .foregroundStyle(tint)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
         .background(tint.opacity(0.12), in: Capsule())
     }
 }
@@ -148,11 +227,11 @@ struct DeskInfoPopoverButton: View {
                     Image(systemName: "info.circle")
                 }
                 .font(.caption.weight(.medium))
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(DeskPalette.accent)
             } else {
                 Image(systemName: "info.circle")
                     .font(.system(size: 12.5))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(DeskPalette.secondary)
                     .contentShape(Rectangle())
             }
         }
@@ -173,6 +252,7 @@ struct DeskInfoPopoverButton: View {
             }
             .padding(14)
             .frame(width: 340, alignment: .leading)
+            .background(DeskPalette.cardBackground)
         }
     }
 }
@@ -190,9 +270,10 @@ struct DeskSegmentedTabs<Tab: Hashable>: View {
                 } label: {
                     Text(item.title)
                         .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
-                        .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                        .foregroundStyle(isSelected ? DeskPalette.ink : DeskPalette.secondary)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 5.5)
+                        .frame(maxWidth: .infinity)
                         .background(
                             isSelected ? DeskPalette.cardBackground : Color.clear,
                             in: RoundedRectangle(cornerRadius: 7, style: .continuous)
@@ -206,6 +287,7 @@ struct DeskSegmentedTabs<Tab: Hashable>: View {
                         .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
                 }
                 .buttonStyle(.plain)
+                .accessibilityAddTraits(isSelected ? .isSelected : [])
             }
         }
         .padding(3)
@@ -213,29 +295,46 @@ struct DeskSegmentedTabs<Tab: Hashable>: View {
     }
 }
 
-struct DeskPageHeader<Trailing: View>: View {
+struct DeskSettingsGroup<Content: View>: View {
     let title: String
-    let subtitle: String
-    @ViewBuilder let trailing: () -> Trailing
+    @ViewBuilder let content: () -> Content
 
     var body: some View {
-        HStack(alignment: .center, spacing: 16) {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.callout)
+                .foregroundStyle(DeskPalette.secondary)
+                .accessibilityAddTraits(.isHeader)
+            DeskSurfaceCard(padding: 0, cornerRadius: 9) {
+                VStack(alignment: .leading, spacing: 0, content: content)
+                    .padding(.horizontal, 15)
+            }
+        }
+    }
+}
+
+struct DeskSettingsRow<Value: View>: View {
+    let title: String
+    var detail: String? = nil
+    @ViewBuilder let value: () -> Value
+
+    var body: some View {
+        HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
-                    .font(.system(size: 18, weight: .bold))
-                Text(subtitle)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .font(.callout)
+                    .foregroundStyle(DeskPalette.ink)
+                if let detail {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(DeskPalette.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
-            Spacer(minLength: 8)
-            trailing()
+            Spacer(minLength: 0)
+            value()
         }
-        .padding(.horizontal, 26)
-        .padding(.vertical, 15)
-        .background(.ultraThinMaterial)
-        .overlay(alignment: .bottom) {
-            Divider()
-        }
+        .padding(.vertical, 8)
+        .frame(minHeight: 43)
     }
 }

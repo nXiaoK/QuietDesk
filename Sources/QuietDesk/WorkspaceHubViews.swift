@@ -2,6 +2,66 @@ import AppKit
 import QuietDeskCore
 import SwiftUI
 
+struct DeskSettingsPageTabs<Tab: Hashable, Content: View>: View {
+    let tabs: [(id: Tab, title: String)]
+    @Binding var selection: Tab
+    var canSelect: (Tab) -> Bool = { _ in true }
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(tabs, id: \.id) { tab in
+                    let isSelected = selection == tab.id
+                    let isEnabled = canSelect(tab.id)
+                    Button {
+                        selection = tab.id
+                    } label: {
+                        Text(tab.title)
+                            .font(.callout.weight(isSelected ? .semibold : .regular))
+                            .foregroundStyle(isSelected ? DeskPalette.ink : DeskPalette.secondary)
+                            .multilineTextAlignment(.leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 8)
+                            .background(
+                                isSelected ? DeskPalette.selection : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 7)
+                            )
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!isEnabled)
+                    .opacity(isEnabled ? 1 : 0.55)
+                    .accessibilityAddTraits(isSelected ? .isSelected : [])
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(10)
+            .frame(width: 151, alignment: .leading)
+            .frame(maxHeight: .infinity, alignment: .topLeading)
+            .background(DeskPalette.sidebarBackground, in: RoundedRectangle(cornerRadius: 11))
+            .padding(.leading, 12)
+            .padding(.vertical, 12)
+
+            content()
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .background(DeskPalette.canvasBackground)
+    }
+}
+
+struct DeskSettingsPageHeading: View {
+    let title: String
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 24, weight: .bold))
+            .foregroundStyle(DeskPalette.ink)
+            .accessibilityAddTraits(.isHeader)
+    }
+}
+
 enum NetworkWorkspaceSubTab: String, CaseIterable, Hashable {
     case viewerMappings
     case relayNodes
@@ -20,6 +80,19 @@ enum PreferencesWorkspaceSubTab: String, CaseIterable, Hashable {
     case updates
 }
 
+private enum NetworkWorkspacePage: Hashable {
+    case network(NetworkWorkspaceSubTab)
+    case diagnostics(DiagnosticsWorkspaceSubTab)
+
+    static let tabs: [(id: Self, title: String)] = [
+        (.network(.viewerMappings), "TCP 端口映射"),
+        (.network(.relayNodes), "自托管中继"),
+        (.network(.hostApprovals), "本机映射授权"),
+        (.diagnostics(.benchmark), "线路实测"),
+        (.diagnostics(.traffic), "地址历史流量")
+    ]
+}
+
 struct NetworkWorkspaceView: View {
     @ObservedObject var viewer: DeskModel
     @ObservedObject var host: DeskModel
@@ -28,6 +101,7 @@ struct NetworkWorkspaceView: View {
     @Binding var subTab: NetworkWorkspaceSubTab
     var preferredDeviceID: UUID? = nil
     let openBenchmarkForRecord: (ConnectionRecord?) -> Void
+    let openDiagnostics: (DiagnosticsWorkspaceSubTab) -> Void
 
     init(
         viewer: DeskModel,
@@ -35,7 +109,8 @@ struct NetworkWorkspaceView: View {
         portMappings: PortMappingManager,
         subTab: Binding<NetworkWorkspaceSubTab>,
         preferredDeviceID: UUID? = nil,
-        openBenchmarkForRecord: @escaping (ConnectionRecord?) -> Void
+        openBenchmarkForRecord: @escaping (ConnectionRecord?) -> Void,
+        openDiagnostics: @escaping (DiagnosticsWorkspaceSubTab) -> Void
     ) {
         self.viewer = viewer
         self.host = host
@@ -44,10 +119,7 @@ struct NetworkWorkspaceView: View {
         self._subTab = subTab
         self.preferredDeviceID = preferredDeviceID
         self.openBenchmarkForRecord = openBenchmarkForRecord
-    }
-
-    private var runningCount: Int {
-        portMappings.rules.filter { portMappings.isEnabled($0.id) }.count
+        self.openDiagnostics = openDiagnostics
     }
 
     private var activeDeviceRecord: ConnectionRecord? {
@@ -58,22 +130,18 @@ struct NetworkWorkspaceView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 12) {
-                DeskSegmentedTabs(
-                    tabs: [
-                        (.viewerMappings, runningCount > 0 ? "TCP 端口映射 (\(runningCount))" : "TCP 端口映射"),
-                        (.relayNodes, viewer.relayEnabled ? "自托管中继节点 (\(viewer.relayNodes.count))" : "自托管中继节点"),
-                        (.hostApprovals, portMappings.hostApprovalPending ? "本机被控映射授权 (\(portMappings.pendingTargets.count) 待确认)" : "本机被控映射授权")
-                    ],
-                    selection: $subTab
-                )
-                Spacer()
-            }
-            .padding(.horizontal, 26)
-            .padding(.top, 18)
-            .padding(.bottom, 12)
-
+        DeskSettingsPageTabs(
+            tabs: NetworkWorkspacePage.tabs,
+            selection: Binding(
+                get: { .network(subTab) },
+                set: { page in
+                    switch page {
+                    case .network(let tab): subTab = tab
+                    case .diagnostics(let tab): openDiagnostics(tab)
+                    }
+                }
+            )
+        ) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     switch subTab {
@@ -90,6 +158,7 @@ struct NetworkWorkspaceView: View {
                             deviceRouteSummaryCard(for: record)
                         }
                     case .relayNodes:
+                        DeskSettingsPageHeading(title: "自托管中继")
                         RelaySettingsView(
                             enabled: viewer.relayEnabled,
                             nodes: viewer.relayNodes,
@@ -102,6 +171,7 @@ struct NetworkWorkspaceView: View {
                             save: viewer.saveRelayConfiguration
                         )
                     case .hostApprovals:
+                        DeskSettingsPageHeading(title: "本机映射授权")
                         PortMappingHostView(
                             model: host,
                             manager: host.portMappings,
@@ -111,7 +181,7 @@ struct NetworkWorkspaceView: View {
                     }
                 }
                 .padding(.horizontal, 26)
-                .padding(.bottom, 24)
+                .padding(.vertical, 24)
                 .frame(maxWidth: 1080, alignment: .leading)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
             }
@@ -125,7 +195,7 @@ struct NetworkWorkspaceView: View {
         let runs = descriptor.hasIdentity ? benchmarkStore.archive.runs(matching: descriptor) : []
         let assessment = RouteBenchmarkHistoryEvaluator.assess(runs: runs, targetOverride: descriptor)
 
-        DeskSurfaceCard(padding: 16, cornerRadius: 14) {
+        DeskSurfaceCard(padding: 15, cornerRadius: 9) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .center, spacing: 12) {
                     if let assessment {
@@ -177,7 +247,7 @@ struct NetworkWorkspaceView: View {
                     Button("前往线路实测…") {
                         openBenchmarkForRecord(record)
                     }
-                    .controlSize(.small)
+                    .buttonStyle(DeskButtonStyle(.secondary))
                     .disabled(viewer.active || viewer.working)
                 }
 
@@ -236,47 +306,52 @@ struct DiagnosticsWorkspaceView: View {
     @ObservedObject var history: TrafficHistoryFeed
     @Binding var subTab: DiagnosticsWorkspaceSubTab
     @Binding var benchmarkTargetRecord: ConnectionRecord?
+    let openNetwork: (NetworkWorkspaceSubTab) -> Void
     @State private var inlineRunner: RouteQualityBenchmarkRunner?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 12) {
-                DeskSegmentedTabs(
-                    tabs: [
-                        (.benchmark, "连接与中继线路实测"),
-                        (.traffic, "地址历史流量统计")
-                    ],
-                    selection: $subTab
-                )
-                Spacer()
-                if subTab == .benchmark, !viewer.connections.isEmpty {
-                    Menu {
-                        Button("使用连接页当前填写目标") {
-                            rebuildRunner(for: nil)
-                        }
-                        Divider()
-                        ForEach(viewer.connections) { record in
-                            Button("\(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record))") {
-                                rebuildRunner(for: record)
-                            }
-                        }
-                    } label: {
-                        Label(
-                            benchmarkTargetRecord.map { "目标：\(ConnectionEntryPresentation.title($0))" } ?? "切换测速目标",
-                            systemImage: "desktopcomputer"
-                        )
+        DeskSettingsPageTabs(
+            tabs: NetworkWorkspacePage.tabs,
+            selection: Binding(
+                get: { .diagnostics(subTab) },
+                set: { page in
+                    switch page {
+                    case .network(let tab): openNetwork(tab)
+                    case .diagnostics(let tab): subTab = tab
                     }
-                    .controlSize(.small)
-                    .disabled(inlineRunner?.isRunning == true || viewer.active || viewer.working)
                 }
+            ),
+            canSelect: { page in
+                if case .network = page { return !viewer.isRunningRouteBenchmark }
+                return true
             }
-            .padding(.horizontal, 26)
-            .padding(.top, 18)
-            .padding(.bottom, 12)
-
-            Divider()
-
-            Group {
+        ) {
+            VStack(alignment: .leading, spacing: 0) {
+                if subTab == .benchmark, !viewer.connections.isEmpty {
+                    HStack {
+                        Spacer()
+                        Menu {
+                            Button("使用连接页当前填写目标") {
+                                rebuildRunner(for: nil)
+                            }
+                            Divider()
+                            ForEach(viewer.connections) { record in
+                                Button("\(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record))") {
+                                    rebuildRunner(for: record)
+                                }
+                            }
+                        } label: {
+                            Label(
+                                benchmarkTargetRecord.map { "目标：\(ConnectionEntryPresentation.title($0))" } ?? "切换测速目标",
+                                systemImage: "desktopcomputer"
+                            )
+                        }
+                        .controlSize(.small)
+                        .disabled(inlineRunner?.isRunning == true || viewer.active || viewer.working)
+                    }
+                    .padding(.horizontal, 26)
+                    .padding(.top, 14)
+                }
                 switch subTab {
                 case .benchmark:
                     if let runner = inlineRunner {
@@ -331,49 +406,41 @@ struct PreferencesWorkspaceView: View {
     let openTraffic: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                DeskSegmentedTabs(
-                    tabs: [
-                        (.keyboard, "键盘与系统快捷键"),
-                        (.privacy, "被控端防窥与自动解锁"),
-                        (.connectionDefaults, "连接、画质与诊断默认项"),
-                        (.updates, updates.manifest != nil ? "软件更新 · 新版本" : "软件更新")
-                    ],
-                    selection: $subTab
-                )
-                Spacer()
-            }
-            .padding(.horizontal, 26)
-            .padding(.top, 18)
-            .padding(.bottom, 12)
-
+        DeskSettingsPageTabs(
+            tabs: [
+                (.keyboard, "键盘与快捷键"),
+                (.connectionDefaults, "连接默认项"),
+                (.privacy, "隐私偏好"),
+                (.updates, updates.manifest != nil ? "软件更新 · 新版本" : "软件更新")
+            ],
+            selection: $subTab
+        ) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     switch subTab {
                     case .keyboard:
-                        DeskSurfaceCard(padding: 0, cornerRadius: 14) {
-                            CapsLockSettingsView(model: viewer, done: {}, embedded: true)
-                        }
+                        DeskSettingsPageHeading(title: "键盘与快捷键")
+                        CapsLockSettingsView(model: viewer, done: {}, embedded: true)
                     case .privacy:
+                        DeskSettingsPageHeading(title: "被控端隐私与安全")
                         SessionEffectsView(model: viewer, done: {}, embedded: true)
                     case .connectionDefaults:
-                        DeskSurfaceCard(padding: 0, cornerRadius: 14) {
-                            ConnectionSettingsView(
-                                model: viewer,
-                                openCaps: { subTab = .keyboard },
-                                openTraffic: openTraffic,
-                                openEffects: { subTab = .privacy },
-                                openBenchmark: openBenchmark,
-                                embedded: true
-                            )
-                        }
+                        DeskSettingsPageHeading(title: "连接默认项")
+                        ConnectionSettingsView(
+                            model: viewer,
+                            openCaps: { subTab = .keyboard },
+                            openTraffic: openTraffic,
+                            openEffects: { subTab = .privacy },
+                            openBenchmark: openBenchmark,
+                            embedded: true
+                        )
                     case .updates:
+                        DeskSettingsPageHeading(title: "软件更新")
                         UpdateSettingsPanel(controller: updates)
                     }
                 }
                 .padding(.horizontal, 26)
-                .padding(.bottom, 24)
+                .padding(.vertical, 24)
                 .frame(maxWidth: 1080, alignment: .leading)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
             }

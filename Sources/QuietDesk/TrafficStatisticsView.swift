@@ -27,20 +27,15 @@ struct TrafficStatisticsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 12) {
-                if !embedded {
-                    Image(systemName: "chart.bar.xaxis")
-                        .font(.system(size: 20))
-                        .foregroundStyle(Color.accentColor)
-                        .frame(width: 40, height: 40)
-                        .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                }
-                VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
                     Text("地址历史流量")
-                        .font(embedded ? .system(size: 15, weight: .bold) : .title3.weight(.semibold))
+                        .font(.system(size: 23, weight: .bold))
+                        .foregroundStyle(DeskPalette.ink)
+                        .accessibilityAddTraits(.isHeader)
                     Text("\(model.trafficHistoryStatus) · 本机视角（1 KB = 1000 字节）")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(DeskPalette.secondary)
                 }
                 Spacer()
                 DeskInfoPopoverButton(
@@ -52,20 +47,12 @@ struct TrafficStatisticsView: View {
                     ],
                     label: "统计说明"
                 )
-            }
-
-            if !history.records.isEmpty {
-                HStack(spacing: 12) {
-                    summaryCard(title: "统计地址数", value: "\(history.records.count) 个", tint: .secondary)
-                    summaryCard(title: "累计本机发送", value: trafficAmount(totalSent), tint: .accentColor)
-                    summaryCard(title: "累计本机接收", value: trafficAmount(totalReceived), tint: DeskPalette.emerald)
-                    summaryCard(title: "应用层总计", value: trafficAmount(totalCombined), tint: .primary)
-                }
+                .padding(.top, 4)
             }
 
             if let error = history.error {
                 HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(DeskPalette.amber)
                     ScrollView {
                         Text(error).font(.caption).textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -74,7 +61,7 @@ struct TrafficStatisticsView: View {
                     .frame(maxHeight: 34)
                 }
                 .padding(10)
-                .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .background(DeskPalette.amber.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
 
             if history.records.isEmpty {
@@ -96,7 +83,7 @@ struct TrafficStatisticsView: View {
                     TableColumn("网址/IP＋端口") { record in
                         Label {
                             Text(record.endpoint.label)
-                                .font(.system(.body, design: .monospaced))
+                                .font(.system(.callout, design: .monospaced))
                                 .textSelection(.enabled)
                                 .lineLimit(1)
                         } icon: {
@@ -104,34 +91,52 @@ struct TrafficStatisticsView: View {
                         }
                         .help(record.endpoint.label)
                     }
-                    .width(min: 220, ideal: 290, max: 440)
+                    .width(min: 170, ideal: 290, max: 440)
                     TableColumn("本机发送") { record in
                         Text(trafficAmount(Decimal(record.sentBytes)))
                             .monospacedDigit().frame(maxWidth: .infinity, alignment: .trailing)
                             .help("精确发送：" + String(record.sentBytes) + " 字节")
                     }
-                    .width(110)
+                    .width(min: 82, ideal: 110, max: 132)
                     TableColumn("本机接收") { record in
                         Text(trafficAmount(Decimal(record.receivedBytes)))
                             .monospacedDigit().frame(maxWidth: .infinity, alignment: .trailing)
                             .help("精确接收：" + String(record.receivedBytes) + " 字节")
                     }
-                    .width(110)
+                    .width(min: 82, ideal: 110, max: 132)
                     TableColumn("合计") { record in
                         Text(trafficAmount(record.totalBytes))
                             .fontWeight(.medium)
                             .monospacedDigit().frame(maxWidth: .infinity, alignment: .trailing)
                             .help("精确合计：\(NSDecimalNumber(decimal: record.totalBytes).stringValue) 字节")
                     }
-                    .width(110)
+                    .width(min: 82, ideal: 110, max: 132)
                 }
-                .tableStyle(.inset)
+                .tableStyle(.inset(alternatesRowBackgrounds: false))
+                .scrollContentBackground(.hidden)
+                .background(DeskPalette.cardBackground)
                 .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
                 .overlay {
                     RoundedRectangle(cornerRadius: 11, style: .continuous)
                         .strokeBorder(DeskPalette.hairline, lineWidth: 0.8)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
+            }
+
+            if !history.records.isEmpty {
+                DeskSurfaceCard(padding: 10, cornerRadius: 8) {
+                    HStack(spacing: 14) {
+                        summaryValue(title: "统计地址数", value: "\(history.records.count) 个")
+                        summaryValue(title: "累计本机发送", value: trafficAmount(totalSent))
+                        summaryValue(title: "累计本机接收", value: trafficAmount(totalReceived))
+                        summaryValue(title: "应用层总计", value: trafficAmount(totalCombined))
+                    }
+                }
+            }
+
+            if let selectedRecord {
+                recordDetails(selectedRecord)
             }
 
             if !history.legacyRecords.isEmpty {
@@ -163,19 +168,15 @@ struct TrafficStatisticsView: View {
             }
 
             HStack {
-                if let selectedRecord {
-                    Text("首次统计：\(selectedRecord.firstSeen.formatted(date: .abbreviated, time: .shortened)) · 最近连接：\(selectedRecord.lastSeen.formatted(date: .abbreviated, time: .shortened))")
+                if selectedRecord == nil {
+                    Text(history.records.isEmpty ? "从建立连接开始自动记录。" : "点选地址行可查看首次统计与最近连接时间。")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(history.records.isEmpty ? "从建立连接开始自动记录。" : "点选任意地址行可查看首次统计与最近连接时间。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(DeskPalette.secondary)
                 }
                 Spacer()
                 if !embedded {
                     Button("完成", action: done)
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(DeskButtonStyle(.primary))
                         .keyboardShortcut(.defaultAction)
                 }
             }
@@ -184,7 +185,8 @@ struct TrafficStatisticsView: View {
         .padding(.vertical, embedded ? 16 : 20)
         .frame(width: embedded ? nil : 760, height: embedded ? nil : 560)
         .frame(maxWidth: embedded ? .infinity : nil, maxHeight: embedded ? .infinity : nil)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(DeskPalette.canvasBackground)
+        .tint(DeskPalette.accent)
         .onAppear { model.flushTrafficHistory() }
         .onDisappear { model.flushTrafficHistory() }
         .onExitCommand {
@@ -192,25 +194,45 @@ struct TrafficStatisticsView: View {
         }
     }
 
-    private func summaryCard(title: String, value: String, tint: Color) -> some View {
+    private func summaryValue(title: String, value: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.secondary)
+                .font(.caption)
+                .foregroundStyle(DeskPalette.secondary)
             Text(value)
-                .font(.system(size: 15, weight: .bold))
+                .font(.callout.weight(.semibold))
                 .monospacedDigit()
-                .foregroundStyle(tint)
                 .lineLimit(1)
         }
-        .padding(.horizontal, 13)
-        .padding(.vertical, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(DeskPalette.hairline, lineWidth: 0.8)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func recordDetails(_ record: EndpointTrafficRecord) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("\(record.endpoint.label) · 统计详情")
+                .font(.headline)
+                .lineLimit(1)
+            DeskSurfaceCard(padding: 11, cornerRadius: 8) {
+                VStack(spacing: 7) {
+                    detailRow("首次统计", date: record.firstSeen)
+                    Divider()
+                    detailRow("最近连接", date: record.lastSeen)
+                }
+            }
         }
+    }
+
+    private func detailRow(_ title: String, date: Date) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(date.formatted(date: .abbreviated, time: .shortened))
+                .foregroundStyle(DeskPalette.secondary)
+                .monospacedDigit()
+        }
+        .font(.caption)
+        .accessibilityElement(children: .combine)
     }
 
     private func trafficAmount(_ bytes: Decimal) -> String {

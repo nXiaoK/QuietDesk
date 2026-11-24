@@ -14,7 +14,7 @@ build_directory="$("${swift_build[@]}" --show-bin-path)"
 core_objects=("$build_directory"/QuietDeskCore.build/*.swift.o)
 swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     -module-cache-path "$build_directory/ModuleCache" -I "$build_directory/Modules" \
-    "${core_objects[@]}" Sources/QuietDesk/FileTransferNotice.swift Checks/FileResultChecks.swift \
+    "${core_objects[@]}" Sources/QuietDesk/DeskTheme.swift Sources/QuietDesk/FileTransferNotice.swift Checks/FileResultChecks.swift \
     Checks/FileApprovalChecks.swift Checks/FileReceptionChecks.swift Checks/ClipboardWindowChecks.swift Checks/ClipboardStorageChecks.swift \
     AppChecks/FileTransferResultChecks.swift -o "$build_directory/FileTransferResultChecks"
 "$build_directory/FileTransferResultChecks" "$@"

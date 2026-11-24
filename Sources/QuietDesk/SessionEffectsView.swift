@@ -10,89 +10,16 @@ struct SessionEffectsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            if !embedded {
-                HStack {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("被控端隐私与安全").font(.title3.weight(.bold))
-                        Text("开启成功后自动记忆，后续连接自动生效；断开连接时恢复被控端原状。")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                }
-            }
-
-            DeskSurfaceCard(padding: 16, cornerRadius: 13) {
-                VStack(alignment: .leading, spacing: 14) {
-                    HStack {
-                        Label("会话期间防窥与静音策略", systemImage: "eye.slash.circle.fill")
-                            .font(.system(size: 13.5, weight: .bold))
-                        Spacer()
-                        DeskInfoPopoverButton(
-                            title: "防窥遮罩与亮度归零边界说明",
-                            lines: [
-                                "软件黑屏防窥只从远端画面排除黑屏遮罩本身；被控端的 QuietDesk 窗口、文件确认和权限弹窗在远端仍可见可操作，系统安全界面与 Mission Control 不保证遮住。可在被控端按 ⌃⌥Esc 退出。",
-                                "内建屏幕亮度归零仅支持笔记本内建屏（背光关闭，锁屏与调度中心亦不可见），外接显示器不变暗；若被控 Mac 本机调高亮度会自动关闭此项。",
-                                "断开立即锁屏涵盖网络中断、休眠与重连；被控进程被强制终止或崩溃时无法执行。"
-                            ],
-                            label: "边界说明"
-                        )
-                    }
-
-                    effectRow(
-                        title: "被控端本机静音",
-                        subtitle: "关闭被控 Mac 扬声器外放（不影响远端音频回传到本机）",
-                        isOn: Binding(get: { model.sessionEffects.muted }, set: model.setRemoteMuted),
-                        disabled: switchesDisabled
-                    )
-                    Divider()
-                    effectRow(
-                        title: "软件黑屏防窥遮罩",
-                        subtitle: "被控屏幕覆盖全黑遮罩并配合即时光标隐藏物理指针，远端照常操作",
-                        isOn: Binding(get: { model.sessionEffects.privacy }, set: model.setRemotePrivacy),
-                        disabled: switchesDisabled
-                    )
-                    Divider()
-                    effectRow(
-                        title: "笔记本内建屏幕亮度归零",
-                        subtitle: "关闭 MacBook 内建屏幕背光，锁屏与调度中心同样防窥",
-                        isOn: Binding(get: { model.sessionEffects.dimBuiltInDisplay }, set: model.setRemoteDisplayDim),
-                        disabled: switchesDisabled || !(model.hostDisplayDimmable || model.sessionEffects.dimBuiltInDisplay)
-                    )
-                    Divider()
-                    effectRow(
-                        title: "断开连接后立即锁定被控 Mac",
-                        subtitle: "任意断线、控制端休眠或重建连接时立即触发系统锁屏",
-                        isOn: Binding(get: { model.sessionEffects.lockOnDisconnect }, set: model.setRemoteLockOnDisconnect),
-                        disabled: switchesDisabled || !model.supportsSessionLock
-                    )
-
-                    if let remembered = model.sessionEffectsMemory.connectionState {
-                        let items = [
-                            remembered.muted ? "被控端静音" : nil,
-                            remembered.privacy ? "黑屏防窥" : nil,
-                            remembered.dimBuiltInDisplay ? "亮度归零" : nil,
-                            remembered.lockOnDisconnect ? "断开后锁屏" : nil
-                        ].compactMap { $0 }
-                        if !items.isEmpty {
-                            Text("已记忆（新连接自动开启）：" + items.joined(separator: "、"))
-                                .font(.caption)
-                                .foregroundStyle(Color.accentColor)
-                        }
-                    }
-
-                    availabilityStatusView
-                }
-            }
-
-            DeskSurfaceCard(padding: 16, cornerRadius: 13) {
-                unlockSection
-            }
-
-            if !embedded {
+            if embedded {
+                details
+            } else {
+                DeskSectionHeading(title: "被控端隐私与安全")
+                ScrollView { details }
+                    .frame(maxHeight: 500)
                 HStack {
                     Spacer()
                     Button("完成", action: done)
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(DeskButtonStyle(.primary))
                         .keyboardShortcut(.defaultAction)
                 }
             }
@@ -101,16 +28,84 @@ struct SessionEffectsView: View {
         .padding(embedded ? 0 : 22)
         .frame(width: embedded ? nil : 500)
         .frame(maxWidth: embedded ? .infinity : nil, alignment: .leading)
+        .background(embedded ? Color.clear : DeskPalette.canvasBackground)
         .onExitCommand { if !embedded { done() } }
         .onAppear { model.refreshUnlockState() }
         .onDisappear { unlockPassword = "" }
+    }
+
+    private var details: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            effectsGroup
+            unlockSection
+            HStack(alignment: .top, spacing: 7) {
+                Text("开启成功后按连接记忆，断开时恢复被控端原状。")
+                    .font(.caption)
+                    .foregroundStyle(DeskPalette.secondary)
+                DeskInfoPopoverButton(
+                    title: "防窥遮罩与亮度归零边界说明",
+                    lines: [
+                        "软件黑屏遮罩下，被控端的 QuietDesk 窗口、文件确认和权限弹窗在远端仍可见可操作，系统安全界面与 Mission Control 可能在被控屏幕上显示。可在被控端按 ⌃⌥Esc 退出。",
+                        "亮度归零仅作用于 Mac 笔记本的内建屏幕；本机调高亮度会关闭此项。",
+                        "断开立即锁屏涵盖网络中断、休眠与重连；被控进程被强制终止或崩溃时无法执行。"
+                    ]
+                )
+            }
+            availabilityStatusView
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var effectsGroup: some View {
+        DeskSettingsGroup(title: "会话期间策略") {
+            effectRow(
+                title: "被控端本机静音",
+                subtitle: "关闭被控 Mac 扬声器外放（不影响远端音频回传到本机）",
+                isOn: Binding(get: { model.sessionEffects.muted }, set: model.setRemoteMuted),
+                disabled: switchesDisabled
+            )
+            Divider()
+            effectRow(
+                title: "软件黑屏防窥遮罩",
+                subtitle: "被控屏幕覆盖全黑遮罩并配合即时光标隐藏物理指针，远端照常操作",
+                isOn: Binding(get: { model.sessionEffects.privacy }, set: model.setRemotePrivacy),
+                disabled: switchesDisabled
+            )
+            Divider()
+            effectRow(
+                title: "笔记本内建屏幕亮度归零",
+                subtitle: "关闭 MacBook 内建屏幕背光，锁屏与调度中心同样防窥",
+                isOn: Binding(get: { model.sessionEffects.dimBuiltInDisplay }, set: model.setRemoteDisplayDim),
+                disabled: switchesDisabled || !(model.hostDisplayDimmable || model.sessionEffects.dimBuiltInDisplay)
+            )
+            Divider()
+            effectRow(
+                title: "断开连接后立即锁定被控 Mac",
+                subtitle: "任意断线、控制端休眠或重建连接时立即触发系统锁屏",
+                isOn: Binding(get: { model.sessionEffects.lockOnDisconnect }, set: model.setRemoteLockOnDisconnect),
+                disabled: switchesDisabled || !model.supportsSessionLock
+            )
+
+            if let remembered = model.sessionEffectsMemory.connectionState {
+                let items = [
+                    remembered.muted ? "被控端静音" : nil,
+                    remembered.privacy ? "黑屏防窥" : nil,
+                    remembered.dimBuiltInDisplay ? "亮度归零" : nil,
+                    remembered.lockOnDisconnect ? "断开后锁屏" : nil
+                ].compactMap { $0 }
+                if !items.isEmpty {
+                    Divider()
+                    DeskSettingsRow(title: "已为后续连接记忆", detail: items.joined(separator: "、")) { EmptyView() }
+                }
+            }
+        }
     }
 
     private func effectRow(title: String, subtitle: String, isOn: Binding<Bool>, disabled: Bool) -> some View {
         Toggle(isOn: isOn) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.callout)
                 Text(subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -119,6 +114,7 @@ struct SessionEffectsView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .disabled(disabled)
+        .padding(.vertical, 9)
     }
 
     @ViewBuilder
@@ -150,11 +146,8 @@ struct SessionEffectsView: View {
     @ViewBuilder
     private var unlockSection: some View {
         let record = model.currentRecordID != nil
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Label("远端锁屏自动输入密码解锁", systemImage: "lock.open.display")
-                    .font(.system(size: 13.5, weight: .bold))
-                Spacer()
+        DeskSettingsGroup(title: "自动解锁") {
+            DeskSettingsRow(title: "连接记录的远端锁屏密码") {
                 DeskInfoPopoverButton(
                     title: "自动解锁存储与安全机制",
                     lines: [
@@ -165,37 +158,47 @@ struct SessionEffectsView: View {
                 )
             }
 
-            Toggle("连接时若被控 Mac 处于锁屏，自动输入密码解锁", isOn: Binding(get: { model.autoUnlockEnabled }, set: model.setAutoUnlock))
-                .font(.system(size: 13, weight: .medium))
-                .disabled(!record || !model.unlockPasswordSaved)
+            Divider()
 
-            HStack(spacing: 8) {
-                SecureField(model.unlockPasswordSaved ? "已保存登录密码；输入新密码可替换" : "输入被控 Mac 的系统登录密码", text: $unlockPassword)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(!record)
-                Button("保存密码") { if model.saveUnlockPassword(unlockPassword) { unlockPassword = "" } }
-                    .disabled(!record || unlockPassword.isEmpty)
-                if model.unlockPasswordSaved {
-                    Button("删除", role: .destructive) { model.removeUnlockPassword() }
+            Toggle("连接时若被控 Mac 处于锁屏，自动输入密码解锁", isOn: Binding(get: { model.autoUnlockEnabled }, set: model.setAutoUnlock))
+                .font(.callout)
+                .disabled(!record || !model.unlockPasswordSaved)
+                .frame(minHeight: 43)
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 9) {
+                HStack(spacing: 8) {
+                    SecureField(model.unlockPasswordSaved ? "已保存登录密码；输入新密码可替换" : "输入被控 Mac 的系统登录密码", text: $unlockPassword)
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(!record)
+                    Button("保存密码") { if model.saveUnlockPassword(unlockPassword) { unlockPassword = "" } }
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .disabled(!record || unlockPassword.isEmpty)
+                    if model.unlockPasswordSaved {
+                        Button("删除", role: .destructive) { model.removeUnlockPassword() }
+                            .buttonStyle(DeskButtonStyle(.danger))
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    Button("立即输入密码解锁") { model.unlockNow() }
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .disabled(!model.connected || !model.supportsSessionUnlock || !model.unlockPasswordSaved || model.unlockWorking)
+                    if model.unlockWorking { ProgressView().controlSize(.small) }
+                }
+
+                if !record {
+                    Text("成功连接一次某台设备后，即可为该连接记录配置自动解锁密码。")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else if model.connected, !model.supportsSessionUnlock {
+                    Text("共享端需更新后才能自动解锁。").font(.caption).foregroundStyle(.secondary)
+                }
+                if !model.unlockStatus.isEmpty {
+                    Text(model.unlockStatus).font(.caption).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                 }
             }
-
-            HStack(spacing: 8) {
-                Button("立即输入密码解锁") { model.unlockNow() }
-                    .controlSize(.small)
-                    .disabled(!model.connected || !model.supportsSessionUnlock || !model.unlockPasswordSaved || model.unlockWorking)
-                if model.unlockWorking { ProgressView().controlSize(.small) }
-            }
-
-            if !record {
-                Text("成功连接一次某台设备后，即可为该连接记录配置自动解锁密码。")
-                    .font(.caption).foregroundStyle(.secondary)
-            } else if model.connected, !model.supportsSessionUnlock {
-                Text("共享端需更新后才能自动解锁。").font(.caption).foregroundStyle(.secondary)
-            }
-            if !model.unlockStatus.isEmpty {
-                Text(model.unlockStatus).font(.caption).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-            }
+            .padding(.vertical, 10)
         }
     }
 }
@@ -214,8 +217,9 @@ private struct SessionEffectSwitch: View {
         Button { configuration.isOn.toggle() } label: {
             HStack(spacing: 12) {
                 configuration.label
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 Capsule()
-                    .fill(configuration.isOn ? Color.accentColor : Color.primary.opacity(0.15))
+                    .fill(configuration.isOn ? DeskPalette.actionFill : DeskPalette.hairline)
                     .overlay(alignment: configuration.isOn ? .trailing : .leading) {
                         Circle().fill(.white).padding(2).shadow(color: .black.opacity(0.25), radius: 1, y: 0.5)
                     }

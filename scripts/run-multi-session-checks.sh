@@ -16,6 +16,7 @@ swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     "${core_objects[@]}" \
     Sources/QuietDesk/AppDataLocation.swift \
     Sources/QuietDesk/PortMappingManager.swift \
+    Sources/QuietDesk/DeskTheme.swift \
     Sources/QuietDesk/PortMappingApprovalPanel.swift \
     Sources/QuietDesk/CapsLockMonitor.swift \
     Sources/QuietDesk/ClipboardSync.swift \

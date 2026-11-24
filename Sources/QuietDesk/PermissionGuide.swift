@@ -56,7 +56,7 @@ final class PermissionGuide: NSWindowController {
         state = PermissionGuideState(bundleURL: bundleURL)
         self.permissionCheck = permissionCheck
         self.onRefresh = onRefresh
-        let panel = PermissionGuidePanel(contentRect: NSRect(x: 0, y: 0, width: 520, height: 250),
+        let panel = PermissionGuidePanel(contentRect: NSRect(x: 0, y: 0, width: 520, height: 345),
             styleMask: [.titled, .closable, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isReleasedWhenClosed = false
         panel.isFloatingPanel = true
@@ -68,7 +68,9 @@ final class PermissionGuide: NSWindowController {
         panel.animationBehavior = .utilityWindow
         super.init(window: panel)
         let content = PermissionGuideHostingView(rootView: PermissionGuideView(state: state,
-            onRefresh: { [weak self] in self?.onRefresh() }, openSettings: openSettings))
+            onRefresh: { [weak self] in self?.onRefresh() },
+            openSettings: openSettings,
+            done: { [weak self] in self?.close() }))
         panel.contentView = content
         panel.setContentSize(content.fittingSize)
     }
@@ -131,63 +133,94 @@ private struct PermissionGuideView: View {
     @ObservedObject var state: PermissionGuideState
     let onRefresh: () -> Void
     let openSettings: (PermissionGuide.Kind) -> Void
+    let done: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 13) {
-            HStack(alignment: .top, spacing: 16) {
+            Text("允许" + state.kind.title)
+                .font(.title3.bold())
+                .accessibilityAddTraits(.isHeader)
+            Text(state.kind.purpose)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            applicationCard
+
+            HStack(spacing: 9) {
+                Button("打开\(state.kind.title)系统设置…") { openSettings(state.kind) }
                 if let applicationURL = state.applicationURL {
-                    PermissionApplicationIcon(applicationURL: applicationURL)
-                        .frame(width: 76, height: 76)
-                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
-                        .help("将当前正在运行的应用拖到系统设置的权限列表")
-                } else {
-                    Image(systemName: "app.dashed")
-                        .font(.system(size: 36)).foregroundStyle(.secondary)
-                        .frame(width: 76, height: 76)
+                    Button("在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([applicationURL]) }
                 }
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(state.applicationURL == nil ? "当前运行的不是 .app 应用" : "拖动应用图标到权限列表")
-                        .font(.system(size: 15, weight: .semibold))
-                    Text(state.applicationURL == nil
-                         ? "命令行运行目录不能作为应用拖入。请先打开已打包的 QuietDesk.app，再从应用中前往授权。"
-                         : "在系统设置的「\(state.kind.title)」列表添加 QuietDesk，再手动打开它的开关。")
-                        .font(.system(size: 12)).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if state.applicationURL != nil {
-                        Text("页面不接受拖入时，请使用「+」选择当前应用；没有「+」时，按系统提示在现有列表中开启。")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            .controlSize(.small)
+
+            Label {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(state.effective ? "系统权限已生效" : "尚未生效")
+                        .font(.callout.weight(.semibold))
+                    if !state.effective {
+                        Text("系统设置中已开启但尚未生效时，请完全退出 QuietDesk 后重开，再返回检测。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
+            } icon: {
+                Image(systemName: state.effective ? "checkmark.circle" : "info.circle")
+                    .foregroundStyle(state.effective ? Color.green : Color.orange)
             }
-            Text(state.kind.purpose).font(.system(size: 11)).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Button("打开\(state.kind.title)系统设置…") { openSettings(state.kind) }.controlSize(.small)
-            Divider()
-            HStack(spacing: 8) {
-                Image(systemName: state.effective ? "checkmark.circle.fill" : "circle.dashed")
-                    .foregroundStyle(state.effective ? Color.green : Color.secondary)
-                Text("\(state.kind.title)：\(state.effective ? "系统权限已生效" : "尚未生效")")
-                    .font(.system(size: 12, weight: .medium))
-                Spacer(minLength: 4)
-                Button("重新检测", action: onRefresh).controlSize(.small)
-                if let applicationURL = state.applicationURL {
-                    Button("在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([applicationURL]) }
-                        .controlSize(.small)
-                }
-            }
-            VStack(alignment: .leading, spacing: 5) {
-                Text("\(state.applicationURL == nil ? "运行目录" : "当前应用")：\(state.bundleURL.path)")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
-                    .lineLimit(2).truncationMode(.middle).help(state.bundleURL.path)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text("系统已开启但仍未生效时，请完全退出 QuietDesk 后重开。此面板不会替你开启权限。")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(10)
+            .background((state.effective ? Color.green : Color.orange).opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+
+            Text("\(state.applicationURL == nil ? "运行目录" : "当前应用")：\(state.bundleURL.path)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .truncationMode(.middle)
+                .help(state.bundleURL.path)
+
+            HStack(spacing: 9) {
+                Spacer()
+                Button("重新检测", action: onRefresh)
+                Button("完成", action: done)
+                    .buttonStyle(.borderedProminent)
             }
         }
-        .padding(18).frame(width: 520)
+        .tint(.blue)
+        .padding(22)
+        .frame(width: 520)
+        .fixedSize(horizontal: false, vertical: true)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var applicationCard: some View {
+        HStack(spacing: 13) {
+            if let applicationURL = state.applicationURL {
+                PermissionApplicationIcon(applicationURL: applicationURL)
+                    .frame(width: 62, height: 62)
+                    .help("将当前正在运行的应用拖到系统设置的权限列表")
+            } else {
+                Image(systemName: "app.dashed")
+                    .font(.system(size: 30))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 62, height: 62)
+            }
+            VStack(alignment: .leading, spacing: 5) {
+                Text(state.applicationURL?.lastPathComponent ?? "当前运行目录")
+                    .font(.headline)
+                Text(state.applicationURL == nil
+                     ? "请先打开已打包的 QuietDesk.app，再从应用中前往授权。"
+                     : "拖入系统隐私列表，或通过「+」选择当前应用，再开启开关。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 9))
     }
 }
 

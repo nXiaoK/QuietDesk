@@ -103,13 +103,12 @@ struct ConnectionSettingsView: View {
 
         if embedded {
             content
-                .padding(18)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             ScrollView {
                 content
                     .padding(16).frame(width: 340)
-                    .background(Color(nsColor: .windowBackgroundColor))
+                    .deskSurface()
             }
             .frame(width: 340).frame(maxHeight: 560)
         }
@@ -146,17 +145,22 @@ private struct ConnectionOptionsSections: View {
                     }
                 }
             } else {
-                VStack(alignment: .leading, spacing: 14) {
-                    displayAndQualityBlock
-                    Divider()
-                    cursorAndAudioBlock
-                    Divider()
-                    networkAndClipboardBlock
+                VStack(alignment: .leading, spacing: 17) {
+                    DeskSettingsGroup(title: "画质与屏幕") {
+                        displayAndQualityBlock.padding(.vertical, 10)
+                    }
+                    DeskSettingsGroup(title: "光标、触控板与音频") {
+                        cursorAndAudioBlock.padding(.vertical, 10)
+                    }
+                    DeskSettingsGroup(title: "连接策略、全屏状态与剪贴板") {
+                        networkAndClipboardBlock.padding(.vertical, 10)
+                    }
                 }
             }
         }
         .toggleStyle(.switch)
         .controlSize(.small)
+        .tint(DeskPalette.accent)
     }
 
     private var displayAndQualityBlock: some View {
@@ -185,10 +189,8 @@ private struct ConnectionOptionsSections: View {
                 }
             }
 
-            SessionQualitySection(model: model, compact: compact)
-
             HStack(spacing: 8) {
-                Text("画面缩放").foregroundStyle(.secondary)
+                Text("画面缩放")
                 Spacer(minLength: 4)
                 Picker("画面显示", selection: $model.canvasScalingMode) {
                     ForEach(RemoteCanvasScalingMode.allCases, id: \.self) { mode in
@@ -196,18 +198,17 @@ private struct ConnectionOptionsSections: View {
                     }
                 }
                 .labelsHidden()
-                .pickerStyle(.segmented)
-                .fixedSize()
+                .pickerStyle(.menu)
+                .frame(width: 146, alignment: .trailing)
             }
+
+            Divider()
+            SessionQualitySection(model: model, compact: compact)
         }
     }
 
     private var cursorAndAudioBlock: some View {
         VStack(alignment: .leading, spacing: 9) {
-            if !compact {
-                Text("光标、触控板与音频").font(.headline)
-            }
-
             Toggle(isOn: Binding(get: { model.viewerViewOnlyLock }, set: { model.setViewerViewOnlyLock($0) })) {
                 VStack(alignment: .leading, spacing: 1.5) {
                     Text("本机仅观看防误触（锁定键鼠发送）")
@@ -220,6 +221,8 @@ private struct ConnectionOptionsSections: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+
+            Divider()
 
             Toggle(isOn: Binding(get: { model.remoteAudioEnabled }, set: { model.setRemoteAudioEnabled($0) })) {
                 VStack(alignment: .leading, spacing: 1.5) {
@@ -235,6 +238,8 @@ private struct ConnectionOptionsSections: View {
             }
             .disabled(model.connected && !model.supportsRemoteAudio)
 
+            Divider()
+
             Toggle(isOn: $model.lowLatencyCursorEnabled) {
                 VStack(alignment: .leading, spacing: 1.5) {
                     Text("本地即时光标")
@@ -248,6 +253,8 @@ private struct ConnectionOptionsSections: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .disabled(model.connected && !model.supportsIndependentCursor)
+
+            Divider()
 
             Toggle(isOn: Binding(get: { model.relativeMouseEnabled }, set: { model.setRelativeMouseEnabled($0) })) {
                 VStack(alignment: .leading, spacing: 1.5) {
@@ -276,10 +283,6 @@ private struct ConnectionOptionsSections: View {
 
     private var networkAndClipboardBlock: some View {
         VStack(alignment: .leading, spacing: 9) {
-            if !compact {
-                Text("连接策略、全屏状态与剪贴板").font(.headline)
-            }
-
             Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) {
                 VStack(alignment: .leading, spacing: 1.5) {
                     Text("双向按需同步文字、图片与文件")
@@ -291,13 +294,22 @@ private struct ConnectionOptionsSections: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            HStack(spacing: 8) {
-                Button { model.canvas.releaseControl(); model.openReceivedFiles() } label: {
-                    Label("打开接收文件目录", systemImage: "folder")
-                }
-                .help(ClipboardSync.receivingDirectory)
-                if let id = model.receivingFileID {
-                    Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }
+            Divider()
+
+            HStack {
+                Text("接收文件目录")
+                Spacer(minLength: 0)
+                HStack(spacing: 7) {
+                    Button("打开目录") {
+                        model.canvas.releaseControl()
+                        model.openReceivedFiles()
+                    }
+                    .buttonStyle(DeskButtonStyle(.secondary))
+                    .help(ClipboardSync.receivingDirectory)
+                    if let id = model.receivingFileID {
+                        Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }
+                            .buttonStyle(DeskButtonStyle(.danger))
+                    }
                 }
             }
 
@@ -310,6 +322,7 @@ private struct ConnectionOptionsSections: View {
                             Label("模拟键入剪贴板", systemImage: "keyboard.badge.ellipsis")
                         }
                         .disabled(model.remoteTypingUnavailableReason != nil)
+                        .buttonStyle(DeskButtonStyle(.secondary))
                         .help(model.remoteTypingUnavailableReason ?? "不经过远端剪贴板，将本机剪贴板纯文本逐字符键入远端焦点框")
 
                         Button {
@@ -319,11 +332,13 @@ private struct ConnectionOptionsSections: View {
                             Label("输入文字/密码…", systemImage: "ellipsis.rectangle")
                         }
                         .disabled(model.remoteTypingUnavailableReason != nil)
+                        .buttonStyle(DeskButtonStyle(.secondary))
 
                         if model.remoteTypingWorking {
                             Button("停止", role: .destructive) {
                                 model.cancelRemoteTypedText()
                             }
+                            .buttonStyle(DeskButtonStyle(.danger))
                         }
                     }
                     if !model.remoteTypingStatus.isEmpty {
@@ -357,14 +372,20 @@ private struct ConnectionOptionsSections: View {
             }
             if model.showFullScreenStatistics { FullScreenStatusSettings(model: model) }
 
+            Divider()
+
             Toggle(isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })) {
                 Text("断线自动重连").frame(maxWidth: .infinity, alignment: .leading)
             }
+
+            Divider()
 
             Toggle(isOn: Binding(get: { model.disableIdleAutoPause }, set: { model.setDisableIdleAutoPause($0) })) {
                 Text(IdleAutoPausePresentation.toggleTitle).frame(maxWidth: .infinity, alignment: .leading)
             }
             .help(IdleAutoPausePresentation.toggleHelp)
+
+            Divider()
 
             Toggle("仅使用 TCP 视频（下次连接生效）", isOn: $model.mediaTCPOnly)
             Text(model.connected ? model.mediaRouteSummary : (model.mediaTCPOnly ? "下次连接视频固定走 TCP" : "优先加密 UDP，不可达自动回退 TCP"))
@@ -374,6 +395,7 @@ private struct ConnectionOptionsSections: View {
             if model.relayEnabled { RelayPeerAssistPicker(model: model) }
 
             if !compact {
+                Divider()
                 Toggle("结束连接后生成会话诊断报告", isOn: $model.connectionDiagnosticsEnabled)
                     .disabled(model.isControllingAnotherMac)
             }
@@ -397,17 +419,7 @@ struct CapsLockSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             if !embedded {
-                HStack(alignment: .top, spacing: 12) {
-                    Image(systemName: "capslock")
-                        .font(.system(size: 23)).foregroundStyle(.secondary)
-                        .frame(width: 42, height: 42)
-                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("键盘与快捷键").font(.system(size: 15, weight: .semibold))
-                        Text("全屏系统快捷键与 Caps Lock 操作远端。")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }
+                DeskSectionHeading(title: "键盘与快捷键", detail: "设置全屏系统快捷键与 Caps Lock 转发。")
             }
             if embedded {
                 CapsLockDetails(model: model, compact: false)
@@ -416,15 +428,18 @@ struct CapsLockSettingsView: View {
                     .frame(height: 350)
                 HStack {
                     Spacer()
-                    Button("完成", action: done).buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    Button("完成", action: done)
+                        .buttonStyle(DeskButtonStyle(.primary))
+                        .keyboardShortcut(.defaultAction)
                 }
             }
         }
         .font(.system(size: 13)).controlSize(.regular)
-        .padding(embedded ? 18 : 22)
+        .padding(embedded ? 0 : 22)
         .frame(width: embedded ? nil : 500)
         .frame(maxWidth: embedded ? .infinity : nil, alignment: .leading)
-        .background(embedded ? Color.clear : Color(nsColor: .windowBackgroundColor))
+        .background(embedded ? Color.clear : DeskPalette.canvasBackground)
+        .tint(DeskPalette.accent)
         .onAppear {
             model.canvas.releaseControl()
             model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
@@ -551,11 +566,10 @@ private struct CapsLockStateLabel: View {
     @ObservedObject var model: DeskModel
 
     var body: some View {
-        Text(!model.capsLockEnabled ? "已关闭" : (model.capsLockRunning ? "已开启" : "待生效"))
-            .font(.system(size: 10))
-            .foregroundStyle(!model.capsLockEnabled ? Color.secondary : (model.capsLockRunning ? Color.green : Color.orange))
-            .padding(.horizontal, 5).padding(.vertical, 2)
-            .background((!model.capsLockEnabled ? Color.secondary : (model.capsLockRunning ? Color.green : Color.orange)).opacity(0.12), in: RoundedRectangle(cornerRadius: 4))
+        DeskPillBadge(
+            text: !model.capsLockEnabled ? "已关闭" : model.capsLockRunning ? "已开启" : "待生效",
+            tint: !model.capsLockEnabled ? DeskPalette.secondary : model.capsLockRunning ? DeskPalette.emerald : DeskPalette.amber
+        )
     }
 }
 
@@ -564,72 +578,107 @@ private struct CapsLockDetails: View {
     let compact: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: compact ? 12 : 16) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("全屏系统快捷键").font(.headline)
-                Text(model.systemShortcutStatus)
-                    .foregroundStyle(model.systemShortcutsRunning ? Color.green : Color.secondary)
-                Text("全屏并点按远程画面后，⌘空格、⌘Tab 等组合键转发到远端。⌃⌥Esc 释放控制、⌃⌘F 退出全屏仍在本机执行。需要下方两项本机权限；系统安全输入开启时暂停转发。")
-                    .foregroundStyle(.secondary)
-            }
-            .font(.system(size: compact ? 10 : 11))
-            .fixedSize(horizontal: false, vertical: true)
-            Toggle(isOn: Binding(get: { model.capsLockEnabled }, set: { model.setCapsLockEnabled($0) })) { Text("启用 Caps Lock 转发").frame(maxWidth: .infinity, alignment: .leading) }
-                .toggleStyle(.switch).controlSize(.small)
-                .padding(compact ? 9 : 11)
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+        VStack(alignment: .leading, spacing: compact ? 11 : 16) {
+            forwardingGroup
+
             PermissionNextStepView(step: model.remoteKeyboardNextStep, compact: compact, perform: permissionAction)
-            VStack(alignment: .leading, spacing: 8) {
-                Text("按键行为").font(.headline)
-                if compact {
-                    VStack(alignment: .leading, spacing: 8) {
-                        CapsBehaviorCard(key: "⇪ 短按", title: "切换中英文", detail: "切换远端输入法", compact: true)
-                        CapsBehaviorCard(key: "⇪ 按住 ≥ 0.6 秒后松开", title: "切换大写锁定", detail: "开启 / 关闭远端大写", compact: true)
-                        CapsBehaviorCard(key: "大写已开启", title: "短按先解除大写", detail: "再次短按才切换中英文", compact: true)
-                    }
-                } else {
-                    HStack(alignment: .top, spacing: 8) {
-                        CapsBehaviorCard(key: "⇪ Caps Lock · 短按", title: "切换中英文", detail: "切换远端输入法", compact: false)
-                        CapsBehaviorCard(key: "按住 ≥ 0.6 秒后松开", title: "切换大写锁定", detail: "开启 / 关闭远端大写", compact: false)
-                        CapsBehaviorCard(key: "大写已开启", title: "短按先解除大写", detail: "再次短按才切换中英文", compact: false)
-                    }
-                }
+
+            DeskSettingsGroup(title: "Caps Lock 按键行为") {
+                behaviorRow("短按 Caps Lock", "切换远端输入法")
+                Divider()
+                behaviorRow("按住至少 0.6 秒后松开", "切换大写锁定")
+                Divider()
+                behaviorRow("大写锁定开启时短按", "先解除大写锁定")
             }
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("本机权限").font(.headline)
-                    Spacer()
-                    Button("重新检测") { model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true) }
+
+            permissionsGroup
+
+            if !model.inputStatus.isEmpty {
+                Text(model.inputStatus)
+                    .font(.caption)
+                    .foregroundStyle(model.capsLockEnabled && !model.capsLockRunning ? DeskPalette.amber : DeskPalette.secondary)
+                    .lineLimit(compact ? 3 : nil)
+                    .textSelection(.enabled)
+                    .help(model.inputStatus)
+            }
+        }
+        .tint(DeskPalette.accent)
+    }
+
+    private var forwardingGroup: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            DeskSettingsGroup(title: "转发行为") {
+                DeskSettingsRow(title: "启用 Caps Lock 转发") {
+                    HStack(spacing: 7) {
+                        CapsLockStateLabel(model: model)
+                        Toggle("启用 Caps Lock 转发", isOn: Binding(
+                            get: { model.capsLockEnabled }, set: { model.setCapsLockEnabled($0) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
                         .controlSize(.small)
-                }
-                VStack(spacing: 0) {
-                    CapsPermissionRow(title: "辅助功能", symbol: "accessibility", effective: model.localAccessibility, compact: compact) { model.requestAccessibility() }
-                    Divider().padding(.horizontal, 10)
-                    CapsPermissionRow(title: "输入监控", symbol: "keyboard.badge.eye", effective: model.localInputMonitoring, compact: compact) { model.requestInputMonitoring() }
-                }
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-                Text("当前应用：\(Bundle.main.bundleURL.path)")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
-                    .lineLimit(compact ? 2 : 3).textSelection(.enabled).help(Bundle.main.bundleURL.path)
-                PermissionNextStepView(step: .localKeyboard(accessibility: model.localAccessibility,
-                    inputMonitoring: model.localInputMonitoring, capsEnabled: model.capsLockEnabled,
-                    capsRunning: model.capsLockRunning), compact: compact, perform: permissionAction)
-            }
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 7) {
-                    Text("实际状态").fontWeight(.semibold)
-                    CapsLockStateLabel(model: model)
-                    if model.capsLockRunning {
-                        Text("本机监听已就绪").foregroundStyle(.secondary)
                     }
                 }
-                if !model.inputStatus.isEmpty {
-                    Text(model.inputStatus)
-                        .foregroundStyle(model.capsLockEnabled && !model.capsLockRunning ? Color.orange : Color.secondary)
-                        .lineLimit(compact ? 3 : nil).textSelection(.enabled).help(model.inputStatus)
+                Divider()
+                DeskSettingsRow(title: "全屏系统快捷键") {
+                    Text(model.systemShortcutStatus)
+                        .font(.caption)
+                        .foregroundStyle(model.systemShortcutsRunning ? DeskPalette.emerald : DeskPalette.secondary)
+                }
+                Divider()
+                DeskSettingsRow(title: "释放控制 / 退出全屏") {
+                    Text("⌃⌥Esc / ⌃⌘F")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(DeskPalette.secondary)
                 }
             }
-            .font(.system(size: compact ? 10 : 11))
+            Text("全屏并点按远程画面后，⌘空格、⌘Tab 等组合键转发到远端。需下方两项本机权限；系统安全输入开启时暂停转发。")
+                .font(.caption)
+                .foregroundStyle(DeskPalette.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var permissionsGroup: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            DeskSettingsGroup(title: "本机权限") {
+                permissionRow("辅助功能", effective: model.localAccessibility, action: model.requestAccessibility)
+                Divider()
+                permissionRow("输入监控", effective: model.localInputMonitoring, action: model.requestInputMonitoring)
+                Divider()
+                DeskSettingsRow(title: "权限与监听检测") {
+                    Button("重新检测") { model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true) }
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                }
+            }
+            Text("当前应用：\(Bundle.main.bundleURL.path)")
+                .font(.caption)
+                .foregroundStyle(DeskPalette.secondary)
+                .lineLimit(compact ? 2 : 3)
+                .textSelection(.enabled)
+                .help(Bundle.main.bundleURL.path)
+            PermissionNextStepView(step: .localKeyboard(accessibility: model.localAccessibility,
+                inputMonitoring: model.localInputMonitoring, capsEnabled: model.capsLockEnabled,
+                capsRunning: model.capsLockRunning), compact: compact, perform: permissionAction)
+        }
+    }
+
+    private func behaviorRow(_ title: String, _ behavior: String) -> some View {
+        DeskSettingsRow(title: title) {
+            Text(behavior).font(.caption).foregroundStyle(DeskPalette.secondary)
+        }
+    }
+
+    private func permissionRow(_ title: String, effective: Bool, action: @escaping () -> Void) -> some View {
+        DeskSettingsRow(title: title) {
+            HStack(spacing: 7) {
+                Text(effective ? "已生效" : "未生效")
+                    .font(.caption)
+                    .foregroundStyle(effective ? DeskPalette.emerald : DeskPalette.amber)
+                Button("系统设置…", action: action)
+                    .buttonStyle(DeskButtonStyle(.secondary))
+                    .accessibilityLabel("打开\(title)系统设置")
+            }
         }
     }
 
@@ -640,51 +689,6 @@ private struct CapsLockDetails: View {
         case .inputMonitoring: model.requestInputMonitoring()
         case .recheck: model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
         }
-    }
-}
-
-private struct CapsBehaviorCard: View {
-    let key: String
-    let title: String
-    let detail: String
-    let compact: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: compact ? 2 : 7) {
-            Text(key).font(.system(size: 10)).foregroundStyle(.secondary)
-            if compact {
-                HStack(spacing: 6) {
-                    Text(title).fontWeight(.semibold)
-                    Spacer(minLength: 0)
-                    Text(detail).font(.system(size: 10)).foregroundStyle(.secondary)
-                }
-            } else {
-                Text(title).font(.system(size: 12, weight: .semibold))
-                Text(detail).font(.system(size: 10)).foregroundStyle(.secondary)
-            }
-        }
-        .frame(maxWidth: .infinity, minHeight: compact ? 27 : 76, alignment: .topLeading)
-        .padding(compact ? 8 : 10)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-    }
-}
-
-private struct CapsPermissionRow: View {
-    let title: String
-    let symbol: String
-    let effective: Bool
-    let compact: Bool
-    let openSettings: () -> Void
-
-    var body: some View {
-        HStack(spacing: compact ? 5 : 8) {
-            Label(title, systemImage: symbol).font(.system(size: compact ? 11 : 12))
-            Spacer(minLength: 0)
-            Text(effective ? "已生效" : "未生效")
-                .font(.system(size: 10)).foregroundStyle(effective ? Color.green : Color.orange)
-            Button(compact ? "系统设置…" : "打开系统设置…", action: openSettings).controlSize(.small)
-        }
-        .padding(.horizontal, compact ? 8 : 10).padding(.vertical, compact ? 7 : 8)
     }
 }
 
@@ -707,21 +711,10 @@ struct RemoteTypeTextSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "keyboard.badge.ellipsis")
-                    .font(.system(size: 22))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 40, height: 40)
-                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("模拟键入文字 / 密码")
-                        .font(.system(size: 15, weight: .semibold))
-                    Text("先在远端画面点选目标输入框，再在此发送。内容经加密会话逐字符模拟键盘按下，不写入远端剪贴板。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
+            DeskSectionHeading(
+                title: "模拟键入文字 / 密码",
+                detail: "先在远端画面点选目标输入框，再在此发送。内容经加密会话逐字符模拟键盘输入，不写入远端剪贴板。"
+            )
 
             Picker("输入模式", selection: $concealed) {
                 Text("隐藏输入（密码 / 令牌）").tag(true)
@@ -738,10 +731,11 @@ struct RemoteTypeTextSheet: View {
                     .font(.system(size: 12.5, design: .monospaced))
                     .frame(height: 110)
                     .padding(4)
-                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+                    .scrollContentBackground(.hidden)
+                    .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 6))
                     .overlay(
                         RoundedRectangle(cornerRadius: 6)
-                            .strokeBorder(Color.secondary.opacity(0.25), lineWidth: 1)
+                            .strokeBorder(DeskPalette.hairline, lineWidth: 1)
                     )
             }
 
@@ -753,13 +747,13 @@ struct RemoteTypeTextSheet: View {
                 Text("\(normalizedText.count)/\(TypeTextRequest.maximumCharacterCount) 字符 · \(normalizedText.utf8.count)/\(TypeTextRequest.maximumUTF8Bytes) 字节")
                     .font(.caption)
                     .monospacedDigit()
-                    .foregroundStyle(overLimit ? Color.red : Color.secondary)
+                    .foregroundStyle(overLimit ? DeskPalette.coral : DeskPalette.secondary)
             }
 
             if let errorMessage = localError ?? model.remoteTypingUnavailableReason {
                 Text(errorMessage)
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(DeskPalette.coral)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -768,12 +762,13 @@ struct RemoteTypeTextSheet: View {
                     text = ""
                     done()
                 }
+                .buttonStyle(DeskButtonStyle(.secondary))
                 .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button("开始模拟键入") {
                     submit()
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(DeskButtonStyle(.primary))
                 .keyboardShortcut(.defaultAction)
                 .disabled(normalizedText.isEmpty || overLimit || model.remoteTypingUnavailableReason != nil)
             }
@@ -781,7 +776,7 @@ struct RemoteTypeTextSheet: View {
         .font(.system(size: 13))
         .padding(22)
         .frame(width: 460)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .deskSurface()
         .onChange(of: text) { _, _ in localError = nil }
         .onDisappear { text = "" }
     }

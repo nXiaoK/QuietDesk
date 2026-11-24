@@ -2,13 +2,14 @@ import AppKit
 import SwiftUI
 import QuietDeskCore
 
-/// One value per line in white on a rounded black background; the viewer sets how transparent the background is.
+/// A movable status overlay with viewer-controlled background opacity.
 struct FullScreenStatusOverlay<Content: View>: View {
     @Binding var position: CGPoint?
     let backgroundOpacity: Double?
     let beginDrag: () -> Void
     var capsule: Bool = false
     @ViewBuilder let content: Content
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var statusSize: CGSize = .zero
     @State private var dragOrigin: CGPoint?
     @State private var translation: CGSize = .zero
@@ -22,16 +23,17 @@ struct FullScreenStatusOverlay<Content: View>: View {
             let proposed = dragOrigin.map { CGPoint(x: $0.x + translation.width, y: $0.y + translation.height) } ?? saved
             let normalized = FullScreenStatusPlacement.position(for: proposed, container: geometry.size, status: statusSize)
             let origin = FullScreenStatusPlacement.origin(for: normalized, container: geometry.size, status: statusSize)
-            let background = backgroundOpacity.flatMap { $0.isFinite ? min(1, max(0, $0)) : nil }
+            let preferredOpacity = backgroundOpacity.flatMap { $0.isFinite ? min(1, max(0, $0)) : nil }
                 ?? FullScreenStatusPlacement.defaultBackgroundOpacity
+            let background = reduceTransparency ? 1 : preferredOpacity
             Group {
                 if capsule {
                     HStack(spacing: 10) { content }
                         .padding(.horizontal, 13)
                         .padding(.vertical, 6)
                         .background {
-                            Capsule().fill(.black.opacity(background))
-                            Capsule().strokeBorder(.white.opacity(dragOrigin != nil ? 0.55 : 0.18), lineWidth: 0.9)
+                            Capsule().fill(DeskPalette.cardBackground.opacity(background))
+                            Capsule().strokeBorder(dragOrigin == nil ? DeskPalette.hairline.opacity(background) : DeskPalette.accent, lineWidth: 1)
                         }
                 } else {
                     VStack(alignment: .leading, spacing: 1) { content }
@@ -46,9 +48,9 @@ struct FullScreenStatusOverlay<Content: View>: View {
             .font(.system(size: 11, weight: .semibold))
             .monospacedDigit()
             .lineLimit(1)
-            .foregroundStyle(.white)
-            // Fades in as the background clears, so the text stays readable over a bright picture.
-            .shadow(color: .black.opacity(0.6 * (1 - background)), radius: 1)
+            .foregroundStyle(capsule ? DeskPalette.ink : .white)
+            .shadow(color: capsule ? DeskPalette.cardBackground.opacity(0.75 * (1 - background))
+                    : .black.opacity(0.6 * (1 - background)), radius: 1)
             .fixedSize()
                 // Measured directly: a size preference would be reset by the drag target, a sibling that reports
                 // the key's default, which left every position computed for a zero-sized status.

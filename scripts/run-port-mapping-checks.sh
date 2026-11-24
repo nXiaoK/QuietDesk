@@ -21,5 +21,6 @@ trap 'rm -rf "$fixture"' EXIT
 swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" -I "$bin/Modules" \
     -module-cache-path "$CLANG_MODULE_CACHE_PATH" "$bin"/QuietDeskCore.build/*.swift.o \
     Sources/QuietDesk/PortMappingManager.swift Sources/QuietDesk/PortMappingApprovalPanel.swift \
+    Sources/QuietDesk/DeskTheme.swift \
     AppChecks/PortMappingRuleChecks.swift -o "$bin/PortMappingRuleChecks"
 "$bin/PortMappingRuleChecks"

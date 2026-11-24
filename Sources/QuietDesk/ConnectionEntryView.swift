@@ -16,15 +16,6 @@ struct ConnectionPreFlightSummary: Equatable {
     let shortcutsReady: Bool
     let clipboardTitle: String
     let clipboardReady: Bool
-
-    static let placeholder = ConnectionPreFlightSummary(
-        capsLockTitle: "按需启用",
-        capsLockReady: false,
-        shortcutsTitle: "全屏焦点时转发",
-        shortcutsReady: false,
-        clipboardTitle: "⌘V 按需同步",
-        clipboardReady: true
-    )
 }
 
 enum ConnectionEntryPresentation {
@@ -110,407 +101,10 @@ enum ConnectionEntryPresentation {
     }
 }
 
-struct RecentConnectionsView: View {
-    let records: [ConnectionRecord]
-    let locked: Bool
-    @Binding var query: String
-    @Binding var expanded: Bool
-    let connect: (ConnectionRecord) -> Void
-    let remove: (ConnectionRecord) -> Void
-    let manage: () -> Void
-    var benchmark: (ConnectionRecord) -> Void = { _ in }
-    var openMapping: (ConnectionRecord) -> Void = { _ in }
-    var qualityBadge: (ConnectionRecord) -> ConnectionRecordCardBadge? = { _ in nil }
-    var runningMappingsCount: (ConnectionRecord) -> Int = { _ in 0 }
-    var isRecordConnected: (ConnectionRecord) -> Bool = { _ in false }
-    var preFlight: ConnectionPreFlightSummary? = nil
-    var openPreferences: (() -> Void)? = nil
-    var wakeRecord: ((ConnectionRecord) -> Void)? = nil
-    var configureWakeRecord: ((ConnectionRecord) -> Void)? = nil
-    var wakeNotice: String? = nil
-    var dismissWakeNotice: (() -> Void)? = nil
-
-    private var matches: [ConnectionRecord] { ConnectionEntryPresentation.matching(records, query: query) }
-    private var searching: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-    private var visibleRecords: [ConnectionRecord] {
-        ConnectionEntryPresentation.visible(records, query: query, expanded: expanded)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .center, spacing: 10) {
-                Text("我的设备书桌")
-                    .font(.system(size: 15.5, weight: .bold))
-                Text("\(records.count) 台已保存 · 本机记录不代表当前在线")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 8)
-                searchField
-                Button("管理…", action: manage)
-                    .controlSize(.small)
-                    .disabled(locked)
-            }
-
-            if let wakeNotice, !wakeNotice.isEmpty {
-                HStack(alignment: .center, spacing: 10) {
-                    Image(systemName: "bolt.horizontal.fill")
-                        .foregroundStyle(Color.accentColor)
-                    Text(wakeNotice)
-                        .font(.caption)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    if let dismissWakeNotice {
-                        Button("收起", action: dismissWakeNotice)
-                            .buttonStyle(.link)
-                            .font(.caption)
-                    }
-                }
-                .padding(10)
-                .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            }
-
-            if matches.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("没有匹配的连接记录")
-                        .font(.callout.weight(.semibold))
-                    Text("试试设备名称、域名、IP、MAC 或完整设备标识，也可以清除搜索条件。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(16)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-            } else {
-                LazyVGrid(
-                    columns: [
-                        GridItem(.adaptive(minimum: 340, maximum: 640), spacing: 14, alignment: .top)
-                    ],
-                    spacing: 14
-                ) {
-                    ForEach(Array(visibleRecords.enumerated()), id: \.element.id) { index, record in
-                        ConnectionDeskCard(
-                            record: record,
-                            highlighted: index == 0 && !searching,
-                            badge: qualityBadge(record),
-                            activeMappings: runningMappingsCount(record),
-                            isConnected: isRecordConnected(record),
-                            connect: { connect(record) },
-                            remove: { remove(record) },
-                            benchmark: { benchmark(record) },
-                            openMapping: { openMapping(record) },
-                            wake: wakeRecord.map { fn in { fn(record) } },
-                            configureWake: configureWakeRecord.map { fn in { fn(record) } }
-                        )
-                        .disabled(locked)
-                    }
-
-                    if let preFlight, !searching {
-                        PreFlightReadinessCard(summary: preFlight, openPreferences: openPreferences)
-                    }
-                }
-            }
-
-            HStack(spacing: 12) {
-                if searching {
-                    Text("找到 \(matches.count) 条，共 \(records.count) 条记录")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else if records.count > ConnectionEntryPresentation.recentLimit {
-                    Button(expanded ? "收起为最近 \(ConnectionEntryPresentation.recentLimit) 台设备" : "展开全部 \(records.count) 台已保存设备") {
-                        expanded.toggle()
-                    }
-                    .buttonStyle(.link)
-                    .font(.caption.weight(.medium))
-                }
-                Spacer(minLength: 0)
-                Text("点按「连接」使用已存配对码；凭据缺失时会提示补录，不读取钥匙串。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private var searchField: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 11.5))
-                .foregroundStyle(.secondary)
-            TextField("搜索名称、地址或设备 ID…", text: $query)
-                .textFieldStyle(.plain)
-                .font(.system(size: 12))
-                .accessibilityLabel("搜索最近连接")
-            if !query.isEmpty {
-                Button {
-                    query = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 11.5))
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help("清除搜索")
-                .accessibilityLabel("清除最近连接搜索")
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .frame(width: 216)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.65), lineWidth: 0.8)
-        }
-    }
-}
-
-private struct ConnectionDeskCard: View {
-    let record: ConnectionRecord
-    let highlighted: Bool
-    let badge: ConnectionRecordCardBadge?
-    let activeMappings: Int
-    var isConnected: Bool = false
-    let connect: () -> Void
-    let remove: () -> Void
-    let benchmark: () -> Void
-    let openMapping: () -> Void
-    var wake: (() -> Void)? = nil
-    var configureWake: (() -> Void)? = nil
-
-    private var emeraldColor: Color { Color(red: 0.07, green: 0.64, blue: 0.44) }
-
-    private var badgeColor: Color {
-        switch badge?.tone {
-        case .good?: return Color(red: 0.07, green: 0.64, blue: 0.44)
-        case .info?: return Color.accentColor
-        case .caution?: return Color(red: 0.88, green: 0.52, blue: 0.08)
-        case .neutral?, nil: return .secondary
-        }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 11) {
-            HStack(alignment: .top, spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(highlighted ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.05))
-                        .frame(width: 40, height: 40)
-                    Image(systemName: ConnectionEntryPresentation.deviceSymbol(record))
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(highlighted ? Color.accentColor : Color.primary.opacity(0.78))
-                }
-
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(alignment: .center, spacing: 6) {
-                        Text(ConnectionEntryPresentation.title(record))
-                            .font(.system(size: 14.5, weight: .bold))
-                            .lineLimit(1)
-                            .help(record.name)
-                        Spacer(minLength: 4)
-                        if isConnected {
-                            Text("远控中")
-                                .font(.system(size: 10.5, weight: .semibold))
-                                .foregroundStyle(emeraldColor)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 2.5)
-                                .background(emeraldColor.opacity(0.14), in: Capsule())
-                        } else if let badge {
-                            Text(badge.text)
-                                .font(.system(size: 10.5, weight: .semibold))
-                                .monospacedDigit()
-                                .foregroundStyle(badgeColor)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 2.5)
-                                .background(badgeColor.opacity(0.12), in: Capsule())
-                        } else {
-                            Text(ConnectionEntryPresentation.route(record))
-                                .font(.system(size: 10.5, weight: .medium))
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 2.5)
-                                .background(Color.primary.opacity(0.05), in: Capsule())
-                        }
-                    }
-
-                    HStack(spacing: 5) {
-                        if badge != nil {
-                            Text(ConnectionEntryPresentation.route(record))
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(.secondary)
-                            Text("·").foregroundStyle(.secondary)
-                        }
-                        Text(ConnectionEntryPresentation.endpoint(record))
-                            .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .help(ConnectionEntryPresentation.endpoint(record))
-                    }
-
-                    if let relay = record.relay {
-                        Text("设备 ID: \(relay.deviceID.uuidString.lowercased())")
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .help(relay.deviceID.uuidString.lowercased())
-                    }
-                }
-            }
-
-            HStack(spacing: 6) {
-                Image(systemName: "sparkles.tv")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
-                Text(ConnectionEntryPresentation.savedQualityLabel(record))
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer(minLength: 4)
-                if activeMappings > 0 {
-                    Text("\(activeMappings) 条映射启用中")
-                        .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(Color.accentColor)
-                }
-            }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
-            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-
-            HStack(alignment: .center, spacing: 8) {
-                Text(record.lastConnected == .distantPast
-                     ? "已保存 · 尚未远控"
-                     : "上次连接 \(record.lastConnected.formatted(date: .abbreviated, time: .shortened))")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-
-                Spacer(minLength: 4)
-
-                if record.wakeOnLAN != nil, let wake {
-                    Button("唤醒", action: wake)
-                        .controlSize(.small)
-                        .help("发送 Wake-on-LAN 魔术包唤醒此设备（\(record.wakeOnLAN?.macAddress.formatted ?? "")）")
-                        .accessibilityLabel("网络唤醒 \(ConnectionEntryPresentation.title(record))")
-                }
-
-                Button("测速", action: benchmark)
-                    .controlSize(.small)
-                    .help("实测此记录可用的直连与各中继线路质量及丢包情况")
-                    .accessibilityLabel("测试 \(ConnectionEntryPresentation.title(record)) 的线路质量")
-
-                Button(isConnected ? "切到窗口" : "连接", action: connect)
-                    .buttonStyle(.borderedProminent)
-                    .tint(isConnected ? emeraldColor : .accentColor)
-                    .controlSize(.small)
-                    .accessibilityLabel("\(isConnected ? "切到" : "连接") \(ConnectionEntryPresentation.title(record))")
-
-                Menu {
-                    Button("测试线路质量…", action: benchmark)
-                    Button("配置 TCP 端口映射…", action: openMapping)
-                    if record.wakeOnLAN != nil, let wake {
-                        Button("发送网络唤醒包 (WOL)", action: wake)
-                    }
-                    if let configureWake {
-                        Button(record.wakeOnLAN == nil ? "配置网络唤醒 (MAC)…" : "修改网络唤醒配置…", action: configureWake)
-                    }
-                    Divider()
-                    Button("移除此记录", role: .destructive, action: remove)
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .font(.system(size: 13))
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .help("更多设备操作")
-                .accessibilityLabel("\(ConnectionEntryPresentation.title(record)) 的记录操作")
-            }
-        }
-        .padding(15)
-        .frame(maxWidth: .infinity, minHeight: 158, alignment: .topLeading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .strokeBorder(
-                    highlighted ? Color.accentColor.opacity(0.38) : Color(nsColor: .separatorColor).opacity(0.65),
-                    lineWidth: highlighted ? 1.3 : 0.8
-                )
-        }
-        .contextMenu {
-            Button(isConnected ? "切到远控窗口" : "连接", action: connect)
-            Button("测试线路质量…", action: benchmark)
-            Button("配置 TCP 端口映射…", action: openMapping)
-            if record.wakeOnLAN != nil, let wake {
-                Button("发送网络唤醒包 (WOL)", action: wake)
-            }
-            if let configureWake {
-                Button(record.wakeOnLAN == nil ? "配置网络唤醒 (MAC)…" : "修改网络唤醒配置…", action: configureWake)
-            }
-            Divider()
-            Button("移除", role: .destructive, action: remove)
-        }
-    }
-}
-
-private struct PreFlightReadinessCard: View {
-    let summary: ConnectionPreFlightSummary
-    let openPreferences: (() -> Void)?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 7) {
-                Image(systemName: "checkmark.shield.fill")
-                    .foregroundStyle(Color.accentColor)
-                Text("本机连接前就绪状态")
-                    .font(.system(size: 13.5, weight: .bold))
-                Spacer()
-                if let openPreferences {
-                    Button("偏好设置 →", action: openPreferences)
-                        .buttonStyle(.link)
-                        .font(.caption.weight(.medium))
-                }
-            }
-
-            readinessRow(title: "Caps Lock 远端中英切换", value: summary.capsLockTitle, ok: summary.capsLockReady)
-            readinessRow(title: "全屏系统快捷键 (⌘Tab / ⌘Space)", value: summary.shortcutsTitle, ok: summary.shortcutsReady)
-            readinessRow(title: "剪贴板与文件按需拉取", value: summary.clipboardTitle, ok: summary.clipboardReady)
-
-            Spacer(minLength: 0)
-
-            Text("快捷键：⌃⌥Esc 释放控制 · ⌃⌘F 全屏 · ⌃⌘S 远端截图")
-                .font(.system(size: 10.5))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-        }
-        .padding(15)
-        .frame(maxWidth: .infinity, minHeight: 158, alignment: .topLeading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.65), lineWidth: 0.8)
-        }
-    }
-
-    private func readinessRow(title: String, value: String, ok: Bool) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: ok ? "checkmark.circle.fill" : "circle.dashed")
-                .font(.system(size: 11.5))
-                .foregroundStyle(ok ? Color(red: 0.07, green: 0.64, blue: 0.44) : Color.secondary)
-            Text(title)
-                .font(.system(size: 11.5))
-                .lineLimit(1)
-            Spacer(minLength: 4)
-            Text(value)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(ok ? Color(red: 0.07, green: 0.64, blue: 0.44) : Color.secondary)
-                .lineLimit(1)
-        }
-    }
-}
-
 struct ConnectionEntryView<NodePicker: View, Options: View>: View {
     let records: [ConnectionRecord]
+    let selectedRecord: ConnectionRecord?
+    @Binding var showNewConnection: Bool
     let locked: Bool
     let failure: String?
     let status: String
@@ -523,517 +117,964 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
     let nodePicker: NodePicker
     @Binding var showOptions: Bool
     let options: Options
-    let connect: () -> Void
+    let connect: () -> Bool
     let cancel: () -> Void
-    let quickConnect: (ConnectionRecord) -> Void
+    let clearFailure: () -> Void
+    let quickConnect: (ConnectionRecord) -> Bool
     let remove: (ConnectionRecord) -> Void
-    let manage: () -> Void
     let openOptions: () -> Void
     let openCaps: () -> Void
     let openRelay: () -> Void
-    let openTraffic: () -> Void
-    var openBenchmark: () -> Void = {}
-    var benchmarkRecord: (ConnectionRecord) -> Void = { _ in }
-    var openPortMappingRecord: (ConnectionRecord) -> Void = { _ in }
-    var qualityBadge: (ConnectionRecord) -> ConnectionRecordCardBadge? = { _ in nil }
-    var runningMappingsCount: (ConnectionRecord) -> Int = { _ in 0 }
-    var preFlight: ConnectionPreFlightSummary? = nil
-    var lanScanning = false
-    var discoveredLANHosts: [DiscoveredLANHost] = []
-    var lanScanStatus = ""
-    var toggleLANScan: (() -> Void)? = nil
-    var dismissLANScan: (() -> Void)? = nil
-    var hasSavedCredentialForDiscovered: (DiscoveredLANHost) -> Bool = { _ in false }
-    var selectDiscoveredHost: (DiscoveredLANHost) -> Void = { _ in }
-    var wakeRecord: ((ConnectionRecord) -> Void)? = nil
-    var configureWakeRecord: ((ConnectionRecord) -> Void)? = nil
-    var wakeNotice: String? = nil
-    var dismissWakeNotice: (() -> Void)? = nil
-    var activeSessions: [ActiveRemoteSessionSummary] = []
-    var focusSession: (UUID) -> Void = { _ in }
-    var disconnectSession: (UUID) -> Void = { _ in }
-    var disconnectAllSessions: () -> Void = {}
-    var isRecordConnected: (ConnectionRecord) -> Bool = { _ in false }
+    let openBenchmark: () -> Void
+    let benchmarkRecord: (ConnectionRecord) -> Void
+    let openPortMappingRecord: (ConnectionRecord) -> Void
+    let qualityBadge: (ConnectionRecord) -> ConnectionRecordCardBadge?
+    let runningMappingsCount: (ConnectionRecord) -> Int
+    let preFlight: ConnectionPreFlightSummary
+    let lanScanning: Bool
+    let discoveredLANHosts: [DiscoveredLANHost]
+    let lanScanStatus: String
+    let toggleLANScan: () -> Void
+    let dismissLANScan: () -> Void
+    let hasSavedCredentialForDiscovered: (DiscoveredLANHost) -> Bool
+    let selectDiscoveredHost: (DiscoveredLANHost) -> Bool
+    let wakeRecord: (ConnectionRecord) -> Void
+    let configureWakeRecord: (ConnectionRecord) -> Void
+    let wakeNotice: String?
+    let dismissWakeNotice: () -> Void
+    let activeSessions: [ActiveRemoteSessionSummary]
+    let focusSession: (UUID) -> Void
+    let disconnectSession: (UUID) -> Void
+    let disconnectAllSessions: () -> Void
+    let sessionForRecord: (ConnectionRecord) -> ActiveRemoteSessionSummary?
+
+    @State private var sheet: Sheet?
     @State private var query = ""
     @State private var expandedRecords = false
+    @State private var triedCredential = false
+    @State private var afterSheetDismissal: (() -> Void)?
     @FocusState private var focusedField: ConnectionEntryPresentation.Field?
+
+    private enum Sheet: Equatable {
+        case connection, credentials(title: String, endpoint: String), discovery, records, sessions, readiness
+    }
 
     private var usesRelay: Bool { relayEnabled && strategy != .direct }
     private var showsAddress: Bool { !relayEnabled || strategy != .relay }
+    private var matches: [ConnectionRecord] { ConnectionEntryPresentation.matching(records, query: query) }
+    private var searching: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    private var visibleRecords: [ConnectionRecord] {
+        ConnectionEntryPresentation.visible(records, query: query, expanded: expandedRecords)
+    }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                if !activeSessions.isEmpty {
-                    activeSessionsCard
-                }
+            VStack(alignment: .leading, spacing: 20) {
+                pageHeading
                 if locked {
                     connectingBanner
                 }
-                quickConnectCard
-                    .id("new-connection")
+                if let wakeNotice, !wakeNotice.isEmpty {
+                    notice(wakeNotice, symbol: "bolt.horizontal") {
+                        Button("收起", action: dismissWakeNotice)
+                            .buttonStyle(DeskButtonStyle(.quiet))
+                    }
+                }
+                if let failure {
+                    failureNotice(failure)
+                }
 
-                if records.isEmpty {
-                    firstUseGuideCard
+                if let selectedRecord {
+                    deviceDetail(selectedRecord)
+                } else if records.isEmpty {
+                    firstUse
+                        .padding(.top, 38)
                 } else {
-                    RecentConnectionsView(
-                        records: records,
-                        locked: locked,
-                        query: $query,
-                        expanded: $expandedRecords,
-                        connect: quickConnect,
-                        remove: remove,
-                        manage: manage,
-                        benchmark: benchmarkRecord,
-                        openMapping: openPortMappingRecord,
-                        qualityBadge: qualityBadge,
-                        runningMappingsCount: runningMappingsCount,
-                        isRecordConnected: isRecordConnected,
-                        preFlight: preFlight,
-                        openPreferences: openCaps,
-                        wakeRecord: wakeRecord,
-                        configureWakeRecord: configureWakeRecord,
-                        wakeNotice: wakeNotice,
-                        dismissWakeNotice: dismissWakeNotice
+                    allDevices
+                }
+
+                if !activeSessions.isEmpty, selectedRecord == nil {
+                    activeSessionsSection
+                }
+            }
+            .padding(26)
+            .frame(maxWidth: 1040, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .top)
+        }
+        .background(selectedRecord == nil ? DeskPalette.canvasBackground : DeskPalette.cardBackground)
+        .sheet(isPresented: Binding(
+            get: { sheet != nil },
+            set: { presented in if !presented { dismissSheet() } }
+        ), onDismiss: finishSheetDismissal) {
+            sheetContent
+                .fixedSize(horizontal: false, vertical: true)
+                .deskSurface()
+        }
+        .onChange(of: showNewConnection, initial: true) { _, requested in
+            if requested { sheet = .connection }
+        }
+        .onChange(of: failure) { _, failure in
+            if failure != nil && sheet == .connection { focusIncompleteField() }
+        }
+        .onDisappear(perform: dismissSheet)
+        .onReceive(NotificationCenter.default.publisher(for: SystemQuitHandler.dismissSheets)) { _ in
+            afterSheetDismissal = nil
+            dismissSheet()
+        }
+    }
+
+    private var pageHeading: some View {
+        HStack(spacing: 10) {
+            if let selectedRecord {
+                let session = sessionForRecord(selectedRecord)
+                if let session {
+                    DeskPillBadge(
+                        text: session.connected ? "已连接" : session.reconnecting ? "重连中" : "连接中",
+                        symbol: "circle.fill",
+                        tint: session.connected ? DeskPalette.emerald : DeskPalette.amber
                     )
                 }
-            }
-            .padding(.horizontal, 26)
-            .padding(.vertical, 22)
-            .frame(maxWidth: 1080, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .topLeading)
-        }
-        .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear {
-            if records.isEmpty || failure != nil {
-                focusIncompleteField()
-            }
-        }
-        .onChange(of: failure) { _, newFailure in
-            if newFailure != nil {
-                focusIncompleteField()
-            }
-        }
-    }
-
-    private var activeSessionsCard: some View {
-        let emerald = Color(red: 0.07, green: 0.64, blue: 0.44)
-        let amber = Color(red: 0.88, green: 0.52, blue: 0.08)
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Label("当前活动远控会话（\(activeSessions.count) 台）", systemImage: "macwindow.on.rectangle")
-                    .font(.system(size: 13.5, weight: .bold))
-                Text("每个远端桌面运行在独立窗口中，可继续发起其他 Mac 连接")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(ConnectionEntryPresentation.title(selectedRecord))
+                    .font(.system(size: 22, weight: .semibold))
                     .lineLimit(1)
-                Spacer(minLength: 8)
-                if activeSessions.count > 1 {
-                    Button("全部断开", role: .destructive, action: disconnectAllSessions)
-                        .controlSize(.small)
-                }
-            }
-
-            VStack(spacing: 8) {
-                ForEach(activeSessions) { session in
-                    HStack(spacing: 10) {
-                        Circle()
-                            .fill(session.connected ? emerald : (session.reconnecting || session.working ? amber : .secondary))
-                            .frame(width: 7.5, height: 7.5)
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 6) {
-                                Text(session.title)
-                                    .font(.system(size: 13, weight: .semibold))
-                                    .lineLimit(1)
-                                Text(session.endpointLabel)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                            }
-                            Text(session.statusLabel)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                        Spacer(minLength: 8)
-                        Button("切到窗口") { focusSession(session.id) }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-                        Button("断开") { disconnectSession(session.id) }
-                            .controlSize(.small)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 9, style: .continuous)
-                            .strokeBorder(Color(nsColor: .separatorColor).opacity(0.6), lineWidth: 0.8)
-                    }
-                }
-            }
-        }
-        .padding(14)
-        .background(emerald.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(emerald.opacity(0.28), lineWidth: 1)
-        }
-    }
-
-    private var connectingBanner: some View {
-        HStack(spacing: 12) {
-            ProgressView()
-                .controlSize(.small)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("正在建立加密连接…")
-                    .font(.subheadline.weight(.semibold))
-                Text(status)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityAddTraits(.isHeader)
+                recordMenu(selectedRecord, session: session, inManagementSheet: false)
+            } else {
+                Text(records.isEmpty ? "第一次使用 QuietDesk" : "全部设备")
+                    .font(.system(size: 22, weight: .semibold))
+                    .accessibilityAddTraits(.isHeader)
             }
             Spacer(minLength: 8)
-            Button("取消连接", action: cancel)
-                .controlSize(.regular)
+            if !activeSessions.isEmpty {
+                Button {
+                    sheet = .sessions
+                } label: {
+                    Label("活动会话", systemImage: "macwindow.on.rectangle")
+                }
+                .buttonStyle(DeskButtonStyle(.quiet))
+            }
+            if selectedRecord != nil {
+                Button {
+                    sheet = .readiness
+                } label: {
+                    Image(systemName: "checkmark.shield")
+                }
+                .buttonStyle(DeskButtonStyle(.quiet))
+                .help("连接前就绪状态")
+                .accessibilityLabel("连接前就绪状态")
+            }
         }
-        .padding(14)
-        .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(Color.accentColor.opacity(0.28), lineWidth: 1)
+        .frame(minHeight: 33)
+    }
+
+    private var firstUse: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "display")
+                .font(.system(size: 46, weight: .light))
+                .foregroundStyle(DeskPalette.muted.opacity(0.72))
+                .accessibilityHidden(true)
+            Text("从另一台 Mac 开启共享")
+                .font(.system(size: 23, weight: .semibold))
+            Text("在「本机共享」复制配对码，然后填写地址连接。")
+                .font(.callout)
+                .foregroundStyle(DeskPalette.secondary)
+            Button {
+                sheet = .connection
+            } label: {
+                Text("新建连接").frame(minWidth: 112)
+            }
+            .buttonStyle(DeskButtonStyle(.primary))
+            .disabled(locked)
+            .padding(.top, 12)
+            Text("同一局域网可扫描开启发现广播的设备。")
+                .font(.callout)
+                .foregroundStyle(DeskPalette.secondary)
+                .padding(.top, 6)
+            Button(action: openDiscovery) {
+                Text("扫描局域网").frame(minWidth: 112)
+            }
+            .buttonStyle(DeskButtonStyle(.secondary))
+            .disabled(locked)
+        }
+        .multilineTextAlignment(.center)
+        .frame(maxWidth: .infinity, minHeight: 290)
+    }
+
+    private var allDevices: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Text("\(records.count) 台已保存")
+                    .font(.callout)
+                    .foregroundStyle(DeskPalette.secondary)
+                Spacer()
+                Button("扫描局域网", action: openDiscovery)
+                    .buttonStyle(DeskButtonStyle(.secondary))
+                    .disabled(locked)
+                Button("管理记录") { sheet = .records }
+                    .buttonStyle(DeskButtonStyle(.secondary))
+                    .disabled(locked)
+                Button("新建连接") { sheet = .connection }
+                    .buttonStyle(DeskButtonStyle(.primary))
+                    .disabled(locked)
+            }
+
+            TextField("搜索名称、地址或设备 ID…", text: $query)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityLabel("搜索连接记录")
+
+            if matches.isEmpty {
+                VStack(spacing: 10) {
+                    Text("没有匹配的连接记录")
+                        .font(.system(size: 18, weight: .semibold))
+                    Text("尝试设备名称、域名、IP、MAC 或完整设备标识。")
+                        .font(.callout)
+                        .foregroundStyle(DeskPalette.secondary)
+                    Button("清除搜索") { query = "" }
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .padding(.top, 4)
+                }
+                .frame(maxWidth: .infinity, minHeight: 168)
+            } else {
+                recordTable(visibleRecords, inManagementSheet: false)
+            }
+
+            HStack {
+                if searching {
+                    Text("找到 \(matches.count) 条，共 \(records.count) 条记录")
+                        .font(.caption)
+                        .foregroundStyle(DeskPalette.secondary)
+                } else if records.count > ConnectionEntryPresentation.recentLimit {
+                    Button(expandedRecords ? "收起为最近 \(ConnectionEntryPresentation.recentLimit) 台设备" : "展开全部 \(records.count) 台设备") {
+                        expandedRecords.toggle()
+                    }
+                    .buttonStyle(DeskButtonStyle(.quiet))
+                }
+                Spacer()
+                Button("连接前就绪状态") { sheet = .readiness }
+                    .buttonStyle(DeskButtonStyle(.quiet))
+            }
         }
     }
 
-    private var quickConnectCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .center, spacing: 10) {
-                Label("快速发起新连接", systemImage: "bolt.horizontal.circle.fill")
-                    .font(.system(size: 14, weight: .bold))
-                Spacer(minLength: 8)
-                if relayEnabled {
-                    Picker("连接策略", selection: $strategy) {
-                        ForEach(RelayConnectionStrategy.allCases, id: \.self) { mode in
-                            Text(mode.title).tag(mode)
+    private func deviceDetail(_ record: ConnectionRecord) -> some View {
+        let session = sessionForRecord(record)
+        return VStack(alignment: .leading, spacing: 13) {
+            VStack(spacing: 0) {
+                VStack(spacing: 14) {
+                    Image(systemName: "display")
+                        .font(.system(size: 49, weight: .light))
+                        .foregroundStyle(DeskPalette.muted.opacity(0.72))
+                        .accessibilityHidden(true)
+                    Text(session == nil ? "连接后显示远程桌面" : "远程桌面在独立窗口运行")
+                        .font(.system(size: 22, weight: .medium))
+                    Text(session?.statusLabel ?? "此设备尚未建立会话，没有实时画面。")
+                        .font(.callout)
+                        .foregroundStyle(DeskPalette.secondary)
+                        .multilineTextAlignment(.center)
+                    Button {
+                        connectSavedDevice(record)
+                    } label: {
+                        Text(session == nil ? "连接到设备" : "进入桌面")
+                            .frame(minWidth: 98)
+                    }
+                    .buttonStyle(DeskButtonStyle(.primary))
+                    .disabled(locked)
+                    .padding(.top, 8)
+                }
+                .frame(maxWidth: .infinity, minHeight: 254)
+                .background(DeskPalette.insetBackground)
+
+                Divider()
+                HStack(spacing: 12) {
+                    Button { openPortMappingRecord(record) } label: {
+                        Label("端口映射", systemImage: "point.3.connected.trianglepath.dotted")
+                    }
+                    Divider().frame(height: 14)
+                    Button(action: openOptions) {
+                        Label("连接选项", systemImage: "slider.horizontal.3")
+                    }
+                    .popover(isPresented: optionsPresentation(inComposer: false), arrowEdge: .bottom) { options }
+                    Divider().frame(height: 14)
+                    Button { benchmarkRecord(record) } label: {
+                        Label("测试线路", systemImage: "speedometer")
+                    }
+                    if record.wakeOnLAN != nil {
+                        Divider().frame(height: 14)
+                        Button { wakeRecord(record) } label: {
+                            Label("网络唤醒", systemImage: "bolt.horizontal")
                         }
                     }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .controlSize(.small)
-                    .fixedSize()
-                    .disabled(locked)
-                } else {
-                    Button(action: openRelay) {
-                        Label("直连 IP/域名 · 配置自托管中继…", systemImage: "network")
-                            .font(.caption)
-                    }
-                    .buttonStyle(.link)
-                    .disabled(locked)
+                }
+                .buttonStyle(DeskButtonStyle(.quiet))
+                .disabled(locked)
+                .frame(maxWidth: .infinity, minHeight: 47)
+            }
+            .background(DeskPalette.cardBackground)
+            .clipShape(.rect(cornerRadius: 11))
+            .overlay { RoundedRectangle(cornerRadius: 11).strokeBorder(DeskPalette.hairline) }
+
+            HStack(spacing: 10) {
+                Text(ConnectionEntryPresentation.savedQualityLabel(record))
+                    .lineLimit(1)
+                if let badge = qualityBadge(record) {
+                    DeskPillBadge(text: badge.text, tint: qualityTint(badge.tone), monospaced: true)
+                }
+                let mappings = runningMappingsCount(record)
+                if mappings > 0 {
+                    Text("\(mappings) 条映射启用中")
+                }
+                Spacer()
+                if let session {
+                    Button("打开独立窗口") { focusSession(session.id) }
+                        .buttonStyle(DeskButtonStyle(.quiet))
                 }
             }
-
-            if let failure {
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.red)
-                    Text(failure)
-                        .font(.callout)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    Button("重试", action: connect)
-                        .controlSize(.small)
-                        .disabled(locked)
-                }
-                .padding(11)
-                .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            }
-
-            ViewThatFits(in: .horizontal) {
-                horizontalInputRow
-                verticalInputStack
-            }
-            .textFieldStyle(.roundedBorder)
-            .disabled(locked)
-
-            HStack(spacing: 14) {
-                if usesRelay {
-                    HStack(spacing: 6) {
-                        Text("中继节点：")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        nodePicker
-                            .controlSize(.small)
-                    }
-                }
-                Button(action: openOptions) {
-                    Label("本次连接选项…", systemImage: "slider.horizontal.3")
-                }
-                .popover(isPresented: $showOptions, arrowEdge: .bottom) { options }
-
-                Button(action: openCaps) {
-                    Label("键盘与防窥偏好", systemImage: "keyboard")
-                }
-
-                if relayEnabled {
-                    Button(action: openRelay) {
-                        Label("管理节点", systemImage: "server.rack")
-                    }
-                }
-
-                if let toggleLANScan {
-                    Button(action: toggleLANScan) {
-                        Label(
-                            lanScanning ? "停止局域网扫描" : "扫描局域网 Mac",
-                            systemImage: lanScanning ? "stop.circle" : "dot.radiowaves.left.and.right"
-                        )
-                    }
-                    .disabled(locked)
-                }
-
-                Spacer(minLength: 0)
-            }
-            .buttonStyle(.link)
             .font(.caption)
-
-            if lanScanning || !discoveredLANHosts.isEmpty || !lanScanStatus.isEmpty {
-                lanDiscoverySection
-            }
-        }
-        .padding(18)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.65), lineWidth: 0.8)
+            .foregroundStyle(DeskPalette.secondary)
         }
     }
 
-    private var lanDiscoverySection: some View {
-        VStack(alignment: .leading, spacing: 8) {
+    private func recordTable(_ records: [ConnectionRecord], inManagementSheet: Bool) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                tableCell("设备", width: 146)
+                tableCell("连接端点")
+                tableCell("最近连接", width: 112)
+                tableCell("操作", width: 104)
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(DeskPalette.secondary)
+            .padding(.horizontal, 14)
+            .frame(height: 33)
+            .background(DeskPalette.insetBackground)
+
+            ForEach(records) { record in
+                let session = sessionForRecord(record)
+                Divider()
+                HStack(spacing: 12) {
+                    HStack(spacing: 8) {
+                        Image(systemName: ConnectionEntryPresentation.deviceSymbol(record))
+                            .foregroundStyle(DeskPalette.muted)
+                            .accessibilityHidden(true)
+                        tableCell(ConnectionEntryPresentation.title(record))
+                    }
+                    .frame(width: 146, alignment: .leading)
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        tableCell(ConnectionEntryPresentation.endpoint(record))
+                            .font(.system(.caption, design: .monospaced))
+                        if let relay = record.relay {
+                            tableCell(relay.deviceID.uuidString.lowercased())
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(DeskPalette.secondary)
+                        }
+                        if let wake = record.wakeOnLAN, inManagementSheet {
+                            Text("WOL · \(wake.macAddress.formatted)")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(DeskPalette.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    tableCell(
+                        record.lastConnected == .distantPast
+                            ? "尚未远控"
+                            : record.lastConnected.formatted(date: .abbreviated, time: .shortened),
+                        width: 112
+                    )
+                    .font(.caption)
+                    .foregroundStyle(DeskPalette.secondary)
+
+                    HStack(spacing: 2) {
+                        Button(session == nil ? "连接" : "切到窗口") { connectSavedDevice(record) }
+                            .buttonStyle(DeskButtonStyle(.quiet))
+                        recordMenu(record, session: session, inManagementSheet: inManagementSheet)
+                    }
+                    .frame(width: 104, alignment: .leading)
+                    .disabled(locked)
+                }
+                .font(.callout)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .frame(minHeight: 42)
+                .contextMenu {
+                    Button(session == nil ? "连接" : "切到窗口") { connectSavedDevice(record) }
+                        .disabled(locked)
+                    recordMenuActions(record, session: session, inManagementSheet: inManagementSheet)
+                }
+            }
+        }
+        .background(DeskPalette.cardBackground)
+        .clipShape(.rect(cornerRadius: 8))
+        .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(DeskPalette.hairline) }
+    }
+
+    private func recordMenu(_ record: ConnectionRecord, session: ActiveRemoteSessionSummary?, inManagementSheet: Bool) -> some View {
+        Menu {
+            recordMenuActions(record, session: session, inManagementSheet: inManagementSheet)
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 13, weight: .semibold))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .tint(DeskPalette.secondary)
+        .fixedSize()
+        .disabled(locked)
+        .help("设备操作")
+        .accessibilityLabel("\(ConnectionEntryPresentation.title(record)) 的记录操作")
+    }
+
+    @ViewBuilder
+    private func recordMenuActions(_ record: ConnectionRecord, session: ActiveRemoteSessionSummary?, inManagementSheet: Bool) -> some View {
+        Button(record.wakeOnLAN == nil ? "配置网络唤醒…" : "编辑网络唤醒…") {
+            performAfterManagement(inManagementSheet) { configureWakeRecord(record) }
+        }
+        .disabled(locked)
+        if record.wakeOnLAN != nil {
+            Button("发送唤醒包") { performAfterManagement(inManagementSheet) { wakeRecord(record) } }
+                .disabled(locked)
+        }
+        Button("测试线路质量…") { performAfterManagement(inManagementSheet) { benchmarkRecord(record) } }
+            .disabled(locked)
+        Button("配置 TCP 端口映射…") { performAfterManagement(inManagementSheet) { openPortMappingRecord(record) } }
+            .disabled(locked)
+        if let session {
+            Button("断开连接", role: .destructive) { disconnectSession(session.id) }
+        }
+        Divider()
+        Button("移除此记录", role: .destructive) { remove(record) }
+            .disabled(locked)
+    }
+
+    private func tableCell(_ text: String, width: CGFloat? = nil) -> some View {
+        Text(text)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .help(text)
+            .frame(width: width, alignment: .leading)
+            .frame(maxWidth: width == nil ? .infinity : nil, alignment: .leading)
+    }
+
+    private var activeSessionsSection: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Text("当前活动会话")
+                    .font(.headline)
+                Spacer()
+                Button("查看会话") { sheet = .sessions }
+                    .buttonStyle(DeskButtonStyle(.secondary))
+            }
+            activeSessionRows
+        }
+    }
+
+    private var activeSessionRows: some View {
+        DeskSurfaceCard(padding: 0, cornerRadius: 8) {
+            VStack(spacing: 0) {
+                ForEach(activeSessions) { session in
+                    if session.id != activeSessions.first?.id { Divider() }
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(session.connected ? DeskPalette.emerald : (session.reconnecting || session.working ? DeskPalette.amber : DeskPalette.muted))
+                            .frame(width: 6, height: 6)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 3) {
+                            tableCell(session.title)
+                                .font(.callout.weight(.semibold))
+                            tableCell(session.endpointLabel)
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(DeskPalette.secondary)
+                        }
+                        tableCell(session.statusLabel, width: 136)
+                            .foregroundStyle(DeskPalette.secondary)
+                        Button("切到窗口") {
+                            if sheet == .sessions { dismissSheet() }
+                            focusSession(session.id)
+                        }
+                        .buttonStyle(DeskButtonStyle(.quiet))
+                        Button("断开", role: .destructive) { disconnectSession(session.id) }
+                            .buttonStyle(DeskButtonStyle(.danger))
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var sheetContent: some View {
+        switch sheet {
+        case .connection:
+            connectionSheet
+        case let .credentials(title, endpoint):
+            credentialsSheet(title: title, endpoint: endpoint)
+        case .discovery:
+            discoverySheet
+        case .records:
+            managementSheet
+        case .sessions:
+            sessionsSheet
+        case .readiness:
+            readinessSheet
+        case nil:
+            EmptyView()
+        }
+    }
+
+    private var connectionSheet: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            sheetHeading(
+                usesRelay ? "通过设备标识连接" : "新建连接",
+                detail: nil
+            )
+
+            ViewThatFits(in: .vertical) {
+                connectionFields
+                ScrollView { connectionFields }
+                    .scrollBounceBehavior(.basedOnSize)
+            }
+            .frame(maxHeight: 368, alignment: .topLeading)
+
             Divider()
             HStack(spacing: 8) {
-                if lanScanning {
-                    ProgressView()
-                        .controlSize(.mini)
-                } else {
-                    Image(systemName: "dot.radiowaves.left.and.right")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-                Text(lanScanStatus.isEmpty ? "局域网发现" : lanScanStatus)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 8)
-                if !lanScanning, let dismissLANScan {
-                    Button("收起", action: dismissLANScan)
-                        .buttonStyle(.link)
-                        .font(.caption)
-                }
-            }
-
-            if !discoveredLANHosts.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 10) {
-                        ForEach(discoveredLANHosts) { host in
-                            let hasCredential = hasSavedCredentialForDiscovered(host)
-                            HStack(spacing: 10) {
-                                Image(systemName: "desktopcomputer")
-                                    .font(.system(size: 13.5, weight: .medium))
-                                    .foregroundStyle(Color.accentColor)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack(spacing: 5) {
-                                        Text(host.serviceName)
-                                            .font(.system(size: 12, weight: .semibold))
-                                            .lineLimit(1)
-                                        if hasCredential {
-                                            Text("已配对")
-                                                .font(.system(size: 9.5, weight: .semibold))
-                                                .foregroundStyle(Color(red: 0.07, green: 0.64, blue: 0.44))
-                                                .padding(.horizontal, 5)
-                                                .padding(.vertical, 1.5)
-                                                .background(Color(red: 0.07, green: 0.64, blue: 0.44).opacity(0.12), in: Capsule())
-                                        }
-                                    }
-                                    Text(host.endpointLabel)
-                                        .font(.system(size: 10.5, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
-                                }
-                                Button(hasCredential ? "连接" : "填入") {
-                                    selectDiscoveredHost(host)
-                                    if !hasCredential {
-                                        focusedField = .code
-                                    }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.mini)
-                                .disabled(locked)
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
-                            .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                    .strokeBorder(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.8)
-                            }
-                        }
-                    }
-                }
+                Button("测试线路") { dismissSheet(then: openBenchmark) }
+                    .buttonStyle(DeskButtonStyle(.secondary))
+                    .help("测量直连与中继的实际帧率、延迟及 UDP 丢包")
+                    .disabled(locked)
+                Button("扫描局域网", action: openDiscovery)
+                    .buttonStyle(DeskButtonStyle(.quiet))
+                    .disabled(locked)
+                Spacer()
+                cancelButton
+                Button(failure == nil ? "连接" : "重试", action: submitConnection)
+                    .buttonStyle(DeskButtonStyle(.primary))
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(locked)
             }
         }
+        .padding(24)
+        .frame(width: 548)
+        .textFieldStyle(.roundedBorder)
+        .controlSize(.large)
+        .onAppear(perform: focusIncompleteField)
     }
 
-    private var horizontalInputRow: some View {
-        HStack(alignment: .bottom, spacing: 10) {
+    private var connectionFields: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            if relayEnabled {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("连接方式").font(.callout).foregroundStyle(DeskPalette.secondary)
+                    DeskSegmentedTabs(
+                        tabs: [(.direct, "地址直连"), (.automatic, "自动（直连优先）"), (.relay, "中继设备标识")],
+                        selection: $strategy
+                    )
+                }
+            } else {
+                HStack {
+                    Text("地址直连")
+                        .font(.callout)
+                        .foregroundStyle(DeskPalette.secondary)
+                    Spacer()
+                    Button("配置自托管中继…") { dismissSheet(then: openRelay) }
+                        .buttonStyle(DeskButtonStyle(.quiet))
+                        .disabled(locked)
+                }
+            }
+
             if usesRelay {
-                labeledField("目标设备标识", minWidth: 190) {
+                labeledField("自托管中继") { nodePicker }
+                labeledField("目标设备标识") {
                     TextField("被控 Mac 显示的完整 UUID", text: $deviceID)
-                        .font(.system(size: 12.5, design: .monospaced))
+                        .font(.system(.callout, design: .monospaced))
                         .accessibilityLabel("目标中继设备标识")
                         .focused($focusedField, equals: .deviceID)
                         .onSubmit { focusedField = showsAddress ? .address : .code }
                 }
             }
             if showsAddress {
-                labeledField(usesRelay ? "可选直连地址" : "目标地址（域名或 IP）", minWidth: 170) {
-                    TextField(usesRelay ? "可选：已知域名或 IP" : "例如 studio.local 或 10.0.0.8", text: $address)
-                        .font(.system(size: 12.5))
-                        .accessibilityLabel("家里 Mac 的地址")
+                labeledField(usesRelay ? "可选直连地址" : "地址") {
+                    TextField("域名或 IP", text: $address)
+                        .accessibilityLabel("被控 Mac 的地址")
                         .focused($focusedField, equals: .address)
                         .onSubmit { focusedField = .code }
                 }
-                labeledField("端口", fixedWidth: 82) {
+                labeledField("端口") {
                     TextField("5908", text: $port)
-                        .font(.system(size: 12.5, design: .monospaced))
-                        .accessibilityLabel("映射后的端口")
+                        .font(.system(.callout, design: .monospaced))
+                        .accessibilityLabel("目标端口")
                         .focused($focusedField, equals: .port)
                         .onSubmit { focusedField = .code }
                 }
             }
-            labeledField("配对码", minWidth: 175) {
-                SecureField("粘贴完整配对码", text: $code)
-                    .font(.system(size: 12.5, design: .monospaced))
-                    .accessibilityLabel("家里 Mac 显示的配对码")
-                    .focused($focusedField, equals: .code)
-                    .onSubmit { if !locked { connect() } }
+            labeledField("配对码") { pairingField }
+
+            if let failure {
+                notice(failure, symbol: "exclamationmark.circle", tint: DeskPalette.coral) { EmptyView() }
+            } else if usesRelay {
+                notice("使用被控 Mac 的完整 UUID 与配对码。两端需接入同一组自托管中继。", symbol: "info.circle") {
+                    Button("管理节点…") { dismissSheet(then: openRelay) }
+                        .buttonStyle(DeskButtonStyle(.quiet))
+                        .disabled(locked)
+                }
             }
 
+            Button(action: openOptions) {
+                HStack {
+                    Text("连接选项")
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.caption.weight(.medium))
+                }
+            }
+            .buttonStyle(DeskButtonStyle(.quiet))
+            .popover(isPresented: optionsPresentation(inComposer: true), arrowEdge: .bottom) { options }
+
+        }
+    }
+
+    private func credentialsSheet(title: String, endpoint: String) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sheetHeading("补录连接凭据", detail: "\(title) · \(endpoint)")
+            labeledField("粘贴被控 Mac 显示的完整配对码") { pairingField }
+            Text("配对码保存在本机私有文件，由当前账户的文件权限保护，未单独加密。连接记录不会读取钥匙串。")
+                .font(.callout)
+                .foregroundStyle(DeskPalette.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if triedCredential, let failure {
+                notice(failure, symbol: "exclamationmark.circle", tint: DeskPalette.coral) {
+                    Button("编辑连接") { sheet = .connection }
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                }
+            }
             HStack(spacing: 8) {
-                Button("测速", action: openBenchmark)
-                    .buttonStyle(.bordered)
-                    .controlSize(.large)
+                Spacer()
+                cancelButton
+                Button("继续连接", action: submitConnection)
+                    .buttonStyle(DeskButtonStyle(.primary))
+                    .keyboardShortcut(.defaultAction)
                     .disabled(locked)
-                    .help("实测直连与各中继方式的实际帧率、延迟及 UDP 丢包情况")
+            }
+            .padding(.top, 12)
+        }
+        .padding(24)
+        .frame(width: 520)
+        .textFieldStyle(.roundedBorder)
+        .controlSize(.large)
+        .onAppear { focusedField = .code }
+    }
 
-                Button(action: connect) {
-                    Label("连接", systemImage: "arrow.right.circle.fill")
+    private var pairingField: some View {
+        SecureField("粘贴完整配对码", text: $code)
+            .font(.system(.callout, design: .monospaced))
+            .accessibilityLabel("被控 Mac 显示的配对码")
+            .focused($focusedField, equals: .code)
+            .onSubmit(submitConnection)
+    }
+
+    private var cancelButton: some View {
+        Button("取消", action: dismissSheet)
+            .buttonStyle(DeskButtonStyle(.secondary))
+            .keyboardShortcut(.cancelAction)
+    }
+
+    private func optionsPresentation(inComposer: Bool) -> Binding<Bool> {
+        Binding(
+            get: { showOptions && (sheet == .connection) == inComposer },
+            set: { if (sheet == .connection) == inComposer { showOptions = $0 } }
+        )
+    }
+
+    private var discoverySheet: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            HStack(alignment: .top) {
+                sheetHeading("局域网设备", detail: "发现开启 Bonjour 广播的共享端。扫描结果反映本次发现情况。")
+                Spacer()
+                Button(lanScanning ? "停止扫描" : "重新扫描", action: toggleLANScan)
+                    .buttonStyle(DeskButtonStyle(.secondary))
+            }
+
+            if !discoveredLANHosts.isEmpty {
+                ScrollView {
+                    DeskSurfaceCard(padding: 0, cornerRadius: 8) {
+                        VStack(spacing: 0) {
+                            ForEach(discoveredLANHosts) { host in
+                                if host.id != discoveredLANHosts.first?.id { Divider() }
+                                let hasCredential = hasSavedCredentialForDiscovered(host)
+                                HStack(spacing: 12) {
+                                    tableCell(host.serviceName, width: 144)
+                                    tableCell(host.endpointLabel)
+                                        .font(.system(.caption, design: .monospaced))
+                                    Text(hasCredential ? "已配对" : "未配对")
+                                        .foregroundStyle(DeskPalette.secondary)
+                                    Button(hasCredential ? "连接" : "填写配对码") {
+                                        if selectDiscoveredHost(host) {
+                                            dismissSheet()
+                                        } else if hasCredential {
+                                            sheet = .connection
+                                        } else {
+                                            triedCredential = false
+                                            sheet = .credentials(title: host.serviceName, endpoint: host.endpointLabel)
+                                        }
+                                    }
+                                    .buttonStyle(DeskButtonStyle(.quiet))
+                                }
+                                .font(.callout)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                                .frame(minHeight: 42)
+                            }
+                        }
+                    }
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
+                .frame(height: min(CGFloat(discoveredLANHosts.count) * 43 + 1, 250))
+            }
+
+            if lanScanning || !lanScanStatus.isEmpty {
+                notice(lanScanStatus, symbol: lanScanning ? nil : "info.circle") {
+                    if lanScanning { ProgressView().controlSize(.small) }
+                }
+            }
+            HStack {
+                Spacer()
+                Button("完成", action: dismissSheet)
+                    .buttonStyle(DeskButtonStyle(.primary))
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 634)
+    }
+
+    private var managementSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            sheetHeading("管理连接记录", detail: "配对码由本机账户文件权限保护，未单独加密。移除连接记录也会删除本机文件中的对应配对码。")
+            if records.isEmpty {
+                ContentUnavailableView("没有连接记录", systemImage: "desktopcomputer")
+                    .frame(maxWidth: .infinity, minHeight: 140)
+            } else {
+                ScrollView { recordTable(records, inManagementSheet: true) }
+                    .frame(height: min(CGFloat(records.count) * 62 + 35, 300))
+            }
+            HStack {
+                Spacer()
+                Button("完成", action: dismissSheet)
+                    .buttonStyle(DeskButtonStyle(.primary))
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 700)
+    }
+
+    private var sessionsSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                sheetHeading("当前活动会话", detail: "每个远程桌面在独立窗口运行。")
+                Spacer()
+                Button("新建连接") { sheet = .connection }
+                    .buttonStyle(DeskButtonStyle(.primary))
+                    .disabled(locked)
+            }
+            if activeSessions.isEmpty {
+                ContentUnavailableView("没有活动会话", systemImage: "macwindow.on.rectangle")
+            } else {
+                ScrollView { activeSessionRows }
+                    .frame(height: min(CGFloat(activeSessions.count) * 53 + 1, 260))
+            }
+            HStack {
+                if activeSessions.count > 1 {
+                    Button("全部断开", role: .destructive, action: disconnectAllSessions)
+                        .buttonStyle(DeskButtonStyle(.danger))
+                }
+                Spacer()
+                Button("完成", action: dismissSheet)
+                    .buttonStyle(DeskButtonStyle(.secondary))
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 650)
+    }
+
+    private var readinessSheet: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            sheetHeading("连接前就绪状态", detail: "控制与快捷键按本机实际权限生效。")
+            DeskSurfaceCard(padding: 0, cornerRadius: 8) {
+                VStack(spacing: 0) {
+                    readinessRow("Caps Lock 远端中英切换", value: preFlight.capsLockTitle, ready: preFlight.capsLockReady)
+                    Divider()
+                    readinessRow("全屏系统快捷键", value: preFlight.shortcutsTitle, ready: preFlight.shortcutsReady)
+                    Divider()
+                    readinessRow("剪贴板与文件按需拉取", value: preFlight.clipboardTitle, ready: preFlight.clipboardReady)
+                }
+            }
+            Text("⌃⌥Esc 释放控制  ·  ⌃⌘F 全屏  ·  ⌃⌘S 远端截图")
+                .font(.caption)
+                .foregroundStyle(DeskPalette.secondary)
+            HStack {
+                Button("偏好设置…") { dismissSheet(then: openCaps) }
+                    .buttonStyle(DeskButtonStyle(.secondary))
+                Spacer()
+                Button("关闭", action: dismissSheet)
+                    .buttonStyle(DeskButtonStyle(.primary))
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(.top, 8)
+        }
+        .padding(24)
+        .frame(width: 578)
+    }
+
+    private func readinessRow(_ title: String, value: String, ready: Bool) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value)
+                .foregroundStyle(ready ? DeskPalette.emerald : DeskPalette.amber)
+        }
+        .font(.callout)
+        .padding(.horizontal, 14)
+        .frame(minHeight: 38)
+    }
+
+    private var connectingBanner: some View {
+        DeskSurfaceCard {
+            HStack(spacing: 12) {
+                ProgressView().controlSize(.small)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("正在建立加密连接…").font(.headline)
+                    if !status.isEmpty {
+                        Text(status).font(.caption).foregroundStyle(DeskPalette.secondary)
+                    }
+                }
+                Spacer()
+                Button("取消连接", action: cancel)
+                    .buttonStyle(DeskButtonStyle(.secondary))
+            }
+        }
+    }
+
+    private func failureNotice(_ message: String) -> some View {
+        notice(message, symbol: "exclamationmark.circle", tint: DeskPalette.coral) {
+            Button("编辑连接") { sheet = .connection }
+                .buttonStyle(DeskButtonStyle(.secondary))
                 .disabled(locked)
-                .help("配对码输入完成后也可按 Return 连接")
-            }
+            Button("收起", action: clearFailure)
+                .buttonStyle(DeskButtonStyle(.quiet))
         }
     }
 
-    private var verticalInputStack: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if usesRelay {
-                labeledField("目标设备标识") {
-                    TextField("被控 Mac 显示的完整 UUID", text: $deviceID)
-                        .font(.system(size: 12.5, design: .monospaced))
-                        .focused($focusedField, equals: .deviceID)
-                        .onSubmit { focusedField = showsAddress ? .address : .code }
-                }
-            }
-            if showsAddress {
-                HStack(spacing: 10) {
-                    labeledField(usesRelay ? "可选直连地址" : "目标地址（域名或 IP）") {
-                        TextField(usesRelay ? "可选：已知域名或 IP" : "域名或 IP", text: $address)
-                            .focused($focusedField, equals: .address)
-                            .onSubmit { focusedField = .code }
-                    }
-                    labeledField("端口", fixedWidth: 90) {
-                        TextField("5908", text: $port)
-                            .font(.system(size: 12.5, design: .monospaced))
-                            .focused($focusedField, equals: .port)
-                            .onSubmit { focusedField = .code }
-                    }
-                }
-            }
-            HStack(alignment: .bottom, spacing: 10) {
-                labeledField("配对码") {
-                    SecureField("粘贴完整配对码", text: $code)
-                        .font(.system(size: 12.5, design: .monospaced))
-                        .focused($focusedField, equals: .code)
-                        .onSubmit { if !locked { connect() } }
-                }
-                Button("测速", action: openBenchmark)
-                    .buttonStyle(.bordered)
-                    .controlSize(.large)
-                Button("连接", action: connect)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
-            }
-        }
-    }
-
-    private func labeledField<FieldContent: View>(
-        _ label: String,
-        minWidth: CGFloat? = nil,
-        fixedWidth: CGFloat? = nil,
-        @ViewBuilder content: () -> FieldContent
+    private func notice<Actions: View>(
+        _ message: String, symbol: String?, tint: Color = DeskPalette.secondary,
+        @ViewBuilder actions: () -> Actions
     ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(label)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            content()
+        HStack(spacing: 10) {
+            if let symbol { Image(systemName: symbol).accessibilityHidden(true) }
+            Text(message)
+                .font(.callout)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            actions()
         }
-        .frame(minWidth: minWidth)
-        .frame(width: fixedWidth)
-        .frame(maxWidth: fixedWidth == nil ? .infinity : nil, alignment: .leading)
+        .foregroundStyle(tint)
+        .padding(12)
+        .background(DeskPalette.insetBackground, in: .rect(cornerRadius: 7))
+    }
+
+    private func sheetHeading(_ title: String, detail: String?) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.system(size: 19, weight: .semibold))
+                .accessibilityAddTraits(.isHeader)
+            if let detail {
+                Text(detail)
+                    .font(.callout)
+                    .foregroundStyle(DeskPalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func labeledField<FieldContent: View>(_ title: String, @ViewBuilder field: () -> FieldContent) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.callout)
+                .foregroundStyle(DeskPalette.secondary)
+            field()
+        }
+    }
+
+    private func qualityTint(_ tone: ConnectionRecordCardBadge.Tone) -> Color {
+        switch tone {
+        case .good: return DeskPalette.emerald
+        case .info: return DeskPalette.accent
+        case .caution: return DeskPalette.amber
+        case .neutral: return DeskPalette.secondary
+        }
+    }
+
+    private func connectSavedDevice(_ record: ConnectionRecord) {
+        if quickConnect(record) {
+            dismissSheet()
+        } else if code.isEmpty {
+            triedCredential = false
+            sheet = .credentials(
+                title: ConnectionEntryPresentation.title(record),
+                endpoint: ConnectionEntryPresentation.endpoint(record)
+            )
+        } else {
+            sheet = .connection
+        }
+    }
+
+    private func openDiscovery() {
+        if !lanScanning { toggleLANScan() }
+        sheet = .discovery
+    }
+
+    private func dismissSheet() {
+        if sheet == .discovery { dismissLANScan() }
+        if sheet == .connection { showOptions = false }
+        sheet = nil
+        showNewConnection = false
+        triedCredential = false
+    }
+
+    private func dismissSheet(then action: @escaping () -> Void) {
+        afterSheetDismissal = action
+        dismissSheet()
+    }
+
+    private func finishSheetDismissal() {
+        let action = afterSheetDismissal
+        afterSheetDismissal = nil
+        action?()
+    }
+
+    private func performAfterManagement(_ inManagementSheet: Bool, _ action: @escaping () -> Void) {
+        if inManagementSheet {
+            dismissSheet(then: action)
+        } else {
+            action()
+        }
+    }
+
+    private func submitConnection() {
+        guard !locked, sheet != nil else { return }
+        triedCredential = true
+        if connect() {
+            dismissSheet()
+        } else if sheet == .connection {
+            focusIncompleteField()
+        }
     }
 
     private func focusIncompleteField() {
         guard !locked else { return }
         focusedField = ConnectionEntryPresentation.firstIncompleteField(
-            relayEnabled: relayEnabled,
-            strategy: strategy,
-            address: address,
-            port: port,
-            deviceID: deviceID,
-            code: code
+            relayEnabled: relayEnabled, strategy: strategy, address: address, port: port, deviceID: deviceID, code: code
         )
-    }
-
-    private var firstUseGuideCard: some View {
-        HStack(alignment: .top, spacing: 16) {
-            Image(systemName: "sparkles.rectangle.stack.fill")
-                .font(.system(size: 24))
-                .foregroundStyle(Color.accentColor)
-                .frame(width: 44, height: 44)
-                .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("第一次使用 QuietDesk")
-                    .font(.headline)
-                Text("在另一台 Mac 打开 QuietDesk → 左侧选择「本机共享」→ 开启共享并复制配对码，然后在上方粘贴连接。")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text("同一局域网直接填写内网 IP（默认端口 5908）；异地跨网可配置路由器 TCP/UDP 同端口转发，或启用左侧「端口映射与中继」中的自托管中继。")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .padding(18)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.65), lineWidth: 0.8)
-        }
     }
 }

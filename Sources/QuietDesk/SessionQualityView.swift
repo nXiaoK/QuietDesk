@@ -114,12 +114,7 @@ struct SessionQualityView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: compact ? 8 : 10) {
             HStack(spacing: 7) {
-                Text("连接画质").font(.system(size: compact ? 12.5 : 13.5, weight: .bold))
-                Text("按连接记忆")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
-                    .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background(Color.accentColor.opacity(0.12), in: Capsule())
+                DeskSectionHeading(title: "画质预设")
                 Spacer(minLength: 0)
                 Button {
                     showHelpPopover.toggle()
@@ -144,10 +139,25 @@ struct SessionQualityView: View {
                     .foregroundStyle(.secondary)
                     .padding(14)
                     .frame(width: 310, alignment: .leading)
+                    .background(DeskPalette.cardBackground)
                 }
             }
 
-            HStack(spacing: compact ? 5 : 6) {
+            if let state = presentation.applied {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("当前已生效")
+                        .foregroundStyle(DeskPalette.secondary)
+                    Spacer(minLength: 4)
+                    Text("\(state.settings.summary) · \(state.width) × \(state.height)")
+                        .foregroundStyle(DeskPalette.emerald)
+                        .monospacedDigit()
+                    Text(appliedCodec == .hevc ? (appliedChroma == .yuv444 ? "HEVC 4:4:4" : "HEVC 4:2:0") : "H.264")
+                        .foregroundStyle(DeskPalette.muted)
+                }
+                .font(.system(size: 11))
+            }
+
+            VStack(spacing: 2) {
                 ForEach(SessionQualityPreset.allCases, id: \.self) { preset in
                     let resolved = preset.resolvedSettings(longestEdges: longestEdges, frameRates: frameRates, bitRates: bitRates)
                     let isSelected = settings == resolved
@@ -160,22 +170,29 @@ struct SessionQualityView: View {
                             if supportsTrueColor { trueColor?.wrappedValue = preset.prefersTrueColor }
                         }
                     } label: {
-                        Text(preset.title)
-                            .font(.system(size: compact ? 11 : 11.5, weight: isSelected ? .bold : .medium))
-                            .foregroundStyle(isSelected ? Color.white : Color.primary)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 5.5)
-                            .background(
-                                isSelected ? Color.accentColor : Color.primary.opacity(0.06),
-                                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            )
-                            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        HStack {
+                            Text(preset.title)
+                                .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
+                            Spacer(minLength: 6)
+                            if isSelected {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(DeskPalette.accent)
+                                    .accessibilityHidden(true)
+                            }
+                        }
+                        .padding(.horizontal, 9)
+                        .frame(minHeight: 29)
+                        .background(isSelected ? DeskPalette.subtleFill : .clear, in: RoundedRectangle(cornerRadius: 6))
+                        .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityAddTraits(isSelected ? .isSelected : [])
                     .help("\(preset.title)：\(resolved.summary)\(supportsTrueColor && preset.prefersTrueColor ? " · 4:4:4 真彩" : "")")
                 }
             }
             .disabled(presentation.availability != .ready)
+            .opacity(presentation.availability == .ready ? 1 : 0.58)
 
             if supportsTrueColor, let trueColor {
                 Toggle(isOn: trueColor) {
@@ -194,7 +211,7 @@ struct SessionQualityView: View {
             }
 
             if compact {
-                DisclosureGroup("微调上限参数（\(settings.summary)）", isExpanded: $showFineTuning) {
+                DisclosureGroup("高级画质设置（\(settings.summary)）", isExpanded: $showFineTuning) {
                     parameterGrid
                         .padding(.top, 6)
                 }
@@ -211,7 +228,7 @@ struct SessionQualityView: View {
             case .unsupported:
                 Label("共享端版本较旧，不支持会话中动态调画质", systemImage: "exclamationmark.circle")
                     .font(.caption)
-                    .foregroundStyle(Color.orange)
+                    .foregroundStyle(DeskPalette.amber)
             case .ready:
                 updateStatus
                 if let message = presentation.message {
@@ -219,39 +236,13 @@ struct SessionQualityView: View {
                         Text(message).textSelection(.enabled)
                     } icon: { Image(systemName: "exclamationmark.triangle.fill") }
                     .font(.caption)
-                    .foregroundStyle(Color.red)
+                    .foregroundStyle(DeskPalette.coral)
                     .fixedSize(horizontal: false, vertical: true)
                     .lineLimit(compact ? 3 : nil)
                     .help(message)
                 }
             }
 
-            if let state = presentation.applied {
-                HStack(alignment: .center, spacing: 8) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(Color(red: 0.07, green: 0.64, blue: 0.44))
-                        .font(.system(size: 12))
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text("已生效：\(state.settings.summary)")
-                                .font(.system(size: 11, weight: .semibold))
-                                .monospacedDigit()
-                            Text(appliedCodec == .hevc ? (appliedChroma == .yuv444 ? "HEVC 4:4:4" : "HEVC 4:2:0") : "H.264")
-                                .font(.system(size: 9.5, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 5).padding(.vertical, 1)
-                                .background(Color.secondary.opacity(0.12), in: Capsule())
-                        }
-                        Text("实际帧尺寸 \(state.width) × \(state.height)")
-                            .font(.system(size: 10.5))
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                    }
-                    Spacer(minLength: 0)
-                }
-                .padding(9)
-                .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            }
         }
         .font(.system(size: compact ? 11.5 : 12))
         .help(qualityHelp)

@@ -33,7 +33,7 @@ struct PermissionNextStep: Equatable {
                 detail: (started ? "当前权限仅允许观看。" : "如只需观看，可点“开启共享”。") + "若需键盘鼠标控制，请在这台被控 Mac 开启辅助功能，再重新检测；本机未授权不影响只观看共享。",
                 action: .accessibility)
         }
-        return Self(title: started ? "共享所需权限已生效" : "权限已生效，按需开启共享",
+        return Self(title: started ? "共享所需权限已生效" : "共享所需权限已生效，按需开启共享",
             detail: started ? "屏幕录制用于传送画面，辅助功能用于接受键盘鼠标控制。控制端仍需连接并通过验证。"
                 : "请返回上方点“开启共享”；配对码、端口与画面准备仍会按原流程检查。授权不会自动开启共享。",
             action: nil)
@@ -94,16 +94,29 @@ struct PermissionNextStepView: View {
     let perform: (PermissionNextStep.Action) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(step.title).font(.system(size: compact ? 11 : 12, weight: .semibold))
-            Text(step.detail).font(.system(size: compact ? 10 : 11)).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if let action = step.action, let title = step.actionTitle {
-                Button(title) { perform(action) }.controlSize(.small)
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "info.circle")
+                .font(.system(size: 12))
+                .foregroundStyle(step.action == nil ? Color.secondary : Color.orange)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(step.title).font(.system(size: compact ? 11 : 12, weight: .semibold))
+                Text(step.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let action = step.action, let title = step.actionTitle {
+                    Button(title) { perform(action) }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(compact ? 9 : 11)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+        .padding(compact ? 10 : 12)
+        .background(
+            step.action == nil ? Color.secondary.opacity(0.07) : Color.orange.opacity(0.09),
+            in: RoundedRectangle(cornerRadius: 8)
+        )
     }
 }

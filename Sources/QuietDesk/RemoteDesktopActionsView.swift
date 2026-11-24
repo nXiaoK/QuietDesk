@@ -67,22 +67,19 @@ struct RemoteDesktopActionsView: View {
             HStack(spacing: 6) {
                 ForEach(RemoteDesktopAction.inlineOrder, id: \.self) { action in
                     Button { perform(action) } label: {
-                        VStack(spacing: 4) {
-                            Image(systemName: action.toolbarSymbol)
-                            Text(action.compactTitle).font(.system(size: 10))
-                        }
-                        .frame(maxWidth: .infinity, minHeight: 32)
+                        Label(action.compactTitle, systemImage: action.toolbarSymbol)
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity)
                     }
                     .help(action.helpText(unavailableReason: unavailableReason, privacyEnabled: privacyEnabled))
                 }
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
+            .buttonStyle(DeskButtonStyle(.secondary))
             .disabled(unavailableReason != nil)
             if let detail = Self.detailText(unavailableReason: unavailableReason, status: status, privacyEnabled: privacyEnabled) {
                 Text(detail)
                     .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(DeskPalette.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }

@@ -27,94 +27,23 @@ struct PortMappingView: View {
     private var rules: [PortMappingRule] { manager.rules.filter { $0.deviceID == deviceID } }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 18) {
             if !embedded {
-                HStack {
-                    Text("TCP 端口映射").font(.title2.bold())
+                HStack(alignment: .top) {
+                    DeskSectionHeading(title: "TCP 端口映射", symbol: nil, detail: "管理到目标设备的加密 TCP 转发。")
                     Spacer()
-                    Button("完成", action: done).keyboardShortcut(.cancelAction)
+                    Button("完成", action: done)
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .keyboardShortcut(.cancelAction)
                 }
             }
 
-            HStack(spacing: 12) {
-                HStack(spacing: 8) {
-                    Text("目标设备")
-                        .font(.callout.weight(.medium))
-                        .foregroundStyle(.secondary)
-                    Picker("设备", selection: $deviceID) {
-                        if model.connections.isEmpty { Text("尚无已存设备").tag(nil as UUID?) }
-                        ForEach(model.connections) { record in
-                            Text("\(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record))")
-                                .tag(Optional(record.id))
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(maxWidth: 360)
-                }
+            deviceSelector
 
-                if !model.connected && !model.working {
-                    Button("导入连接页当前配置") {
-                        do { deviceID = try model.savePortMappingDevice(); error = nil }
-                        catch { self.error = error.localizedDescription }
-                    }
-                    .controlSize(.small)
-                    .help("将连接页填写的地址、端口和配对码保存并用于端口映射")
-                }
-
-                if let id = deviceID, model.hasConnectedDesktopSession(for: id) {
-                    DeskPillBadge(text: "远控已连接", symbol: "display", tint: DeskPalette.emerald)
-                }
-
-                Spacer(minLength: 8)
-
-                Button {
-                    if let selected { editor = MappingEditorSelection(device: selected) }
-                } label: {
-                    Label("新建映射", systemImage: "plus")
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.regular)
-                .disabled(selected == nil)
-            }
-
-            if selected == nil || rules.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: "point.3.connected.trianglepath.dotted")
-                        .font(.system(size: 28))
-                        .foregroundStyle(.secondary)
-                    Text(selected == nil ? "请先添加或选择目标 Mac" : "尚无 TCP 端口映射规则")
-                        .font(.headline)
-                    Text(selected == nil
-                         ? "可在「远程桌面」连接一次目标 Mac，或填写地址与配对码后点击上方「导入连接页当前配置」。"
-                         : "添加规则后可通过本机端口安全访问远端服务。曾远控过该 Mac 时免确认直通；未曾远控的设备首次启用需被控端确认。")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 520)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 34)
-                .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 13, style: .continuous)
-                        .strokeBorder(DeskPalette.hairline, lineWidth: 0.8)
-                }
+            if embedded {
+                mappingTable
             } else {
-                if embedded {
-                    VStack(spacing: 10) {
-                        ForEach(rules) { rule in
-                            tunnelCard(rule)
-                        }
-                    }
-                } else {
-                    ScrollView {
-                        VStack(spacing: 10) {
-                            ForEach(rules) { rule in
-                                tunnelCard(rule)
-                            }
-                        }
-                    }
-                }
+                ScrollView { mappingTable }
             }
 
             if let message = error ?? manager.storageError {
@@ -124,13 +53,19 @@ struct PortMappingView: View {
                     .textSelection(.enabled)
             }
 
-            Text("被控 Mac 需开启桌面共享或「本机映射授权」中的独立映射服务。远控画面活动期间映射流量自动退让限速，优先保障键鼠与帧率。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Label(
+                "被控 Mac 需开启桌面共享或「本机映射授权」中的独立映射服务。远控画面活动期间映射流量自动退让限速，优先保障键鼠与帧率。",
+                systemImage: "info.circle"
+            )
+            .font(.caption)
+            .foregroundStyle(DeskPalette.secondary)
+            .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(embedded ? 0 : 22)
-        .frame(width: embedded ? nil : 680, height: embedded ? nil : 480)
+        .padding(embedded ? 0 : 24)
+        .frame(width: embedded ? nil : 740, height: embedded ? nil : 500)
         .frame(maxWidth: embedded ? .infinity : nil, alignment: .leading)
+        .background(embedded ? Color.clear : DeskPalette.canvasBackground)
+        .tint(DeskPalette.accent)
         .onAppear {
             let preferred = preferredDeviceID.flatMap { id in model.connections.first { $0.id == id } }
             let selectedRecord = model.connections.first { $0.id == model.selectedConnectionID }
@@ -160,86 +95,201 @@ struct PortMappingView: View {
         } message: { _ in Text("当前规则的本地监听和加密转发会同时停止。") }
     }
 
-    private func tunnelCard(_ rule: PortMappingRule) -> some View {
-        let isEnabled = manager.isEnabled(rule.id)
-        let state = manager.states[rule.id]
-        return HStack(alignment: .center, spacing: 14) {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 7) {
-                    Text(rule.name)
-                        .font(.system(size: 13.5, weight: .bold))
+    private var deviceSelector: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            if let selected {
+                HStack(spacing: 9) {
+                    Image(systemName: "desktopcomputer")
+                        .foregroundStyle(DeskPalette.secondary)
+                        .accessibilityHidden(true)
+                    Text(ConnectionEntryPresentation.title(selected))
+                        .font(.system(size: 19, weight: .semibold))
                         .lineLimit(1)
-                    DeskPillBadge(text: rule.scope.title, tint: .secondary)
+                    if model.hasConnectedDesktopSession(for: selected.id) {
+                        DeskPillBadge(text: "远控已连接", symbol: "circle.fill", tint: DeskPalette.emerald)
+                    }
                 }
-                statusView(state)
-                    .font(.system(size: 11.5, weight: .medium))
-                    .fixedSize(horizontal: false, vertical: true)
             }
-            .frame(minWidth: 190, maxWidth: 260, alignment: .leading)
 
-            HStack(spacing: 8) {
-                endpointChip(role: "本机", address: "127.0.0.1:\(rule.localPort)")
-                HStack(spacing: 4) {
-                    Rectangle()
-                        .fill(isEnabled ? Color.accentColor.opacity(0.45) : DeskPalette.hairline)
-                        .frame(width: 20, height: 2)
-                    Image(systemName: "lock.fill")
-                        .font(.system(size: 9.5))
-                        .foregroundStyle(isEnabled ? Color.accentColor : .secondary)
-                    Image(systemName: "arrow.right")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(isEnabled ? Color.accentColor : .secondary)
+            HStack(spacing: 10) {
+                Picker("目标设备", selection: $deviceID) {
+                    if model.connections.isEmpty { Text("尚无已存设备").tag(nil as UUID?) }
+                    ForEach(model.connections) { record in
+                        Text("\(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record))")
+                            .tag(Optional(record.id))
+                    }
                 }
-                endpointChip(role: "远端", address: rule.target.mappingAddress)
+                .labelsHidden()
+                .accessibilityLabel("目标设备")
+                .frame(maxWidth: 350)
+                if !model.connected && !model.working {
+                    Button("导入连接页当前配置") {
+                        do { deviceID = try model.savePortMappingDevice(); error = nil }
+                        catch { self.error = error.localizedDescription }
+                    }
+                    .buttonStyle(DeskButtonStyle(.secondary))
+                    .help("将连接页填写的地址、端口和配对码保存并用于端口映射")
+                }
+                Spacer(minLength: 0)
             }
-
-            Spacer(minLength: 6)
-
-            Toggle("启用 \(rule.name)", isOn: Binding(get: { isEnabled }, set: { enabled in
-                do {
-                    if enabled { try model.startPortMapping(rule) } else { manager.stop(rule.id) }
-                    error = nil
-                } catch { self.error = error.localizedDescription }
-            }))
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .controlSize(.small)
-
-            Menu {
-                Button("编辑规则…") { if let selected { editor = MappingEditorSelection(device: selected, rule: rule) } }
-                Divider()
-                Button("删除规则…", role: .destructive) { deleting = rule }
-            } label: {
-                Image(systemName: "ellipsis.circle")
-                    .font(.system(size: 14))
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .accessibilityLabel("\(rule.name)的更多操作")
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 13)
-        .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(isEnabled ? Color.accentColor.opacity(0.28) : DeskPalette.hairline, lineWidth: 0.9)
         }
     }
 
-    private func endpointChip(role: String, address: String) -> some View {
-        HStack(spacing: 5) {
-            Text(role)
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(.secondary)
-            Text(verbatim: address)
-                .font(.system(size: 11.5, weight: .medium, design: .monospaced))
-                .textSelection(.enabled)
-                .lineLimit(1)
+    private var mappingTable: some View {
+        ViewThatFits(in: .horizontal) {
+            mappingTable(compact: false)
+                .frame(minWidth: 600)
+            mappingTable(compact: true)
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 5)
-        .background(DeskPalette.subtleFill, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+    }
+
+    private func mappingTable(compact: Bool) -> some View {
+        DeskSurfaceCard(padding: 0, cornerRadius: 9) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 10) {
+                    Text("映射列表").font(.headline)
+                    Text(rules.count.formatted())
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(DeskPalette.muted)
+                        .accessibilityLabel("\(rules.count) 条规则")
+                    Spacer()
+                    Button {
+                        if let selected { editor = MappingEditorSelection(device: selected) }
+                    } label: {
+                        Label("添加映射", systemImage: "plus")
+                    }
+                    .buttonStyle(DeskButtonStyle(.secondary))
+                    .disabled(selected == nil)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+
+                Divider()
+                if rules.isEmpty {
+                    mappingEmptyState
+                } else {
+                    mappingColumns(compact: compact)
+                        .font(.caption)
+                        .foregroundStyle(DeskPalette.secondary)
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 14)
+                        .background(DeskPalette.insetBackground)
+                    ForEach(rules) { rule in
+                        Divider().padding(.horizontal, 14)
+                        mappingRow(rule, compact: compact)
+                    }
+                }
+
+                Divider()
+                HStack {
+                    Text("\(rules.count) 条规则 · \(rules.filter { manager.isEnabled($0.id) }.count) 条已启用")
+                    Spacer()
+                    Text("本地仅监听 127.0.0.1")
+                }
+                .font(.caption)
+                .foregroundStyle(DeskPalette.secondary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+
+    private var mappingEmptyState: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "point.3.connected.trianglepath.dotted")
+                .font(.system(size: 24))
+                .foregroundStyle(DeskPalette.muted)
+                .accessibilityHidden(true)
+            Text(selected == nil ? "请先添加或选择目标 Mac" : "尚无 TCP 端口映射规则")
+                .font(.headline)
+            Text(selected == nil
+                 ? "可在「远程桌面」连接一次目标 Mac，或填写地址与配对码后点击上方「导入连接页当前配置」。"
+                 : "添加规则后可通过本机端口安全访问远端服务。曾远控过该 Mac 时免确认直通；未曾远控的设备首次启用需被控端确认。")
+                .font(.callout)
+                .foregroundStyle(DeskPalette.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 440)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(26)
+    }
+
+    private func mappingColumns(compact: Bool) -> some View {
+        HStack(spacing: 8) {
+            Text("名称").frame(maxWidth: .infinity, alignment: .leading)
+            portColumn(Text("本地端口"))
+            addressColumn(Text(compact ? "目标地址与端口" : "目标地址"))
+            if !compact { portColumn(Text("目标端口")) }
+            statusColumn(Text("映射状态"), compact: compact)
+            Text("操作").frame(width: 72, alignment: .leading)
+        }
+        .accessibilityHidden(true)
+    }
+
+    private func mappingRow(_ rule: PortMappingRule, compact: Bool) -> some View {
+        let targetAddress = compact ? rule.target.mappingAddress : rule.target.host
+        return HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(rule.name).fontWeight(.medium).lineLimit(1).help(rule.name)
+                Text(rule.scope.title).font(.caption).foregroundStyle(DeskPalette.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            portColumn(Text(rule.localPort.formatted(.number.grouping(.never))).monospacedDigit())
+                .accessibilityLabel("本地端口 \(rule.localPort)")
+            addressColumn(Text(verbatim: targetAddress).lineLimit(1).truncationMode(.middle))
+                .help(targetAddress)
+                .textSelection(.enabled)
+                .accessibilityLabel("目标地址 \(targetAddress)")
+            if !compact {
+                portColumn(Text(rule.target.port.formatted(.number.grouping(.never))).monospacedDigit())
+                    .accessibilityLabel("目标端口 \(rule.target.port)")
+            }
+            statusColumn(statusView(manager.states[rule.id]), compact: compact)
+                .font(.caption)
+            HStack(spacing: 6) {
+                Toggle("启用 \(rule.name)", isOn: Binding(get: { manager.isEnabled(rule.id) }, set: { enabled in
+                    do {
+                        if enabled { try model.startPortMapping(rule) } else { manager.stop(rule.id) }
+                        error = nil
+                    } catch { self.error = error.localizedDescription }
+                }))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+
+                Menu {
+                    Button("编辑规则…") { if let selected { editor = MappingEditorSelection(device: selected, rule: rule) } }
+                    Divider()
+                    Button("删除规则…", role: .destructive) { deleting = rule }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(DeskPalette.secondary)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .accessibilityLabel("\(rule.name)的更多操作")
+            }
+            .frame(width: 72, alignment: .leading)
+        }
+        .font(.callout)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+    }
+
+    private func portColumn(_ content: some View) -> some View {
+        content.frame(width: 54, alignment: .leading)
+    }
+
+    private func addressColumn(_ content: some View) -> some View {
+        content.frame(width: 96, alignment: .leading)
+    }
+
+    private func statusColumn(_ content: some View, compact: Bool) -> some View {
+        content.frame(width: compact ? 102 : 132, alignment: .leading)
     }
 
     @ViewBuilder
@@ -291,37 +341,63 @@ private struct PortMappingEditor: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(item.rule == nil ? "添加映射规则" : "编辑映射规则").font(.title3.bold())
-            Form {
-                TextField("名称", text: $name, prompt: Text("例如：Web 开发服务"))
-                TextField("本地端口", text: $localPort, prompt: Text("3000"))
-                TextField("目标地址", text: $host, prompt: Text("回环 127.0.0.1 或私有局域网 IP"))
-                TextField("目标端口", text: $remotePort, prompt: Text(localPort.isEmpty ? "留空默认同本地端口" : localPort))
-                Picker("运行方式", selection: $scope) {
-                    ForEach(PortMappingScope.allCases, id: \.self) { Text($0.title).tag($0) }
+        VStack(alignment: .leading, spacing: 16) {
+            DeskSectionHeading(title: item.rule == nil ? "添加 TCP 映射规则" : "编辑 TCP 映射规则", symbol: nil, detail: nil)
+            VStack(alignment: .leading, spacing: 11) {
+                editorField("名称") {
+                    TextField("名称", text: $name, prompt: Text("例如：Web 开发服务"))
                 }
-                .pickerStyle(.segmented)
+                editorField("本地端口") {
+                    TextField("本地端口", text: $localPort, prompt: Text("3000"))
+                }
+                editorField("目标地址") {
+                    TextField("目标地址", text: $host, prompt: Text("回环 127.0.0.1 或私有局域网 IP"))
+                }
+                editorField("目标端口") {
+                    TextField("目标端口", text: $remotePort, prompt: Text(localPort.isEmpty ? "留空默认同本地端口" : localPort))
+                }
+                editorField("运行方式") {
+                    Picker("运行方式", selection: $scope) {
+                        ForEach(PortMappingScope.allCases, id: \.self) { Text($0.title).tag($0) }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.top, 4)
             }
             .textFieldStyle(.roundedBorder)
-            Text("目标地址从「\(ConnectionEntryPresentation.title(item.device))」发起访问，127.0.0.1 表示该 Mac 自身。")
-                .font(.caption).foregroundStyle(.secondary)
-            Text(scope == .independent
-                 ? "独立规则在断开桌面远控后继续保持转发；系统睡眠或退出 QuietDesk 会停止映射。"
-                 : "会话规则仅在此设备的远控会话期间工作，断开远控自动停止。")
-                .font(.caption).foregroundStyle(.secondary)
-            if let error { Text(error).foregroundStyle(.red).font(.callout) }
-            HStack {
-                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
+            .controlSize(.large)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("目标地址从「\(ConnectionEntryPresentation.title(item.device))」发起访问，127.0.0.1 表示该 Mac 自身。")
+                Text(scope == .independent
+                     ? "独立规则在断开桌面远控后继续保持转发；系统睡眠或退出 QuietDesk 会停止映射。"
+                     : "会话规则仅在此设备的远控会话期间工作，断开远控自动停止。")
+            }
+            .font(.caption)
+            .foregroundStyle(DeskPalette.secondary)
+            if let error { Text(error).foregroundStyle(DeskPalette.coral).font(.callout) }
+            HStack(spacing: 10) {
+                Button("取消") { dismiss() }
+                    .buttonStyle(DeskButtonStyle(.secondary))
+                    .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button(item.rule == nil ? "仅保存" : "保存并停用") { submit(enable: false) }
+                    .buttonStyle(DeskButtonStyle(.secondary))
                 Button("保存并启用") { submit(enable: true) }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(DeskButtonStyle(.primary))
                     .disabled(scope == .session && !sessionAvailable)
             }
+            .padding(.top, 10)
         }
-        .padding(22)
-        .frame(width: 460)
+        .padding(24)
+        .frame(width: 500)
+        .deskSurface()
+    }
+
+    private func editorField(_ title: String, @ViewBuilder content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title).font(.caption).foregroundStyle(DeskPalette.secondary).accessibilityHidden(true)
+            content().labelsHidden()
+        }
     }
 
     private func submit(enable: Bool) {

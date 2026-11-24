@@ -13,7 +13,8 @@ struct ConnectionView: View {
     let openBenchmark: (ConnectionRecord?) -> Void
     var openRelayWorkspace: (() -> Void)? = nil
     var openPortMappingWorkspace: ((ConnectionRecord) -> Void)? = nil
-    @State private var showRecords = false
+    let selectedRecord: ConnectionRecord?
+    @Binding var showNewConnection: Bool
     @State private var showRelaySettings = false
     @State private var wakeConfigurationRecord: ConnectionRecord?
 
@@ -26,7 +27,9 @@ struct ConnectionView: View {
         openEffects: @escaping () -> Void,
         openBenchmark: @escaping (ConnectionRecord?) -> Void,
         openRelayWorkspace: (() -> Void)? = nil,
-        openPortMappingWorkspace: ((ConnectionRecord) -> Void)? = nil
+        openPortMappingWorkspace: ((ConnectionRecord) -> Void)? = nil,
+        selectedRecord: ConnectionRecord? = nil,
+        showNewConnection: Binding<Bool> = .constant(false)
     ) {
         self.models = models
         self.model = model
@@ -39,6 +42,8 @@ struct ConnectionView: View {
         self.openBenchmark = openBenchmark
         self.openRelayWorkspace = openRelayWorkspace
         self.openPortMappingWorkspace = openPortMappingWorkspace
+        self.selectedRecord = selectedRecord
+        self._showNewConnection = showNewConnection
     }
 
     private var locked: Bool { model.active || model.working }
@@ -66,6 +71,8 @@ struct ConnectionView: View {
     var body: some View {
         ConnectionEntryView(
             records: model.connections,
+            selectedRecord: selectedRecord,
+            showNewConnection: $showNewConnection,
             locked: locked,
             failure: model.connectionFailure,
             status: model.status,
@@ -84,11 +91,11 @@ struct ConnectionView: View {
                 openEffects: openEffects,
                 openBenchmark: { showOptions = false; openBenchmark(nil) }
             ),
-            connect: { _ = models.connectFromHub() },
+            connect: { models.connectFromHub() != nil },
             cancel: { model.stop() },
-            quickConnect: { _ = models.quickConnect($0) },
+            clearFailure: model.clearConnectionError,
+            quickConnect: { models.quickConnect($0) != nil },
             remove: model.removeConnection,
-            manage: { showRecords = true },
             openOptions: { model.canvas.releaseControl(); showOptions = true },
             openCaps: openCaps,
             openRelay: {
@@ -99,7 +106,6 @@ struct ConnectionView: View {
                     showRelaySettings = true
                 }
             },
-            openTraffic: openTraffic,
             openBenchmark: { openBenchmark(nil) },
             benchmarkRecord: { openBenchmark($0) },
             openPortMappingRecord: { record in
@@ -116,7 +122,7 @@ struct ConnectionView: View {
             toggleLANScan: { model.toggleLANScan() },
             dismissLANScan: { model.stopLANScan(clearResults: true) },
             hasSavedCredentialForDiscovered: { model.hasSavedCredential(for: $0) },
-            selectDiscoveredHost: { _ = models.connectOrFillDiscoveredHost($0) },
+            selectDiscoveredHost: { models.connectOrFillDiscoveredHost($0) != nil },
             wakeRecord: { model.sendWakeOnLAN(for: $0) },
             configureWakeRecord: { wakeConfigurationRecord = $0 },
             wakeNotice: model.wakeStatusNotice,
@@ -125,51 +131,12 @@ struct ConnectionView: View {
             focusSession: { models.focusViewerSession(id: $0) },
             disconnectSession: { models.disconnectViewerSession(id: $0) },
             disconnectAllSessions: { models.disconnectAllViewerSessions() },
-            isRecordConnected: { record in
-                guard let existing = models.existingSession(for: record) else { return false }
-                return existing.active || existing.working || existing.reconnecting
+            sessionForRecord: { record in
+                guard let existing = models.existingSession(for: record),
+                      existing.active || existing.working || existing.reconnecting else { return nil }
+                return existing.activeSessionSummary
             }
         )
-        .sheet(isPresented: $showRecords) {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("管理连接记录").font(.title3.weight(.semibold))
-                Text("配对码保存在本机私有文件，由当前账户的文件权限保护，未单独加密。移除记录会删除本机文件中对应的配对码；旧钥匙串条目保持不动。")
-                    .font(.callout).foregroundStyle(.secondary)
-                if model.connections.isEmpty {
-                    ContentUnavailableView("没有连接记录", systemImage: "desktopcomputer")
-                } else {
-                    List(model.connections) { record in
-                        HStack(spacing: 12) {
-                            Image(systemName: ConnectionEntryPresentation.deviceSymbol(record))
-                                .foregroundStyle(.secondary)
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(ConnectionEntryPresentation.title(record)).font(.headline)
-                                Text(ConnectionEntryPresentation.endpoint(record)).font(.caption).monospaced()
-                                    .foregroundStyle(.secondary).lineLimit(2)
-                                if let relay = record.relay {
-                                    Text("\(ConnectionEntryPresentation.route(record)) · \(relay.deviceID.uuidString.lowercased())")
-                                        .font(.caption).monospaced().foregroundStyle(.secondary).lineLimit(2)
-                                }
-                                if let wake = record.wakeOnLAN {
-                                    Text("WOL: \(wake.macAddress.formatted)")
-                                        .font(.caption).monospaced().foregroundStyle(.secondary)
-                                }
-                                Text(record.lastConnected == .distantPast ? "已保存 · 尚未远控" : record.lastConnected.formatted(date: .abbreviated, time: .shortened))
-                                    .font(.caption).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            if record.wakeOnLAN != nil {
-                                Button("唤醒") { showRecords = false; model.sendWakeOnLAN(for: record) }
-                            }
-                            Button("测速…") { showRecords = false; openBenchmark(record) }
-                            Button("连接") { showRecords = false; _ = models.quickConnect(record) }
-                            Button("移除") { model.removeConnection(record) }
-                        }.padding(.vertical, 6)
-                    }.listStyle(.inset).clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-                HStack { Spacer(); Button("完成") { showRecords = false }.keyboardShortcut(.cancelAction) }
-            }.padding(24).frame(width: 560, height: 440)
-        }
         .sheet(isPresented: $showRelaySettings) {
             RelaySettingsView(enabled: model.relayEnabled, nodes: model.relayNodes, deviceID: model.relayDeviceID,
                               locked: model.relaySettingsLocked, measurements: model.relayNodeMeasurements,
@@ -190,7 +157,8 @@ struct ConnectionView: View {
             )
         }
         .onReceive(NotificationCenter.default.publisher(for: SystemQuitHandler.dismissSheets)) { _ in
-            showRecords = false; showRelaySettings = false; wakeConfigurationRecord = nil
+            showRelaySettings = false
+            wakeConfigurationRecord = nil
         }
     }
 
@@ -248,22 +216,18 @@ private struct WakeOnLANConfigurationSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("配置网络唤醒（Wake-on-LAN）")
-                .font(.title3.weight(.semibold))
+            Text("配置网络唤醒")
+                .font(.system(size: 19, weight: .semibold))
+                .accessibilityAddTraits(.isHeader)
             Text("目标设备：\(ConnectionEntryPresentation.title(record))（\(ConnectionEntryPresentation.endpoint(record))）")
                 .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Text("向局域网发送标准 IEEE 802.3 魔术包以唤醒睡眠中的台式 Mac。通常需要目标 Mac 使用有线以太网，并在「系统设置 → 节能」开启「唤醒以供网络访问」。")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+                .foregroundStyle(DeskPalette.secondary)
 
             VStack(alignment: .leading, spacing: 10) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("有线网卡物理 MAC 地址")
                         .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(DeskPalette.secondary)
                     TextField("例如 AA:BB:CC:DD:EE:FF", text: $macAddress)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.body, design: .monospaced))
@@ -273,7 +237,7 @@ private struct WakeOnLANConfigurationSheet: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("广播地址（可选，留空自动匹配子网）")
                             .font(.caption.weight(.medium))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(DeskPalette.secondary)
                         TextField("默认自动发送至活跃子网广播与 255.255.255.255", text: $broadcastAddress)
                             .textFieldStyle(.roundedBorder)
                             .font(.system(.body, design: .monospaced))
@@ -281,7 +245,7 @@ private struct WakeOnLANConfigurationSheet: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("UDP 端口")
                             .font(.caption.weight(.medium))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(DeskPalette.secondary)
                         TextField("9", text: $port)
                             .textFieldStyle(.roundedBorder)
                             .font(.system(.body, design: .monospaced))
@@ -290,10 +254,15 @@ private struct WakeOnLANConfigurationSheet: View {
                 }
             }
 
+            Text("通常需要目标 Mac 使用有线以太网，并在「系统设置 → 节能」开启「唤醒以供网络访问」。")
+                .font(.callout)
+                .foregroundStyle(DeskPalette.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
             if let errorMessage {
                 Text(errorMessage)
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(DeskPalette.coral)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
@@ -307,9 +276,11 @@ private struct WakeOnLANConfigurationSheet: View {
                             errorMessage = error.localizedDescription
                         }
                     }
+                    .buttonStyle(DeskButtonStyle(.danger))
                 }
                 Spacer()
                 Button("取消") { dismiss() }
+                    .buttonStyle(DeskButtonStyle(.secondary))
                     .keyboardShortcut(.cancelAction)
                 Button("保存并立即唤醒") {
                     do {
@@ -320,6 +291,7 @@ private struct WakeOnLANConfigurationSheet: View {
                         errorMessage = error.localizedDescription
                     }
                 }
+                .buttonStyle(DeskButtonStyle(.secondary))
                 Button("保存") {
                     do {
                         let config = try parsedConfiguration()
@@ -329,12 +301,14 @@ private struct WakeOnLANConfigurationSheet: View {
                         errorMessage = error.localizedDescription
                     }
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(DeskButtonStyle(.primary))
                 .keyboardShortcut(.defaultAction)
             }
         }
-        .padding(22)
-        .frame(width: 500)
+        .padding(24)
+        .frame(width: 520)
+        .controlSize(.large)
+        .deskSurface()
     }
 
     private func parsedConfiguration() throws -> WakeOnLANConfiguration {

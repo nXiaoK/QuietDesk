@@ -53,7 +53,7 @@ struct UpdateView: View {
         }
         .padding(22)
         .frame(minWidth: 520, minHeight: 420)
-        .background(DeskPalette.canvasBackground)
+        .deskSurface()
         .alert("安装更新并重新启动？", isPresented: $confirmInstallation) {
             Button("取消", role: .cancel) {}.keyboardShortcut(.defaultAction)
             Button("安装并重新启动") { controller.install() }
@@ -64,26 +64,12 @@ struct UpdateView: View {
 
     private var headerSection: some View {
         HStack(alignment: .center, spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                    .fill(Color.accentColor.opacity(0.14))
-                    .frame(width: 42, height: 42)
-                Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
-                    .font(.system(size: 21, weight: .semibold))
-                    .foregroundStyle(Color.accentColor)
-            }
-
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 8) {
-                    Text("QuietDesk 更新")
-                        .font(.system(size: 17, weight: .bold))
-                    UpdateStateBadge(controller: controller)
-                }
-                Text("当前版本 \(controller.currentVersion)（Build \(controller.currentBuild)）· \(controller.usesAdHocSignature ? "临时签名" : "固定签名证书")")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 8)
+            DeskSectionHeading(
+                title: "QuietDesk 更新",
+                detail: "当前版本 \(controller.currentVersion)（Build \(controller.currentBuild)）· \(controller.usesAdHocSignature ? "临时签名" : "固定签名证书")"
+            )
+            Spacer()
+            UpdateStateBadge(controller: controller)
         }
     }
 
@@ -201,19 +187,20 @@ struct UpdateView: View {
                         controller.install()
                     }
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(DeskButtonStyle(.primary))
                 .disabled(controller.installBlocked)
             } else if controller.manifest != nil && !changing && controller.requiredSystemVersion == nil {
                 if controller.installBlocked {
                     Button("先下载更新") { controller.download() }
                 } else {
                     Button("立即下载并安装") { controller.downloadAndInstall() }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(DeskButtonStyle(.primary))
                 }
             } else if !changing && controller.requiredSystemVersion == nil {
                 Button("重新检查") { controller.check() }
             }
         }
+        .buttonStyle(DeskButtonStyle(.secondary))
     }
 }
 
@@ -256,45 +243,33 @@ struct UpdateSettingsPanel: View {
     }
 
     private var versionAndActionCard: some View {
-        DeskSurfaceCard(padding: 18, cornerRadius: 14) {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(alignment: .center, spacing: 14) {
-                    ZStack {
-                        Circle()
-                            .fill(Color.accentColor.opacity(0.14))
-                            .frame(width: 46, height: 46)
-                        Image(systemName: "arrow.triangle.2.circlepath")
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundStyle(Color.accentColor)
-                    }
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 8) {
-                            Text("QuietDesk \(controller.currentVersion)")
-                                .font(.system(size: 16.5, weight: .bold))
-                            DeskPillBadge(text: "Build \(controller.currentBuild)", tint: .secondary, monospaced: true)
-                            DeskPillBadge(
-                                text: controller.usesAdHocSignature ? "临时签名" : "固定签名证书",
-                                tint: controller.usesAdHocSignature ? DeskPalette.amber : DeskPalette.emerald
-                            )
-                            UpdateStateBadge(controller: controller)
-                        }
-                        Text(controller.enabled
-                             ? "上次自动检查：\(formattedLastCheck)\(controller.message.isEmpty ? "" : " · \(controller.message)")"
-                             : "当前构建未配置更新源与签名公钥，应用内更新已关闭。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .textSelection(.enabled)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                    actionButtons
+        DeskSettingsGroup(title: "当前版本") {
+            DeskSettingsRow(title: "QuietDesk", detail: controller.usesAdHocSignature ? "临时签名" : "固定签名证书") {
+                HStack(spacing: 8) {
+                    Text("\(controller.currentVersion) · Build \(controller.currentBuild)")
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(DeskPalette.secondary)
+                        .textSelection(.enabled)
+                    UpdateStateBadge(controller: controller)
                 }
-
-                if controller.state == .downloading {
-                    UpdateDownloadProgressRow(receivedBytes: controller.receivedBytes, totalBytes: controller.totalBytes)
-                }
+            }
+            Divider()
+            DeskSettingsRow(title: "检查更新", detail: controller.enabled
+                            ? "上次自动检查：\(formattedLastCheck)"
+                            : "当前构建未配置更新源与签名公钥。") {
+                actionButtons
+            }
+            if !controller.message.isEmpty {
+                Text(controller.message)
+                    .font(.caption)
+                    .foregroundStyle(DeskPalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .padding(.bottom, 10)
+            }
+            if controller.state == .downloading {
+                UpdateDownloadProgressRow(receivedBytes: controller.receivedBytes, totalBytes: controller.totalBytes)
+                    .padding(.bottom, 12)
             }
         }
     }
@@ -323,7 +298,7 @@ struct UpdateSettingsPanel: View {
                             controller.install()
                         }
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(DeskButtonStyle(.primary))
                     .disabled(controller.installBlocked)
                 } else if controller.manifest != nil, controller.requiredSystemVersion == nil {
                     Button("跳过此版本") { controller.skip() }
@@ -331,93 +306,72 @@ struct UpdateSettingsPanel: View {
                         Button("先下载更新") { controller.download() }
                     } else {
                         Button("立即下载并安装") { controller.downloadAndInstall() }
-                            .buttonStyle(.borderedProminent)
+                            .buttonStyle(DeskButtonStyle(.primary))
                     }
                 } else {
                     Button("检查更新") { controller.check(manual: true, presentWindow: false) }
-                        .buttonStyle(.borderedProminent)
+                        .buttonStyle(DeskButtonStyle(.primary))
                 }
             }
+            .buttonStyle(DeskButtonStyle(.secondary))
         }
     }
 
     private var automaticPolicyCard: some View {
-        DeskSurfaceCard(padding: 18, cornerRadius: 14) {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack {
-                    Label("自动检查与自动更新策略", systemImage: "sparkles")
-                        .font(.system(size: 13.5, weight: .bold))
-                    Spacer()
-                    DeskInfoPopoverButton(
-                        title: "自动更新安全与空闲判定说明",
-                        lines: [
-                            "所有更新清单均经内置 Ed25519 公钥验签，归档严格校验大小、SHA-256、ZIP 结构、代码签名与开发团队一致性。",
-                            "当本机正在远程控制其他 Mac、正被其他 Mac 远程控制，或存在活动 TCP 端口映射连接时，不会启动后台下载或自动重启。",
-                            "本机仅开启「本机共享」等待连接（当前无远端接入）不视为处于远程控制中，可正常自动完成更新并在重启后恢复共享。",
-                            "远程连接刚断开时会留出 10 秒空闲稳定期，避免短暂网络重连期间误触发重启。"
-                        ],
-                        label: "安全规则"
-                    )
+        VStack(alignment: .leading, spacing: 11) {
+            DeskSettingsGroup(title: "更新策略") {
+                DeskSettingsRow(title: "自动检查更新") {
+                    Toggle("自动检查更新", isOn: Binding(
+                        get: { controller.autoCheckPreference == true },
+                        set: { controller.setAutomaticChecks($0) }
+                    ))
+                    .labelsHidden()
+                    .disabled(!controller.enabled)
                 }
-
-                Toggle(isOn: Binding(
-                    get: { controller.autoCheckPreference == true },
-                    set: { controller.setAutomaticChecks($0) }
-                )) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("自动检查更新")
-                            .fontWeight(.medium)
-                        Text("启动满 2 分钟后，每 24 小时最多访问一次 GitHub Release 获取最新签名清单；网络异常时按小时退避重试。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .disabled(!controller.enabled)
 
                 Divider()
 
-                Toggle(isOn: Binding(
-                    get: { controller.autoInstallPreference },
-                    set: { controller.setAutomaticInstall($0) }
-                )) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("自动更新（非远程控制情况下自动下载并安装）")
-                            .fontWeight(.medium)
-                        Text("开启后自动启用更新检查；发现新版本且不处于远程控制或活动连接时，自动在后台下载、校验、替换应用并静默重启。")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .disabled(!controller.enabled)
-
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(controller.isRemoteControlActive ? DeskPalette.amber : DeskPalette.emerald)
-                        .frame(width: 7.5, height: 7.5)
-                    Text(controller.isRemoteControlActive
-                         ? "当前检测：处于远程控制或活动连接中 · 自动更新将推迟至连接空闲后执行"
-                         : "当前检测：未处于远程控制状态 · 满足自动更新安装条件")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 11)
-                .padding(.vertical, 8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(DeskPalette.subtleFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-
-                if controller.usesAdHocSignature {
-                    Label("当前应用使用临时签名（ad-hoc），自动更新替换后 macOS 可能要求在本机重新确认屏幕录制、辅助功能与输入监控权限。", systemImage: "exclamationmark.triangle")
-                        .font(.caption)
-                        .foregroundStyle(DeskPalette.amber)
-                        .fixedSize(horizontal: false, vertical: true)
+                DeskSettingsRow(title: "非远程控制时自动下载并安装") {
+                    Toggle("非远程控制时自动下载并安装", isOn: Binding(
+                        get: { controller.autoInstallPreference },
+                        set: { controller.setAutomaticInstall($0) }
+                    ))
+                    .labelsHidden()
+                    .disabled(!controller.enabled)
                 }
             }
             .toggleStyle(.switch)
             .controlSize(.small)
+
+            HStack(alignment: .top, spacing: 7) {
+                Text("启动满 2 分钟后，每 24 小时最多检查一次。网络异常时按小时退避；自动安装需无远控、无被控、无活动映射连接。")
+                    .font(.caption)
+                    .foregroundStyle(DeskPalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                DeskInfoPopoverButton(
+                    title: "自动更新安全与空闲判定说明",
+                    lines: [
+                        "更新清单经内置 Ed25519 公钥验签，归档校验大小、SHA-256、ZIP 结构、代码签名与开发团队一致性。",
+                        "本机仅开启共享等待连接（无远端接入）时，可自动更新并在重启后恢复共享。",
+                        "远程连接断开后留出 10 秒空闲稳定期，避免短暂网络重连触发重启。"
+                    ]
+                )
+            }
+
+            Label(controller.isRemoteControlActive
+                  ? "远控或映射连接正在运行。自动更新将延后。"
+                  : "当前没有活动远控或映射连接。",
+                  systemImage: controller.isRemoteControlActive ? "clock" : "checkmark.circle")
+                .font(.caption)
+                .foregroundStyle(controller.isRemoteControlActive ? DeskPalette.amber : DeskPalette.secondary)
+
+            if controller.usesAdHocSignature {
+                Label("临时签名构建更新后，macOS 可能要求在本机重新授权屏幕录制、辅助功能与输入监控。",
+                      systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(DeskPalette.amber)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -469,7 +423,7 @@ struct UpdateBanner: View {
 
             if controller.state == .ready && !controller.installBlocked && !controller.needsManualInstall && controller.autoInstallPreference {
                 Button("立即安装并重启") { controller.install() }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(DeskButtonStyle(.primary))
                     .controlSize(.small)
             }
             Button("查看更新") { controller.present() }

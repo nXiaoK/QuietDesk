@@ -10,7 +10,11 @@ use windows::Win32::Foundation::S_OK;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::Variant::VARIANT;
-use windows::core::{GUID, Interface};
+use windows::core::{GUID, HRESULT, Interface};
+
+#[path = "codec_hardware.rs"]
+mod hardware;
+pub(super) use hardware::H264HardwareEncoder;
 
 /// Media Foundation for the current process, shut down when dropped.
 pub struct MediaFoundation;
@@ -58,27 +62,99 @@ unsafe fn sample_with(bytes: &[u8], time: i64, duration: i64) -> windows::core::
 }
 
 /// One `ProcessOutput` call. `Ok(None)` means the transform wants more input.
-unsafe fn take_output(transform: &IMFTransform) -> windows::core::Result<Option<IMFSample>> {
+unsafe fn take_output(transform: &IMFTransform, stream: u32) -> windows::core::Result<Option<IMFSample>> {
     unsafe {
-        let info = transform.GetOutputStreamInfo(0)?;
+        let info = transform.GetOutputStreamInfo(stream)?;
         let provides = info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32 != 0;
         let own = if provides {
             None
         } else {
             let sample = MFCreateSample()?;
-            sample.AddBuffer(&MFCreateMemoryBuffer(info.cbSize.max(1 << 16))?)?;
+            let capacity = info.cbSize.max(1 << 16);
+            let buffer = if info.cbAlignment != 0 { MFCreateAlignedMemoryBuffer(capacity, info.cbAlignment)? } else { MFCreateMemoryBuffer(capacity)? };
+            sample.AddBuffer(&buffer)?;
             Some(sample)
         };
-        let mut output = MFT_OUTPUT_DATA_BUFFER { dwStreamID: 0, pSample: ManuallyDrop::new(own), dwStatus: 0, pEvents: ManuallyDrop::new(None) };
+        let mut output = MFT_OUTPUT_DATA_BUFFER { dwStreamID: stream, pSample: ManuallyDrop::new(own), dwStatus: 0, pEvents: ManuallyDrop::new(None) };
         let mut status = 0;
         let result = transform.ProcessOutput(0, std::slice::from_mut(&mut output), &mut status);
         let sample = ManuallyDrop::take(&mut output.pSample);
         ManuallyDrop::drop(&mut output.pEvents);
+        let no_sample = MFT_OUTPUT_DATA_BUFFER_NO_SAMPLE.0 as u32;
         match result {
+            Ok(()) if output.dwStatus & no_sample == no_sample => Ok(None),
             Ok(()) => Ok(sample),
             Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => Ok(None),
             Err(error) => Err(error),
         }
+    }
+}
+
+fn encoder_rate(settings: StreamSettings) -> (u32, u32) {
+    (settings.frames_per_second.clamp(1, 60) as u32, (settings.megabits.clamp(1, 100) * 1_000_000) as u32)
+}
+
+fn encoder_options(rate: u32, bits: u32) -> [(&'static str, &'static GUID, VARIANT); 5] {
+    [
+        ("low latency", &CODECAPI_AVLowLatencyMode, VARIANT::from(true)),
+        ("constant bit rate", &CODECAPI_AVEncCommonRateControlMode, VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32)),
+        ("bit rate", &CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bits)),
+        ("no B frames", &CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32)),
+        ("keyframe distance", &CODECAPI_AVEncMPVGOPSize, VARIANT::from(rate * 3600)),
+    ]
+}
+
+fn codec_option(control: &ICodecAPI, name: &GUID, value: &VARIANT) -> HRESULT {
+    unsafe { (control.vtable().SetValue)(control.as_raw(), name, value) }
+}
+
+fn set_encoder_bitrate(control: &ICodecAPI, megabits: i64) -> Result<()> {
+    // SetValue may return S_FALSE for a read-only property.
+    let status = codec_option(control, &CODECAPI_AVEncCommonMeanBitRate, &VARIANT::from((megabits * 1_000_000) as u32));
+    if status == S_OK { Ok(()) } else { Err(DeskError::platform(format!("编码器未接受动态码率：{status:?}"))) }
+}
+
+unsafe fn encoder_types(width: u32, height: u32, rate: u32, bits: u32) -> windows::core::Result<(IMFMediaType, IMFMediaType)> {
+    unsafe {
+        let output = video_type(&MFVideoFormat_H264)?;
+        output.SetUINT32(&MF_MT_AVG_BITRATE, bits)?;
+        output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
+        let input = video_type(&MFVideoFormat_NV12)?;
+        for media_type in [&output, &input] {
+            media_type.SetUINT64(&MF_MT_FRAME_SIZE, pack(width, height))?;
+            media_type.SetUINT64(&MF_MT_FRAME_RATE, pack(rate, 1))?;
+            media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
+            media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+            media_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
+            media_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
+            media_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
+            media_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+        }
+        Ok((input, output))
+    }
+}
+
+unsafe fn assemble_output(transform: &IMFTransform, stream: u32, assembler: &mut H264FrameAssembler, output: IMFSample) -> Result<Option<EncodedFrame>> {
+    unsafe {
+        let buffer = output.ConvertToContiguousBuffer().map_err(failed("读取编码输出"))?;
+        let (mut data, mut length) = (std::ptr::null_mut(), 0);
+        buffer.Lock(&mut data, None, Some(&mut length)).map_err(failed("读取编码输出"))?;
+        let bytes = if length == 0 { &[] } else { std::slice::from_raw_parts(data, length as usize) };
+        let assembled = assembler.assemble(bytes).or_else(|_| {
+            // Some encoders announce the parameter sets in the output type instead of the stream.
+            let (mut data, mut length) = (std::ptr::null_mut(), 0);
+            if let Ok(current) = transform.GetOutputCurrentType(stream)
+                && current.GetAllocatedBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut data, &mut length).is_ok()
+            {
+                if length != 0 {
+                    assembler.set_parameter_sets(std::slice::from_raw_parts(data, length as usize));
+                }
+                CoTaskMemFree(Some(data.cast()));
+            }
+            assembler.assemble(bytes)
+        });
+        let _ = buffer.Unlock();
+        assembled
     }
 }
 
@@ -112,44 +188,21 @@ unsafe impl Send for H264Encoder {}
 
 impl H264Encoder {
     pub fn new(width: u32, height: u32, settings: StreamSettings) -> Result<Self> {
-        let rate = settings.frames_per_second.clamp(1, 60) as u32;
-        let bits = (settings.megabits.clamp(1, 100) * 1_000_000) as u32;
+        let (rate, bits) = encoder_rate(settings);
         unsafe {
             let transform: IMFTransform = CoCreateInstance(&CLSID_MSH264EncoderMFT, None, CLSCTX_INPROC_SERVER).map_err(failed("创建 H.264 编码器"))?;
             // The encoder reads these when its output type is set; set later, low-latency mode is ignored and
             // it holds more than a dozen frames back before the first one comes out.
             let control = transform.cast::<ICodecAPI>().ok();
             if let Some(control) = &control {
-                let options: [(&str, &GUID, VARIANT); 5] = [
-                    ("low latency", &CODECAPI_AVLowLatencyMode, VARIANT::from(true)),
-                    ("constant bit rate", &CODECAPI_AVEncCommonRateControlMode, VARIANT::from(eAVEncCommonRateControlMode_CBR.0 as u32)),
-                    ("bit rate", &CODECAPI_AVEncCommonMeanBitRate, VARIANT::from(bits)),
-                    ("no B frames", &CODECAPI_AVEncMPVDefaultBPictureCount, VARIANT::from(0u32)),
-                    // Keyframes are sent when a stream starts or resumes, not on a schedule.
-                    ("keyframe distance", &CODECAPI_AVEncMPVGOPSize, VARIANT::from(rate * 3600)),
-                ];
-                for (label, name, value) in &options {
-                    if let Err(error) = control.SetValue(*name, std::ptr::from_ref(value).cast()) {
+                for (label, name, value) in encoder_options(rate, bits) {
+                    if let Err(error) = codec_option(control, name, &value).ok() {
                         log::warn!("encoder option {label} was not accepted: {error}");
                     }
                 }
             }
             let configure = || -> windows::core::Result<()> {
-                let output = video_type(&MFVideoFormat_H264)?;
-                output.SetUINT32(&MF_MT_AVG_BITRATE, bits)?;
-                output.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
-                let input = video_type(&MFVideoFormat_NV12)?;
-                for media_type in [&output, &input] {
-                    media_type.SetUINT64(&MF_MT_FRAME_SIZE, pack(width, height))?;
-                    media_type.SetUINT64(&MF_MT_FRAME_RATE, pack(rate, 1))?;
-                    media_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
-                    media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-                    // The frames are BT.709 video range; an encoder that writes colour information says so.
-                    media_type.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32)?;
-                    media_type.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
-                    media_type.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
-                    media_type.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
-                }
+                let (input, output) = encoder_types(width, height, rate, bits)?;
                 // The encoder accepts an input type only once it knows what it will produce.
                 transform.SetOutputType(0, &output, 0)?;
                 transform.SetInputType(0, &input, 0)
@@ -173,14 +226,7 @@ impl H264Encoder {
 
     pub fn set_bitrate(&mut self, megabits: i64) -> Result<()> {
         let control = self.control.as_ref().ok_or_else(|| DeskError::platform("编码器不支持动态码率"))?;
-        let value = VARIANT::from((megabits * 1_000_000) as u32);
-        let status = unsafe {
-            // SetValue may return S_FALSE for a read-only property.
-            (control.vtable().SetValue)(control.as_raw(), &CODECAPI_AVEncCommonMeanBitRate, &value)
-        };
-        if status != S_OK {
-            return Err(DeskError::platform(format!("编码器未接受动态码率：{status:?}")));
-        }
+        set_encoder_bitrate(control, megabits)?;
         self.settings.megabits = megabits;
         Ok(())
     }
@@ -222,20 +268,8 @@ impl H264Encoder {
             let transform = &self.transform;
             let assembler = &mut self.assembler;
             let result = drain_access_units(
-                || take_output(transform).map_err(failed("读取编码输出")),
-                |output| {
-                    let buffer = output.ConvertToContiguousBuffer().map_err(failed("读取编码输出"))?;
-                    let (mut data, mut length) = (std::ptr::null_mut(), 0);
-                    buffer.Lock(&mut data, None, Some(&mut length)).map_err(failed("读取编码输出"))?;
-                    let stream = std::slice::from_raw_parts(data, length as usize);
-                    let assembled = assembler.assemble(stream).or_else(|_| {
-                        // Some encoders announce the parameter sets in the output type instead of the stream.
-                        Self::announce_parameter_sets(transform, assembler);
-                        assembler.assemble(stream)
-                    });
-                    let _ = buffer.Unlock();
-                    assembled
-                },
+                || take_output(transform, 0).map_err(failed("读取编码输出")),
+                |output| assemble_output(transform, 0, assembler, output),
                 frames,
             );
             self.pending = self.pending.saturating_sub(frames.len() as u32);
@@ -243,18 +277,6 @@ impl H264Encoder {
                 frames.clear();
             }
             result
-        }
-    }
-
-    unsafe fn announce_parameter_sets(transform: &IMFTransform, assembler: &mut H264FrameAssembler) {
-        unsafe {
-            let (mut data, mut length) = (std::ptr::null_mut(), 0);
-            if let Ok(current) = transform.GetOutputCurrentType(0)
-                && current.GetAllocatedBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut data, &mut length).is_ok()
-            {
-                assembler.set_parameter_sets(std::slice::from_raw_parts(data, length as usize));
-                CoTaskMemFree(Some(data.cast()));
-            }
         }
     }
 }
@@ -448,7 +470,7 @@ impl H264Decoder {
                         Err(error) => return Err(failed("提交解码输入")(error)),
                     }
                 }
-                let output = match take_output(&self.transform) {
+                let output = match take_output(&self.transform, 0) {
                     Ok(Some(output)) => output,
                     Ok(None) if submitted => return Ok(()),
                     Ok(None) => return Err(DeskError::platform("H.264 解码器既不接受输入也没有输出")),

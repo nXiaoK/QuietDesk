@@ -153,7 +153,19 @@ impl FrameWindow {
     }
 
     fn has_credit(&self) -> bool {
-        self.outstanding < self.limit && self.bytes < window::MAX_BUFFERED_BYTES && (self.gate == Gate::Open || (self.gate == Gate::One && !self.key_submitted))
+        self.available_credit() != 0
+    }
+
+    fn available_credit(&self) -> usize {
+        if self.bytes >= window::MAX_BUFFERED_BYTES {
+            return 0;
+        }
+        let remaining = self.limit.saturating_sub(self.outstanding);
+        match self.gate {
+            Gate::Open => remaining,
+            Gate::One if !self.key_submitted => remaining.min(1),
+            _ => 0,
+        }
     }
 }
 
@@ -181,6 +193,11 @@ impl FrameSink {
     /// Whether another frame may be encoded. A frame produced without credit only adds delay.
     pub fn has_credit(&self) -> bool {
         self.window.lock().unwrap().has_credit()
+    }
+
+    /// Frame slots an asynchronous encoder may account against while pictures are in flight.
+    pub fn available_credit(&self) -> usize {
+        self.window.lock().unwrap().available_credit()
     }
 
     /// Maximum frame credits granted by the current media negotiation and measured path.
@@ -1496,11 +1513,13 @@ mod tests {
         let sink = FrameSink { frames, window: window.clone() };
         let key = EncodedFrame { sps: vec![0x67, 1], pps: vec![0x68, 2], avcc: vec![0, 0, 0, 2, 0x65, 3] };
         let delta = EncodedFrame { sps: vec![], pps: vec![], avcc: vec![0, 0, 0, 2, 0x41, 4] };
+        assert_eq!(sink.available_credit(), FrameSink::WINDOW);
         assert_eq!(sink.try_submit(key.clone()), FrameSubmission::Queued);
         window.lock().unwrap().set_gate(Gate::Closed);
         assert!(!sink.has_credit());
         assert_eq!(sink.try_submit(delta.clone()), FrameSubmission::Dropped);
         window.lock().unwrap().set_gate(Gate::One);
+        assert_eq!(sink.available_credit(), 1, "the asynchronous encoder has only the opening slot");
         assert_eq!(sink.try_submit(delta.clone()), FrameSubmission::Dropped);
         assert!(sink.has_credit(), "a dependent frame was finishing when capture heard the request");
         assert_eq!(sink.try_submit(key.clone()), FrameSubmission::Queued);

@@ -226,8 +226,9 @@ private final class InteropMediaRoute: @unchecked Sendable {
 }
 
 /// Frames of a moving pattern encoded by this Mac's hardware or software H.264 encoder.
-private func encodeFrames(width: Int, height: Int, count: Int) throws -> [VideoPacket] {
-    let encoder = try VideoEncoder(width: width, height: height, settings: StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 3))
+private func encodeFrames(width: Int, height: Int, count: Int, colorSpace: VideoColorSpace = .sRGB) throws -> [VideoPacket] {
+    let encoder = try VideoEncoder(width: width, height: height,
+                                   settings: StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 3), colorSpace: colorSpace)
     defer { encoder.stop() }
     let ready = DispatchSemaphore(value: 0)
     let output = Shared<Result<VideoPacket, Error>?>(nil)
@@ -456,7 +457,7 @@ private final class MacViewer: @unchecked Sendable {
         var displayUpdates: [DisplayControl] = []
         var inputFeedback: [InputFeedback] = []
         var tuning: VideoTuningSession?
-        var decoded: [(sequence: UInt32, key: Bool, width: Int, height: Int)] = []
+        var decoded: [(sequence: UInt32, key: Bool, width: Int, height: Int, frameID: UInt64?)] = []
         var received: [UInt32] = []
         var legacyFrames = 0
         var failures: [String] = []
@@ -992,7 +993,7 @@ private final class MacViewer: @unchecked Sendable {
             switch result {
             case .success(let image):
                 let hold = state.update { state -> Bool in
-                    state.decoded.append((packet.sequence, !packet.sps.isEmpty, CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image)))
+                    state.decoded.append((packet.sequence, !packet.sps.isEmpty, CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image), frameID))
                     if state.holdAcknowledgements, let frameID {
                         state.heldDecodes.append((frameID, { completion(true) }))
                     }
@@ -1796,8 +1797,9 @@ private struct WindowsInteropChecks {
         func withWindowsHost(_ extra: [String] = [], useMedia: Bool = true, udp: Bool = false, viewerKey: PairingKey? = nil, identity: DeviceIdentity? = nil, clipboard: InteropClipboard? = nil,
                              routeAuxiliary: ((UInt16) throws -> UInt16)? = nil,
                              preferred: StreamSettings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8),
+                             videoRecording: String? = nil,
                              _ body: (Probe, MacViewer) throws -> Void) throws {
-            let probe = try Probe(probePath, ["host", "--code", key.code, "--recording", recording, "--size", "\(size.width)x\(size.height)",
+            let probe = try Probe(probePath, ["host", "--code", key.code, "--recording", videoRecording ?? recording, "--size", "\(size.width)x\(size.height)",
                                               "--name", "检查用 Windows 电脑"] + (udp ? [] : ["--no-udp"]) + extra)
             defer { probe.stop() }
             guard let port = try probe.next("listening")["port"] as? Int else { throw Failure("The probe did not report its port") }
@@ -1864,6 +1866,37 @@ private struct WindowsInteropChecks {
                         && state.mediaFrames.contains { $0.header.stream != frame.header.stream && $0.header.isIDR }
                 }
                 try require(probe.all("configured").count == 2, "The fallback restarted capture more than once")
+            }
+        }
+
+        run("A Mac decodes a replacement H.264 IDR and its predictions in the same Windows TCP epoch") {
+            let firstCount = 4
+            let replacement = try encodeFrames(width: size.width, height: size.height, count: 6, colorSpace: .displayP3)
+            // Use different coded color tags to exercise a new SPS at the original size and frame rate.
+            try require(replacement[0].sps != packets[0].sps, "The replacement encoder did not produce a different SPS")
+            let recording = work + "/replacement-encoder.h264"
+            _ = try writeRecording(Array(packets.prefix(firstCount)) + replacement, to: recording)
+            try withWindowsHost(videoRecording: recording) { probe, viewer in
+                let frameCount = firstCount + replacement.count
+                let expectedIDs = (1...frameCount).map(UInt64.init)
+                try until("the new IDR and its predicted frames decode") {
+                    let state = viewer.state.get()
+                    return state.commitPaths == ["tcp"] && Set(expectedIDs).isSubset(of: Set(state.decoded.compactMap(\.frameID)))
+                }
+                let state = viewer.state.get()
+                let media = Array(state.mediaFrames.prefix(frameCount))
+                let decoded = state.decoded.filter { $0.frameID.map { $0 <= UInt64(frameCount) } == true }
+                let starts = probe.all("configured").count
+                try require(state.commits.count == 1 && starts == 1, "Unexpected commit or capture restart: \(state.commits), \(starts) starts")
+                try require(media.allSatisfy { $0.header.stream == state.commits[0] }, "The replacement switched away from the committed stream")
+                let frameIDs = media.map(\.header.frameID)
+                try require(frameIDs == expectedIDs, "Nonconsecutive media frame IDs: \(frameIDs)")
+                try require(media[0].header.isIDR && media[firstCount].header.isIDR &&
+                            media[firstCount].packet.sps == replacement[0].sps && media[firstCount].packet.pps == replacement[0].pps &&
+                            media[(firstCount + 1)...].allSatisfy { !$0.header.isIDR } &&
+                            decoded.compactMap(\.frameID).sorted() == expectedIDs &&
+                            decoded.allSatisfy { $0.width == size.width && $0.height == size.height },
+                            "The replacement parameter sets, reference order or decoded frame size changed in transit")
             }
         }
 

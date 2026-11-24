@@ -36,22 +36,24 @@ struct SessionEffectsView: View {
 
     private var details: some View {
         VStack(alignment: .leading, spacing: 16) {
-            effectsGroup
-            unlockSection
-            HStack(alignment: .top, spacing: 7) {
-                Text("开启成功后按连接记忆，断开时恢复被控端原状。")
-                    .font(.caption)
-                    .foregroundStyle(DeskPalette.secondary)
-                DeskInfoPopoverButton(
-                    title: "防窥遮罩与亮度归零边界说明",
-                    lines: [
-                        "软件黑屏遮罩下，被控端的 QuietDesk 窗口、文件确认和权限弹窗在远端仍可见可操作，系统安全界面与 Mission Control 可能在被控屏幕上显示。可在被控端按 ⌃⌥Esc 退出。",
-                        "亮度归零仅作用于 Mac 笔记本的内建屏幕；本机调高亮度会关闭此项。",
-                        "断开立即锁屏涵盖网络中断、休眠与重连；被控进程被强制终止或崩溃时无法执行。"
-                    ]
-                )
-            }
             availabilityStatusView
+            if !embedded || model.connected {
+                effectsGroup
+                unlockSection
+                HStack(alignment: .top, spacing: 7) {
+                    Text("开启成功后按连接记忆，断开时恢复被控端原状。")
+                        .font(.caption)
+                        .foregroundStyle(DeskPalette.secondary)
+                    DeskInfoPopoverButton(
+                        title: "防窥遮罩与亮度归零边界说明",
+                        lines: [
+                            "软件黑屏遮罩下，被控端的 QuietDesk 窗口、文件确认和权限弹窗在远端仍可见可操作，系统安全界面与 Mission Control 可能在被控屏幕上显示。可在被控端按 ⌃⌥Esc 退出。",
+                            "亮度归零仅作用于 Mac 笔记本的内建屏幕；本机调高亮度会关闭此项。",
+                            "断开立即锁屏涵盖网络中断、休眠与重连；被控进程被强制终止或崩溃时无法执行。"
+                        ]
+                    )
+                }
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -120,8 +122,15 @@ struct SessionEffectsView: View {
     @ViewBuilder
     private var availabilityStatusView: some View {
         if !model.connected {
-            Label("当前未连接远端，连接建立后可即时切换以上开关。", systemImage: "info.circle")
-                .font(.caption).foregroundStyle(.secondary)
+            Label(
+                embedded
+                    ? "连接设备后，可在对应远控窗口的「会话设置」中调整隐私与安全。"
+                    : "远控会话尚未连接，连接建立后可调整隐私与安全。",
+                systemImage: "info.circle"
+            )
+            .font(.callout)
+            .foregroundStyle(DeskPalette.secondary)
+            .fixedSize(horizontal: false, vertical: true)
         } else if !model.supportsSessionEffects {
             Text("共享端需更新后才能使用这些开关。").font(.caption).foregroundStyle(.secondary)
         } else if !model.supportsSessionLock {

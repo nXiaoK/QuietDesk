@@ -127,6 +127,8 @@ private struct ConnectionOptionsSections: View {
     @State private var compactTab: CompactTab = .display
     @State private var showTypeTextSheet = false
 
+    private var showsSessionControls: Bool { compact || model.connected }
+
     var body: some View {
         Group {
             if compact {
@@ -146,7 +148,7 @@ private struct ConnectionOptionsSections: View {
                 }
             } else {
                 VStack(alignment: .leading, spacing: 17) {
-                    DeskSettingsGroup(title: "画质与屏幕") {
+                    DeskSettingsGroup(title: showsSessionControls ? "画质与屏幕" : "屏幕显示") {
                         displayAndQualityBlock.padding(.vertical, 10)
                     }
                     DeskSettingsGroup(title: "光标、触控板与音频") {
@@ -202,8 +204,10 @@ private struct ConnectionOptionsSections: View {
                 .frame(width: 146, alignment: .trailing)
             }
 
-            Divider()
-            SessionQualitySection(model: model, compact: compact)
+            if showsSessionControls {
+                Divider()
+                SessionQualitySection(model: model, compact: compact)
+            }
         }
     }
 
@@ -254,23 +258,24 @@ private struct ConnectionOptionsSections: View {
             }
             .disabled(model.connected && !model.supportsIndependentCursor)
 
-            Divider()
-
-            Toggle(isOn: Binding(get: { model.relativeMouseEnabled }, set: { model.setRelativeMouseEnabled($0) })) {
-                VStack(alignment: .leading, spacing: 1.5) {
-                    Text("相对鼠标（3D 视角锁定）")
-                        .fontWeight(.medium)
-                    Text(!model.connected ? "连接后可用 · 适合 3D 建模与视角旋转"
-                         : !model.supportsRelativeMouse ? "对端版本不支持相对鼠标"
-                         : model.relativeMouseCaptured ? "已锁定 · 按 ⌃⌥Esc 立即释放光标"
-                         : model.relativeMouseEnabled ? "待激活 · 点击远程画面锁定（⌃⌥Esc 释放）"
-                         : "点击画面锁定无边界位移（会话结束重置）")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            if showsSessionControls {
+                Divider()
+                Toggle(isOn: Binding(get: { model.relativeMouseEnabled }, set: model.setRelativeMouseEnabled)) {
+                    VStack(alignment: .leading, spacing: 1.5) {
+                        Text("相对鼠标（3D 视角锁定）")
+                            .fontWeight(.medium)
+                        Text(!model.connected ? "连接后可用 · 适合 3D 建模与视角旋转"
+                             : !model.supportsRelativeMouse ? "对端版本不支持相对鼠标"
+                             : model.relativeMouseCaptured ? "已锁定 · 按 ⌃⌥Esc 立即释放光标"
+                             : model.relativeMouseEnabled ? "待激活 · 点击远程画面锁定（⌃⌥Esc 释放）"
+                             : "点击画面锁定无边界位移（会话结束重置）")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .disabled(!model.connected || !model.supportsRelativeMouse || !model.effectiveViewerCanControl)
             }
-            .disabled(!model.connected || !model.supportsRelativeMouse || !model.effectiveViewerCanControl)
 
             if model.connected {
                 Text("\(model.controlTransportStatus) · \(model.supportsTrackpadGestures ? "触控板缩放/旋转手势已就绪" : "旧端不含触控板缩放手势")")

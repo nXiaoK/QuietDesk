@@ -1002,6 +1002,8 @@ struct DeskView: View {
                 viewer: models.viewer,
                 updates: updates,
                 subTab: $preferencesSubTab,
+                activeSessions: models.activeSessionSummaries,
+                openSession: { models.focusViewerSession(id: $0) },
                 openBenchmark: {
                     diagnosticsSubTab = .benchmark
                     models.workspaceSection = .benchmark

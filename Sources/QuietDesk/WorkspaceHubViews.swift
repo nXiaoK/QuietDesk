@@ -391,8 +391,14 @@ struct PreferencesWorkspaceView: View {
     @ObservedObject var viewer: DeskModel
     @ObservedObject var updates: UpdateController
     @Binding var subTab: PreferencesWorkspaceSubTab
+    let activeSessions: [ActiveRemoteSessionSummary]
+    let openSession: (UUID) -> Void
     let openBenchmark: () -> Void
     let openTraffic: () -> Void
+
+    private var connectedSessions: [ActiveRemoteSessionSummary] {
+        activeSessions.filter(\.connected)
+    }
 
     var body: some View {
         DeskSettingsPageTabs(
@@ -412,7 +418,7 @@ struct PreferencesWorkspaceView: View {
                         CapsLockSettingsView(model: viewer, done: {}, embedded: true)
                     case .privacy:
                         DeskSettingsPageHeading(title: "被控端隐私与安全")
-                        SessionEffectsView(model: viewer, done: {}, embedded: true)
+                        privacyContent
                     case .connectionDefaults:
                         DeskSettingsPageHeading(title: "连接默认项")
                         ConnectionSettingsView(
@@ -435,5 +441,28 @@ struct PreferencesWorkspaceView: View {
             }
         }
         .background(DeskPalette.canvasBackground)
+    }
+
+    @ViewBuilder
+    private var privacyContent: some View {
+        if viewer.connected || connectedSessions.isEmpty {
+            SessionEffectsView(model: viewer, done: {}, embedded: true)
+        } else {
+            Text("防窥和自动解锁按设备管理。在对应窗口中打开「会话设置」，再选择「被控端隐私与安全」。")
+                .font(.callout)
+                .foregroundStyle(DeskPalette.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            DeskSettingsGroup(title: "已连接的会话") {
+                ForEach(connectedSessions) { session in
+                    if session.id != connectedSessions.first?.id { Divider() }
+                    DeskSettingsRow(title: session.title, detail: session.endpointLabel) {
+                        Button("打开会话") { openSession(session.id) }
+                            .buttonStyle(DeskButtonStyle(.secondary))
+                            .accessibilityLabel("打开 \(session.title) 的会话")
+                    }
+                }
+            }
+        }
     }
 }

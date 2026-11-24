@@ -226,8 +226,6 @@ struct SharingView: View {
                 Divider()
                 permissionRow("辅助功能", granted: model.localAccessibility, action: model.requestAccessibility)
                 Divider()
-                permissionRow("输入监控", granted: model.localInputMonitoring, action: model.requestInputMonitoring)
-                Divider()
                 settingToggle("允许控制端操作键盘、鼠标与自动解锁", isOn: Binding(
                     get: { model.hostAllowsRemoteControl },
                     set: { model.setHostAllowsRemoteControl($0) }
@@ -418,7 +416,7 @@ struct SharingView: View {
                         "应用运行于用户态，macOS 登录前或 FileVault 解锁前无法共享。",
                         "关闭主窗口后共享仍在菜单栏后台运行；完全退出 QuietDesk 会停止共享。",
                         "开启阻止空闲睡眠后只在外部供电时生效。使用电池时允许系统正常睡眠。",
-                        "开启共享后可同时在「远程桌面」控制其他设备。",
+                        "开启共享后可同时在「全部设备」中连接其他设备。",
                         "局域网发现只广播设备名称与匿名标识，控制端仍须凭配对码完成加密认证。"
                     ]
                 )

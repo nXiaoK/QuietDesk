@@ -16,37 +16,66 @@ struct ConnectionDiagnosticReportView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 14) {
                 HStack(alignment: .top, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: 5) {
                         Text("连接诊断报告")
                             .font(.system(size: 23, weight: .bold))
                             .foregroundStyle(DeskPalette.ink)
                             .accessibilityAddTraits(.isHeader)
-                        Text(report.remoteName.isEmpty ? "远程连接" : report.remoteName)
-                            .font(.callout)
+                        Text("\(report.remoteName.isEmpty ? "远程连接" : report.remoteName) · 会话结束后的本机观测，不保证覆盖所有网络事件")
+                            .font(.system(size: 13))
                             .foregroundStyle(DeskPalette.secondary)
                             .textSelection(.enabled)
                             .lineLimit(2)
                     }
                     Spacer()
                     VStack(alignment: .trailing, spacing: 3) {
-                        Text("连接总时长").font(.caption).foregroundStyle(.secondary)
-                        Text(elapsed(report.duration)).font(.headline.monospacedDigit())
+                        Text("连接总时长")
+                            .font(.caption)
+                            .foregroundStyle(DeskPalette.secondary)
+                        Text(elapsed(report.duration))
+                            .font(.system(size: 16, weight: .bold, design: .monospaced))
                     }
                 }
-                HStack(alignment: .firstTextBaseline, spacing: 14) {
-                    Label(report.startedAt.formatted(date: .abbreviated, time: .standard), systemImage: "clock")
-                        .fixedSize().help("本次连接开始时间")
-                    Text(report.reason).lineLimit(3).textSelection(.enabled).help(report.reason)
-                }
-                .font(.callout).foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 24).padding(.vertical, 16)
 
-            DeskSegmentedTabs(tabs: [(false, "质量趋势"), (true, "路径对比")], selection: $showRoutes)
-                .padding(.horizontal, 24)
-                .padding(.bottom, 12)
+                HStack(alignment: .center, spacing: 12) {
+                    DeskSegmentedTabs(tabs: [(false, "质量趋势"), (true, "路径对比")], selection: $showRoutes)
+                        .frame(maxWidth: 240)
+
+                    if !showRoutes {
+                        HStack(spacing: 8) {
+                            Text(selection.map { "区间 " + elapsed($0.start) + " – " + elapsed($0.end) } ?? "整个会话")
+                                .font(.system(size: 12.5, weight: .medium, design: .monospaced))
+                                .foregroundStyle(DeskPalette.secondary)
+                            if selection != nil {
+                                Button("查看全程") { selectedTime = nil }
+                                    .buttonStyle(DeskButtonStyle(.quiet))
+                            }
+                        }
+                    }
+
+                    Spacer()
+
+                    HStack(spacing: 10) {
+                        Label(report.startedAt.formatted(date: .abbreviated, time: .shortened), systemImage: "clock")
+                            .fixedSize()
+                        Text("·")
+                        Text(report.reason)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .help(report.reason)
+                    }
+                    .font(.system(size: 12))
+                    .foregroundStyle(DeskPalette.muted)
+                }
+            }
+            .padding(.horizontal, 28)
+            .padding(.top, 22)
+            .padding(.bottom, 14)
+
+            Divider()
+
             ScrollView {
                 if showRoutes {
                     routeComparison
@@ -57,29 +86,29 @@ struct ConnectionDiagnosticReportView: View {
             .id(showRoutes)
             .frame(maxWidth: .infinity)
         }
-        .frame(minWidth: 600, minHeight: 420)
+        .frame(minWidth: 620, minHeight: 440)
         .background(DeskPalette.canvasBackground)
         .tint(DeskPalette.accent)
     }
 
     private var trends: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 16) {
             HStack {
-                Text(selection.map { "区间 " + elapsed($0.start) + " – " + elapsed($0.end) } ?? "整个连接时段")
-                    .font(.headline).monospacedDigit()
+                Text("帧率与链路变化")
+                    .font(.system(size: 15, weight: .semibold))
                 Spacer()
-                if selection != nil {
-                    Button("查看全程") { selectedTime = nil }.buttonStyle(.link)
-                } else {
-                    Text("点按图表查看区间").font(.caption).foregroundStyle(.secondary)
+                if selection == nil {
+                    Text("点按图表可查看特定区间指标")
+                        .font(.caption)
+                        .foregroundStyle(DeskPalette.secondary)
                 }
             }
 
-            DeskSurfaceCard(padding: 16, cornerRadius: 9) {
-                VStack(alignment: .leading, spacing: 12) {
+            DeskSurfaceCard(padding: 18, cornerRadius: 10) {
+                VStack(alignment: .leading, spacing: 14) {
                     let commonDomain = 0...max(0.001, report.duration)
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("视频路径").font(.callout.weight(.semibold))
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("视频路径时间轴").font(.system(size: 13, weight: .semibold))
                         Chart(report.timeline, id: \.start) { bucket in
                             RectangleMark(xStart: .value("开始", bucket.start), xEnd: .value("结束", bucket.end))
                                 .foregroundStyle(pathBandColor(bucket))
@@ -93,7 +122,7 @@ struct ConnectionDiagnosticReportView: View {
                         .padding(.leading, 50)
                         .accessibilityLabel("视频路径时间轴")
                         if let selection {
-                            Text(pathList(selection)).font(.caption).foregroundStyle(.secondary)
+                            Text(pathList(selection)).font(.caption).foregroundStyle(DeskPalette.secondary)
                                 .lineLimit(3).textSelection(.enabled).help(pathList(selection))
                         } else {
                             let colors = Set(report.timeline.map(pathBandColor))
@@ -106,43 +135,110 @@ struct ConnectionDiagnosticReportView: View {
                             }
                         }
                     }
-                    .padding(.bottom, 3)
+                    .padding(.bottom, 4)
 
                     if report.totals.hasMeasurements {
                         ForEach(ReportMetric.allCases) { metric in
                             trendRow(metric, domain: commonDomain)
                         }
                     } else {
-                        ContentUnavailableView("没有质量样本", systemImage: "waveform.path.ecg",
-                                               description: Text("可在「路径对比」查看本次尝试的路径和用时。"))
+                        VStack(spacing: 8) {
+                            Image(systemName: "waveform.path.ecg")
+                                .font(.system(size: 26, weight: .light))
+                                .foregroundStyle(DeskPalette.muted)
+                            Text("暂无诊断观测")
+                                .font(.system(size: 16, weight: .semibold))
+                            Text("会话样本不足，不绘制虚构曲线或生成确定结论；可在「路径对比」查看本次尝试的路径和用时。")
+                                .font(.system(size: 13))
+                                .foregroundStyle(DeskPalette.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                        .padding(.vertical, 24)
+                        .frame(maxWidth: .infinity)
                     }
+
                     HStack {
                         Text(elapsed(0)); Spacer(); Text(elapsed(report.duration / 2)); Spacer(); Text(elapsed(report.duration))
                     }
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(DeskPalette.secondary)
                     .padding(.leading, 50)
                 }
             }
+
+            if !report.routes.isEmpty {
+                routeSummaryTable
+            }
+
             if report.totals.hasMeasurements {
                 Text("图中显示各区间的均值，空白表示没有观测。控制 RTT 来自控制通道，UDP 视频 RTT 取自已启用的 UDP 视频路径。分片丢失率含 UDP 试传期间已结算的分片。")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.system(size: 12))
+                    .foregroundStyle(DeskPalette.secondary)
             }
         }
-        .padding(.horizontal, 24).padding(.vertical, 16)
+        .padding(.horizontal, 28)
+        .padding(.vertical, 20)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var routeSummaryTable: some View {
+        DeskSurfaceCard(padding: 0, cornerRadius: 10) {
+            VStack(spacing: 0) {
+                HStack(spacing: 12) {
+                    Text("路径").frame(width: 170, alignment: .leading)
+                    Text("观测").frame(maxWidth: .infinity, alignment: .leading)
+                    Text("结论").frame(width: 140, alignment: .leading)
+                }
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(DeskPalette.secondary)
+                .padding(.horizontal, 16)
+                .frame(height: 35)
+                .background(DeskPalette.insetBackground)
+
+                ForEach(report.routes, id: \.route) { entry in
+                    Divider()
+                    HStack(spacing: 12) {
+                        HStack(spacing: 7) {
+                            Image(systemName: entry.route.media.symbol)
+                                .font(.system(size: 12))
+                                .foregroundStyle(entry.route.media.color)
+                            Text(entry.route.media.title)
+                                .font(.system(size: 13, weight: .medium))
+                                .lineLimit(1)
+                        }
+                        .frame(width: 170, alignment: .leading)
+
+                        Text("\(entry.route.detail) · 时长 \(elapsed(entry.duration))")
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(DeskPalette.secondary)
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        Text(entry.quality.hasMeasurements ? "样本有效（仅本次会话）" : "仅路径计时")
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(DeskPalette.secondary)
+                            .frame(width: 140, alignment: .leading)
+                    }
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 42)
+                }
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private func trendRow(_ metric: ReportMetric, domain: ClosedRange<Double>) -> some View {
         let summary = selection?.quality ?? report.totals
         return VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Text(metric.title).font(.callout.weight(.semibold))
+                Text(metric.title).font(.system(size: 13, weight: .semibold))
                 Spacer()
                 if let peak = metric.peak(summary) {
-                    Text("最高 " + metric.format(peak)).font(.caption).foregroundStyle(.secondary)
+                    Text("最高 " + metric.format(peak)).font(.caption).foregroundStyle(DeskPalette.secondary)
                 }
                 Text(metric.value(summary).map { "平均 " + metric.format($0) } ?? "无样本")
-                    .font(.callout).foregroundStyle(metric.value(summary) == nil ? .secondary : .primary)
+                    .font(.system(size: 13))
+                    .foregroundStyle(metric.value(summary) == nil ? DeskPalette.secondary : DeskPalette.ink)
             }
             .monospacedDigit()
             if metric.value(report.totals) != nil {
@@ -154,7 +250,7 @@ struct ConnectionDiagnosticReportView: View {
                         Spacer()
                         Text("0")
                     }
-                    .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                    .font(.caption2.monospacedDigit()).foregroundStyle(DeskPalette.secondary)
                     .frame(width: 44, alignment: .trailing)
                     Chart {
                         RuleMark(y: .value("零", 0)).foregroundStyle(.secondary.opacity(0.22))
@@ -182,7 +278,7 @@ struct ConnectionDiagnosticReportView: View {
                     .selectDiagnosticTime($selectedTime)
                     .accessibilityLabel(metric.title + "趋势")
                 }
-                .frame(height: 43)
+                .frame(height: 44)
             } else {
                 Divider().padding(.vertical, 6)
             }
@@ -191,11 +287,12 @@ struct ConnectionDiagnosticReportView: View {
     }
 
     private var routeComparison: some View {
-        LazyVStack(alignment: .leading, spacing: 12) {
+        LazyVStack(alignment: .leading, spacing: 14) {
             Text("相同控制路径、视频路径和节点的时段合并统计。")
-                .font(.callout).foregroundStyle(.secondary)
-            DeskSurfaceCard(padding: 14, cornerRadius: 9) {
-                VStack(alignment: .leading, spacing: 11) {
+                .font(.system(size: 13))
+                .foregroundStyle(DeskPalette.secondary)
+            DeskSurfaceCard(padding: 16, cornerRadius: 10) {
+                VStack(alignment: .leading, spacing: 12) {
                     ForEach(report.routes, id: \.route) { entry in
                         if entry.route != report.routes.first?.route { Divider() }
                         routeDetail(entry)
@@ -203,9 +300,11 @@ struct ConnectionDiagnosticReportView: View {
                 }
             }
             Text("指标显示该路径的平均实测值。UDP 分片丢失率按已结算的分片数计算，破折号表示没有观测。")
-                .font(.caption).foregroundStyle(DeskPalette.secondary)
+                .font(.system(size: 12))
+                .foregroundStyle(DeskPalette.secondary)
         }
-        .padding(.horizontal, 24).padding(.vertical, 16)
+        .padding(.horizontal, 28)
+        .padding(.vertical, 20)
     }
 
     private func routeDetail(_ entry: DiagnosticRouteSummary) -> some View {
@@ -215,22 +314,25 @@ struct ConnectionDiagnosticReportView: View {
                     Text(entry.route.media.title)
                 } icon: {
                     Image(systemName: entry.route.media.symbol).foregroundStyle(entry.route.media.color)
-                }.font(.headline)
+                }
+                .font(.system(size: 15, weight: .semibold))
                 Spacer()
-                if entry.visits > 1 { Text("共 \(entry.visits) 段").font(.caption).foregroundStyle(.secondary) }
-                Text(elapsed(entry.duration)).font(.headline.monospacedDigit())
+                if entry.visits > 1 { Text("共 \(entry.visits) 段").font(.caption).foregroundStyle(DeskPalette.secondary) }
+                Text(elapsed(entry.duration)).font(.system(size: 15, weight: .semibold, design: .monospaced))
             }
             Text(entry.route.detail)
-                .font(.callout).foregroundStyle(.secondary).textSelection(.enabled)
+                .font(.system(size: 13))
+                .foregroundStyle(DeskPalette.secondary)
+                .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
             if entry.quality.hasMeasurements {
                 Divider()
                 HStack(alignment: .top, spacing: 8) {
                     ForEach(ReportMetric.allCases) { metric in
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(metric.shortTitle).font(.caption).foregroundStyle(.secondary)
+                            Text(metric.shortTitle).font(.caption).foregroundStyle(DeskPalette.secondary)
                             Text(metric.value(entry.quality).map(metric.format) ?? "—")
-                                .font(.callout.monospacedDigit())
+                                .font(.system(size: 13, design: .monospaced))
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .help(metric.help)
@@ -242,9 +344,9 @@ struct ConnectionDiagnosticReportView: View {
     }
 
     private func pathKey(_ name: String, _ color: Color) -> some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 5) {
             Circle().fill(color).frame(width: 7, height: 7)
-            Text(name).font(.caption)
+            Text(name).font(.caption).foregroundStyle(DeskPalette.secondary)
         }
     }
 
@@ -261,7 +363,7 @@ struct ConnectionDiagnosticReportView: View {
         if interval > 0 && interval < 1 { return interval.formatted(.number.precision(.fractionLength(2))) + " 秒" }
         let seconds = Int(interval)
         if seconds >= 3600 { return String(format: "%d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60) }
-        return String(format: "%d:%02d", seconds / 60, seconds % 60)
+        return String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
 }
 

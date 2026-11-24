@@ -42,28 +42,54 @@ struct ClipboardActivityView: View {
                 FileTransferResultView(notice: notice, openFolder: openFolder, dismiss: dismissResult)
             }
             if let status {
-                HStack(alignment: .top, spacing: 10) {
-                    Image(systemName: pendingOffer ? "doc.on.doc" : "arrow.triangle.2.circlepath")
-                        .foregroundStyle(pendingOffer ? DeskPalette.amber : DeskPalette.accent)
-                    VStack(alignment: .leading, spacing: 7) {
-                        Text(pendingOffer ? "1 个文件请求待确认" : "剪贴板与文件").font(.system(size: 14, weight: .semibold))
-                        Text(status).font(.callout).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-                        if let keptFilesMessage {
-                            Text(keptFilesMessage).font(.caption).foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: pendingOffer ? "doc.on.doc" : (cancelReception != nil ? "arrow.down.circle" : "arrow.triangle.2.circlepath"))
+                            .font(.system(size: 13.5, weight: .medium))
+                            .foregroundStyle(pendingOffer ? DeskPalette.amber : DeskPalette.accent)
+                            .accessibilityHidden(true)
+                        Text(pendingOffer ? "1 个文件请求待确认" : (cancelReception != nil ? "正在接收文件" : "剪贴板与文件"))
+                            .font(.system(size: 14.5, weight: .semibold))
+                            .foregroundStyle(DeskPalette.ink)
+                        Spacer(minLength: 4)
+                        Button(action: dismissStatus) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 11, weight: .semibold))
                         }
-                        if let cancelReception {
-                            Button("中断接收", role: .destructive, action: cancelReception)
-                                .buttonStyle(DeskButtonStyle(.danger))
+                        .buttonStyle(.plain)
+                        .foregroundStyle(DeskPalette.muted)
+                        .help("收起状态提示")
+                        .accessibilityLabel("收起状态提示")
+                    }
+
+                    Text(status)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(DeskPalette.secondary)
+                        .monospacedDigit()
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if let keptFilesMessage {
+                        Text(keptFilesMessage)
+                            .font(.caption)
+                            .foregroundStyle(DeskPalette.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if cancelReception != nil || keptFilesMessage != nil {
+                        HStack {
+                            Spacer()
+                            if let cancelReception {
+                                Button("中断接收", role: .destructive, action: cancelReception)
+                                    .buttonStyle(DeskButtonStyle(.danger))
+                            }
+                            if keptFilesMessage != nil {
+                                Button("打开目录", action: openFolder)
+                                    .buttonStyle(DeskButtonStyle(.secondary))
+                            }
                         }
-                        if keptFilesMessage != nil {
-                            Button("打开接收文件目录", action: openFolder)
-                                .buttonStyle(DeskButtonStyle(.secondary))
-                        }
-                    }.frame(maxWidth: .infinity, alignment: .leading)
-                    Button(action: dismissStatus) { Image(systemName: "xmark") }
-                        .buttonStyle(.plain).foregroundStyle(.secondary)
-                        .help("收起状态提示").accessibilityLabel("收起状态提示")
+                        .padding(.top, 2)
+                    }
                 }
             }
         }
@@ -76,24 +102,49 @@ struct FileTransferResultView: View {
     let dismiss: () -> Void
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: notice.result.outcome == .completed ? "checkmark.circle.fill"
-                  : notice.result.outcome == .cancelled ? "minus.circle" : "exclamationmark.triangle.fill")
-                .foregroundStyle(notice.result.outcome == .completed ? DeskPalette.emerald : DeskPalette.amber)
-            VStack(alignment: .leading, spacing: 7) {
-                Text(notice.title).font(.system(size: 14, weight: .semibold))
-                Text(notice.result.message).font(.callout).textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                Text(notice.nextStep).font(.caption).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: notice.result.outcome == .completed ? "checkmark.circle.fill"
+                      : notice.result.outcome == .cancelled ? "minus.circle" : "exclamationmark.triangle.fill")
+                    .font(.system(size: 13.5))
+                    .foregroundStyle(notice.result.outcome == .completed ? DeskPalette.emerald : DeskPalette.amber)
+                    .accessibilityHidden(true)
+                Text(notice.title)
+                    .font(.system(size: 14.5, weight: .semibold))
+                    .foregroundStyle(DeskPalette.ink)
+                Spacer(minLength: 4)
+                Button(action: dismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(DeskPalette.muted)
+                .help("收起文件传输结果")
+                .accessibilityLabel("收起文件传输结果")
+            }
+
+            Text(notice.result.message)
+                .font(.system(size: 12.5))
+                .foregroundStyle(DeskPalette.ink)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text(notice.nextStep)
+                .font(.system(size: 11.5))
+                .foregroundStyle(DeskPalette.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Spacer()
                 if notice.canOpenFolder {
-                    Button("打开接收文件目录", action: openFolder)
+                    Button("打开目录", action: openFolder)
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                } else {
+                    Button("收起", action: dismiss)
                         .buttonStyle(DeskButtonStyle(.secondary))
                 }
-            }.frame(maxWidth: .infinity, alignment: .leading)
-            Button(action: dismiss) { Image(systemName: "xmark") }
-                .buttonStyle(.plain).foregroundStyle(.secondary)
-                .help("收起文件传输结果").accessibilityLabel("收起文件传输结果")
+            }
+            .padding(.top, 2)
         }
     }
 }

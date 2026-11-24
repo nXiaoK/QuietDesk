@@ -105,6 +105,7 @@ struct ConnectionRecoveryView: View {
     var failure: String? = nil
     var disconnectedActionTitle: String = "返回连接"
     var retry: (() -> Void)? = nil
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
@@ -118,34 +119,41 @@ struct ConnectionRecoveryView: View {
                 failure: failure,
                 disconnectedActionTitle: disconnectedActionTitle
             )
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 11) {
+            VStack(alignment: .leading, spacing: 11) {
+                HStack(spacing: 10) {
                     if presentation.showsActivity {
                         ProgressView().controlSize(.small)
                     } else {
                         Image(systemName: presentation.symbol)
-                            .font(.system(size: 17))
+                            .font(.system(size: 18, weight: .medium))
                             .foregroundStyle(DeskPalette.secondary)
                             .accessibilityHidden(true)
                     }
                     Text(presentation.title)
-                        .font(.system(size: 18, weight: .semibold))
+                        .font(.system(size: 18, weight: .bold))
                         .accessibilityAddTraits(.isHeader)
                 }
+
                 Text(presentation.detail)
-                    .font(.system(size: 13))
-                    .foregroundStyle(DeskPalette.secondary)
+                    .font(.system(size: 13.5))
+                    .foregroundStyle(DeskPalette.ink)
                     .monospacedDigit()
                     .fixedSize(horizontal: false, vertical: true)
+
                 if let reason = presentation.reason {
-                    Text(reason).font(.caption).foregroundStyle(DeskPalette.secondary)
+                    Text(reason)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(DeskPalette.secondary)
                         .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
+
                 if reconnecting {
-                    Text("重连期间不发送键盘鼠标")
-                        .font(.caption)
+                    Text("键盘鼠标暂不发送；可随时取消重连。")
+                        .font(.system(size: 12))
                         .foregroundStyle(DeskPalette.muted)
                 }
+
                 HStack(spacing: 8) {
                     Spacer(minLength: 0)
                     if reconnecting || connecting {
@@ -160,14 +168,14 @@ struct ConnectionRecoveryView: View {
                         }
                     }
                 }
-                .padding(.top, 7)
+                .padding(.top, 8)
             }
             .padding(24)
-            .frame(maxWidth: 420)
+            .frame(maxWidth: 430)
             .foregroundStyle(DeskPalette.ink)
-            .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 12))
-            .overlay { RoundedRectangle(cornerRadius: 12).strokeBorder(DeskPalette.hairline) }
-            .shadow(color: .black.opacity(0.09), radius: 15, y: 5)
+            .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay { RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(DeskPalette.hairline) }
+            .shadow(color: reduceTransparency ? .clear : .black.opacity(0.09), radius: 15, y: 5)
         }
     }
 }

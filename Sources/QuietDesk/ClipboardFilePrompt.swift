@@ -10,7 +10,7 @@ final class ClipboardFilePrompt: NSWindowController, NSWindowDelegate {
 
     init(offer: ClipboardFileOffer, peerName: String = "", onDecision: @escaping (Bool) -> Void) {
         self.onDecision = onDecision
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 440, height: 300),
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 470, height: 320),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
         panel.title = "接收文件"
         panel.titlebarAppearsTransparent = true
@@ -72,101 +72,95 @@ struct ClipboardFilePromptView: View {
     var peerName: String = ""
     let decide: (Bool) -> Void
 
+    private func itemSymbol(for name: String) -> String {
+        if name.hasSuffix("/") || (name as NSString).pathExtension.isEmpty {
+            return "folder"
+        }
+        return "doc.text"
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: "doc.on.doc")
-                    .font(.system(size: 17))
-                    .foregroundStyle(DeskPalette.secondary)
-                    .padding(.top, 2)
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(peerName.isEmpty ? "接收对端的文件？" : "接收来自「\(peerName)」的文件？")
-                        .font(.system(size: 18, weight: .semibold))
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .accessibilityAddTraits(.isHeader)
-                    Text("确认接收后开始下载文件。")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 0) {
-                if offer.names.isEmpty {
-                    Text("对方未提供文件名称")
-                        .foregroundStyle(.secondary)
-                        .padding(12)
-                } else {
-                    ForEach(Array(offer.names.prefix(3).enumerated()), id: \.offset) { index, name in
-                        if index > 0 { Divider().padding(.leading, 34) }
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Image(systemName: "doc")
-                                .foregroundStyle(.secondary)
-                                .frame(width: 14)
-                            Text(verbatim: name)
-                                .lineLimit(2)
-                                .truncationMode(.middle)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                    }
-                    if offer.count > min(offer.names.count, 3) {
-                        Divider()
-                        Text("另有 \(offer.count - min(offer.names.count, 3)) 项，确认信息仅预览前三项名称")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 8)
-                    }
-                }
-                Divider()
-                Text("共 \(offer.count) 项\(offer.entryCount == offer.count ? "" : "（含 \(offer.entryCount) 个文件和文件夹）") · \(ByteCountFormatter.string(fromByteCount: Int64(clamping: offer.bytes), countStyle: .file))")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-            }
-            .font(.system(size: 13))
-            .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 8))
-            .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(DeskPalette.hairline) }
-
+        VStack(alignment: .leading, spacing: 15) {
             VStack(alignment: .leading, spacing: 5) {
-                Label("保存到接收文件目录", systemImage: "folder")
-                    .font(.system(size: 11, weight: .medium))
-                Text(verbatim: ClipboardSync.receivingDirectory)
-                    .font(.system(size: 10, design: .monospaced))
+                Text(peerName.isEmpty ? "接收来自对端的文件？" : "接收来自 \(peerName) 的文件？")
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundStyle(DeskPalette.ink)
+                    .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
-                Text("接收完成后会在此目录创建独立子目录。")
-                    .font(.system(size: 11))
+                    .accessibilityAddTraits(.isHeader)
+                Text("确认后才开始下载")
+                    .font(.system(size: 13))
+                    .foregroundStyle(DeskPalette.secondary)
             }
-            .foregroundStyle(.secondary)
+
+            DeskSurfaceCard(padding: 0, cornerRadius: 9) {
+                VStack(alignment: .leading, spacing: 0) {
+                    if offer.names.isEmpty {
+                        Text("对方未提供文件名称")
+                            .font(.system(size: 13))
+                            .foregroundStyle(DeskPalette.secondary)
+                            .padding(12)
+                    } else {
+                        ForEach(Array(offer.names.prefix(3).enumerated()), id: \.offset) { index, name in
+                            if index > 0 { Divider().padding(.leading, 38) }
+                            HStack(spacing: 10) {
+                                Image(systemName: itemSymbol(for: name))
+                                    .font(.system(size: 13.5))
+                                    .foregroundStyle(DeskPalette.secondary)
+                                    .frame(width: 16)
+                                Text(verbatim: name)
+                                    .font(.system(size: 13.5))
+                                    .foregroundStyle(DeskPalette.ink)
+                                    .lineLimit(2)
+                                    .truncationMode(.middle)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 9)
+                        }
+                        if offer.count > min(offer.names.count, 3) {
+                            Divider()
+                            Text("另有 \(offer.count - min(offer.names.count, 3)) 项，确认面板仅预览前三项名称")
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(DeskPalette.secondary)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 8)
+                        }
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("共 \(offer.count) 项\(offer.entryCount == offer.count ? "" : "（含 \(offer.entryCount) 个文件和文件夹）") · \(ByteCountFormatter.string(fromByteCount: Int64(clamping: offer.bytes), countStyle: .file))")
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(DeskPalette.secondary)
+                    .monospacedDigit()
+                Text("保存到接收文件目录，并创建独立子目录。")
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(DeskPalette.secondary)
+                    .help(ClipboardSync.receivingDirectory)
+            }
 
             TimelineView(.periodic(from: .now, by: 1)) { _ in
                 let remaining = max(0, 90 - (SessionClock.now - offer.createdUptime))
-                VStack(alignment: .leading, spacing: 7) {
-                    Label(remaining > 0 ? "约 \(Int(ceil(remaining))) 秒后未确认将自动拒绝" : "已到确认时限，等待请求清理…", systemImage: "clock")
-                        .font(.system(size: 11))
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(remaining > 0 ? "剩余 \(Int(ceil(remaining))) 秒 · 每次发送都需确认" : "已到确认时限，等待请求清理…")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(DeskPalette.amber)
                         .monospacedDigit()
+                    Text("关闭或按 Esc 即拒绝；90 秒未确认自动拒绝。")
+                        .font(.system(size: 12))
+                        .foregroundStyle(DeskPalette.secondary)
                     ProgressView(value: min(remaining, 90), total: 90)
                         .progressViewStyle(.linear)
                         .tint(DeskPalette.accent)
+                        .padding(.top, 2)
                         .accessibilityLabel("剩余确认时间")
                         .accessibilityValue(remaining > 0 ? "约 \(Int(ceil(remaining))) 秒" : "等待请求清理")
                 }
             }
-            .foregroundStyle(DeskPalette.amber)
-            .padding(10)
-            .background(DeskPalette.amber.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
 
             HStack(spacing: 10) {
-                Text("关闭或按 Esc = 拒绝\n每次发送都需确认")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
                 Spacer()
                 Button("拒绝") { decide(false) }
                     .buttonStyle(DeskButtonStyle(.secondary))
@@ -174,9 +168,10 @@ struct ClipboardFilePromptView: View {
                 Button("接收") { decide(true) }
                     .buttonStyle(DeskButtonStyle(.primary))
             }
+            .padding(.top, 4)
         }
-        .padding(24)
-        .frame(width: 440)
+        .padding(26)
+        .frame(width: 460)
         .deskSurface()
         .fixedSize(horizontal: false, vertical: true)
     }

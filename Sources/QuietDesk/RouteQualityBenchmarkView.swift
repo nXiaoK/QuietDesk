@@ -28,45 +28,80 @@ struct RouteQualityBenchmarkView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            headerSection
-                .padding(.horizontal, embedded ? 26 : 22)
-                .padding(.vertical, 15)
+            if embedded {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        headerSection
 
-            Divider()
+                        if let warning = runner.storageWarningMessage {
+                            bannerRow(
+                                icon: "exclamationmark.icloud.fill",
+                                color: DeskPalette.amber,
+                                text: warning
+                            )
+                        }
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    if let warning = runner.storageWarningMessage {
-                        bannerRow(
-                            icon: "exclamationmark.icloud.fill",
-                            color: DeskPalette.amber,
-                            text: warning
-                        )
+                        switch runner.selectedTab {
+                        case .currentRun:
+                            currentRunContent
+                        case .history:
+                            historyContent
+                        }
+
+                        if runner.isRunning, runner.selectedTab == .currentRun {
+                            DeskSurfaceCard(padding: 16, cornerRadius: 10) {
+                                liveProgressCard
+                            }
+                        }
+
+                        footerSection
                     }
-
-                    switch runner.selectedTab {
-                    case .currentRun:
-                        currentRunContent
-                    case .history:
-                        historyContent
-                    }
+                    .padding(.horizontal, 28)
+                    .padding(.vertical, 22)
+                    .frame(maxWidth: 920, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
-                .padding(.horizontal, embedded ? 26 : 22)
-                .padding(.vertical, 16)
-            }
+            } else {
+                headerSection
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 16)
 
-            if runner.isRunning, runner.selectedTab == .currentRun {
                 Divider()
-                liveProgressCard
-                    .padding(.horizontal, embedded ? 26 : 22)
-                    .padding(.vertical, 10)
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        if let warning = runner.storageWarningMessage {
+                            bannerRow(
+                                icon: "exclamationmark.icloud.fill",
+                                color: DeskPalette.amber,
+                                text: warning
+                            )
+                        }
+
+                        switch runner.selectedTab {
+                        case .currentRun:
+                            currentRunContent
+                        case .history:
+                            historyContent
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 16)
+                }
+
+                if runner.isRunning, runner.selectedTab == .currentRun {
+                    Divider()
+                    liveProgressCard
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 10)
+                }
+
+                Divider()
+
+                footerSection
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 12)
             }
-
-            Divider()
-
-            footerSection
-                .padding(.horizontal, embedded ? 26 : 22)
-                .padding(.vertical, 11)
         }
         .frame(
             minWidth: embedded ? nil : 720,

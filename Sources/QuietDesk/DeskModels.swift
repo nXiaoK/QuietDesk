@@ -126,7 +126,6 @@ final class DeskModels: ObservableObject {
 
     private var sessionCancellables: [UUID: AnyCancellable] = [:]
     private let sessionChangeRelay = PassthroughSubject<Void, Never>()
-    private var fullScreenCloseObservers: [UUID: NSObjectProtocol] = [:]
 
     var current: DeskModel { selected == .host ? host : viewer }
     var all: [DeskModel] { [viewer, host] + viewerSessions }
@@ -270,48 +269,17 @@ final class DeskModels: ObservableObject {
 
     func disconnectViewerSession(id: UUID) {
         guard let session = session(for: id) else { return }
-        disconnectViewerSession(session)
-    }
-
-    func disconnectViewerSession(_ session: DeskModel) {
-        let id = session.sessionID
         let window = session.mainWindow ?? session.canvas.window
-        let wasFullScreen = window?.styleMask.contains(.fullScreen) == true || session.isFullScreen
-        let hadFullScreenFlag = session.isFullScreen
-        if wasFullScreen, let window {
-            if let prior = fullScreenCloseObservers.removeValue(forKey: id) {
-                NotificationCenter.default.removeObserver(prior)
-            }
-            let observer = NotificationCenter.default.addObserver(
-                forName: NSWindow.didExitFullScreenNotification,
-                object: window,
-                queue: .main
-            ) { [weak self, weak window] _ in
-                MainActor.assumeIsolated {
-                    if let removed = self?.fullScreenCloseObservers.removeValue(forKey: id) {
-                        NotificationCenter.default.removeObserver(removed)
-                    }
-                    window?.close()
-                    self?.mainWindow?.makeKeyAndOrderFront(nil)
-                }
-            }
-            fullScreenCloseObservers[id] = observer
-        }
-        session.stop()
+        session.stop(exitFullScreen: false)
         unregisterViewerSession(id: id)
-        guard let window else { return }
-        if wasFullScreen {
-            if !hadFullScreenFlag, window.styleMask.contains(.fullScreen) {
-                window.toggleFullScreen(nil)
-            }
-        } else {
-            window.close()
-        }
+        // AppKit closes the full-screen Space along with its window. Toggling full screen
+        // first races the close against an animation that can order the window back in.
+        window?.close()
     }
 
     func disconnectAllViewerSessions() {
         for session in viewerSessions {
-            disconnectViewerSession(session)
+            disconnectViewerSession(id: session.sessionID)
         }
         if viewer.active || viewer.working || viewer.reconnecting {
             viewer.stop()
@@ -319,12 +287,9 @@ final class DeskModels: ObservableObject {
     }
 
     func windowDidCloseForSession(id: UUID) {
-        if let observer = fullScreenCloseObservers.removeValue(forKey: id) {
-            NotificationCenter.default.removeObserver(observer)
-        }
         if let session = session(for: id) {
             if session.active || session.working || session.reconnecting || session.connected {
-                session.stop()
+                session.stop(exitFullScreen: false)
             }
             unregisterViewerSession(id: id)
         }

@@ -123,23 +123,12 @@ private struct StaleSessionWindowCloser: NSViewRepresentable {
     func makeNSView(context: Context) -> CloserView { CloserView() }
     func updateNSView(_ nsView: CloserView, context: Context) {}
     final class CloserView: NSView {
-        override init(frame frameRect: NSRect) {
-            super.init(frame: frameRect)
-            wantsLayer = true
-            layer?.backgroundColor = NSColor.black.cgColor
-        }
-        required init?(coder: NSCoder) {
-            super.init(coder: coder)
-            wantsLayer = true
-            layer?.backgroundColor = NSColor.black.cgColor
-        }
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             guard let window else { return }
             window.isRestorable = false
-            guard !window.styleMask.contains(.fullScreen) else { return }
-            DispatchQueue.main.async { [weak window] in
-                guard let window, !window.styleMask.contains(.fullScreen) else { return }
+            DispatchQueue.main.async { [weak self, weak window] in
+                guard let window, self?.window === window else { return }
                 window.close()
             }
         }
@@ -200,7 +189,7 @@ private struct RemoteControlCommands: Commands {
 
             Button("断开远程连接") {
                 if activeViewer !== models.viewer {
-                    models.disconnectViewerSession(activeViewer)
+                    models.disconnectViewerSession(id: activeViewer.sessionID)
                 } else {
                     activeViewer.stop()
                 }
@@ -753,7 +742,7 @@ struct DeskView: View {
 
             Button(role: .destructive) {
                 if isDedicatedSessionWindow {
-                    models.disconnectViewerSession(model)
+                    models.disconnectViewerSession(id: model.sessionID)
                 } else {
                     model.stop()
                 }
@@ -805,7 +794,7 @@ struct DeskView: View {
     private var endCurrentSessionAction: () -> Void {
         {
             if isDedicatedSessionWindow {
-                models.disconnectViewerSession(model)
+                models.disconnectViewerSession(id: model.sessionID)
             } else if model.active || model.working || model.reconnecting {
                 model.stop()
             } else if model.isFullScreen {
@@ -864,14 +853,14 @@ struct DeskView: View {
                     now: { SessionClock.now },
                     stop: {
                         if isDedicatedSessionWindow {
-                            models.disconnectViewerSession(model)
+                            models.disconnectViewerSession(id: model.sessionID)
                         } else {
                             model.stop()
                         }
                     },
                     returnToConnection: {
                         if isDedicatedSessionWindow {
-                            models.disconnectViewerSession(model)
+                            models.disconnectViewerSession(id: model.sessionID)
                         } else {
                             model.toggleFullScreen()
                         }

@@ -6067,7 +6067,7 @@ final class DeskModel: ObservableObject, Identifiable {
         oldPeer.closeAfterSessionTermination(notify: subscribed)
     }
 
-    func stop(reason: String? = nil) {
+    func stop(reason: String? = nil, exitFullScreen: Bool = true) {
         let report: ConnectionDiagnosticReport?
         if let diagnostics = connectionDiagnostics {
             let name: String
@@ -6105,7 +6105,7 @@ final class DeskModel: ObservableObject, Identifiable {
         reconnectWait = nil
         target = nil
         reconnecting = false
-        if mode == .viewer, isFullScreen { canvas.window?.toggleFullScreen(nil) }
+        if exitFullScreen, mode == .viewer, isFullScreen { canvas.window?.toggleFullScreen(nil) }
         generation = UUID()
         active = false
         peer?.close()

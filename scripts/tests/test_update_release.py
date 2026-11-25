@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import subprocess
 import tempfile
 import unittest
@@ -68,10 +69,31 @@ class UpdateBuildConfigurationTests(unittest.TestCase):
 
 
 class UpdateReleaseWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        jobs = self.workflow.split("\njobs:\n", 1)[1]
+        self.jobs = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  \S|\Z)", jobs))
+
+    def test_macos_checks_run_independently_and_gate_publishing(self):
+        checks = self.jobs["macos-checks"]
+        release = self.jobs["release"]
+        self.assertNotIn("needs:", checks)
+        self.assertNotIn("secrets.", checks)
+        self.assertNotIn("continue-on-error:", checks)
+        self.assertIn("ref: ${{ github.sha }}", checks)
+        self.assertIn("run: ./scripts/run-all-checks.sh", checks)
+        self.assertNotIn("run: ./scripts/run-all-checks.sh", release)
+        dependencies = re.search(r"(?m)^    needs: \[([^\]]+)\]$", release)
+        self.assertIsNotNone(dependencies)
+        self.assertCountEqual(
+            [job.strip() for job in dependencies.group(1).split(",")],
+            ["relay-docker", "windows-installer", "macos-checks"],
+        )
+        self.assertRegex(release, r"(?m)^    if: github.ref == 'refs/heads/main'$")
+
     def test_preflight_runs_before_any_release_side_effect(self):
-        value = (ROOT / ".github/workflows/release.yml").read_text()
+        value = self.jobs["release"]
         self.assertLess(value.index("name: Allocate version"), value.index("name: Preflight update signing"))
-        self.assertLess(value.index("name: Preflight update signing"), value.index("name: Run project checks"))
         self.assertLess(value.index("name: Preflight update signing"), value.index("git tag -a"))
         self.assertIn("echo 'skip=true'", value)
         self.assertIn("if: steps.draft.outputs.skip != 'true' &&", value)
@@ -87,7 +109,7 @@ class UpdateReleaseWorkflowTests(unittest.TestCase):
         self.assertLess(publish.index("gh release upload"), publish.index("--draft=false"))
 
     def test_release_never_sets_test_source_overrides(self):
-        value = (ROOT / ".github/workflows/release.yml").read_text()
+        value = self.workflow
         self.assertNotIn("QUIETDESK_UPDATE_FEED_URL:", value)
         self.assertNotIn("QUIETDESK_UPDATE_PUBLIC_KEYS:", value)
         self.assertNotIn("QUIETDESK_BUNDLE_IDENTIFIER:", value)
@@ -95,9 +117,8 @@ class UpdateReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("QUIETDESK_WINDOWS_APP_ID:", value)
 
     def test_code_signing_keychain_lifecycle_and_secret_scoping(self):
-        value = (ROOT / ".github/workflows/release.yml").read_text()
-        self.assertLess(value.index("name: Preflight code signing"), value.index("name: Run project checks"))
-        self.assertLess(value.index("name: Run project checks"), value.index("name: Import code signing certificate"))
+        value = self.jobs["release"]
+        self.assertLess(value.index("name: Preflight code signing"), value.index("name: Import code signing certificate"))
         self.assertLess(value.index("name: Import code signing certificate"), value.index("name: Build Universal application"))
         self.assertLess(value.index("name: Package DMG, ZIP and source"), value.index("name: Remove temporary code signing keychain"))
         self.assertLess(value.index("name: Remove temporary code signing keychain"), value.index("name: Create draft release and upload packages"))

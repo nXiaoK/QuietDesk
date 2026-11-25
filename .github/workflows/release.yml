@@ -135,8 +135,38 @@ jobs:
             outputs/windows/QuietDesk-${{ steps.win-ver.outputs.version }}-Windows-arm64-Setup.exe
             outputs/windows/SHA256SUMS-${{ steps.win-ver.outputs.version }}-Windows.txt
           if-no-files-found: error
+  macos-checks:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
+        with:
+          xcode-version: latest-stable
+      - name: Show Apple build toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          xcrun --sdk macosx --show-sdk-version
+          xcrun --sdk macosx --show-sdk-path
+      - name: Set up Go for relay
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: relay/go.mod
+          cache: false
+      - name: Verify relay build toolchain
+        run: go version
+      - name: Run project checks
+        run: ./scripts/run-all-checks.sh
   release:
-    needs: [relay-docker, windows-installer]
+    needs: [relay-docker, windows-installer, macos-checks]
     if: github.ref == 'refs/heads/main'
     runs-on: macos-26
     timeout-minutes: 45
@@ -196,8 +226,6 @@ jobs:
         run: ./scripts/import-ci-cert.sh --preflight
       - name: Verify relay build toolchain
         run: go version
-      - name: Run project checks
-        run: ./scripts/run-all-checks.sh
       - name: Import code signing certificate
         env:
           QUIETDESK_CODESIGN_P12_BASE64: ${{ secrets.QUIETDESK_CODESIGN_P12_BASE64 }}
@@ -276,7 +304,6 @@ jobs:
         run: |
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$RUNNER_TEMP/quietdesk-release-notes.txt"
           revision="$(git rev-parse HEAD)"
-          swift build --product QuietDeskUpdateTool
           tool="$(swift build --show-bin-path)/QuietDeskUpdateTool"
           "$tool" sign --app dist/QuietDesk.app --archive "dist/QuietDesk-$RELEASE_VERSION-macOS-universal.zip" \
             --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --notes-file "$RUNNER_TEMP/quietdesk-release-notes.txt" --out dist/QuietDesk-update.json

@@ -878,6 +878,7 @@ impl Canvas {
             self.send(ViewerCommand::ReleaseInput);
             self.update_clipboard_preference();
         }
+        self.refresh_status_mode();
     }
 
     /// Takes the keyboard, including the shortcuts Windows would otherwise keep for itself.
@@ -890,6 +891,7 @@ impl Canvas {
             if self.hook.is_none() && self.caps_forwarding && self.supports_input_actions {
                 self.set_status("键盘监听未就绪，Caps Lock 独立转发未启用");
             }
+            self.refresh_status_mode();
         }
         self.capture_relative_mouse();
         self.update_clipboard_preference();

@@ -7,6 +7,8 @@ use super::settings::{Settings, VIEWER_QUALITIES};
 use super::util::{display_label, wide};
 use super::viewer_cursor::ViewerCursor;
 use super::viewer_gestures::{TouchGestures, Touchpad};
+use super::workspace_style::{ButtonKind, FontRole, Surface, TextTone};
+use chrome::*;
 use quietdesk_core::cursor::CursorPresentationState;
 use quietdesk_core::display::RemoteDisplayInfo;
 use quietdesk_core::input::{CapsLockPress, DoubleClick, PcKeyEvent, ViewerInputTranslator};
@@ -27,19 +29,22 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject, ScreenToClient, ValidateRect};
+use windows::Win32::Graphics::Gdi::{HDC, ScreenToClient, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::HRAWINPUT;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetAsyncKeyState, GetCapture, GetDoubleClickTime, GetFocus, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, ReleaseCapture, SetCapture, SetFocus,
-    TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL,
-    VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
+    EnableWindow, GetAsyncKeyState, GetCapture, GetDoubleClickTime, GetFocus, GetKeyState, MAPVK_VSC_TO_VK_EX, MapVirtualKeyW, ReleaseCapture, SetCapture,
+    SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_CONTROL, VK_ESCAPE, VK_F10, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
+    VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
+mod chrome;
+
+const CANVAS_CLASS: PCWSTR = w!("QuietDeskCanvas");
 const WM_SESSION_EVENT: u32 = WM_APP + 1;
 const WM_SESSION_FRAME: u32 = WM_APP + 2;
 const WM_SESSION_ENDED: u32 = WM_APP + 3;
@@ -53,18 +58,6 @@ const IDLE_TIMER: usize = 3;
 const TOUCHPAD_TIMER: usize = 4;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const MOVE_INTERVAL: Duration = Duration::from_millis(8);
-const MENU_FULL_SCREEN: usize = 100;
-const MENU_SEND_CLIPBOARD: usize = 101;
-const MENU_REQUEST_CLIPBOARD: usize = 102;
-const MENU_DISCONNECT: usize = 103;
-const RETRY_NOW: usize = 104;
-const CANCEL_RETRY: usize = 105;
-const MENU_CAPS_ACTIONS: usize = 106;
-const MENU_RELATIVE_MOUSE: usize = 107;
-const MENU_AUTO_CLIPBOARD: usize = 108;
-const MENU_REMOTE_AUDIO: usize = 109;
-const MENU_QUALITY: usize = 200;
-const MENU_DISPLAY: usize = 300;
 
 /// What the session threads leave for the window thread.
 enum Notice {
@@ -169,7 +162,7 @@ struct Canvas {
     commands: UnboundedSender<ViewerControl>,
     mailbox: Arc<Mailbox>,
     generation: u64,
-    target: Option<ID2D1HwndRenderTarget>,
+    target: Option<(ID2D1HwndRenderTarget, ID2D1SolidColorBrush)>,
     bitmap: Option<(ID2D1Bitmap, usize, usize)>,
     uploaded_serial: Option<u64>,
     uploaded_display: Option<DisplayGeometry>,
@@ -181,6 +174,7 @@ struct Canvas {
     cursor: ViewerCursor,
     local_pointer: bool,
     factory: ID2D1Factory,
+    chrome: Chrome,
     translator: ViewerInputTranslator,
     started: Instant,
     name: String,
@@ -202,7 +196,6 @@ struct Canvas {
     caps_press: CapsLockPress,
     caps_forwarding: bool,
     supports_input_actions: bool,
-    session_menu: HMENU,
     hook: Option<HHOOK>,
     relative_supported: bool,
     relative_enabled: bool,
@@ -212,7 +205,7 @@ struct Canvas {
     touch_gestures: TouchGestures,
     pending_move: Option<PendingMove>,
     last_move: Instant,
-    full_screen: Option<(WINDOW_STYLE, WINDOWPLACEMENT, HMENU)>,
+    full_screen: Option<(WINDOW_STYLE, WINDOWPLACEMENT)>,
     paused: bool,
     pending_pause: Option<bool>,
     attention: Attention,
@@ -237,41 +230,23 @@ pub(super) fn open(
 ) -> windows::core::Result<ViewerWindow> {
     unsafe {
         let instance: HINSTANCE = GetModuleHandleW(None)?.into();
-        let class = w!("QuietDeskCanvas");
         let definition = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(window_procedure),
             hInstance: instance,
             hIcon: LoadIconW(Some(instance), PCWSTR(1 as _)).unwrap_or_default(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            lpszClassName: class,
+            lpszClassName: CANVAS_CLASS,
             ..Default::default()
         };
         // Registering twice fails harmlessly for the second window.
         RegisterClassExW(&definition);
         let factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-        let menu = CreateMenu()?;
-        let session = CreatePopupMenu()?;
-        AppendMenuW(session, MF_STRING, MENU_FULL_SCREEN, w!("全屏\tCtrl+Alt+Enter"))?;
-        AppendMenuW(session, MF_STRING | MF_GRAYED, MENU_CAPS_ACTIONS, w!("独立转发 Caps Lock（短按切输入法，长按切大写）"))?;
-        AppendMenuW(session, MF_STRING | MF_GRAYED, MENU_RELATIVE_MOUSE, w!("相对鼠标（Ctrl+Alt+Esc 释放）"))?;
-        AppendMenuW(session, MF_STRING | MF_GRAYED, MENU_AUTO_CLIPBOARD, w!("自动同步剪贴板"))?;
-        AppendMenuW(session, MF_STRING | MF_GRAYED, MENU_REMOTE_AUDIO, w!("播放远端系统声音"))?;
-        AppendMenuW(session, MF_STRING, MENU_SEND_CLIPBOARD, w!("发送本机剪贴板文字"))?;
-        AppendMenuW(session, MF_STRING, MENU_REQUEST_CLIPBOARD, w!("获取远端剪贴板文字"))?;
-        AppendMenuW(session, MF_SEPARATOR, 0, None)?;
-        AppendMenuW(session, MF_STRING, MENU_DISCONNECT, w!("断开连接"))?;
-        AppendMenuW(menu, MF_POPUP, session.0 as usize, w!("会话"))?;
-        let qualities = CreatePopupMenu()?;
-        for (index, (label, _)) in VIEWER_QUALITIES.iter().enumerate() {
-            AppendMenuW(qualities, MF_STRING, MENU_QUALITY + index, PCWSTR(wide(label).as_ptr()))?;
-        }
-        AppendMenuW(menu, MF_POPUP, qualities.0 as usize, w!("画质"))?;
-        let displays = DisplayMenu::new(menu)?;
-        let title = wide(&format!("QuietDesk · 正在连接 {address}…"));
+        let displays = DisplayMenu::new()?;
+        let title = wide(&format!("QuietDesk · {address}"));
         let window = CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            class,
+            CANVAS_CLASS,
             PCWSTR(title.as_ptr()),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
@@ -279,12 +254,16 @@ pub(super) fn open(
             1280,
             800,
             None,
-            Some(menu),
+            None,
             Some(instance),
             None,
         )?;
-        let retry_panel = match RetryPanel::new(window, instance) {
-            Ok(panel) => panel,
+        let controls = Chrome::new(window, instance, GetDpiForWindow(window).max(96)).and_then(|chrome| {
+            let retry = RetryPanel::new(window, instance, &chrome)?;
+            Ok((chrome, retry))
+        });
+        let (chrome, retry_panel) = match controls {
+            Ok(controls) => controls,
             Err(error) => {
                 let _ = DestroyWindow(window);
                 return Err(error);
@@ -326,6 +305,7 @@ pub(super) fn open(
             cursor: ViewerCursor::default(),
             local_pointer: false,
             factory,
+            chrome,
             translator: ViewerInputTranslator::new(settings.pc_modifiers, double_click),
             started: Instant::now(),
             name: address.clone(),
@@ -347,7 +327,6 @@ pub(super) fn open(
             caps_press: CapsLockPress::default(),
             caps_forwarding: settings.caps_forwarding,
             supports_input_actions: false,
-            session_menu: session,
             hook: None,
             pending_move: None,
             relative_supported: false,
@@ -363,6 +342,10 @@ pub(super) fn open(
             attention: Attention::default(),
             closing: false,
         });
+        canvas.chrome.set_connected(false);
+        canvas.update_input_menu();
+        canvas.chrome.enable_button(TOOL_DISPLAY, false);
+        canvas.layout_chrome();
         SetWindowLongPtrW(window, GWLP_USERDATA, Box::into_raw(canvas) as isize);
         let _ = ShowWindow(window, SW_SHOW);
         runtime.spawn(async move {
@@ -414,9 +397,7 @@ impl Attention {
 }
 
 struct DisplayMenu {
-    parent: HMENU,
-    popup: HMENU,
-    position: u32,
+    popup: Rc<Popup>,
     ids: Vec<u32>,
     selected: Option<DisplayGeometry>,
     pending: bool,
@@ -428,34 +409,27 @@ impl DisplayMenu {
         !self.pending && (display == self.selected || (display.is_none() && self.selected.is_some_and(|selected| selected.revision == 0)))
     }
 
-    unsafe fn new(parent: HMENU) -> windows::core::Result<Self> {
-        unsafe {
-            let position = GetMenuItemCount(Some(parent)) as u32;
-            let popup = CreatePopupMenu()?;
-            AppendMenuW(parent, MF_POPUP | MF_GRAYED, popup.0 as usize, w!("显示器"))?;
-            Ok(Self { parent, popup, position, ids: Vec::new(), selected: None, pending: false })
-        }
+    unsafe fn new() -> windows::core::Result<Self> {
+        let popup = Rc::new(unsafe { Popup::new()? });
+        Ok(Self { popup, ids: Vec::new(), selected: None, pending: false })
     }
 
-    unsafe fn update(&mut self, window: HWND, displays: &[RemoteDisplayInfo], selected: Option<DisplayGeometry>, pending: bool) -> windows::core::Result<()> {
+    unsafe fn update(&mut self, displays: &[RemoteDisplayInfo], selected: Option<DisplayGeometry>, pending: bool) -> windows::core::Result<()> {
         self.selected = selected;
         self.pending = pending;
         self.ids.clear();
         unsafe {
-            let _ = EnableMenuItem(self.parent, self.position, MF_BYPOSITION | MF_GRAYED);
-            for index in (0..GetMenuItemCount(Some(self.popup))).rev() {
-                DeleteMenu(self.popup, index as u32, MF_BYPOSITION)?;
-            }
+            let popup = Popup::new()?;
+            let mut ids = Vec::with_capacity(displays.len());
             for display in displays {
                 let flags = if Some(display.id) == selected.map(|s| s.id) { MF_STRING | MF_CHECKED } else { MF_STRING };
                 let label = wide(&display_label(display).replace('&', "&&"));
-                AppendMenuW(self.popup, flags, MENU_DISPLAY + self.ids.len(), PCWSTR(label.as_ptr()))?;
-                self.ids.push(display.id);
+                AppendMenuW(popup.0, flags, MENU_DISPLAY + ids.len(), PCWSTR(label.as_ptr()))?;
+                ids.push(display.id);
             }
-            if !self.ids.is_empty() && !pending {
-                let _ = EnableMenuItem(self.parent, self.position, MF_BYPOSITION | MF_ENABLED);
-            }
-            DrawMenuBar(window)
+            self.popup = Rc::new(popup);
+            self.ids = ids;
+            Ok(())
         }
     }
 }
@@ -467,33 +441,46 @@ struct RetryPanel {
 }
 
 impl RetryPanel {
-    unsafe fn new(window: HWND, instance: HINSTANCE) -> windows::core::Result<Self> {
+    unsafe fn new(window: HWND, instance: HINSTANCE, chrome: &Chrome) -> windows::core::Result<Self> {
         unsafe {
             let control = |class, title, id, style| -> windows::core::Result<HWND> {
                 let child =
                     CreateWindowExW(WINDOW_EX_STYLE(0), class, title, WS_CHILD | style, 0, 0, 0, 0, Some(window), Some(HMENU(id as _)), Some(instance), None)?;
-                SendMessageW(child, WM_SETFONT, Some(WPARAM(GetStockObject(DEFAULT_GUI_FONT).0 as usize)), Some(LPARAM(0)));
                 Ok(child)
             };
-            Ok(Self {
-                status: control(w!("STATIC"), w!(""), 0, WINDOW_STYLE(0))?,
-                retry: control(w!("BUTTON"), w!("立即重试"), RETRY_NOW, WS_TABSTOP)?,
-                cancel: control(w!("BUTTON"), w!("取消重连"), CANCEL_RETRY, WS_TABSTOP)?,
-            })
+            let status_style = WINDOW_STYLE(0x0201 | 0x4000); // SS_CENTER | SS_CENTERIMAGE | SS_ENDELLIPSIS
+            let button_style = WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32);
+            let panel = Self {
+                status: control(w!("STATIC"), w!(""), 0, status_style)?,
+                retry: control(w!("BUTTON"), w!("立即重试"), RETRY_NOW, button_style)?,
+                cancel: control(w!("BUTTON"), w!("取消重连"), CANCEL_RETRY, button_style)?,
+            };
+            panel.apply_font(chrome);
+            Ok(panel)
         }
     }
 
-    unsafe fn layout(&self, window: HWND) {
+    unsafe fn apply_font(&self, chrome: &Chrome) {
         unsafe {
-            let mut client = RECT::default();
-            let _ = GetClientRect(window, &mut client);
-            let dpi = GetDpiForWindow(window).max(96) as i32;
-            let px = |value| value * dpi / 96;
-            let button = px(92).min(client.right / 2);
+            let font = WPARAM(chrome.theme.font(FontRole::Body).0 as usize);
+            for control in [self.status, self.retry, self.cancel] {
+                SendMessageW(control, WM_SETFONT, Some(font), Some(LPARAM(1)));
+            }
+        }
+    }
+
+    unsafe fn layout(&self, viewport: RECT, chrome: &Chrome) {
+        unsafe {
+            let px = |value| chrome.theme.scale(value);
+            let width = px(460).min((viewport.right - px(24)).max(0));
+            let left = (viewport.right - width) / 2;
+            let y = viewport.top + px(12);
+            let button = px(104).min((width - px(4)).max(0) / 2);
+            let buttons_left = (viewport.right - button * 2 - px(4)) / 2;
             let flags = SWP_NOZORDER | SWP_NOACTIVATE;
-            let _ = SetWindowPos(self.status, None, 0, 0, client.right, px(30), flags);
-            let _ = SetWindowPos(self.retry, None, 0, px(30), button, px(30), flags);
-            let _ = SetWindowPos(self.cancel, None, button, px(30), button, px(30), flags);
+            let _ = SetWindowPos(self.status, None, left, y, width, px(36), flags);
+            let _ = SetWindowPos(self.retry, None, buttons_left, y + px(36), button, px(32), flags);
+            let _ = SetWindowPos(self.cancel, None, buttons_left + button + px(4), y + px(36), button, px(32), flags);
         }
     }
 
@@ -567,11 +554,7 @@ impl Canvas {
             (MENU_AUTO_CLIPBOARD, self.supports_clipboard, self.mailbox.clipboard_enabled.load(Ordering::Relaxed)),
             (MENU_REMOTE_AUDIO, self.supports_audio && !self.audio_pending, self.audio_playing),
         ] {
-            let enabled = self.connected && supported;
-            unsafe {
-                let _ = EnableMenuItem(self.session_menu, id as u32, if enabled { MF_ENABLED } else { MF_GRAYED });
-                CheckMenuItem(self.session_menu, id as u32, if enabled && selected { MF_CHECKED.0 } else { MF_UNCHECKED.0 });
-            }
+            self.chrome.set_action(id, self.connected && supported, selected);
         }
     }
 
@@ -591,12 +574,12 @@ impl Canvas {
             Ok(mouse) => {
                 self.relative_mouse = Some(mouse);
                 self.update_pointer();
-                self.set_title("相对鼠标已锁定，Ctrl+Alt+Esc 释放");
+                self.set_status("相对鼠标已锁定，Ctrl+Alt+Esc 释放");
             }
             Err(error) => {
                 self.relative_enabled = false;
                 self.update_input_menu();
-                self.set_title(&format!("无法锁定相对鼠标：{error}"));
+                self.set_status(&format!("无法锁定相对鼠标：{error}"));
             }
         }
     }
@@ -605,27 +588,76 @@ impl Canvas {
         self.generation == self.mailbox.generation.load(Ordering::Acquire)
     }
 
-    fn set_title(&self, status: &str) {
-        let title = wide(&format!("QuietDesk · {} · {status}", self.name));
+    fn set_device_title(&self) {
+        let title = wide(&format!("QuietDesk · {}", self.name.replace(char::is_control, " ")));
         let _ = unsafe { SetWindowTextW(self.window, PCWSTR(title.as_ptr())) };
+    }
+
+    fn set_status(&mut self, status: &str) {
+        self.refresh_status_mode();
+        self.chrome.set_notice(status);
+    }
+
+    fn refresh_status_mode(&mut self) {
+        let mode = if self.closing {
+            Mode::Closing
+        } else if self.retry.is_some() {
+            Mode::Reconnecting
+        } else if !self.connected {
+            Mode::Connecting
+        } else if self.relative_mouse.is_some() {
+            Mode::RelativeMouse
+        } else if !self.can_control {
+            Mode::ViewOnly
+        } else if self.controlling() && self.owns_input() {
+            Mode::Controlling
+        } else {
+            Mode::Ready
+        };
+        self.chrome.set_mode(mode);
+    }
+
+    fn viewport(&self) -> Option<RECT> {
+        let mut client = RECT::default();
+        unsafe { GetClientRect(self.window, &mut client) }.ok()?;
+        Some(self.chrome.viewport(client, self.full_screen.is_some()))
+    }
+
+    unsafe fn layout_chrome(&self) {
+        unsafe {
+            let mut client = RECT::default();
+            let _ = GetClientRect(self.window, &mut client);
+            let full_screen = self.full_screen.is_some();
+            self.chrome.layout(client, full_screen);
+            if self.retry.is_some() {
+                self.retry_panel.layout(self.chrome.viewport(client, full_screen), &self.chrome);
+            }
+        }
     }
 
     /// Where the picture lies in the client area: as large as fits, centred.
     fn picture(&self) -> Option<(f32, f32, f32, f32)> {
+        self.picture_in(self.viewport()?)
+    }
+
+    fn picture_in(&self, viewport: RECT) -> Option<(f32, f32, f32, f32)> {
         let (width, height) = self.bitmap.as_ref().map(|(_, width, height)| (*width as f32, *height as f32))?;
-        let mut client = RECT::default();
-        unsafe { GetClientRect(self.window, &mut client) }.ok()?;
-        let (client_width, client_height) = ((client.right - client.left) as f32, (client.bottom - client.top) as f32);
+        let (client_width, client_height) = ((viewport.right - viewport.left) as f32, (viewport.bottom - viewport.top) as f32);
         if client_width < 1.0 || client_height < 1.0 {
             return None;
         }
         let scale = (client_width / width).min(client_height / height);
         let (shown_width, shown_height) = (width * scale, height * scale);
-        Some(((client_width - shown_width) / 2.0, (client_height - shown_height) / 2.0, shown_width, shown_height))
+        Some((viewport.left as f32 + (client_width - shown_width) / 2.0, viewport.top as f32 + (client_height - shown_height) / 2.0, shown_width, shown_height))
     }
 
     fn fraction(&self, x: i32, y: i32) -> Option<(f64, f64)> {
-        let (left, top, width, height) = self.picture()?;
+        let viewport = self.viewport()?;
+        // Preserve edge dragging after capture while leaving the window's own tools and status outside the remote input area.
+        if !(viewport.top..viewport.bottom).contains(&y) && unsafe { GetCapture() } != self.window {
+            return None;
+        }
+        let (left, top, width, height) = self.picture_in(viewport)?;
         Some((f64::from((x as f32 - left) / width), f64::from((y as f32 - top) / height)))
     }
 
@@ -660,18 +692,17 @@ impl Canvas {
             if WindowFromPoint(point) != self.window || !ScreenToClient(self.window, &mut point).as_bool() {
                 return None;
             }
-            let mut rect = RECT::default();
-            GetClientRect(self.window, &mut rect).ok()?;
-            (point.x >= 0 && point.x < rect.right && point.y >= 0 && point.y < rect.bottom).then_some((point.x, point.y))
+            let rect = self.viewport()?;
+            ((rect.left..rect.right).contains(&point.x) && (rect.top..rect.bottom).contains(&point.y)).then_some((point.x, point.y))
         }
     }
 
-    fn update_pointer(&mut self) {
+    fn update_pointer(&mut self) -> bool {
         let position = self.pointer_in_client();
         let owns = self.controlling() && self.owns_input();
         self.local_pointer = self.relative_mouse.is_none() && owns && position.and_then(|(x, y)| self.fraction(x, y)).is_some_and(Self::inside_picture);
         if position.is_none() {
-            return;
+            return false;
         }
         let independent = self.independent();
         unsafe {
@@ -686,6 +717,7 @@ impl Canvas {
             };
             SetCursor(handle);
         }
+        true
     }
 
     fn flush_move(&mut self) {
@@ -721,8 +753,10 @@ impl Canvas {
 
     unsafe fn draw(&mut self) {
         unsafe {
+            self.refresh_status_mode();
             let mut client = RECT::default();
             let _ = GetClientRect(self.window, &mut client);
+            let viewport = self.chrome.viewport(client, self.full_screen.is_some());
             let size = D2D_SIZE_U { width: (client.right - client.left).max(1) as u32, height: (client.bottom - client.top).max(1) as u32 };
             let format = D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE };
             if self.target.is_none() {
@@ -734,14 +768,17 @@ impl Canvas {
                     ..Default::default()
                 };
                 let window = D2D1_HWND_RENDER_TARGET_PROPERTIES { hwnd: self.window, pixelSize: size, presentOptions: D2D1_PRESENT_OPTIONS_IMMEDIATELY };
-                match self.factory.CreateHwndRenderTarget(&properties, &window) {
+                match self.factory.CreateHwndRenderTarget(&properties, &window).and_then(|target| {
+                    let fill = target.CreateSolidColorBrush(&D2D1_COLOR_F { a: 1.0, ..Default::default() }, None)?;
+                    Ok((target, fill))
+                }) {
                     Ok(target) => self.target = Some(target),
                     Err(error) => return log::error!("the picture cannot be drawn: {error}"),
                 }
                 self.bitmap = None;
                 self.uploaded_serial = None;
             }
-            let Some(target) = self.target.clone() else { return };
+            let Some((target, chrome_brush)) = self.target.clone() else { return };
             {
                 let frame = self.mailbox.frame.lock().unwrap();
                 if frame.width > 0 && self.uploaded_serial != Some(frame.serial) && frame.bgra.len() == frame.width * frame.height * 4 {
@@ -767,7 +804,11 @@ impl Canvas {
             let _ = target.Resize(&size);
             target.BeginDraw();
             target.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }));
-            let painted = if let (Some((bitmap, _, _)), Some((left, top, width, height))) = (&self.bitmap, self.picture()) {
+            if self.full_screen.is_none() {
+                self.chrome.paint_bands(&target, &chrome_brush, client, viewport);
+            }
+            let picture = self.picture_in(viewport);
+            let painted = if let (Some((bitmap, _, _)), Some((left, top, width, height))) = (&self.bitmap, picture) {
                 let area = D2D_RECT_F { left, top, right: left + width, bottom: top + height };
                 target.DrawBitmap(bitmap, Some(&area), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
                 true
@@ -787,7 +828,7 @@ impl Canvas {
             self.update_pointer();
             if !self.local_pointer
                 && let Some(pos) = self.shown_cursor.as_ref().filter(|s| s.enabled).and_then(|s| s.position.as_ref()).filter(|p| p.inside_display)
-                && let Some(rect) = self.picture()
+                && let Some(rect) = picture
                 && let Err(error) = self.cursor.draw(&target, rect, pos.x, pos.y)
             {
                 log::debug!("could not draw the independent cursor: {error}");
@@ -803,38 +844,6 @@ impl Canvas {
                 }
                 if changed_display || fresh {
                     self.update_pointer();
-                }
-            }
-        }
-    }
-
-    unsafe fn toggle_full_screen(&mut self) {
-        unsafe {
-            match self.full_screen.take() {
-                Some((style, placement, menu)) => {
-                    SetWindowLongPtrW(self.window, GWL_STYLE, style.0 as isize);
-                    let _ = SetMenu(self.window, Some(menu));
-                    let _ = SetWindowPlacement(self.window, &placement);
-                    let _ = SetWindowPos(self.window, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
-                }
-                None => {
-                    let style = WINDOW_STYLE(GetWindowLongPtrW(self.window, GWL_STYLE) as u32);
-                    let mut placement = WINDOWPLACEMENT { length: size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
-                    let _ = GetWindowPlacement(self.window, &mut placement);
-                    let menu = GetMenu(self.window);
-                    let monitor = windows::Win32::Graphics::Gdi::MonitorFromWindow(self.window, windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST);
-                    let mut info = windows::Win32::Graphics::Gdi::MONITORINFO {
-                        cbSize: size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,
-                        ..Default::default()
-                    };
-                    if !windows::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut info).as_bool() {
-                        return;
-                    }
-                    self.full_screen = Some((style, placement, menu));
-                    SetWindowLongPtrW(self.window, GWL_STYLE, (style & !WS_OVERLAPPEDWINDOW).0 as isize);
-                    let _ = SetMenu(self.window, None);
-                    let area = info.rcMonitor;
-                    let _ = SetWindowPos(self.window, Some(HWND_TOP), area.left, area.top, area.right - area.left, area.bottom - area.top, SWP_FRAMECHANGED);
                 }
             }
         }
@@ -879,7 +888,7 @@ impl Canvas {
             FOCUSED.set(std::ptr::from_mut(self));
             self.hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), None, 0) }.ok();
             if self.hook.is_none() && self.caps_forwarding && self.supports_input_actions {
-                self.set_title("键盘监听未就绪，Caps Lock 独立转发未启用");
+                self.set_status("键盘监听未就绪，Caps Lock 独立转发未启用");
             }
         }
         self.capture_relative_mouse();
@@ -907,12 +916,12 @@ impl Canvas {
             self.held.remove(&(scan_code, extended));
             unsafe {
                 if virtual_key == u32::from(VK_RETURN.0) {
-                    // The host never saw the Enter; the modifiers are released with the rest when focus changes.
-                    self.toggle_full_screen();
+                    // Defer resizing the window until this keyboard callback has returned.
+                    let _ = PostMessageW(Some(self.window), WM_COMMAND, WPARAM(MENU_FULL_SCREEN), LPARAM(0));
                 } else {
                     self.release();
                     self.draw();
-                    self.set_title("已释放控制，点击画面继续");
+                    self.set_status("点击画面继续");
                 }
             }
             return true;
@@ -937,10 +946,10 @@ impl Canvas {
         true
     }
 
-    unsafe fn update_retry_title(&self) {
+    unsafe fn update_retry_title(&mut self) {
         if let Some(status) = &self.retry {
             let title = retry_title(status, Instant::now());
-            self.set_title(&title);
+            self.set_status(&title);
             let _ = unsafe { SetWindowTextW(self.retry_panel.status, PCWSTR(wide(&title).as_ptr())) };
         }
     }
@@ -958,8 +967,11 @@ impl Canvas {
             self.touchpad = None;
             self.relative_enabled = false;
             self.relative_supported = false;
+            self.chrome.set_connected(false);
+            self.chrome.reset_metrics();
             self.update_input_menu();
-            let _ = self.displays.update(self.window, &[], None, false);
+            let _ = self.displays.update(&[], None, false);
+            self.chrome.enable_button(TOOL_DISPLAY, false);
             self.can_control = false;
             self.release();
             self.paused = false;
@@ -975,7 +987,7 @@ impl Canvas {
             }
             let _ = EnableWindow(self.retry_panel.retry, waiting);
             self.update_retry_title();
-            self.retry_panel.layout(self.window);
+            self.layout_chrome();
             self.retry_panel.visible(true);
             self.draw();
         }
@@ -1019,6 +1031,11 @@ impl Canvas {
             self.closing = true;
             unsafe { self.release() };
             self.connected = false;
+            self.chrome.set_connected(false);
+            self.chrome.enable_button(TOOL_DISPLAY, false);
+            self.update_input_menu();
+            self.refresh_status_mode();
+            self.chrome.set_notice("");
             let _ = self.commands.send(ViewerCommand::Disconnect.into());
         }
     }
@@ -1029,6 +1046,7 @@ impl Canvas {
                 name,
                 device_id,
                 can_control,
+                stream,
                 session_pause,
                 input_actions,
                 relative_mouse,
@@ -1059,9 +1077,12 @@ impl Canvas {
                 self.supports_gestures = trackpad_gestures;
                 self.touchpad = Touchpad::open(self.window, trackpad_gestures).ok();
                 self.relative_supported = relative_mouse;
+                self.chrome.set_connected(true);
+                self.chrome.set_stream(stream);
                 self.update_input_menu();
                 self.reconcile_pause();
-                self.set_title(if can_control { "已连接，点击画面开始操作" } else { "已连接 · 仅观看" });
+                self.set_device_title();
+                self.set_status(if can_control { "点击画面开始操作" } else { "被控端未开放控制" });
                 if let Some(details) = self.host_details.upgrade() {
                     details.set(Some(ConnectedHost { name: self.name.clone(), id: device_id }));
                     unsafe { SendMessageW(self.owner, WM_CANVAS_CONNECTED, Some(WPARAM(self.window.0 as usize)), None) };
@@ -1070,24 +1091,28 @@ impl Canvas {
                     self.draw();
                 }
             }
-            ViewerEvent::Stream { stream, error } => match error {
-                Some(error) => self.set_title(&format!("画质调整失败：{error}")),
-                None => self.set_title(&format!("{} × {} · {}", stream.width, stream.height, stream.settings.summary())),
-            },
+            ViewerEvent::Stream { stream, error } => {
+                self.chrome.set_stream(stream);
+                match error {
+                    Some(error) => self.set_status(&format!("画质调整失败：{error}")),
+                    None => self.set_status(&stream.settings.summary()),
+                }
+            }
             ViewerEvent::Displays { displays, selected, pending, error, revision } => unsafe {
                 let next = DisplayGeometry::selected(&displays, selected, revision);
                 if self.displays.selected != next || pending.is_some() {
                     self.release();
                 }
-                if let Err(cause) = self.displays.update(self.window, &displays, next, pending.is_some()) {
+                if let Err(cause) = self.displays.update(&displays, next, pending.is_some()) {
                     log::warn!("could not update the display menu: {cause}");
                 }
+                self.chrome.enable_button(TOOL_DISPLAY, !self.displays.ids.is_empty() && !self.displays.pending);
                 if let Some(error) = error {
-                    self.set_title(&format!("显示器切换失败：{error}"));
+                    self.set_status(&format!("显示器切换失败：{error}"));
                 } else if pending.is_some() {
-                    self.set_title("正在切换显示器…");
+                    self.set_status("正在切换显示器…");
                 } else if let Some(display) = displays.iter().find(|display| Some(display.id) == selected) {
-                    self.set_title(&format!("正在查看 {}", display_label(display)));
+                    self.set_status(&format!("正在查看 {}", display_label(display)));
                 }
                 self.draw();
             },
@@ -1096,7 +1121,7 @@ impl Canvas {
                 if !can_control {
                     unsafe { self.release() };
                 }
-                self.set_title(if can_control { "被控端允许控制" } else { "仅观看（被控端已关闭控制）" });
+                self.set_status(if can_control { "被控端允许控制" } else { "被控端已关闭控制" });
                 unsafe { self.draw() };
             }
             ViewerEvent::Paused { paused, error } => {
@@ -1107,12 +1132,12 @@ impl Canvas {
                     unsafe { self.release() };
                 }
                 if let Some(error) = error {
-                    self.set_title(&error);
+                    self.set_status(&error);
                     if request != Some(self.attention.idle) {
                         self.reconcile_pause();
                     }
                 } else {
-                    self.set_title(if paused { "已暂停画面传输" } else { "已恢复画面传输" });
+                    self.set_status(if paused { "已暂停画面传输" } else { "已恢复画面传输" });
                     self.reconcile_pause();
                 }
                 unsafe { self.draw() };
@@ -1123,15 +1148,16 @@ impl Canvas {
             }
             ViewerEvent::InputStatus(feedback) => {
                 if self.uses_caps_actions() {
-                    self.set_title(&feedback.message.replace(char::is_control, " "));
+                    self.set_status(&feedback.message);
                 }
             }
             ViewerEvent::InputActionTimeout => {
                 if self.uses_caps_actions() {
-                    self.set_title("未能确认远端键盘状态，请点击远端输入位置后重试");
+                    self.set_status("未能确认远端键盘状态，请点击远端输入位置后重试");
                 }
             }
-            ViewerEvent::RoundTrip(_) | ViewerEvent::MediaCommitted(_) => {}
+            ViewerEvent::RoundTrip(milliseconds) => self.chrome.set_latency(milliseconds),
+            ViewerEvent::MediaCommitted(_) => {}
             ViewerEvent::Audio { enabled, pending, error } => {
                 self.audio_playing = enabled;
                 self.audio_pending = pending;
@@ -1140,17 +1166,17 @@ impl Canvas {
                 }
                 self.update_input_menu();
                 if let Some(error) = error {
-                    self.set_title(&format!("远端声音未开启：{}", error.replace(char::is_control, " ")));
+                    self.set_status(&format!("远端声音未开启：{error}"));
                 } else if pending {
-                    self.set_title(if self.audio_wanted { "正在开启远端声音…" } else { "正在关闭远端声音…" });
+                    self.set_status(if self.audio_wanted { "正在开启远端声音…" } else { "正在关闭远端声音…" });
                 } else {
-                    self.set_title(if enabled { "远端系统声音已开启" } else { "远端系统声音已关闭" });
+                    self.set_status(if enabled { "远端系统声音已开启" } else { "远端系统声音已关闭" });
                 }
             }
-            ViewerEvent::ClipboardStatus(status) => self.set_title(&status),
+            ViewerEvent::ClipboardStatus(status) => self.set_status(&status),
             ViewerEvent::ClipboardText(text) => match clipboard::set_text(&text) {
-                Ok(()) => self.set_title("已接收远端剪贴板文字"),
-                Err(error) => self.set_title(&error.to_string()),
+                Ok(()) => self.set_status("已接收远端剪贴板文字"),
+                Err(error) => self.set_status(&error.to_string()),
             },
         }
     }
@@ -1173,11 +1199,109 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     }
 }
 
+/// Routes local toolbar navigation without consuming keystrokes while remote input is captured.
+pub(super) unsafe fn dialog_message(message: &MSG) -> bool {
+    let key = VIRTUAL_KEY(message.wParam.0 as u16);
+    if !matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) || !matches!(key, VK_TAB | VK_F10 | VK_RETURN) {
+        return false;
+    }
+    unsafe {
+        let window = GetAncestor(message.hwnd, GA_ROOT);
+        let mut class = [0; 32];
+        let len = GetClassNameW(window, &mut class) as usize;
+        if class.get(..len) != Some(CANVAS_CLASS.as_wide()) {
+            return false;
+        }
+        let canvas = GetWindowLongPtrW(window, GWLP_USERDATA) as *const Canvas;
+        let Some(canvas) = canvas.as_ref() else { return false };
+        if canvas.owns_input() {
+            return false;
+        }
+        if key == VK_RETURN && GetKeyState(i32::from(VK_CONTROL.0)) < 0 && GetKeyState(i32::from(VK_MENU.0)) < 0 {
+            let _ = PostMessageW(Some(window), WM_COMMAND, WPARAM(MENU_FULL_SCREEN), LPARAM(0));
+            return true;
+        }
+        if message.hwnd != window {
+            return IsDialogMessageW(window, message).as_bool();
+        }
+        if matches!(key, VK_TAB | VK_F10) {
+            let reverse = key == VK_TAB && GetKeyState(i32::from(VK_SHIFT.0)) < 0;
+            if let Ok(control) = GetNextDlgTabItem(window, None, reverse) {
+                let _ = SetFocus(Some(control));
+                return true;
+            }
+        }
+        false
+    }
+}
+
+unsafe fn toggle_full_screen(window: HWND, canvas: *mut Canvas) {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
+    unsafe {
+        if let Some((style, placement)) = (*canvas).full_screen.take() {
+            SetWindowLongPtrW(window, GWL_STYLE, style.0 as isize);
+            let _ = SetWindowPlacement(window, &placement);
+            let _ = SetWindowPos(window, None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        } else {
+            let style = WINDOW_STYLE(GetWindowLongPtrW(window, GWL_STYLE) as u32);
+            let mut placement = WINDOWPLACEMENT { length: size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+            let _ = GetWindowPlacement(window, &mut placement);
+            let monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+                return;
+            }
+            (*canvas).full_screen = Some((style, placement));
+            SetWindowLongPtrW(window, GWL_STYLE, (style & !WS_OVERLAPPEDWINDOW).0 as isize);
+            let area = info.rcMonitor;
+            let _ = SetWindowPos(window, Some(HWND_TOP), area.left, area.top, area.right - area.left, area.bottom - area.top, SWP_FRAMECHANGED);
+        }
+        (*canvas).layout_chrome();
+        (*canvas).draw();
+    }
+}
+
 unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         let canvas = GetWindowLongPtrW(window, GWLP_USERDATA) as *mut Canvas;
         if canvas.is_null() {
             return DefWindowProcW(window, message, wparam, lparam);
+        }
+        if message == WM_COMMAND {
+            let id = wparam.0 & 0xFFFF;
+            if id == MENU_FULL_SCREEN {
+                toggle_full_screen(window, canvas);
+                return LRESULT(0);
+            }
+            if lparam.0 != 0
+                && let Some(popup) = (*canvas).chrome.popup(id, &(*canvas).displays.popup)
+            {
+                if (*canvas).owns_input() {
+                    (*canvas).release();
+                    (*canvas).draw();
+                }
+                // Tracking a popup pumps window messages, including a possible session end or display-list change.
+                let command = popup.track(window, HWND(lparam.0 as _));
+                let current = GetWindowLongPtrW(window, GWLP_USERDATA) as *const Canvas;
+                if let Some(command) = command
+                    && std::ptr::eq(current, canvas)
+                    && (id != TOOL_DISPLAY || Rc::ptr_eq(&popup, &(*current).displays.popup))
+                {
+                    SendMessageW(window, WM_COMMAND, Some(WPARAM(command)), None);
+                }
+                return LRESULT(0);
+            }
+        }
+        if message == WM_DPICHANGED {
+            (*canvas).chrome.set_dpi(wparam.0 as u16 as u32);
+            (*canvas).retry_panel.apply_font(&(*canvas).chrome);
+            if (*canvas).full_screen.is_none() {
+                let rect = &*(lparam.0 as *const RECT);
+                let _ = SetWindowPos(window, None, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            (*canvas).layout_chrome();
+            (*canvas).draw();
+            return LRESULT(0);
         }
         let canvas = &mut *canvas;
         match message {
@@ -1186,6 +1310,39 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 let _ = ValidateRect(Some(window), None);
             }
             WM_ERASEBKGND => return LRESULT(1),
+            WM_DRAWITEM if lparam.0 != 0 => {
+                let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
+                if canvas.chrome.draw_button(item) {
+                    return LRESULT(1);
+                }
+                if [canvas.retry_panel.retry, canvas.retry_panel.cancel].contains(&item.hwndItem) {
+                    let kind = if item.hwndItem == canvas.retry_panel.retry { ButtonKind::Primary } else { ButtonKind::Secondary };
+                    canvas.chrome.theme.draw_button(item, kind);
+                    return LRESULT(1);
+                }
+            }
+            WM_CTLCOLORSTATIC => {
+                let control = HWND(lparam.0 as _);
+                let hdc = HDC(wparam.0 as _);
+                if let Some(brush) = canvas.chrome.status_colors(control, hdc) {
+                    return LRESULT(brush.0 as isize);
+                }
+                if control == canvas.retry_panel.status {
+                    let brush = canvas.chrome.theme.control_colors(hdc, Surface::Card, TextTone::Ink);
+                    return LRESULT(brush.0 as isize);
+                }
+                return DefWindowProcW(window, message, wparam, lparam);
+            }
+            WM_GETMINMAXINFO => {
+                let limits = &mut *(lparam.0 as *mut MINMAXINFO);
+                limits.ptMinTrackSize.x = limits.ptMinTrackSize.x.max(canvas.chrome.theme.scale(600));
+                limits.ptMinTrackSize.y = limits.ptMinTrackSize.y.max(canvas.chrome.theme.scale(320));
+            }
+            WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED => {
+                canvas.chrome.refresh_palette();
+                canvas.draw();
+                return DefWindowProcW(window, message, wparam, lparam);
+            }
             WM_SESSION_FRAME => {
                 canvas.mailbox.frame_posted.store(false, Ordering::Release);
                 canvas.draw();
@@ -1213,7 +1370,7 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                     canvas.closing = true;
                     let _ = KillTimer(Some(window), RETRY_TIMER);
                     canvas.retry_panel.visible(false);
-                    canvas.set_title(&format!("已结束：{}", end.reason));
+                    canvas.set_status(&format!("已结束：{}", end.reason));
                     let text = wide(&end.reason);
                     MessageBoxW(Some(window), PCWSTR(text.as_ptr()), w!("QuietDesk"), MB_OK | MB_ICONINFORMATION);
                 }
@@ -1227,9 +1384,7 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 if let Some(pad) = &canvas.touchpad {
                     let _ = pad.resize();
                 }
-                if canvas.retry.is_some() {
-                    canvas.retry_panel.layout(window);
-                }
+                canvas.layout_chrome();
                 canvas.draw();
             }
             WM_ACTIVATE => {
@@ -1257,11 +1412,11 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
             }
             WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
                 let owned = canvas.local_pointer;
-                canvas.update_pointer();
+                let updated = canvas.update_pointer();
                 if owned != canvas.local_pointer && canvas.independent() {
                     canvas.draw();
                 }
-                return LRESULT(1);
+                return if updated { LRESULT(1) } else { DefWindowProcW(window, message, wparam, lparam) };
             }
             WM_MOUSELEAVE => canvas.draw(),
             DM_POINTERHITTEST if canvas.controlling() && canvas.owns_input() => {
@@ -1431,8 +1586,15 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 }
             }
             WM_COMMAND => match wparam.0 & 0xFFFF {
-                MENU_FULL_SCREEN => canvas.toggle_full_screen(),
+                MENU_RELEASE if canvas.connected => {
+                    canvas.release();
+                    canvas.set_status("点击画面继续");
+                    canvas.draw();
+                }
                 MENU_REMOTE_AUDIO if canvas.connected && canvas.current_generation() && canvas.supports_audio && !canvas.audio_pending && !canvas.closing => {
+                    if canvas.owns_input() {
+                        canvas.release();
+                    }
                     canvas.audio_wanted = !canvas.audio_wanted;
                     canvas.audio_pending = true;
                     canvas.update_input_menu();
@@ -1444,7 +1606,7 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                     canvas.update_input_menu();
                     canvas.capture_keyboard();
                     if canvas.relative_enabled && canvas.relative_mouse.is_none() {
-                        canvas.set_title("点击远端画面锁定相对鼠标，Ctrl+Alt+Esc 释放");
+                        canvas.set_status("点击远端画面锁定相对鼠标，Ctrl+Alt+Esc 释放");
                     }
                 }
                 MENU_CAPS_ACTIONS if canvas.connected && canvas.current_generation() && canvas.supports_input_actions && !canvas.closing => {
@@ -1461,7 +1623,7 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                 }
                 MENU_SEND_CLIPBOARD if canvas.connected && canvas.current_generation() && !canvas.closing => match clipboard::text() {
                     Some(text) => canvas.send(ViewerCommand::SendClipboard(text)),
-                    None => canvas.set_title("本机剪贴板中没有文字"),
+                    None => canvas.set_status("本机剪贴板中没有文字"),
                 },
                 MENU_REQUEST_CLIPBOARD if canvas.connected && !canvas.closing => canvas.send(ViewerCommand::RequestClipboard),
                 RETRY_NOW if matches!(canvas.retry, Some(RetryStatus::Waiting { .. })) && !canvas.closing => {
@@ -1474,6 +1636,7 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
                     {
                         canvas.release();
                         canvas.displays.pending = true;
+                        canvas.chrome.enable_button(TOOL_DISPLAY, false);
                         canvas.send(ViewerCommand::SelectDisplay(target));
                     }
                 }
@@ -1493,9 +1656,6 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
             WM_NCDESTROY => {
                 canvas.disconnect();
                 canvas.release();
-                if let Some((_, _, menu)) = canvas.full_screen.take() {
-                    let _ = DestroyMenu(menu);
-                }
                 SetWindowLongPtrW(window, GWLP_USERDATA, 0);
                 SendMessageW(canvas.owner, WM_CANVAS_CLOSED, Some(WPARAM(window.0 as usize)), None);
                 drop(Box::from_raw(std::ptr::from_mut(canvas)));

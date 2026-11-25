@@ -1,60 +1,40 @@
-//! The main window: connect to another machine, or share this PC.
+//! The workspace owns connection, sharing and update state for the main window.
 
 use super::app::{HostActivity, HostNotice, computer_name, network_runtime, serve_host, start_logging};
 use super::canvas::{self, WM_CANVAS_CLOSED, WM_CANVAS_CONNECTED, WM_CAPS_PREFERENCE};
 use super::clipboard;
-use super::displays;
 use super::settings::{Connection, QUALITY_LIMITS, Settings, VIEWER_QUALITIES, local_device_id, protect, unprotect};
 use super::util::{display_label, from_wide, wide};
+use super::workspace::*;
+use super::{device_table, displays};
 use quietdesk_core::display::RemoteDisplayInfo;
 use quietdesk_core::host::{HostCommand, HostEvent, HostOptions};
 use quietdesk_core::keymap::{MacModifierMapping, PcModifierMapping};
 use quietdesk_core::messages::{DeviceIdentity, device_display_name};
 use quietdesk_core::pairing::PairingKey;
+use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, CreateFontIndirectW, HBRUSH, HFONT};
+use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, LVN_ITEMACTIVATE, NMHDR};
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetActiveWindow, SetFocus, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 const WM_HOST_NOTICE: u32 = WM_APP + 10;
 const WM_UPDATE_EVENT: u32 = WM_APP + 40;
 const TIMER_UPDATE_TICK: usize = 1;
-const ADDRESS: usize = 1001;
-const PORT: usize = 1002;
-const CODE: usize = 1003;
-const CONNECT: usize = 1004;
-const RECENT: usize = 1005;
-const FORGET: usize = 1006;
-const VIEWER_QUALITY: usize = 1007;
-const PC_MODIFIERS: usize = 1008;
-const AUTO_RECONNECT: usize = 1009;
-const HOST_STATUS: usize = 1101;
-const HOST_PORT: usize = 1102;
-const SHARE: usize = 1103;
-const HOST_CODE: usize = 1104;
-const COPY_CODE: usize = 1105;
-const NEW_CODE: usize = 1106;
-const ALLOW_CONTROL: usize = 1107;
-const ALLOW_CLIPBOARD: usize = 1108;
-const QUALITY_LIMIT: usize = 1109;
-const MAC_MODIFIERS: usize = 1110;
-const SHARED_DISPLAY: usize = 1111;
-const UPDATE_STATUS: usize = 1201;
-const UPDATE_ACTION: usize = 1202;
-const UPDATE_NOTES: usize = 1203;
-const AUTO_CHECK_UPDATES: usize = 1204;
-const AUTO_INSTALL_UPDATES: usize = 1205;
 
 struct Main {
     window: HWND,
+    workspace: Rc<Workspace>,
     settings: Settings,
     local_identity: Option<DeviceIdentity>,
     viewer_name: Option<String>,
@@ -120,7 +100,7 @@ impl Main {
         self.sharing = None;
         unsafe {
             let _ = KillTimer(Some(self.window), TIMER_UPDATE_TICK);
-            let _ = DestroyWindow(self.window);
+            let _ = PostMessageW(Some(self.window), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
     }
 
@@ -282,12 +262,79 @@ impl Main {
         }
     }
 
-    fn refresh_recent(&self) {
+    fn refresh_recent(&self, selection: Option<&Connection>) {
+        let rows = self
+            .settings
+            .connections
+            .iter()
+            .map(|connection| (device_display_name(&connection.name), format!("{}:{}", connection.address, connection.port)))
+            .collect::<Vec<_>>();
         self.message(RECENT, LB_RESETCONTENT, 0, 0);
-        for connection in &self.settings.connections {
-            let label = wide(&format!("{}  —  {}:{}", device_display_name(&connection.name), connection.address, connection.port));
+        for (name, endpoint) in &rows {
+            let label = wide(&format!("{name}  ·  {endpoint}"));
             self.message(RECENT, LB_ADDSTRING, 0, label.as_ptr() as isize);
         }
+        let table = self.item(DEVICE_TABLE);
+        if let Err(error) = device_table::replace(table, rows.iter().map(|(name, endpoint)| (name.as_str(), endpoint.as_str()))) {
+            log::warn!("could not refresh device table: {error}");
+        }
+        self.workspace.show_devices(rows.len());
+        let index = selection.and_then(|selected| {
+            self.settings
+                .connections
+                .iter()
+                .position(|connection| connection.port == selected.port && connection.address.eq_ignore_ascii_case(&selected.address))
+        });
+        self.message(RECENT, LB_SETCURSEL, index.unwrap_or(usize::MAX), 0);
+        device_table::select(table, index);
+        self.refresh_device_heading();
+    }
+
+    fn open_device(&self, index: usize) -> bool {
+        let Some(connection) = self.settings.connections.get(index) else { return false };
+        self.message(RECENT, LB_SETCURSEL, index, 0);
+        device_table::select(self.item(DEVICE_TABLE), Some(index));
+        self.set_text(ADDRESS, &connection.address);
+        self.set_text(PORT, &connection.port.to_string());
+        self.set_text(CODE, &unprotect(&connection.code).unwrap_or_default());
+        self.refresh_device_heading();
+        self.workspace.select(Page::Connection);
+        true
+    }
+
+    fn refresh_device_heading(&self) {
+        if let Some(index) = self.selected() {
+            let connection = &self.settings.connections[index];
+            self.set_text(DEVICE_HEADING, &device_display_name(&connection.name));
+            self.set_text(DEVICE_DETAIL, &format!("{}:{}", connection.address, connection.port));
+            let _ = unsafe { EnableWindow(self.item(FORGET), true) };
+        } else {
+            self.set_text(DEVICE_HEADING, "新建连接");
+            self.set_text(DEVICE_DETAIL, "填写目标设备的连接信息");
+            let _ = unsafe { EnableWindow(self.item(FORGET), false) };
+        }
+    }
+
+    fn new_connection(&self) {
+        self.message(RECENT, LB_SETCURSEL, usize::MAX, 0);
+        device_table::select(self.item(DEVICE_TABLE), None);
+        self.set_text(ADDRESS, "");
+        self.set_text(PORT, &self.settings.port.to_string());
+        self.set_text(CODE, "");
+        self.refresh_device_heading();
+        self.workspace.select(Page::Connection);
+        let _ = unsafe { SetFocus(Some(self.item(ADDRESS))) };
+    }
+
+    fn refresh_sharing_summary(&self) {
+        let text = if self.sharing.is_none() {
+            "共享未开启"
+        } else if self.host_activity.connected() {
+            "正在被控制"
+        } else {
+            "本机共享已开启"
+        };
+        self.set_text(SHARING_SUMMARY, text);
     }
 
     fn selected(&self) -> Option<usize> {
@@ -329,6 +376,7 @@ impl Main {
             self.refresh_displays();
             self.set_text(SHARE, "开始共享");
             self.set_text(HOST_STATUS, "未共享");
+            self.refresh_sharing_summary();
             self.updater.observe_remote_sessions(self.host_activity.connected(), self.viewers.len());
             self.refresh_update_controls();
             return;
@@ -358,6 +406,7 @@ impl Main {
         self.sharing = Some(commands);
         self.set_text(SHARE, "停止共享");
         self.set_text(HOST_STATUS, "正在开启共享…");
+        self.set_text(SHARING_SUMMARY, "正在准备共享");
     }
 
     fn host_notice(&mut self, notice: HostNotice) {
@@ -410,6 +459,7 @@ impl Main {
                 self.refresh_update_controls();
             }
         }
+        self.refresh_sharing_summary();
     }
 
     fn update_session_status(&mut self, text: String) {
@@ -430,6 +480,19 @@ impl Main {
         let checked = |main: &Self, id: usize| main.message(id, BM_GETCHECK, 0, 0) == 1;
         let chosen = |main: &Self, id: usize| main.message(id, CB_GETCURSEL, 0, 0).max(0) as usize;
         match (id, notification) {
+            (NEW_CONNECTION | NEW_CONNECTION_PAGE, BN_CLICKED) => self.new_connection(),
+            (CONTINUE_CONNECTION, BN_CLICKED) => {
+                self.workspace.select(Page::Connection);
+                let _ = unsafe { SetFocus(Some(self.item(ADDRESS))) };
+            }
+            (NAV_DEVICES, BN_CLICKED) => {
+                let has_entry = unsafe { GetWindowTextLengthW(self.item(ADDRESS)) != 0 || GetWindowTextLengthW(self.item(CODE)) != 0 };
+                self.workspace.set_draft_available(has_entry || self.text(PORT) != self.settings.port.to_string());
+                self.workspace.navigate(id);
+            }
+            (NAV_SHARING | NAV_SETTINGS | TAB_SHARING | TAB_HOST_QUALITY | TAB_KEYBOARD | TAB_DEFAULTS | TAB_UPDATES, BN_CLICKED) => {
+                self.workspace.navigate(id);
+            }
             (CONNECT, BN_CLICKED) => self.connect(),
             (SHARED_DISPLAY, CBN_SELCHANGE) => {
                 let choice = self.message(id, CB_GETCURSEL, 0, 0);
@@ -456,19 +519,25 @@ impl Main {
                 self.save();
             }
             (RECENT, LBN_SELCHANGE | LBN_DBLCLK) => {
-                let Some(connection) = self.selected().map(|index| self.settings.connections[index].clone()) else { return };
-                self.set_text(ADDRESS, &connection.address);
-                self.set_text(PORT, &connection.port.to_string());
-                self.set_text(CODE, &unprotect(&connection.code).unwrap_or_default());
-                if notification == LBN_DBLCLK {
+                if let Some(index) = self.selected()
+                    && self.open_device(index)
+                    && notification == LBN_DBLCLK
+                {
                     self.connect();
+                }
+            }
+            (DEVICE_TABLE, BN_CLICKED) => {
+                if let Some(index) = device_table::selected(self.item(DEVICE_TABLE))
+                    && self.open_device(index)
+                {
+                    let _ = unsafe { SetFocus(Some(self.item(CONNECT))) };
                 }
             }
             (FORGET, BN_CLICKED) => {
                 if let Some(index) = self.selected() {
                     self.settings.connections.remove(index);
                     self.save();
-                    self.refresh_recent();
+                    self.refresh_recent(None);
                 }
             }
             (SHARE, BN_CLICKED) => self.toggle_sharing(),
@@ -577,179 +646,183 @@ impl Main {
         }
     }
 
-    unsafe fn build(&mut self, font: HFONT, scale: f32) -> windows::core::Result<()> {
-        unsafe {
-            let instance: HINSTANCE = GetModuleHandleW(None)?.into();
-            let add = |class: PCWSTR, text: &str, style: u32, edge: bool, x: i32, y: i32, width: i32, height: i32, id: usize| -> windows::core::Result<HWND> {
-                let px = |value: i32| (value as f32 * scale).round() as i32;
-                let extended = if edge { WS_EX_CLIENTEDGE } else { WINDOW_EX_STYLE(0) };
-                let control = CreateWindowExW(
-                    extended,
-                    class,
-                    PCWSTR(wide(text).as_ptr()),
-                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(style),
-                    px(x),
-                    px(y),
-                    px(width),
-                    px(height),
-                    Some(self.window),
-                    Some(HMENU(id as _)),
-                    Some(instance),
-                    None,
-                )?;
-                SendMessageW(control, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
-                Ok(control)
-            };
-            let (label, edit, button, list, combo) = (w!("STATIC"), w!("EDIT"), w!("BUTTON"), w!("LISTBOX"), w!("COMBOBOX"));
-            let (tab, push, check, group) = (WS_TABSTOP.0, WS_TABSTOP.0 | BS_PUSHBUTTON as u32, WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32, BS_GROUPBOX as u32);
-            let (field, drop) = (tab | ES_AUTOHSCROLL as u32, tab | CBS_DROPDOWNLIST as u32 | WS_VSCROLL.0);
-
-            add(button, "控制另一台电脑", group, false, 10, 8, 540, 238, 0)?;
-            add(label, "地址", 0, false, 24, 37, 44, 20, 0)?;
-            add(edit, "", field, true, 70, 33, 250, 24, ADDRESS)?;
-            add(label, "端口", 0, false, 334, 37, 36, 20, 0)?;
-            add(edit, &self.settings.port.to_string(), field | ES_NUMBER as u32, true, 372, 33, 72, 24, PORT)?;
-            add(label, "配对码", 0, false, 24, 69, 44, 20, 0)?;
-            add(edit, "", field, true, 70, 65, 374, 24, CODE)?;
-            add(button, "连接", push | BS_DEFPUSHBUTTON as u32, false, 454, 33, 84, 56, CONNECT)?;
-            add(label, "最近连接（双击直接连接）", 0, false, 24, 100, 300, 20, 0)?;
-            add(button, "断线后自动重连", check, false, 328, 96, 210, 22, AUTO_RECONNECT)?;
-            add(list, "", tab | LBS_NOTIFY as u32 | WS_VSCROLL.0, true, 24, 120, 420, 82, RECENT)?;
-            add(button, "删除", push, false, 454, 120, 84, 26, FORGET)?;
-            add(label, "画质", 0, false, 24, 214, 44, 20, 0)?;
-            add(combo, "", drop, false, 70, 210, 210, 240, VIEWER_QUALITY)?;
-            add(label, "键盘", 0, false, 292, 214, 36, 20, 0)?;
-            add(combo, "", drop, false, 328, 210, 210, 240, PC_MODIFIERS)?;
-
-            add(button, "共享这台电脑", group, false, 10, 254, 540, 276, 0)?;
-            add(label, "未共享", 0, false, 24, 280, 514, 20, HOST_STATUS)?;
-            add(label, "端口", 0, false, 24, 314, 44, 20, 0)?;
-            add(edit, &self.settings.port.to_string(), field | ES_NUMBER as u32, true, 70, 310, 72, 24, HOST_PORT)?;
-            add(button, "开始共享", push, false, 454, 306, 84, 30, SHARE)?;
-            add(label, "配对码", 0, false, 24, 348, 44, 20, 0)?;
-            add(edit, "", field | ES_READONLY as u32, true, 70, 344, 468, 24, HOST_CODE)?;
-            add(button, "复制", push, false, 70, 374, 80, 26, COPY_CODE)?;
-            add(button, "重新生成", push, false, 158, 374, 90, 26, NEW_CODE)?;
-            add(button, "允许控制端操作键盘和鼠标", check, false, 24, 408, 236, 22, ALLOW_CONTROL)?;
-            add(button, "允许同步剪贴板文字、图片和文件", check, false, 264, 408, 274, 22, ALLOW_CLIPBOARD)?;
-            add(label, "共享屏幕", 0, false, 24, 438, 64, 20, 0)?;
-            add(combo, "", drop, false, 92, 434, 446, 240, SHARED_DISPLAY)?;
-            add(label, "画质上限", 0, false, 24, 468, 64, 20, 0)?;
-            add(combo, "", drop, false, 92, 464, 250, 240, QUALITY_LIMIT)?;
-            add(label, "Mac 键盘", 0, false, 24, 500, 64, 20, 0)?;
-            add(combo, "", drop, false, 92, 496, 446, 240, MAC_MODIFIERS)?;
-
-            add(button, "软件更新", group, false, 10, 538, 540, 86, 0)?;
-            add(label, &self.updater.status_text, 0, false, 24, 564, 326, 20, UPDATE_STATUS)?;
-            add(button, "检查更新", push, false, 356, 558, 96, 26, UPDATE_ACTION)?;
-            add(button, "更新说明", push, false, 458, 558, 80, 26, UPDATE_NOTES)?;
-            add(button, "自动检查更新（每天一次）", check, false, 24, 594, 216, 22, AUTO_CHECK_UPDATES)?;
-            add(button, "非远程控制空闲时自动下载并安装", check, false, 248, 594, 290, 22, AUTO_INSTALL_UPDATES)?;
-
-            let fill = |id: usize, labels: &[&str], selected: usize| {
-                for label in labels {
-                    self.message(id, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
-                }
-                self.message(id, CB_SETCURSEL, selected.min(labels.len() - 1), 0);
-            };
-            fill(VIEWER_QUALITY, &VIEWER_QUALITIES.map(|(label, _)| label), self.settings.viewer_quality);
-            fill(QUALITY_LIMIT, &QUALITY_LIMITS.map(|(label, _)| label), self.settings.quality_limit);
-            fill(
-                PC_MODIFIERS,
-                &["标准：Ctrl=⌃ Alt=⌥ Win=⌘", "左 Ctrl 作为 ⌘，右 Ctrl 仍为 ⌃"],
-                usize::from(self.settings.pc_modifiers != PcModifierMapping::Standard),
-            );
-            fill(
-                MAC_MODIFIERS,
-                &["⌘ 与 ⌃ 都作为 Ctrl，右 ⌘ 作为 Win 键", "标准：⌃=Ctrl ⌥=Alt ⌘=Win 键"],
-                usize::from(self.settings.mac_modifiers != MacModifierMapping::CommandAsControl),
-            );
-            self.message(ALLOW_CONTROL, BM_SETCHECK, usize::from(self.settings.allow_control), 0);
-            self.refresh_displays();
-            self.message(AUTO_RECONNECT, BM_SETCHECK, usize::from(self.settings.auto_reconnect), 0);
-            self.message(ALLOW_CLIPBOARD, BM_SETCHECK, usize::from(self.settings.clipboard), 0);
-            if let Some(code) = self.settings.host_code.as_deref().and_then(unprotect) {
-                self.set_text(HOST_CODE, &code);
-            } else if self.settings.host_code.is_none() {
-                self.set_text(HOST_CODE, "首次开始共享时生成");
-            }
-            self.refresh_recent();
-            self.refresh_update_controls();
-            Ok(())
-        }
-    }
-}
-
-unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    unsafe {
-        let main = GetWindowLongPtrW(window, GWLP_USERDATA) as *mut Main;
-        if main.is_null() {
-            return DefWindowProcW(window, message, wparam, lparam);
-        }
-        let main = &mut *main;
+    fn dispatch_event(&mut self, message: u32, wparam: WPARAM) {
         match message {
-            WM_COMMAND => main.command(wparam.0 & 0xFFFF, ((wparam.0 >> 16) & 0xFFFF) as u32),
+            WM_COMMAND => self.command(wparam.0 & 0xFFFF, ((wparam.0 >> 16) & 0xFFFF) as u32),
             WM_HOST_NOTICE => {
-                let notices = std::mem::take(&mut *main.notices.lock().unwrap());
+                let notices = std::mem::take(&mut *self.notices.lock().unwrap());
                 for notice in notices {
-                    main.host_notice(notice);
+                    self.host_notice(notice);
                 }
             }
             WM_UPDATE_EVENT => {
-                let events = std::mem::take(&mut *main.updater.events.lock().unwrap());
+                let events = std::mem::take(&mut *self.updater.events.lock().unwrap());
                 let mut should_save = false;
                 let mut immediate_install = false;
                 for event in events {
-                    let (save, install_now) = main.updater.handle_worker_event(event, &mut main.settings);
+                    let (save, install_now) = self.updater.handle_worker_event(event, &mut self.settings);
                     should_save |= save;
                     immediate_install |= install_now;
                 }
                 if should_save {
-                    main.save();
+                    self.save();
                 }
-                main.refresh_update_controls();
+                self.refresh_update_controls();
                 if immediate_install {
-                    main.trigger_manual_install();
+                    self.trigger_manual_install();
                 } else {
-                    main.tick_updater();
+                    self.tick_updater();
                 }
             }
-            WM_TIMER if wparam.0 == TIMER_UPDATE_TICK => main.tick_updater(),
+            WM_TIMER if wparam.0 == TIMER_UPDATE_TICK => self.tick_updater(),
             WM_DISPLAYCHANGE => {
-                main.refresh_displays();
-                if let Some(sharing) = &main.sharing {
+                self.refresh_displays();
+                if let Some(sharing) = &self.sharing {
                     let _ = sharing.send(HostCommand::RefreshDisplays);
                 }
             }
             WM_CANVAS_CONNECTED => {
-                if let Some((viewer, history)) = main.viewers.iter_mut().find(|(viewer, _)| viewer.window.0 as usize == wparam.0)
+                if let Some((viewer, history)) = self.viewers.iter_mut().find(|(viewer, _)| viewer.window.0 as usize == wparam.0)
                     && let Some(host) = viewer.connected.take()
                     && let Some(mut connection) = history.take()
                 {
                     connection.name = host.name;
                     connection.device_id = host.id;
-                    main.settings.remember(connection);
-                    main.save();
-                    main.refresh_recent();
+                    let selection = self.selected().map(|index| self.settings.connections[index].clone());
+                    self.settings.remember(connection);
+                    self.save();
+                    self.refresh_recent(selection.as_ref());
                 }
             }
             WM_CANVAS_CLOSED => {
-                main.viewers.retain(|(viewer, _)| viewer.window.0 as usize != wparam.0);
-                main.updater.observe_remote_sessions(main.host_activity.connected(), main.viewers.len());
-                main.refresh_update_controls();
+                self.viewers.retain(|(viewer, _)| viewer.window.0 as usize != wparam.0);
+                self.updater.observe_remote_sessions(self.host_activity.connected(), self.viewers.len());
+                self.refresh_update_controls();
             }
             WM_CAPS_PREFERENCE => {
-                main.settings.caps_forwarding = wparam.0 != 0;
-                main.save();
+                self.settings.caps_forwarding = wparam.0 != 0;
+                self.save();
+            }
+            _ => {}
+        }
+    }
+
+    fn initialize_controls(&mut self) {
+        let fill = |id: usize, labels: &[&str], selected: usize| {
+            for label in labels {
+                self.message(id, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
+            }
+            self.message(id, CB_SETCURSEL, selected.min(labels.len() - 1), 0);
+        };
+        fill(VIEWER_QUALITY, &VIEWER_QUALITIES.map(|(label, _)| label), self.settings.viewer_quality);
+        fill(QUALITY_LIMIT, &QUALITY_LIMITS.map(|(label, _)| label), self.settings.quality_limit);
+        fill(
+            PC_MODIFIERS,
+            &["标准：Ctrl=⌃ Alt=⌥ Win=⌘", "左 Ctrl 作为 ⌘，右 Ctrl 仍为 ⌃"],
+            usize::from(self.settings.pc_modifiers != PcModifierMapping::Standard),
+        );
+        fill(
+            MAC_MODIFIERS,
+            &["⌘ 与 ⌃ 都作为 Ctrl，右 ⌘ 作为 Win 键", "标准：⌃=Ctrl ⌥=Alt ⌘=Win 键"],
+            usize::from(self.settings.mac_modifiers != MacModifierMapping::CommandAsControl),
+        );
+        self.message(ALLOW_CONTROL, BM_SETCHECK, usize::from(self.settings.allow_control), 0);
+        self.refresh_displays();
+        self.message(AUTO_RECONNECT, BM_SETCHECK, usize::from(self.settings.auto_reconnect), 0);
+        self.message(ALLOW_CLIPBOARD, BM_SETCHECK, usize::from(self.settings.clipboard), 0);
+        if let Some(code) = self.settings.host_code.as_deref().and_then(unprotect) {
+            self.set_text(HOST_CODE, &code);
+        } else if self.settings.host_code.is_none() {
+            self.set_text(HOST_CODE, "首次开始共享时生成");
+        }
+        self.refresh_recent(None);
+        if !self.settings.connections.is_empty() {
+            self.workspace.select(Page::Devices);
+        }
+        self.refresh_update_controls();
+    }
+}
+
+struct WindowState {
+    workspace: Rc<Workspace>,
+    main: RefCell<Main>,
+    pending: RefCell<VecDeque<(u32, WPARAM)>>,
+}
+
+unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        let state = GetWindowLongPtrW(window, GWLP_USERDATA) as *const WindowState;
+        let Some(state) = state.as_ref() else {
+            return DefWindowProcW(window, message, wparam, lparam);
+        };
+        let workspace = &state.workspace;
+        match message {
+            WM_PAINT => {
+                workspace.paint();
+                return LRESULT(0);
+            }
+            WM_ERASEBKGND => return LRESULT(1),
+            WM_DRAWITEM if lparam.0 != 0 => {
+                if workspace.draw_item(&*(lparam.0 as *const DRAWITEMSTRUCT)) {
+                    return LRESULT(1);
+                }
+                return DefWindowProcW(window, message, wparam, lparam);
+            }
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => {
+                return workspace.control_colors(HDC(wparam.0 as _), HWND(lparam.0 as _));
+            }
+            WM_SIZE if wparam.0 != SIZE_MINIMIZED as usize => {
+                workspace.layout();
+                return LRESULT(0);
+            }
+            WM_GETMINMAXINFO => {
+                let result = DefWindowProcW(window, message, wparam, lparam);
+                workspace.min_size(&mut *(lparam.0 as *mut MINMAXINFO));
+                return result;
+            }
+            WM_DPICHANGED => {
+                workspace.dpi_changed((wparam.0 & 0xffff) as u32, &*(lparam.0 as *const RECT));
+                return LRESULT(0);
+            }
+            WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED => {
+                workspace.refresh_palette();
+                return DefWindowProcW(window, message, wparam, lparam);
+            }
+            WM_NOTIFY if lparam.0 != 0 => {
+                let header = &*(lparam.0 as *const NMHDR);
+                if header.idFrom == DEVICE_TABLE && header.code == LVN_ITEMACTIVATE {
+                    if let Ok(mut main) = state.main.try_borrow_mut() {
+                        main.command(DEVICE_TABLE, BN_CLICKED);
+                    }
+                    return LRESULT(0);
+                }
+                return DefWindowProcW(window, message, wparam, lparam);
+            }
+            WM_NCDESTROY => {
+                SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+                return DefWindowProcW(window, message, wparam, lparam);
             }
             WM_DESTROY => {
                 let _ = KillTimer(Some(window), TIMER_UPDATE_TICK);
-                main.sharing = None;
-                main.updater.shutdown();
                 PostQuitMessage(0);
+                return LRESULT(0);
             }
+            WM_COMMAND | WM_HOST_NOTICE | WM_UPDATE_EVENT | WM_TIMER | WM_DISPLAYCHANGE | WM_CANVAS_CONNECTED | WM_CANVAS_CLOSED | WM_CAPS_PREFERENCE => {}
             _ => return DefWindowProcW(window, message, wparam, lparam),
         }
+        let Ok(mut main) = state.main.try_borrow_mut() else {
+            // Native modal prompts pump posted session and update notifications.
+            if !matches!(message, WM_COMMAND | WM_TIMER) {
+                state.pending.borrow_mut().push_back((message, wparam));
+            }
+            return LRESULT(0);
+        };
+        let mut next = Some((message, wparam));
+        while let Some((message, wparam)) = next {
+            main.dispatch_event(message, wparam);
+            next = state.pending.borrow_mut().pop_front();
+        }
+
         LRESULT(0)
     }
 }
@@ -777,21 +850,18 @@ unsafe fn run_window() -> windows::core::Result<()> {
             hInstance: instance,
             hIcon: LoadIconW(Some(instance), PCWSTR(1 as _)).unwrap_or_default(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as _),
             lpszClassName: class,
             ..Default::default()
         };
         RegisterClassExW(&definition);
-        let scale = GetDpiForSystem() as f32 / 96.0;
-        let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        let mut frame = RECT { left: 0, top: 0, right: (560.0 * scale) as i32, bottom: (634.0 * scale) as i32 };
-        AdjustWindowRectEx(&mut frame, style, false, WINDOW_EX_STYLE(0))?;
+        let dpi = GetDpiForSystem();
+        let frame = window_frame(dpi, 980, 630);
         let title = wide(&format!("QuietDesk {}", env!("QUIETDESK_VERSION")));
         let window = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
             PCWSTR(title.as_ptr()),
-            style,
+            FRAME_STYLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             frame.right - frame.left,
@@ -801,14 +871,20 @@ unsafe fn run_window() -> windows::core::Result<()> {
             Some(instance),
             None,
         )?;
-        let mut metrics = NONCLIENTMETRICSW { cbSize: size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
-        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, metrics.cbSize, Some(std::ptr::from_mut(&mut metrics).cast()), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0))?;
-        let font = CreateFontIndirectW(&metrics.lfMessageFont);
         let settings = Settings::load();
         let mut updater = super::update::WindowUpdater::new();
         let post_update_options = updater.apply_startup_result();
-        let main = Box::into_raw(Box::new(Main {
+        let dpi = GetDpiForWindow(window);
+        let workspace = match Workspace::new(window, dpi, settings.port, &updater.status_text) {
+            Ok(workspace) => Rc::new(workspace),
+            Err(error) => {
+                let _ = DestroyWindow(window);
+                return Err(error);
+            }
+        };
+        let mut main = Main {
             window,
+            workspace: workspace.clone(),
             local_identity: local_device_id().map(|id| DeviceIdentity { id, name: device_display_name(&computer_name()) }),
             viewer_name: None,
             session_status: String::new(),
@@ -823,27 +899,61 @@ unsafe fn run_window() -> windows::core::Result<()> {
             notices: Arc::new(Mutex::new(VecDeque::new())),
             viewers: Vec::new(),
             updater,
-        }));
-        (*main).build(font, scale)?;
-        SetWindowLongPtrW(window, GWLP_USERDATA, main as isize);
+        };
+        main.initialize_controls();
+        if post_update_options.as_ref().is_some_and(|options| options.resume_host_sharing) {
+            main.toggle_sharing();
+        }
+        let state = Box::new(WindowState { workspace, main: RefCell::new(main), pending: RefCell::default() });
+        SetWindowLongPtrW(window, GWLP_USERDATA, std::ptr::from_ref(state.as_ref()) as isize);
         let _ = SetTimer(Some(window), TIMER_UPDATE_TICK, 5_000, None);
-        if let Some(opts) = post_update_options {
-            if opts.resume_host_sharing {
-                (*main).toggle_sharing();
-            }
-            let show_cmd = if opts.minimize_on_launch { SW_SHOWMINNOACTIVE } else { SW_SHOW };
-            let _ = ShowWindow(window, show_cmd);
-        } else {
-            let _ = ShowWindow(window, SW_SHOW);
+        let minimize = post_update_options.is_some_and(|options| options.minimize_on_launch);
+        let _ = ShowWindow(window, if minimize { SW_SHOWMINNOACTIVE } else { SW_SHOW });
+        if !minimize && GetActiveWindow() == window {
+            let main = state.main.borrow();
+            let initial_focus = if main.settings.connections.is_empty() { ADDRESS } else { DEVICE_TABLE };
+            let _ = SetFocus(Some(main.item(initial_focus)));
         }
         let mut message = MSG::default();
-        while GetMessageW(&mut message, None, 0, 0).as_bool() {
-            // Tab and Enter work in the main window; viewer windows receive their keys untouched.
-            if !IsDialogMessageW(window, &message).as_bool() {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
+        while GetMessageW(&mut message, None, 0, 0).0 > 0 {
+            if workspace_enter(window, &message) || IsDialogMessageW(window, &message).as_bool() || canvas::dialog_message(&message) {
+                continue;
             }
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
         }
+        if IsWindow(Some(window)).as_bool() {
+            let _ = DestroyWindow(window);
+        }
+        let mut main = state.main.into_inner();
+        main.sharing = None;
+        main.updater.shutdown();
         Ok(())
     }
+}
+
+fn workspace_enter(window: HWND, message: &MSG) -> bool {
+    if message.message != WM_KEYDOWN || message.wParam.0 != VK_RETURN.0 as usize || unsafe { GetParent(message.hwnd) }.ok() != Some(window) {
+        return false;
+    }
+    unsafe {
+        let id = GetDlgCtrlID(message.hwnd) as usize;
+        match id {
+            ADDRESS | PORT | CODE => {
+                SendMessageW(window, WM_COMMAND, Some(WPARAM(CONNECT)), Some(LPARAM(0)));
+            }
+            RECENT => {
+                SendMessageW(window, WM_COMMAND, Some(WPARAM(RECENT | (LBN_DBLCLK as usize) << 16)), Some(LPARAM(0)));
+            }
+            DEVICE_TABLE => {
+                SendMessageW(window, WM_COMMAND, Some(WPARAM(DEVICE_TABLE)), Some(LPARAM(0)));
+            }
+            NEW_CONNECTION | NEW_CONNECTION_PAGE | NAV_DEVICES | NAV_SHARING | NAV_SETTINGS | TAB_SHARING | TAB_HOST_QUALITY | TAB_KEYBOARD | TAB_DEFAULTS
+            | TAB_UPDATES | CONTINUE_CONNECTION | CONNECT | FORGET | SHARE | COPY_CODE | NEW_CODE | UPDATE_ACTION | UPDATE_NOTES => {
+                SendMessageW(message.hwnd, BM_CLICK, None, None);
+            }
+            _ => return false,
+        }
+    }
+    true
 }

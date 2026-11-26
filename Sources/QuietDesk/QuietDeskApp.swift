@@ -311,7 +311,6 @@ struct DeskView: View {
     @State private var showCapsSettings = false
     @State private var showOptions = false
     @State private var showFullScreenMenu = false
-    @State private var hoveringFullScreenTrigger = false
     @State private var showTrafficStatistics = false
     @State private var showSessionEffects = false
     @State private var showPortMapping = false
@@ -940,30 +939,12 @@ struct DeskView: View {
                                         .strokeBorder(DeskPalette.hairline, lineWidth: 1)
                                 }
                         }
-                        Button {
+                        FullScreenControlsButton(expanded: showFullScreenMenu, dimmed: model.controlling,
+                                                 position: $model.fullScreenControlsPosition,
+                                                 containerHeight: geometry.size.height) {
                             model.releaseControlForLocalUI()
                             showFullScreenMenu.toggle()
-                        } label: {
-                            Image(systemName: showFullScreenMenu ? "chevron.right" : "slider.horizontal.3")
-                                .font(.system(size: 13.5, weight: .semibold))
-                                .frame(width: 26, height: 66)
-                                .foregroundStyle(showFullScreenMenu ? Color.white : DeskPalette.ink)
-                                .background {
-                                    if showFullScreenMenu {
-                                        Capsule().fill(DeskPalette.actionFill)
-                                    } else {
-                                        Capsule().fill(DeskPalette.cardBackground)
-                                    }
-                                }
-                                .overlay(Capsule().strokeBorder(DeskPalette.hairline, lineWidth: 1))
-                                .contentShape(Capsule())
                         }
-                        .buttonStyle(.plain)
-                        .opacity(model.controlling && !hoveringFullScreenTrigger && !showFullScreenMenu ? 0.45 : 1.0)
-                        .onHover { hoveringFullScreenTrigger = $0 }
-                        .animation(.easeOut(duration: 0.16), value: hoveringFullScreenTrigger)
-                        .help(showFullScreenMenu ? "收起控制与设置" : "展开控制与设置")
-                        .accessibilityLabel(showFullScreenMenu ? "收起控制与设置" : "展开控制与设置")
                     }
                     .padding(.trailing, 8)
                     .frame(maxHeight: .infinity)

@@ -232,6 +232,14 @@ final class DeskModel: ObservableObject, Identifiable {
             } else { UserDefaults.standard.removeObject(forKey: Self.fullScreenStatusPositionKey) }
         }
     }
+    /// Where the viewer dragged the full-screen controls button along the trailing edge (0 top, 1 bottom);
+    /// nil keeps it centred.
+    @Published var fullScreenControlsPosition = UserDefaults.standard.object(forKey: "fullScreenControlsPosition") as? Double {
+        didSet {
+            if let fullScreenControlsPosition { UserDefaults.standard.set(fullScreenControlsPosition, forKey: "fullScreenControlsPosition") }
+            else { UserDefaults.standard.removeObject(forKey: "fullScreenControlsPosition") }
+        }
+    }
     // Opacity of the black background behind the white status text; missing means the default. The text opacity
     // saved before the background existed ("fullScreenStatusOpacity") is left for older versions and not reused.
     private static let fullScreenStatusBackgroundOpacityKey = "fullScreenStatusBackgroundOpacity"

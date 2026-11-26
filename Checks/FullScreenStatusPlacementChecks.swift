@@ -38,4 +38,24 @@ func runFullScreenStatusPlacementChecks() {
             status: .zero) == .zero, "Invalid geometry generated non-finite coordinates")
         try check(FullScreenStatusPlacement.defaultBackgroundOpacity == 0.4, "Status background does not start 60% transparent")
     }
+    run("The full-screen controls button stays centred until dragged and keeps its share of the edge on any screen") {
+        let control: CGFloat = 66
+        try check(FullScreenControlsPlacement.offset(for: nil, containerHeight: 1117, controlHeight: control) == 0,
+                  "An undragged button left the centre")
+        // Dragged 300 pt up on a 1117 pt screen, it keeps that share of the travel on a smaller one.
+        let position = FullScreenControlsPlacement.position(forOffset: -300, containerHeight: 1117, controlHeight: control)
+        try check(abs(FullScreenControlsPlacement.offset(for: position, containerHeight: 1117, controlHeight: control) + 300) < 0.001,
+                  "A dragged position did not round-trip")
+        let smaller = FullScreenControlsPlacement.offset(for: position, containerHeight: 800, controlHeight: control)
+        try check(smaller < 0 && abs(smaller) <= (800 - control - FullScreenControlsPlacement.margin * 2) / 2,
+                  "A saved position left the smaller screen: \(smaller)")
+        // A drag past the edge stops at the margin, and unusable sizes or values fall back to the centre.
+        try check(FullScreenControlsPlacement.position(forOffset: -5_000, containerHeight: 1117, controlHeight: control) == 0
+                  && FullScreenControlsPlacement.position(forOffset: 5_000, containerHeight: 1117, controlHeight: control) == 1,
+                  "A drag past the edge was not kept inside")
+        try check(FullScreenControlsPlacement.position(forOffset: 40, containerHeight: 60, controlHeight: control) == 0.5
+                  && FullScreenControlsPlacement.offset(for: .nan, containerHeight: 1117, controlHeight: control) == 0
+                  && FullScreenControlsPlacement.offset(for: 0.2, containerHeight: .infinity, controlHeight: control) == 0,
+                  "An unusable size or value moved the button")
+    }
 }

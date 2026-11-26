@@ -34,3 +34,28 @@ public enum FullScreenStatusPlacement {
 
     private static func unit(_ value: CGFloat) -> CGFloat { value.isFinite ? min(1, max(0, value)) : 0 }
 }
+
+/// Where the full-screen controls button sits along the trailing edge: centred until the viewer drags it,
+/// then at the same share of the available travel on any screen.
+public enum FullScreenControlsPlacement {
+    /// Distance kept from the top and bottom edges.
+    public static let margin: CGFloat = 16
+
+    /// The vertical offset from the centre for a saved position (0 top, 1 bottom); nil is the centre.
+    public static func offset(for position: Double?, containerHeight: CGFloat, controlHeight: CGFloat) -> CGFloat {
+        guard let position, position.isFinite else { return 0 }
+        return (CGFloat(min(1, max(0, position))) - 0.5) * travel(containerHeight: containerHeight, controlHeight: controlHeight)
+    }
+
+    /// The position for an offset from the centre, kept inside the travel.
+    public static func position(forOffset offset: CGFloat, containerHeight: CGFloat, controlHeight: CGFloat) -> Double {
+        let travel = travel(containerHeight: containerHeight, controlHeight: controlHeight)
+        guard travel > 0, offset.isFinite else { return 0.5 }
+        return Double(min(1, max(0, offset / travel + 0.5)))
+    }
+
+    private static func travel(containerHeight: CGFloat, controlHeight: CGFloat) -> CGFloat {
+        guard containerHeight.isFinite, controlHeight.isFinite else { return 0 }
+        return max(0, containerHeight - controlHeight - margin * 2)
+    }
+}

@@ -177,6 +177,62 @@ private func mouse(_ type: CGEventType, button: CGMouseButton = .left,
     return try nativeEvent(event, point: point)
 }
 
+/// SwiftUI handles mouse events only in a window the window server shows. This one is shown far outside
+/// every screen and cannot become key, so nothing appears on a display and no focus moves.
+@MainActor
+private final class OffscreenInteraction<Content: View> {
+    let window: NSWindow
+    let hosting: NSHostingView<Content>
+    private var eventNumber = 0
+
+    init(size: CGSize, content: Content) {
+        window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        hosting = NSHostingView(rootView: content)
+        window.contentView = hosting
+        window.setFrameOrigin(NSPoint(x: -20_000, y: -20_000))
+        window.orderFrontRegardless()
+        settle()
+    }
+
+    func settle() {
+        for _ in 0..<3 {
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+            hosting.layoutSubtreeIfNeeded()
+        }
+    }
+
+    /// `point` is in window coordinates, from the bottom-left corner.
+    func send(_ type: NSEvent.EventType, at point: CGPoint) throws {
+        eventNumber += 1
+        guard let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                                             timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                                             context: nil, eventNumber: eventNumber, clickCount: 1,
+                                             pressure: type == .leftMouseUp ? 0 : 1) else {
+            throw CanvasCheckFailure("Could not create a pointer event")
+        }
+        window.sendEvent(event)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
+    }
+
+    func click(at point: CGPoint) throws {
+        try send(.leftMouseDown, at: point)
+        try send(.leftMouseUp, at: point)
+        settle()
+    }
+
+    func drag(from start: CGPoint, by distance: CGFloat, steps: Int = 10) throws {
+        try send(.leftMouseDown, at: start)
+        for step in 1...steps {
+            try send(.leftMouseDragged, at: CGPoint(x: start.x, y: start.y + distance * CGFloat(step) / CGFloat(steps)))
+        }
+        try send(.leftMouseUp, at: CGPoint(x: start.x, y: start.y + distance))
+        settle()
+    }
+
+    func close() { window.close() }
+}
+
 @main
 private struct RemoteCanvasChecks {
     @MainActor
@@ -1615,6 +1671,55 @@ private struct RemoteCanvasChecks {
                         && inputs[1].kind == .rotate && inputs[1].rotation == 0 && inputs[1].gesturePhase == .cancelled,
                         "Entering letterboxing did not cancel open magnify and rotate gestures: \(inputs)")
             try inputs.forEach { try $0.validate() }
+        }
+
+        // Without a session that shows windows SwiftUI receives no events at all; the canary tells that apart
+        // from a button that stopped responding.
+        do {
+            let container = CGSize(width: 300, height: 600)
+            var position: Double?, toggles = 0, canary = 0
+            let interaction = OffscreenInteraction(size: container, content: ZStack(alignment: .topLeading) {
+                HStack {
+                    Spacer(minLength: 0)
+                    FullScreenControlsButton(expanded: false, dimmed: false,
+                                             position: Binding(get: { position }, set: { position = $0 }),
+                                             containerHeight: container.height) { toggles += 1 }
+                        .padding(.trailing, 8)
+                }
+                .frame(width: container.width, height: container.height)
+                Button(action: { canary += 1 }) { Color.clear.frame(width: 20, height: 20).contentShape(Rectangle()) }
+                    .buttonStyle(.plain)
+            }.frame(width: container.width, height: container.height))
+            defer { interaction.close() }
+            let name = "The full-screen controls button toggles on a click and moves on a drag without toggling"
+            try? interaction.click(at: CGPoint(x: 10, y: container.height - 10))
+            if canary != 1 {
+                print("SKIP \(name): this session delivers no pointer events to an off-screen SwiftUI window")
+            } else {
+                run(name) {
+                    // Centred on the trailing edge: 26 pt wide, 8 pt from the edge.
+                    let centre = CGPoint(x: container.width - 8 - 13, y: container.height / 2)
+                    try interaction.click(at: centre)
+                    try require(toggles == 1 && position == nil, "A click did not toggle the panel once: \(toggles), \(String(describing: position))")
+                    // Window coordinates grow upwards: 120 pt up is 120 pt towards the top of the edge.
+                    try interaction.drag(from: centre, by: 120)
+                    let travel = container.height - FullScreenControlsButton.height - FullScreenControlsPlacement.margin * 2
+                    try require(toggles == 1, "A drag toggled the panel")
+                    try require(position.map { abs($0 - (0.5 - 120 / travel)) < 0.01 } == true,
+                                "A drag of 120 pt did not move the button by as much: \(String(describing: position))")
+                    let moved = CGPoint(x: centre.x, y: centre.y + 120)
+                    try interaction.click(at: centre)
+                    try require(toggles == 1, "The button still answered where it used to be")
+                    try interaction.click(at: moved)
+                    try require(toggles == 2, "The button did not answer where it was dragged to")
+                    // A press that barely moves is a click, and a drag past the edge stops at the margin.
+                    let kept = position
+                    try interaction.drag(from: moved, by: 2, steps: 1)
+                    try require(toggles == 3 && position == kept, "A 2 pt wobble was not a click: \(toggles), \(String(describing: position))")
+                    try interaction.drag(from: moved, by: -2_000)
+                    try require(position == 1 && toggles == 3, "A drag past the bottom edge left the screen or toggled: \(String(describing: position))")
+                }
+            }
         }
 
         print("\(passed) passed, \(failed) failed")

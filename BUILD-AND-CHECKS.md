@@ -1,5 +1,18 @@
 # 构建与检查记录
 
+## macOS 编码实验结论与 4:4:4 降档条件更正（2026-11-26，`2c4ced2`、`61beead`）
+
+- **做了什么**：
+  - 离线编码实验（M2 Pro、macOS 26.5.2，合成滚动文字与图片块，2560×1440 与 3840×2160、60 fps，硬件编码后硬件解码比较 PSNR；不采集屏幕、不联网，运行期间本机没有会话连入）。结论与数据写入 `docs/lan-video-bursts.md`（`61beead`）：标准硬件编码器的码控属性（含 macOS 26 新增的 VBR/VBV）都不能限制单帧大小；低延迟编码器可以逐帧限量并用长期参考帧在不发关键帧的情况下恢复，但 60 fps 及以上的可持续帧率减半（3840×2160 约 31–35 fps，标准编码器 44–53 fps），且要求 4:4:4 时实际输出 4:2:0。两项都不采用，产品代码未因此改动。
+  - `2c4ced2`（`Sources/QuietDeskCore/MediaPathPolicy.swift`、`Checks/MediaPathPolicyChecks.swift`、`docs/udp-tcp-transport.md`、`docs/usage.md`）：更正 `d7c5864` 的降档顺序。实验测得 3840×2160 下硬件编码 HEVC 4:4:4 约 50–51 fps、4:2:0 约 48–51 fps，没有差别；硬件解码则是 4:4:4 约 226 fps、4:2:0 约 380 fps。因此只有控制端解码是较慢一侧时才先放弃 4:4:4；共享端编码跟不上时保留 4:4:4、直接缩小尺寸（与 `d7c5864` 之前相同）。下一节“先改用 4:2:0”的描述以本节为准。
+- **跑了什么与结果**：
+  - `2c4ced2` 上：`QuietDeskChecks` 全量通过（**`462 passed, 0 failed`**，改写 2 项画质策略检查），`./scripts/run-session-quality-checks.sh`（`38 passed`）、`./scripts/run-media-impairment-checks.sh`（9 项 PASS）、`./scripts/run-port-mapping-checks.sh`（28 项 PASS）通过，应用可构建。
+  - 从干净克隆的提交 `61beead` 构建并校验 Universal 产物（`outputs/chroma-fallback-20261126/`，`0.7.3` build `25`，`arm64` + `x86_64`，两架构最低系统 14.0、SDK 26.5，`codesign --verify --deep --strict` 与证书固定检查通过）：DMG（SHA-256 `a6e6177e...`，`hdiutil verify` 有效）、应用 ZIP（SHA-256 `795011f5...`）、源码 ZIP（SHA-256 `f94db475...`，461 项受管文件与 `git ls-files` 逐项一致，不含构建缓存与私有配置）。
+- **没验证什么**：
+  - 实验是一台机器上的合成画面，不代表真实桌面内容、其他芯片、Intel 机型或 macOS 14；“4:2:0 不比 4:4:4 编码更快”只在这台 M2 Pro 上测过，其他硬件上可能不同。
+  - 完整的 `scripts/run-all-checks.sh` 上一次运行在 `150b0b2`，之后只改了画质策略一处条件及其检查，未重跑全套。
+  - 未在真实双机会话中验证；产物为 ad-hoc 临时签名，本机生产版未被替换、重启或中断，未改动系统权限。
+
 ## macOS 会话工具不再丢控制权、全屏按钮可拖动与顶部悬停工具条（2026-11-26，`89e923b`、`48c49be`、`9855e0e`、`ec428ca`、`150b0b2`）
 
 - **做了什么**（均为控制端界面，线上协议与默认快捷键不变）：

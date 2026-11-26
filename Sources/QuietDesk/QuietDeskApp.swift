@@ -703,7 +703,9 @@ struct DeskView: View {
 
             if model.supportsRelativeMouse {
                 Button {
-                    sessionAction { model.setRelativeMouseEnabled(!model.relativeMouseEnabled) }
+                    // The pointer is captured by the click on the picture that follows, not by this menu item.
+                    model.releaseControlByChoice()
+                    model.setRelativeMouseEnabled(!model.relativeMouseEnabled)
                 } label: {
                     Label(
                         model.relativeMouseEnabled ? "关闭相对鼠标视角锁定" : "开启相对鼠标 · 3D 视角",

@@ -691,6 +691,8 @@ final class DeskModel: ObservableObject, Identifiable {
         canvas.onFocus = { [weak self] focused in
             guard let self else { return }
             self.controlling = focused
+            // The picture has the keyboard again, by the hand-back or a click; nothing is left to hand back.
+            if focused { self.controlResumption.cancel() }
             self.refreshClipboardFocus()
         }
         canvas.onRelativeMouseCaptureChanged = { [weak self] captured in

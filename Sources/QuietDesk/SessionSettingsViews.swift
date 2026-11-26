@@ -698,6 +698,7 @@ private struct SessionQualitySection: View {
             appliedCodec: model.activeVideoCodec,
             appliedChroma: model.activeVideoChroma,
             onSelectPreset: { model.chooseViewerPreset($0) },
+            sharpnessFirst: model.supportsMediaTransport ? $model.videoPrefersSharpness : nil,
             localNetworkQuality: model.localNetworkQuality,
             qualityHelp: model.videoQualityHelp, compact: compact)
     }

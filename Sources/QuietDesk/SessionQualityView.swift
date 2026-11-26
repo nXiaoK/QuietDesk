@@ -105,6 +105,7 @@ struct SessionQualityView: View {
     var appliedCodec: VideoCodec = .h264
     var appliedChroma: VideoChromaSubsampling = .yuv420
     var onSelectPreset: ((SessionQualityPreset) -> Void)? = nil
+    var sharpnessFirst: Binding<Bool>? = nil
     let localNetworkQuality: Bool
     let qualityHelp: String
     let compact: Bool
@@ -307,6 +308,21 @@ struct SessionQualityView: View {
                         .toggleStyle(.switch)
                         .controlSize(.small)
                 }
+            }
+            if let sharpnessFirst {
+                HStack {
+                    Text("清晰优先")
+                        .foregroundStyle(DeskPalette.secondary)
+                    Spacer()
+                    Text("先降帧率")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(DeskPalette.muted)
+                    Toggle("清晰优先", isOn: sharpnessFirst)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                }
+                .help("两端编解码跟不上时，先把帧率降到 30 fps 并保持画面尺寸；关闭时保持 60 fps，先改用 4:2:0 再缩小画面。对所有连接生效，局域网不因编解码降档。")
             }
         }
         .pickerStyle(.menu)

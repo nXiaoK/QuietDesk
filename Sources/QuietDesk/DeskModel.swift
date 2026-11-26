@@ -83,6 +83,15 @@ final class DeskModel: ObservableObject, Identifiable {
             if oldValue != lowLatencyCursorEnabled { sendCursorRequest() }
         }
     }
+    /// Under compute pressure, lower the frame rate before the picture size. One preference for every session.
+    @Published var videoPrefersSharpness = UserDefaults.standard.bool(forKey: "videoPrefersSharpness") {
+        didSet {
+            guard oldValue != videoPrefersSharpness else { return }
+            UserDefaults.standard.set(videoPrefersSharpness, forKey: "videoPrefersSharpness")
+            viewerSession.mediaQuality?.setPrefersSharpness(videoPrefersSharpness, now: SessionClock.now)
+            for other in services.otherModels(excluding: self) { other.videoPrefersSharpness = videoPrefersSharpness }
+        }
+    }
     @Published var canvasScalingMode = RemoteCanvasScalingMode(rawValue: UserDefaults.standard.string(forKey: "canvasScalingMode") ?? "") ?? .fitWindow {
         didSet {
             UserDefaults.standard.set(canvasScalingMode.rawValue, forKey: "canvasScalingMode")
@@ -2464,6 +2473,7 @@ final class DeskModel: ObservableObject, Identifiable {
                                                    applied: settings, bitRates: bitRates,
                                                    appliedSize: activeVideoState.map { ($0.width, $0.height) },
                                                    sustained: sustained, choosesTrueColor: videoTuning?.desiredChroma == .yuv444,
+                                                   prefersSharpness: videoPrefersSharpness,
                                                    now: SessionClock.now)
         channel.configureMedia { [weak media] in media?.receive($0) ?? false }
         channel.configureReliableData { [weak media] in media?.sendReliableData($0) }

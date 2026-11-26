@@ -565,21 +565,27 @@ public struct SustainedVideoSize: Codable, Equatable, Sendable {
     public let leftTrueColor: Bool
     /// How many times the 4:2:0 time per frame 4:4:4 took, when both were measured.
     public let trueColorCost: Double?
+    /// Measured while the viewer preferred the picture size over the frame rate; the other preference
+    /// gives up something else first, so it does not start from this.
+    public let sharpnessFirst: Bool
 
-    public init?(longestEdge: Int, aspect: Double, leftTrueColor: Bool = false, trueColorCost: Double? = nil) {
+    public init?(longestEdge: Int, aspect: Double, leftTrueColor: Bool = false, trueColorCost: Double? = nil,
+                 sharpnessFirst: Bool = false) {
         guard StreamSettings.longestEdges.contains(longestEdge), aspect.isFinite, aspect > 0, aspect <= 1 else { return nil }
         self.longestEdge = longestEdge; self.aspect = aspect; self.leftTrueColor = leftTrueColor
+        self.sharpnessFirst = sharpnessFirst
         self.trueColorCost = trueColorCost.flatMap { leftTrueColor && $0.isFinite && $0 >= 1 && $0 <= 16 ? $0 : nil }
     }
 
-    private enum CodingKeys: String, CodingKey { case longestEdge, aspect, leftTrueColor, trueColorCost }
+    private enum CodingKeys: String, CodingKey { case longestEdge, aspect, leftTrueColor, trueColorCost, sharpnessFirst }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         guard let size = SustainedVideoSize(longestEdge: try values.decode(Int.self, forKey: .longestEdge),
                                             aspect: try values.decode(Double.self, forKey: .aspect),
                                             leftTrueColor: (try? values.decode(Bool.self, forKey: .leftTrueColor)) ?? false,
-                                            trueColorCost: try? values.decode(Double.self, forKey: .trueColorCost)) else {
+                                            trueColorCost: try? values.decode(Double.self, forKey: .trueColorCost),
+                                            sharpnessFirst: (try? values.decode(Bool.self, forKey: .sharpnessFirst)) ?? false) else {
             throw DeskError.invalid("已保存的可持续画面尺寸无效")
         }
         self = size
@@ -591,6 +597,7 @@ public struct SustainedVideoSize: Codable, Equatable, Sendable {
         try values.encode(aspect, forKey: .aspect)
         if leftTrueColor { try values.encode(true, forKey: .leftTrueColor) }
         try values.encodeIfPresent(trueColorCost, forKey: .trueColorCost)
+        if sharpnessFirst { try values.encode(true, forKey: .sharpnessFirst) }
     }
 }
 
@@ -679,6 +686,8 @@ public struct MediaQualityPolicy: Sendable {
     // (1000 / its time per frame) but not below this floor. At the floor the size drops only when the
     // codec sustains less than `computeRateTolerance` of it, about 50 of 60 fps.
     public static let computeRateFloor = 60
+    /// The floor when the viewer prefers the picture size: the rate drops this far before 4:4:4 or the size go.
+    public static let sharpnessRateFloor = 30
     public static let computeRateTolerance = 0.85
     // A higher frame rate needs the measured time per frame to fit this share of its frame interval.
     public static let computeHeadroom = 0.85
@@ -755,6 +764,13 @@ public struct MediaQualityPolicy: Sendable {
         var costMeasured = false
     }
     private var slowTrueColor: SlowTrueColor?
+    /// Under compute pressure the viewer would rather keep the picture size than the frame rate.
+    public private(set) var prefersSharpness = false
+    // That preference lowered the rate below `computeRateFloor`; it returns when the preference is given up.
+    private var sharpnessLoweredRate = false
+    private var rateFloor: Int {
+        min(prefersSharpness ? Self.sharpnessRateFloor : Self.computeRateFloor, upperBound.framesPerSecond)
+    }
     /// The stream runs with 4:4:4 chroma.
     public private(set) var trueColor = false
     /// The chroma the pending recommendation changes to, when it changes it.
@@ -807,7 +823,7 @@ public struct MediaQualityPolicy: Sendable {
     public init(hostDefault: StreamSettings, preferred: StreamSettings? = nil, applied: StreamSettings? = nil,
                 sourceLongestEdge: Int? = nil, bitRates: [Int] = StreamSettings.bitRates,
                 appliedSize: (width: Int, height: Int)? = nil, sustained: SustainedVideoSize? = nil,
-                choosesTrueColor: Bool = false, now: TimeInterval) throws {
+                choosesTrueColor: Bool = false, prefersSharpness: Bool = false, now: TimeInterval) throws {
         try hostDefault.validateControlValues()
         if let preferred { try preferred.validateControlValues() }
         if let applied { try applied.validateControlValues() }
@@ -822,7 +838,8 @@ public struct MediaQualityPolicy: Sendable {
         lastNow = now.isFinite ? now : 0
         lastObservationAt = lastNow; lastChangeAt = lastNow
         if let appliedSize { learn(appliedSize, for: effective) }
-        if let sustained { resume(from: sustained, choosesTrueColor: choosesTrueColor) }
+        self.prefersSharpness = prefersSharpness
+        if let sustained, sustained.sharpnessFirst == prefersSharpness { resume(from: sustained, choosesTrueColor: choosesTrueColor) }
     }
 
     // An earlier session of this pair settled at this size after compute pressure left the next one up. On a
@@ -847,7 +864,19 @@ public struct MediaQualityPolicy: Sendable {
         let edge = slowEdges.keys.min().flatMap { slowest in StreamSettings.longestEdges.last(where: { $0 < slowest }) }
         guard let learnedAspect, edge != nil || slowTrueColor != nil else { return nil }
         return SustainedVideoSize(longestEdge: edge ?? upperBound.longestEdge, aspect: learnedAspect,
-                                  leftTrueColor: slowTrueColor != nil, trueColorCost: slowTrueColor?.cost)
+                                  leftTrueColor: slowTrueColor != nil, trueColorCost: slowTrueColor?.cost,
+                                  sharpnessFirst: prefersSharpness)
+    }
+
+    /// Changes what compute pressure gives up first. Preferring the size lets a size and 4:4:4 that were
+    /// given up be tried again at once; giving the preference up returns the rate it lowered with the next
+    /// window, so that pressure can make the other choice.
+    public mutating func setPrefersSharpness(_ value: Bool, now: TimeInterval) {
+        guard accept(now), prefersSharpness != value else { return }
+        prefersSharpness = value
+        guard value else { return }
+        for (edge, slow) in slowEdges { slowEdges[edge]?.leftAt = now - slow.hold }
+        if let slow = slowTrueColor { slowTrueColor?.leftAt = now - slow.hold }
     }
 
     /// The chroma the host confirmed. A retry of 4:4:4 that came back as 4:2:0 was refused by the host's
@@ -874,7 +903,7 @@ public struct MediaQualityPolicy: Sendable {
         resetEvidence(); lastObservationAt = now; lastChangeAt = now
         upgradeHold = Self.initialUpgradeHold; bitrateHold = Self.initialBitrateHold
         bitrateUpgradedAt = nil; pixelsUpgradedAt = nil
-        slowEdges.removeAll(); slowTrueColor = nil; recentCompute = nil
+        slowEdges.removeAll(); slowTrueColor = nil; recentCompute = nil; sharpnessLoweredRate = false
         lastAdjustment = nil; localLatencyLimited = false; localRoundTrip = nil
         mappedBitrateHoldUntil = -.infinity
         forgetLoss()
@@ -923,6 +952,7 @@ public struct MediaQualityPolicy: Sendable {
             next = computeReduction(from: next, milliseconds: computeMilliseconds)
             guard next != effective else { return nil }
             if shownEdge(next) < shownEdge(effective) { leaveSlowEdge(shownEdge(effective), now: now) }
+            if prefersSharpness, next.framesPerSecond < min(Self.computeRateFloor, effective.framesPerSecond) { sharpnessLoweredRate = true }
             return recommendReduction(next, adjustment: adjustment, now: now)
         }
         for dimension in [1, 2, 0] {
@@ -957,6 +987,15 @@ public struct MediaQualityPolicy: Sendable {
         lastObservationAt = now
         guard elapsed > 0 else { return nil }
         guard sample.mediaActive, pending == nil else { resetEvidence(); return nil }
+        if !prefersSharpness, sharpnessLoweredRate {
+            sharpnessLoweredRate = false
+            if effective.framesPerSecond < rateFloor {
+                var next = effective
+                next.framesPerSecond = rateFloor
+                lastAdjustment = .raise
+                return recommend(next, now: now)
+            }
+        }
         noteCompute(sample, elapsed: elapsed)
         if sample.mappedTransfer != nil, now < mappedBitrateHoldUntil { mappedBitrateHoldUntil = now + 6 }
         if let next = relieveMappedFrameWait(sample, elapsed: elapsed, now: now) { return next }
@@ -1301,7 +1340,7 @@ public struct MediaQualityPolicy: Sendable {
     private func computeReduction(from current: StreamSettings, milliseconds: Double) -> StreamSettings {
         var next = current
         let sustained = 1_000 / milliseconds
-        let floor = min(Self.computeRateFloor, upperBound.framesPerSecond)
+        let floor = rateFloor
         if current.framesPerSecond > floor {
             let rate = StreamSettings.frameRates.last(where: { Double($0) <= sustained && $0 < current.framesPerSecond }) ?? floor
             next.framesPerSecond = max(floor, rate)
@@ -1320,7 +1359,7 @@ public struct MediaQualityPolicy: Sendable {
 
     // At the floor rate and clearly short of it.
     private func shortOfFloor(_ current: StreamSettings, milliseconds: Double) -> Bool {
-        let floor = min(Self.computeRateFloor, upperBound.framesPerSecond)
+        let floor = rateFloor
         return current.framesPerSecond <= floor && 1_000 / milliseconds < Double(floor) * Self.computeRateTolerance
     }
 
@@ -1374,7 +1413,7 @@ public struct MediaQualityPolicy: Sendable {
         guard let slow = slowTrueColor, now - slow.leftAt < Self.maximumSlowSizeHold, let cost = slow.cost,
               effective.framesPerSecond >= Self.computeRateFloor,
               let recent = recentCompute, recent.edge == shownEdge(effective), !recent.trueColor else { return true }
-        return recent.milliseconds * cost <= 1_000 / (Double(Self.computeRateFloor) * Self.computeRateTolerance)
+        return recent.milliseconds * cost <= 1_000 / (Double(rateFloor) * Self.computeRateTolerance)
     }
 
     // A size compute pressure left is tried again only when the codec's recent time per frame, grown by the
@@ -1386,7 +1425,7 @@ public struct MediaQualityPolicy: Sendable {
               effective.framesPerSecond >= Self.computeRateFloor,
               let recent = recentCompute, recent.edge == shownEdge(effective) else { return true }
         let scale = Double(shownEdge(candidate)) / Double(recent.edge)
-        return recent.milliseconds * scale * scale <= 1_000 / (Double(Self.computeRateFloor) * Self.computeRateTolerance)
+        return recent.milliseconds * scale * scale <= 1_000 / (Double(rateFloor) * Self.computeRateTolerance)
     }
 
     private func networkReduction(from current: StreamSettings, factor: Double) -> StreamSettings {

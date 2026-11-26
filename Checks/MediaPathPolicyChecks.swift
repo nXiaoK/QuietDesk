@@ -1251,6 +1251,63 @@ func runMediaPathPolicyChecks() {
         try check(!old.leftTrueColor && old.trueColorCost == nil, "A record without the chroma fields did not read as 4:4:4 kept")
     }
 
+    run("Preferring the picture size lowers the rate to 30 fps before 4:4:4 or the size go, and giving it up returns the rate") {
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 60)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
+                                             appliedSize: (3840, 2160), prefersSharpness: true, now: 0)
+        quality.synchronizeTrueColor(true)
+        var time = 0.0
+        func firstChange(_ policy: inout MediaQualityPolicy, encode: Double, within seconds: Int) -> (settings: StreamSettings, trueColor: Bool?)? {
+            for _ in 0..<seconds {
+                time += 1
+                guard let next = policy.observe(codec(fps: policy.effective.framesPerSecond, encode: encode), now: time) else { continue }
+                let chroma = policy.pendingTrueColor
+                _ = policy.confirmApplied(next, now: time)
+                if let chroma { policy.synchronizeTrueColor(chroma) }
+                return (next, chroma)
+            }
+            return nil
+        }
+        // 25 ms a frame is 40 fps: the rate drops to 30 and the whole 4:4:4 picture stays.
+        let slower = firstChange(&quality, encode: 25, within: 5)
+        try check(slower?.settings == StreamSettings(longestEdge: 8192, framesPerSecond: 30, megabits: 60)
+                  && slower?.trueColor == nil && quality.trueColor, "The rate did not drop first: \(String(describing: slower))")
+        try check(firstChange(&quality, encode: 25, within: 60) == nil, "25 ms a frame at 30 fps changed something else")
+        // Clearly short of 30 fps as well: 4:4:4 goes, then the size.
+        let chroma = firstChange(&quality, encode: 45, within: 5)
+        try check(chroma?.trueColor == false && chroma?.settings.longestEdge == 8192, "4:4:4 did not go before the size at 30 fps")
+        let size = firstChange(&quality, encode: 45, within: 5)
+        try check(size?.settings == StreamSettings(longestEdge: 2560, framesPerSecond: 30, megabits: 60), "The size did not go last")
+        try check(quality.sustainedSize?.sharpnessFirst == true, "What was sustained did not say under which preference")
+        // Giving the preference up returns the rate it lowered with the next window.
+        quality.setPrefersSharpness(false, now: time)
+        let restored = firstChange(&quality, encode: 12, within: 2)
+        try check(restored?.settings.framesPerSecond == 60 && quality.lastAdjustment == .raise, "The lowered rate did not return")
+        // Without the preference a 4K picture at 25 ms a frame goes to 2560 and stays there at 13 ms. Choosing
+        // the preference tries the whole picture again at once, and this time the rate gives way.
+        var plain = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
+                                           appliedSize: (3840, 2160), now: 0)
+        time = 0
+        try check(firstChange(&plain, encode: 25, within: 5)?.settings.longestEdge == 2560, "Compute pressure did not leave the size")
+        try plain.synchronizeApplied(plain.effective, size: (2560, 1440), now: time)
+        try check(firstChange(&plain, encode: 13, within: 400) == nil, "The size came back although the codec was no faster")
+        plain.setPrefersSharpness(true, now: time)
+        let whole = firstChange(&plain, encode: 13, within: 15)
+        try check(whole?.settings.longestEdge == 3840 && whole?.settings.framesPerSecond == 60, "The preference did not retry the size")
+        try plain.synchronizeApplied(plain.effective, size: (3840, 2160), now: time)
+        let kept = firstChange(&plain, encode: 25, within: 5)
+        try check(kept?.settings.longestEdge == 3840 && kept?.settings.framesPerSecond == 30, "The rate did not give way for the size")
+        // A size measured under one preference is not where a session under the other starts.
+        guard let record = SustainedVideoSize(longestEdge: 2560, aspect: 0.5625, sharpnessFirst: true) else { throw CheckFailure("Bad fixture") }
+        let other = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (3840, 2160), sustained: record, now: 0)
+        let same = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (3840, 2160), sustained: record,
+                                          prefersSharpness: true, now: 0)
+        try check(other.startingSettings(maximumMegabits: 20).longestEdge == 8192 && same.startingSettings(maximumMegabits: 20).longestEdge == 2560,
+                  "A session started from a size measured under the other preference")
+        try check(try JSONDecoder().decode(SustainedVideoSize.self, from: JSONEncoder().encode(record)) == record,
+                  "The preference did not round-trip with the sustained size")
+    }
+
     run("A chosen frame rate below 60 is its own floor, and raising the rate needs room in the measured codec time") {
         let low = StreamSettings(longestEdge: 8192, framesPerSecond: 30, megabits: 100)
         var thirty = try MediaQualityPolicy(hostDefault: low, preferred: low, appliedSize: (3456, 2234), now: 0)

@@ -129,6 +129,32 @@ private struct ConnectionEntryChecks {
             try require(ConnectionEntryPresentation.matching([desktop, records[0]], query: "cccc1111").map(\.id) == [desktop.id],
                         "Direct deviceID search failed")
         }
+        run("A pasted invitation fills address, port and code from either field, and other input stays as typed") {
+            let key = try PairingKey.generate()
+            let invitation = try ConnectionInvitation(address: "192.168.1.10", port: 6001, key: key)
+            var draft = ConnectionEntryDraft()
+            draft.address = "old.example"; draft.deviceID = "kept"; draft.recordID = records[0].id
+            guard let filled = ConnectionEntryPresentation.adopting("  " + invitation.text + "\n", into: draft, relayEnabled: false) else {
+                throw EntryCheckFailure("A pasted invitation was not recognised")
+            }
+            try require(filled.address == "192.168.1.10" && filled.port == "6001" && filled.code == key.code
+                        && filled.deviceID == "kept" && filled.recordID == records[0].id && filled.strategy == .direct,
+                        "The invitation did not fill address, port and code alone")
+            try require(ConnectionEntryPresentation.firstIncompleteField(relayEnabled: false, strategy: filled.strategy, address: filled.address,
+                                                                         port: filled.port, deviceID: filled.deviceID, code: filled.code) == nil,
+                        "A filled draft still had an incomplete field")
+            // A relay-only draft has no address field; automatic keeps the relay and gains the direct address.
+            draft.strategy = .relay
+            try require(ConnectionEntryPresentation.adopting(invitation.text, into: draft, relayEnabled: true)?.strategy == .direct,
+                        "A relay-only draft kept hiding the pasted address")
+            draft.strategy = .automatic
+            try require(ConnectionEntryPresentation.adopting(invitation.text, into: draft, relayEnabled: true)?.strategy == .automatic,
+                        "An automatic draft lost its relay")
+            for text in ["192.168.1.10", key.code, "quietdesk://192.168.1.10:6001", "studio.local", ""] {
+                try require(ConnectionEntryPresentation.adopting(text, into: draft, relayEnabled: false) == nil,
+                            "Ordinary input was replaced: \(text.prefix(24))")
+            }
+        }
         print("\(passed) passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

@@ -1088,6 +1088,18 @@ final class DeskModel: ObservableObject, Identifiable {
         clipboardStatus = "配对码已复制，仅在本机保留 60 秒，请通过可信渠道传递"
     }
 
+    /// Copies this Mac's address, port and pairing code as one piece of text for another Mac to paste.
+    /// It gives the same access as the pairing code, so it is kept off clipboard history and cleared the same way.
+    func copyConnectionInvitation(address: String) -> String {
+        prepareHostCode()
+        guard let port = UInt16(hostPort), let key = try? PairingKey(code: hostCode),
+              let invitation = try? ConnectionInvitation(address: address, port: port, key: key) else {
+            return hostCode.isEmpty ? "还没有配对码，请先生成或输入" : "地址或端口无效，无法生成连接信息"
+        }
+        guard ClipboardPrivacy.copyPairingCode(invitation.text) else { return "连接信息复制失败，请重试" }
+        return "已复制，包含配对码，仅在本机保留 60 秒；在另一台 Mac 的“新建连接”里粘贴"
+    }
+
     func requestAccessibility() {
         if mode == .viewer { canvas.releaseControl() }
         openPermissionSettings(.accessibility)

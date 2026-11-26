@@ -17,6 +17,9 @@ struct SharingView: View {
     @State private var page: Page = .sharing
     @State private var showCode = false
     @State private var pairingCopyStatus: String?
+    @State private var localAddresses: [String] = []
+    @State private var sharedAddress: String?
+    @State private var invitationStatus: String?
     @State private var confirmingRegeneration = false
     @State private var showRestoreCodeSheet = false
     @State private var previousCode = ""
@@ -69,7 +72,11 @@ struct SharingView: View {
         }
         .toggleStyle(.switch)
         .controlSize(.small)
-        .onAppear { model.prepareHostCode() }
+        .onAppear {
+            model.prepareHostCode()
+            refreshLocalAddresses()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in refreshLocalAddresses() }
         .onChange(of: page) { _, newPage in
             if newPage != .sharing {
                 previousCode = ""
@@ -153,6 +160,13 @@ struct SharingView: View {
             }
 
             Divider()
+            DeskSettingsRow(title: "本机地址", detail: invitationStatus
+                ?? (localAddresses.isEmpty ? "没有可用的网络地址；连上网络后回到这里"
+                    : "同一局域网的另一台 Mac 用它连接。不在同一网络时，粘贴后把地址改成公网地址或域名")) {
+                localAddressValue
+            }
+
+            Divider()
             DeskSettingsRow(title: "监听端口") {
                 Text(model.hostPort)
                     .font(.system(size: 13, design: .monospaced))
@@ -213,6 +227,54 @@ struct SharingView: View {
                 }
                 .buttonStyle(DeskButtonStyle(.danger))
             }
+        }
+    }
+
+    /// The address the invitation carries: the one chosen, while this Mac still has it, otherwise the first.
+    private var invitationAddress: String? {
+        sharedAddress.flatMap { localAddresses.contains($0) ? $0 : nil } ?? localAddresses.first
+    }
+
+    private func refreshLocalAddresses() {
+        localAddresses = ConnectionInvitation.localAddresses()
+    }
+
+    private func endpointLabel(_ address: String) -> String {
+        (address.contains(":") ? "[\(address)]" : address) + ":" + model.hostPort
+    }
+
+    @ViewBuilder
+    private var localAddressValue: some View {
+        if let address = invitationAddress {
+            HStack(spacing: 7) {
+                if localAddresses.count > 1 {
+                    Menu {
+                        ForEach(localAddresses, id: \.self) { candidate in
+                            Button(endpointLabel(candidate)) { sharedAddress = candidate; invitationStatus = nil }
+                        }
+                    } label: {
+                        Text(endpointLabel(address))
+                            .font(.system(size: 13, design: .monospaced))
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help("这台 Mac 有多个网络地址，选择另一台 Mac 能访问到的那个")
+                    .accessibilityLabel("本机地址")
+                } else {
+                    Text(endpointLabel(address))
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundStyle(DeskPalette.secondary)
+                        .textSelection(.enabled)
+                }
+                Button("复制连接信息") { invitationStatus = model.copyConnectionInvitation(address: address) }
+                    .buttonStyle(DeskButtonStyle(.secondary))
+                    .disabled(model.hostCode.isEmpty)
+                    .help("把地址、端口和配对码作为一段文字复制；在另一台 Mac 的“新建连接”里粘贴即可填好")
+            }
+        } else {
+            Text("未连接网络")
+                .font(.system(size: 13))
+                .foregroundStyle(DeskPalette.secondary)
         }
     }
 

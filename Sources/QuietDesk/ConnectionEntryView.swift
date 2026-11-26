@@ -135,6 +135,19 @@ enum ConnectionEntryPresentation {
         }
         return (try? PairingKey(code: code)) == nil ? .code : nil
     }
+
+    /// The draft with a whole invitation, pasted into any of its fields, spread over address, port and code;
+    /// nil when `text` is not one, so that ordinary input stays exactly as typed.
+    static func adopting(_ text: String, into draft: ConnectionEntryDraft, relayEnabled: Bool) -> ConnectionEntryDraft? {
+        guard let invitation = ConnectionInvitation(text: text) else { return nil }
+        var filled = draft
+        filled.address = invitation.address
+        filled.port = String(invitation.port)
+        filled.code = invitation.code
+        // The invitation names an address, which a relay-only connection has no field for.
+        if relayEnabled, filled.strategy == .relay { filled.strategy = .direct }
+        return filled
+    }
 }
 
 struct ConnectionEntryView<NodePicker: View, Options: View>: View {
@@ -356,7 +369,7 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                 .accessibilityHidden(true)
             Text("从另一台 Mac 开启共享")
                 .font(.system(size: 22, weight: .bold))
-            Text("在「本机共享」复制配对码，然后填写地址连接。")
+            Text("在被控 Mac 的「本机共享」里点“复制连接信息”，回到这里新建连接并粘贴。")
                 .font(.system(size: 13.5))
                 .foregroundStyle(DeskPalette.secondary)
 
@@ -1118,6 +1131,8 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
         .padding(26)
         .frame(width: 540)
         .onAppear(perform: focusIncompleteField)
+        .onChange(of: draft.address) { _, text in adoptInvitation(text) }
+        .onChange(of: draft.code) { _, text in adoptInvitation(text) }
     }
 
     private var connectionFields: some View {
@@ -1169,7 +1184,7 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
 
             if showsAddress {
                 labeledField(usesRelay ? "可选直连地址" : "地址") {
-                    TextField("域名或 IP（如 192.168.1.10）", text: $draft.address)
+                    TextField("域名或 IP，或粘贴被控 Mac 复制的连接信息", text: $draft.address)
                         .font(.system(size: 13))
                         .focused($focusedField, equals: .address)
                         .deskInputBox(focused: focusedField == .address)
@@ -1262,6 +1277,10 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
         .padding(26)
         .frame(width: 500)
         .onAppear { focusedField = .code }
+        // This record keeps its own address; of a pasted invitation only the code is used.
+        .onChange(of: draft.code) { _, text in
+            if let invitation = ConnectionInvitation(text: text) { draft.code = invitation.code }
+        }
     }
 
     private var pairingField: some View {
@@ -1636,6 +1655,15 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
         guard let attempt = connect(draft) else { dismissSheet(); return }
         draftFailure = attempt.message
         if sheet == .connection { focusIncompleteField() }
+    }
+
+    /// A whole invitation pasted into the address or the code field fills address, port and code at once.
+    /// Anything else stays exactly as typed.
+    private func adoptInvitation(_ text: String) {
+        guard !locked, let filled = ConnectionEntryPresentation.adopting(text, into: draft, relayEnabled: relayEnabled) else { return }
+        draft = filled
+        draftFailure = nil
+        focusIncompleteField()
     }
 
     private func focusIncompleteField() {

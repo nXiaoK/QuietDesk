@@ -1,5 +1,20 @@
 # 构建与检查记录
 
+## macOS 编解码跟不上时的降档顺序、清晰优先开关与码率快速回升（2026-11-26，`d7c5864`、`e1d2a3b`、`1d55a00`）
+
+- **做了什么**（均为控制端的画质策略与会话设置，被控端无需更新，线上协议不变）：
+  - `d7c5864`（`Sources/QuietDeskCore/MediaPathPolicy.swift`、`Sources/QuietDesk/DeskModel.swift`、`Checks/MediaPathPolicyChecks.swift`、`docs/udp-tcp-transport.md`、`docs/usage.md`）：选择了 HEVC 4:4:4 的会话在 60 fps 下限上仍明显跟不上时，先改用 4:2:0 并保持画面尺寸，4:2:0 仍跟不上才缩小最长边；4:4:4 在尺寸恢复之后按等待时间和实测耗时倍数恢复，被控端拒绝时不再重试。“4:4:4 真彩”开关继续表示所选。连接记录的 `sustainedVideoSize` 增加可选的 `leftTrueColor`、`trueColorCost`。
+  - `e1d2a3b`（另含 `Sources/QuietDesk/SessionQualityView.swift`、`Sources/QuietDesk/SessionSettingsViews.swift`）：画质高级设置新增“清晰优先”开关，默认关闭、对所有连接生效（`UserDefaults` 的 `videoPrefersSharpness`）。开启后帧率下限由 60 fps 改为 30 fps，先降帧率并保持尺寸与 4:4:4；开启时立即重试此前放弃的尺寸，关闭后恢复它降下的帧率。`sustainedVideoSize` 增加可选的 `sharpnessFirst`，只供同一偏好的会话起步。
+  - `1d55a00`：因网络降码率后，线路降档前稳定生效过的码率记约 10 分钟；之后连续约 4 秒健康且有解码画面，码率即按每次最多翻倍回到它的一半，不再要求画面用满当前码率。超过一半仍按原规则；回升中的一步在约 30 秒内又因网络降回时目标减半、等待翻倍。局域网路径不使用。
+- **跑了什么与结果**（均在本机没有生产会话连入时运行）：
+  - 最终提交 `1d55a00` 上：`QuietDeskChecks` 全量通过（**`458 passed, 0 failed`**，本组新增 3 项）；`./scripts/run-session-quality-checks.sh`（`38 passed`）、`./scripts/run-media-impairment-checks.sh`（9 项 PASS）、`./scripts/run-port-mapping-checks.sh`（28 项 PASS）通过，应用可构建。
+  - `e1d2a3b` 上另跑 `./scripts/run-session-tools-checks.sh`（`14 passed`）、`./scripts/run-connection-entry-checks.sh`（`16 passed`）；`d7c5864` 上另跑 `./scripts/run-credential-checks.sh`（`18 passed`）、`./scripts/run-relay-connection-checks.sh`（`4 passed`）。之后的提交未改动这些检查覆盖的文件，未重跑。
+  - 从干净克隆的提交 `1d55a00` 构建并校验 Universal 产物（`outputs/video-quality-policy-20261126/`，`0.7.3` build `25`，`arm64` + `x86_64`，两架构最低系统 14.0、SDK 26.5，`codesign --verify --deep --strict` 与证书固定检查通过）：DMG（SHA-256 `dd2dce82...`，`hdiutil verify` 有效）、应用 ZIP（SHA-256 `29f6c498...`）、源码 ZIP（SHA-256 `cb53b1f3...`，456 项受管文件与 `git ls-files` 逐项一致，不含构建缓存与私有配置）。
+- **没验证什么**：
+  - 未在真实双机会话中验证；“4K 4:2:0 比缩小后的 4:4:4 更清楚”与“清晰优先”的主观效果、码率快速回升在真实弱网上的表现都需实机确认。“清晰优先”开关只做了编译与策略检查，没有打开界面实际点按。
+  - 产物为 ad-hoc 临时签名（本机钥匙串没有固定自签名身份），本机生产版未被替换、重启或中断，未改动系统权限。
+  - 未运行完整的 `scripts/run-all-checks.sh` 与 Python 脚本测试（脚本未改动，上一组已通过 68 项）。Windows 控制端未改动。
+
 ## macOS 画面尺寸不再周期性来回切换，并从上次撑得住的尺寸起步（2026-11-26，`f292ef2`、`65154b5`、`9da3e59`）
 
 - **依据**：本机诊断日志（11-10 至 11-26）中，作为被控端的 74 次会话（52.1 小时）有 67 次在开始后中位 5 秒缩小画面尺寸；另有 91 次“升回更大尺寸后中位 4 秒又降回”，间隔中位 326 秒，占全部 413 次尺寸切换的 44%。被控端日志不记录降档原因；按“帧率不变只缩尺寸”和 300 秒的重试间隔推断为编解码跟不上，未在双机上单独证实。

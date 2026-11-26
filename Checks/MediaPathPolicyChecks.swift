@@ -974,7 +974,7 @@ func runMediaPathPolicyChecks() {
         try check(reduced?.framesPerSecond == 90 && reduced?.longestEdge == 8192, "10% over the frame interval did not lower the rate")
     }
 
-    run("Near the 60 fps floor the size stays; clearly short of it, one size step drops and is not retried before the longest hold") {
+    run("Near the 60 fps floor the size stays; clearly short of it, one size step drops and returns only once the codec got faster") {
         let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 120, megabits: 100)
         var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (3456, 2234), now: 0)
         var time = 0.0
@@ -994,17 +994,94 @@ func runMediaPathPolicyChecks() {
         _ = quality.confirmApplied(reduced!, now: time)
         try check(quality.lastAdjustment == .compute(.encoder, milliseconds: 25), "The size reduction lost its cause")
         let reducedAt = time
-        // 2560 encodes in 13 ms: sustainable at 60 fps, without the headroom 75 fps needs.
-        while time < reducedAt + MediaQualityPolicy.maximumUpgradeHold - 1 {
+        // 2560 encodes in 13 ms: sustainable at 60 fps, without the headroom 75 fps needs. The larger size has
+        // 1.8 times the pixels, about 24 ms a frame, so it would be left again: it is not retried at all.
+        while time < reducedAt + MediaQualityPolicy.maximumUpgradeHold * 3 {
             time += 1
             try check(quality.observe(codec(fps: 60, encode: 13), now: time) == nil,
-                      "A size measured too slow was retried, or the rate rose without headroom")
+                      "A size the codec still cannot keep up with was retried, or the rate rose without headroom")
         }
+        // The codec now needs 10 ms, about 18 ms at the larger size: within what keeps a size at the floor.
         var retried: StreamSettings?
-        while retried == nil, time < reducedAt + 400 { time += 1; retried = quality.observe(codec(fps: 60, encode: 13), now: time) }
-        try check(retried?.longestEdge == 3840 && time == reducedAt + MediaQualityPolicy.maximumUpgradeHold,
-                  "The slow size did not return once the longest hold passed")
+        let fasterAt = time
+        while retried == nil, time < fasterAt + 60 { time += 1; retried = quality.observe(codec(fps: 60, encode: 10), now: time) }
+        try check(retried?.longestEdge == 3840 && retried?.framesPerSecond == 60, "A faster codec did not bring the slow size back")
         try check(quality.lastAdjustment == .raise, "The upgrade was not reported as one")
+    }
+
+    run("A slow size retried in vain waits twice as long each time, and one that lasts as long as its wait starts over") {
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 100)
+        let smaller = StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 100)
+        // The next size step above 2560; on this 3456-wide screen it is the whole screen again.
+        let larger = StreamSettings(longestEdge: 3840, framesPerSecond: 60, megabits: 100)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (3456, 2234), now: 0)
+        var time = 0.0
+        // The larger size needs 25 ms a frame. Leaves it and returns the time that took.
+        func leave() throws -> Double {
+            let started = time
+            while time < started + 20 {
+                time += 1
+                if let next = quality.observe(codec(fps: 60, encode: 25), now: time) {
+                    try check(next == smaller && quality.confirmApplied(next, now: time), "Compute pressure did not leave the size")
+                    return time - started
+                }
+            }
+            throw CheckFailure("The slow size was kept")
+        }
+        // The smaller size encodes in 4 ms, which predicts that the larger one fits although it does not: only
+        // the wait holds a retry back. Returns how long after leaving the larger size was requested again.
+        func retry() throws -> Double {
+            let started = time
+            while time < started + 2 * MediaQualityPolicy.maximumSlowSizeHold {
+                time += 1
+                if let next = quality.observe(codec(fps: 60, encode: 4), now: time) {
+                    try check(next == larger && quality.confirmApplied(next, now: time), "The retry was not the larger size")
+                    return time - started
+                }
+            }
+            throw CheckFailure("The slow size was never retried")
+        }
+        _ = try leave()
+        var waits: [Double] = []
+        for _ in 0..<6 { waits.append(try retry()); _ = try leave() }
+        try check(waits == [300, 600, 1_200, 2_400, 3_600, 3_600], "Retries in vain did not wait twice as long each time: \(waits)")
+        // Carrying frames for less than the hour this retry waited does not prove the size.
+        func carry(_ seconds: TimeInterval) throws {
+            for _ in 0..<Int(seconds) {
+                time += 1
+                try check(quality.observe(codec(fps: 60, encode: 12), now: time) == nil, "A sustainable size was changed")
+            }
+        }
+        _ = try retry()
+        try carry(MediaQualityPolicy.maximumSlowSizeHold - 60)
+        _ = try leave()
+        try check(try retry() == MediaQualityPolicy.maximumSlowSizeHold, "A retry that did not last its wait shortened the next one")
+        // Carrying them for the whole hour does: the size is no longer a slow one.
+        try carry(MediaQualityPolicy.maximumSlowSizeHold)
+        _ = try leave()
+        try check(try retry() == 300, "A size that had lasted kept the long wait")
+        // A manual choice forgets what was measured before it.
+        _ = try leave()
+        try check(try quality.chooseManually(ceiling, now: time) == ceiling && quality.confirmApplied(ceiling, now: time),
+                  "The manual choice was not applied")
+        _ = try leave()
+        try check(try retry() == 300, "A manual choice kept the earlier wait")
+    }
+
+    run("A display of another shape is not held to the sizes measured too slow on the previous one") {
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 100)
+        let smaller = StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 100)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (3456, 2234), now: 0)
+        var time = 0.0, reduced: StreamSettings?
+        while reduced == nil, time < 20 { time += 1; reduced = quality.observe(codec(fps: 60, encode: 25), now: time) }
+        try check(reduced == smaller && quality.confirmApplied(smaller, now: time), "Compute pressure did not leave the size")
+        // The host switched to a 16:9 display. Its sizes hold other pixel counts, so 13 ms here blocks nothing.
+        try quality.synchronizeApplied(smaller, size: (2560, 1440), now: time)
+        var raised: StreamSettings?
+        let switchedAt = time
+        while raised == nil, time < switchedAt + 60 { time += 1; raised = quality.observe(codec(fps: 60, encode: 13), now: time) }
+        try check(raised?.longestEdge == 3840 && time - switchedAt == MediaQualityPolicy.initialUpgradeHold,
+                  "The new display inherited a slow size: \(String(describing: raised)) after \(time - switchedAt) s")
     }
 
     run("A chosen frame rate below 60 is its own floor, and raising the rate needs room in the measured codec time") {

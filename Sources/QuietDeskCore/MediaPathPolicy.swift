@@ -572,6 +572,9 @@ public struct MediaQualityPolicy: Sendable {
     // time needed before the next one, so an unsustainable level is not retried every few seconds.
     public static let initialUpgradeHold: TimeInterval = 10
     public static let maximumUpgradeHold: TimeInterval = 300
+    /// A size compute pressure left waits `maximumUpgradeHold` before it is tried again. A retry the same
+    /// pressure ends before the size carried frames for as long as that wait doubles it, up to this.
+    public static let maximumSlowSizeHold: TimeInterval = 3_600
     // A bitrate step reaches the running encoder without a new keyframe, so it may be tried sooner.
     public static let initialBitrateHold: TimeInterval = 4
     public static let maximumBitrateHold: TimeInterval = 120
@@ -685,8 +688,18 @@ public struct MediaQualityPolicy: Sendable {
     public private(set) var lastAdjustment: Adjustment?
     // The slowest codec time per frame in the current run of healthy windows.
     private var peakComputeMilliseconds: Double?
-    // Produced edges a compute reduction left, and when; not retried before the longest upgrade hold.
-    private var slowEdges: [Int: TimeInterval] = [:]
+    // A produced edge that compute pressure left.
+    private struct SlowEdge: Sendable {
+        var leftAt: TimeInterval
+        // The wait before the edge is tried again.
+        var hold: TimeInterval
+        // Time the edge has carried frames since it was tried again; nil until then.
+        var retriedFor: TimeInterval?
+    }
+    private var slowEdges: [Int: SlowEdge] = [:]
+    // The slower codec's time per frame at a produced edge, smoothed over the windows that measured one
+    // at the floor rate or above.
+    private var recentCompute: (edge: Int, milliseconds: Double)?
     private var mappedCreditWaitDuration: TimeInterval = 0
     private var mappedBitrateHoldUntil: TimeInterval = -.infinity
     // Local delay reduced the load on this route, so its recovery climbs one step at a time.
@@ -760,7 +773,8 @@ public struct MediaQualityPolicy: Sendable {
         resetEvidence(); lastObservationAt = now; lastChangeAt = now
         upgradeHold = Self.initialUpgradeHold; bitrateHold = Self.initialBitrateHold
         bitrateUpgradedAt = nil; pixelsUpgradedAt = nil
-        slowEdges.removeAll(); lastAdjustment = nil; localLatencyLimited = false; localRoundTrip = nil
+        slowEdges.removeAll(); recentCompute = nil
+        lastAdjustment = nil; localLatencyLimited = false; localRoundTrip = nil
         mappedBitrateHoldUntil = -.infinity
         forgetLoss()
         pending = effective == settings ? nil : settings
@@ -798,7 +812,7 @@ public struct MediaQualityPolicy: Sendable {
         if let computeMilliseconds, computeMilliseconds.isFinite, computeMilliseconds > 0 {
             next = computeReduction(from: next, milliseconds: computeMilliseconds)
             guard next != effective else { return nil }
-            if shownEdge(next) < shownEdge(effective) { slowEdges[shownEdge(effective)] = now }
+            if shownEdge(next) < shownEdge(effective) { leaveSlowEdge(shownEdge(effective), now: now) }
             return recommendReduction(next, adjustment: adjustment, now: now)
         }
         for dimension in [1, 2, 0] {
@@ -833,6 +847,7 @@ public struct MediaQualityPolicy: Sendable {
         lastObservationAt = now
         guard elapsed > 0 else { return nil }
         guard sample.mediaActive, pending == nil else { resetEvidence(); return nil }
+        noteCompute(sample, elapsed: elapsed)
         if sample.mappedTransfer != nil, now < mappedBitrateHoldUntil { mappedBitrateHoldUntil = now + 6 }
         if let next = relieveMappedFrameWait(sample, elapsed: elapsed, now: now) { return next }
         if isLocalNetwork {
@@ -1135,7 +1150,10 @@ public struct MediaQualityPolicy: Sendable {
     private mutating func learn(_ size: (width: Int, height: Int), for settings: StreamSettings) {
         let longest = max(size.width, size.height), shortest = min(size.width, size.height)
         guard (2...8192).contains(longest), shortest >= 2 else { return }
-        aspect = Double(shortest) / Double(longest)
+        let shape = Double(shortest) / Double(longest)
+        // Another shape is another display: an edge of it holds a different number of pixels.
+        if abs(shape - aspect) > 0.01 { slowEdges.removeAll(); recentCompute = nil }
+        aspect = shape
         if longest < settings.longestEdge - 2 { sourceLongestEdge = longest }
         else if let known = sourceLongestEdge, known < longest { sourceLongestEdge = nil }
     }
@@ -1176,7 +1194,39 @@ public struct MediaQualityPolicy: Sendable {
     }
 
     private func recentlySlow(_ settings: StreamSettings, now: TimeInterval) -> Bool {
-        slowEdges[shownEdge(settings)].map { now - $0 < Self.maximumUpgradeHold } ?? false
+        slowEdges[shownEdge(settings)].map { now - $0.leftAt < $0.hold } ?? false
+    }
+
+    // An edge is still listed when it is left only if its retry did not last; the next wait is twice as long.
+    private mutating func leaveSlowEdge(_ edge: Int, now: TimeInterval) {
+        let hold = slowEdges[edge].map { $0.retriedFor == nil ? $0.hold : min(Self.maximumSlowSizeHold, $0.hold * 2) }
+            ?? Self.maximumUpgradeHold
+        slowEdges[edge] = SlowEdge(leftAt: now, hold: hold)
+    }
+
+    // At the floor rate or above the codec's time per frame is what the produced size costs; below it a Mac
+    // host's encoder paces itself to the frame rate. A size tried again that carries frames for as long as
+    // it had to wait is no longer a slow one.
+    private mutating func noteCompute(_ sample: MediaPathSample, elapsed: TimeInterval) {
+        guard let milliseconds = sample.computeMilliseconds, milliseconds > 0 else { return }
+        let edge = shownEdge(effective)
+        if effective.framesPerSecond >= Self.computeRateFloor {
+            let previous = recentCompute.flatMap { $0.edge == edge ? $0.milliseconds : nil }
+            recentCompute = (edge, previous.map { $0 + (milliseconds - $0) / 4 } ?? milliseconds)
+        }
+        guard let slow = slowEdges[edge], let retriedFor = slow.retriedFor, sample.bottleneck == nil else { return }
+        if retriedFor + elapsed + mediaPolicyTimeTolerance >= slow.hold { slowEdges[edge] = nil }
+        else { slowEdges[edge]?.retriedFor = retriedFor + elapsed }
+    }
+
+    // A size compute pressure left is tried again only when the codec's recent time per frame, grown by the
+    // pixels the size adds, stays within what keeps a size at the floor rate: an unchanged codec would end
+    // the retry the way the last one ended. Below the floor rate there is no such time and the wait decides.
+    private func computeFits(size candidate: StreamSettings) -> Bool {
+        guard slowEdges[shownEdge(candidate)] != nil, effective.framesPerSecond >= Self.computeRateFloor,
+              let recent = recentCompute, recent.edge == shownEdge(effective) else { return true }
+        let scale = Double(shownEdge(candidate)) / Double(recent.edge)
+        return recent.milliseconds * scale * scale <= 1_000 / (Double(Self.computeRateFloor) * Self.computeRateTolerance)
     }
 
     private func networkReduction(from current: StreamSettings, factor: Double) -> StreamSettings {
@@ -1220,8 +1270,9 @@ public struct MediaQualityPolicy: Sendable {
             if shownEdge(next) < shownEdge(upperBound),
                let higher = StreamSettings.longestEdges.first(where: { $0 > next.longestEdge && $0 <= upperBound.longestEdge }) {
                 var candidate = next; candidate.longestEdge = higher
-                if !recentlySlow(candidate, now: now) {
+                if !recentlySlow(candidate, now: now), computeFits(size: candidate) {
                     if Double(next.megabits) >= megabits(Self.comfortableBitsPerPixel, for: candidate) {
+                        slowEdges[shownEdge(candidate)]?.retriedFor = 0
                         return recommendUpgrade(candidate, kind: .pixels, now: now)
                     }
                     blockedByBitrate = true

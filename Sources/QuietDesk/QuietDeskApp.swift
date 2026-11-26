@@ -148,7 +148,7 @@ private struct RemoteControlCommands: Commands {
         CommandMenu("远程控制") {
             Button("释放控制") {
                 activeViewer.cancelRemoteTypedText()
-                activeViewer.canvas.releaseControl()
+                activeViewer.releaseControlByChoice()
             }
             .keyboardShortcut(.escape, modifiers: [.control, .option])
 
@@ -163,14 +163,16 @@ private struct RemoteControlCommands: Commands {
             Divider()
 
             Button("发送本机剪贴板文字") {
-                activeViewer.canvas.releaseControl()
+                activeViewer.releaseControlForLocalUI()
                 activeViewer.pushClipboard()
+                activeViewer.resumeControlAfterLocalUI()
             }
             .disabled(!activeViewer.connected)
 
             Button("获取远端剪贴板文字") {
-                activeViewer.canvas.releaseControl()
+                activeViewer.releaseControlForLocalUI()
                 activeViewer.pullClipboard()
+                activeViewer.resumeControlAfterLocalUI()
             }
             .disabled(!activeViewer.connected)
 
@@ -425,8 +427,7 @@ struct DeskView: View {
                     }
                     if model.supportsRemoteAudio {
                         Button {
-                            model.canvas.releaseControl()
-                            model.setRemoteAudioEnabled(!model.remoteAudioEnabled)
+                            sessionAction { model.setRemoteAudioEnabled(!model.remoteAudioEnabled) }
                         } label: {
                             Label(model.remoteAudioEnabled ? "关闭远端声音" : "开启远端声音",
                                   systemImage: model.remoteAudioStreaming ? "speaker.wave.2.fill"
@@ -439,8 +440,7 @@ struct DeskView: View {
                     sessionClipboardMenu
 
                     Button {
-                        model.canvas.releaseControl()
-                        model.toggleFullScreen()
+                        sessionAction { model.toggleFullScreen() }
                     } label: {
                         Label(SessionToolAction.fullScreen.title(), systemImage: SessionToolAction.fullScreen.symbol())
                     }
@@ -449,7 +449,7 @@ struct DeskView: View {
                     sessionMoreMenu
 
                     Button {
-                        model.canvas.releaseControl()
+                        model.releaseControlForLocalUI()
                         showOptions.toggle()
                     } label: {
                         Label("会话设置", systemImage: "gearshape")
@@ -555,6 +555,7 @@ struct DeskView: View {
         .onChange(of: model.controlling) { _, controlling in if controlling { showFullScreenMenu = false; showOptions = false } }
         .onChange(of: showOptions || showCapsSettings || showTrafficStatistics || showSessionEffects || showPortMapping || showTypeTextSheet || showFullScreenMenu || showNewConnection || routeBenchmarkRunner != nil) { _, presented in
             updates.interfacePromptVisible = presented
+            if !presented { model.resumeControlAfterLocalUI() }
         }
         .onDisappear { updates.interfacePromptVisible = false }
     }
@@ -574,8 +575,7 @@ struct DeskView: View {
                 Section("屏幕与远端空间") {
                     ForEach(model.remoteDisplays) { display in
                         Button {
-                            model.canvas.releaseControl()
-                            model.selectRemoteDisplay(display.id)
+                            sessionAction { model.selectRemoteDisplay(display.id) }
                         } label: {
                             if display.id == model.remoteSelectedDisplayID {
                                 Label(display.summary, systemImage: "checkmark")
@@ -590,21 +590,21 @@ struct DeskView: View {
             }
 
             Button {
-                model.sendDesktopAction(.previousSpace)
+                sessionAction { model.sendDesktopAction(.previousSpace) }
             } label: {
                 Label(RemoteDesktopAction.previousSpace.title, systemImage: RemoteDesktopAction.previousSpace.toolbarSymbol)
             }
             .disabled(model.desktopActionUnavailableReason != nil)
 
             Button {
-                model.sendDesktopAction(.missionControl)
+                sessionAction { model.sendDesktopAction(.missionControl) }
             } label: {
                 Label("调度中心…", systemImage: RemoteDesktopAction.missionControl.toolbarSymbol)
             }
             .disabled(model.desktopActionUnavailableReason != nil)
 
             Button {
-                model.sendDesktopAction(.nextSpace)
+                sessionAction { model.sendDesktopAction(.nextSpace) }
             } label: {
                 Label(RemoteDesktopAction.nextSpace.title, systemImage: RemoteDesktopAction.nextSpace.toolbarSymbol)
             }
@@ -619,16 +619,14 @@ struct DeskView: View {
         Menu {
             Section("剪贴板与截图") {
                 Button {
-                    model.canvas.releaseControl()
-                    model.pushClipboard()
+                    sessionAction { model.pushClipboard() }
                 } label: {
                     Label("发送本机文字", systemImage: SessionToolAction.sendText.symbol())
                 }
                 .disabled(!model.connected)
 
                 Button {
-                    model.canvas.releaseControl()
-                    model.pullClipboard()
+                    sessionAction { model.pullClipboard() }
                 } label: {
                     Label("获取远端文字", systemImage: SessionToolAction.receiveText.symbol())
                 }
@@ -642,7 +640,7 @@ struct DeskView: View {
                 .disabled(model.remoteTypingUnavailableReason != nil)
 
                 Button {
-                    model.canvas.releaseControl()
+                    model.releaseControlForLocalUI()
                     showTypeTextSheet = true
                 } label: {
                     Label("输入文字 / 密码…", systemImage: "ellipsis.rectangle")
@@ -660,8 +658,7 @@ struct DeskView: View {
                 Divider()
 
                 Button {
-                    model.canvas.releaseControl()
-                    model.copyRemoteFrame()
+                    sessionAction { model.copyRemoteFrame() }
                 } label: {
                     Label("截取当前远端画面（⌃⌘S）", systemImage: SessionToolAction.captureFrame.symbol())
                 }
@@ -684,7 +681,7 @@ struct DeskView: View {
         Menu {
             Button {
                 model.cancelRemoteTypedText()
-                model.canvas.releaseControl()
+                model.releaseControlByChoice()
             } label: {
                 Label("释放控制（⌃⌥Esc）", systemImage: "cursorarrow")
             }
@@ -700,8 +697,7 @@ struct DeskView: View {
 
             if model.supportsRelativeMouse {
                 Button {
-                    model.canvas.releaseControl()
-                    model.setRelativeMouseEnabled(!model.relativeMouseEnabled)
+                    sessionAction { model.setRelativeMouseEnabled(!model.relativeMouseEnabled) }
                 } label: {
                     Label(
                         model.relativeMouseEnabled ? "关闭相对鼠标视角锁定" : "开启相对鼠标 · 3D 视角",
@@ -714,7 +710,7 @@ struct DeskView: View {
             Divider()
 
             Button {
-                model.canvas.releaseControl()
+                model.releaseControlForLocalUI()
                 showCapsSettings = true
             } label: {
                 Label("键盘与快捷键…", systemImage: "keyboard")
@@ -769,8 +765,7 @@ struct DeskView: View {
         return Menu {
             ForEach(SessionQualityPreset.allCases, id: \.self) { preset in
                 Button {
-                    model.canvas.releaseControl()
-                    model.chooseViewerPreset(preset)
+                    sessionAction { model.chooseViewerPreset(preset) }
                 } label: {
                     if activePreset == preset {
                         Label(preset.title, systemImage: "checkmark")
@@ -781,7 +776,7 @@ struct DeskView: View {
             }
             Divider()
             Button("高级设置…") {
-                model.canvas.releaseControl()
+                model.releaseControlForLocalUI()
                 showOptions = true
             }
         } label: {
@@ -789,6 +784,14 @@ struct DeskView: View {
         }
         .disabled(!model.connected)
         .help("当前生效的画质预设，或切换到另一项预设")
+    }
+
+    /// A session toolbar action that finishes at once: remote keys are released for it as before, and the
+    /// keyboard returns to the picture afterwards if it had it.
+    private func sessionAction(_ action: () -> Void) {
+        model.releaseControlForLocalUI()
+        action()
+        model.resumeControlAfterLocalUI()
     }
 
     private var endCurrentSessionAction: () -> Void {
@@ -938,7 +941,7 @@ struct DeskView: View {
                                 }
                         }
                         Button {
-                            model.canvas.releaseControl()
+                            model.releaseControlForLocalUI()
                             showFullScreenMenu.toggle()
                         } label: {
                             Image(systemName: showFullScreenMenu ? "chevron.right" : "slider.horizontal.3")
@@ -1204,7 +1207,7 @@ struct DeskView: View {
     }
 
     private func openPortMapping() {
-        model.canvas.releaseControl()
+        model.releaseControlForLocalUI()
         showOptions = false
         showFullScreenMenu = false
         if sessionLayout || immersive {
@@ -1216,7 +1219,7 @@ struct DeskView: View {
     }
 
     private func openTrafficStatistics() {
-        model.canvas.releaseControl()
+        model.releaseControlForLocalUI()
         showOptions = false
         showFullScreenMenu = false
         if sessionLayout || immersive {
@@ -1228,7 +1231,7 @@ struct DeskView: View {
     }
 
     private func openSessionEffects() {
-        model.canvas.releaseControl()
+        model.releaseControlForLocalUI()
         showOptions = false
         showFullScreenMenu = false
         if sessionLayout || immersive {
@@ -1241,7 +1244,7 @@ struct DeskView: View {
 
     private func openRouteBenchmark(_ record: ConnectionRecord? = nil) {
         guard !models.viewer.active, !models.viewer.working, routeBenchmarkRunner == nil else { return }
-        model.canvas.releaseControl()
+        model.releaseControlForLocalUI()
         showOptions = false
         showFullScreenMenu = false
         if sessionLayout || immersive {

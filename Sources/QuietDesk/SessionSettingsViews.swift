@@ -610,7 +610,9 @@ struct SessionControlsView: View {
     }
 
     private func perform(_ action: SessionToolAction) {
-        presentation.perform(action, releaseControl: { model.canvas.releaseControl() }) {
+        presentation.perform(action, releaseControl: {
+            if action == .releaseControl { model.releaseControlByChoice() } else { model.canvas.releaseControl() }
+        }) {
             switch action {
             case .releaseControl: break
             case .fullScreen: close(); model.toggleFullScreen()

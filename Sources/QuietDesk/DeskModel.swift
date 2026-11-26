@@ -544,6 +544,7 @@ final class DeskModel: ObservableObject, Identifiable {
     private var focusRefreshTask: Task<Void, Never>?
     private var suppressIdleFocusWake = false
     private var freshFrameRequiredOnReconnect = false
+    private var controlResumption = ControlResumption()
 
     init(mode: Mode, services: DeskServices) {
         self.mode = mode
@@ -672,6 +673,7 @@ final class DeskModel: ObservableObject, Identifiable {
             self.peer?.send(Message(.releaseInput))
         }
         canvas.onExplicitRelease = { [weak self] in
+            self?.controlResumption.cancel()
             self?.cancelRemoteTypedText()
         }
         canvas.onFocus = { [weak self] focused in
@@ -856,6 +858,35 @@ final class DeskModel: ObservableObject, Identifiable {
     func toggleFullScreen() {
         guard let window = canvas.window ?? NSApp.keyWindow else { return }
         window.toggleFullScreen(nil)
+    }
+
+    /// Releases the remote keyboard and mouse for local session UI, remembering to hand them back.
+    func releaseControlForLocalUI() {
+        controlResumption.localUIOpened(controlling: controlling)
+        canvas.releaseControl()
+    }
+
+    /// The local UI is gone: the keyboard goes back to the picture if it had it.
+    func resumeControlAfterLocalUI() {
+        controlResumption.localUIClosed(now: SessionClock.uptime)
+        // The menu or panel finishes closing first; a window that is not key yet is asked again when it is.
+        DispatchQueue.main.async { [weak self] in self?.resumeControlIfReady() }
+    }
+
+    /// Releases control because the user asked for it; it stays released.
+    func releaseControlByChoice() {
+        controlResumption.cancel()
+        canvas.releaseControl()
+    }
+
+    private func resumeControlIfReady() {
+        guard let window = canvas.window else { return }
+        let ready = NSApp.isActive && window.isKeyWindow && window.attachedSheet == nil
+            && (window.firstResponder == nil || window.firstResponder === window)
+        guard controlResumption.takeResume(now: SessionClock.uptime,
+                                           canControl: mode == .viewer && connected && effectiveViewerCanControl,
+                                           ready: ready) else { return }
+        window.makeFirstResponder(canvas)
     }
 
     func requestInputMonitoring() {
@@ -4946,6 +4977,7 @@ final class DeskModel: ObservableObject, Identifiable {
 
     /// Re-reads whether the session window is focused and visible; called on focus, visibility, lock and display changes.
     func sessionAttentionChanged() {
+        resumeControlIfReady()
         focusRefreshTask?.cancel()
         focusRefreshTask = Task { [weak self] in
             await Task.yield()
@@ -5912,6 +5944,7 @@ final class DeskModel: ObservableObject, Identifiable {
             }
         }
         reconnectWait = nil
+        controlResumption.cancel()
         connectionDiagnostics?.detach()
         if mode == .viewer, let activity { ProcessInfo.processInfo.endActivity(activity); self.activity = nil }
         performanceTimer?.cancel()

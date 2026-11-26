@@ -8,6 +8,8 @@ struct FullScreenStatusOverlay<Content: View>: View {
     let backgroundOpacity: Double?
     let reduceTransparency: Bool
     let beginDrag: () -> Void
+    /// The press that began with `beginDrag` is over, whether it moved the status or was interrupted.
+    var endDrag: () -> Void = {}
     var capsule: Bool = false
     @ViewBuilder let content: Content
     @State private var statusSize: CGSize = .zero
@@ -64,6 +66,7 @@ struct FullScreenStatusOverlay<Content: View>: View {
                     }, move: { translation = $0 }, cancel: {
                         dragOrigin = nil
                         translation = .zero
+                        endDrag()
                     }, end: { final in
                         if let dragOrigin, abs(final.width) + abs(final.height) >= 3 {
                             position = FullScreenStatusPlacement.position(
@@ -72,6 +75,7 @@ struct FullScreenStatusOverlay<Content: View>: View {
                         }
                         dragOrigin = nil
                         translation = .zero
+                        endDrag()
                     })
                 }
                 // The corner position needs the measured size; stay hidden for the first pass instead of flashing off-screen.

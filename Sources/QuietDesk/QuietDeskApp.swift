@@ -901,7 +901,8 @@ struct DeskView: View {
                     position: $model.fullScreenStatusPosition,
                     backgroundOpacity: model.fullScreenStatusBackgroundOpacity,
                     reduceTransparency: reduceTransparency,
-                    beginDrag: { model.canvas.releaseControl() },
+                    beginDrag: { model.releaseControlForLocalUI() },
+                    endDrag: { model.resumeControlAfterLocalUI() },
                     capsule: model.fullScreenStatusCompact
                 ) {
                     if model.fullScreenStatusCompact {

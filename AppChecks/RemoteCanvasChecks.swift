@@ -550,14 +550,14 @@ private struct RemoteCanvasChecks {
             let window = NSWindow(contentRect: canvas.bounds, styleMask: .borderless, backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
             defer { window.close() }
-            var position: CGPoint?, releases = 0, inputs: [RemoteInput] = []
+            var position: CGPoint?, releases = 0, ended = 0, inputs: [RemoteInput] = []
             canvas.canControl = true
             canvas.onRelease = { releases += 1 }
             canvas.onInput = { inputs.append($0) }
             let hosting = NSHostingView(rootView: CanvasView(canvas: canvas).overlay {
                 FullScreenStatusOverlay(position: Binding(get: { position }, set: { position = $0 }), backgroundOpacity: 0.6,
                     reduceTransparency: false,
-                    beginDrag: { canvas.releaseControl() }) {
+                    beginDrag: { canvas.releaseControl() }, endDrag: { ended += 1 }) {
                     Text("0:49"); Text("中继 UDP 视频"); Text("30 fps"); Text("14 ms"); Text("1920 × 1246")
                 }
             }.frame(width: 900, height: 600))
@@ -602,6 +602,7 @@ private struct RemoteCanvasChecks {
             try require(position.map { $0.x > 0 && $0.x < 1 && $0.y > 0 && $0.y < 1 } == true,
                         "Drop did not save a relative position")
             try require(inputs.isEmpty && releases == 1, "Status drag sent remote input or repeated releases")
+            try require(ended == 1, "A finished status drag did not report its end once: \(ended)")
             RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
             let savedPosition = position
             let savedOrigin = target.convert(CGPoint.zero, to: nil)
@@ -614,6 +615,8 @@ private struct RemoteCanvasChecks {
             try require(position == savedPosition && abs(cancelledOrigin.x - savedOrigin.x) < 1
                         && abs(cancelledOrigin.y - savedOrigin.y) < 1 && inputs.isEmpty,
                         "Losing window focus retained or saved an unfinished drag")
+            // The interrupted press reports its end once, so control can be handed back; the late release adds nothing.
+            try require(ended == 2, "An interrupted status drag did not report its end once: \(ended)")
         }
 
         run("Status text stays white while only its background follows the chosen opacity") {

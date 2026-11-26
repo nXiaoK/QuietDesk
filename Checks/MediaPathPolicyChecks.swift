@@ -1001,6 +1001,14 @@ func runMediaPathPolicyChecks() {
             try check(quality.observe(codec(fps: 60, encode: 13), now: time) == nil,
                       "A size the codec still cannot keep up with was retried, or the rate rose without headroom")
         }
+        // The estimate may be wrong, so an unchanged codec still gets the size back once the longest wait passed.
+        var unchanged = quality, unchangedTime = time, late: StreamSettings?
+        while late == nil, unchangedTime < reducedAt + MediaQualityPolicy.maximumSlowSizeHold + 60 {
+            unchangedTime += 1
+            late = unchanged.observe(codec(fps: 60, encode: 13), now: unchangedTime)
+        }
+        try check(late?.longestEdge == 3840 && unchangedTime == reducedAt + MediaQualityPolicy.maximumSlowSizeHold,
+                  "An unchanged codec was not given the size once after the longest wait: \(unchangedTime - reducedAt) s")
         // The codec now needs 10 ms, about 18 ms at the larger size: within what keeps a size at the floor.
         var retried: StreamSettings?
         let fasterAt = time

@@ -672,7 +672,9 @@ public struct MediaQualityPolicy: Sendable {
                                            megabits: StreamSettings.adaptiveBitRates.last!)
     private var bitRates: [Int]
     private var sourceLongestEdge: Int?
-    private var aspect = 0.625
+    // The shape of the last picture, shorter edge over longer; 16:10 until one was seen.
+    private var learnedAspect: Double?
+    private var aspect: Double { learnedAspect ?? 0.625 }
     private var lastNow: TimeInterval
     private var lastObservationAt: TimeInterval
     private var lastChangeAt: TimeInterval
@@ -1152,8 +1154,8 @@ public struct MediaQualityPolicy: Sendable {
         guard (2...8192).contains(longest), shortest >= 2 else { return }
         let shape = Double(shortest) / Double(longest)
         // Another shape is another display: an edge of it holds a different number of pixels.
-        if abs(shape - aspect) > 0.01 { slowEdges.removeAll(); recentCompute = nil }
-        aspect = shape
+        if let learnedAspect, abs(shape - learnedAspect) > 0.01 { slowEdges.removeAll(); recentCompute = nil }
+        learnedAspect = shape
         if longest < settings.longestEdge - 2 { sourceLongestEdge = longest }
         else if let known = sourceLongestEdge, known < longest { sourceLongestEdge = nil }
     }
@@ -1222,8 +1224,10 @@ public struct MediaQualityPolicy: Sendable {
     // A size compute pressure left is tried again only when the codec's recent time per frame, grown by the
     // pixels the size adds, stays within what keeps a size at the floor rate: an unchanged codec would end
     // the retry the way the last one ended. Below the floor rate there is no such time and the wait decides.
-    private func computeFits(size candidate: StreamSettings) -> Bool {
-        guard slowEdges[shownEdge(candidate)] != nil, effective.framesPerSecond >= Self.computeRateFloor,
+    // The estimate can be wrong, so once the longest wait has passed the size is tried whatever it says.
+    private func computeFits(size candidate: StreamSettings, now: TimeInterval) -> Bool {
+        guard let slow = slowEdges[shownEdge(candidate)], now - slow.leftAt < Self.maximumSlowSizeHold,
+              effective.framesPerSecond >= Self.computeRateFloor,
               let recent = recentCompute, recent.edge == shownEdge(effective) else { return true }
         let scale = Double(shownEdge(candidate)) / Double(recent.edge)
         return recent.milliseconds * scale * scale <= 1_000 / (Double(Self.computeRateFloor) * Self.computeRateTolerance)
@@ -1270,7 +1274,7 @@ public struct MediaQualityPolicy: Sendable {
             if shownEdge(next) < shownEdge(upperBound),
                let higher = StreamSettings.longestEdges.first(where: { $0 > next.longestEdge && $0 <= upperBound.longestEdge }) {
                 var candidate = next; candidate.longestEdge = higher
-                if !recentlySlow(candidate, now: now), computeFits(size: candidate) {
+                if !recentlySlow(candidate, now: now), computeFits(size: candidate, now: now) {
                     if Double(next.megabits) >= megabits(Self.comfortableBitsPerPixel, for: candidate) {
                         slowEdges[shownEdge(candidate)]?.retriedFor = 0
                         return recommendUpgrade(candidate, kind: .pixels, now: now)

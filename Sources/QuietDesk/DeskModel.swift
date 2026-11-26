@@ -155,6 +155,8 @@ final class DeskModel: ObservableObject, Identifiable {
                           side, milliseconds, Int(1_000 / milliseconds), applied.summary)
         case .compute?:
             return "视频解码未完成，已自动调整为 \(applied.summary)"
+        case .sustainedSize?:
+            return "上次连接时编解码跟不上更大的画面尺寸，本次从 \(applied.summary) 起步；编解码有余量后自动恢复，重新选择画质可立即重试"
         case .raise?, nil:
             return ""
         }
@@ -791,6 +793,7 @@ final class DeskModel: ObservableObject, Identifiable {
         case .localLatency?: values[.qualityCause] = 5
         case .network?: values[.qualityCause] = 1
         case .raise?: values[.qualityCause] = 2
+        case .sustainedSize?: values[.qualityCause] = 6
         case .compute(let cause, let milliseconds)?:
             values[.qualityCause] = cause == .encoder ? 3 : 4
             if let milliseconds, milliseconds.isFinite { values[.computeMicroseconds] = Int(min(60_000, milliseconds) * 1_000) }
@@ -2413,7 +2416,8 @@ final class DeskModel: ObservableObject, Identifiable {
         }
     }
 
-    private func configureViewerMedia(peer: Peer, settings: StreamSettings, hostDefault: StreamSettings, preferred: StreamSettings, relayRouting: Bool) throws {
+    private func configureViewerMedia(peer: Peer, settings: StreamSettings, hostDefault: StreamSettings, preferred: StreamSettings,
+                                      relayRouting: Bool, sustained: SustainedVideoSize?) throws {
         guard let target, let channel = dataChannel else { return }
         let viewer = viewerSession
         let renderer = canvas.makeMediaReceiver(diagnostics: performanceDiagnostics)
@@ -2451,7 +2455,8 @@ final class DeskModel: ObservableObject, Identifiable {
         let bitRates = supportsAdaptiveVideo ? StreamSettings.adaptiveBitRates : viewerBitRates + [hostDefault.megabits]
         viewer.mediaQuality = try MediaQualityPolicy(hostDefault: hostDefault, preferred: viewerQualityPolicy.preferred == nil ? nil : preferred,
                                                    applied: settings, bitRates: bitRates,
-                                                   appliedSize: activeVideoState.map { ($0.width, $0.height) }, now: SessionClock.now)
+                                                   appliedSize: activeVideoState.map { ($0.width, $0.height) },
+                                                   sustained: sustained, now: SessionClock.now)
         channel.configureMedia { [weak media] in media?.receive($0) ?? false }
         channel.configureReliableData { [weak media] in media?.sendReliableData($0) }
         renderer.reportDecodeTime { [weak media] milliseconds in media?.recordComputeTiming(decodeMilliseconds: milliseconds) }
@@ -3746,8 +3751,6 @@ final class DeskModel: ObservableObject, Identifiable {
                 if hello.mediaTransportV1 == true {
                     // Media adaptation replaces the old RTT shortcut; a compatibility fallback still must not be saved.
                     viewerQualityPolicy.chooseManually(savePreference: viewerQualityPolicy.maySaveCurrentChoice)
-                    try configureViewerMedia(peer: peer, settings: state.settings, hostDefault: hostDefault, preferred: preferred,
-                                             relayRouting: hello.relayTransportV1 == true && target?.relay != nil)
                     // Start non-LAN and relayed sessions from a conservative bitrate so the initial keyframe
                     // and refinement burst cannot overflow unknown WAN uplinks; healthy paths climb quickly.
                     let defaultMaxMegabits: Int? = if viewerSession.usesRelayControl {
@@ -3757,6 +3760,13 @@ final class DeskModel: ObservableObject, Identifiable {
                     } else {
                         nil
                     }
+                    let cautiousStart = (supportsAdaptiveVideo || hello.initialStreamNegotiationV1 == true) && defaultMaxMegabits != nil
+                    // Such a start is also where the size the pair's codecs sustained last time applies; local
+                    // links keep the chosen size. Route benchmarks neither read nor update it.
+                    let sustained = cautiousStart && activeRouteBenchmarkOverride == nil
+                        ? currentRecordID.flatMap { id in connections.first { $0.id == id }?.sustainedVideoSize } : nil
+                    try configureViewerMedia(peer: peer, settings: state.settings, hostDefault: hostDefault, preferred: preferred,
+                                             relayRouting: hello.relayTransportV1 == true && target?.relay != nil, sustained: sustained)
                     // A reconnect soon after a session on this route starts from the bitrate that session settled at.
                     // Route benchmarks neither read nor update that memory, so their runs stay comparable.
                     viewerSession.startingBitrateRoute = activeRouteBenchmarkOverride == nil ? startingBitrateRoute : nil
@@ -3764,13 +3774,13 @@ final class DeskModel: ObservableObject, Identifiable {
                         guard let route = viewerSession.startingBitrateRoute else { return fallback }
                         return startingBitrates.maximum(route: route, fallback: fallback, now: SessionClock.now)
                     }
-                    if supportsAdaptiveVideo || hello.initialStreamNegotiationV1 == true,
-                       let maximumMegabits = initialMaxMegabits, var tuning = videoTuning,
-                       let start = viewerSession.mediaQuality?.startingSettings(maximumMegabits: maximumMegabits), start != tuning.desired {
+                    if cautiousStart, let maximumMegabits = initialMaxMegabits, var tuning = videoTuning,
+                       let quality = viewerSession.mediaQuality,
+                       case let start = quality.startingSettings(maximumMegabits: maximumMegabits), start != tuning.desired {
                         try tuning.choose(start)
                         videoTuning = tuning
                         viewerSession.automaticVideoSettings = start
-                        viewerSession.automaticVideoAdjustment = nil
+                        viewerSession.automaticVideoAdjustment = quality.sustainedSize == nil ? nil : .sustainedSize
                     }
                 }
                 supportsIndependentCursor = viewerSession.media != nil && hello.independentCursorV1 == true
@@ -3966,6 +3976,7 @@ final class DeskModel: ObservableObject, Identifiable {
                 if viewerQualityPolicy.confirm(result.state.settings, maySave: viewerSession.pendingVideoPreferenceCanSave) {
                     saveVideoPreference(result.state.settings)
                 }
+                saveSustainedVideoSize()
             }
             sendNextVideoSettings()
             if !viewerSession.cursorConfigured { sendCursorRequest() }
@@ -4811,11 +4822,25 @@ final class DeskModel: ObservableObject, Identifiable {
               || connections[index].chromaSubsampling != savedChromaPreference else { return }
         connections[index].videoSettings = settings
         connections[index].chromaSubsampling = savedChromaPreference
+        // Measured under the previous choice.
+        connections[index].sustainedVideoSize = nil
         do {
             try ConnectionStore.save(connections)
             services.notifyConnectionsChanged(excluding: self)
         }
         catch { videoSettingsStatus = "画质已生效，但保存记录失败：\(error.localizedDescription)" }
+    }
+
+    /// Keeps the size the codecs sustained with the connection record, where the next session starts. Only a
+    /// session whose video ran off the local network adapts to its codecs, so only it has something to say.
+    private func saveSustainedVideoSize() {
+        guard activeRouteBenchmarkOverride == nil, viewerSession.mediaCommitted,
+              let quality = viewerSession.mediaQuality, !quality.isLocalNetwork, let id = currentRecordID,
+              let index = connections.firstIndex(where: { $0.id == id }),
+              connections[index].sustainedVideoSize != quality.sustainedSize else { return }
+        connections[index].sustainedVideoSize = quality.sustainedSize
+        // Losing this only makes the next session find the size again.
+        if (try? ConnectionStore.save(connections)) != nil { services.notifyConnectionsChanged(excluding: self) }
     }
 
     func resumeSession() { recordSessionActivity() }
@@ -5845,6 +5870,7 @@ final class DeskModel: ObservableObject, Identifiable {
            let quality = viewerSession.mediaQuality, !quality.isLocalNetwork, let settled = quality.settledMegabits {
             startingBitrates.remember(settled, reducing: quality.effective.megabits < settled, route: route, now: SessionClock.now)
         }
+        saveSustainedVideoSize()
         if activeRouteBenchmarkOverride != nil {
             let route = (mediaTransportStatus.isEmpty || (mediaTransportStatus == "TCP 兼容模式" && !connected))
                 ? controlTransportStatus

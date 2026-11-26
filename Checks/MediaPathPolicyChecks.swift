@@ -1092,6 +1092,77 @@ func runMediaPathPolicyChecks() {
                   "The new display inherited a slow size: \(String(describing: raised)) after \(time - switchedAt) s")
     }
 
+    run("A session starts from the size the pair's codecs sustained last time, on a picture of the same shape only") {
+        // A 3456 × 2234 host whose hello shows its default 1920 picture; the viewer's saved choice is the original size.
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 60), hello = StreamSettings()
+        func policy(helloSize: (Int, Int) = (1920, 1240), sustained: SustainedVideoSize? = nil) throws -> MediaQualityPolicy {
+            try MediaQualityPolicy(hostDefault: hello, preferred: ceiling, applied: hello, bitRates: StreamSettings.adaptiveBitRates,
+                                   appliedSize: helloSize, sustained: sustained, now: 0)
+        }
+        var time = 0.0
+        func apply(_ settings: StreamSettings, to quality: inout MediaQualityPolicy) throws {
+            _ = quality.confirmApplied(settings, now: time)
+            try quality.synchronizeApplied(settings, size: settings.dimensions(width: 3456, height: 2234), now: time)
+        }
+        // Feeds one-second windows and returns the size changes the policy asked for, with their times.
+        func run(_ quality: inout MediaQualityPolicy, seconds: Int, encode: Double) throws -> [(edge: Int, at: Double)] {
+            var changes: [(edge: Int, at: Double)] = []
+            for _ in 0..<seconds {
+                time += 1
+                guard let next = quality.observe(codec(fps: 60, encode: encode), now: time) else { continue }
+                if next.longestEdge != quality.effective.longestEdge { changes.append((next.longestEdge, time)) }
+                try apply(next, to: &quality)
+            }
+            return changes
+        }
+        // Without history the session starts at the ceiling, and its codecs, at 25 ms a frame, have to leave it
+        // (three seconds of such windows are what a reduction takes).
+        var first = try policy()
+        let fresh = first.startingSettings(maximumMegabits: 20)
+        try check(first.sustainedSize == nil && fresh == StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 20),
+                  "A pair without history did not start at its ceiling: \(fresh)")
+        try apply(fresh, to: &first)
+        try check(try run(&first, seconds: 3, encode: 25).map(\.edge) == [2560], "Compute pressure did not leave the full screen")
+        guard let kept = first.sustainedSize, kept.longestEdge == 2560, abs(kept.aspect - 2234.0 / 3456) < 0.001 else {
+            throw CheckFailure("The size the codecs sustained was not reported: \(String(describing: first.sustainedSize))")
+        }
+        // The next session begins there with the bitrate cap of its path, and waits before trying more.
+        time = 0
+        var second = try policy(sustained: kept)
+        let start = second.startingSettings(maximumMegabits: 20)
+        try check(start == StreamSettings(longestEdge: 2560, framesPerSecond: 60, megabits: 20) && second.sustainedSize?.longestEdge == 2560,
+                  "The next session did not start from the sustained size: \(start)")
+        try apply(start, to: &second)
+        let hold = MediaQualityPolicy.maximumUpgradeHold
+        let retry = try run(&second, seconds: Int(hold), encode: 8)
+        try check(retry.map(\.edge) == [3840] && retry.first?.at == hold, "The size left last time did not wait its turn: \(retry)")
+        // That request produced the whole 3456-wide screen. Leaving it again doubles the wait, so the size
+        // remembered by its setting is the one the screen really has.
+        let left = try run(&second, seconds: 3, encode: 25)
+        try check(left.map(\.edge) == [2560], "The retried size was kept at 25 ms a frame")
+        let again = try run(&second, seconds: Int(hold) * 2, encode: 8)
+        try check(again.map(\.edge) == [3840] && again.first!.at - left.first!.at == hold * 2,
+                  "A retry in vain did not double the wait of a size resumed from the record: \(again)")
+        // Once it carried frames for as long as it waited, the pair has no smaller size to start from.
+        try check(try run(&second, seconds: Int(hold) * 2, encode: 12).isEmpty && second.sustainedSize == nil,
+                  "A size that lasted is still remembered as too slow")
+        // Another shape is another display, and a screen no larger than the sustained size has nothing above it.
+        let otherShape = try policy(helloSize: (1920, 1080), sustained: kept)
+        try check(otherShape.startingSettings(maximumMegabits: 20).longestEdge == 8192 && otherShape.sustainedSize == nil,
+                  "A 16:9 display started from the size measured on a 3:2 one")
+        var smaller = try policy(sustained: kept)
+        try smaller.synchronizeApplied(smaller.startingSettings(maximumMegabits: 20), size: (1728, 1117), now: 0)
+        try check(smaller.sustainedSize == nil, "A screen smaller than the sustained size kept a slow size above itself")
+        // The record keeps it, and a value it cannot use does not hide the record.
+        let record = ConnectionRecord(address: "home.test", port: 5908, name: "Home", sustainedVideoSize: kept)
+        let data = try JSONEncoder().encode(record)
+        try check(try JSONDecoder().decode(ConnectionRecord.self, from: data) == record, "The record lost the sustained size")
+        var raw = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        raw["sustainedVideoSize"] = ["longestEdge": 2000, "aspect": 0.6464]
+        let recovered = try JSONDecoder().decode(ConnectionRecord.self, from: JSONSerialization.data(withJSONObject: raw))
+        try check(recovered.id == record.id && recovered.sustainedVideoSize == nil, "An unusable sustained size was kept or hid the record")
+    }
+
     run("A chosen frame rate below 60 is its own floor, and raising the rate needs room in the measured codec time") {
         let low = StreamSettings(longestEdge: 8192, framesPerSecond: 30, megabits: 100)
         var thirty = try MediaQualityPolicy(hostDefault: low, preferred: low, appliedSize: (3456, 2234), now: 0)

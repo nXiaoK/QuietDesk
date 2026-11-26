@@ -555,6 +555,30 @@ public struct MediaStartingBitrate: Sendable {
     }
 }
 
+/// The size setting a host's and viewer's codecs kept up with after a larger one proved too slow, with the
+/// shape of the picture it was measured on (shorter edge over longer): an edge of another shape holds a
+/// different number of pixels. Kept with the connection record, the pair's next session starts from it.
+public struct SustainedVideoSize: Codable, Equatable, Sendable {
+    public let longestEdge: Int
+    public let aspect: Double
+
+    public init?(longestEdge: Int, aspect: Double) {
+        guard StreamSettings.longestEdges.contains(longestEdge), aspect.isFinite, aspect > 0, aspect <= 1 else { return nil }
+        self.longestEdge = longestEdge; self.aspect = aspect
+    }
+
+    private enum CodingKeys: String, CodingKey { case longestEdge, aspect }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        guard let size = SustainedVideoSize(longestEdge: try values.decode(Int.self, forKey: .longestEdge),
+                                            aspect: try values.decode(Double.self, forKey: .aspect)) else {
+            throw DeskError.invalid("已保存的可持续画面尺寸无效")
+        }
+        self = size
+    }
+}
+
 // Automatic recommendations change pending/effective settings, never the user's preferred ceiling.
 // The coordinator serializes requests and confirms only settings actually applied by the host.
 //
@@ -654,6 +678,8 @@ public struct MediaQualityPolicy: Sendable {
     /// Why the last automatic recommendation was made, for diagnostics and the quality tooltip.
     public enum Adjustment: Equatable, Sendable {
         case network, localLatency, raise
+        /// The session started at the size an earlier one of this pair sustained.
+        case sustainedSize
         case compute(MediaBottleneck, milliseconds: Double?)
     }
 
@@ -744,7 +770,8 @@ public struct MediaQualityPolicy: Sendable {
     /// `bitRates` are the steps the host accepts; the ceiling itself always comes from the user or host.
     public init(hostDefault: StreamSettings, preferred: StreamSettings? = nil, applied: StreamSettings? = nil,
                 sourceLongestEdge: Int? = nil, bitRates: [Int] = StreamSettings.bitRates,
-                appliedSize: (width: Int, height: Int)? = nil, now: TimeInterval) throws {
+                appliedSize: (width: Int, height: Int)? = nil, sustained: SustainedVideoSize? = nil,
+                now: TimeInterval) throws {
         try hostDefault.validateControlValues()
         if let preferred { try preferred.validateControlValues() }
         if let applied { try applied.validateControlValues() }
@@ -759,12 +786,36 @@ public struct MediaQualityPolicy: Sendable {
         lastNow = now.isFinite ? now : 0
         lastObservationAt = lastNow; lastChangeAt = lastNow
         if let appliedSize { learn(appliedSize, for: effective) }
+        if let sustained { resume(from: sustained) }
     }
 
-    /// The first request for a path known to be narrow: the ceiling with its bitrate capped.
+    // An earlier session of this pair settled at this size after compute pressure left the next one up. On a
+    // picture of the same shape that next size starts as one just left, so this session begins below it
+    // instead of finding out again.
+    private mutating func resume(from sustained: SustainedVideoSize) {
+        guard let learnedAspect, abs(sustained.aspect - learnedAspect) <= 0.01,
+              let larger = StreamSettings.longestEdges.first(where: { $0 > sustained.longestEdge && $0 <= upperBound.longestEdge }) else { return }
+        var kept = upperBound, slow = upperBound
+        kept.longestEdge = sustained.longestEdge; slow.longestEdge = larger
+        // A screen no larger than the sustained size produces the same picture at both settings.
+        guard shownEdge(kept) < shownEdge(slow) else { return }
+        slowEdges[shownEdge(slow)] = SlowEdge(leftAt: lastNow, hold: Self.maximumUpgradeHold)
+    }
+
+    /// The largest size setting below every size compute pressure left and that has not lasted since, with
+    /// the shape of the current picture; nil while there is none.
+    public var sustainedSize: SustainedVideoSize? {
+        guard let learnedAspect, let slowest = slowEdges.keys.min(),
+              let edge = StreamSettings.longestEdges.last(where: { $0 < slowest }) else { return nil }
+        return SustainedVideoSize(longestEdge: edge, aspect: learnedAspect)
+    }
+
+    /// The first request: the ceiling, with its bitrate capped for a path known to be narrow, at the size
+    /// an earlier session sustained when it had to leave a larger one.
     public func startingSettings(maximumMegabits: Int) -> StreamSettings {
         var start = upperBound
         if let capped = bitRates.last(where: { $0 <= maximumMegabits }), capped < start.megabits { start.megabits = capped }
+        if let sustained = sustainedSize { start.longestEdge = sustained.longestEdge }
         return start
     }
 
@@ -1156,7 +1207,15 @@ public struct MediaQualityPolicy: Sendable {
         // Another shape is another display: an edge of it holds a different number of pixels.
         if let learnedAspect, abs(shape - learnedAspect) > 0.01 { slowEdges.removeAll(); recentCompute = nil }
         learnedAspect = shape
-        if longest < settings.longestEdge - 2 { sourceLongestEdge = longest }
+        if longest < settings.longestEdge - 2 {
+            sourceLongestEdge = longest
+            // No size above the whole screen exists. One listed there before the screen's edge was known,
+            // and being tried again now, is the whole screen; any other is forgotten.
+            for (edge, entry) in slowEdges where edge > longest {
+                slowEdges[edge] = nil
+                if entry.retriedFor != nil, slowEdges[longest] == nil { slowEdges[longest] = entry }
+            }
+        }
         else if let known = sourceLongestEdge, known < longest { sourceLongestEdge = nil }
     }
 

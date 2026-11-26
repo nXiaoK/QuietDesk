@@ -232,6 +232,10 @@ final class DeskModel: ObservableObject, Identifiable {
             } else { UserDefaults.standard.removeObject(forKey: Self.fullScreenStatusPositionKey) }
         }
     }
+    /// Full screen shows the session toolbar while the pointer rests at the top edge. On unless turned off.
+    @Published var fullScreenToolbarEnabled = UserDefaults.standard.object(forKey: "fullScreenToolbarEnabled") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(fullScreenToolbarEnabled, forKey: "fullScreenToolbarEnabled") }
+    }
     /// Where the viewer dragged the full-screen controls button along the trailing edge (0 top, 1 bottom);
     /// nil keeps it centred.
     @Published var fullScreenControlsPosition = UserDefaults.standard.object(forKey: "fullScreenControlsPosition") as? Double {

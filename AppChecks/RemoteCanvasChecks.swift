@@ -233,6 +233,36 @@ private final class OffscreenInteraction<Content: View> {
     func close() { window.close() }
 }
 
+/// The remote picture with the full-screen toolbar over it, laid out the way the session window does.
+private struct ToolbarRoutingFixture: View {
+    @ObservedObject var controller: FullScreenToolbarController
+    let canvas: RemoteCanvas
+    let size: CGSize
+    let leaveFullScreen: () -> Void
+    let canary: () -> Void
+    let measured: (CGRect) -> Void
+
+    var body: some View {
+        CanvasView(canvas: canvas)
+            .overlay(alignment: .top) {
+                if controller.revealed {
+                    FullScreenToolbar(reduceTransparency: false) {
+                        FullScreenToolbarButton(title: "退出全屏", symbol: "arrow.down.right.and.arrow.up.left", action: leaveFullScreen)
+                        FullScreenToolbarDivider()
+                        FullScreenToolbarButton(title: "断开", symbol: "stop.circle", destructive: true, action: {})
+                    }
+                    .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }, action: measured)
+                    .padding(.top, FullScreenToolbarReveal.toolbarTop)
+                }
+            }
+            .overlay(alignment: .bottomLeading) {
+                Button(action: canary) { Color.clear.frame(width: 20, height: 20).contentShape(Rectangle()) }
+                    .buttonStyle(.plain)
+            }
+            .frame(width: size.width, height: size.height)
+    }
+}
+
 @main
 private struct RemoteCanvasChecks {
     @MainActor
@@ -1718,6 +1748,66 @@ private struct RemoteCanvasChecks {
                     try require(toggles == 3 && position == kept, "A 2 pt wobble was not a click: \(toggles), \(String(describing: position))")
                     try interaction.drag(from: moved, by: -2_000)
                     try require(position == 1 && toggles == 3, "A drag past the bottom edge left the screen or toggled: \(String(describing: position))")
+                }
+            }
+        }
+
+        do {
+            let size = CGSize(width: 900, height: 600)
+            let canvas = RemoteCanvas(frame: NSRect(origin: .zero, size: size))
+            canvas.remoteSize = size
+            canvas.canControl = true
+            var inputs: [RemoteInput.Kind] = [], exits = 0, canary = 0, bar = CGRect.zero
+            canvas.onInput = { inputs.append($0.kind) }
+            let controller = FullScreenToolbarController()
+            let interaction = OffscreenInteraction(size: size, content: ToolbarRoutingFixture(
+                controller: controller, canvas: canvas, size: size, leaveFullScreen: { exits += 1 },
+                canary: { canary += 1 }, measured: { bar = $0 }))
+            defer { interaction.close() }
+            let name = "The full-screen toolbar takes clicks only on itself and only while it shows"
+            try? interaction.click(at: CGPoint(x: 10, y: 10))
+            if canary != 1 {
+                print("SKIP \(name): this session delivers no pointer events to an off-screen SwiftUI window")
+            } else {
+                run(name) {
+                    // Points are given from the top-left corner, as the layout is; events count from the bottom.
+                    @MainActor func click(x: CGFloat, fromTop: CGFloat) throws -> [RemoteInput.Kind] {
+                        inputs.removeAll()
+                        try interaction.click(at: CGPoint(x: x, y: size.height - fromTop))
+                        return inputs
+                    }
+                    let pressed: [RemoteInput.Kind] = [.down, .up]
+                    let middle = FullScreenToolbarReveal.toolbarTop + FullScreenToolbarReveal.toolbarHeight / 2
+                    // Hidden, nothing lies over the picture: where the toolbar will be and the edge that brings it.
+                    let hiddenMiddle = try click(x: size.width / 2, fromTop: middle)
+                    let hiddenEdge = try click(x: size.width / 2, fromTop: 1)
+                    try require(hiddenMiddle == pressed && hiddenEdge == pressed && exits == 0,
+                                "A hidden toolbar kept clicks from the remote picture: \(hiddenMiddle), \(hiddenEdge)")
+                    controller.sample(.edge, buttonPressed: false, now: 100)
+                    controller.sample(.edge, buttonPressed: false, now: 101)
+                    interaction.settle()
+                    try require(controller.revealed && bar.width > 120 && bar.width < 420
+                                && abs(bar.midX - size.width / 2) < 1 && abs(bar.minY - FullScreenToolbarReveal.toolbarTop) < 1
+                                && abs(bar.height - FullScreenToolbarReveal.toolbarHeight) < 1,
+                                "The toolbar did not appear centred below the top edge: \(bar)")
+                    // Its first button answers, and neither that click nor one on its rim reaches the picture.
+                    let onButton = try click(x: bar.minX + 40, fromTop: bar.midY)
+                    try require(onButton.isEmpty && exits == 1,
+                                "The toolbar button did not answer, or the picture received its click: \(exits), \(onButton)")
+                    let onRim = try click(x: bar.minX + 3, fromTop: bar.midY)
+                    try require(onRim.isEmpty && exits == 1,
+                                "A click on the rim of the toolbar went through to the picture or pressed a button: \(exits), \(onRim)")
+                    // Beside it, below it and at the edge above it the picture is still in reach.
+                    let beside = try click(x: bar.minX - 12, fromTop: bar.midY)
+                    let below = try click(x: bar.midX, fromTop: bar.maxY + 10)
+                    let above = try click(x: bar.midX, fromTop: 1)
+                    try require(beside == pressed && below == pressed && above == pressed && exits == 1,
+                                "The toolbar kept clicks around it from the remote picture: \(beside), \(below), \(above)")
+                    controller.stop()
+                    interaction.settle()
+                    let afterwards = try click(x: bar.midX, fromTop: bar.midY)
+                    try require(!controller.revealed && afterwards == pressed,
+                                "A toolbar that left still kept clicks from the remote picture: \(afterwards)")
                 }
             }
         }

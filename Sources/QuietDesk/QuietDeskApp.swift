@@ -311,6 +311,7 @@ struct DeskView: View {
     @State private var showCapsSettings = false
     @State private var showOptions = false
     @State private var showFullScreenMenu = false
+    @StateObject private var fullScreenToolbar = FullScreenToolbarController()
     @State private var showTrafficStatistics = false
     @State private var showSessionEffects = false
     @State private var showPortMapping = false
@@ -552,11 +553,17 @@ struct DeskView: View {
             dismissedClipboardStatus = message
         }
         .onChange(of: model.controlling) { _, controlling in if controlling { showFullScreenMenu = false; showOptions = false } }
+        .onChange(of: fullScreenToolbarCanvas, initial: true) { _, canvas in
+            if canvas != nil { fullScreenToolbar.start(canvas: model.canvas) } else { fullScreenToolbar.stop() }
+        }
         .onChange(of: showOptions || showCapsSettings || showTrafficStatistics || showSessionEffects || showPortMapping || showTypeTextSheet || showFullScreenMenu || showNewConnection || routeBenchmarkRunner != nil) { _, presented in
             updates.interfacePromptVisible = presented
             if !presented { model.resumeControlAfterLocalUI() }
         }
-        .onDisappear { updates.interfacePromptVisible = false }
+        .onDisappear {
+            updates.interfacePromptVisible = false
+            fullScreenToolbar.stop()
+        }
     }
 
     private var sessionScreenAndSpacesMenu: some View {
@@ -776,7 +783,8 @@ struct DeskView: View {
             Divider()
             Button("高级设置…") {
                 model.releaseControlForLocalUI()
-                showOptions = true
+                // Full screen has no window toolbar to attach the popover to; its panel holds the same settings.
+                if immersive { showFullScreenMenu = true } else { showOptions = true }
             }
         } label: {
             Text(activePreset?.title ?? "连接画质")
@@ -791,6 +799,12 @@ struct DeskView: View {
         model.releaseControlForLocalUI()
         action()
         model.resumeControlAfterLocalUI()
+    }
+
+    private var fullScreenToolbarBottom: CGFloat { FullScreenToolbarReveal.toolbarTop + FullScreenToolbarReveal.toolbarHeight }
+    /// The picture whose top edge brings the full-screen toolbar, while there is one.
+    private var fullScreenToolbarCanvas: ObjectIdentifier? {
+        immersive && model.fullScreenToolbarEnabled ? ObjectIdentifier(model.canvas) : nil
     }
 
     private var endCurrentSessionAction: () -> Void {
@@ -910,8 +924,28 @@ struct DeskView: View {
                     sessionNotice(notice, symbol: model.remoteTypingWorking ? "keyboard.badge.ellipsis" : "keyboard")
                 }
             }
-            .padding(.top, immersive ? 44 : 16).allowsHitTesting(false)
+            .padding(.top, immersive ? (fullScreenToolbar.revealed ? fullScreenToolbarBottom + 12 : 44) : 16).allowsHitTesting(false)
         }
+        .overlay(alignment: .top) {
+            if immersive && fullScreenToolbar.revealed {
+                FullScreenToolbar(reduceTransparency: reduceTransparency) {
+                    sessionScreenAndSpacesMenu.fullScreenToolbarMenu()
+                    if model.supportsLiveSettings {
+                        sessionQualityMenu.fullScreenToolbarMenu()
+                    }
+                    FullScreenToolbarDivider()
+                    FullScreenToolbarButton(title: SessionToolAction.fullScreen.title(fullScreen: true),
+                                            symbol: SessionToolAction.fullScreen.symbol(fullScreen: true)) {
+                        sessionAction { model.toggleFullScreen() }
+                    }
+                    FullScreenToolbarButton(title: SessionToolAction.endSession.title(), symbol: SessionToolAction.endSession.symbol(),
+                                            destructive: true, action: endCurrentSessionAction)
+                }
+                .padding(.top, FullScreenToolbarReveal.toolbarTop)
+                .transition(.opacity)
+            }
+        }
+        .animation(.easeOut(duration: 0.14), value: fullScreenToolbar.revealed)
         .overlay(alignment: .topTrailing) {
             if showClipboardActivity {
                 clipboardActivity.padding(.top, 16).padding(.trailing, immersive ? 76 : 16)

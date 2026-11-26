@@ -16,7 +16,7 @@ A native macOS remote desktop app for your own Macs. Connect directly over a LAN
 
 | Feature | What it does |
 | --- | --- |
-| Remote control | Mouse (including side buttons 4/5 and 3D relative-mouse lock), keyboard, drag, scroll, trackpad pinch/rotate/smart-magnify gestures, host & viewer view-only access/input lock modes, and floating fullscreen controls |
+| Remote control | Mouse (including side buttons 4/5 and 3D relative-mouse lock), keyboard, drag, scroll, trackpad pinch/rotate/smart-magnify gestures, host & viewer view-only access/input lock modes, floating fullscreen controls and a top-edge hover toolbar |
 | Self-hosted relay | Single-node full-session relay by device ID, with optional direct path and separate control/media routing |
 | Route quality benchmark | Before connecting, benchmark Direct (UDP/TCP) and each Relay node (auto-punch, pure relay UDP, pure relay TCP) over 15 s / 30 s (default) / 1 min with real video traffic and UDP packet-loss metrics, persist every run locally, and generate a cumulative historical quality assessment with one-click connection |
 | TCP port forwarding | Forward a local loopback port to a TCP service on the host. Devices that have previously remote-controlled the host start immediately without confirmation; other devices require host approval. Start from the home screen, a windowed session or full screen. Desktop sessions take priority over transfers. |

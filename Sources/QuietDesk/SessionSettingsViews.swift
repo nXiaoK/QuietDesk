@@ -210,6 +210,10 @@ struct ConnectionSettingsView: View {
                     .labelsHidden()
                 }
                 Divider()
+                DeskSettingsRow(title: "全屏顶部工具条", detail: "指针在屏幕顶部中间停留片刻时显示切换屏幕、画质、退出全屏和断开") {
+                    Toggle("全屏顶部工具条", isOn: $model.fullScreenToolbarEnabled).labelsHidden()
+                }
+                Divider()
                 DeskSettingsRow(title: "全屏显示实时连接指标") {
                     Toggle("全屏显示实时连接指标", isOn: $model.showFullScreenStatistics).labelsHidden()
                 }
@@ -450,6 +454,8 @@ private struct ConnectionOptionsSections: View {
                 }
             }
 
+            Divider()
+            compactToggleRow("全屏顶部工具条", detail: "指针在屏幕顶部中间停留片刻时显示", isOn: $model.fullScreenToolbarEnabled)
             Divider()
             compactToggleRow("全屏实时连接指标", isOn: $model.showFullScreenStatistics)
             if model.showFullScreenStatistics {

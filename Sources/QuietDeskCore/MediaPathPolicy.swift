@@ -811,6 +811,9 @@ public struct MediaQualityPolicy: Sendable {
     /// A level passed through for seconds while climbing or collapsing is not one the route settled at.
     public private(set) var settledMegabits: Int?
     private var bitrateHeld: (megabits: Int, since: TimeInterval)?
+    // The bitrate this route had settled at when network reductions took it lower, and when they began.
+    // It carried that much until then, so the way back to half of it needs no proof from a busy screen.
+    private var carriedBitrate: (megabits: Int, at: TimeInterval)?
     /// Loss this path showed at a lower bitrate as well; up to about it, loss alone changes nothing.
     public private(set) var toleratedLoss = 0.0
     private var lossEvidence = LossEvidence()
@@ -902,7 +905,7 @@ public struct MediaQualityPolicy: Sendable {
         preferred = settings
         resetEvidence(); lastObservationAt = now; lastChangeAt = now
         upgradeHold = Self.initialUpgradeHold; bitrateHold = Self.initialBitrateHold
-        bitrateUpgradedAt = nil; pixelsUpgradedAt = nil
+        bitrateUpgradedAt = nil; pixelsUpgradedAt = nil; carriedBitrate = nil
         slowEdges.removeAll(); slowTrueColor = nil; recentCompute = nil; sharpnessLoweredRate = false
         lastAdjustment = nil; localLatencyLimited = false; localRoundTrip = nil
         mappedBitrateHoldUntil = -.infinity
@@ -918,7 +921,7 @@ public struct MediaQualityPolicy: Sendable {
         isLocalNetwork = enabled
         mappedBitrateHoldUntil = -.infinity
         localLatencyLimited = false; localRoundTrip = nil
-        settledMegabits = nil; bitrateHeld = nil
+        settledMegabits = nil; bitrateHeld = nil; carriedBitrate = nil
         forgetLoss()
         lastObservationAt = now
         resetEvidence()
@@ -1451,6 +1454,10 @@ public struct MediaQualityPolicy: Sendable {
     private mutating func upgrade(now: TimeInterval) -> StreamSettings? {
         guard now >= mappedBitrateHoldUntil, now - lastChangeAt + mediaPolicyTimeTolerance >= 3 else { return nil }
         var next = effective
+        if let step = recoveryStep(from: next, now: now) {
+            next.megabits = step
+            return recommendUpgrade(next, kind: .bitrate, now: now)
+        }
         let pixelsDuration = localLatencyLimited ? filledDuration : (next.megabits < upperBound.megabits ? activeDuration : healthyDuration)
         let pixelsBelowCeiling = next.framesPerSecond < upperBound.framesPerSecond || shownEdge(next) < shownEdge(upperBound)
         let sustainedDegradedHealth = !isLocalNetwork && !localLatencyLimited && pixelsBelowCeiling
@@ -1494,6 +1501,21 @@ public struct MediaQualityPolicy: Sendable {
         return recommendUpgrade(next, kind: .bitrate, now: now)
     }
 
+    // After network reductions the bitrate first returns to half of what the route carried before them, at
+    // most doubling each time. Healthy windows with decoded frames are enough for that: the route carried
+    // twice as much minutes ago. Beyond half, or once that is old, a higher bitrate has to be filled again.
+    private mutating func recoveryStep(from current: StreamSettings, now: TimeInterval) -> Int? {
+        guard let carried = carriedBitrate, !isLocalNetwork else { return nil }
+        let goal = bitRates.last(where: { $0 <= min(upperBound.megabits, carried.megabits / 2) }) ?? 0
+        guard now - carried.at < MediaStartingBitrate.lifetime, current.megabits < goal else {
+            carriedBitrate = nil
+            return nil
+        }
+        guard healthyDuration + mediaPolicyTimeTolerance >= bitrateHold else { return nil }
+        return bitRates.last(where: { $0 > current.megabits && $0 <= min(goal, current.megabits * 2) })
+            ?? bitRates.first(where: { $0 > current.megabits && $0 <= goal })
+    }
+
     private func nextBitrateStep(from current: Int) -> Int? {
         let target = Double(current) * 1.25
         return bitRates.first(where: { Double($0) >= target && $0 <= upperBound.megabits })
@@ -1517,6 +1539,14 @@ public struct MediaQualityPolicy: Sendable {
     private mutating func recommendReduction(_ settings: StreamSettings, trueColor: Bool? = nil, adjustment: Adjustment,
                                              now: TimeInterval) -> StreamSettings {
         lastAdjustment = adjustment
+        if adjustment == .network {
+            if bitrateUpgradedAt != nil, let carried = carriedBitrate {
+                // A step back up did not hold: the route no longer carries what it did.
+                carriedBitrate = (carried.megabits / 2, carried.at)
+            } else if let settled = settledMegabits, settled > settings.megabits, settled > carriedBitrate?.megabits ?? 0 {
+                carriedBitrate = (settled, now)
+            }
+        }
         if bitrateUpgradedAt != nil {
             bitrateHold = min(Self.maximumBitrateHold, bitrateHold * 2)
             bitrateUpgradedAt = nil

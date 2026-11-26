@@ -1502,6 +1502,61 @@ func runMediaPathPolicyChecks() {
                   "A bitrate upgrade inside pixel probation erased the pixel upgrade backoff")
     }
 
+    run("After network reductions the bitrate returns to half of what the route carried within seconds, and a failed step halves that goal") {
+        // Small enough that 1 Mbps keeps the picture readable, so only the bitrate moves.
+        let ceiling = StreamSettings(longestEdge: 1280, framesPerSecond: 30, megabits: 30)
+        func settledAndCollapsed() throws -> (MediaQualityPolicy, Double) {
+            var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
+                                                 appliedSize: (1280, 800), now: 0)
+            var time = 0.0
+            for _ in 0..<31 { time += 1; _ = quality.observe(sample(frames: 30, received: 1), now: time) }
+            try check(quality.settledMegabits == 30, "The route did not settle at its ceiling")
+            for _ in 0..<6 {
+                time += 1
+                if let next = quality.observe(sample(frames: 30, delivery: 600), now: time) { _ = quality.confirmApplied(next, now: time) }
+            }
+            try check(quality.effective == StreamSettings(longestEdge: 1280, framesPerSecond: 30, megabits: 1),
+                      "A severe queue did not take the bitrate down: \(quality.effective)")
+            return (quality, time)
+        }
+        // A quiet screen fills nothing, yet the route is taken back to half of the 30 Mbps it carried.
+        var (quality, time) = try settledAndCollapsed()
+        let started = time
+        var steps: [Int] = []
+        while time < started + 120, quality.effective.megabits < 15 {
+            time += 1
+            if let next = quality.observe(sample(frames: 30, received: 0.2), now: time) {
+                steps.append(next.megabits)
+                _ = quality.confirmApplied(next, now: time)
+            }
+        }
+        try check(steps == [2, 4, 8, 15] && time - started == 16, "The bitrate did not double back to half in 16 s: \(steps) in \(time - started) s")
+        // Beyond half, a quiet screen proves nothing, as before.
+        for _ in 0..<60 {
+            time += 1
+            try check(quality.observe(sample(frames: 30, received: 0.2), now: time) == nil, "A quiet screen raised the bitrate beyond half")
+        }
+        // A step back up that congestion ends within its probation halves the goal and doubles the wait.
+        var (marginal, clock) = try settledAndCollapsed()
+        var first: StreamSettings?
+        while first == nil, clock < 60 { clock += 1; first = marginal.observe(sample(frames: 30, received: 0.2), now: clock) }
+        try check(first?.megabits == 2 && marginal.confirmApplied(first!, now: clock), "Recovery did not begin with one doubling")
+        var failed: StreamSettings?
+        while failed == nil, clock < 70 { clock += 1; failed = marginal.observe(sample(frames: 30, delivery: 600), now: clock) }
+        try check(failed?.megabits == 1 && marginal.confirmApplied(failed!, now: clock), "Congestion did not end the step")
+        let failedAt = clock
+        var climb: [(megabits: Int, after: Double)] = []
+        for _ in 0..<120 {
+            clock += 1
+            if let next = marginal.observe(sample(frames: 30, received: 0.2), now: clock) {
+                climb.append((next.megabits, clock - failedAt))
+                _ = marginal.confirmApplied(next, now: clock)
+            }
+        }
+        try check(climb.map(\.megabits) == [2, 4, 6] && climb.first?.after == 8,
+                  "A failed step did not halve the goal to 6 Mbps and wait 8 s: \(climb)")
+    }
+
     run("Bitrate increases needed to restore frame rate respect failed-step backoff on a marginal link") {
         let ceiling = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 15)
         let sustainable = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 3)

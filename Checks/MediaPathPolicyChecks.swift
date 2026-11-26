@@ -1163,58 +1163,67 @@ func runMediaPathPolicyChecks() {
         try check(recovered.id == record.id && recovered.sustainedVideoSize == nil, "An unusable sustained size was kept or hid the record")
     }
 
-    run("Compute pressure at the floor rate gives up 4:4:4 before the size, and brings it back only when it fits") {
+    run("A viewer whose decoder falls behind at the floor rate gives up 4:4:4 before the size; a slow encoder keeps it") {
         let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 60)
         var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
                                              appliedSize: (3840, 2160), now: 0)
         quality.synchronizeTrueColor(true)
         var time = 0.0
-        // One window; applies what the policy asks for, the way the coordinator does.
-        func step(encode: Double) -> (settings: StreamSettings, trueColor: Bool?)? {
+        // One window in which the viewer's decoder is the slower codec; applies what the policy asks for,
+        // the way the coordinator does.
+        func step(decode: Double) -> (settings: StreamSettings, trueColor: Bool?)? {
             time += 1
-            guard let next = quality.observe(codec(fps: 60, encode: encode), now: time) else { return nil }
+            guard let next = quality.observe(codec(fps: 60, encode: 2, decode: decode), now: time) else { return nil }
             let chroma = quality.pendingTrueColor
             _ = quality.confirmApplied(next, now: time)
             if let chroma { quality.synchronizeTrueColor(chroma) }
             return (next, chroma)
         }
-        func firstChange(encode: Double, within seconds: Int) -> (settings: StreamSettings, trueColor: Bool?)? {
-            for _ in 0..<seconds { if let change = step(encode: encode) { return change } }
+        func firstChange(decode: Double, within seconds: Int) -> (settings: StreamSettings, trueColor: Bool?)? {
+            for _ in 0..<seconds { if let change = step(decode: decode) { return change } }
             return nil
         }
-        // The 4K screen needs 30 ms a frame in 4:4:4: the chroma goes and the size stays.
-        let left = firstChange(encode: 30, within: 5)
+        // A hardware encoder is no faster in 4:2:0, so a host that needs 30 ms a frame keeps 4:4:4 and the size goes.
+        var hostBound = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
+                                               appliedSize: (3840, 2160), now: 0)
+        hostBound.synchronizeTrueColor(true)
+        var smallerPicture: StreamSettings?
+        for second in 1...5 where smallerPicture == nil { smallerPicture = hostBound.observe(codec(fps: 60, encode: 30), now: Double(second)) }
+        try check(smallerPicture?.longestEdge == 2560 && hostBound.pendingTrueColor == nil && !hostBound.leftTrueColor,
+                  "A slow encoder gave up 4:4:4, or kept the size: \(String(describing: smallerPicture))")
+        // The viewer needs 30 ms to decode a 4K frame in 4:4:4: the chroma goes and the size stays.
+        let left = firstChange(decode: 30, within: 5)
         try check(left?.settings == ceiling && left?.trueColor == false && !quality.trueColor && quality.leftTrueColor,
                   "4:4:4 was not given up before the size: \(String(describing: left))")
-        try check(quality.lastAdjustment == .compute(.encoder, milliseconds: 30), "Giving up 4:4:4 lost its cause")
+        try check(quality.lastAdjustment == .compute(.decoder, milliseconds: 30), "Giving up 4:4:4 lost its cause")
         let leftAt = time
-        // In 4:2:0 the same size takes 15 ms, so 4:4:4 cost twice as much and would be left again: not retried.
-        try check(firstChange(encode: 15, within: Int(MediaQualityPolicy.maximumUpgradeHold) * 3) == nil,
+        // In 4:2:0 the same size decodes in 15 ms, so 4:4:4 cost twice as much and would be left again: not retried.
+        try check(firstChange(decode: 15, within: Int(MediaQualityPolicy.maximumUpgradeHold) * 3) == nil,
                   "4:4:4 was retried although the codec did not get faster")
         guard let kept = quality.sustainedSize, kept.leftTrueColor, kept.longestEdge == 8192,
               abs((kept.trueColorCost ?? 0) - 2) < 0.01 else {
             throw CheckFailure("The chroma given up was not reported: \(String(describing: quality.sustainedSize))")
         }
         // At 8 ms in 4:2:0 it fits, and comes back with the size unchanged.
-        let back = firstChange(encode: 8, within: 60)
+        let back = firstChange(decode: 8, within: 60)
         try check(back?.settings == ceiling && back?.trueColor == true && quality.trueColor && quality.lastAdjustment == .raise,
                   "4:4:4 did not return once it fit: \(String(describing: back))")
         // Left again at 30 ms although 4:2:0 takes 8 ms: 4:4:4 costs more than was measured before, and that
         // newer cost keeps it from being retried until the longest wait has passed.
-        let again = firstChange(encode: 30, within: 5)
+        let again = firstChange(decode: 30, within: 5)
         try check(again?.trueColor == false, "4:4:4 at 30 ms a frame was kept")
         let secondLeftAt = time
-        try check(firstChange(encode: 8, within: Int(MediaQualityPolicy.maximumUpgradeHold) * 3) == nil,
+        try check(firstChange(decode: 8, within: Int(MediaQualityPolicy.maximumUpgradeHold) * 3) == nil,
                   "A retry that failed did not teach what 4:4:4 costs")
-        let late = firstChange(encode: 8, within: Int(MediaQualityPolicy.maximumSlowSizeHold))
+        let late = firstChange(decode: 8, within: Int(MediaQualityPolicy.maximumSlowSizeHold))
         try check(late?.trueColor == true && time - secondLeftAt == MediaQualityPolicy.maximumSlowSizeHold,
                   "4:4:4 was not given one retry after the longest wait: \(time - secondLeftAt) s")
         // When 4:2:0 is short of the floor rate as well, the size goes next.
-        try check(firstChange(encode: 30, within: 5)?.trueColor == false, "4:4:4 at 30 ms a frame was kept")
-        let smaller = firstChange(encode: 25, within: 5)
+        try check(firstChange(decode: 30, within: 5)?.trueColor == false, "4:4:4 at 30 ms a frame was kept")
+        let smaller = firstChange(decode: 25, within: 5)
         try check(smaller?.settings.longestEdge == 2560 && smaller?.trueColor == nil, "The size did not go after the chroma")
-        // Below 60 fps the encoder paces itself, so no cost can be measured and only the wait holds a retry
-        // back: each retry in vain doubles it.
+        // Below 60 fps no cost is measured (a Mac host's encoder paces itself there), so only the wait holds a
+        // retry back: each retry in vain doubles it.
         let slowCeiling = StreamSettings(longestEdge: 8192, framesPerSecond: 30, megabits: 60)
         var paced = try MediaQualityPolicy(hostDefault: slowCeiling, preferred: slowCeiling, bitRates: StreamSettings.adaptiveBitRates,
                                            appliedSize: (3840, 2160), now: 0)
@@ -1222,8 +1231,8 @@ func runMediaPathPolicyChecks() {
         var pacedTime = 0.0, lastLeft = 0.0, waits: [Double] = []
         while waits.count < 3, pacedTime < 4_000 {
             pacedTime += 1
-            // 50 ms in 4:4:4 is 20 of the chosen 30 fps; 20 ms in 4:2:0 keeps up.
-            guard let next = paced.observe(codec(fps: 30, encode: paced.trueColor ? 50 : 20), now: pacedTime),
+            // 50 ms to decode in 4:4:4 is 20 of the chosen 30 fps; 20 ms in 4:2:0 keeps up.
+            guard let next = paced.observe(codec(fps: 30, encode: 2, decode: paced.trueColor ? 50 : 20), now: pacedTime),
                   let chroma = paced.pendingTrueColor else { continue }
             _ = paced.confirmApplied(next, now: pacedTime)
             paced.synchronizeTrueColor(chroma)
@@ -1251,7 +1260,7 @@ func runMediaPathPolicyChecks() {
         try check(!old.leftTrueColor && old.trueColorCost == nil, "A record without the chroma fields did not read as 4:4:4 kept")
     }
 
-    run("Preferring the picture size lowers the rate to 30 fps before 4:4:4 or the size go, and giving it up returns the rate") {
+    run("Preferring the picture size lowers the rate to 30 fps before the size goes, and giving it up returns the rate") {
         let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 60)
         var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
                                              appliedSize: (3840, 2160), prefersSharpness: true, now: 0)
@@ -1273,11 +1282,10 @@ func runMediaPathPolicyChecks() {
         try check(slower?.settings == StreamSettings(longestEdge: 8192, framesPerSecond: 30, megabits: 60)
                   && slower?.trueColor == nil && quality.trueColor, "The rate did not drop first: \(String(describing: slower))")
         try check(firstChange(&quality, encode: 25, within: 60) == nil, "25 ms a frame at 30 fps changed something else")
-        // Clearly short of 30 fps as well: 4:4:4 goes, then the size.
-        let chroma = firstChange(&quality, encode: 45, within: 5)
-        try check(chroma?.trueColor == false && chroma?.settings.longestEdge == 8192, "4:4:4 did not go before the size at 30 fps")
+        // Clearly short of 30 fps as well: the size goes, and a slow encoder keeps 4:4:4.
         let size = firstChange(&quality, encode: 45, within: 5)
-        try check(size?.settings == StreamSettings(longestEdge: 2560, framesPerSecond: 30, megabits: 60), "The size did not go last")
+        try check(size?.settings == StreamSettings(longestEdge: 2560, framesPerSecond: 30, megabits: 60) && size?.trueColor == nil
+                  && quality.trueColor, "The size did not go last, or 4:4:4 went with it: \(String(describing: size))")
         try check(quality.sustainedSize?.sharpnessFirst == true, "What was sustained did not say under which preference")
         // Giving the preference up returns the rate it lowered with the next window.
         quality.setPrefersSharpness(false, now: time)

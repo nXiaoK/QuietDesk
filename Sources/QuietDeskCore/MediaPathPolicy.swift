@@ -943,9 +943,11 @@ public struct MediaQualityPolicy: Sendable {
             return next != effective ? recommendReduction(next, adjustment: adjustment, now: now) : nil
         }
         if let computeMilliseconds, computeMilliseconds.isFinite, computeMilliseconds > 0 {
-            // Short of the floor rate only fewer samples to encode help, and 4:4:4 goes before the size: the
-            // whole size in 4:2:0 shows text better than a smaller picture in 4:4:4 scaled up.
-            if trueColor, shortOfFloor(next, milliseconds: computeMilliseconds) {
+            // Short of the floor rate, a viewer whose decoder is the slower side gives up 4:4:4 before the size:
+            // 4:2:0 decodes clearly faster, and the whole size in 4:2:0 shows text better than a smaller picture
+            // in 4:4:4 scaled up. A hardware encoder takes as long for either (measured on an M2 Pro at 4K), so
+            // when the host is the slower side the chroma would be lost for nothing: the size goes instead.
+            if trueColor, cause == .decoder, shortOfFloor(next, milliseconds: computeMilliseconds) {
                 let hold = slowTrueColor.map { $0.retriedFor == nil ? $0.hold : min(Self.maximumSlowSizeHold, $0.hold * 2) }
                     ?? Self.maximumUpgradeHold
                 slowTrueColor = SlowTrueColor(leftAt: now, hold: hold, edge: shownEdge(next), milliseconds: computeMilliseconds,

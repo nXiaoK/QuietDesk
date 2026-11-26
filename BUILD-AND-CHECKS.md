@@ -1,5 +1,20 @@
 # 构建与检查记录
 
+## macOS 画面尺寸不再周期性来回切换，并从上次撑得住的尺寸起步（2026-11-26，`f292ef2`、`65154b5`、`9da3e59`）
+
+- **依据**：本机诊断日志（11-10 至 11-26）中，作为被控端的 74 次会话（52.1 小时）有 67 次在开始后中位 5 秒缩小画面尺寸；另有 91 次“升回更大尺寸后中位 4 秒又降回”，间隔中位 326 秒，占全部 413 次尺寸切换的 44%。被控端日志不记录降档原因；按“帧率不变只缩尺寸”和 300 秒的重试间隔推断为编解码跟不上，未在双机上单独证实。
+- **做了什么**（均为控制端的画质策略，被控端无需更新，线上协议不变）：
+  - `f292ef2`、`65154b5`（`Sources/QuietDeskCore/MediaPathPolicy.swift`、`Checks/MediaPathPolicyChecks.swift`、`docs/udp-tcp-transport.md`）：因编解码跟不上而离开的尺寸，等待约 5 分钟后只有在较小尺寸上实测的每帧耗时按像素数放大后仍不超过约 20 ms 才重试；耗时没有变化则不重试。重试后没能连续出帧撑满等待时间就再次降回的，等待时间翻倍（最长约 1 小时）；估算可能有偏差，距上次降回满约 1 小时后无论估算结果都再试一次。所选帧率低于 60 fps 时没有可用耗时，只按等待时间重试。手动选择画质、被控端换到另一种比例的显示器时清除这些记录。
+  - `9da3e59`（另含 `Sources/QuietDeskCore/Reliability.swift`、`Sources/QuietDesk/DeskModel.swift`、`docs/usage.md`）：连接记录新增可选字段 `sustainedVideoSize`（撑得住的最长边档位与画面比例），旧记录无需迁移、无法识别的值按缺失处理。经公网直连或中继连接、画面比例相同时，下次会话直接从该尺寸起步，画质提示说明原因，诊断日志 `qualityCause` 新增 6。局域网会话与线路测速不读取也不更新；手动选择画质会清除它。
+- **跑了什么与结果**（均在本机没有生产会话连入时运行）：
+  - `QuietDeskChecks` 全量通过（**`455 passed, 0 failed`**，含新增 3 项、改写 1 项画质策略检查）。
+  - `./scripts/run-session-quality-checks.sh`（`38 passed`）、`./scripts/run-connection-entry-checks.sh`（`16 passed`）、`./scripts/run-credential-checks.sh`（`18 passed`）、`./scripts/run-relay-connection-checks.sh`（`4 passed`）、`./scripts/run-media-impairment-checks.sh`（9 项 PASS）、`./scripts/run-port-mapping-checks.sh`（28 项 PASS）、Python 脚本测试（`68 passed`）全部通过。
+  - 从干净克隆的提交 `9da3e59` 构建并校验 Universal 产物（`outputs/video-size-stability-20261126/`，`0.7.3` build `25`，`arm64` + `x86_64`，两架构最低系统 14.0、SDK 26.5，`codesign --verify --deep --strict` 与证书固定检查通过）：`QuietDesk-0.7.3-macOS-universal.dmg`（SHA-256 `d4ecfe94...`，`hdiutil verify` 有效）、`QuietDesk-0.7.3-macOS-universal.zip`（SHA-256 `b4501300...`）、`QuietDesk-0.7.3-Source.zip`（SHA-256 `8913a04b...`，456 项受管文件与 `git ls-files` 逐项一致，不含构建缓存与私有配置）。
+- **没验证什么**：
+  - 未在真实双机会话中验证；本机生产版未被替换、重启或中断，也未改动系统权限。效果需把控制端更新后，对同一台被控端连续两次公网会话，对照 `streamConfigured` 的尺寸切换次数确认。
+  - 本机钥匙串没有可用的固定自签名代码签名身份，产物为 ad-hoc 临时签名；与已安装的生产版签名不同，覆盖安装后需要重新授权。
+  - 未运行完整的 `scripts/run-all-checks.sh`；只运行了上面与改动相关的检查。Windows 控制端只自动调整码率，本次未改动。
+
 ## Windows WP14 · x64/ARM64 安装包自动发布与应用内更新（2026-11-23，`c7ef032`、`2e19294`、`34f7dab`、`99ce018`）
 
 - **做了什么**：

@@ -1163,6 +1163,94 @@ func runMediaPathPolicyChecks() {
         try check(recovered.id == record.id && recovered.sustainedVideoSize == nil, "An unusable sustained size was kept or hid the record")
     }
 
+    run("Compute pressure at the floor rate gives up 4:4:4 before the size, and brings it back only when it fits") {
+        let ceiling = StreamSettings(longestEdge: 8192, framesPerSecond: 60, megabits: 60)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
+                                             appliedSize: (3840, 2160), now: 0)
+        quality.synchronizeTrueColor(true)
+        var time = 0.0
+        // One window; applies what the policy asks for, the way the coordinator does.
+        func step(encode: Double) -> (settings: StreamSettings, trueColor: Bool?)? {
+            time += 1
+            guard let next = quality.observe(codec(fps: 60, encode: encode), now: time) else { return nil }
+            let chroma = quality.pendingTrueColor
+            _ = quality.confirmApplied(next, now: time)
+            if let chroma { quality.synchronizeTrueColor(chroma) }
+            return (next, chroma)
+        }
+        func firstChange(encode: Double, within seconds: Int) -> (settings: StreamSettings, trueColor: Bool?)? {
+            for _ in 0..<seconds { if let change = step(encode: encode) { return change } }
+            return nil
+        }
+        // The 4K screen needs 30 ms a frame in 4:4:4: the chroma goes and the size stays.
+        let left = firstChange(encode: 30, within: 5)
+        try check(left?.settings == ceiling && left?.trueColor == false && !quality.trueColor && quality.leftTrueColor,
+                  "4:4:4 was not given up before the size: \(String(describing: left))")
+        try check(quality.lastAdjustment == .compute(.encoder, milliseconds: 30), "Giving up 4:4:4 lost its cause")
+        let leftAt = time
+        // In 4:2:0 the same size takes 15 ms, so 4:4:4 cost twice as much and would be left again: not retried.
+        try check(firstChange(encode: 15, within: Int(MediaQualityPolicy.maximumUpgradeHold) * 3) == nil,
+                  "4:4:4 was retried although the codec did not get faster")
+        guard let kept = quality.sustainedSize, kept.leftTrueColor, kept.longestEdge == 8192,
+              abs((kept.trueColorCost ?? 0) - 2) < 0.01 else {
+            throw CheckFailure("The chroma given up was not reported: \(String(describing: quality.sustainedSize))")
+        }
+        // At 8 ms in 4:2:0 it fits, and comes back with the size unchanged.
+        let back = firstChange(encode: 8, within: 60)
+        try check(back?.settings == ceiling && back?.trueColor == true && quality.trueColor && quality.lastAdjustment == .raise,
+                  "4:4:4 did not return once it fit: \(String(describing: back))")
+        // Left again at 30 ms although 4:2:0 takes 8 ms: 4:4:4 costs more than was measured before, and that
+        // newer cost keeps it from being retried until the longest wait has passed.
+        let again = firstChange(encode: 30, within: 5)
+        try check(again?.trueColor == false, "4:4:4 at 30 ms a frame was kept")
+        let secondLeftAt = time
+        try check(firstChange(encode: 8, within: Int(MediaQualityPolicy.maximumUpgradeHold) * 3) == nil,
+                  "A retry that failed did not teach what 4:4:4 costs")
+        let late = firstChange(encode: 8, within: Int(MediaQualityPolicy.maximumSlowSizeHold))
+        try check(late?.trueColor == true && time - secondLeftAt == MediaQualityPolicy.maximumSlowSizeHold,
+                  "4:4:4 was not given one retry after the longest wait: \(time - secondLeftAt) s")
+        // When 4:2:0 is short of the floor rate as well, the size goes next.
+        try check(firstChange(encode: 30, within: 5)?.trueColor == false, "4:4:4 at 30 ms a frame was kept")
+        let smaller = firstChange(encode: 25, within: 5)
+        try check(smaller?.settings.longestEdge == 2560 && smaller?.trueColor == nil, "The size did not go after the chroma")
+        // Below 60 fps the encoder paces itself, so no cost can be measured and only the wait holds a retry
+        // back: each retry in vain doubles it.
+        let slowCeiling = StreamSettings(longestEdge: 8192, framesPerSecond: 30, megabits: 60)
+        var paced = try MediaQualityPolicy(hostDefault: slowCeiling, preferred: slowCeiling, bitRates: StreamSettings.adaptiveBitRates,
+                                           appliedSize: (3840, 2160), now: 0)
+        paced.synchronizeTrueColor(true)
+        var pacedTime = 0.0, lastLeft = 0.0, waits: [Double] = []
+        while waits.count < 3, pacedTime < 4_000 {
+            pacedTime += 1
+            // 50 ms in 4:4:4 is 20 of the chosen 30 fps; 20 ms in 4:2:0 keeps up.
+            guard let next = paced.observe(codec(fps: 30, encode: paced.trueColor ? 50 : 20), now: pacedTime),
+                  let chroma = paced.pendingTrueColor else { continue }
+            _ = paced.confirmApplied(next, now: pacedTime)
+            paced.synchronizeTrueColor(chroma)
+            if chroma { waits.append(pacedTime - lastLeft) } else { lastLeft = pacedTime }
+        }
+        try check(waits == [300, 600, 1_200], "4:4:4 retries in vain did not double their wait: \(waits)")
+        // A host whose encoder refuses 4:4:4 on a retry is not asked again.
+        var refused = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, bitRates: StreamSettings.adaptiveBitRates,
+                                             appliedSize: (3840, 2160), sustained: kept, choosesTrueColor: true, now: 0)
+        try check(refused.leftTrueColor && refused.startingSettings(maximumMegabits: 20).longestEdge == 8192,
+                  "The next session did not start without 4:4:4 at the full size")
+        var asked: StreamSettings?, clock = 0.0
+        while asked == nil, clock < 400 { clock += 1; asked = refused.observe(codec(fps: 60, encode: 8), now: clock) }
+        try check(asked == ceiling && refused.pendingTrueColor == true && clock == MediaQualityPolicy.maximumUpgradeHold,
+                  "A resumed session did not retry 4:4:4 after its wait: \(clock)")
+        _ = refused.confirmApplied(ceiling, now: clock)
+        refused.synchronizeTrueColor(false)
+        try check(!refused.leftTrueColor && refused.sustainedSize == nil, "A refused 4:4:4 is still waiting to be retried")
+        // Someone who did not choose 4:4:4 this time is not held to it, and older records read as before.
+        let plain = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (3840, 2160), sustained: kept, now: 0)
+        try check(!plain.leftTrueColor, "A 4:2:0 choice resumed a 4:4:4 fallback")
+        let data = try JSONEncoder().encode(kept)
+        try check(try JSONDecoder().decode(SustainedVideoSize.self, from: data) == kept, "The chroma fallback did not round-trip")
+        let old = try JSONDecoder().decode(SustainedVideoSize.self, from: Data(#"{"longestEdge":2560,"aspect":0.5625}"#.utf8))
+        try check(!old.leftTrueColor && old.trueColorCost == nil, "A record without the chroma fields did not read as 4:4:4 kept")
+    }
+
     run("A chosen frame rate below 60 is its own floor, and raising the rate needs room in the measured codec time") {
         let low = StreamSettings(longestEdge: 8192, framesPerSecond: 30, megabits: 100)
         var thirty = try MediaQualityPolicy(hostDefault: low, preferred: low, appliedSize: (3456, 2234), now: 0)

@@ -143,7 +143,9 @@ final class DeskModel: ObservableObject, Identifiable {
     /// Why the applied quality is below the choice, after an automatic reduction; empty otherwise.
     private(set) var automaticQualityNote = ""
 
-    static func qualityNote(_ adjustment: MediaQualityPolicy.Adjustment?, applied: StreamSettings) -> String {
+    /// `withoutTrueColor`: this adjustment has the stream in 4:2:0 although 4:4:4 is the choice.
+    static func qualityNote(_ adjustment: MediaQualityPolicy.Adjustment?, applied: StreamSettings,
+                            withoutTrueColor: Bool = false) -> String {
         switch adjustment {
         case .localLatency?:
             return "局域网连续测得至少 80 ms 延迟，已自动调整为 \(applied.summary)"
@@ -151,12 +153,14 @@ final class DeskModel: ObservableObject, Identifiable {
             return "网络丢包或延迟升高，已自动调整为 \(applied.summary)"
         case .compute(let cause, let milliseconds?)? where milliseconds.isFinite && milliseconds > 0:
             let side = cause == .encoder ? "被控端编码" : "本机解码"
-            return String(format: "%@每帧约 %.1f ms，最多约 %d fps，已自动调整为 %@",
-                          side, milliseconds, Int(1_000 / milliseconds), applied.summary)
+            let change = withoutTrueColor ? "已自动改用 4:2:0 色度并保持画面尺寸（\(applied.summary)）；有余量后自动恢复 4:4:4"
+                : "已自动调整为 \(applied.summary)"
+            return String(format: "%@每帧约 %.1f ms，最多约 %d fps，%@", side, milliseconds, Int(1_000 / milliseconds), change)
         case .compute?:
             return "视频解码未完成，已自动调整为 \(applied.summary)"
         case .sustainedSize?:
-            return "上次连接时编解码跟不上更大的画面尺寸，本次从 \(applied.summary) 起步；编解码有余量后自动恢复，重新选择画质可立即重试"
+            return "上次连接时编解码跟不上所选画质，本次从 \(applied.summary)\(withoutTrueColor ? " · 4:2:0 色度" : "") 起步；"
+                + "编解码有余量后自动恢复，重新选择画质可立即重试"
         case .raise?, nil:
             return ""
         }
@@ -344,7 +348,10 @@ final class DeskModel: ObservableObject, Identifiable {
     @Published private(set) var videoTuning: VideoTuningSession?
     @Published private(set) var videoSettingsStatus = ""
     var viewerSettings: StreamSettings { viewerSession.mediaQuality?.upperBound ?? videoTuning?.desired ?? activeVideoState?.settings ?? StreamSettings() }
-    var viewerTrueColor: Bool { (videoTuning?.desiredChroma ?? activeVideoChroma) == .yuv444 }
+    /// The chosen chroma: 4:4:4 stays the choice while compute pressure has the stream in 4:2:0.
+    var viewerTrueColor: Bool {
+        (videoTuning?.desiredChroma ?? activeVideoChroma) == .yuv444 || viewerSession.mediaQuality?.leftTrueColor == true
+    }
     var viewerLongestEdges: [Int] { supportsExtendedVideoSettings ? StreamSettings.longestEdges : StreamSettings.legacyLongestEdges }
     var viewerFrameRates: [Int] {
         supportsHigherFrameRateVideo ? StreamSettings.frameRates
@@ -2456,7 +2463,8 @@ final class DeskModel: ObservableObject, Identifiable {
         viewer.mediaQuality = try MediaQualityPolicy(hostDefault: hostDefault, preferred: viewerQualityPolicy.preferred == nil ? nil : preferred,
                                                    applied: settings, bitRates: bitRates,
                                                    appliedSize: activeVideoState.map { ($0.width, $0.height) },
-                                                   sustained: sustained, now: SessionClock.now)
+                                                   sustained: sustained, choosesTrueColor: videoTuning?.desiredChroma == .yuv444,
+                                                   now: SessionClock.now)
         channel.configureMedia { [weak media] in media?.receive($0) ?? false }
         channel.configureReliableData { [weak media] in media?.sendReliableData($0) }
         renderer.reportDecodeTime { [weak media] milliseconds in media?.recordComputeTiming(decodeMilliseconds: milliseconds) }
@@ -2672,12 +2680,13 @@ final class DeskModel: ObservableObject, Identifiable {
 
     private func applyAutomaticMediaSettings(_ settings: StreamSettings) {
         guard connected, supportsLiveSettings, var tuning = videoTuning,
-              tuning.pending == nil, tuning.desired == tuning.applied.settings else {
+              tuning.pending == nil, tuning.desired == tuning.applied.settings, tuning.desiredChroma == tuning.appliedChroma else {
             viewerSession.mediaQuality?.rejectPending(now: SessionClock.now)
             return
         }
         do { try tuning.choose(settings) }
         catch { viewerSession.mediaQuality?.rejectPending(now: SessionClock.now); return }
+        if let trueColor = viewerSession.mediaQuality?.pendingTrueColor { tuning.chooseChromaSubsampling(trueColor ? .yuv444 : .yuv420) }
         viewerSession.automaticVideoSettings = settings
         viewerSession.automaticVideoAdjustment = viewerSession.mediaQuality?.lastAdjustment
         videoTuning = tuning
@@ -3776,8 +3785,10 @@ final class DeskModel: ObservableObject, Identifiable {
                     }
                     if cautiousStart, let maximumMegabits = initialMaxMegabits, var tuning = videoTuning,
                        let quality = viewerSession.mediaQuality,
-                       case let start = quality.startingSettings(maximumMegabits: maximumMegabits), start != tuning.desired {
+                       case let start = quality.startingSettings(maximumMegabits: maximumMegabits),
+                       start != tuning.desired || quality.leftTrueColor {
                         try tuning.choose(start)
+                        if quality.leftTrueColor { tuning.chooseChromaSubsampling(.yuv420) }
                         videoTuning = tuning
                         viewerSession.automaticVideoSettings = start
                         viewerSession.automaticVideoAdjustment = quality.sustainedSize == nil ? nil : .sustainedSize
@@ -3957,13 +3968,18 @@ final class DeskModel: ObservableObject, Identifiable {
                     && previousChroma == tuning.appliedChroma))
             viewerSession.media?.updateSettings(result.state.settings, restartsStream: !inPlace)
             viewerSession.mediaQuality?.receiveSettingsResult(result, for: request.settings, now: SessionClock.now)
+            viewerSession.mediaQuality?.synchronizeTrueColor(tuning.appliedChroma == .yuv444)
             let wasAutomatic = viewerSession.automaticVideoSettings == request.settings
             let adjustment = wasAutomatic && result.error == nil ? viewerSession.automaticVideoAdjustment : nil
             if wasAutomatic {
                 viewerSession.automaticVideoSettings = nil
                 viewerSession.automaticVideoAdjustment = nil
             }
-            if result.error == nil { automaticQualityNote = Self.qualityNote(adjustment, applied: result.state.settings) }
+            if result.error == nil {
+                let withoutTrueColor = tuning.appliedChroma == .yuv420 && (previousChroma == .yuv444
+                    || adjustment == .sustainedSize && viewerSession.mediaQuality?.leftTrueColor == true)
+                automaticQualityNote = Self.qualityNote(adjustment, applied: result.state.settings, withoutTrueColor: withoutTrueColor)
+            }
             recordVideoConfiguration(result.state, succeeded: result.error == nil, adjustment: adjustment)
             canvas.remoteSize = CGSize(width: result.state.width, height: result.state.height)
             resolution = "\(result.state.width) × \(result.state.height)"
@@ -4138,6 +4154,8 @@ final class DeskModel: ObservableObject, Identifiable {
         }
         do { try tuning.choose(settings) }
         catch { videoSettingsStatus = error.localizedDescription; return }
+        // Choosing again also brings back the 4:4:4 that compute pressure gave up.
+        let chroma = chroma ?? (viewerSession.mediaQuality?.leftTrueColor == true ? .yuv444 : nil)
         if let chroma, supportsHEVC444Video {
             tuning.chooseChromaSubsampling(chroma)
             savedChromaPreference = chroma

@@ -1,5 +1,20 @@
 # 构建与检查记录
 
+## macOS 会话工具不再丢控制权、全屏按钮可拖动与顶部悬停工具条（2026-11-26，`89e923b`、`48c49be`、`9855e0e`、`ec428ca`、`150b0b2`）
+
+- **做了什么**（均为控制端界面，线上协议与默认快捷键不变）：
+  - `89e923b`、`ec428ca`、`150b0b2`（`Sources/QuietDeskCore/ControlResumption.swift`、`Sources/QuietDesk/DeskModel.swift`、`Sources/QuietDesk/QuietDeskApp.swift`、`Sources/QuietDesk/SessionSettingsViews.swift`、`Sources/QuietDesk/FullScreenStatusOverlay.swift`、`Checks/ControlResumptionChecks.swift`、`AppChecks/RemoteCanvasChecks.swift`、`docs/usage.md`）：工具栏动作、菜单、会话面板、对话框和拖动全屏连接状态仍先释放远端控制，但打开前正在控制的，结束后键盘自动回到远程画面，不再需要点按画面（那一下点按会同时发到远端）。⌃⌥Esc 或“释放控制”主动释放的保持释放；切换“相对鼠标”后仍由随后点按画面的那一下开始锁定指针；画面重新获得键盘后丢弃尚未执行的归还。
+  - `48c49be`（`Sources/QuietDesk/FullScreenControls.swift`、`Sources/QuietDeskCore/FullScreenStatusPlacement.swift`、`Checks/FullScreenStatusPlacementChecks.swift`、`scripts/run-input-checks.sh`）：全屏右缘的控制按钮可按住上下拖动，位置按可移动范围的比例保存（`UserDefaults` 的 `fullScreenControlsPosition`），右键恢复居中；点按仍展开或收起会话面板。
+  - `9855e0e`（`Sources/QuietDeskCore/FullScreenToolbarReveal.swift`、`Checks/FullScreenToolbarRevealChecks.swift`、`README.md`、`README.en.md`）：全屏时指针在顶部中间停留约 0.3 秒，在顶部下方 56 pt 处浮出工具条（屏幕与空间菜单、画质预设、退出全屏、断开），指针离开约 0.8 秒后收起；按住鼠标拖到顶部、相对鼠标锁定或窗口不在前台时不触发。指针位置每 0.1 秒采样一次、只在全屏期间运行，菜单打开期间不采样。会话设置新增“全屏顶部工具条”开关（默认开启，`fullScreenToolbarEnabled`）。
+- **跑了什么与结果**（均在本机没有生产会话连入时运行）：
+  - 最终提交 `150b0b2` 上完整运行 `./scripts/run-all-checks.sh`：退出码 0，共 1242 行 PASS、0 行 FAIL、0 行 SKIP；其中 `QuietDeskChecks` **`462 passed, 0 failed`**（本组新增 4 项），输入检查 `23 passed` 与 `46 passed`（本组新增 2 项、扩充 1 项），Python 脚本测试 `68 passed`，中继 `go vet` 与 `go test -race` 通过，其余各项 App 检查与中继互通检查全部通过。
+  - 新增的两项界面交互检查把独立标识的检查程序窗口放在所有屏幕之外（不成为主窗口、不抢焦点），向其中的 SwiftUI 发送合成指针事件：点按右缘按钮只切换面板、拖动只移动位置且不切换、越界拖动停在边距；工具条隐藏时其位置和顶部边缘的点按到达远程画面，显示时只有工具条自身（含边缘留白）接收点按，旁边、下方和上方照常到达画面，收起后恢复。不能显示窗口的会话里这两项会打印 `SKIP` 而不计为通过。
+  - 从干净克隆的提交 `150b0b2` 构建并校验 Universal 产物（`outputs/session-controls-20261126/`，`0.7.3` build `25`，`arm64` + `x86_64`，两架构最低系统 14.0、SDK 26.5，`codesign --verify --deep --strict` 与证书固定检查通过）：DMG（SHA-256 `bc2f5a75...`，`hdiutil verify` 有效）、应用 ZIP（SHA-256 `b7fd8fec...`）、源码 ZIP（SHA-256 `30380211...`，461 项受管文件与 `git ls-files` 逐项一致，不含构建缓存与私有配置）。
+- **没验证什么**：
+  - 没有在真实窗口和真实全屏会话里操作过。键盘归还依赖窗口处于前台并成为主窗口，只检查了判定逻辑，没有实测焦点是否真的回到画面；顶部工具条的真实指针采样、与系统菜单栏同时出现时的位置、带刘海屏幕上的触发、其中菜单打开期间保持显示，都只经代码检查和合成事件检查。
+  - 工具条外观只用未显示窗口的合成渲染看过浅色与深色各一张（放在 `work/`，未进入源码）。
+  - 产物为 ad-hoc 临时签名（本机钥匙串没有固定自签名身份）；本机生产版未被替换、重启或中断，未改动系统权限、剪贴板、钥匙串或输入源。Windows 控制端未改动。
+
 ## macOS 编解码跟不上时的降档顺序、清晰优先开关与码率快速回升（2026-11-26，`d7c5864`、`e1d2a3b`、`1d55a00`）
 
 - **做了什么**（均为控制端的画质策略与会话设置，被控端无需更新，线上协议不变）：

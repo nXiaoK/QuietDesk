@@ -1457,7 +1457,7 @@ final class DeskModel: ObservableObject, Identifiable {
         prepareHostCode()
         guard !hostCode.isEmpty else {
             hostingRequested = false
-            status = hostCodeNeedsSetup ? "请先补录原配对码，或明确选择生成新配对码，再开启共享" : "配对码未能读取，请检查本机凭据文件"
+            status = hostCodeNeedsSetup ? "请先输入原配对码，或选择生成新配对码，再开启共享" : "配对码未能读取，请检查本机凭据文件"
             return
         }
         if interactive { hostBackoff.reset() }
@@ -2326,7 +2326,7 @@ final class DeskModel: ObservableObject, Identifiable {
         let session = connectedModel?.target
         if rule.scope == .session, session == nil { throw DeskError.invalid("请先连接此设备的远控会话，或选择独立运行") }
         guard let key = try session?.key ?? KeyStore.load(account: "remote." + record.id.uuidString) else {
-            throw DeskError.invalid("此设备缺少配对码，请在连接页面补录")
+            throw DeskError.invalid("此设备缺少配对码，请在连接页面输入")
         }
         let address = session?.address ?? record.address
         let port = session?.port ?? record.port
@@ -3309,7 +3309,7 @@ final class DeskModel: ObservableObject, Identifiable {
         connectionError = nil
         do {
             guard let key = try KeyStore.load(account: "remote." + record.id.uuidString) else {
-                throw DeskError.invalid("此记录尚未保存到本机凭据文件。请在上方补录原配对码后连接；成功后会记住，无需读取钥匙串")
+                throw DeskError.invalid("此记录还没有保存配对码。请在上方输入原配对码后连接，成功后会记住，不会读取钥匙串")
             }
             viewerCode = key.code
             return prepareSessionLaunch(savedRelayRoute: record.relay)
@@ -6392,7 +6392,7 @@ final class DeskModel: ObservableObject, Identifiable {
             if selectedConnectionID == record.id, !trimmed.isEmpty {
                 return try PairingKey(code: trimmed)
             }
-            throw DeskError.invalid("此记录尚未保存本机配对凭据，请先在连接界面补录原配对码")
+            throw DeskError.invalid("此记录还没有保存配对码，请先在连接界面输入原配对码")
         }
         let trimmed = viewerCode.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {

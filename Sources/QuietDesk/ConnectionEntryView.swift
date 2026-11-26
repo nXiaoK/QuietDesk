@@ -343,12 +343,6 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                 }
             }
             .frame(minHeight: 34)
-
-            if selectedRecord == nil, records.isEmpty {
-                Text("设备列表为空时的首次连接入口")
-                    .font(.system(size: 13))
-                    .foregroundStyle(DeskPalette.secondary)
-            }
         }
     }
 
@@ -847,7 +841,7 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                     tableCell("设备", width: 152)
                     tableCell("连接端点")
                     tableCell(inManagementSheet ? "凭据" : "最近连接", width: inManagementSheet ? 88 : 162)
-                    tableCell("操作", width: 112)
+                    tableCell("操作", width: 128)
                 }
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(DeskPalette.secondary)
@@ -892,13 +886,13 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
 
                         if inManagementSheet {
-                            tableCell(credentialSaved ? "已保存" : "待补录", width: 88)
+                            tableCell(credentialSaved ? "已保存" : "缺少配对码", width: 88)
                                 .font(.system(size: 12.5, weight: .medium))
                                 .foregroundStyle(credentialSaved ? DeskPalette.secondary : DeskPalette.amber)
                         } else {
                             tableCell(
                                 record.lastConnected == .distantPast
-                                    ? (credentialSaved ? "尚未远控" : "待补录")
+                                    ? (credentialSaved ? "尚未远控" : "缺少配对码")
                                     : record.lastConnected.formatted(date: .abbreviated, time: .shortened),
                                 width: 162
                             )
@@ -908,13 +902,14 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                         }
 
                         HStack(spacing: 6) {
-                            Button(session != nil ? "切到窗口" : (credentialSaved ? "连接" : "补录")) {
+                            Button(session != nil ? "切到窗口" : (credentialSaved ? "连接" : "输入配对码")) {
                                 connectSavedDevice(record)
                             }
                             .buttonStyle(DeskButtonStyle(.secondary, compact: true))
                             recordMenu(record, session: session, inManagementSheet: inManagementSheet)
                         }
-                        .frame(width: 112, alignment: .leading)
+                        // Wide enough for the longest action, "输入配对码", beside the menu.
+                        .frame(width: 128, alignment: .leading)
                         .disabled(locked)
                     }
                     .font(.system(size: 13))
@@ -922,7 +917,7 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                     .padding(.vertical, 8)
                     .frame(minHeight: 46)
                     .contextMenu {
-                        Button(session != nil ? "切到窗口" : (credentialSaved ? "连接" : "补录")) {
+                        Button(session != nil ? "切到窗口" : (credentialSaved ? "连接" : "输入配对码")) {
                             connectSavedDevice(record)
                         }
                         .disabled(locked)
@@ -1240,9 +1235,9 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
 
     private func credentialsSheet(title: String, endpoint: String) -> some View {
         VStack(alignment: .leading, spacing: 15) {
-            sheetHeading("补录连接凭据", detail: "\(title) · \(endpoint)")
+            sheetHeading("输入配对码", detail: "\(title) · \(endpoint)")
             labeledField("粘贴被控 Mac 显示的完整配对码") { pairingField }
-            Text("连接记录不从钥匙串读取凭据。凭据保存在本机私有文件中，不宣称已独立加密。")
+            Text("这条记录还没有保存配对码，输入一次后会记住；QuietDesk 不读取钥匙串。配对码保存在本机私有文件中，未单独加密。")
                 .font(.system(size: 12.5))
                 .foregroundStyle(DeskPalette.secondary)
                 .fixedSize(horizontal: false, vertical: true)

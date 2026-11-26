@@ -302,7 +302,7 @@ private struct AutoUnlockConfigurationSheet: View {
 
             DeskCalloutBox(
                 title: "本机凭据存储",
-                message: "按连接记录保存到本机私有文件，绑定当前配对码，不宣称已独立加密。",
+                message: "按连接记录保存到本机私有文件，绑定当前配对码，未单独加密。",
                 symbol: "info.circle",
                 tone: .warning
             )

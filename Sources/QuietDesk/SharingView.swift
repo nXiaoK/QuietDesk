@@ -173,10 +173,10 @@ struct SharingView: View {
             if model.hostCodeNeedsSetup {
                 Divider()
                 DeskSettingsRow(
-                    title: "升级前配对码补录",
-                    detail: "如果升级前已有配对码，可补录一次让原控制端免改码连接。"
+                    title: "沿用升级前的配对码",
+                    detail: "如果升级前已有配对码，输入一次后原控制端不用改码就能连接。"
                 ) {
-                    Button("补录原配对码…") {
+                    Button("输入原配对码…") {
                         previousCode = ""
                         showRestoreCodeSheet = true
                     }
@@ -286,10 +286,10 @@ struct SharingView: View {
     private var restorePreviousCodeSheet: some View {
         VStack(alignment: .leading, spacing: 15) {
             VStack(alignment: .leading, spacing: 5) {
-                Text("补录升级前的配对码")
+                Text("输入升级前的配对码")
                     .font(.system(size: 20, weight: .bold))
                     .accessibilityAddTraits(.isHeader)
-                Text("如果升级前已有配对码，可以补录一次，让原控制端继续使用原码连接。")
+                Text("如果升级前已有配对码，在这里输入一次，原控制端就能继续使用原码连接。")
                     .font(.system(size: 13))
                     .foregroundStyle(DeskPalette.secondary)
                     .fixedSize(horizontal: false, vertical: true)

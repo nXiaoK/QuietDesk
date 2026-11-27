@@ -1,5 +1,19 @@
 # 构建与检查记录
 
+## macOS 界面文案清理与“复制连接信息”（2026-11-27，`4e7a809`、`0216ab8`）
+
+- **做了什么**（线上协议、配对码格式与存储位置不变）：
+  - `4e7a809`（`Sources/QuietDesk/ConnectionEntryView.swift`、`Sources/QuietDesk/DeskModel.swift`、`Sources/QuietDesk/SessionEffectsView.swift`、`Sources/QuietDesk/SharingView.swift`、`docs/usage.md`）：删除设备页标题下漏出的内部说明“设备列表为空时的首次连接入口”；没有保存配对码的记录由“待补录 / 补录”改为“缺少配对码 / 输入配对码”，相关提示与错误文案同步改写；存储说明由“不宣称已独立加密”改为“未单独加密”。操作列加宽到 128 pt 以容纳最长的按钮文字。
+  - `0216ab8`（`Sources/QuietDeskCore/ConnectionInvitation.swift`、`Checks/ConnectionInvitationChecks.swift`、`AppChecks/ConnectionEntryChecks.swift`、另含上述界面文件）：「本机共享」新增“本机地址”一行，列出另一台设备可尝试的地址（多个时可选），“复制连接信息”把地址、端口和配对码复制为一段文字 `quietdesk://地址:端口#配对码`，与配对码一样标记为不进剪贴板历史、仅本机、60 秒后清除。在“新建连接”的地址栏或配对码栏粘贴完整的这段文字会一次填好三项；不完整或多余的内容不识别，保持原样。“输入配对码”对话框里粘贴时只取其中的配对码。没有注册 `quietdesk://` 链接类型，点按链接不会打开应用。
+- **跑了什么与结果**（均在本机没有生产会话连入时运行）：
+  - 提交 `0216ab8` 上完整运行 `./scripts/run-all-checks.sh`：退出码 0，共 1244 行 PASS、0 行 FAIL、0 行 SKIP；其中 `QuietDeskChecks` **`463 passed, 0 failed`**（新增 1 项）、连接入口检查 `17 passed`（新增 1 项）、Python 脚本测试 `68 passed`。
+  - 用独立标识（`local.quietdesk.preview.optimization20261126`）的合成预览在不显示窗口的情况下渲染了首次使用页、「本机共享」浅色与深色、会话设置面板，确认新增一行的布局和文案；预览使用自己的数据目录和自己生成的配对码，运行前后生产数据目录未被改动，预览数据已删除。预览源码与截图在 `work/`，未进入源码。
+  - 从干净克隆的提交 `0216ab8` 构建并校验 Universal 产物（`outputs/first-connection-20261127/`，`0.7.3` build `25`，`arm64` + `x86_64`，两架构最低系统 14.0、SDK 26.5，`codesign --verify --deep --strict` 与证书固定检查通过）：DMG（SHA-256 `041f95b0...`，`hdiutil verify` 有效）、应用 ZIP（SHA-256 `a6b51b54...`）、源码 ZIP（SHA-256 `f2855b98...`，463 项受管文件与 `git ls-files` 逐项一致，不含构建缓存与私有配置）。
+- **没验证什么**：
+  - 没有在真实窗口里点过“复制连接信息”，也没有写入或读取真实系统剪贴板；复制路径复用已有的配对码复制函数，粘贴后的填充只检查了识别与填充逻辑，没有实测在输入框里粘贴。
+  - 没有在两台 Mac 之间用这段文字实际连接。显示的是本机网卡地址，不探测公网地址；两台 Mac 不在同一网络时仍需手动改成可达的地址。
+  - 产物为 ad-hoc 临时签名；本机生产版未被替换、重启或中断，未改动系统权限、钥匙串或输入源。Windows 端未改动，不识别这段文字。
+
 ## macOS 编码实验结论与 4:4:4 降档条件更正（2026-11-26，`2c4ced2`、`61beead`）
 
 - **做了什么**：

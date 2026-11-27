@@ -277,28 +277,60 @@ struct UpdateSettingsPanel: View {
     }
 
     private var versionAndActionCard: some View {
-        DeskSettingsGroup(title: "当前版本") {
-            DeskSettingsRow(title: "QuietDesk", detail: controller.usesAdHocSignature ? "临时签名" : "固定签名证书") {
-                HStack(spacing: 8) {
-                    Text("\(controller.currentVersion) · Build \(controller.currentBuild)")
-                        .font(.system(size: 13, design: .monospaced))
-                        .foregroundStyle(DeskPalette.secondary)
-                        .textSelection(.enabled)
-                    UpdateStateBadge(controller: controller)
+        DeskSurfaceCard(padding: 16, cornerRadius: 10) {
+            VStack(alignment: .leading, spacing: 12) {
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .top, spacing: 16) {
+                        versionIdentity
+                        Spacer(minLength: 8)
+                        VStack(alignment: .trailing, spacing: 10) {
+                            UpdateStateBadge(controller: controller)
+                            actionButtons
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: 10) {
+                        versionIdentity
+                        UpdateStateBadge(controller: controller)
+                        actionButtons
+                    }
+                }
+
+                Text(controller.enabled
+                    ? (!controller.message.isEmpty ? controller.message : "上次检查：\(formattedLastCheck)")
+                    : "当前构建未配置更新源与签名公钥。")
+                    .font(.system(size: 12))
+                    .foregroundStyle(DeskPalette.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+
+                if controller.state == .downloading {
+                    UpdateDownloadProgressRow(receivedBytes: controller.receivedBytes, totalBytes: controller.totalBytes)
                 }
             }
-            Divider()
-            DeskSettingsRow(
-                title: "检查更新",
-                detail: controller.enabled
-                    ? (!controller.message.isEmpty ? controller.message : "上次检查：\(formattedLastCheck)")
-                    : "当前构建未配置更新源与签名公钥。"
-            ) {
-                actionButtons
-            }
-            if controller.state == .downloading {
-                UpdateDownloadProgressRow(receivedBytes: controller.receivedBytes, totalBytes: controller.totalBytes)
-                    .padding(.bottom, 12)
+        }
+    }
+
+    private var versionIdentity: some View {
+        HStack(alignment: .top, spacing: 13) {
+            Image(systemName: "rectangle.on.rectangle")
+                .font(.system(size: 21, weight: .medium))
+                .foregroundStyle(DeskPalette.accent)
+                .frame(width: 43, height: 43)
+                .background(DeskPalette.selection, in: RoundedRectangle(cornerRadius: 8))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("QuietDesk")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(DeskPalette.secondary)
+                Text(controller.currentVersion)
+                    .font(.system(size: 28, weight: .bold, design: .monospaced))
+                    .foregroundStyle(DeskPalette.ink)
+                    .textSelection(.enabled)
+                    .accessibilityLabel("当前版本 \(controller.currentVersion)")
+                Text("Build \(controller.currentBuild) · \(controller.usesAdHocSignature ? "临时签名" : "固定签名证书")")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(DeskPalette.secondary)
+                    .textSelection(.enabled)
             }
         }
     }
@@ -337,8 +369,12 @@ struct UpdateSettingsPanel: View {
                             .buttonStyle(DeskButtonStyle(.primary))
                     }
                 } else {
-                    Button("立即检查") { controller.check(manual: true, presentWindow: false) }
-                        .buttonStyle(DeskButtonStyle(.secondary))
+                    Button {
+                        controller.check(manual: true, presentWindow: false)
+                    } label: {
+                        Label("立即检查", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(DeskButtonStyle(.primary))
                 }
             }
             .buttonStyle(DeskButtonStyle(.secondary))
@@ -348,7 +384,7 @@ struct UpdateSettingsPanel: View {
     private var automaticPolicyCard: some View {
         VStack(alignment: .leading, spacing: 11) {
             DeskSettingsGroup(title: "更新策略") {
-                DeskSettingsRow(title: "自动检查更新") {
+                DeskSettingsRow(title: "自动检查更新", detail: "每 24 小时最多检查一次") {
                     Toggle("自动检查更新", isOn: Binding(
                         get: { controller.autoCheckPreference == true },
                         set: { controller.setAutomaticChecks($0) }
@@ -371,11 +407,10 @@ struct UpdateSettingsPanel: View {
             .toggleStyle(.switch)
             .controlSize(.small)
 
-            HStack(alignment: .center, spacing: 7) {
-                Text("启动满 2 分钟后，每 24 小时最多检查一次；网络异常按小时退避。自动安装需无远控、无被控、无活动映射连接。")
-                    .font(.system(size: 12))
-                    .foregroundStyle(DeskPalette.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            DeskCalloutBox(
+                title: "自动安装时机",
+                message: "安装时须无远控、无被控、无活动映射连接。自动检查在启动满 2 分钟后运行，网络异常时按小时退避。"
+            ) {
                 DeskInfoPopoverButton(
                     title: "自动更新安全与空闲判定说明",
                     lines: [

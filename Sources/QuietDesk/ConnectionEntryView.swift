@@ -173,7 +173,7 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
     let retryDraft: () -> ConnectionEntryDraft
     let nodePicker: NodePicker
     @Binding var showOptions: Bool
-    let options: (@escaping () -> Void) -> Options
+    let options: (_ columns: Bool, _ benchmark: @escaping () -> Void) -> Options
     let connect: (ConnectionEntryDraft) -> ConnectionEntryAttemptFailure?
     let cancel: () -> Void
     let clearFailure: () -> Void
@@ -207,6 +207,7 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
     let disconnectAllSessions: () -> Void
     let sessionForRecord: (ConnectionRecord) -> ActiveRemoteSessionSummary?
     var liveSessionForRecord: (ConnectionRecord) -> LiveDeviceSessionOverview? = { _ in nil }
+    var selectRecord: ((ConnectionRecord) -> Void)? = nil
     var openReceivedFiles: () -> Void = {}
     var viewerViewOnlyLocked: Bool = false
     var toggleViewerViewOnly: () -> Void = {}
@@ -276,12 +277,12 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                     activeSessionsSection
                 }
             }
-            .padding(.horizontal, 28)
-            .padding(.vertical, 22)
-            .frame(maxWidth: 1020, alignment: .leading)
+            .padding(.horizontal, 22)
+            .padding(.vertical, 20)
+            .frame(maxWidth: 1160, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .top)
         }
-        .background(selectedRecord == nil ? DeskPalette.canvasBackground : DeskPalette.cardBackground)
+        .background(DeskPalette.canvasBackground)
         .sheet(isPresented: Binding(
             get: { sheet != nil },
             set: { presented in if !presented { dismissSheet() } }
@@ -292,6 +293,9 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                 .modifier(recordRemovalAlert(inManagementSheet: true))
         }
         .modifier(recordRemovalAlert(inManagementSheet: false))
+        .onChange(of: selectedRecord?.id) { _, _ in
+            if sheet == nil { showOptions = false }
+        }
         .onChange(of: showNewConnection, initial: true) { _, requested in
             if requested { openNewConnection() }
         }
@@ -302,7 +306,10 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
             guard !locked, sheet == nil, let record = records.first(where: { $0.id == id }) else { return }
             connectSavedDevice(record)
         }
-        .onDisappear(perform: dismissSheet)
+        .onDisappear {
+            showOptions = false
+            dismissSheet()
+        }
         .onReceive(NotificationCenter.default.publisher(for: SystemQuitHandler.dismissSheets)) { _ in
             afterSheetDismissal = nil
             dismissSheet()
@@ -312,81 +319,78 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
     // MARK: - Page Heading
 
     private var pageHeading: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 10) {
-                if let selectedRecord {
-                    let session = sessionForRecord(selectedRecord)
-                    let live = liveSessionForRecord(selectedRecord)
-                    if let live {
-                        DeskPillBadge(
-                            text: live.badgeTitle,
-                            symbol: "circle.fill",
-                            tint: live.connected ? DeskPalette.emerald : DeskPalette.amber
-                        )
-                    } else if let session {
-                        DeskPillBadge(
-                            text: session.connected ? "已连接" : session.reconnecting ? "重连中" : "连接中",
-                            symbol: "circle.fill",
-                            tint: session.connected ? DeskPalette.emerald : DeskPalette.amber
-                        )
-                    }
+        HStack(spacing: 10) {
+            if let selectedRecord {
+                let session = sessionForRecord(selectedRecord)
+                let live = liveSessionForRecord(selectedRecord)
+                Image(systemName: ConnectionEntryPresentation.deviceSymbol(selectedRecord))
+                    .font(.system(size: 21, weight: .medium))
+                    .foregroundStyle(DeskPalette.accent)
+                    .frame(width: 45, height: 45)
+                    .background(DeskPalette.selection, in: RoundedRectangle(cornerRadius: 8))
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
                     Text(ConnectionEntryPresentation.title(selectedRecord))
-                        .font(.system(size: 22, weight: .bold))
+                        .font(.system(size: 26, weight: .bold))
                         .lineLimit(1)
                         .accessibilityAddTraits(.isHeader)
-                    recordMenu(selectedRecord, session: session, inManagementSheet: false)
-                } else {
+                    HStack(spacing: 8) {
+                        Text(selectedRecord.relay.map { "中继设备标识 · " + ConnectionEntryPresentation.compactRelayIdentity($0.deviceID) }
+                             ?? ConnectionEntryPresentation.endpoint(selectedRecord))
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(DeskPalette.secondary)
+                            .lineLimit(1)
+                        DeskPillBadge(
+                            text: live?.badgeTitle ?? session?.statusLabel ?? "未连接",
+                            tint: live != nil ? DeskPalette.emerald : session != nil ? DeskPalette.amber : DeskPalette.secondary
+                        )
+                    }
+                }
+                Spacer(minLength: 4)
+                if let live {
+                    Button(action: live.enterFullScreen) {
+                        Image(systemName: "viewfinder")
+                    }
+                    .buttonStyle(DeskButtonStyle(.secondary, compact: true))
+                    .help("进入全屏")
+                    .accessibilityLabel("进入全屏")
+                }
+                Button(session == nil ? "连接设备" : "打开会话窗口") { connectSavedDevice(selectedRecord) }
+                    .buttonStyle(DeskButtonStyle(.primary))
+                    .disabled(locked)
+                deviceActions(selectedRecord, live: live)
+                    .disabled(locked)
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
                     Text(records.isEmpty ? "第一次使用 QuietDesk" : "全部设备")
-                        .font(.system(size: 23, weight: .bold))
+                        .font(.system(size: 26, weight: .bold))
                         .accessibilityAddTraits(.isHeader)
+                    if !records.isEmpty {
+                        Text("\(records.count) 条本机连接记录")
+                            .font(.system(size: 12))
+                            .foregroundStyle(DeskPalette.secondary)
+                    }
                 }
-
-                Spacer(minLength: 8)
-
-                if !activeSessions.isEmpty {
-                    Button {
-                        sheet = .sessions
-                    } label: {
-                        HStack(spacing: 5) {
-                            Circle()
-                                .fill(DeskPalette.emerald)
-                                .frame(width: 6.5, height: 6.5)
-                            Text("活动会话（\(activeSessions.count)）")
-                        }
-                    }
-                    .buttonStyle(DeskButtonStyle(.secondary))
-                }
-
-                if let selectedRecord {
-                    let live = liveSessionForRecord(selectedRecord)
-                    Button(action: openReceivedFiles) {
-                        Image(systemName: "square.and.arrow.up")
-                    }
-                    .buttonStyle(DeskButtonStyle(.quiet))
-                    .help("打开接收文件目录")
-                    .accessibilityLabel("打开接收文件目录")
-
-                    if let live {
-                        Button(action: live.enterFullScreen) {
-                            Image(systemName: "viewfinder")
-                        }
-                        .buttonStyle(DeskButtonStyle(.quiet))
-                        .help("切到远控窗口并进入全屏")
-                        .accessibilityLabel("进入全屏")
-                    }
-
-                    Button {
-                        sheet = .readiness
-                    } label: {
-                        Image(systemName: "checkmark.shield")
-                    }
-                    .buttonStyle(DeskButtonStyle(.quiet))
-                    .help("连接前就绪状态")
-                    .accessibilityLabel("连接前就绪状态")
+                Spacer(minLength: 6)
+                if !records.isEmpty {
+                    Button("扫描局域网", action: openDiscovery)
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .disabled(locked)
+                    Button(action: openNewConnection) { Label("新建连接", systemImage: "plus") }
+                        .buttonStyle(DeskButtonStyle(.primary))
+                        .disabled(locked)
                 }
             }
-            .frame(minHeight: 34)
+            if !activeSessions.isEmpty {
+                Button {
+                    sheet = .sessions
+                } label: {
+                    Label("活动会话（\(activeSessions.count)）", systemImage: "rectangle.on.rectangle")
+                }
+                .buttonStyle(DeskButtonStyle(.secondary, compact: true))
+            }
         }
+        .frame(minHeight: 45)
     }
 
     // MARK: - First-Use Empty State (Page 9)
@@ -431,28 +435,21 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
 
     private var allDevices: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(spacing: 8) {
-                Text("\(records.count) 台已保存设备 · 本机保存的记录不代表设备当前在线")
-                    .font(.system(size: 13))
-                    .foregroundStyle(DeskPalette.secondary)
-                    .lineLimit(1)
-                Spacer()
-                Button("扫描局域网", action: openDiscovery)
-                    .buttonStyle(DeskButtonStyle(.secondary))
-                    .disabled(locked)
-                Button("管理记录") { sheet = .records }
-                    .buttonStyle(DeskButtonStyle(.secondary))
-                    .disabled(locked)
-                Button("新建连接", action: openNewConnection)
-                    .buttonStyle(DeskButtonStyle(.primary))
-                    .disabled(locked)
+            HStack(spacing: 12) {
+                DeskSearchField(
+                    placeholder: "搜索名称、地址或设备 ID…",
+                    text: $query,
+                    accessibilityTitle: "搜索连接记录"
+                )
+                if records.count > ConnectionEntryPresentation.recentLimit, !searching {
+                    DeskSegmentedTabs(
+                        tabs: [(false, "最近 \(ConnectionEntryPresentation.recentLimit) 台"),
+                               (true, "全部 \(records.count) 台")],
+                        selection: $expandedRecords
+                    )
+                    .frame(width: 174)
+                }
             }
-
-            DeskSearchField(
-                placeholder: "搜索名称、地址或设备 ID…",
-                text: $query,
-                accessibilityTitle: "搜索连接记录"
-            )
 
             if matches.isEmpty {
                 DeskSurfaceCard(padding: 36, cornerRadius: 11) {
@@ -474,17 +471,15 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
             }
 
             HStack {
-                if searching {
-                    Text("找到 \(matches.count) 条，共 \(records.count) 条记录")
-                        .font(.caption)
-                        .foregroundStyle(DeskPalette.secondary)
-                } else if records.count > ConnectionEntryPresentation.recentLimit {
-                    Button(expandedRecords ? "收起为最近 \(ConnectionEntryPresentation.recentLimit) 台设备" : "展开全部 \(records.count) 台设备") {
-                        expandedRecords.toggle()
-                    }
-                    .buttonStyle(DeskButtonStyle(.quiet))
-                }
+                Text(searching
+                     ? "找到 \(matches.count) 条，共 \(records.count) 条记录"
+                     : "已显示 \(visibleRecords.count) 条本机记录")
+                    .font(.caption)
+                    .foregroundStyle(DeskPalette.secondary)
                 Spacer()
+                Button("管理记录") { sheet = .records }
+                    .buttonStyle(DeskButtonStyle(.secondary, compact: true))
+                    .disabled(locked)
                 Button("连接前就绪状态") { sheet = .readiness }
                     .buttonStyle(DeskButtonStyle(.quiet))
             }
@@ -498,24 +493,41 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
         let live = liveSessionForRecord(record)
         let viewOnlyActive = live?.viewOnlyLocked ?? viewerViewOnlyLocked
 
-        return VStack(alignment: .leading, spacing: 14) {
-            DeskSurfaceCard(padding: 0, cornerRadius: 12) {
-                VStack(spacing: 0) {
+        return ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: 12) {
+                desktopPanel(record: record, live: live, session: session, viewOnlyActive: viewOnlyActive)
+                    .frame(minWidth: 365)
+                deviceInspector(record: record, live: live, session: session, alignedHeight: true)
+                    .frame(width: showOptions ? 278 : 234)
+            }
+            VStack(alignment: .leading, spacing: 12) {
+                desktopPanel(record: record, live: live, session: session, viewOnlyActive: viewOnlyActive, compact: true)
+                deviceInspector(record: record, live: live, session: session)
+            }
+        }
+    }
+
+    private func desktopPanel(
+        record: ConnectionRecord, live: LiveDeviceSessionOverview?, session: ActiveRemoteSessionSummary?,
+        viewOnlyActive: Bool, compact: Bool = false
+    ) -> some View {
+        DeskSurfaceCard(padding: 12, cornerRadius: 10) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("远程桌面").font(.system(size: 15, weight: .semibold))
+                    .accessibilityAddTraits(.isHeader)
+                Group {
                     if let live {
                         connectedDeviceStage(record: record, live: live)
                     } else if let session {
                         connectingDeviceStage(record: record, session: session)
                     } else {
-                        idleDeviceStage(record: record)
+                        idleDeviceStage(compact: compact)
                     }
-
-                    Divider()
-
-                    stageActionDock(record: record, live: live, viewOnlyActive: viewOnlyActive)
                 }
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                Divider()
+                stageActionDock(record: record, live: live, viewOnlyActive: viewOnlyActive)
             }
-
-            deviceFooterMetadata(record: record, live: live, session: session)
         }
     }
 
@@ -638,37 +650,50 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
         .background(DeskPalette.insetBackground)
     }
 
-    private func idleDeviceStage(record: ConnectionRecord) -> some View {
-        VStack(spacing: 12) {
-            Image(systemName: "display")
-                .font(.system(size: 42, weight: .light))
-                .foregroundStyle(DeskPalette.muted.opacity(0.8))
-                .accessibilityHidden(true)
-
-            Text("连接后显示远程桌面")
-                .font(.system(size: 20, weight: .semibold))
-                .foregroundStyle(DeskPalette.ink)
-
-            Text("此设备尚未建立会话，没有实时画面。")
-                .font(.system(size: 13))
-                .foregroundStyle(DeskPalette.secondary)
-
-            Button {
-                connectSavedDevice(record)
-            } label: {
-                Text("连接到设备")
-                    .padding(.horizontal, 8)
-                    .frame(minWidth: 118, minHeight: 32)
+    private func idleDeviceStage(compact: Bool) -> some View {
+        ZStack {
+            DeskPalette.insetBackground
+            Canvas { context, size in
+                for x in stride(from: CGFloat(14), to: size.width, by: 19) {
+                    for y in stride(from: CGFloat(14), to: size.height, by: 19) {
+                        context.fill(
+                            Path(ellipseIn: CGRect(x: x, y: y, width: 1.3, height: 1.3)),
+                            with: .color(DeskPalette.accent.opacity(0.20))
+                        )
+                    }
+                }
             }
-            .buttonStyle(DeskButtonStyle(.primary))
-            .disabled(locked)
-            .padding(.top, 6)
+            .accessibilityHidden(true)
+            VStack(spacing: 20) {
+                ZStack {
+                    previewWindow.offset(x: -32, y: -18)
+                    previewWindow.offset(x: 32, y: 17)
+                    Circle().fill(DeskPalette.accent).frame(width: 7, height: 7)
+                        .offset(x: -13, y: 12)
+                }
+                .frame(width: 160, height: 105)
+                .accessibilityHidden(true)
+                Text("连接后显示远程桌面")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(DeskPalette.secondary)
+            }
         }
-        .multilineTextAlignment(.center)
-        .padding(.horizontal, 28)
-        .padding(.vertical, 52)
-        .frame(maxWidth: .infinity, minHeight: 310)
-        .background(DeskPalette.insetBackground.opacity(0.65))
+        .frame(maxWidth: .infinity, minHeight: compact ? 244 : 342)
+    }
+
+    private var previewWindow: some View {
+        RoundedRectangle(cornerRadius: 9)
+            .fill(DeskPalette.cardBackground.opacity(0.54))
+            .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(DeskPalette.accent.opacity(0.46), lineWidth: 1.5) }
+            .overlay(alignment: .topLeading) {
+                HStack(spacing: 4) {
+                    ForEach(0..<3) { _ in
+                        Circle().fill(DeskPalette.accent.opacity(0.45)).frame(width: 3.5, height: 3.5)
+                    }
+                }
+                .padding(8)
+            }
+            .frame(width: 94, height: 61)
     }
 
     private func stageActionDock(
@@ -676,45 +701,24 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
         live: LiveDeviceSessionOverview?,
         viewOnlyActive: Bool
     ) -> some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 0) {
-                dockButton("文件接收", symbol: "doc.on.doc", action: openReceivedFiles)
-                dockDivider
-                dockButton(
-                    viewOnlyActive ? "仅观看已开" : "仅观看",
-                    symbol: viewOnlyActive ? "eye.fill" : "eye",
-                    highlighted: viewOnlyActive,
-                    action: {
-                        if let live {
-                            live.toggleViewOnly()
-                        } else {
-                            toggleViewerViewOnly()
-                        }
-                    }
-                )
-                dockDivider
-                dockButton("端口映射", symbol: "point.3.connected.trianglepath.dotted") {
-                    openPortMappingRecord(record)
-                }
-                dockDivider
-                dockOptionsButton(record: record)
-                dockDivider
-                dockMoreMenu(record: record, live: live, includePortMappingAndTest: false)
+        HStack(spacing: 0) {
+            dockButton("文件接收", symbol: "folder", action: openReceivedFiles)
+            dockDivider
+            dockButton(
+                viewOnlyActive ? "仅观看已开" : "仅观看",
+                symbol: viewOnlyActive ? "eye.fill" : "eye",
+                highlighted: viewOnlyActive,
+                action: { if let live { live.toggleViewOnly() } else { toggleViewerViewOnly() } }
+            )
+            dockDivider
+            dockButton("端口映射", symbol: "point.3.connected.trianglepath.dotted") {
+                openPortMappingRecord(record)
             }
-            .fixedSize(horizontal: false, vertical: true)
-
-            HStack(spacing: 0) {
-                dockButton("端口映射", symbol: "point.3.connected.trianglepath.dotted") {
-                    openPortMappingRecord(record)
-                }
-                dockDivider
-                dockOptionsButton(record: record)
-                dockDivider
-                dockMoreMenu(record: record, live: live, includePortMappingAndTest: true)
+            dockDivider
+            dockButton("连接选项", symbol: "slider.horizontal.3", highlighted: showOptions) {
+                if showOptions { showOptions = false } else { openOptions() }
             }
         }
-        .frame(minHeight: 46)
-        .background(DeskPalette.cardBackground)
         .disabled(locked)
     }
 
@@ -741,41 +745,16 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                     .foregroundStyle(highlighted ? DeskPalette.accent : DeskPalette.ink)
                     .lineLimit(1)
             }
-            .frame(maxWidth: .infinity, minHeight: 44)
+            .frame(maxWidth: .infinity, minHeight: 33)
+            .background(highlighted ? DeskPalette.selection : .clear, in: RoundedRectangle(cornerRadius: 6))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
 
-    private func dockOptionsButton(record: ConnectionRecord) -> some View {
-        Button(action: openOptions) {
-            HStack(spacing: 6) {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 12.5))
-                    .foregroundStyle(DeskPalette.secondary)
-                Text("连接选项")
-                    .font(.system(size: 12.5, weight: .medium))
-                    .foregroundStyle(DeskPalette.ink)
-                    .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity, minHeight: 44)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .popover(isPresented: optionsPresentation(inComposer: false), arrowEdge: .bottom) {
-            options { benchmarkRecord(record) }
-        }
-    }
-
-    private func dockMoreMenu(
-        record: ConnectionRecord,
-        live: LiveDeviceSessionOverview?,
-        includePortMappingAndTest: Bool
-    ) -> some View {
+    private func deviceActions(_ record: ConnectionRecord, live: LiveDeviceSessionOverview?) -> some View {
         Menu {
-            if includePortMappingAndTest {
-                Button("打开接收文件目录", action: openReceivedFiles)
-            }
+            Button("打开接收文件目录", action: openReceivedFiles)
             Button("测试线路质量…") { benchmarkRecord(record) }
                 .disabled(live != nil)
             if record.wakeOnLAN != nil {
@@ -784,94 +763,93 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
             } else {
                 Button("配置网络唤醒…") { configureWakeRecord(record) }
             }
+            Button("配置 TCP 端口映射…") { openPortMappingRecord(record) }
             Button("连接前就绪状态…") { sheet = .readiness }
             if let live {
                 Divider()
-                Button("断开远程连接", role: .destructive) {
-                    disconnectSession(live.sessionID)
-                }
+                Button("断开远程连接", role: .destructive) { disconnectSession(live.sessionID) }
             }
             Divider()
             Button("移除此记录…", role: .destructive) { recordToRemove = record }
         } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 12.5, weight: .semibold))
-                    .foregroundStyle(DeskPalette.secondary)
-                Text("更多")
-                    .font(.system(size: 12.5, weight: .medium))
-                    .foregroundStyle(DeskPalette.ink)
-            }
-            .padding(.horizontal, 10)
-            .frame(minHeight: 44)
-            .contentShape(Rectangle())
+            Image(systemName: "ellipsis").frame(width: 28, height: 29)
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
-        .fixedSize(horizontal: true, vertical: false)
-        .frame(maxWidth: .infinity, minHeight: 44)
+        .fixedSize()
+        .frame(width: 32, height: 31)
+        .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 7))
+        .overlay { RoundedRectangle(cornerRadius: 7).strokeBorder(DeskPalette.hairline) }
+        .help("更多连接操作")
+        .accessibilityLabel("更多连接操作")
     }
 
-    private func deviceFooterMetadata(
-        record: ConnectionRecord,
-        live: LiveDeviceSessionOverview?,
-        session: ActiveRemoteSessionSummary?
+    private func deviceInspector(
+        record: ConnectionRecord, live: LiveDeviceSessionOverview?, session: ActiveRemoteSessionSummary?,
+        alignedHeight: Bool = false
     ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                if let live {
-                    let parts = [
-                        "当前会话",
-                        live.resolution.isEmpty ? nil : live.resolution,
-                        live.qualitySummary.isEmpty ? nil : live.qualitySummary
-                    ].compactMap { $0 }
-                    Text(parts.joined(separator: " · "))
-                        .lineLimit(1)
-                } else {
-                    Text("\(ConnectionEntryPresentation.endpoint(record)) · \(ConnectionEntryPresentation.route(record)) · \(ConnectionEntryPresentation.savedQualityLabel(record))")
-                        .lineLimit(1)
-                        .textSelection(.enabled)
-                }
-
-                if let badge = qualityBadge(record) {
-                    DeskPillBadge(text: badge.text, tint: qualityTint(badge.tone), monospaced: true)
-                }
-
-                let mappings = runningMappingsCount(record)
-                if mappings > 0 {
-                    DeskPillBadge(text: "\(mappings) 条映射启用中", tint: DeskPalette.emerald)
-                }
-
-                Spacer(minLength: 8)
-
-                if let session {
-                    Button("打开独立窗口") { focusSession(session.id) }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(DeskPalette.accent)
-                } else {
-                    HStack(spacing: 10) {
-                        Button("测试线路") { benchmarkRecord(record) }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(DeskPalette.secondary)
-                        if record.wakeOnLAN != nil {
-                            Text("·").foregroundStyle(DeskPalette.muted)
-                            Button("网络唤醒") { wakeRecord(record) }
-                                .buttonStyle(.plain)
-                                .foregroundStyle(DeskPalette.secondary)
-                        }
+        DeskSurfaceCard(padding: 14, cornerRadius: 10) {
+            VStack(alignment: .leading, spacing: 11) {
+                HStack {
+                    Text(showOptions ? "连接选项" : "连接概况")
+                        .font(.system(size: 16, weight: .semibold))
+                        .accessibilityAddTraits(.isHeader)
+                    Spacer(minLength: 0)
+                    if showOptions {
+                        Button { showOptions = false } label: { Image(systemName: "xmark") }
+                            .buttonStyle(DeskButtonStyle(.quiet, compact: true))
+                            .accessibilityLabel("关闭连接选项")
                     }
-                    .font(.system(size: 12))
+                }
+                if showOptions {
+                    Text("对所有连接生效").font(.caption).foregroundStyle(DeskPalette.secondary)
+                    ScrollView {
+                        options(false) { benchmarkRecord(record) }
+                    }
+                    .scrollBounceBehavior(.basedOnSize)
+                    .frame(maxHeight: 425)
+                } else {
+                    detailRow("连接方式", ConnectionEntryPresentation.route(record))
+                    detailRow(record.relay == nil ? "连接地址" : "中继节点", ConnectionEntryPresentation.endpoint(record))
+                    if let live {
+                        let summary = [live.resolution, live.qualitySummary].filter { !$0.isEmpty }.joined(separator: " · ")
+                        detailRow("当前画质", summary.isEmpty ? "正在等待画面" : summary)
+                    } else {
+                        detailRow("默认画质", ConnectionEntryPresentation.savedQualityLabel(record))
+                    }
+                    detailRow("配对记录", hasSavedCredentialForRecord(record) ? "已保存" : "缺少配对码")
+                    if let badge = qualityBadge(record) {
+                        DeskPillBadge(text: badge.text, tint: qualityTint(badge.tone), monospaced: true)
+                    }
+                    let mappings = runningMappingsCount(record)
+                    if mappings > 0 {
+                        DeskPillBadge(text: "\(mappings) 条映射启用中", tint: DeskPalette.emerald)
+                    }
+                    HStack(spacing: 5) {
+                        if let session {
+                            Button("打开独立窗口") { focusSession(session.id) }
+                                .buttonStyle(DeskButtonStyle(.secondary, compact: true))
+                        } else {
+                            Button("测试线路") { benchmarkRecord(record) }
+                                .buttonStyle(DeskButtonStyle(.secondary, compact: true))
+                                .disabled(locked)
+                        }
+                        Button("就绪状态") { sheet = .readiness }
+                            .buttonStyle(DeskButtonStyle(.secondary, compact: true))
+                    }
                 }
             }
-            .font(.system(size: 12.5))
-            .foregroundStyle(DeskPalette.secondary)
+            .frame(minHeight: alignedHeight ? 420 : 0, alignment: .topLeading)
+        }
+    }
 
-            if live == nil {
-                Text("远程桌面将在建立加密连接后在独立窗口中运行。")
-                    .font(.system(size: 12))
-                    .foregroundStyle(DeskPalette.muted)
-            }
+    private func detailRow(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Divider()
+            Text(label).font(.system(size: 11)).foregroundStyle(DeskPalette.secondary)
+            Text(value)
+                .font(.system(size: 12.5, weight: .medium))
+                .textSelection(.enabled)
         }
     }
 
@@ -903,8 +881,16 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                                 .foregroundStyle(DeskPalette.secondary)
                                 .frame(width: 18)
                                 .accessibilityHidden(true)
-                            tableCell(ConnectionEntryPresentation.title(record))
-                                .fontWeight(.medium)
+                            if !inManagementSheet, let selectRecord {
+                                Button { selectRecord(record) } label: {
+                                    tableCell(ConnectionEntryPresentation.title(record)).fontWeight(.medium)
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(DeskPalette.accent)
+                                .disabled(locked)
+                            } else {
+                                tableCell(ConnectionEntryPresentation.title(record)).fontWeight(.medium)
+                            }
                         }
                         .frame(width: 152, alignment: .leading)
 
@@ -1120,77 +1106,134 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
     }
 
     private var connectionSheet: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 14) {
             sheetHeading(
-                draftTitle == nil ? (usesRelay ? "通过设备标识连接" : "新建连接") : "编辑连接",
-                detail: draftTitle
+                showOptions ? "连接选项" : draftTitle == nil ? "新建连接" : "编辑连接",
+                detail: showOptions ? "新建连接 / 对所有连接生效" : draftTitle ?? "选择方式并填写被控设备的连接信息。"
             )
 
-            ViewThatFits(in: .vertical) {
-                connectionFields
-                ScrollView { connectionFields }
+            if showOptions {
+                ScrollView { options(true, benchmarkDraft) }
                     .scrollBounceBehavior(.basedOnSize)
-            }
-            .frame(maxHeight: 396, alignment: .topLeading)
-
-            HStack(spacing: 8) {
-                Button("测试线路", action: benchmarkDraft)
-                    .buttonStyle(DeskButtonStyle(.secondary))
-                    .help("测量直连与中继的实际帧率、延迟及 UDP 丢包")
-                    .disabled(locked)
-                Button("扫描局域网", action: openDiscovery)
-                    .buttonStyle(DeskButtonStyle(.quiet))
-                    .disabled(locked)
-                if let openPortMappingDraft {
-                    Button("用于端口映射…") {
-                        let input = draft
-                        dismissSheet { openPortMappingDraft(input) }
+                    .frame(height: 390)
+                Divider()
+                HStack {
+                    Spacer()
+                    Button {
+                        showOptions = false
+                    } label: {
+                        Label("返回连接", systemImage: "arrow.left")
                     }
-                    .buttonStyle(DeskButtonStyle(.quiet))
-                    .disabled(locked)
-                }
-                Spacer()
-                cancelButton
-                Button(draftFailure == nil ? "连接" : "重试", action: submitConnection)
                     .buttonStyle(DeskButtonStyle(.primary))
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(locked)
+                    .keyboardShortcut(.cancelAction)
+                }
+            } else {
+                HStack(alignment: .top, spacing: 16) {
+                    connectionMethods
+                        .frame(width: 172)
+                    ScrollView {
+                        connectionFields
+                    }
+                    .scrollBounceBehavior(.basedOnSize)
+                    .frame(maxWidth: .infinity)
+                    .onAppear(perform: focusIncompleteField)
+                }
+                .frame(height: 383, alignment: .topLeading)
+                HStack {
+                    if usesRelay {
+                        Button("管理节点…") { dismissSheet(then: openRelay) }
+                            .buttonStyle(DeskButtonStyle(.quiet, compact: true))
+                            .disabled(locked)
+                    }
+                    Spacer(minLength: 0)
+                    Button(action: openOptions) { Label("连接选项", systemImage: "slider.horizontal.3") }
+                        .buttonStyle(DeskButtonStyle(.secondary, compact: true))
+                        .disabled(locked)
+                }
+                Divider()
+                HStack(spacing: 8) {
+                    Button("测试线路", action: benchmarkDraft)
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .help("测量直连与中继的实际帧率、延迟及 UDP 丢包")
+                        .disabled(locked)
+                    Button("扫描局域网", action: openDiscovery)
+                        .buttonStyle(DeskButtonStyle(.quiet))
+                        .disabled(locked)
+                    if let openPortMappingDraft {
+                        Button("用于端口映射…") {
+                            let input = draft
+                            dismissSheet { openPortMappingDraft(input) }
+                        }
+                        .buttonStyle(DeskButtonStyle(.quiet))
+                        .disabled(locked)
+                    }
+                    Spacer()
+                    cancelButton
+                    Button(draftFailure == nil ? "连接" : "重试", action: submitConnection)
+                        .buttonStyle(DeskButtonStyle(.primary))
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(locked)
+                }
             }
-            .padding(.top, 4)
         }
-        .padding(26)
-        .frame(width: 540)
-        .onAppear(perform: focusIncompleteField)
+        .padding(23)
+        .frame(width: 762)
         .onChange(of: draft.address) { _, text in adoptInvitation(text) }
         .onChange(of: draft.code) { _, text in adoptInvitation(text) }
     }
 
-    private var connectionFields: some View {
-        VStack(alignment: .leading, spacing: 14) {
+    private var connectionMethods: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("连接方式").font(.system(size: 11.5, weight: .semibold))
+                .foregroundStyle(DeskPalette.secondary)
+                .padding(.horizontal, 6)
             if relayEnabled {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("连接方式")
-                        .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(DeskPalette.secondary)
-                    DeskSegmentedTabs(
-                        tabs: [(.direct, "地址直连"), (.automatic, "自动（直连优先）"), (.relay, "中继设备标识")],
-                        selection: $draft.strategy
-                    )
-                }
+                methodRow(.direct, detail: "使用域名或 IP", symbol: "link")
+                methodRow(.automatic, detail: "优先尝试直连", symbol: "arrow.right")
+                methodRow(.relay, detail: "使用自托管中继", symbol: "point.3.connected.trianglepath.dotted")
             } else {
-                HStack {
-                    Text("连接方式 · 地址直连")
-                        .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(DeskPalette.secondary)
-                    Spacer()
-                    Button("配置自托管中继…") { dismissSheet(then: openRelay) }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(DeskPalette.accent)
-                        .disabled(locked)
-                }
+                methodRow(.direct, detail: "使用域名或 IP", symbol: "link")
+                Button("配置自托管中继…") { dismissSheet(then: openRelay) }
+                    .buttonStyle(DeskButtonStyle(.quiet, compact: true))
+                    .disabled(locked)
             }
+            Spacer(minLength: 0)
+        }
+        .padding(8)
+        .frame(maxHeight: .infinity, alignment: .topLeading)
+        .background(DeskPalette.subtleFill, in: RoundedRectangle(cornerRadius: 8))
+    }
 
+    private func methodRow(_ strategy: RelayConnectionStrategy, detail: String, symbol: String) -> some View {
+        let selected = !relayEnabled || draft.strategy == strategy
+        return Button { draft.strategy = strategy } label: {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: symbol)
+                    .frame(width: 17)
+                    .foregroundStyle(selected ? DeskPalette.accent : DeskPalette.secondary)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(strategy == .direct ? "地址直连" : strategy == .relay ? "中继设备标识" : strategy.title)
+                        .font(.system(size: 12, weight: .semibold))
+                    Text(detail).font(.system(size: 11)).foregroundStyle(DeskPalette.secondary)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(selected ? DeskPalette.selection : .clear, in: RoundedRectangle(cornerRadius: 6))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(locked)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    private var connectionFields: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Text(usesRelay ? (showsAddress ? "自动选择线路" : "通过设备标识连接") : "通过地址连接")
+                .font(.system(size: 17, weight: .semibold))
+                .accessibilityAddTraits(.isHeader)
             if usesRelay {
                 labeledField("自托管中继") {
                     nodePicker
@@ -1212,30 +1255,33 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                 }
             }
 
+            if showsAddress {
+                HStack(alignment: .top, spacing: 12) {
+                    labeledField(usesTailnet ? "对端 Tailscale IPv4" : (usesRelay ? "可选直连地址" : "地址")) {
+                        TextField(usesTailnet ? "100.x.y.z" : "域名、IP 或粘贴连接信息", text: addressField)
+                            .font(.system(size: 13))
+                            .focused($focusedField, equals: .address)
+                            .deskInputBox(focused: focusedField == .address)
+                            .accessibilityLabel("被控 Mac 的地址")
+                            .onSubmit { focusedField = .code }
+                    }
+                    labeledField("端口") {
+                        TextField("5908", text: $draft.port)
+                            .font(.system(size: 13, design: .monospaced))
+                            .focused($focusedField, equals: .port)
+                            .deskInputBox(focused: focusedField == .port)
+                            .accessibilityLabel("目标端口")
+                            .onSubmit { focusedField = .code }
+                    }
+                    .frame(width: 96)
+                }
+            }
             if !usesRelay {
                 Toggle("通过内置 Tailscale 连接", isOn: Binding(get: { usesTailnet }, set: { enabled in
                     draft.address = enabled ? TailnetAddress.prefix + draft.address : String(draft.address.dropFirst(TailnetAddress.prefix.count))
                 }))
                 .toggleStyle(.checkbox)
                 .disabled(locked)
-            }
-            if showsAddress {
-                labeledField(usesTailnet ? "对端 Tailscale IPv4" : (usesRelay ? "可选直连地址" : "地址")) {
-                    TextField(usesTailnet ? "100.x.y.z" : "域名或 IP，或粘贴被控 Mac 复制的连接信息", text: addressField)
-                        .font(.system(size: 13))
-                        .focused($focusedField, equals: .address)
-                        .deskInputBox(focused: focusedField == .address)
-                        .accessibilityLabel("被控 Mac 的地址")
-                        .onSubmit { focusedField = .code }
-                }
-                labeledField("端口") {
-                    TextField("5908", text: $draft.port)
-                        .font(.system(size: 13, design: .monospaced))
-                        .focused($focusedField, equals: .port)
-                        .deskInputBox(focused: focusedField == .port)
-                        .accessibilityLabel("目标端口")
-                        .onSubmit { focusedField = .code }
-                }
             }
 
             labeledField("配对码") { pairingField }
@@ -1250,39 +1296,16 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                         symbol: "info.circle",
                         tone: .info
                     )
-                    Button("管理节点…") { dismissSheet(then: openRelay) }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(DeskPalette.accent)
-                        .disabled(locked)
                 }
             } else if usesTailnet {
                 Text("两端先在「网络与线路 → Tailscale」登录同一网络，然后填入对端显示的地址和 QuietDesk 配对码。")
                     .font(.system(size: 12))
                     .foregroundStyle(DeskPalette.secondary)
             }
-
-            VStack(spacing: 0) {
-                Button(action: openOptions) {
-                    HStack {
-                        Text("连接选项")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(DeskPalette.ink)
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 11.5, weight: .semibold))
-                            .foregroundStyle(DeskPalette.muted)
-                    }
-                    .padding(.vertical, 9)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .popover(isPresented: optionsPresentation(inComposer: true), arrowEdge: .bottom) {
-                    options(benchmarkDraft)
-                }
-                Divider()
-            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 2)
+        .padding(.vertical, 2)
     }
 
     private func credentialsSheet(title: String, endpoint: String) -> some View {
@@ -1333,13 +1356,6 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
         Button("取消", action: dismissSheet)
             .buttonStyle(DeskButtonStyle(.secondary))
             .keyboardShortcut(.cancelAction)
-    }
-
-    private func optionsPresentation(inComposer: Bool) -> Binding<Bool> {
-        Binding(
-            get: { showOptions && (sheet == .connection) == inComposer },
-            set: { if (sheet == .connection) == inComposer { showOptions = $0 } }
-        )
     }
 
     // MARK: - LAN Discovery Sheet (Page 10)
@@ -1508,9 +1524,11 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                 readinessRow("剪贴板与文件按需拉取", value: preFlight.clipboardTitle, ready: preFlight.clipboardReady)
             }
 
-            Text("释放控制 Ctrl+Option+Esc  ·  全屏 Ctrl+Cmd+F  ·  远端截图 Ctrl+Cmd+S")
-                .font(.system(size: 12))
-                .foregroundStyle(DeskPalette.secondary)
+            HStack(spacing: 12) {
+                readinessShortcut("释放控制", "⌃⌥Esc")
+                readinessShortcut("全屏", "⌃⌘F")
+                readinessShortcut("远端截图", "⌃⌘S")
+            }
 
             HStack {
                 Button("偏好设置…") { dismissSheet(then: openCaps) }
@@ -1524,6 +1542,19 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
         }
         .padding(26)
         .frame(width: 540)
+    }
+
+    private func readinessShortcut(_ action: String, _ shortcut: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(action).font(.caption).foregroundStyle(DeskPalette.secondary)
+            Text(shortcut)
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(DeskPalette.subtleFill, in: RoundedRectangle(cornerRadius: 4))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .combine)
     }
 
     private func readinessRow(_ title: String, value: String, ready: Bool) -> some View {

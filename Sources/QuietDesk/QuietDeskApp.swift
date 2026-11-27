@@ -72,6 +72,7 @@ struct QuietDeskApp: App {
         .defaultSize(width: 1100, height: 760)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            QuietDeskAboutCommands()
             CommandGroup(after: .appInfo) {
                 if updates.enabled {
                     Button("检查更新…") { updates.check() }
@@ -88,9 +89,48 @@ struct QuietDeskApp: App {
         }
         .defaultSize(width: 1220, height: 800)
         .windowToolbarStyle(.unified)
+        Window("关于 QuietDesk", id: "about") {
+            QuietDeskAboutView(version: updates.currentVersion, build: updates.currentBuild)
+        }
+        .windowResizability(.contentSize)
         MenuBarExtra("QuietDesk", systemImage: "display.2") {
             TrayView(models: models, viewer: models.viewer, host: models.host, updates: updates)
         }
+    }
+}
+
+private struct QuietDeskAboutCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(replacing: .appInfo) {
+            Button("关于 QuietDesk") { openWindow(id: "about") }
+        }
+    }
+}
+
+private struct QuietDeskAboutView: View {
+    let version: String
+    let build: Int
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "rectangle.on.rectangle")
+                .font(.system(size: 37, weight: .medium))
+                .foregroundStyle(DeskPalette.accent)
+                .frame(width: 82, height: 82)
+                .background(DeskPalette.selection, in: RoundedRectangle(cornerRadius: 20))
+                .accessibilityHidden(true)
+            Text("QuietDesk")
+                .font(.system(size: 29, weight: .bold))
+                .accessibilityAddTraits(.isHeader)
+            Text("版本 \(version)（\(build)）")
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundStyle(DeskPalette.secondary)
+                .textSelection(.enabled)
+        }
+        .frame(width: 408, height: 242)
+        .deskSurface()
     }
 }
 
@@ -1053,7 +1093,7 @@ struct DeskView: View {
                             }
                         }
                     )
-                    .frame(width: min(236, max(204, geometry.size.width * 0.22)))
+                    .frame(width: min(208, max(176, geometry.size.width * 0.18)))
 
                     Rectangle()
                         .fill(DeskPalette.hairline)
@@ -1180,6 +1220,7 @@ struct DeskView: View {
                     models.workspaceSection = .network
                 },
                 selectedRecord: models.viewer.connections.first { $0.id == workspaceDeviceID },
+                selectRecord: { workspaceDeviceID = $0.id },
                 showNewConnection: $showNewConnection,
                 openRecordRequest: $openDeviceRequest
             )
@@ -1598,72 +1639,34 @@ private struct DeskWorkspaceSidebar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 6) {
+            HStack(spacing: 7) {
+                Image(systemName: "rectangle.on.rectangle")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(DeskPalette.accent)
+                    .accessibilityHidden(true)
                 Text("QuietDesk")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(DeskPalette.ink)
-                    .padding(.leading, 18)
                 Spacer(minLength: 0)
                 Button(action: toggleSidebar) {
                     Image(systemName: "sidebar.left")
-                        .font(.system(size: 12.5, weight: .medium))
+                        .font(.system(size: 12, weight: .medium))
                 }
-                .buttonStyle(DeskButtonStyle(.quiet))
+                .buttonStyle(DeskButtonStyle(.quiet, compact: true))
                 .help("收起设备栏")
                 .accessibilityLabel("收起设备栏")
             }
-            .frame(height: 38)
-            .padding(.trailing, 8)
+            .frame(height: 42)
+            .padding(.horizontal, 12)
 
-            HStack(spacing: 5) {
-                Text("我的设备")
-                    .font(.system(size: 11.5, weight: .medium))
-                    .foregroundStyle(DeskPalette.muted)
-                    .accessibilityAddTraits(.isHeader)
-                Spacer(minLength: 0)
-                Button(action: newConnection) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 12, weight: .medium))
-                }
-                .buttonStyle(DeskButtonStyle(.quiet))
-                .disabled(roleLocked)
-                .help("新建连接")
-                .accessibilityLabel("新建连接")
+            Button(action: newConnection) {
+                Label("新建连接", systemImage: "plus")
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.leading, 18)
-            .padding(.trailing, 10)
-            .padding(.top, 8)
-            .padding(.bottom, 5)
-
-            // A native list: arrow keys move the selection, Return or a double-click connects, a right-click
-            // opens the device's menu and a drag reorders.
-            List(selection: deviceSelection) {
-                ForEach(models.arrangedConnections) { record in
-                    deviceRow(record)
-                        .listRowSeparator(.hidden)
-                }
-                .onMove { models.moveDevices(from: $0, to: $1) }
-                Button(action: newConnection) {
-                    rowLabel("新建连接", symbol: "plus")
-                        .foregroundStyle(DeskPalette.muted)
-                        .padding(.leading, Self.listRowLeading)
-                        .frame(minHeight: 31)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .listRowSeparator(.hidden)
-            }
-            .listStyle(.inset)
-            .scrollContentBackground(.hidden)
-            .contentMargins(.vertical, 0, for: .scrollContent)
-            .environment(\.defaultMinListRowHeight, 35)
-            .contextMenu(forSelectionType: UUID.self) { ids in
-                deviceMenu(ids)
-            } primaryAction: { ids in
-                if let id = ids.first { openDevice(id) }
-            }
+            .buttonStyle(DeskButtonStyle(.secondary))
             .disabled(roleLocked)
-            .frame(maxHeight: .infinity)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 10)
 
             VStack(spacing: 2) {
                 navigationRow(.connect, selected: models.workspaceSection == .connect && workspaceDeviceID == nil) {
@@ -1694,6 +1697,41 @@ private struct DeskWorkspaceSidebar: View {
             }
             .padding(.horizontal, 10)
             .padding(.top, 8)
+
+            Divider()
+                .padding(.horizontal, 12)
+                .padding(.vertical, 11)
+            if !models.arrangedConnections.isEmpty {
+                Text("设备记录")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(DeskPalette.secondary)
+                    .accessibilityAddTraits(.isHeader)
+                    .padding(.leading, 14)
+                    .padding(.bottom, 5)
+                // A native list: arrow keys move the selection, Return or a double-click connects, a right-click
+                // opens the device's menu and a drag reorders.
+                List(selection: deviceSelection) {
+                    ForEach(models.arrangedConnections) { record in
+                        deviceRow(record)
+                            .listRowSeparator(.hidden)
+                    }
+                    .onMove { models.moveDevices(from: $0, to: $1) }
+                }
+                .listStyle(.inset)
+                .scrollContentBackground(.hidden)
+                .contentMargins(.vertical, 0, for: .scrollContent)
+                .environment(\.defaultMinListRowHeight, 35)
+                .contextMenu(forSelectionType: UUID.self) { ids in
+                    deviceMenu(ids)
+                } primaryAction: { ids in
+                    if let id = ids.first { openDevice(id) }
+                }
+                .disabled(roleLocked)
+                .frame(height: CGFloat(min(ConnectionEntryPresentation.recentLimit, models.arrangedConnections.count)) * 35)
+
+            }
+
+            Spacer(minLength: 0)
 
             VStack(spacing: 6) {
                 Rectangle().fill(DeskPalette.hairline).frame(height: 1)
@@ -1738,6 +1776,21 @@ private struct DeskWorkspaceSidebar: View {
         .accessibilityLabel(title)
         .accessibilityValue(status ?? "未连接")
         .help(status ?? "点按查看设备；连按两次或按 Return 连接，右键可重命名，按住拖动可调整顺序")
+        .padding(.trailing, deviceSelection.wrappedValue == record.id ? 25 : 0)
+        .overlay(alignment: .trailing) {
+            if deviceSelection.wrappedValue == record.id {
+                Menu {
+                    deviceMenu([record.id])
+                } label: {
+                    Image(systemName: "ellipsis").frame(width: 21, height: 23)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("设备记录操作")
+                .accessibilityLabel("设备记录操作")
+            }
+        }
     }
 
     @ViewBuilder
@@ -1772,7 +1825,7 @@ private struct DeskWorkspaceSidebar: View {
                         .fixedSize()
                 }
             }
-            .foregroundStyle(isSelected ? DeskPalette.ink : DeskPalette.secondary)
+            .foregroundStyle(isSelected ? DeskPalette.accent : DeskPalette.secondary)
         }
         .buttonStyle(DeskSidebarRowStyle(selected: isSelected))
         .disabled(roleLocked && !isSelected)

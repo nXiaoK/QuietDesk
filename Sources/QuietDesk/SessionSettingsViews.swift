@@ -94,36 +94,22 @@ struct ConnectionSettingsView: View {
     let openEffects: () -> Void
     var openBenchmark: (() -> Void)? = nil
     var embedded: Bool = false
+    var inline: Bool = false
+    var inlineColumns: Bool = false
 
     var body: some View {
-        let content = VStack(alignment: .leading, spacing: 18) {
+        let embeddedContent = Group {
             if embedded {
                 embeddedConnectionDefaults
+            } else if inline {
+                ConnectionOptionsSections(
+                    model: model, compact: false, inline: true, inlineColumns: inlineColumns,
+                    settingsActions: settingsActions
+                )
             } else {
-                ConnectionOptionsSections(model: model, compact: false)
-                Divider()
-                HStack(spacing: 8) {
-                    Label("键盘与快捷键", systemImage: "keyboard")
-                    CapsLockStateLabel(model: model)
-                    Spacer(minLength: 0)
-                    Button("设置…", action: openCaps).buttonStyle(.link)
-                }
-                Text(model.systemShortcutStatus)
-                    .font(.caption)
-                    .foregroundStyle(DeskPalette.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let openBenchmark, !model.connected {
-                    Button(action: openBenchmark) {
-                        Label("连接与中继线路质量实测…", systemImage: "speedometer")
-                    }
-                    .buttonStyle(DeskButtonStyle(.secondary))
-                    .disabled(model.active || model.working)
-                }
-                HStack(spacing: 8) {
-                    Button("隐私与安全…", action: openEffects)
-                        .buttonStyle(DeskButtonStyle(.secondary))
-                    Button("历史流量…", action: openTraffic)
-                        .buttonStyle(DeskButtonStyle(.secondary))
+                VStack(alignment: .leading, spacing: 18) {
+                    ConnectionOptionsSections(model: model, compact: false)
+                    settingsActions
                 }
             }
         }
@@ -131,12 +117,11 @@ struct ConnectionSettingsView: View {
         .toggleStyle(.switch)
         .controlSize(.small)
 
-        if embedded {
-            content
-                .frame(maxWidth: .infinity, alignment: .leading)
+        if embedded || inline {
+            embeddedContent.frame(maxWidth: .infinity, alignment: .leading)
         } else {
             ScrollView {
-                content
+                embeddedContent
                     .padding(16)
                     .frame(width: 356)
                     .deskSurface()
@@ -146,103 +131,162 @@ struct ConnectionSettingsView: View {
         }
     }
 
+    private var settingsActions: ConnectionSettingsActions {
+        ConnectionSettingsActions(
+            model: model, openCaps: openCaps, openTraffic: openTraffic, openEffects: openEffects,
+            openBenchmark: openBenchmark
+        )
+    }
+
     private var embeddedConnectionDefaults: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            DeskSettingsGroup(title: "传输偏好") {
-                DeskSettingsRow(
-                    title: "仅使用 TCP 视频",
-                    detail: model.mediaTCPOnly ? "下次连接视频固定走可靠 TCP" : "默认优先加密 UDP，不可达时自动回退 TCP"
-                ) {
-                    Toggle("仅使用 TCP 视频", isOn: $model.mediaTCPOnly).labelsHidden()
+        VStack(alignment: .leading, spacing: 16) {
+            DeskSettingsColumns {
+                VStack(alignment: .leading, spacing: 16) {
+                    defaultTransportSettings
+                    relatedSettings
                 }
-                Divider()
-                DeskSettingsRow(title: "断线自动重连") {
-                    Toggle("断线自动重连", isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) }))
-                        .labelsHidden()
-                }
-                Divider()
-                DeskSettingsRow(title: IdleAutoPausePresentation.toggleTitle, detail: "离开前台满 10 分钟默认暂停画面省流") {
-                    Toggle(IdleAutoPausePresentation.toggleTitle, isOn: Binding(
-                        get: { model.disableIdleAutoPause }, set: { model.setDisableIdleAutoPause($0) }
-                    ))
-                    .labelsHidden()
-                    .help(IdleAutoPausePresentation.toggleHelp)
-                }
-                Divider()
-                DeskSettingsRow(title: "结束连接后生成诊断报告") {
-                    Toggle("结束连接后生成诊断报告", isOn: $model.connectionDiagnosticsEnabled)
-                        .labelsHidden()
-                        .disabled(model.isControllingAnotherMac)
-                }
-                if model.relayEnabled {
-                    Divider()
-                    RelayPeerAssistPicker(model: model)
-                        .padding(.vertical, 10)
-                }
-            }
-
-            DeskSettingsGroup(title: "显示、音频与剪贴板默认项") {
-                DeskSettingsRow(title: "画面缩放") {
-                    Picker("画面缩放", selection: $model.canvasScalingMode) {
-                        ForEach(RemoteCanvasScalingMode.allCases, id: \.self) { mode in
-                            Text(mode.title).tag(mode)
-                        }
+            } trailing: {
+                VStack(alignment: .leading, spacing: 8) {
+                    defaultDisplaySettings
+                    if model.showFullScreenStatistics {
+                        FullScreenStatusSettings(model: model)
                     }
-                    .labelsHidden()
-                    .frame(width: 176)
-                }
-                Divider()
-                DeskSettingsRow(title: "窗口贴合画面比例", detail: "连接后和拖动窗口边缘后，会话窗口取远端画面的形状，不留黑边") {
-                    Toggle("窗口贴合画面比例", isOn: $model.windowFollowsPicture).labelsHidden()
-                }
-                Divider()
-                DeskSettingsRow(title: "本地即时光标", detail: "首帧分离视频与指针，消除双光标跟随") {
-                    Toggle("本地即时光标", isOn: $model.lowLatencyCursorEnabled).labelsHidden()
-                }
-                Divider()
-                DeskSettingsRow(title: "远端系统声音回传", detail: "可与「被控端本机静音」同时开启") {
-                    Toggle("远端系统声音回传", isOn: Binding(
-                        get: { model.remoteAudioEnabled }, set: { model.setRemoteAudioEnabled($0) }
-                    ))
-                    .labelsHidden()
-                }
-                Divider()
-                DeskSettingsRow(title: "双向按需同步文字、图片与文件", detail: "⌘V 按需拉取文字图片；文件逐次确认后下载") {
-                    Toggle("双向按需同步", isOn: Binding(
-                        get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) }
-                    ))
-                    .labelsHidden()
-                }
-                Divider()
-                DeskSettingsRow(title: "全屏顶部工具条", detail: "指针在屏幕顶部中间停留片刻时显示切换屏幕、画质、退出全屏和断开") {
-                    Toggle("全屏顶部工具条", isOn: $model.fullScreenToolbarEnabled).labelsHidden()
-                }
-                Divider()
-                DeskSettingsRow(title: "全屏显示实时连接指标") {
-                    Toggle("全屏显示实时连接指标", isOn: $model.showFullScreenStatistics).labelsHidden()
-                }
-                if model.showFullScreenStatistics {
-                    Divider()
-                    FullScreenStatusSettings(model: model)
-                        .padding(.vertical, 8)
                 }
             }
 
-            DeskSettingsGroup(title: "相关设置") {
-                DeskSettingsRow(title: "键盘与快捷键") {
-                    Button("打开设置", action: openCaps)
-                        .buttonStyle(DeskButtonStyle(.secondary))
-                }
-                Divider()
-                DeskSettingsRow(title: "被控端隐私偏好") {
-                    Button("打开设置", action: openEffects)
-                        .buttonStyle(DeskButtonStyle(.secondary))
-                }
-            }
-
-            Text("连接级选项与共享端默认编码上限分开；不将待下次连接生效的设置表示为当前已生效。")
+            Text("连接默认项用于建立连接。会话画质受共享端编码上限约束。")
                 .font(.system(size: 12))
                 .foregroundStyle(DeskPalette.secondary)
+        }
+    }
+
+    private var defaultTransportSettings: some View {
+        DeskSettingsGroup(title: "传输偏好") {
+            DeskSettingsRow(
+                title: "仅使用 TCP 视频",
+                detail: model.mediaTCPOnly
+                    ? "下次连接视频固定走可靠 TCP。"
+                    : "下次连接生效。默认优先加密 UDP，不可达时自动回退 TCP。"
+            ) {
+                Toggle("仅使用 TCP 视频", isOn: $model.mediaTCPOnly).labelsHidden()
+            }
+            Divider()
+            DeskSettingsRow(title: "断线自动重连") {
+                Toggle("断线自动重连", isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) }))
+                    .labelsHidden()
+            }
+            Divider()
+            DeskSettingsRow(title: IdleAutoPausePresentation.toggleTitle, detail: "离开前台满 10 分钟默认暂停画面省流") {
+                Toggle(IdleAutoPausePresentation.toggleTitle, isOn: Binding(
+                    get: { model.disableIdleAutoPause }, set: { model.setDisableIdleAutoPause($0) }
+                ))
+                .labelsHidden()
+                .help(IdleAutoPausePresentation.toggleHelp)
+            }
+            Divider()
+            DeskSettingsRow(title: "结束连接后生成诊断报告") {
+                Toggle("结束连接后生成诊断报告", isOn: $model.connectionDiagnosticsEnabled)
+                    .labelsHidden()
+                    .disabled(model.isControllingAnotherMac)
+            }
+            if model.relayEnabled {
+                Divider()
+                RelayPeerAssistPicker(model: model)
+                    .padding(.vertical, 10)
+            }
+        }
+    }
+
+    private var defaultDisplaySettings: some View {
+        DeskSettingsGroup(title: "显示、音频与剪贴板默认项") {
+            DeskSettingsRow(title: "画面缩放") {
+                Picker("画面缩放", selection: $model.canvasScalingMode) {
+                    ForEach(RemoteCanvasScalingMode.allCases, id: \.self) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: 152)
+            }
+            Divider()
+            DeskSettingsRow(title: "窗口贴合画面比例", detail: "连接后和拖动窗口边缘后，会话窗口取远端画面的形状，不留黑边") {
+                Toggle("窗口贴合画面比例", isOn: $model.windowFollowsPicture).labelsHidden()
+            }
+            Divider()
+            DeskSettingsRow(title: "本地即时光标", detail: "首帧分离视频与指针，消除双光标跟随") {
+                Toggle("本地即时光标", isOn: $model.lowLatencyCursorEnabled).labelsHidden()
+            }
+            Divider()
+            DeskSettingsRow(title: "远端系统声音回传", detail: "可与「被控端本机静音」同时开启") {
+                Toggle("远端系统声音回传", isOn: Binding(
+                    get: { model.remoteAudioEnabled }, set: { model.setRemoteAudioEnabled($0) }
+                ))
+                .labelsHidden()
+            }
+            Divider()
+            DeskSettingsRow(title: "双向按需同步文字、图片与文件", detail: "⌘V 按需拉取文字图片；文件逐次确认后下载") {
+                Toggle("双向按需同步", isOn: Binding(
+                    get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) }
+                ))
+                .labelsHidden()
+            }
+            Divider()
+            DeskSettingsRow(title: "全屏顶部工具条", detail: "指针在屏幕顶部中间停留片刻时显示切换屏幕、画质、退出全屏和断开") {
+                Toggle("全屏顶部工具条", isOn: $model.fullScreenToolbarEnabled).labelsHidden()
+            }
+            Divider()
+            DeskSettingsRow(title: "全屏显示实时连接指标") {
+                Toggle("全屏显示实时连接指标", isOn: $model.showFullScreenStatistics).labelsHidden()
+            }
+        }
+    }
+
+    private var relatedSettings: some View {
+        DeskSettingsGroup(title: "相关设置") {
+            DeskSettingsRow(title: "键盘与快捷键") {
+                Button("打开设置", action: openCaps)
+                    .buttonStyle(DeskButtonStyle(.secondary))
+            }
+            Divider()
+            DeskSettingsRow(title: "被控端隐私偏好") {
+                Button("打开设置", action: openEffects)
+                    .buttonStyle(DeskButtonStyle(.secondary))
+            }
+        }
+    }
+}
+
+private struct ConnectionSettingsActions: View {
+    @ObservedObject var model: DeskModel
+    let openCaps: () -> Void
+    let openTraffic: () -> Void
+    let openEffects: () -> Void
+    let openBenchmark: (() -> Void)?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            DeskSettingsGroup(title: "键盘与快捷键") {
+                DeskSettingsRow(title: "本机检测", detail: model.systemShortcutStatus) {
+                    HStack(spacing: 6) {
+                        CapsLockStateLabel(model: model)
+                        Button("设置…", action: openCaps)
+                            .buttonStyle(DeskButtonStyle(.secondary, compact: true))
+                    }
+                }
+            }
+            if let openBenchmark, !model.connected {
+                Button(action: openBenchmark) {
+                    Label("测试线路质量…", systemImage: "speedometer")
+                }
+                .buttonStyle(DeskButtonStyle(.secondary, compact: true))
+                .disabled(model.active || model.working)
+            }
+            HStack(spacing: 8) {
+                Button("隐私与安全…", action: openEffects)
+                    .buttonStyle(DeskButtonStyle(.quiet, compact: true))
+                Button("历史流量…", action: openTraffic)
+                    .buttonStyle(DeskButtonStyle(.quiet, compact: true))
+            }
         }
     }
 }
@@ -256,8 +300,17 @@ private struct ConnectionOptionsSections: View {
         case connection = "连接"
     }
 
+    private enum InlineTab: String, CaseIterable, Hashable {
+        case displayAndInput = "显示与输入"
+        case transportAndDiagnostics = "传输与诊断"
+    }
+
     @ObservedObject var model: DeskModel
     let compact: Bool
+    var inline: Bool = false
+    var inlineColumns: Bool = false
+    var settingsActions: ConnectionSettingsActions? = nil
+    @State private var inlineTab: InlineTab = .displayAndInput
     @State private var compactTab: CompactTab = .display
     @State private var showTypeTextSheet = false
 
@@ -265,7 +318,9 @@ private struct ConnectionOptionsSections: View {
 
     var body: some View {
         Group {
-            if compact {
+            if inline {
+                inlineOptions
+            } else if compact {
                 VStack(alignment: .leading, spacing: 11) {
                     DeskSegmentedTabs(
                         tabs: CompactTab.allCases.map { ($0, $0.rawValue) },
@@ -297,6 +352,65 @@ private struct ConnectionOptionsSections: View {
         .toggleStyle(.switch)
         .controlSize(.small)
         .tint(DeskPalette.accent)
+    }
+
+    private var inlineOptions: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            DeskUnderlineTabs(
+                tabs: InlineTab.allCases.map { ($0, $0.rawValue) }, selection: $inlineTab
+            )
+            switch inlineTab {
+            case .displayAndInput:
+                if inlineColumns {
+                    DeskSettingsColumns(minimumColumnWidth: 278) {
+                        displaySettingsGroup
+                    } trailing: {
+                        inputSettingsGroup
+                    }
+                } else {
+                    displaySettingsGroup
+                    inputSettingsGroup
+                }
+            case .transportAndDiagnostics:
+                if inlineColumns {
+                    DeskSettingsColumns(minimumColumnWidth: 278) {
+                        transportSettingsGroup
+                    } trailing: {
+                        diagnosisAndActions
+                    }
+                } else {
+                    transportSettingsGroup
+                    diagnosisAndActions
+                }
+            }
+        }
+    }
+
+    private var displaySettingsGroup: some View {
+        DeskSettingsGroup(title: "显示与声音") {
+            displayAndSoundBlock.padding(.vertical, 8)
+        }
+    }
+
+    private var inputSettingsGroup: some View {
+        DeskSettingsGroup(title: "输入与剪贴板") {
+            inputAndClipboardBlock.padding(.vertical, 6)
+        }
+    }
+
+    private var transportSettingsGroup: some View {
+        DeskSettingsGroup(title: "传输与中继") {
+            transportBlock
+        }
+    }
+
+    private var diagnosisAndActions: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            DeskSettingsGroup(title: "诊断") {
+                diagnosticsBlock.padding(.bottom, model.lastDisconnect.isEmpty ? 0 : 7)
+            }
+            settingsActions
+        }
     }
 
     private var displayAndSoundBlock: some View {
@@ -373,7 +487,11 @@ private struct ConnectionOptionsSections: View {
                     .padding(.bottom, 8)
             }
 
-            scopeNote(showsSessionControls ? "画质随此连接保存，远端显示器只在本次会话有效；其余对所有连接生效。" : "对所有连接生效。")
+            if !inline {
+                scopeNote(showsSessionControls
+                          ? "画质随此连接保存。远端显示器只在本次会话有效，其余对所有连接生效。"
+                          : "对所有连接生效。")
+            }
         }
     }
 
@@ -471,12 +589,22 @@ private struct ConnectionOptionsSections: View {
             }
             .padding(.vertical, 8)
 
-            scopeNote((showsSessionControls ? "相对鼠标只在本次会话有效；其余对所有连接生效。" : "对所有连接生效。")
-                      + "共享端权限未生效造成的仅观看，不等同于本机防误触锁定。")
+            scopeNote((showsSessionControls ? "相对鼠标只在本次会话有效，其余对所有连接生效。"
+                       : (inline ? "" : "对所有连接生效。"))
+                      + "防误触锁定只控制本机是否发送键鼠，远程控制还需要共享端权限。")
         }
     }
 
     private var connectionBlock: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            transportBlock
+            Divider()
+            diagnosticsBlock
+            scopeNote("对所有连接生效。")
+        }
+    }
+
+    private var transportBlock: some View {
         VStack(alignment: .leading, spacing: 0) {
             compactToggleRow(
                 "断线自动重连",
@@ -508,15 +636,16 @@ private struct ConnectionOptionsSections: View {
                 RelayPeerAssistPicker(model: model)
                     .padding(.vertical, 8)
             }
+        }
+    }
 
-            Divider()
+    private var diagnosticsBlock: some View {
+        VStack(alignment: .leading, spacing: 0) {
             compactToggleRow(
                 "结束后生成诊断报告",
                 isOn: $model.connectionDiagnosticsEnabled,
                 disabled: model.isControllingAnotherMac
             )
-
-            scopeNote("对所有连接生效。")
 
             if !model.lastDisconnect.isEmpty {
                 Text("上次断开：\(model.lastDisconnect)")
@@ -575,9 +704,9 @@ struct CapsLockSettingsView: View {
                 DeskSectionHeading(title: "键盘与快捷键", detail: "设置系统快捷键与 Caps Lock 转发。")
             }
             if embedded {
-                CapsLockDetails(model: model, compact: false)
+                CapsLockDetails(model: model, embedded: true)
             } else {
-                ScrollView { CapsLockDetails(model: model, compact: false) }
+                ScrollView { CapsLockDetails(model: model) }
                     .frame(height: 390)
                 HStack {
                     Spacer()
@@ -668,7 +797,7 @@ private struct FullScreenStatusSettings: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("样式").foregroundStyle(DeskPalette.secondary)
+                Text("指标样式").foregroundStyle(DeskPalette.secondary)
                 Spacer()
                 Picker("状态样式", selection: $model.fullScreenStatusCompact) {
                     Text("单行胶囊").tag(true)
@@ -744,29 +873,31 @@ private struct CapsLockStateLabel: View {
 
 private struct CapsLockDetails: View {
     @ObservedObject var model: DeskModel
-    let compact: Bool
+    var embedded = false
+    var compact = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: compact ? 12 : 18) {
+        VStack(alignment: .leading, spacing: compact ? 12 : 16) {
             forwardingGroup
 
             if model.connected || model.reconnecting {
                 PermissionNextStepView(step: model.remoteKeyboardNextStep, compact: compact, perform: permissionAction)
             }
 
-            if compact {
-                DeskSettingsGroup(title: "Caps Lock 按键行为") {
-                    behaviorRow("短按 Caps Lock", "切换远端输入法")
-                    Divider()
-                    behaviorRow("按住 ≥ 0.6 秒后松开", "切换大写锁定")
-                    Divider()
-                    behaviorRow("远端大写已开启", "短按先解除大写")
+            if embedded {
+                DeskSettingsColumns {
+                    behaviorGroup
+                } trailing: {
+                    permissionsGroup
                 }
             } else {
-                capsBehaviorTable
+                if compact { behaviorGroup } else { capsBehaviorTable }
+                permissionsGroup
             }
 
-            permissionsGroup
+            PermissionNextStepView(step: .localKeyboard(accessibility: model.localAccessibility,
+                inputMonitoring: model.localInputMonitoring, capsEnabled: model.capsLockEnabled,
+                capsRunning: model.capsLockRunning), compact: compact, perform: permissionAction)
 
             if !model.inputStatus.isEmpty {
                 Text(model.inputStatus)
@@ -802,7 +933,7 @@ private struct CapsLockDetails: View {
                 }
                 Divider()
                 DeskSettingsRow(title: "窗口模式也转发系统快捷键",
-                                detail: "控制画面有焦点时，⌘Tab、⌘空格等送到远端而不是本机；按 ⌃⌥Esc 释放控制后恢复本机快捷键。关闭时只在全屏转发") {
+                                detail: "控制画面有焦点时转发 ⌘Tab、⌘空格等快捷键。按 ⌃⌥Esc 释放控制，关闭此项时仅在全屏转发。") {
                     Toggle("窗口模式也转发系统快捷键", isOn: $model.systemShortcutsInWindow)
                         .labelsHidden()
                         .toggleStyle(.switch)
@@ -810,11 +941,34 @@ private struct CapsLockDetails: View {
                 }
                 Divider()
                 DeskSettingsRow(title: "释放控制 / 退出全屏") {
-                    Text("Ctrl+Option+Esc / Ctrl+Cmd+F")
-                        .font(.system(size: 12.5, design: .monospaced))
-                        .foregroundStyle(DeskPalette.secondary)
+                    HStack(spacing: 8) {
+                        keycap("⌃⌥Esc", help: "Control + Option + Esc")
+                        keycap("⌃⌘F", help: "Control + Command + F")
+                    }
                 }
             }
+        }
+    }
+
+    private func keycap(_ label: String, help: String) -> some View {
+        Text(label)
+            .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+            .foregroundStyle(DeskPalette.ink)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(DeskPalette.insetBackground, in: RoundedRectangle(cornerRadius: 5))
+            .overlay { RoundedRectangle(cornerRadius: 5).strokeBorder(DeskPalette.hairline, lineWidth: 1) }
+            .help(help)
+            .accessibilityLabel(help)
+    }
+
+    private var behaviorGroup: some View {
+        DeskSettingsGroup(title: "Caps Lock 按键行为") {
+            behaviorRow("短按 Caps Lock", "切换远端输入法")
+            Divider()
+            behaviorRow("按住 ≥ 0.6 秒后松开", "切换大写锁定")
+            Divider()
+            behaviorRow("远端大写已开启", "短按先解除大写", detail: "再次短按切换中英文")
         }
     }
 
@@ -867,9 +1021,10 @@ private struct CapsLockDetails: View {
             DeskSettingsGroup(title: "本机权限 · 实际生效检测") {
                 if model.capsLockEnabled {
                     DeskSettingsRow(title: "本机监听") {
-                        Text(model.capsLockRunning ? "已就绪" : "尚未就绪")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(model.capsLockRunning ? DeskPalette.emerald : DeskPalette.amber)
+                        DeskPillBadge(
+                            text: model.capsLockRunning ? "已就绪" : "尚未就绪",
+                            tint: model.capsLockRunning ? DeskPalette.emerald : DeskPalette.amber
+                        )
                     }
                     Divider()
                 }
@@ -883,30 +1038,24 @@ private struct CapsLockDetails: View {
                 }
             }
 
-            Text("本机授权与被控端授权不能互相代替。系统安全输入开启时暂停快捷键转发。")
+            Text("本机和被控端分别授权。系统安全输入开启时暂停快捷键转发。")
                 .font(.system(size: 12))
                 .foregroundStyle(DeskPalette.secondary)
-
-            PermissionNextStepView(step: .localKeyboard(accessibility: model.localAccessibility,
-                inputMonitoring: model.localInputMonitoring, capsEnabled: model.capsLockEnabled,
-                capsRunning: model.capsLockRunning), compact: compact, perform: permissionAction)
         }
     }
 
-    private func behaviorRow(_ title: String, _ behavior: String) -> some View {
-        DeskSettingsRow(title: title) {
+    private func behaviorRow(_ title: String, _ behavior: String, detail: String? = nil) -> some View {
+        DeskSettingsRow(title: title, detail: detail) {
             Text(behavior).font(.caption).foregroundStyle(DeskPalette.secondary)
         }
     }
 
     private func permissionRow(_ title: String, effective: Bool, action: @escaping () -> Void) -> some View {
         DeskSettingsRow(title: title) {
-            HStack(spacing: 10) {
-                Text(effective ? "已生效" : "尚未生效")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(effective ? DeskPalette.emerald : DeskPalette.amber)
-                Button("打开系统设置…", action: action)
-                    .buttonStyle(DeskButtonStyle(.secondary))
+            HStack(spacing: 7) {
+                DeskPillBadge(text: effective ? "已生效" : "尚未生效", tint: effective ? DeskPalette.emerald : DeskPalette.amber)
+                Button("系统设置…", action: action)
+                    .buttonStyle(DeskButtonStyle(.secondary, compact: true))
                     .accessibilityLabel("打开\(title)系统设置")
             }
         }

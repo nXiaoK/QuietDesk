@@ -60,23 +60,16 @@ struct RelaySettingsView: View {
             }
 
             if locked {
-                DeskSettingsGroup(title: "已连接期间的配置锁定") {
-                    DeskSettingsRow(title: "自托管节点配置") {
-                        Text("请先停止共享并断开远控")
-                            .font(.system(size: 13))
-                            .foregroundStyle(DeskPalette.secondary)
-                    }
-                    Divider()
-                    DeskSettingsRow(title: "节点证书") {
-                        Text("绑定当前地址与端口，不写系统根证书")
-                            .font(.system(size: 13))
-                            .foregroundStyle(DeskPalette.secondary)
-                    }
-                }
+                DeskCalloutBox(
+                    title: "中继配置已锁定",
+                    message: "停止本机共享并断开远控后可编辑节点。",
+                    symbol: "lock",
+                    tone: .warning
+                )
             }
 
             let inner = VStack(alignment: .leading, spacing: 18) {
-                DeskSurfaceCard(padding: 0, cornerRadius: 10) {
+                DeskSettingsGroup(title: "") {
                     DeskSettingsRow(
                         title: "启用自托管中继",
                         detail: "共享时在全部节点登记，连接时优先尝试延迟最低的节点"
@@ -86,7 +79,13 @@ struct RelaySettingsView: View {
                             .toggleStyle(.switch)
                             .controlSize(.small)
                     }
-                    .padding(.horizontal, 16)
+                    Divider()
+                    DeskSettingsRow(title: "节点证书") {
+                        Text("仅绑定当前地址与端口")
+                            .font(.system(size: 12))
+                            .foregroundStyle(DeskPalette.secondary)
+                            .help("节点证书绑定当前地址与端口，不写入系统根证书。")
+                    }
                 }
 
                 if enabled {
@@ -100,7 +99,7 @@ struct RelaySettingsView: View {
                 inner
             } else {
                 ScrollView { inner }
-                    .frame(maxHeight: enabled ? 400 : 80)
+                    .frame(maxHeight: enabled ? 410 : 116)
             }
 
             if editing == nil, let failure {
@@ -171,8 +170,10 @@ struct RelaySettingsView: View {
                     .foregroundStyle(DeskPalette.secondary)
                 Spacer()
                 if editing == nil {
-                    Button("添加节点…") { beginEditing("") }
-                        .buttonStyle(DeskButtonStyle(.secondary))
+                    Button { beginEditing("") } label: {
+                        Label("添加节点…", systemImage: "plus")
+                    }
+                    .buttonStyle(DeskButtonStyle(.secondary))
                 }
             }
 
@@ -245,48 +246,39 @@ struct RelaySettingsView: View {
 
     private var deviceIdentitySection: some View {
         VStack(alignment: .leading, spacing: 9) {
-            Text("本机中继设备标识")
-                .font(.system(size: 12.5, weight: .medium))
-                .foregroundStyle(DeskPalette.secondary)
-
-            HStack {
-                Text(deviceID)
-                    .font(.system(size: 13, design: .monospaced))
-                    .foregroundStyle(DeskPalette.ink)
-                    .textSelection(.enabled)
-                Spacer(minLength: 8)
-            }
-            .padding(.horizontal, 12)
-            .frame(minHeight: 36)
-            .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .strokeBorder(DeskPalette.hairline, lineWidth: 1)
-            }
-
-            HStack(spacing: 8) {
-                Button("更换标识") {
-                    deviceID = UUID().uuidString.lowercased()
+            DeskSettingsGroup(title: "本机设备标识") {
+                DeskSettingsRow(title: "中继设备标识") {
+                    Text(deviceID)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(DeskPalette.ink)
+                        .textSelection(.enabled)
                 }
-                .buttonStyle(DeskButtonStyle(.secondary))
+                Divider()
+                DeskSettingsRow(title: "设备标识操作") {
+                    HStack(spacing: 8) {
+                        Button(copiedDeviceID ? "已复制" : "复制标识") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(deviceID, forType: .string)
+                            copiedDeviceID = true
+                            Task { @MainActor in
+                                try? await Task.sleep(for: .seconds(1.2))
+                                copiedDeviceID = false
+                            }
+                        }
+                        .buttonStyle(DeskButtonStyle(.secondary))
 
-                Button(copiedDeviceID ? "已复制" : "复制标识") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(deviceID, forType: .string)
-                    copiedDeviceID = true
-                    Task { @MainActor in
-                        try? await Task.sleep(for: .seconds(1.2))
-                        copiedDeviceID = false
+                        Button("更换标识") {
+                            deviceID = UUID().uuidString.lowercased()
+                        }
+                        .buttonStyle(DeskButtonStyle(.secondary))
                     }
                 }
-                .buttonStyle(DeskButtonStyle(.quiet))
             }
 
-            Text("开启共享后，控制端凭此标识与配对码连入。更换标识后须更新另一台 Mac 保存的目标标识，不影响配对码。")
+            Text("开启共享后，控制端凭此标识与配对码连入。更换后需更新控制端保存的目标标识。")
                 .font(.system(size: 12))
                 .foregroundStyle(DeskPalette.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-                .padding(.top, 2)
         }
     }
 

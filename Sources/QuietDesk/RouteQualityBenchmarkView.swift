@@ -22,86 +22,20 @@ struct RouteQualityBenchmarkView: View {
     var selectedTargetRecord: ConnectionRecord? = nil
     var onSelectTargetRecord: ((ConnectionRecord?) -> Void)? = nil
 
+    @Namespace private var assessmentAnchor
+    @Namespace private var runsAnchor
     @State private var expandedRunIDs: Set<UUID> = []
+    @State private var expandedRouteIDs: Set<String> = []
     @State private var didSeedInitialExpansion = false
     @State private var showClearConfirmation = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if embedded {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
-                        headerSection
-
-                        if let warning = runner.storageWarningMessage {
-                            bannerRow(
-                                icon: "exclamationmark.icloud.fill",
-                                color: DeskPalette.amber,
-                                text: warning
-                            )
-                        }
-
-                        switch runner.selectedTab {
-                        case .currentRun:
-                            currentRunContent
-                        case .history:
-                            historyContent
-                        }
-
-                        if runner.isRunning, runner.selectedTab == .currentRun {
-                            DeskSurfaceCard(padding: 16, cornerRadius: 10) {
-                                liveProgressCard
-                            }
-                        }
-
-                        footerSection
-                    }
-                    .padding(.horizontal, 28)
-                    .padding(.vertical, 22)
-                    .frame(maxWidth: 920, alignment: .leading)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                }
-            } else {
-                headerSection
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 16)
-
-                Divider()
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
-                        if let warning = runner.storageWarningMessage {
-                            bannerRow(
-                                icon: "exclamationmark.icloud.fill",
-                                color: DeskPalette.amber,
-                                text: warning
-                            )
-                        }
-
-                        switch runner.selectedTab {
-                        case .currentRun:
-                            currentRunContent
-                        case .history:
-                            historyContent
-                        }
-                    }
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 16)
-                }
-
-                if runner.isRunning, runner.selectedTab == .currentRun {
-                    Divider()
-                    liveProgressCard
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 10)
-                }
-
-                Divider()
-
-                footerSection
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 12)
-            }
+        ScrollViewReader { proxy in
+            mainContent(scrollToAssessment: {
+                withAnimation { proxy.scrollTo(assessmentAnchor, anchor: .top) }
+            }, scrollToRuns: {
+                withAnimation { proxy.scrollTo(runsAnchor, anchor: .top) }
+            })
         }
         .frame(
             minWidth: embedded ? nil : 720,
@@ -157,6 +91,85 @@ struct RouteQualityBenchmarkView: View {
         }
     }
 
+    private func mainContent(scrollToAssessment: @escaping () -> Void, scrollToRuns: @escaping () -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if embedded {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        headerSection
+
+                        if let warning = runner.storageWarningMessage {
+                            bannerRow(
+                                icon: "exclamationmark.icloud.fill",
+                                color: DeskPalette.amber,
+                                text: warning
+                            )
+                        }
+
+                        switch runner.selectedTab {
+                        case .currentRun:
+                            currentRunContent
+                        case .history:
+                            historyContent(scrollToAssessment: scrollToAssessment, scrollToRuns: scrollToRuns)
+                        }
+
+                        if runner.isRunning, runner.selectedTab == .currentRun {
+                            DeskSurfaceCard(padding: 16, cornerRadius: 10) {
+                                liveProgressCard
+                            }
+                        }
+
+                        footerSection
+                    }
+                    .padding(.horizontal, 28)
+                    .padding(.vertical, 22)
+                    .frame(maxWidth: 920, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+            } else {
+                headerSection
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 16)
+
+                Divider()
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        if let warning = runner.storageWarningMessage {
+                            bannerRow(
+                                icon: "exclamationmark.icloud.fill",
+                                color: DeskPalette.amber,
+                                text: warning
+                            )
+                        }
+
+                        switch runner.selectedTab {
+                        case .currentRun:
+                            currentRunContent
+                        case .history:
+                            historyContent(scrollToAssessment: scrollToAssessment, scrollToRuns: scrollToRuns)
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 16)
+                }
+
+                if runner.isRunning, runner.selectedTab == .currentRun {
+                    Divider()
+                    liveProgressCard
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 10)
+                }
+
+                Divider()
+
+                footerSection
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 12)
+            }
+        }
+    }
+
     private func seedExpandedRunIfNeeded() {
         guard !didSeedInitialExpansion else { return }
         didSeedInitialExpansion = true
@@ -169,58 +182,32 @@ struct RouteQualityBenchmarkView: View {
 
     private var headerSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(pageTitle)
-                        .font(.system(size: 23, weight: .bold))
-                        .foregroundStyle(DeskPalette.ink)
-                        .accessibilityAddTraits(.isHeader)
-                    Text(runner.targetSummary)
-                        .font(.callout)
-                        .foregroundStyle(DeskPalette.secondary)
-                        .textSelection(.enabled)
-                        .lineLimit(2)
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 12) {
+                    benchmarkHeading.frame(minWidth: 200, alignment: .leading)
+                    Spacer(minLength: 8)
+                    benchmarkActions.fixedSize(horizontal: true, vertical: false)
                 }
-
-                Spacer()
-                HStack(spacing: 8) {
-                    if let onSelectTargetRecord, !availableRecords.isEmpty {
-                        Menu {
-                            Button("使用连接页当前填写目标") {
-                                onSelectTargetRecord(nil)
-                            }
-                            Divider()
-                            ForEach(availableRecords) { record in
-                                Button("\(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record))") {
-                                    onSelectTargetRecord(record)
-                                }
-                            }
-                        } label: {
-                            Label(
-                                selectedTargetRecord.map { "目标：\(ConnectionEntryPresentation.title($0))" } ?? "切换测速目标",
-                                systemImage: "desktopcomputer"
-                            )
-                        }
-                        .buttonStyle(DeskButtonStyle(.secondary))
-                        .disabled(runner.isRunning)
-                    }
-                    if !runner.isRunning {
-                        Button(runner.completedOrFailedCount > 0 ? "重新实测" : "开始实测") {
-                            runner.start()
-                        }
-                        .buttonStyle(DeskButtonStyle(.primary))
-                        .disabled(runner.selectedCount == 0)
-                    }
+                VStack(alignment: .leading, spacing: 8) {
+                    benchmarkHeading
+                    benchmarkActions
                 }
             }
 
-            DeskSegmentedTabs(
-                tabs: [(.currentRun, "本次实测"), (.history, historyTabTitle)],
-                selection: $runner.selectedTab
-            )
-            .frame(maxWidth: 340, alignment: .leading)
-
-            if runner.selectedTab == .currentRun {
+            if runner.selectedTab == .history {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) {
+                        benchmarkTabs.fixedSize(horizontal: true, vertical: false)
+                        Spacer(minLength: 8)
+                        historyHeaderControls.fixedSize(horizontal: true, vertical: false)
+                    }
+                    VStack(alignment: .leading, spacing: 8) {
+                        benchmarkTabs
+                        historyHeaderControls
+                    }
+                }
+            } else {
+                benchmarkTabs
                 HStack(spacing: 10) {
                     Text("单条时长")
                         .font(.caption)
@@ -240,9 +227,86 @@ struct RouteQualityBenchmarkView: View {
                             .foregroundStyle(DeskPalette.secondary)
                     }
                 }
-            } else {
-                historyHeaderControls
             }
+        }
+    }
+
+    private var benchmarkHeading: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(pageTitle)
+                .font(.system(size: 23, weight: .bold))
+                .foregroundStyle(DeskPalette.ink)
+                .accessibilityAddTraits(.isHeader)
+            Text(runner.targetSummary)
+                .font(.callout)
+                .foregroundStyle(DeskPalette.secondary)
+                .textSelection(.enabled)
+                .lineLimit(2)
+        }
+    }
+
+    private var benchmarkActions: some View {
+        HStack(spacing: 8) {
+            if let onSelectTargetRecord, !availableRecords.isEmpty {
+                Menu {
+                    Button("使用连接页当前填写目标") {
+                        onSelectTargetRecord(nil)
+                    }
+                    Divider()
+                    ForEach(availableRecords) { record in
+                        Button("\(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record))") {
+                            onSelectTargetRecord(record)
+                        }
+                    }
+                } label: {
+                    Label("切换测速目标", systemImage: "desktopcomputer")
+                }
+                .buttonStyle(DeskButtonStyle(.secondary))
+                .accessibilityValue(selectedTargetRecord.map(ConnectionEntryPresentation.title) ?? "当前连接草稿")
+                .disabled(runner.isRunning)
+            }
+            if !runner.isRunning {
+                Button {
+                    runner.start()
+                } label: {
+                    Label(runner.completedOrFailedCount > 0 ? "重新实测" : "开始实测", systemImage: "play")
+                }
+                .buttonStyle(DeskButtonStyle(.primary))
+                .disabled(runner.selectedCount == 0)
+            }
+        }
+    }
+
+    private var benchmarkTabs: some View {
+        HStack(spacing: 0) {
+            ForEach([RouteQualityBenchmarkRunner.ViewTab.currentRun, .history], id: \.self) { tab in
+                let selected = runner.selectedTab == tab
+                Button {
+                    runner.selectedTab = tab
+                } label: {
+                    Text(tab == .currentRun ? "本次实测" : historyTabTitle)
+                        .font(.system(size: 12, weight: selected ? .semibold : .medium))
+                        .foregroundStyle(selected ? DeskPalette.accent : DeskPalette.secondary)
+                        .frame(minHeight: 32)
+                        .padding(.horizontal, 11)
+                        .overlay(alignment: .bottom) {
+                            if selected {
+                                Capsule()
+                                    .fill(DeskPalette.accent)
+                                    .frame(height: 2)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(DeskPalette.hairline)
+                .frame(height: 0.5)
+                .allowsHitTesting(false)
         }
     }
 
@@ -253,7 +317,7 @@ struct RouteQualityBenchmarkView: View {
 
     private var historyTabTitle: String {
         let count = runner.badgeHistoryCount
-        return count > 0 ? "历史记录与总评估（\(count)）" : "历史记录与总评估"
+        return count > 0 ? "历史记录与评估（\(count)）" : "历史记录与评估"
     }
 
     @ViewBuilder
@@ -343,8 +407,7 @@ struct RouteQualityBenchmarkView: View {
             selectionToolbar
             benchmarkTable {
                 benchmarkTableHeader {
-                    Text("候选线路").frame(maxWidth: .infinity, alignment: .leading)
-                    Text("选择").frame(width: 44, alignment: .leading)
+                    Text("候选线路 / 节点").frame(maxWidth: .infinity, alignment: .leading)
                     Text("状态").frame(width: 98, alignment: .leading)
                     Text("操作").frame(width: 132, alignment: .leading)
                 }
@@ -412,12 +475,12 @@ struct RouteQualityBenchmarkView: View {
                     Button("用历史最优连接") {
                         connectWith(best.candidate, preferredTargetRecordID: assessment.target.recordID)
                     }
-                    .buttonStyle(DeskButtonStyle(.primary))
+                    .buttonStyle(DeskButtonStyle(.secondary))
                 }
             }
         }
         .padding(12)
-        .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 9))
+        .background(DeskPalette.insetBackground, in: RoundedRectangle(cornerRadius: 9))
         .overlay { RoundedRectangle(cornerRadius: 9).strokeBorder(DeskPalette.hairline, lineWidth: 1) }
     }
 
@@ -431,13 +494,13 @@ struct RouteQualityBenchmarkView: View {
             if !runner.isRunning {
                 if runner.results.count > 1 {
                     Button("全选") { runner.selectAll() }
-                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .buttonStyle(DeskButtonStyle(.quiet, compact: true))
                 }
                 if runner.hasDirectCandidates && runner.hasRelayCandidates {
                     Button("仅测直连") { runner.selectDirectOnly() }
-                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .buttonStyle(DeskButtonStyle(.quiet, compact: true))
                     Button("仅测中继") { runner.selectRelayOnly() }
-                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .buttonStyle(DeskButtonStyle(.quiet, compact: true))
                 }
                 Button("刷新线路") { runner.reloadPlan() }
                     .buttonStyle(DeskButtonStyle(.secondary))
@@ -553,36 +616,33 @@ struct RouteQualityBenchmarkView: View {
         let isWinner = !runner.isRunning && runner.recommendation?.winner.id == item.id
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 9) {
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 6) {
-                        Text(item.candidate.title)
-                            .font(.callout.weight(.semibold))
-                            .lineLimit(1)
-                            .help(item.candidate.title)
-                        if isWinner {
-                            capsuleTag(text: "本次最佳", color: DeskPalette.emerald)
-                        }
-                    }
-                    Text(item.candidate.subtitle)
-                        .font(.caption)
-                        .foregroundStyle(DeskPalette.secondary)
-                        .lineLimit(2)
-                        .help(item.candidate.subtitle)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
                 Button {
                     runner.toggleSelection(item.id)
                 } label: {
                     Image(systemName: item.isSelected ? "checkmark.square.fill" : "square")
                         .font(.system(size: 14))
                         .foregroundStyle(item.isSelected ? DeskPalette.accent : DeskPalette.secondary)
+                        .frame(width: 19, height: 24)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .disabled(runner.isRunning)
                 .accessibilityLabel(item.isSelected ? "取消勾选 \(item.candidate.title)" : "勾选 \(item.candidate.title)")
                 .accessibilityAddTraits(item.isSelected ? .isSelected : [])
-                .frame(width: 44, alignment: .leading)
+
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 9) {
+                        candidateTitle(item.candidate, isWinner: isWinner)
+                            .frame(minWidth: 128, alignment: .leading)
+                        candidateAddress(item.candidate)
+                            .frame(minWidth: 135, maxWidth: .infinity, alignment: .leading)
+                    }
+                    VStack(alignment: .leading, spacing: 3) {
+                        candidateTitle(item.candidate, isWinner: isWinner)
+                        candidateAddress(item.candidate)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
 
                 statusBadge(for: item)
                     .frame(width: 98, alignment: .leading)
@@ -595,7 +655,7 @@ struct RouteQualityBenchmarkView: View {
                             Text("使用此线路连接")
                                 .lineLimit(1)
                         }
-                        .buttonStyle(DeskButtonStyle(.secondary, compact: true))
+                        .buttonStyle(DeskButtonStyle(.quiet, compact: true))
                         .fixedSize(horizontal: true, vertical: false)
                     } else {
                         Color.clear.frame(height: 0).accessibilityHidden(true)
@@ -620,8 +680,29 @@ struct RouteQualityBenchmarkView: View {
             }
         }
         .padding(.horizontal, 13)
-        .padding(.vertical, 10)
+        .padding(.vertical, 4)
         .background(runner.activeCandidateID == item.id ? DeskPalette.accent.opacity(0.06) : Color.clear)
+    }
+
+    private func candidateTitle(_ candidate: RouteBenchmarkCandidate, isWinner: Bool = false) -> some View {
+        HStack(spacing: 6) {
+            Text(candidate.kind.usesRelay ? candidate.kind.modeTitle : candidate.title)
+                .font(.system(size: 12, weight: .semibold))
+                .lineLimit(1)
+                .help(candidate.title)
+            if isWinner {
+                capsuleTag(text: "本次最佳", color: DeskPalette.emerald)
+            }
+        }
+    }
+
+    private func candidateAddress(_ candidate: RouteBenchmarkCandidate) -> some View {
+        Text(candidate.subtitle.components(separatedBy: " · ").first ?? candidate.subtitle)
+            .font(.system(size: 11, design: .monospaced))
+            .foregroundStyle(DeskPalette.secondary)
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .help(candidate.subtitle)
     }
 
     private func benchmarkTable(@ViewBuilder content: () -> some View) -> some View {
@@ -645,7 +726,10 @@ struct RouteQualityBenchmarkView: View {
     // MARK: - Tab 2: History & Overall Assessment
 
     @ViewBuilder
-    private var historyContent: some View {
+    private func historyContent(
+        scrollToAssessment: @escaping () -> Void,
+        scrollToRuns: @escaping () -> Void
+    ) -> some View {
         if runner.allHistoryRuns.isEmpty {
             emptyHistoryView
         } else if runner.displayedHistoryRuns.isEmpty {
@@ -653,11 +737,13 @@ struct RouteQualityBenchmarkView: View {
         } else {
             if let assessment = runner.displayedAssessment {
                 overallAssessmentCard(assessment)
-                historicalRoutesSection(assessment)
+                    .id(assessmentAnchor)
+                historicalRoutesSection(assessment, scrollToRuns: scrollToRuns)
             } else {
                 multiTargetScopeNotice
             }
-            historicalRunsSection
+            historicalRunsSection(scrollToAssessment: runner.displayedAssessment == nil ? nil : scrollToAssessment)
+                .id(runsAnchor)
         }
     }
 
@@ -745,167 +831,239 @@ struct RouteQualityBenchmarkView: View {
     }
 
     private func overallAssessmentCard(_ assessment: RouteBenchmarkOverallAssessment) -> some View {
-        let color = assessment.overallGrade.deskTint
-        return VStack(alignment: .leading, spacing: 12) {
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+        return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 14) {
-                VStack(spacing: 2) {
+                VStack(spacing: 3) {
                     Text("\(assessment.overallScore)")
-                        .font(.system(size: 26, weight: .bold, design: .rounded).monospacedDigit())
-                        .foregroundStyle(color)
-                    Text(assessment.overallGrade.title)
+                        .font(.system(size: 30, weight: .bold).monospacedDigit())
+                    Text("综合评分")
                         .font(.caption2.weight(.semibold))
-                        .foregroundStyle(color)
                 }
-                .frame(width: 62, height: 58)
-                .background(color.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
+                .foregroundStyle(DeskPalette.accent)
+                .frame(width: 72, height: 76)
+                .background(DeskPalette.selection, in: RoundedRectangle(cornerRadius: 8))
+                .accessibilityLabel("综合评分 \(assessment.overallScore) 分，\(assessment.overallGrade.title)")
 
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 8) {
                         Text("历史总质量评估")
-                            .font(.title3.bold())
+                            .font(.subheadline.weight(.semibold))
                         stabilityBadge(assessment.overallStability)
                     }
-                    Text("\(assessment.target.displayName) · 累计 \(assessment.runCount) 次实测（有效采样 \(formatDurationSeconds(assessment.totalMeasuredSeconds))） · 最近测速 \(formatDateTime(assessment.latestRunAt))")
+                    Text("\(assessment.target.displayName) · 累计 \(assessment.runCount) 次实测 · 最近测速 \(formatDateTime(assessment.latestRunAt))")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(DeskPalette.secondary)
                         .textSelection(.enabled)
-                    Text(assessment.headline)
-                        .font(.callout)
-                        .foregroundStyle(.primary)
-                        .textSelection(.enabled)
-                        .padding(.top, 1)
-                }
-
-                Spacer(minLength: 0)
-            }
-
-            if let best = assessment.recommendedRoute {
-                HStack(alignment: .center, spacing: 12) {
-                    Image(systemName: "star.circle.fill")
-                        .font(.system(size: 22))
-                        .foregroundStyle(DeskPalette.emerald)
-                        .accessibilityHidden(true)
-
-                    VStack(alignment: .leading, spacing: 3) {
-                        HStack(spacing: 7) {
-                            Text("长期推荐线路：\(best.candidate.title)")
-                                .font(.subheadline.weight(.semibold))
-                            scorePill(score: best.overallScore, grade: best.overallGrade)
+                    if let best = assessment.recommendedRoute {
+                        ViewThatFits(in: .horizontal) {
+                            HStack(alignment: .bottom, spacing: 10) {
+                                recommendedHistoryRoute(best)
+                                    .frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+                                if !runner.isRunning {
+                                    connectHistoricalRoute(best, targetRecordID: assessment.target.recordID)
+                                        .fixedSize(horizontal: true, vertical: false)
+                                }
+                            }
+                            VStack(alignment: .leading, spacing: 7) {
+                                recommendedHistoryRoute(best)
+                                if !runner.isRunning {
+                                    connectHistoricalRoute(best, targetRecordID: assessment.target.recordID)
+                                }
+                            }
                         }
-                        Text(assessment.recommendationReason)
+                    } else {
+                        Text(assessment.headline)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(DeskPalette.secondary)
                             .textSelection(.enabled)
                     }
-
-                    Spacer(minLength: 8)
-
-                    if !runner.isRunning {
-                        Button("使用历史最优线路连接") {
-                            connectWith(best.candidate, preferredTargetRecordID: assessment.target.recordID)
-                        }
-                        .buttonStyle(DeskButtonStyle(.primary))
-                    }
                 }
-                .padding(12)
-                .background(DeskPalette.insetBackground, in: RoundedRectangle(cornerRadius: 8))
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if !assessment.insights.isEmpty {
+            DisclosureGroup("综合质量诊断结论") {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("综合质量诊断结论")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                    Text("有效采样 \(formatDurationSeconds(assessment.totalMeasuredSeconds))")
+                    if assessment.recommendedRoute != nil {
+                        Text(assessment.headline)
+                        Text(assessment.recommendationReason)
+                    }
                     ForEach(assessment.insights, id: \.self) { insight in
-                        HStack(alignment: .firstTextBaseline, spacing: 7) {
-                            Image(systemName: "waveform.path.ecg")
-                                .font(.caption2)
-                                .foregroundStyle(.teal)
-                            Text(insight)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                        }
+                        Label(insight, systemImage: "waveform.path.ecg")
                     }
                 }
-                .padding(.top, 2)
+                .foregroundStyle(DeskPalette.secondary)
+                .textSelection(.enabled)
+                .padding(.top, 6)
             }
+            .font(.caption)
         }
-        .padding(15)
-        .background(DeskPalette.cardBackground, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(DeskPalette.hairline, lineWidth: 1)
-        )
+        .padding(13)
+        .background(DeskPalette.insetBackground, in: shape)
+        .overlay { shape.strokeBorder(DeskPalette.hairline, lineWidth: 1) }
     }
 
-    private func historicalRoutesSection(_ assessment: RouteBenchmarkOverallAssessment) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("各线路历史聚合对比（\(assessment.routeSummaries.count) 条）")
-                .font(.headline)
+    private func recommendedHistoryRoute(_ best: RouteBenchmarkHistoricalRouteSummary) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("长期推荐 · \(best.candidate.kind.usesRelay ? best.candidate.kind.modeTitle : best.candidate.title)")
+                .font(.system(size: 13, weight: .semibold))
+            candidateAddress(best.candidate)
+        }
+        .help("\(best.candidate.title)，\(best.overallScore) 分 · \(best.overallGrade.title)")
+    }
 
-            benchmarkTable {
-                ForEach(Array(assessment.routeSummaries.enumerated()), id: \.element.id) { index, summary in
-                    if index > 0 { Divider().padding(.horizontal, 13) }
-                    let isTopRecommended = index == 0 && summary.overallGrade != .unreachable
-                    historicalRouteRow(
-                        summary,
-                        isTopRecommended: isTopRecommended,
-                        targetRecordID: assessment.target.recordID
-                    )
+    private func connectHistoricalRoute(_ best: RouteBenchmarkHistoricalRouteSummary, targetRecordID: UUID?) -> some View {
+        Button {
+            connectWith(best.candidate, preferredTargetRecordID: targetRecordID)
+        } label: {
+            Label("使用历史最优线路连接", systemImage: "arrow.right")
+        }
+        .buttonStyle(DeskButtonStyle(.secondary, compact: true))
+    }
+
+    private func historicalRoutesSection(
+        _ assessment: RouteBenchmarkOverallAssessment,
+        scrollToRuns: @escaping () -> Void
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Text("各线路历史聚合对比（\(assessment.routeSummaries.count) 条）")
+                    .font(.headline)
+                Spacer(minLength: 8)
+                Button(action: scrollToRuns) {
+                    Label("查看历次记录", systemImage: "list.bullet")
+                }
+                .buttonStyle(DeskButtonStyle(.quiet, compact: true))
+            }
+            comparisonTable {
+                ForEach(assessment.routeSummaries) { summary in
+                    Divider()
+                    historicalRouteRow(summary, targetRecordID: assessment.target.recordID)
+                }
+            }
+
+            Text("TCP 的 UDP 丢包不适用，以 — 显示。")
+                .font(.caption)
+                .foregroundStyle(DeskPalette.secondary)
+        }
+    }
+
+    private func comparisonTable(@ViewBuilder _ rows: () -> some View) -> some View {
+        let content = rows()
+        return benchmarkTable {
+            ViewThatFits(in: .horizontal) {
+                comparisonTableContent(content)
+                    .frame(minWidth: 568)
+                ScrollView(.horizontal) {
+                    comparisonTableContent(content)
+                        .frame(minWidth: 568)
                 }
             }
         }
+    }
+
+    private func comparisonTableContent<Rows: View>(_ rows: Rows) -> some View {
+        VStack(spacing: 0) {
+            benchmarkTableHeader {
+                Text("候选线路")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                comparisonCells(["评分", "RTT", "UDP 丢包", "平均帧率", "视频吞吐"], isHeading: true)
+                Text("操作").frame(width: 45, alignment: .leading)
+            }
+            rows
+        }
+    }
+
+    private func comparisonCells(_ values: [String], isHeading: Bool = false) -> some View {
+        let widths: [CGFloat] = [42, 60, 65, 62, 77]
+        return ForEach(Array(values.enumerated()), id: \.offset) { index, value in
+            Text(value)
+                .font(.system(size: 11, weight: index == 0 ? .semibold : .medium))
+                .monospacedDigit()
+                .foregroundStyle(isHeading ? DeskPalette.secondary : index == 0 ? DeskPalette.accent : DeskPalette.ink)
+                .frame(width: widths[index], alignment: .leading)
+                .accessibilityLabel(isHeading ? value : "\(comparisonMetricLabel(index)) \(value)")
+        }
+    }
+
+    private func comparisonMetricLabel(_ index: Int) -> String {
+        ["评分", "RTT", "UDP 丢包", "平均帧率", "视频吞吐"][index]
+    }
+
+    private func formattedMetric(_ value: Double?, _ pattern: String) -> String {
+        value.map { String(format: pattern, $0) } ?? "—"
     }
 
     private func historicalRouteRow(
         _ summary: RouteBenchmarkHistoricalRouteSummary,
-        isTopRecommended: Bool,
         targetRecordID: UUID?
     ) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top, spacing: 10) {
-                VStack(alignment: .leading, spacing: 3) {
+        let expanded = expandedRouteIDs.contains(summary.id)
+        let values = [
+            summary.completedCount > 0 ? String(summary.overallScore) : "—",
+            formattedMetric(summary.meanRTTMilliseconds, "%.0f ms"),
+            formattedMetric(summary.candidate.kind.mediaTCPOnly ? nil : summary.meanUDPLossPercent, "%.2f%%"),
+            formattedMetric(summary.meanFPS, "%.1f"),
+            formattedMetric(summary.meanMegabits, "%.2f Mbps")
+        ]
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 9) {
+                Button {
+                    if expanded { expandedRouteIDs.remove(summary.id) }
+                    else { expandedRouteIDs.insert(summary.id) }
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(DeskPalette.secondary)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 2) {
+                            candidateTitle(summary.candidate)
+                            candidateAddress(summary.candidate)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(summary.candidate.title)
+                .accessibilityHint(expanded ? "收起线路评估详情" : "展开线路评估详情")
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                comparisonCells(values)
+                Group {
+                    if !runner.isRunning, summary.overallGrade != .unreachable {
+                        Button("连接") {
+                            connectWith(summary.candidate, preferredTargetRecordID: targetRecordID)
+                        }
+                        .buttonStyle(DeskButtonStyle(.quiet, compact: true))
+                        .accessibilityLabel("使用 \(summary.candidate.title) 连接")
+                    }
+                }
+                .frame(width: 45, alignment: .leading)
+            }
+            .padding(.horizontal, 13)
+            .padding(.vertical, 7)
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 8) {
-                        Text(summary.candidate.title)
-                            .font(.headline)
-                        if isTopRecommended {
-                            capsuleTag(text: "长期最佳", color: DeskPalette.emerald)
-                        }
-                        if summary.overallGrade == .unreachable {
-                            capsuleTag(text: "历史未接通", color: DeskPalette.coral)
-                        } else {
-                            scorePill(score: summary.overallScore, grade: summary.overallGrade)
-                            stabilityBadge(summary.stability)
-                        }
+                        scorePill(score: summary.overallScore, grade: summary.overallGrade)
+                        stabilityBadge(summary.stability)
                     }
-                    Text(summary.candidate.subtitle)
+                    if summary.completedCount > 0 {
+                        historicalMetricsGrid(summary)
+                    }
+                    Text(summary.summary)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
+                        .foregroundStyle(summary.completedCount == 0 ? DeskPalette.coral : DeskPalette.secondary)
+                        .textSelection(.enabled)
                 }
-
-                Spacer(minLength: 8)
-
-                if !runner.isRunning, summary.overallGrade != .unreachable {
-                    Button("使用此线路连接") {
-                        connectWith(summary.candidate, preferredTargetRecordID: targetRecordID)
-                    }
-                    .buttonStyle(DeskButtonStyle(.secondary))
-                    .controlSize(.small)
-                }
+                .padding(.horizontal, 13)
+                .padding(.bottom, 10)
             }
-
-            if summary.completedCount > 0 {
-                historicalMetricsGrid(summary)
-            }
-
-            Text(summary.summary)
-                .font(.caption)
-                .foregroundStyle(summary.completedCount == 0 ? .red : .secondary)
-                .textSelection(.enabled)
         }
-        .padding(13)
     }
 
     private func historicalMetricsGrid(_ s: RouteBenchmarkHistoricalRouteSummary) -> some View {
@@ -962,7 +1120,7 @@ struct RouteQualityBenchmarkView: View {
             return "无分片丢包（可靠 TCP）"
         }
         guard let mean = s.meanUDPLossPercent else {
-            return s.tcpFallbackCount > 0 ? "UDP 已降级 TCP" : "0.00%"
+            return s.tcpFallbackCount > 0 ? "UDP 已降级 TCP" : "—"
         }
         if let worst = s.worstUDPLossPercent, worst > mean + 0.05 {
             return String(format: "%.2f%%（峰值 %.1f%%）", mean, worst)
@@ -996,15 +1154,22 @@ struct RouteQualityBenchmarkView: View {
 
     // MARK: - Historical Run List
 
-    private var historicalRunsSection: some View {
+    private func historicalRunsSection(scrollToAssessment: (() -> Void)?) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
                 Text("历次测试记录（\(runner.displayedHistoryRuns.count) 次）")
                     .font(.headline)
                 Spacer()
-                Text("点按记录行展开当次各线路详情")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if let scrollToAssessment {
+                    Button(action: scrollToAssessment) {
+                        Label("返回长期评估", systemImage: "arrow.left")
+                    }
+                    .buttonStyle(DeskButtonStyle(.quiet, compact: true))
+                } else {
+                    Text("点按记录行展开当次各线路详情")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             benchmarkTable {
@@ -1096,12 +1261,15 @@ struct RouteQualityBenchmarkView: View {
                             .textSelection(.enabled)
                     }
 
-                    ForEach(run.evaluatedEntries) { entry in
-                        savedEntryDetailRow(
-                            entry,
-                            isRunWinner: entry.id == run.recommendedCandidateID,
-                            targetRecordID: run.target.recordID
-                        )
+                    comparisonTable {
+                        ForEach(run.evaluatedEntries) { entry in
+                            Divider()
+                            savedEntryDetailRow(
+                                entry,
+                                isRunWinner: entry.id == run.recommendedCandidateID,
+                                targetRecordID: run.target.recordID
+                            )
+                        }
                     }
                 }
                 .padding(12)
@@ -1115,57 +1283,54 @@ struct RouteQualityBenchmarkView: View {
         isRunWinner: Bool,
         targetRecordID: UUID?
     ) -> some View {
-        HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 7) {
-                    Text(entry.candidate.title)
-                        .font(.caption.weight(.semibold))
-                    if isRunWinner {
-                        capsuleTag(text: "当次最佳", color: DeskPalette.emerald)
-                    }
-                    switch entry.outcome {
-                    case .completed:
-                        if let eval = entry.evaluation {
-                            scorePill(score: eval.score, grade: eval.grade)
-                        }
-                    case .failed:
-                        capsuleTag(text: "不可用", color: DeskPalette.coral)
-                    case .skipped:
-                        capsuleTag(text: "已跳过", color: .secondary)
-                    }
+        let metrics = entry.metrics
+        let values = [
+            entry.evaluation.map { String($0.score) } ?? "—",
+            formattedMetric(metrics?.udpRTTMeanMilliseconds ?? metrics?.controlRTTMeanMilliseconds, "%.0f ms"),
+            formattedMetric(entry.candidate.kind.mediaTCPOnly ? nil : metrics?.udpLossMeanPercent, "%.2f%%"),
+            formattedMetric(metrics?.averageFPS, "%.1f"),
+            formattedMetric(metrics?.averageMegabits, "%.2f Mbps")
+        ]
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 9) {
+                VStack(alignment: .leading, spacing: 2) {
+                    candidateTitle(entry.candidate, isWinner: isRunWinner)
+                    candidateAddress(entry.candidate)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-                switch entry.outcome {
-                case .completed:
-                    if let m = entry.metrics {
-                        Text(compactMetricsLine(candidate: entry.candidate, metrics: m))
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+                comparisonCells(values)
+                Group {
+                    if !runner.isRunning, entry.outcome == .completed {
+                        Button("连接") {
+                            connectWith(entry.candidate, preferredTargetRecordID: targetRecordID)
+                        }
+                        .buttonStyle(DeskButtonStyle(.quiet, compact: true))
+                        .accessibilityLabel("使用 \(entry.candidate.title) 连接")
                     }
-                case let .failed(reason):
-                    Text(reason)
-                        .font(.caption2)
-                        .foregroundStyle(DeskPalette.coral)
-                        .textSelection(.enabled)
-                case .skipped:
-                    EmptyView()
                 }
+                .frame(width: 45, alignment: .leading)
             }
 
-            Spacer(minLength: 8)
-
-            if !runner.isRunning, entry.outcome == .completed {
-                Button("连接") {
-                    connectWith(entry.candidate, preferredTargetRecordID: targetRecordID)
+            switch entry.outcome {
+            case .completed:
+                if let metrics {
+                    Text(compactMetricsLine(candidate: entry.candidate, metrics: metrics))
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(DeskPalette.secondary)
+                        .textSelection(.enabled)
                 }
-                .buttonStyle(DeskButtonStyle(.secondary))
-                .controlSize(.mini)
+            case let .failed(reason):
+                Label(reason.isEmpty ? "不可用" : reason, systemImage: "exclamationmark.circle")
+                    .font(.caption2)
+                    .foregroundStyle(DeskPalette.coral)
+                    .textSelection(.enabled)
+            case .skipped:
+                Text("已跳过").font(.caption2).foregroundStyle(DeskPalette.secondary)
             }
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, 13)
         .padding(.vertical, 7)
-        .background(DeskPalette.insetBackground, in: RoundedRectangle(cornerRadius: 8))
     }
 
     private func compactMetricsLine(candidate: RouteBenchmarkCandidate, metrics: RouteBenchmarkMetrics) -> String {
@@ -1218,7 +1383,7 @@ struct RouteQualityBenchmarkView: View {
     private func statusBadge(for item: RouteBenchmarkResult) -> some View {
         switch item.status {
         case .pending:
-            Text(item.isSelected ? "待测试" : "未勾选")
+            Text(item.isSelected ? "未测试" : "未勾选")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         case .connecting:
@@ -1347,7 +1512,7 @@ struct RouteQualityBenchmarkView: View {
             }
             return String(format: "%.2f%%", loss)
         }
-        return "0.00%（未检出丢包）"
+        return "—"
     }
 
     private func lossHighlightColor(candidate: RouteBenchmarkCandidate, metrics: RouteBenchmarkMetrics) -> Color? {

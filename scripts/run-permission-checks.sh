@@ -31,6 +31,6 @@ cat > "$check_app/Contents/Info.plist" <<'PLIST'
 PLIST
 swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     -module-cache-path "$check_root/ModuleCache" \
-    Sources/QuietDesk/PermissionGuide.swift AppChecks/PermissionGuideChecks.swift \
+    Sources/QuietDesk/DeskTheme.swift Sources/QuietDesk/PermissionGuide.swift AppChecks/PermissionGuideChecks.swift \
     -o "$check_app/Contents/MacOS/PermissionGuideChecks"
 "$check_app/Contents/MacOS/PermissionGuideChecks"

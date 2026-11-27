@@ -1,4 +1,3 @@
-import AppKit
 import SwiftUI
 
 struct PermissionNextStep: Equatable {
@@ -94,58 +93,27 @@ struct PermissionNextStepView: View {
     let compact: Bool
     let perform: (PermissionNextStep.Action) -> Void
 
-    private static let amber = Color(nsColor: NSColor(name: nil) { appearance in
-        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? NSColor(srgbRed: 0xF3 / 255.0, green: 0xBC / 255.0, blue: 0x6E / 255.0, alpha: 1)
-            : NSColor(srgbRed: 0x94 / 255.0, green: 0x54 / 255.0, blue: 0x0F / 255.0, alpha: 1)
-    })
-
-    private static let cardFill = Color(nsColor: NSColor(name: nil) { appearance in
-        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? NSColor(srgbRed: 0x26 / 255.0, green: 0x2A / 255.0, blue: 0x33 / 255.0, alpha: 1)
-            : NSColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
-    })
-
-    private static let cardBorder = Color(nsColor: NSColor(name: nil) { appearance in
-        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? NSColor.white.withAlphaComponent(0.14)
-            : NSColor.black.withAlphaComponent(0.12)
-    })
-
     var body: some View {
         let needsAction = step.action != nil
         let shape = RoundedRectangle(cornerRadius: 9, style: .continuous)
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: needsAction ? "exclamationmark.circle" : "info.circle")
                 .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(needsAction ? Self.amber : Color.secondary)
+                .foregroundStyle(needsAction ? DeskPalette.amber : DeskPalette.secondary)
                 .padding(.top, 1.5)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 6) {
                 Text(step.title)
                     .font(.system(size: compact ? 11.5 : 12.5, weight: .semibold))
-                    .foregroundStyle(needsAction ? Self.amber : Color.primary)
+                    .foregroundStyle(needsAction ? DeskPalette.amber : DeskPalette.ink)
                 Text(step.detail)
                     .font(.system(size: compact ? 11 : 12))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(DeskPalette.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let action = step.action, let title = step.actionTitle {
-                    Button {
-                        perform(action)
-                    } label: {
-                        Text(title)
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(.primary)
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 5)
-                            .background(Self.cardFill, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                    .strokeBorder(Self.cardBorder, lineWidth: 1)
-                            }
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.top, 2)
+                    Button(title) { perform(action) }
+                        .buttonStyle(DeskButtonStyle(.secondary, compact: compact))
+                        .padding(.top, 2)
                 }
             }
         }
@@ -153,12 +121,12 @@ struct PermissionNextStepView: View {
         .padding(.horizontal, compact ? 11 : 14)
         .padding(.vertical, compact ? 10 : 11)
         .background(
-            needsAction ? Self.amber.opacity(0.09) : Color.secondary.opacity(0.07),
+            needsAction ? DeskPalette.amber.opacity(0.09) : DeskPalette.insetBackground,
             in: shape
         )
         .overlay {
             shape.strokeBorder(
-                needsAction ? Self.amber.opacity(0.26) : Color.secondary.opacity(0.16),
+                needsAction ? DeskPalette.amber.opacity(0.26) : DeskPalette.hairline,
                 lineWidth: 1
             )
         }

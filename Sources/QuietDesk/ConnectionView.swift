@@ -14,6 +14,7 @@ struct ConnectionView: View {
     var openRelayWorkspace: (() -> Void)? = nil
     var openPortMappingWorkspace: ((ConnectionRecord?) -> Void)? = nil
     let selectedRecord: ConnectionRecord?
+    let selectRecord: ((ConnectionRecord) -> Void)?
     @Binding var showNewConnection: Bool
     @Binding var openRecordRequest: UUID?
     @State private var showRelaySettings = false
@@ -30,6 +31,7 @@ struct ConnectionView: View {
         openRelayWorkspace: (() -> Void)? = nil,
         openPortMappingWorkspace: ((ConnectionRecord?) -> Void)? = nil,
         selectedRecord: ConnectionRecord? = nil,
+        selectRecord: ((ConnectionRecord) -> Void)? = nil,
         showNewConnection: Binding<Bool> = .constant(false),
         openRecordRequest: Binding<UUID?> = .constant(nil)
     ) {
@@ -45,6 +47,7 @@ struct ConnectionView: View {
         self.openRelayWorkspace = openRelayWorkspace
         self.openPortMappingWorkspace = openPortMappingWorkspace
         self.selectedRecord = selectedRecord
+        self.selectRecord = selectRecord
         self._showNewConnection = showNewConnection
         self._openRecordRequest = openRecordRequest
     }
@@ -90,13 +93,15 @@ struct ConnectionView: View {
             retryDraft: { model.hubConnectionDraft },
             nodePicker: RelayNodePicker(model: model),
             showOptions: $showOptions,
-            options: { benchmark in
+            options: { columns, benchmark in
                 ConnectionSettingsView(
                     model: model,
                     openCaps: { showOptions = false; openCaps() },
                     openTraffic: openTraffic,
                     openEffects: openEffects,
-                    openBenchmark: { showOptions = false; benchmark() }
+                    openBenchmark: { showOptions = false; benchmark() },
+                    inline: true,
+                    inlineColumns: columns
                 )
             },
             connect: { draft in
@@ -201,6 +206,7 @@ struct ConnectionView: View {
                     }
                 )
             },
+            selectRecord: selectRecord,
             openReceivedFiles: {
                 model.canvas.releaseControl()
                 model.openReceivedFiles()

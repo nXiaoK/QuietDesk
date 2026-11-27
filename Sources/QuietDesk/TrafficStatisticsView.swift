@@ -77,7 +77,7 @@ struct TrafficStatisticsView: View {
             HStack(alignment: .top, spacing: 12) {
                 DeskSettingsPageHeading(
                     title: "地址历史流量",
-                    detail: "\(model.trafficHistoryStatus) · 本机视角（1 KB = 1000 字节）；与测速评分分开统计"
+                    detail: "累计应用层收发，以本机视角统计。\(model.trafficHistoryStatus)"
                 )
                 Spacer()
                 DeskInfoPopoverButton(
@@ -106,7 +106,7 @@ struct TrafficStatisticsView: View {
                         Text("暂无地址流量记录")
                             .font(.system(size: 17, weight: .semibold))
                         Text(history.error == nil
-                             ? "建立连接产生流量后在本机累计，不伪造统计。"
+                             ? "建立连接后，收发流量会在本机按地址累计。"
                              : "当前没有可显示的统计，详细原因见上方提示。")
                             .font(.system(size: 13))
                             .foregroundStyle(DeskPalette.secondary)
@@ -115,16 +115,8 @@ struct TrafficStatisticsView: View {
                     .frame(maxWidth: .infinity)
                 }
             } else {
+                trafficSummary
                 trafficTableCard
-
-                DeskSurfaceCard(padding: 13, cornerRadius: 10) {
-                    HStack(spacing: 16) {
-                        summaryValue(title: "统计地址数", value: "\(history.records.count) 个")
-                        summaryValue(title: "累计本机发送", value: trafficAmount(totalSent))
-                        summaryValue(title: "累计本机接收", value: trafficAmount(totalReceived))
-                        summaryValue(title: "应用层总计", value: trafficAmount(totalCombined))
-                    }
-                }
 
                 if let selectedRecord {
                     recordDetails(selectedRecord)
@@ -169,14 +161,44 @@ struct TrafficStatisticsView: View {
         }
     }
 
+    private var trafficSummary: some View {
+        let metrics = [
+            ("统计地址数", "\(history.records.count) 个"),
+            ("累计本机发送", trafficAmount(totalSent)),
+            ("累计本机接收", trafficAmount(totalReceived)),
+            ("应用层总计", trafficAmount(totalCombined))
+        ]
+        return ViewThatFits(in: .horizontal) {
+            trafficSummaryGrid(metrics, columns: 4)
+                .frame(minWidth: 478)
+            trafficSummaryGrid(metrics, columns: 2)
+        }
+    }
+
+    private func trafficSummaryGrid(_ metrics: [(String, String)], columns: Int) -> some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 10), count: columns), spacing: 10) {
+            ForEach(Array(metrics.enumerated()), id: \.offset) { index, metric in
+                summaryValue(title: metric.0, value: metric.1, highlighted: index == metrics.count - 1)
+            }
+        }
+    }
+
     private var trafficTableCard: some View {
+        ViewThatFits(in: .horizontal) {
+            trafficTable(amountWidth: 96)
+                .frame(minWidth: 524)
+            trafficTable(amountWidth: 75)
+        }
+    }
+
+    private func trafficTable(amountWidth: CGFloat) -> some View {
         DeskSurfaceCard(padding: 0, cornerRadius: 10) {
             VStack(spacing: 0) {
                 HStack(spacing: 12) {
                     Text("地址 / 设备").frame(maxWidth: .infinity, alignment: .leading)
-                    Text("本机发送").frame(width: 108, alignment: .leading)
-                    Text("本机接收").frame(width: 108, alignment: .leading)
-                    Text("合计").frame(width: 108, alignment: .leading)
+                    Text("本机发送").frame(width: amountWidth, alignment: .trailing)
+                    Text("本机接收").frame(width: amountWidth, alignment: .trailing)
+                    Text("合计").frame(width: amountWidth, alignment: .trailing)
                 }
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(DeskPalette.secondary)
@@ -209,24 +231,24 @@ struct TrafficStatisticsView: View {
 
                             Text(trafficAmount(Decimal(record.sentBytes)))
                                 .monospacedDigit()
-                                .frame(width: 108, alignment: .leading)
+                                .frame(width: amountWidth, alignment: .trailing)
                                 .help("精确发送：\(record.sentBytes) 字节")
 
                             Text(trafficAmount(Decimal(record.receivedBytes)))
                                 .monospacedDigit()
-                                .frame(width: 108, alignment: .leading)
+                                .frame(width: amountWidth, alignment: .trailing)
                                 .help("精确接收：\(record.receivedBytes) 字节")
 
                             Text(trafficAmount(record.totalBytes))
                                 .fontWeight(.semibold)
                                 .monospacedDigit()
-                                .frame(width: 108, alignment: .leading)
+                                .frame(width: amountWidth, alignment: .trailing)
                                 .help("精确合计：\(NSDecimalNumber(decimal: record.totalBytes).stringValue) 字节")
                         }
                         .font(.system(size: 13))
                         .foregroundStyle(DeskPalette.ink)
                         .padding(.horizontal, 16)
-                        .frame(minHeight: 44)
+                        .frame(minHeight: 32)
                         .background(isSelected ? DeskPalette.accent.opacity(0.08) : Color.clear)
                         .contentShape(Rectangle())
                     }
@@ -247,17 +269,22 @@ struct TrafficStatisticsView: View {
         return name.isEmpty ? nil : name
     }
 
-    private func summaryValue(title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+    private func summaryValue(title: String, value: String, highlighted: Bool) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 8, style: .continuous)
+        return VStack(alignment: .leading, spacing: 5) {
             Text(title)
                 .font(.caption)
                 .foregroundStyle(DeskPalette.secondary)
             Text(value)
-                .font(.system(size: 14, weight: .semibold))
-                .monospacedDigit()
+                .font(.system(size: 18, weight: .semibold, design: .monospaced))
+                .foregroundStyle(highlighted ? DeskPalette.accent : DeskPalette.ink)
                 .lineLimit(1)
+                .minimumScaleFactor(0.74)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .frame(maxWidth: .infinity, minHeight: 65, alignment: .leading)
+        .background(highlighted ? DeskPalette.selection : DeskPalette.cardBackground, in: shape)
+        .overlay { shape.strokeBorder(DeskPalette.hairline) }
         .accessibilityElement(children: .combine)
     }
 

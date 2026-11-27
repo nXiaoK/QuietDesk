@@ -40,7 +40,7 @@ struct PortMappingHostView: View {
                 authorizationGroups
             } else {
                 HStack(alignment: .top) {
-                    DeskSectionHeading(title: "本机映射授权", symbol: nil, detail: nil)
+                    DeskSettingsPageHeading(title: "本机映射授权", detail: "查看和管理允许访问本机映射的来源。")
                     Spacer()
                     Button("完成", action: done)
                         .buttonStyle(DeskButtonStyle(.secondary))
@@ -110,10 +110,12 @@ struct PortMappingHostView: View {
                 DeskSettingsGroup(title: "已授权来源") {
                     sourceRows
                 }
-                Text("撤回会立即断开对应映射。曾用当前配对码成功远控本机的设备可自动免确认。")
-                    .font(.system(size: 12))
-                    .foregroundStyle(DeskPalette.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                DeskCalloutBox(
+                    title: "撤回后立即断开对应映射",
+                    message: "曾用当前配对码成功远控本机的设备可自动免确认。",
+                    symbol: "exclamationmark.shield",
+                    tone: .warning
+                )
             }
 
             if let error = manager.storageError {

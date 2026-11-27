@@ -32,18 +32,18 @@ enum DeskWorkspaceSection: String, CaseIterable, Identifiable {
 }
 
 enum DeskPalette {
-    static let accent = adaptive(0x0A74E6, 0x68B3FF, contrast: 0x0058B8)
-    static let actionFill = adaptive(0x0A74E6, 0x0A68D0, contrast: 0x0056B3)
-    static let ink = adaptive(0x1D232A, 0xEEF1F6, contrast: 0x0E1318)
-    static let secondary = adaptive(0x525E6B, 0xAEB9C6, contrast: 0x333D47)
-    static let muted = adaptive(0x6D7A87, 0x8F9CAB, contrast: 0x46505B)
-    static let canvasBackground = adaptive(0xF5F6F8, 0x1E2228, contrast: 0xF0F2F5, darkContrast: 0x171A1F)
+    static let accent = adaptive(0x285DD6, 0x68B3FF, contrast: 0x1949AC)
+    static let actionFill = adaptive(0x285DD6, 0x0A68D0, contrast: 0x0056B3)
+    static let ink = adaptive(0x1C2839, 0xEEF1F6, contrast: 0x0E1318)
+    static let secondary = adaptive(0x55647A, 0xAEB9C6, contrast: 0x333D47)
+    static let muted = adaptive(0x63738A, 0x8F9CAB, contrast: 0x46505B)
+    static let canvasBackground = adaptive(0xFBFCFE, 0x1E2228, contrast: 0xF0F2F5, darkContrast: 0x171A1F)
     static let cardBackground = adaptive(0xFFFFFF, 0x272C34, contrast: 0xFFFFFF, darkContrast: 0x22272F)
-    static let sidebarBackground = adaptive(0xECEEF1, 0x232830, contrast: 0xE4E7EC, darkContrast: 0x1D2128)
-    static let insetBackground = adaptive(0xF6F7F9, 0x22272F, contrast: 0xEDEFF3, darkContrast: 0x1B1F26)
-    static let subtleFill = adaptive(0xE9EDF2, 0x313843, contrast: 0xDDE3EA, darkContrast: 0x363E4A)
-    static let selection = adaptive(0xDFE5EC, 0x384250, contrast: 0xC8D6E6, darkContrast: 0x425063)
-    static let hairline = adaptive(0xDFE3E8, 0x3D444F, contrast: 0x98A5B3, darkContrast: 0x768393)
+    static let sidebarBackground = adaptive(0xF3F6FA, 0x232830, contrast: 0xE4E7EC, darkContrast: 0x1D2128)
+    static let insetBackground = adaptive(0xF6F8FD, 0x22272F, contrast: 0xEDEFF3, darkContrast: 0x1B1F26)
+    static let subtleFill = adaptive(0xF3F6FA, 0x313843, contrast: 0xDDE3EA, darkContrast: 0x363E4A)
+    static let selection = adaptive(0xEAF1FF, 0x384250, contrast: 0xC8D6E6, darkContrast: 0x425063)
+    static let hairline = adaptive(0xDDE5EF, 0x3D444F, contrast: 0x98A5B3, darkContrast: 0x768393)
     static let emerald = adaptive(0x127A50, 0x5CD6A5, contrast: 0x0B5E3C)
     static let amber = adaptive(0x94540F, 0xF3BC6E, contrast: 0x753F05)
     static let coral = adaptive(0xB82E39, 0xFF8F96, contrast: 0x941E28)
@@ -176,7 +176,7 @@ struct DeskButtonStyle: ButtonStyle {
             case .primary: return .white
             case .secondary: return DeskPalette.ink
             case .danger: return DeskPalette.coral
-            case .quiet: return hovering && isEnabled ? DeskPalette.ink : DeskPalette.secondary
+            case .quiet: return hovering && isEnabled ? DeskPalette.ink : DeskPalette.accent
             }
         }
 
@@ -188,7 +188,7 @@ struct DeskButtonStyle: ButtonStyle {
                 return DeskPalette.actionFill
             case .danger:
                 if isEnabled && (configuration.isPressed || hovering) { return DeskPalette.coral.opacity(0.09) }
-                return DeskPalette.cardBackground
+                return DeskPalette.coral.opacity(0.075)
             case .secondary:
                 if isEnabled && (configuration.isPressed || hovering) { return DeskPalette.subtleFill }
                 return DeskPalette.cardBackground
@@ -456,7 +456,7 @@ struct DeskSegmentedTabs<Tab: Hashable>: View {
                 } label: {
                     Text(item.title)
                         .font(.system(size: 12.5, weight: isSelected ? .semibold : .medium))
-                        .foregroundStyle(isSelected ? DeskPalette.ink : DeskPalette.secondary)
+                        .foregroundStyle(isSelected ? DeskPalette.accent : DeskPalette.secondary)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 6)
                         .frame(maxWidth: .infinity)
@@ -506,7 +506,7 @@ struct DeskSettingsGroup<Content: View>: View {
             }
             DeskSurfaceCard(padding: 0, cornerRadius: 10) {
                 VStack(alignment: .leading, spacing: 0, content: content)
-                    .padding(.horizontal, 16)
+                    .padding(.horizontal, 12)
             }
         }
     }
@@ -533,7 +533,7 @@ struct DeskSettingsRow<Value: View>: View {
             Spacer(minLength: 8)
             value()
         }
-        .padding(.vertical, 9)
-        .frame(minHeight: 46)
+        .padding(.vertical, 7)
+        .frame(minHeight: 38)
     }
 }

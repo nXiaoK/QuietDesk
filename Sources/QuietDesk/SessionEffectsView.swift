@@ -50,15 +50,17 @@ struct SessionEffectsView: View {
             effectsGroup
             recordMemoryAndUnlockGroup
 
-            HStack(alignment: .center, spacing: 8) {
+            VStack(alignment: .leading, spacing: 6) {
                 Text("断开时恢复原状。非笔记本/合盖可能不支持调光；旧端不支持时禁用。")
                     .font(.system(size: 12))
                     .foregroundStyle(DeskPalette.secondary)
-                Spacer(minLength: 8)
-                Button("防窥与锁屏边界…") { showBoundarySheet = true }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(DeskPalette.accent)
+                Button {
+                    showBoundarySheet = true
+                } label: {
+                    Label("操作与安全说明", systemImage: "info.circle")
+                }
+                .buttonStyle(DeskButtonStyle(.quiet, compact: true))
+                .accessibilityHint("查看防窥和锁屏的生效条件")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -131,7 +133,7 @@ struct SessionEffectsView: View {
         if !model.connected {
             DeskCalloutBox(
                 title: "未连接远端",
-                message: "连接建立后可在对应远控窗口的「会话设置」或「更多操作」即时切换以下策略；未连接时不将开关显示为已开启。",
+                message: "建立连接后，可在对应远控窗口的「会话设置」或「更多操作」即时调整这些策略。",
                 symbol: "info.circle",
                 tone: .info
             )

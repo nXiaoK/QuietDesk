@@ -12,6 +12,14 @@ struct SharingView: View {
         case sharing = "本机共享"
         case quality = "默认画质"
         case background = "后台与传输"
+
+        var detail: String {
+            switch self {
+            case .sharing: return "管理这台 Mac 的共享地址、配对码与系统权限。"
+            case .quality: return "配置共享显示器、监听端口和新会话的编码上限。"
+            case .background: return "管理登录启动、睡眠、文件接收及中继设置。"
+            }
+        }
     }
 
     @State private var page: Page = .sharing
@@ -25,6 +33,9 @@ struct SharingView: View {
     @State private var previousCode = ""
     @State private var showRelaySettings = false
     @State private var showPermissionTroubleshooting = false
+    @State private var showPairingSafety = false
+    @State private var showEncodingDetails = false
+    @State private var showBackgroundDetails = false
     @FocusState private var portFocused: Bool
 
     private var locked: Bool { model.active || model.working }
@@ -33,17 +44,11 @@ struct SharingView: View {
     var body: some View {
         DeskSettingsPageTabs(tabs: Page.allCases.map { ($0, $0.rawValue) }, selection: $page) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    DeskSettingsPageHeading(
-                        title: page == .sharing && locked ? "共享运行中" : page.rawValue,
-                        badgeText: page == .sharing && locked
-                            ? (model.connected ? "已连入控制端" : (model.working ? "正在准备" : "运行中"))
-                            : nil,
-                        badgeTint: model.connected || model.working ? DeskPalette.amber : DeskPalette.emerald
-                    )
+                VStack(alignment: .leading, spacing: 18) {
+                    DeskSettingsPageHeading(title: page.rawValue, detail: page.detail)
 
                     if page != .background, let notice = model.fileTransferNotice {
-                        DeskSurfaceCard(padding: 14, cornerRadius: 10) {
+                        DeskSurfaceCard(padding: 14) {
                             fileTransferResult(notice)
                         }
                     }
@@ -51,22 +56,37 @@ struct SharingView: View {
                     switch page {
                     case .sharing:
                         sharingStatus
-                        if locked {
-                            sharingLockedNoticeGroup
+                        DeskSettingsColumns(minimumColumnWidth: 340) {
+                            connectionInformation
+                        } trailing: {
+                            VStack(alignment: .leading, spacing: 18) {
+                                permissionHealth
+                                if locked { sharingLockedNoticeGroup }
+                            }
                         }
-                        permissionHealth
                     case .quality:
-                        displayAndListener
-                        defaultEncoding
+                        if listenerSettingsLocked {
+                            qualityLockNotice
+                        }
+                        DeskSettingsColumns(minimumColumnWidth: 340) {
+                            displayAndListener
+                        } trailing: {
+                            defaultEncoding
+                        }
                     case .background:
-                        launchSettings
-                        clipboardAndFiles
-                        relaySettings
+                        DeskSettingsColumns(minimumColumnWidth: 340) {
+                            launchSettings
+                        } trailing: {
+                            VStack(alignment: .leading, spacing: 18) {
+                                clipboardAndFiles
+                                relaySettings
+                            }
+                        }
                     }
                 }
-                .padding(.horizontal, 28)
-                .padding(.vertical, 22)
-                .frame(maxWidth: 880, alignment: .leading)
+                .frame(maxWidth: 1000, alignment: .leading)
+                .padding(.horizontal, 22)
+                .padding(.vertical, 20)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
             }
         }
@@ -83,7 +103,10 @@ struct SharingView: View {
                 showCode = false
             }
         }
-        .onDisappear { previousCode = "" }
+        .onDisappear {
+            previousCode = ""
+            showCode = false
+        }
         .sheet(isPresented: $showRelaySettings) {
             RelaySettingsView(
                 enabled: model.relayEnabled,
@@ -106,127 +129,189 @@ struct SharingView: View {
         }
     }
 
-    // MARK: - Page 1: 本机共享 / 共享运行中 (Pages 12, 16, 17, 53)
+    // MARK: - 本机共享
+
+    private var sharingStatusText: String {
+        if model.connected { return model.canControl ? "控制连接" : "仅观看连接" }
+        if model.working { return "正在准备" }
+        return locked ? "共享运行中" : "共享已停止"
+    }
+
+    private var sharingStatusTint: Color {
+        if model.working { return DeskPalette.amber }
+        return locked ? DeskPalette.emerald : DeskPalette.secondary
+    }
+
+    private var serviceStatusDetail: String? {
+        guard !model.connected, !model.hasIncomingControlConnection,
+              !model.status.isEmpty, model.status != "准备就绪", model.status != "共享已停止" else { return nil }
+        return model.status
+    }
 
     private var sharingStatus: some View {
-        DeskSettingsGroup(title: locked ? "当前共享" : "共享状态") {
-            DeskSettingsRow(title: "共享这台 Mac") {
-                HStack(spacing: 8) {
-                    if model.working { ProgressView().controlSize(.small) }
-                    if model.connected {
-                        DeskPillBadge(
-                            text: model.canControl ? "控制连接" : "仅观看连接",
-                            symbol: "circle.fill",
-                            tint: DeskPalette.emerald
-                        )
-                    }
-                    Toggle(locked ? "停止共享" : "开启共享", isOn: Binding(
-                        get: { locked },
-                        set: { enabled in
-                            if enabled { model.startHosting() } else { model.stop() }
+        DeskSurfaceCard(padding: 13) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 11) {
+                    Image(systemName: "display")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(DeskPalette.accent)
+                        .frame(width: 36, height: 36)
+                        .background(DeskPalette.selection, in: RoundedRectangle(cornerRadius: 8))
+                        .accessibilityHidden(true)
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 7) {
+                            if model.working { ProgressView().controlSize(.small) }
+                            DeskPillBadge(text: sharingStatusText, symbol: "circle.fill", tint: sharingStatusTint)
+                                .fixedSize()
+                            if let serviceStatusDetail {
+                                Text(serviceStatusDetail)
+                                    .font(.system(size: 12.5))
+                                    .foregroundStyle(DeskPalette.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .textSelection(.enabled)
+                            }
                         }
-                    ))
-                    .labelsHidden()
-                    .help(locked ? "停止共享" : "开启共享")
-                }
-            }
+                        Text(model.active ? "监听端口 \(model.hostPort)" : "配置端口 \(model.hostPort)")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(DeskPalette.secondary)
+                            .textSelection(.enabled)
+                    }
 
-            if model.connected || model.hasIncomingControlConnection {
-                Divider()
-                DeskSettingsRow(title: "控制端", detail: model.status) {
-                    if model.hasIncomingControlConnection {
-                        Button("断开控制端", role: .destructive) { model.disconnectController() }
+                    Spacer(minLength: 8)
+                    if locked {
+                        Button("停止共享", role: .destructive) { model.stop() }
                             .buttonStyle(DeskButtonStyle(.danger))
-                            .help("结束当前控制连接，共享保持开启；旧版控制端可能自动重连")
+                    } else {
+                        Button("开启共享") { model.startHosting() }
+                            .buttonStyle(DeskButtonStyle(.primary))
                     }
                 }
-            } else if model.status != "准备就绪" && model.status != "共享已停止" && !model.status.isEmpty {
-                Divider()
-                DeskSettingsRow(title: "运行状态") {
-                    Text(model.status)
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(DeskPalette.secondary)
-                        .textSelection(.enabled)
-                }
-            }
 
-            if model.connected, let state = model.activeVideoState {
-                Divider()
-                DeskSettingsRow(title: "当前生效画面", detail: "当前会话调整不会回写默认值。") {
-                    Text("\(state.settings.summary)\(model.activeVideoFormatSuffix)")
-                        .font(.system(size: 13, design: .monospaced))
-                        .foregroundStyle(DeskPalette.secondary)
-                }
-            }
-
-            Divider()
-            DeskSettingsRow(title: "本机地址", detail: invitationStatus
-                ?? (localAddresses.isEmpty ? "没有可用的网络地址；连上网络后回到这里"
-                    : "同一局域网的另一台 Mac 用它连接。不在同一网络时，粘贴后把地址改成公网地址或域名")) {
-                localAddressValue
-            }
-
-            Divider()
-            DeskSettingsRow(title: "监听端口") {
-                Text(model.hostPort)
-                    .font(.system(size: 13, design: .monospaced))
-                    .foregroundStyle(DeskPalette.secondary)
-                    .textSelection(.enabled)
-            }
-
-            Divider()
-            DeskSettingsRow(title: "本机配对码") {
-                pairingCodeValue
-            }
-
-            Divider()
-            DeskSettingsRow(title: "配对码操作", detail: pairingCopyStatus) {
-                pairingActions
-            }
-
-            if model.hostCodeNeedsSetup {
-                Divider()
-                DeskSettingsRow(
-                    title: "沿用升级前的配对码",
-                    detail: "如果升级前已有配对码，输入一次后原控制端不用改码就能连接。"
-                ) {
-                    Button("输入原配对码…") {
-                        previousCode = ""
-                        showRestoreCodeSheet = true
+                if model.connected || model.hasIncomingControlConnection {
+                    Divider()
+                    HStack(alignment: .top, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("控制端").font(.system(size: 13, weight: .medium))
+                            Text(model.status)
+                                .font(.callout)
+                                .foregroundStyle(DeskPalette.secondary)
+                                .textSelection(.enabled)
+                        }
+                        Spacer(minLength: 8)
+                        if model.hasIncomingControlConnection {
+                            Button("断开控制端", role: .destructive) { model.disconnectController() }
+                                .buttonStyle(DeskButtonStyle(.danger))
+                                .help("结束当前控制连接，共享保持开启；旧版控制端可能自动重连")
+                        }
                     }
-                    .buttonStyle(DeskButtonStyle(.secondary))
-                    .disabled(listenerSettingsLocked)
+                    if model.connected, let state = model.activeVideoState {
+                        Divider()
+                        DeskSettingsRow(title: "当前生效画面", detail: "当前会话调整不会回写默认值。") {
+                            Text("\(state.settings.summary)\(model.activeVideoFormatSuffix)")
+                                .font(.system(size: 13, design: .monospaced))
+                                .foregroundStyle(DeskPalette.secondary)
+                        }
+                    }
                 }
             }
         }
     }
 
+    private var connectionInformation: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            DeskSettingsGroup(title: "连接信息") {
+                sharingValueRow("本机地址") { localAddressValue }
+                    .help("同一局域网内可直接连接。跨网时，将连接信息中的地址替换为可访问的公网地址或域名。")
+                if let invitationStatus {
+                    Text(invitationStatus)
+                        .font(.caption)
+                        .foregroundStyle(DeskPalette.secondary)
+                        .padding(.bottom, 8)
+                }
+                Divider()
+                sharingValueRow("本机配对码") {
+                    HStack(spacing: 7) {
+                        pairingCodeValue
+                        Button(showCode ? "隐藏" : "显示") {
+                            model.prepareHostCode()
+                            showCode.toggle()
+                        }
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .disabled(model.hostCode.isEmpty)
+                    }
+                }
+                Divider()
+                DeskSettingsRow(title: "配对码操作", detail: pairingCopyStatus) { pairingActions }
+
+                if model.hostCodeNeedsSetup {
+                    Divider()
+                    DeskSettingsRow(
+                        title: "沿用升级前的配对码",
+                        detail: "如果升级前已有配对码，输入一次后原控制端不用改码就能连接。"
+                    ) {
+                        Button("输入原配对码…") {
+                            previousCode = ""
+                            showRestoreCodeSheet = true
+                        }
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .disabled(listenerSettingsLocked)
+                    }
+                }
+            }
+
+            SharingInlineHelp(
+                "配对码安全说明",
+                expanded: $showPairingSafety,
+                lines: [
+                    "持有完整配对码可发起连接，在系统与共享设置允许时也能控制这台 Mac。请只通过可信渠道交给自己的设备。",
+                    "配对码保存在当前账户的本机私有文件中，由系统账户文件权限保护，未单独加密，也不再读取旧钥匙串。",
+                    "重新生成配对码会让原码立即失效。共享或独立端口映射服务运行期间锁定更换。"
+                ],
+                tone: .warning
+            )
+        }
+    }
+
+    private func sharingValueRow<Value: View>(_ title: String, @ViewBuilder value: () -> Value) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) {
+                Text(title).fixedSize()
+                Spacer(minLength: 4)
+                value().fixedSize(horizontal: true, vertical: false)
+            }
+            VStack(alignment: .leading, spacing: 7) {
+                Text(title)
+                value()
+            }
+        }
+        .font(.system(size: 13.5))
+        .foregroundStyle(DeskPalette.ink)
+        .padding(.vertical, 9)
+        .frame(minHeight: 40)
+    }
+
     private var sharingLockedNoticeGroup: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 9) {
             DeskSettingsGroup(title: "共享期间锁定") {
                 DeskSettingsRow(title: "监听端口") {
-                    Text("\(model.hostPort) · 停止后修改")
-                        .font(.system(size: 12.5))
+                    Text(model.hostPort)
+                        .font(.system(size: 12, design: .monospaced))
                         .foregroundStyle(DeskPalette.secondary)
                 }
                 Divider()
                 DeskSettingsRow(title: "默认编码上限") {
-                    Text("\(defaultQualityTitle) · 停止后修改")
-                        .font(.system(size: 12.5))
+                    Text(defaultQualityTitle)
+                        .font(.system(size: 12, design: .monospaced))
                         .foregroundStyle(DeskPalette.secondary)
                 }
             }
-
-            HStack {
-                Text("当前会话的画质调整不会回写默认值。停止共享会结束被控服务。")
-                    .font(.system(size: 12))
-                    .foregroundStyle(DeskPalette.secondary)
-                Spacer(minLength: 12)
-                Button("停止共享", role: .destructive) {
-                    model.stop()
-                }
-                .buttonStyle(DeskButtonStyle(.danger))
-            }
+            Text(model.mappingHosting
+                 ? "停止共享后可调整默认编码。调整监听端口还需停止独立映射服务。"
+                 : "停止共享后可修改以上设置。当前会话的画质调整不会回写默认值。")
+                .font(.system(size: 12))
+                .foregroundStyle(DeskPalette.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -257,7 +342,6 @@ struct SharingView: View {
                             .font(.system(size: 13, design: .monospaced))
                     }
                     .menuStyle(.borderlessButton)
-                    .fixedSize()
                     .help("这台 Mac 有多个网络地址，选择另一台 Mac 能访问到的那个")
                     .accessibilityLabel("本机地址")
                 } else {
@@ -291,35 +375,12 @@ struct SharingView: View {
                 .textSelection(.enabled)
                 .lineLimit(showCode ? nil : 1)
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(minWidth: 196, alignment: .leading)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                .background(DeskPalette.insetBackground, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 7, style: .continuous)
-                        .strokeBorder(DeskPalette.hairline, lineWidth: 1)
-                }
                 .accessibilityLabel(showCode ? model.hostCode : "配对码已隐藏")
         }
     }
 
     private var pairingActions: some View {
         HStack(spacing: 7) {
-            DeskInfoPopoverButton(
-                title: "配对码安全与存储说明",
-                lines: [
-                    "持有完整配对码即可查看并控制这台 Mac，请只通过可信渠道交给自己的设备。",
-                    "配对码保存在当前账户的本机私有文件中，由系统账户文件权限保护，未单独加密，也不再读取旧钥匙串。",
-                    "重新生成配对码会让原码立即失效；共享或独立端口映射服务运行期间锁定更换。"
-                ]
-            )
-            Button(showCode ? "隐藏" : "显示") {
-                model.prepareHostCode()
-                showCode.toggle()
-            }
-            .buttonStyle(DeskButtonStyle(.secondary))
-            .disabled(model.hostCode.isEmpty)
-
             Button("复制") {
                 model.copyHostCode()
                 pairingCopyStatus = model.clipboardStatus
@@ -420,41 +481,37 @@ struct SharingView: View {
                 }
             }
 
-            HStack(alignment: .top) {
-                DisclosureGroup("已勾选仍未生效？查看排障与当前应用路径", isExpanded: $showPermissionTroubleshooting) {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("建议先将应用移到「应用程序」再授权。系统已勾选仍未生效时，请完全退出后重开；升级覆盖安装后的旧授权记录可能需要先在系统设置中移除（-），再重新拖入当前应用一次。")
-                        Text("当前进程路径：\(Bundle.main.bundleURL.path)")
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                    }
-                    .padding(.top, 6)
-                    .fixedSize(horizontal: false, vertical: true)
+            Button("授权指引与重新检测") {
+                model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
+                if !model.localScreenRecording {
+                    model.openScreenPermission()
+                } else if model.hostAllowsRemoteControl && !model.localAccessibility {
+                    model.requestAccessibility()
                 }
-                .font(.caption)
-                .foregroundStyle(DeskPalette.secondary)
-
-                Spacer(minLength: 12)
-
-                Button("授权指引与重新检测") {
-                    model.refreshPermissions(checkScreenCapture: true, retryCapsLock: true)
-                    if !model.localScreenRecording {
-                        model.openScreenPermission()
-                    } else if model.hostAllowsRemoteControl && !model.localAccessibility {
-                        model.requestAccessibility()
-                    }
-                }
-                .buttonStyle(DeskButtonStyle(.secondary))
             }
+            .buttonStyle(DeskButtonStyle(.quiet))
+
+            DisclosureGroup("已勾选仍未生效？查看排障与当前应用路径", isExpanded: $showPermissionTroubleshooting) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("建议先将应用移到「应用程序」再授权。系统已勾选仍未生效时，请完全退出后重开；升级覆盖安装后的旧授权记录可能需要先在系统设置中移除（-），再重新拖入当前应用一次。")
+                    Text("当前进程路径：\(Bundle.main.bundleURL.path)")
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+                .padding(.top, 6)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            .font(.caption)
+            .foregroundStyle(DeskPalette.secondary)
         }
     }
 
     private func permissionRow(_ title: String, granted: Bool, action: @escaping () -> Void) -> some View {
         DeskSettingsRow(title: title) {
-            HStack(spacing: 12) {
-                Text(granted ? "已生效" : "尚未生效")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(granted ? DeskPalette.emerald : DeskPalette.amber)
+            HStack(spacing: 8) {
+                DeskPillBadge(text: granted ? "已生效" : "尚未生效",
+                              tint: granted ? DeskPalette.emerald : DeskPalette.amber)
+                    .fixedSize()
                 Button("系统设置…", action: action)
                     .buttonStyle(DeskButtonStyle(.secondary))
                     .accessibilityLabel("打开\(title)系统设置")
@@ -462,7 +519,28 @@ struct SharingView: View {
         }
     }
 
-    // MARK: - Page 2: 默认画质 (Page 13)
+    // MARK: - 默认画质
+
+    @ViewBuilder
+    private var qualityLockNotice: some View {
+        if locked {
+            DeskCalloutBox(
+                title: model.working ? "共享正在准备，设置已锁定" : "共享运行中，设置已锁定",
+                message: model.mappingHosting
+                    ? "停止共享后可调整默认编码。修改监听端口还需停止独立映射服务。"
+                    : "停止共享后可调整监听端口和默认编码设置。",
+                symbol: "lock",
+                tone: .warning
+            )
+        } else {
+            DeskCalloutBox(
+                title: "监听端口已锁定",
+                message: "停止独立端口映射服务后可调整监听端口。",
+                symbol: "lock",
+                tone: .warning
+            )
+        }
+    }
 
     private var displayAndListener: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -562,20 +640,20 @@ struct SharingView: View {
             }
             .disabled(locked)
 
-            HStack(alignment: .center, spacing: 7) {
-                Text("端口与默认画质需停止共享后修改；当前会话画质由控制端调整，不回写默认值。")
-                    .font(.system(size: 12))
-                    .foregroundStyle(DeskPalette.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                DeskInfoPopoverButton(
-                    title: "编码档位与兼容说明",
-                    lines: [
-                        "H.264 / HEVC 视频始终经端到端加密传送。",
-                        "静止画面最多渐进细化 4 次后停止重复编码，0 fps 属于正常省流表现。",
-                        "原分辨率上限为单边 8192 像素、总计 3600 万像素；两端硬件均支持时自动启用 HEVC，最高可选 240 fps 与 100 Mbps。"
-                    ]
-                )
-            }
+            Text("当前会话画质由控制端调整，不回写默认值。")
+                .font(.system(size: 12))
+                .foregroundStyle(DeskPalette.secondary)
+
+            SharingInlineHelp(
+                "编码档位与兼容说明",
+                expanded: $showEncodingDetails,
+                lines: [
+                    "H.264 / HEVC 视频始终经端到端加密传送。",
+                    "静止画面最多渐进细化 4 次后停止重复编码，0 fps 属于正常省流表现。",
+                    "原分辨率上限为单边 8192 像素、总计 3600 万像素。",
+                    "两端硬件均支持时自动启用 HEVC，最高可选 240 fps 与 100 Mbps。"
+                ]
+            )
         }
     }
 
@@ -612,52 +690,52 @@ struct SharingView: View {
         }
     }
 
-    // MARK: - Page 3: 后台与传输 (Pages 14 & 64)
+    // MARK: - 后台与传输
 
     private var launchSettings: some View {
-        DeskSettingsGroup(title: "启动与共享") {
-            if model.loginNeedsApproval {
-                DeskSettingsRow(title: "登录自动启动") {
-                    Text("系统未允许")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(DeskPalette.amber)
+        VStack(alignment: .leading, spacing: 8) {
+            DeskSettingsGroup(title: "启动与共享") {
+                if model.loginNeedsApproval {
+                    DeskSettingsRow(title: "登录自动启动") {
+                        Text("系统未允许")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(DeskPalette.amber)
+                    }
+                    Divider()
+                    DeskSettingsRow(title: "登录启动设置", detail: "请在系统设置 → 通用 → 登录项与扩展中允许 QuietDesk。") {
+                        Button("在系统设置中允许…") { LaunchSettings.openSettings() }
+                            .buttonStyle(DeskButtonStyle(.secondary))
+                    }
+                } else {
+                    settingToggle("登录启动", isOn: Binding(
+                        get: { model.loginEnabled }, set: { model.setLoginEnabled($0) }
+                    ))
                 }
                 Divider()
-                DeskSettingsRow(title: "登录启动设置", detail: "请在系统设置 → 通用 → 登录项与扩展中允许 QuietDesk。") {
-                    Button("在系统设置中允许…") { LaunchSettings.openSettings() }
-                        .buttonStyle(DeskButtonStyle(.secondary))
-                }
-            } else {
-                settingToggle("登录启动", isOn: Binding(
-                    get: { model.loginEnabled }, set: { model.setLoginEnabled($0) }
-                ))
-            }
-            Divider()
-            settingToggle("启动后自动开启本机共享", isOn: $model.autoStartSharing)
-            Divider()
-            settingToggle("登录自动启动时最小化主窗口", isOn: $model.minimizeAtLogin)
-            Divider()
-            settingToggle("接通外部电源时阻止空闲睡眠", isOn: $model.preventHostSleepOnExternalPower)
-            Divider()
-            settingToggle("允许 Bonjour 局域网发现", isOn: $model.lanDiscoveryAdvertiseEnabled)
-            if let updates, updates.enabled {
+                settingToggle("启动后自动开启本机共享", isOn: $model.autoStartSharing)
                 Divider()
-                SharingAutoUpdateToggleRow(updates: updates)
+                settingToggle("登录自动启动时最小化主窗口", isOn: $model.minimizeAtLogin)
+                Divider()
+                settingToggle("接通外部电源时阻止空闲睡眠", isOn: $model.preventHostSleepOnExternalPower)
+                Divider()
+                settingToggle("允许 Bonjour 局域网发现", isOn: $model.lanDiscoveryAdvertiseEnabled)
+                if let updates, updates.enabled {
+                    Divider()
+                    SharingAutoUpdateToggleRow(updates: updates)
+                }
             }
-            Divider()
-            DeskSettingsRow(title: "后台共享说明") {
-                DeskInfoPopoverButton(
-                    title: "后台共享边界说明",
-                    lines: [
-                        "应用运行于用户态，macOS 登录前或 FileVault 解锁前无法共享。",
-                        "关闭主窗口后共享仍在菜单栏后台运行；完全退出 QuietDesk 会停止共享。",
-                        "开启阻止空闲睡眠后只在外部供电时生效。使用电池时允许系统正常睡眠。",
-                        "开启共享后可同时在「全部设备」中连接其他设备。",
-                        "局域网发现只广播设备名称与匿名标识，控制端仍须凭配对码完成加密认证。"
-                    ],
-                    label: "查看边界说明"
-                )
-            }
+
+            SharingInlineHelp(
+                "后台共享说明",
+                expanded: $showBackgroundDetails,
+                lines: [
+                    "应用运行于用户态，macOS 登录前或 FileVault 解锁前无法共享。",
+                    "关闭主窗口后共享仍在菜单栏后台运行。完全退出 QuietDesk 会停止共享。",
+                    "开启阻止空闲睡眠后只在外部供电时生效。使用电池时允许系统正常睡眠。",
+                    "开启共享后可同时在「全部设备」中连接其他设备。",
+                    "局域网发现只广播设备名称与匿名标识，控制端仍须凭配对码完成加密认证。"
+                ]
+            )
         }
     }
 
@@ -744,6 +822,42 @@ struct SharingView: View {
     private func settingToggle(_ title: String, isOn: Binding<Bool>) -> some View {
         DeskSettingsRow(title: title) {
             Toggle(title, isOn: isOn).labelsHidden()
+        }
+    }
+}
+
+private struct SharingInlineHelp: View {
+    let title: String
+    @Binding var expanded: Bool
+    let lines: [String]
+    let tone: DeskCalloutBox<EmptyView>.Tone
+
+    init(_ title: String, expanded: Binding<Bool>, lines: [String],
+         tone: DeskCalloutBox<EmptyView>.Tone = .info) {
+        self.title = title
+        self._expanded = expanded
+        self.lines = lines
+        self.tone = tone
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                expanded.toggle()
+            } label: {
+                HStack(spacing: 6) {
+                    Label(title, systemImage: "info.circle")
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .accessibilityHidden(true)
+                }
+            }
+            .buttonStyle(DeskButtonStyle(.quiet))
+            .accessibilityValue(expanded ? "已展开" : "已收起")
+
+            if expanded {
+                DeskCalloutBox(message: lines.map { "• " + $0 }.joined(separator: "\n"), tone: tone)
+            }
         }
     }
 }

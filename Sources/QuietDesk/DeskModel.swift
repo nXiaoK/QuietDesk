@@ -108,8 +108,21 @@ final class DeskModel: ObservableObject, Identifiable {
         didSet {
             UserDefaults.standard.set(canvasScalingMode.rawValue, forKey: "canvasScalingMode")
             canvas.scalingMode = canvasScalingMode
+            if oldValue != canvasScalingMode { sessionWindowFit.pictureChanged() }
         }
     }
+    /// A session window takes the shape of the remote picture, when it becomes known and after an edge was dragged.
+    @Published var windowFollowsPicture = UserDefaults.standard.object(forKey: "windowFollowsPicture") as? Bool ?? true {
+        didSet {
+            guard oldValue != windowFollowsPicture else { return }
+            UserDefaults.standard.set(windowFollowsPicture, forKey: "windowFollowsPicture")
+            for other in services.otherModels(excluding: self) where other.windowFollowsPicture != windowFollowsPicture {
+                other.windowFollowsPicture = windowFollowsPicture
+            }
+            if windowFollowsPicture { sessionWindowFit.pictureChanged() }
+        }
+    }
+    private let sessionWindowFit = SessionWindowFit()
     @Published var mediaTCPOnly = UserDefaults.standard.bool(forKey: "mediaTCPOnly") {
         didSet { UserDefaults.standard.set(mediaTCPOnly, forKey: "mediaTCPOnly") }
     }
@@ -5756,6 +5769,18 @@ final class DeskModel: ObservableObject, Identifiable {
     func refreshLoginStatus() {
         loginEnabled = LaunchSettings.enabled
         loginNeedsApproval = LaunchSettings.needsApproval
+    }
+
+    /// A window of this session alone takes the shape of its picture; the main window, which shows other
+    /// pages as well, keeps its own.
+    func fitSessionWindowToPicture(_ window: NSWindow) {
+        sessionWindowFit.enabled = { [weak self] in
+            guard let self else { return false }
+            return self.windowFollowsPicture && self.connected && !self.isFullScreen
+        }
+        canvas.onRemoteSizeChange = { [weak self] in self?.sessionWindowFit.pictureChanged() }
+        canvas.onLayout = { [weak self] in self?.sessionWindowFit.canvasLaidOut() }
+        sessionWindowFit.attach(window: window, canvas: canvas)
     }
 
     func attachWindow(_ window: NSWindow) {

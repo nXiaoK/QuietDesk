@@ -192,6 +192,10 @@ struct ConnectionSettingsView: View {
                     .frame(width: 176)
                 }
                 Divider()
+                DeskSettingsRow(title: "窗口贴合画面比例", detail: "连接后和拖动窗口边缘后，会话窗口取远端画面的形状，不留黑边") {
+                    Toggle("窗口贴合画面比例", isOn: $model.windowFollowsPicture).labelsHidden()
+                }
+                Divider()
                 DeskSettingsRow(title: "本地即时光标", detail: "首帧分离视频与指针，消除双光标跟随") {
                     Toggle("本地即时光标", isOn: $model.lowLatencyCursorEnabled).labelsHidden()
                 }
@@ -346,6 +350,13 @@ private struct ConnectionOptionsSections: View {
             }
             .padding(.bottom, 2)
 
+            Divider()
+            compactToggleRow(
+                "窗口贴合画面比例",
+                detail: model.canvasScalingMode == .fitWindow ? "连接后和拖动窗口边缘后，窗口取远端画面的形状" : "“原始比例 1:1”下不调整窗口",
+                isOn: $model.windowFollowsPicture,
+                disabled: model.canvasScalingMode != .fitWindow
+            )
             Divider()
             compactToggleRow(
                 "远端系统声音回传",

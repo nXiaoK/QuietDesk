@@ -1815,6 +1815,104 @@ private struct RemoteCanvasChecks {
             }
         }
 
+        run("A session window takes the shape of the remote picture when it becomes known and after an edge is dragged") {
+            // A window that is never shown: 28 pt of title bar above the picture and 40 pt of status bar below it.
+            let screen = CGRect(x: 0, y: 0, width: 1728, height: 1050)
+            let window = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 1220, height: 750),
+                                  styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: true)
+            window.isReleasedWhenClosed = false
+            window.minSize = NSSize(width: 720, height: 580)
+            defer { window.close() }
+            let content = NSView(frame: NSRect(x: 0, y: 0, width: 1220, height: 750))
+            let canvas = RemoteCanvas(frame: NSRect(x: 0, y: 40, width: 1220, height: 710))
+            canvas.autoresizingMask = [.width, .height]
+            content.addSubview(canvas)
+            window.contentView = content
+            let chrome = window.frame.height - canvas.bounds.height
+            var enabled = false
+            let fit = SessionWindowFit()
+            fit.enabled = { enabled }
+            fit.visibleFrame = { _ in screen }
+            canvas.onRemoteSizeChange = { fit.pictureChanged() }
+            canvas.onLayout = { fit.canvasLaidOut() }
+            fit.attach(window: window, canvas: canvas)
+            func area() -> CGSize { canvas.bounds.size }
+            func drag(_ change: (inout CGRect) -> Void) {
+                NotificationCenter.default.post(name: NSWindow.willStartLiveResizeNotification, object: window)
+                var frame = window.frame
+                change(&frame)
+                window.setFrame(frame, display: false)
+                NotificationCenter.default.post(name: NSWindow.didEndLiveResizeNotification, object: window)
+            }
+            let start = window.frame
+
+            // Before the session shows a picture the window is left alone; the layout pass after it connects fits it.
+            canvas.remoteSize = CGSize(width: 3840, height: 2160)
+            try require(window.frame == start, "The window moved before the session showed a picture: \(window.frame)")
+            enabled = true
+            canvas.needsLayout = true
+            content.layoutSubtreeIfNeeded()
+            // The fit follows the layout pass rather than resizing the window inside it.
+            try require(window.frame == start, "The window was resized inside the layout pass")
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+            try require(area() == CGSize(width: 1220, height: 686), "A 16:9 picture did not set the height: \(area())")
+            try require(window.frame.minX == start.minX && window.frame.maxY == start.maxY && window.frame.width == start.width,
+                        "Fitting moved the top-left corner or the width: \(window.frame)")
+            try require(abs(window.frame.height - area().height - chrome) < 0.5, "What surrounds the picture changed its size")
+
+            // The host switches to a screen of another shape: the width stays and the height follows.
+            canvas.remoteSize = CGSize(width: 3024, height: 1964)
+            try require(area() == CGSize(width: 1220, height: 792) && window.frame.maxY == start.maxY, "A narrower picture did not grow the height: \(area())")
+            // The same screen at another scale is the same shape: nothing moves.
+            let settled = window.frame
+            canvas.remoteSize = CGSize(width: 1920, height: 1247)
+            try require(window.frame == settled, "Another scale of the same screen moved the window: \(window.frame)")
+            canvas.remoteSize = CGSize(width: 3840, height: 2160)
+            try require(area() == CGSize(width: 1220, height: 686), "Returning to the first screen did not restore its shape: \(area())")
+
+            // The right edge dragged out by 180 pt: the height follows, downwards, and the window grows.
+            var before = window.frame
+            drag { $0.size.width += 180 }
+            try require(area() == CGSize(width: 1400, height: 788), "A wider drag did not grow the height: \(area())")
+            try require(window.frame.minX == before.minX && window.frame.maxY == before.maxY, "A drag of the right edge moved the top-left corner")
+            // The left edge dragged in by 200 pt: the right edge stays where it is.
+            before = window.frame
+            drag { $0.origin.x += 200; $0.size.width -= 200 }
+            try require(area() == CGSize(width: 1200, height: 675) && window.frame.maxX == before.maxX && window.frame.maxY == before.maxY,
+                        "A drag of the left edge lost the right or the top edge: \(window.frame), \(area())")
+            // The bottom edge dragged up by 75 pt: the width follows and the left edge stays.
+            before = window.frame
+            drag { $0.origin.y += 75; $0.size.height -= 75 }
+            try require(area() == CGSize(width: 1067, height: 600) && window.frame.minX == before.minX && window.frame.maxY == before.maxY,
+                        "A drag of the bottom edge did not set the width: \(window.frame), \(area())")
+            // Dragged wider than the screen can show in that shape: the largest area that fits, kept on the screen.
+            drag { $0.size.width = 1728 }
+            try require(window.frame.width <= screen.width && window.frame.height <= screen.height && window.frame.minY >= screen.minY
+                        && WindowAspectFit.fills(area(), aspect: 16.0 / 9), "A drag past the screen left it or lost the shape: \(window.frame)")
+
+            // Switched off, with 1:1 scaling, or while the session shows no picture, a drag is left as it is.
+            drag { $0.size = CGSize(width: 1220, height: 780) }
+            let fitted = window.frame
+            enabled = false
+            drag { $0.size.width += 150 }
+            try require(window.frame.width == fitted.width + 150 && window.frame.height == fitted.height, "A window that does not follow the picture was resized")
+            enabled = true
+            canvas.scalingMode = .original1To1
+            drag { $0.size.width += 50 }
+            try require(window.frame.width == fitted.width + 200 && window.frame.height == fitted.height, "1:1 scaling resized the window")
+            // Back to fitting: the next change of the picture's size sets the shape again.
+            canvas.scalingMode = .fitWindow
+            fit.pictureChanged()
+            try require(WindowAspectFit.fills(area(), aspect: 16.0 / 9) && window.frame.width == fitted.width + 200,
+                        "Returning to fitting did not set the shape at the width in use: \(window.frame), \(area())")
+            // A window that was detached is no longer touched.
+            fit.detach()
+            let detached = window.frame
+            canvas.remoteSize = CGSize(width: 1000, height: 1000)
+            drag { $0.size.width += 40 }
+            try require(window.frame.height == detached.height, "A detached window was still resized")
+        }
+
         print("\(passed) passed, \(failed) failed")
         exit(failed == 0 ? 0 : 1)
     }

@@ -396,6 +396,7 @@ struct DeskView: View {
                 resolved: { window in
                     if isDedicatedSessionWindow {
                         model.attachWindow(window)
+                        model.fitSessionWindowToPicture(window)
                     } else {
                         models.attachWindow(window)
                     }

@@ -536,8 +536,13 @@ final class RemoteCanvas: NSView {
             updateLayerFrame()
             window?.invalidateCursorRects(for: self)
             updateCursorPresentation()
+            onRemoteSizeChange?()
         }
     }
+    /// The size of the remote picture changed; its shape may have.
+    var onRemoteSizeChange: (() -> Void)?
+    /// The canvas was laid out, in a window or at a new size.
+    var onLayout: (() -> Void)?
     var scalingMode: RemoteCanvasScalingMode = .fitWindow {
         didSet {
             guard oldValue != scalingMode else { return }
@@ -650,6 +655,7 @@ final class RemoteCanvas: NSView {
 
     override func layout() {
         super.layout()
+        onLayout?()
         updateLayerFrame()
         if videoLayer.status == .failed || displayedFrame == nil || mailbox.hasPendingFrame {
             showLatestFrame()

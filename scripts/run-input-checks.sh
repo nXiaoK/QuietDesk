@@ -33,6 +33,7 @@ PLIST
 swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     -module-cache-path "$build_directory/ModuleCache" -I "$build_directory/Modules" \
     "${core_objects[@]}" Sources/QuietDesk/DeskTheme.swift Sources/QuietDesk/RemoteCanvas.swift Sources/QuietDesk/FullScreenStatusOverlay.swift Sources/QuietDesk/FullScreenControls.swift Sources/QuietDesk/SessionToolsView.swift Sources/QuietDesk/CapsLockMonitor.swift \
+    Sources/QuietDesk/SessionWindowFit.swift \
     Sources/QuietDesk/SystemShortcutMonitor.swift AppChecks/RemoteCanvasChecks.swift \
     -o "$canvas_check_app/Contents/MacOS/RemoteCanvasChecks"
 "$canvas_check_app/Contents/MacOS/RemoteCanvasChecks"

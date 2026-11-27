@@ -5,12 +5,12 @@ use quietdesk_core::messages::VideoStreamState;
 use std::rc::Rc;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::{D2D_RECT_F, D2D1_COLOR_F};
-use windows::Win32::Graphics::Direct2D::{ID2D1HwndRenderTarget, ID2D1SolidColorBrush};
+use windows::Win32::Graphics::Direct2D::{D2D1_DC_INITIALIZE_MODE_COPY, ID2D1GdiInteropRenderTarget, ID2D1HwndRenderTarget, ID2D1SolidColorBrush};
 use windows::Win32::Graphics::Gdi::{HBRUSH, HDC, InvalidateRect};
 use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PCWSTR, w};
+use windows::core::{Interface, PCWSTR, w};
 
 pub(super) const MENU_FULL_SCREEN: usize = 100;
 pub(super) const MENU_SEND_CLIPBOARD: usize = 101;
@@ -35,15 +35,19 @@ const TOOLBAR_HEIGHT: i32 = 48;
 const STATUS_HEIGHT: i32 = 30;
 const STATUS_STYLE: WINDOW_STYLE = WINDOW_STYLE(0x0200 | 0x4000); // SS_CENTERIMAGE | SS_ENDELLIPSIS
 const STATUS_ALIGN_RIGHT: WINDOW_STYLE = WINDOW_STYLE(2); // SS_RIGHT
-const TOOLBAR: [(usize, PCWSTR, i32); 7] = [
-    (TOOL_DISPLAY, w!("显示器"), 74),
-    (TOOL_QUALITY, w!("画质"), 62),
-    (MENU_REMOTE_AUDIO, w!("远端声音"), 100),
-    (TOOL_CLIPBOARD, w!("剪贴板"), 78),
-    (MENU_FULL_SCREEN, w!("全屏"), 52),
-    (TOOL_MORE, w!("更多操作"), 84),
-    (TOOL_SETTINGS, w!("会话设置"), 84),
+const TOOLBAR: [(usize, PCWSTR, i32, i32); 7] = [
+    (TOOL_DISPLAY, w!("显示器 ▾"), 74, 4),
+    (TOOL_QUALITY, w!("画质 ▾"), 62, 4),
+    (MENU_REMOTE_AUDIO, w!("远端声音"), 88, 10),
+    (TOOL_CLIPBOARD, w!("剪贴板 ▾"), 78, 4),
+    (MENU_FULL_SCREEN, w!("全屏"), 52, 10),
+    (TOOL_MORE, w!("更多操作 ▾"), 88, 4),
+    (TOOL_SETTINGS, w!("会话设置 ▾"), 88, 0),
 ];
+
+pub(super) fn color_for_target(color: COLORREF) -> D2D1_COLOR_F {
+    D2D1_COLOR_F { r: (color.0 & 255) as f32 / 255.0, g: ((color.0 >> 8) & 255) as f32 / 255.0, b: ((color.0 >> 16) & 255) as f32 / 255.0, a: 1.0 }
+}
 
 pub(super) struct Popup(pub(super) HMENU);
 
@@ -128,6 +132,7 @@ impl Mode {
 
 pub(super) struct Chrome {
     pub(super) theme: Theme,
+    heading: HWND,
     buttons: [HWND; TOOLBAR.len()],
     status: HWND,
     metrics: HWND,
@@ -165,11 +170,12 @@ impl Chrome {
                 CreateWindowExW(WINDOW_EX_STYLE(0), class, title, WS_CHILD | style, 0, 0, 0, 0, Some(window), Some(HMENU(id as _)), Some(instance), None)
             };
             let mut buttons = [HWND::default(); TOOLBAR.len()];
-            for (button, (id, label, _)) in buttons.iter_mut().zip(TOOLBAR) {
+            for (button, (id, label, _, _)) in buttons.iter_mut().zip(TOOLBAR) {
                 *button = control(w!("BUTTON"), label, id, WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32))?;
             }
             let chrome = Self {
                 theme: Theme::new(dpi),
+                heading: control(w!("STATIC"), w!("远程桌面"), 0, STATUS_STYLE)?,
                 buttons,
                 status: control(w!("STATIC"), w!(""), 0, STATUS_STYLE)?,
                 metrics: control(w!("STATIC"), w!(""), 0, STATUS_STYLE | STATUS_ALIGN_RIGHT)?,
@@ -190,7 +196,9 @@ impl Chrome {
 
     unsafe fn apply_fonts(&self) {
         unsafe {
-            for (controls, role) in [(self.buttons.as_slice(), FontRole::Body), (&[self.status, self.metrics], FontRole::Small)] {
+            for (controls, role) in
+                [(self.buttons.as_slice(), FontRole::Body), (&[self.heading], FontRole::Emphasis), (&[self.status, self.metrics], FontRole::Small)]
+            {
                 for &control in controls {
                     SendMessageW(control, WM_SETFONT, Some(WPARAM(self.theme.font(role).0 as usize)), Some(LPARAM(1)));
                 }
@@ -215,18 +223,20 @@ impl Chrome {
     pub(super) unsafe fn layout(&self, client: RECT, full_screen: bool) {
         unsafe {
             let px = |value| self.theme.scale(value);
-            let gap = px(4);
-            let gaps = gap * (TOOLBAR.len() as i32 - 1);
-            let ideal = TOOLBAR.iter().map(|&(_, _, width)| px(width)).sum::<i32>();
-            let available = (client.right - px(16) - gaps).clamp(0, ideal);
-            let mut x = (client.right - px(8) - available - gaps).max(px(8));
+            let inset = px(14);
+            let gaps = TOOLBAR.iter().map(|&(_, _, _, gap)| px(gap)).sum::<i32>();
+            let ideal = TOOLBAR.iter().map(|&(_, _, width, _)| px(width)).sum::<i32>();
+            let available = (client.right - 2 * inset - gaps).clamp(0, ideal);
+            let mut x = (client.right - inset - available - gaps).max(inset);
             let flags = SWP_NOZORDER | SWP_NOACTIVATE | if full_screen { SWP_HIDEWINDOW } else { SWP_SHOWWINDOW };
-            for (button, (_, _, width)) in self.buttons.into_iter().zip(TOOLBAR) {
+            let heading_width = x - inset - px(16);
+            let heading_flags = if heading_width >= px(72) { flags } else { SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW };
+            let _ = SetWindowPos(self.heading, None, inset, px(8), heading_width.max(0), px(32), heading_flags);
+            for (button, (_, _, width, gap)) in self.buttons.into_iter().zip(TOOLBAR) {
                 let width = px(width) * available / ideal;
                 let _ = SetWindowPos(button, None, x, px(8), width, px(32), flags);
-                x += width + gap;
+                x += width + px(gap);
             }
-            let inset = px(14);
             let footer_y = self.viewport(client, full_screen).bottom + px(1);
             let metrics_width = (client.right * 2 / 5).min(px(330));
             let _ = SetWindowPos(self.status, None, inset, footer_y, (client.right - metrics_width - 2 * inset).max(0), px(28), flags);
@@ -237,19 +247,30 @@ impl Chrome {
     pub(super) unsafe fn paint_bands(&self, target: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush, client: RECT, viewport: RECT) {
         unsafe {
             let fill = |top, bottom, surface| {
-                let color = self.theme.surface_color(surface).0;
-                brush.SetColor(&D2D1_COLOR_F {
-                    r: (color & 255) as f32 / 255.0,
-                    g: ((color >> 8) & 255) as f32 / 255.0,
-                    b: ((color >> 16) & 255) as f32 / 255.0,
-                    a: 1.0,
-                });
+                brush.SetColor(&color_for_target(self.theme.surface_color(surface)));
                 target.FillRectangle(&D2D_RECT_F { left: 0.0, top: top as f32, right: client.right as f32, bottom: bottom as f32 }, brush);
             };
-            fill(0, viewport.top, Surface::Canvas);
+            fill(0, viewport.top, Surface::Card);
             fill(viewport.bottom, client.bottom, Surface::Inset);
             fill(viewport.top - 1, viewport.top, Surface::Hairline);
             fill(viewport.bottom, viewport.bottom + 1, Surface::Hairline);
+        }
+    }
+
+    pub(super) unsafe fn paint_placeholder(&self, target: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush, viewport: RECT) {
+        unsafe {
+            brush.SetColor(&color_for_target(self.theme.surface_color(Surface::Preview)));
+            target.FillRectangle(
+                &D2D_RECT_F { left: viewport.left as f32, top: viewport.top as f32, right: viewport.right as f32, bottom: viewport.bottom as f32 },
+                brush,
+            );
+            // The branded empty canvas uses the same owner drawing as the device overview.
+            if let Ok(surface) = target.cast::<ID2D1GdiInteropRenderTarget>()
+                && let Ok(dc) = surface.GetDC(D2D1_DC_INITIALIZE_MODE_COPY)
+            {
+                self.theme.device_preview(dc, &viewport);
+                let _ = surface.ReleaseDC(None);
+            }
         }
     }
 
@@ -266,7 +287,7 @@ impl Chrome {
     }
 
     fn button(&self, id: usize) -> HWND {
-        self.buttons[TOOLBAR.iter().position(|&(action, _, _)| action == id).expect("toolbar action")]
+        self.buttons[TOOLBAR.iter().position(|&(action, _, _, _)| action == id).expect("toolbar action")]
     }
 
     pub(super) fn enable_button(&self, id: usize, enabled: bool) {
@@ -301,11 +322,14 @@ impl Chrome {
         if !self.buttons.contains(&item.hwndItem) {
             return false;
         }
-        self.theme.draw_button(item, ButtonKind::Tab { selected: false });
+        self.theme.draw_button(item, ButtonKind::Tool { selected: false, icon: None });
         true
     }
 
     pub(super) fn status_colors(&self, control: HWND, hdc: HDC) -> Option<HBRUSH> {
+        if control == self.heading {
+            return Some(self.theme.control_colors(hdc, Surface::Card, TextTone::Ink));
+        }
         let tone = if control == self.status {
             self.mode.tone()
         } else if control == self.metrics {
@@ -371,7 +395,7 @@ impl Chrome {
     pub(super) unsafe fn refresh_palette(&mut self) {
         self.theme.refresh_palette();
         unsafe {
-            for control in self.buttons.into_iter().chain([self.status, self.metrics]) {
+            for control in self.buttons.into_iter().chain([self.heading, self.status, self.metrics]) {
                 let _ = InvalidateRect(Some(control), None, true);
             }
         }

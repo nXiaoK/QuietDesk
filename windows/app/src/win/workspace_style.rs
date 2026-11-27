@@ -1,6 +1,6 @@
 //! Palette and owner drawing for the native workspace controls.
 
-use windows::Win32::Foundation::{COLORREF, POINT, RECT};
+use windows::Win32::Foundation::{COLORREF, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FLAGS, ODS_FOCUS, ODS_HOTLIGHT, ODS_NOFOCUSRECT, ODS_SELECTED};
@@ -16,6 +16,8 @@ pub(super) enum Surface {
     Card,
     Inset,
     Hairline,
+    Preview,
+    Selection,
 }
 
 #[derive(Clone, Copy)]
@@ -25,6 +27,7 @@ pub(super) enum TextTone {
     Muted,
     Emerald,
     Amber,
+    Accent,
 }
 
 #[derive(Clone, Copy)]
@@ -44,32 +47,36 @@ pub(super) enum NavigationIcon {
     Settings,
     Add,
     Computer,
+    Network,
+    Options,
+    Ready,
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum ButtonKind {
     Primary,
-    CanvasAction,
     Secondary,
+    SidebarAction,
     Danger,
     Navigation { selected: bool, icon: Option<NavigationIcon> },
     Tab { selected: bool },
+    Tool { selected: bool, icon: Option<NavigationIcon> },
 }
 
 struct Palette {
     high_contrast: bool,
-    surfaces: [COLORREF; 5],
-    text: [COLORREF; 5],
-    selection: COLORREF,
+    surfaces: [COLORREF; 7],
+    text: [COLORREF; 6],
     selection_text: COLORREF,
     hot: COLORREF,
     primary: COLORREF,
     primary_pressed: COLORREF,
     primary_text: COLORREF,
     danger: COLORREF,
-    danger_border: COLORREF,
+    danger_fill: COLORREF,
     danger_hot: COLORREF,
     disabled: COLORREF,
+    disabled_fill: COLORREF,
 }
 
 impl Palette {
@@ -88,35 +95,35 @@ impl Palette {
             let highlight_text = system(COLOR_HIGHLIGHTTEXT);
             return Self {
                 high_contrast,
-                surfaces: [background, background, background, background, foreground],
-                text: [foreground; 5],
-                selection: highlight,
+                surfaces: [background, background, background, background, foreground, background, highlight],
+                text: [foreground; 6],
                 selection_text: highlight_text,
                 hot: highlight,
                 primary: highlight,
                 primary_pressed: foreground,
                 primary_text: highlight_text,
                 danger: foreground,
-                danger_border: foreground,
+                danger_fill: background,
                 danger_hot: highlight,
                 disabled: system(COLOR_GRAYTEXT),
+                disabled_fill: background,
             };
         }
 
         Self {
             high_contrast,
-            surfaces: [rgb(0xF5F6F8), rgb(0xECEEF1), rgb(0xFFFFFF), rgb(0xF6F7F9), rgb(0xDFE3E8)],
-            text: [rgb(0x1D232A), rgb(0x525E6B), rgb(0x6D7A87), rgb(0x127A50), rgb(0x94540F)],
-            selection: rgb(0xDFE5EC),
-            selection_text: rgb(0x1D232A),
-            hot: rgb(0xE9EDF2),
-            primary: rgb(0x0A74E6),
-            primary_pressed: rgb(0x0863C6),
+            surfaces: [rgb(0xFBFCFE), rgb(0xF3F6FA), rgb(0xFFFFFF), rgb(0xF3F6FA), rgb(0xDDE5EF), rgb(0xF6F8FD), rgb(0xEAF1FF)],
+            text: [rgb(0x1C2839), rgb(0x55647A), rgb(0x63738A), rgb(0x286047), rgb(0x805015), rgb(0x2454B5)],
+            selection_text: rgb(0x182F61),
+            hot: rgb(0xE8EFFB),
+            primary: rgb(0x285DD6),
+            primary_pressed: rgb(0x1E4CBA),
             primary_text: rgb(0xFFFFFF),
-            danger: rgb(0xB82E39),
-            danger_border: rgb(0xE5B4B8),
-            danger_hot: rgb(0xF9EEF0),
-            disabled: rgb(0x6D7A87),
+            danger: rgb(0xA23C34),
+            danger_fill: rgb(0xF8E7E2),
+            danger_hot: rgb(0xF4D8D2),
+            disabled: rgb(0x63738A),
+            disabled_fill: rgb(0xF1F3F7),
         }
     }
 }
@@ -125,7 +132,7 @@ pub(super) struct Theme {
     dpi: u32,
     fonts: [HFONT; 6],
     palette: Palette,
-    brushes: [HBRUSH; 5],
+    brushes: [HBRUSH; 7],
 }
 
 impl Theme {
@@ -151,8 +158,8 @@ impl Theme {
         let fonts = [
             font(14, FW_NORMAL, w!("Segoe UI")),
             font(14, FW_SEMIBOLD, w!("Segoe UI")),
-            font(25, FW_SEMIBOLD, w!("Segoe UI")),
-            font(17, FW_SEMIBOLD, w!("Segoe UI")),
+            font(26, FW_BOLD, w!("Segoe UI")),
+            font(16, FW_SEMIBOLD, w!("Segoe UI")),
             font(12, FW_NORMAL, w!("Segoe UI")),
             font(18, FW_SEMIBOLD, w!("Consolas")),
         ];
@@ -195,9 +202,79 @@ impl Theme {
         round_box(dc, rect, self.scale(20), self.surface_color(Surface::Card), self.surface_color(Surface::Hairline));
     }
 
-    pub(super) fn control_colors(&self, dc: HDC, surface: Surface, tone: TextTone) -> HBRUSH {
+    pub(super) fn app_mark(&self, dc: HDC, x: i32, y: i32) {
+        let color = if self.palette.high_contrast { self.color(TextTone::Ink) } else { self.palette.primary };
         unsafe {
-            SetTextColor(dc, self.color(tone));
+            let saved = SaveDC(dc);
+            SelectObject(dc, GetStockObject(DC_PEN));
+            SelectObject(dc, GetStockObject(NULL_BRUSH));
+            SetDCPenColor(dc, color);
+            for offset in [0, self.scale(6)] {
+                let size = self.scale(14);
+                let radius = self.scale(5);
+                let (left, top) = (x + offset, y + offset);
+                let _ = RoundRect(dc, left, top, left + size, top + size, radius, radius);
+            }
+            let _ = RestoreDC(dc, saved);
+        }
+    }
+
+    pub(super) fn sharing_indicator(&self, dc: HDC, x: i32, y: i32, active: bool) {
+        let color = if active && !self.palette.high_contrast { rgb(0x328354) } else { self.color(TextTone::Muted) };
+        self.dot(dc, x, y, self.scale(7), color);
+    }
+
+    pub(super) fn device_preview(&self, dc: HDC, rect: &RECT) {
+        let bounds = |left, top, right, bottom| RECT { left, top, right, bottom };
+        let preview = self.surface_color(Surface::Preview);
+        round_box(dc, rect, self.scale(16), preview, self.surface_color(Surface::Hairline));
+
+        let margin = self.scale(12);
+        let step = self.scale(19).max(1) as usize;
+        if !self.palette.high_contrast {
+            for y in (rect.top + margin..rect.bottom - margin).step_by(step) {
+                for x in (rect.left + margin..rect.right - margin).step_by(step) {
+                    let _ = unsafe { SetPixelV(dc, x, y, rgb(0xCBDCF7)) };
+                }
+            }
+        }
+
+        if rect.right - rect.left < self.scale(174) || rect.bottom - rect.top < self.scale(128) {
+            return;
+        }
+
+        let mid_x = (rect.left + rect.right) / 2;
+        let mid_y = (rect.top + rect.bottom) / 2 - self.scale(25);
+        let x = |n| mid_x + self.scale(n);
+        let y = |n| mid_y + self.scale(n);
+        let stroke = if self.palette.high_contrast { self.color(TextTone::Ink) } else { rgb(0x91B4EC) };
+        let glass = if self.palette.high_contrast { preview } else { rgb(0xFBFCFF) };
+        for window in [bounds(x(-78), y(-43), x(18), y(19)), bounds(x(-13), y(-13), x(79), y(47))] {
+            round_box(dc, &window, self.scale(18), glass, stroke);
+            for offset in [12, 20, 28] {
+                self.dot(dc, window.left + self.scale(offset), window.top + self.scale(10), self.scale(4), stroke);
+            }
+        }
+        self.dot(dc, x(-13), y(19), self.scale(7), self.palette.primary);
+    }
+
+    fn dot(&self, dc: HDC, x: i32, y: i32, size: i32, color: COLORREF) {
+        unsafe {
+            let saved = SaveDC(dc);
+            SelectObject(dc, GetStockObject(NULL_PEN));
+            SelectObject(dc, GetStockObject(DC_BRUSH));
+            SetDCBrushColor(dc, color);
+            let left = x - size / 2;
+            let top = y - size / 2;
+            let _ = Ellipse(dc, left, top, left + size, top + size);
+            let _ = RestoreDC(dc, saved);
+        }
+    }
+
+    pub(super) fn control_colors(&self, dc: HDC, surface: Surface, tone: TextTone) -> HBRUSH {
+        let color = if self.palette.high_contrast && matches!(surface, Surface::Selection) { self.palette.selection_text } else { self.color(tone) };
+        unsafe {
+            SetTextColor(dc, color);
             SetBkColor(dc, self.surface_color(surface));
             SetBkMode(dc, OPAQUE);
         }
@@ -230,16 +307,17 @@ impl Theme {
         let focused = has_state(ODS_FOCUS) && !has_state(ODS_NOFOCUSRECT);
         let ink = self.color(TextTone::Ink);
         let secondary = self.color(TextTone::Secondary);
+        let accent = self.color(TextTone::Accent);
         let canvas = self.surface_color(Surface::Canvas);
         let card = self.surface_color(Surface::Card);
         let sidebar = self.surface_color(Surface::Sidebar);
+        let selection = self.surface_color(Surface::Selection);
         let border = self.surface_color(Surface::Hairline);
         let hot_text = if hot && palette.high_contrast { palette.selection_text } else { ink };
         let (surface, fill, outline, text, role, icon, align) = match kind {
-            ButtonKind::Primary | ButtonKind::CanvasAction => {
-                let surface = if matches!(kind, ButtonKind::CanvasAction) { Surface::Canvas } else { Surface::Card };
+            ButtonKind::Primary => {
                 let fill = if !enabled {
-                    card
+                    palette.disabled_fill
                 } else if hot {
                     palette.primary_pressed
                 } else {
@@ -247,38 +325,71 @@ impl Theme {
                 };
                 let outline = if enabled { fill } else { border };
                 let text = if hot && palette.high_contrast { card } else { palette.primary_text };
-                (surface, fill, outline, text, FontRole::Emphasis, None, DT_CENTER)
+                (Surface::Card, fill, outline, text, FontRole::Emphasis, None, DT_CENTER)
             }
             ButtonKind::Secondary => {
-                let fill = if hot { palette.hot } else { card };
+                let fill = if !enabled {
+                    palette.disabled_fill
+                } else if hot {
+                    palette.hot
+                } else {
+                    card
+                };
                 (Surface::Card, fill, border, hot_text, FontRole::Body, None, DT_CENTER)
             }
+            ButtonKind::SidebarAction => {
+                let fill = if !enabled {
+                    palette.disabled_fill
+                } else if hot {
+                    palette.hot
+                } else {
+                    card
+                };
+                (Surface::Sidebar, fill, border, hot_text, FontRole::Emphasis, Some(NavigationIcon::Add), DT_LEFT)
+            }
             ButtonKind::Danger => {
-                let fill = if hot { palette.danger_hot } else { card };
+                let fill = if !enabled {
+                    palette.disabled_fill
+                } else if hot {
+                    palette.danger_hot
+                } else {
+                    palette.danger_fill
+                };
+                let outline = if palette.high_contrast { border } else { fill };
                 let text = if hot && palette.high_contrast { palette.selection_text } else { palette.danger };
-                (Surface::Card, fill, palette.danger_border, text, FontRole::Body, None, DT_CENTER)
+                (Surface::Card, fill, outline, text, FontRole::Emphasis, None, DT_CENTER)
             }
             ButtonKind::Navigation { selected, icon } => {
                 let (fill, text, role) = if selected || pressed {
-                    (palette.selection, palette.selection_text, FontRole::Emphasis)
+                    (selection, palette.selection_text, FontRole::Emphasis)
                 } else if hot {
                     (palette.hot, hot_text, FontRole::Body)
                 } else {
-                    (sidebar, secondary, FontRole::Body)
+                    (sidebar, ink, FontRole::Body)
                 };
                 (Surface::Sidebar, fill, fill, text, role, icon, DT_LEFT)
             }
             ButtonKind::Tab { selected } => {
-                let (fill, outline, text, role) = if selected && palette.high_contrast {
-                    (palette.selection, palette.selection, palette.selection_text, FontRole::Emphasis)
+                let (fill, text, role) = if selected && palette.high_contrast {
+                    (selection, palette.selection_text, FontRole::Emphasis)
                 } else if selected {
-                    (card, border, ink, FontRole::Emphasis)
+                    (canvas, accent, FontRole::Emphasis)
                 } else if hot {
-                    (palette.hot, palette.hot, hot_text, FontRole::Body)
+                    (palette.hot, hot_text, FontRole::Body)
                 } else {
-                    (canvas, canvas, secondary, FontRole::Body)
+                    (canvas, secondary, FontRole::Body)
                 };
-                (Surface::Canvas, fill, outline, text, role, None, DT_CENTER)
+                (Surface::Canvas, fill, fill, text, role, None, DT_CENTER)
+            }
+            ButtonKind::Tool { selected, icon } => {
+                let (fill, text, role) = if selected {
+                    (selection, palette.selection_text, FontRole::Emphasis)
+                } else if hot {
+                    (palette.hot, hot_text, FontRole::Body)
+                } else {
+                    (card, ink, FontRole::Body)
+                };
+                (Surface::Card, fill, fill, text, role, icon, DT_CENTER)
             }
         };
 
@@ -288,31 +399,67 @@ impl Theme {
             bounds.top += self.scale(1);
             bounds.bottom -= self.scale(1);
         }
-        round_box(dc, &bounds, self.scale(16), fill, outline);
+        round_box(dc, &bounds, self.scale(12), fill, outline);
 
         let text = if enabled { text } else { palette.disabled };
         let mut text_bounds = RECT { left: bounds.left + self.scale(10), right: bounds.right - self.scale(10), ..bounds };
-        if let Some(icon) = icon {
-            let middle = (bounds.top + bounds.bottom) / 2;
-            self.draw_icon(dc, icon, text_bounds.left, middle - self.scale(7), text);
-            text_bounds.left += self.scale(23);
-        }
         unsafe {
             let saved = SaveDC(dc);
             SelectObject(dc, self.font(role).into());
             SetTextColor(dc, text);
             SetBkMode(dc, TRANSPARENT);
-            DrawTextW(dc, label, &mut text_bounds, align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            let mut text_size = SIZE::default();
+            let _ = GetTextExtentPoint32W(dc, label, &mut text_size);
+            let text_align = if let Some(icon) = icon {
+                let middle = (bounds.top + bounds.bottom) / 2;
+                let icon_and_gap = self.scale(if label.is_empty() { 14 } else { 20 });
+                let mut icon_left = text_bounds.left;
+                if align == DT_CENTER {
+                    let width = bounds.right - bounds.left;
+                    let text_space = (width - self.scale(12)).max(0);
+                    let group_width = (text_size.cx + icon_and_gap).min(text_space.max(self.scale(14)));
+                    icon_left = (bounds.left + bounds.right - group_width) / 2;
+                }
+                let icon_color =
+                    if enabled && !hot && !palette.high_contrast && matches!(kind, ButtonKind::Navigation { selected: false, .. }) { secondary } else { text };
+                self.draw_icon(dc, icon, icon_left, middle - self.scale(7), icon_color);
+                text_bounds.left = icon_left + if align == DT_CENTER { icon_and_gap } else { self.scale(23) };
+                DT_LEFT
+            } else {
+                align
+            };
+            if !label.is_empty() && text_bounds.right > text_bounds.left {
+                DrawTextW(dc, label, &mut text_bounds, text_align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            }
+            if matches!(kind, ButtonKind::Tab { selected: true }) && enabled && !palette.high_contrast {
+                let width = text_size.cx.min((bounds.right - bounds.left - self.scale(20)).max(0));
+                let mid = (bounds.left + bounds.right) / 2;
+                let underline = RECT { left: mid - width / 2, right: mid - width / 2 + width, top: bounds.bottom - self.scale(2), bottom: bounds.bottom };
+                solid_shape(dc, &underline, 0, palette.primary);
+            }
+            if matches!(kind, ButtonKind::Navigation { icon: Some(NavigationIcon::Computer), .. }) && pressed && !palette.high_contrast {
+                let indicator =
+                    RECT { left: bounds.left, top: bounds.top + self.scale(6), right: bounds.left + self.scale(2), bottom: bounds.bottom - self.scale(6) };
+                solid_shape(dc, &indicator, self.scale(2), palette.primary);
+            }
             if focused {
                 let inset = self.scale(3);
                 let focus = RECT { left: bounds.left + inset, top: bounds.top + inset, right: bounds.right - inset, bottom: bounds.bottom - inset };
-                let _ = DrawFocusRect(dc, &focus);
+                if palette.high_contrast {
+                    let _ = DrawFocusRect(dc, &focus);
+                } else {
+                    SelectObject(dc, GetStockObject(DC_PEN));
+                    SelectObject(dc, GetStockObject(NULL_BRUSH));
+                    SetDCPenColor(dc, if matches!(kind, ButtonKind::Primary) { card } else { palette.primary });
+                    let radius = self.scale(7);
+                    let _ = RoundRect(dc, focus.left, focus.top, focus.right, focus.bottom, radius, radius);
+                }
             }
             let _ = RestoreDC(dc, saved);
         }
     }
 
-    fn draw_icon(&self, dc: HDC, icon: NavigationIcon, x: i32, y: i32, color: COLORREF) {
+    pub(super) fn draw_icon(&self, dc: HDC, icon: NavigationIcon, x: i32, y: i32, color: COLORREF) {
         let at_x = |offset| x + self.scale(offset);
         let at_y = |offset| y + self.scale(offset);
         let point = |x, y| POINT { x: at_x(x), y: at_y(y) };
@@ -340,6 +487,15 @@ impl Theme {
                     line(&[point(7, 0), point(7, 9)]);
                 }
                 NavigationIcon::Settings => {
+                    let _ = Ellipse(dc, at_x(3), at_y(3), at_x(11), at_y(11));
+                    let _ = Ellipse(dc, at_x(5), at_y(5), at_x(9), at_y(9));
+                    for (inner_x, inner_y, outer_x, outer_y) in
+                        [(7, 3, 7, 1), (10, 4, 12, 2), (11, 7, 13, 7), (10, 10, 12, 12), (7, 11, 7, 13), (4, 10, 2, 12), (3, 7, 1, 7), (4, 4, 2, 2)]
+                    {
+                        line(&[point(inner_x, inner_y), point(outer_x, outer_y)]);
+                    }
+                }
+                NavigationIcon::Options => {
                     for (adjustment, center) in [(2, 4), (7, 9), (12, 6)] {
                         line(&[point(0, adjustment), point(center - 2, adjustment)]);
                         line(&[point(center + 2, adjustment), point(14, adjustment)]);
@@ -354,6 +510,17 @@ impl Theme {
                     rect(0, 1, 14, 11);
                     line(&[point(7, 10), point(7, 13)]);
                     line(&[point(3, 13), point(11, 13)]);
+                }
+                NavigationIcon::Network => {
+                    line(&[point(7, 5), point(7, 8), point(2, 8), point(2, 10)]);
+                    line(&[point(7, 8), point(12, 8), point(12, 10)]);
+                    rect(5, 1, 10, 6);
+                    rect(0, 10, 5, 15);
+                    rect(10, 10, 15, 15);
+                }
+                NavigationIcon::Ready => {
+                    line(&[point(7, 1), point(13, 4), point(12, 9), point(7, 13), point(2, 9), point(1, 4), point(7, 1)]);
+                    line(&[point(4, 7), point(6, 9), point(10, 5)]);
                 }
             }
             let _ = RestoreDC(dc, saved);
@@ -380,6 +547,19 @@ fn scale(dpi: u32, value: i32) -> i32 {
 
 const fn rgb(hex: u32) -> COLORREF {
     COLORREF(((hex & 0xFF) << 16) | (hex & 0xFF00) | ((hex >> 16) & 0xFF))
+}
+
+fn solid_shape(dc: HDC, rect: &RECT, diameter: i32, color: COLORREF) {
+    if diameter > 0 {
+        round_box(dc, rect, diameter, color, color);
+        return;
+    }
+    unsafe {
+        let saved = SaveDC(dc);
+        SetDCBrushColor(dc, color);
+        FillRect(dc, rect, HBRUSH(GetStockObject(DC_BRUSH).0));
+        let _ = RestoreDC(dc, saved);
+    }
 }
 
 fn round_box(dc: HDC, rect: &RECT, diameter: i32, fill: COLORREF, outline: COLORREF) {

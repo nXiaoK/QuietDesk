@@ -349,7 +349,7 @@ impl ViewerTarget {
             .ok()
             .filter(|address| matches!(address.octets(), [100, 64..=127, _, _]))
             .ok_or_else(|| DeskError::invalid("请输入 tailscale: 加上对方的 Tailscale IPv4 地址"))?;
-        let client = client.ok_or_else(|| DeskError::invalid("请先在“设置 → Tailscale”登录"))?;
+        let client = client.ok_or_else(|| DeskError::invalid("请先在“网络与线路 → Tailscale”登录"))?;
         Ok(Self(Endpoint::Embedded { address: ip, port, client: client.clone() }))
     }
     pub(super) fn address_label(&self) -> String {

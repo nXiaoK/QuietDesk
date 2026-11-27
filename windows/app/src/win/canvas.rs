@@ -470,18 +470,43 @@ impl RetryPanel {
         }
     }
 
+    fn bounds(viewport: RECT, chrome: &Chrome) -> RECT {
+        let px = |value| chrome.theme.scale(value);
+        let width = px(484).min((viewport.right - px(24)).max(0));
+        let left = (viewport.right - width) / 2;
+        let top = viewport.top + px(12);
+        RECT { left, top, right: left + width, bottom: top + px(92) }
+    }
+
     unsafe fn layout(&self, viewport: RECT, chrome: &Chrome) {
         unsafe {
             let px = |value| chrome.theme.scale(value);
-            let width = px(460).min((viewport.right - px(24)).max(0));
-            let left = (viewport.right - width) / 2;
-            let y = viewport.top + px(12);
-            let button = px(104).min((width - px(4)).max(0) / 2);
-            let buttons_left = (viewport.right - button * 2 - px(4)) / 2;
+            let padding = px(12);
+            let gap = px(8);
+            let card = Self::bounds(viewport, chrome);
+            let width = (card.right - card.left - 2 * padding).max(0);
+            let button = px(104).min((width - gap).max(0) / 2);
+            let buttons_left = (viewport.right - button * 2 - gap) / 2;
             let flags = SWP_NOZORDER | SWP_NOACTIVATE;
-            let _ = SetWindowPos(self.status, None, left, y, width, px(36), flags);
-            let _ = SetWindowPos(self.retry, None, buttons_left, y + px(36), button, px(32), flags);
-            let _ = SetWindowPos(self.cancel, None, buttons_left + button + px(4), y + px(36), button, px(32), flags);
+            let _ = SetWindowPos(self.status, None, card.left + padding, card.top + px(7), width, px(32), flags);
+            let _ = SetWindowPos(self.retry, None, buttons_left, card.top + px(46), button, px(32), flags);
+            let _ = SetWindowPos(self.cancel, None, buttons_left + button + gap, card.top + px(46), button, px(32), flags);
+        }
+    }
+
+    unsafe fn paint(target: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush, viewport: RECT, chrome: &Chrome) {
+        let bounds = Self::bounds(viewport, chrome);
+        let radius = chrome.theme.scale(10) as f32;
+        let card = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F { left: bounds.left as f32, top: bounds.top as f32, right: bounds.right as f32, bottom: bounds.bottom as f32 },
+            radiusX: radius,
+            radiusY: radius,
+        };
+        unsafe {
+            brush.SetColor(&color_for_target(chrome.theme.surface_color(Surface::Card)));
+            target.FillRoundedRectangle(&card, brush);
+            brush.SetColor(&color_for_target(chrome.theme.surface_color(Surface::Hairline)));
+            target.DrawRoundedRectangle(&card, brush, 1.0, None);
         }
     }
 
@@ -809,6 +834,9 @@ impl Canvas {
                 self.chrome.paint_bands(&target, &chrome_brush, client, viewport);
             }
             let picture = self.picture_in(viewport);
+            if picture.is_none() && self.full_screen.is_none() {
+                self.chrome.paint_placeholder(&target, &chrome_brush, viewport);
+            }
             let painted = if let (Some((bitmap, _, _)), Some((left, top, width, height))) = (&self.bitmap, picture) {
                 let area = D2D_RECT_F { left, top, right: left + width, bottom: top + height };
                 target.DrawBitmap(bitmap, Some(&area), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
@@ -816,6 +844,9 @@ impl Canvas {
             } else {
                 false
             };
+            if self.retry.is_some() {
+                RetryPanel::paint(&target, &chrome_brush, viewport, &self.chrome);
+            }
             let fresh = painted && self.fresh_after.zip(self.uploaded_serial).is_some_and(|(old, serial)| serial > old);
             if !self.connected || !self.displays.shows(self.uploaded_display) || (self.fresh_after.is_some() && !fresh) {
                 self.shown_cursor = None;

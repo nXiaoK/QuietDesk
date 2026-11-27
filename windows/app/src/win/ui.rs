@@ -13,7 +13,7 @@ use quietdesk_core::host::{HostCommand, HostEvent, HostOptions};
 use quietdesk_core::keymap::{MacModifierMapping, PcModifierMapping};
 use quietdesk_core::messages::{DeviceIdentity, device_display_name};
 use quietdesk_core::pairing::PairingKey;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +23,7 @@ use tokio::sync::watch;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::HDC;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, LVN_ITEMACTIVATE, NMHDR};
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, EM_SETPASSWORDCHAR, LVN_ITEMACTIVATE, LVN_ITEMCHANGED, NMHDR};
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetActiveWindow, SetFocus, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -38,6 +38,9 @@ struct Main {
     window: HWND,
     workspace: Rc<Workspace>,
     settings: Settings,
+    selected_record: Cell<Option<usize>>,
+    table_records: RefCell<Vec<usize>>,
+    host_code_visible: bool,
     local_identity: Option<DeviceIdentity>,
     viewer_name: Option<String>,
     session_status: String,
@@ -267,7 +270,8 @@ impl Main {
             Ok((stored, key)) => {
                 self.settings.host_code = Some(stored);
                 self.save();
-                self.set_text(HOST_CODE, &key.code());
+                self.host_code_visible = false;
+                self.refresh_host_code();
                 Some(key)
             }
             Err(error) => {
@@ -278,91 +282,231 @@ impl Main {
     }
 
     fn refresh_recent(&self, selection: Option<&Connection>) {
-        let rows = self
-            .settings
-            .connections
-            .iter()
-            .map(|connection| (device_display_name(&connection.name), format!("{}:{}", connection.address, connection.port)))
-            .collect::<Vec<_>>();
         self.message(RECENT, LB_RESETCONTENT, 0, 0);
-        for (name, endpoint) in &rows {
-            let label = wide(&format!("{name}  ·  {endpoint}"));
-            self.message(RECENT, LB_ADDSTRING, 0, label.as_ptr() as isize);
+        for connection in self.settings.connections.iter().take(3) {
+            self.message(RECENT, LB_ADDSTRING, 0, wide(&device_display_name(&connection.name)).as_ptr() as isize);
         }
-        let table = self.item(DEVICE_TABLE);
-        if let Err(error) = device_table::replace(table, rows.iter().map(|(name, endpoint)| (name.as_str(), endpoint.as_str()))) {
-            log::warn!("could not refresh device table: {error}");
-        }
-        self.workspace.show_devices(rows.len());
-        let index = selection.and_then(|selected| {
+        let selected = selection.and_then(|selected| {
             self.settings
                 .connections
                 .iter()
                 .position(|connection| connection.port == selected.port && connection.address.eq_ignore_ascii_case(&selected.address))
         });
-        self.message(RECENT, LB_SETCURSEL, index.unwrap_or(usize::MAX), 0);
-        device_table::select(table, index);
+        self.selected_record.set(selected);
+        self.message(RECENT, LB_SETCURSEL, selected.filter(|index| *index < 3).unwrap_or(usize::MAX), 0);
+        self.refresh_device_list();
         self.refresh_device_heading();
+        if selected.is_none() && self.workspace.page() == Page::Detail {
+            self.workspace.select(Page::Devices);
+        }
+    }
+
+    fn refresh_device_list(&self) {
+        let managing = self.workspace.page() == Page::ManageRecords;
+        let query = if managing { String::new() } else { self.text(SEARCH_DEVICES).to_lowercase() };
+        let total = self.settings.connections.len();
+        let limit = if managing || self.workspace.all_records() || !query.is_empty() { total } else { total.min(3) };
+        let rows = self
+            .settings
+            .connections
+            .iter()
+            .enumerate()
+            .filter(|(_, connection)| {
+                query.is_empty()
+                    || device_display_name(&connection.name).to_lowercase().contains(&query)
+                    || format!("{}:{}", connection.address.to_lowercase(), connection.port).contains(&query)
+                    || connection.device_id.is_some_and(|id| id.to_string().contains(&query))
+            })
+            .take(limit)
+            .map(|(index, connection)| (index, device_display_name(&connection.name), format!("{}:{}", connection.address, connection.port)))
+            .collect::<Vec<_>>();
+        let table = self.item(DEVICE_TABLE);
+        if let Err(error) = device_table::replace(table, rows.iter().map(|(_, name, endpoint)| (name.as_str(), endpoint.as_str()))) {
+            log::warn!("could not refresh device table: {error}");
+        }
+        let selected_row = self.selected().and_then(|index| rows.iter().position(|(row, ..)| *row == index));
+        device_table::select(table, selected_row);
+        self.table_records.replace(rows.iter().map(|(index, ..)| *index).collect());
+        self.workspace.show_devices(rows.len(), total);
+        self.set_text(DEVICES_COUNT, &format!("{} 条本机连接记录 · 显示 {} 条", total, rows.len()));
+        self.set_text(RECENT_SCOPE, &format!("最近 {} 台", total.min(3)));
+        self.set_text(ALL_SCOPE, &format!("全部 {total} 台"));
+        self.set_record_actions_enabled(selected_row.is_some());
+    }
+
+    fn set_record_actions_enabled(&self, enabled: bool) {
+        for id in [OPEN_DEVICE, FORGET] {
+            let _ = unsafe { EnableWindow(self.item(id), enabled) };
+        }
+    }
+
+    fn table_selection(&self) -> Option<usize> {
+        device_table::selected(self.item(DEVICE_TABLE)).and_then(|row| self.table_records.borrow().get(row).copied())
     }
 
     fn open_device(&self, index: usize) -> bool {
-        let Some(connection) = self.settings.connections.get(index) else { return false };
-        self.message(RECENT, LB_SETCURSEL, index, 0);
-        device_table::select(self.item(DEVICE_TABLE), Some(index));
-        self.set_text(ADDRESS, &connection.address);
-        self.set_text(PORT, &connection.port.to_string());
-        self.set_text(CODE, &unprotect(&connection.code).unwrap_or_default());
+        if index >= self.settings.connections.len() {
+            return false;
+        }
+        self.selected_record.set(Some(index));
+        self.message(RECENT, LB_SETCURSEL, if index < 3 { index } else { usize::MAX }, 0);
+        let row = self.table_records.borrow().iter().position(|stored| *stored == index);
+        device_table::select(self.item(DEVICE_TABLE), row);
         self.refresh_device_heading();
-        self.workspace.select(Page::Connection);
+        self.workspace.set_detail_options(DetailOptions::Overview);
+        self.workspace.select(Page::Detail);
         true
     }
 
     fn refresh_device_heading(&self) {
+        let quality = self.settings.viewer_quality().summary();
+        self.set_text(DETAIL_QUALITY, &quality);
         if let Some(index) = self.selected() {
             let connection = &self.settings.connections[index];
-            self.set_text(DEVICE_HEADING, &device_display_name(&connection.name));
-            self.set_text(DEVICE_DETAIL, &format!("{}:{}", connection.address, connection.port));
-            let _ = unsafe { EnableWindow(self.item(FORGET), true) };
-        } else {
-            self.set_text(DEVICE_HEADING, "新建连接");
-            self.set_text(DEVICE_DETAIL, "填写目标设备的连接信息");
-            let _ = unsafe { EnableWindow(self.item(FORGET), false) };
+            let name = device_display_name(&connection.name);
+            let endpoint = format!("{}:{}", connection.address, connection.port);
+            self.set_text(DETAIL_HEADING, &name);
+            self.set_text(DETAIL_ENDPOINT, &endpoint);
+            self.set_text(DETAIL_INSPECTOR_ENDPOINT, &endpoint);
+            self.set_text(DETAIL_ROUTE, if ViewerTarget::embedded_host(&connection.address).is_some() { "Tailscale" } else { "地址直连" });
+            self.set_text(DETAIL_CREDENTIAL, if connection.code.is_empty() { "未保存" } else { "已保存" });
         }
+        let summary = match self.workspace.detail_options() {
+            DetailOptions::Display | DetailOptions::Overview => format!("请求画质 · {quality}"),
+            DetailOptions::Transport => {
+                if self.settings.auto_reconnect {
+                    "断线后自动重连 · 已开启".into()
+                } else {
+                    "断线后自动重连 · 已关闭".into()
+                }
+            }
+        };
+        self.set_text(DETAIL_OPTIONS_VALUE, &summary);
     }
 
-    fn new_connection(&self) {
-        self.message(RECENT, LB_SETCURSEL, usize::MAX, 0);
-        device_table::select(self.item(DEVICE_TABLE), None);
-        self.set_text(ADDRESS, "");
-        self.set_text(PORT, &self.settings.port.to_string());
-        self.set_text(CODE, "");
-        self.refresh_device_heading();
+    fn edit_record(&self, connection: &Connection) {
+        self.set_text(DEVICE_HEADING, "编辑连接");
+        self.set_text(DEVICE_DETAIL, &device_display_name(&connection.name));
+        self.set_text(ADDRESS, &connection.address);
+        self.set_text(PORT, &connection.port.to_string());
+        self.set_text(CODE, &unprotect(&connection.code).unwrap_or_default());
+        self.workspace.set_tailscale_mode(ViewerTarget::embedded_host(&connection.address).is_some());
+        self.show_connection_form();
+    }
+
+    fn show_connection_form(&self) {
         self.workspace.select(Page::Connection);
         let _ = unsafe { SetFocus(Some(self.item(ADDRESS))) };
     }
 
+    fn reset_draft(&self) {
+        self.set_text(DEVICE_HEADING, "新建连接");
+        self.set_text(DEVICE_DETAIL, "先选连接方式，再填写被控端的连接信息。");
+        self.set_text(ADDRESS, "");
+        self.set_text(PORT, &self.settings.port.to_string());
+        self.set_text(CODE, "");
+        self.workspace.set_tailscale_mode(false);
+        self.workspace.set_draft_available(false);
+    }
+
+    fn new_connection(&self) {
+        self.selected_record.set(None);
+        self.message(RECENT, LB_SETCURSEL, usize::MAX, 0);
+        device_table::select(self.item(DEVICE_TABLE), None);
+        self.reset_draft();
+        self.show_connection_form();
+    }
+
+    fn select_connection_mode(&self, tailscale: bool) {
+        let address = self.text(ADDRESS);
+        if !tailscale && let Some(host) = ViewerTarget::embedded_host(&address) {
+            self.set_text(ADDRESS, host);
+        }
+        self.workspace.set_tailscale_mode(tailscale);
+        let _ = unsafe { SetFocus(Some(self.item(ADDRESS))) };
+    }
+
+    fn device_readiness(&self) {
+        let Some(connection) = self.selected().map(|index| &self.settings.connections[index]) else { return };
+        let has_key = unprotect(&connection.code).is_some_and(|code| PairingKey::parse(&code).is_ok());
+        let pairing = if has_key { "本机已读取保存的配对码" } else { "配对码无法读取，请编辑连接后重新填写" };
+        let connection = if ViewerTarget::embedded_host(&connection.address).is_some() { self.tailnet.status_line() } else { "地址直连" };
+        let description = format!("{pairing}\n连接方式：{connection}\n\n对端的键鼠控制权限将在连接后确认。");
+        self.modal_prompt_open.store(true, Ordering::Release);
+        unsafe { MessageBoxW(Some(self.window), PCWSTR(wide(&description).as_ptr()), w!("连接前就绪状态"), MB_OK | MB_ICONINFORMATION) };
+        self.modal_prompt_open.store(false, Ordering::Release);
+    }
+
+    fn device_menu(&mut self) {
+        let Ok(menu) = (unsafe { CreatePopupMenu() }) else { return };
+        let action = unsafe {
+            let mut anchor = RECT::default();
+            let result = AppendMenuW(menu, MF_STRING, DETAIL_EDIT, w!("编辑连接"))
+                .and_then(|_| AppendMenuW(menu, MF_SEPARATOR, 0, None))
+                .and_then(|_| AppendMenuW(menu, MF_STRING, FORGET, w!("移除此记录…")))
+                .and_then(|_| GetWindowRect(self.item(DETAIL_MENU), &mut anchor));
+            self.modal_prompt_open.store(true, Ordering::Release);
+            let action = if result.is_ok() {
+                TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, anchor.left, anchor.bottom, None, self.window, None).0 as usize
+            } else {
+                0
+            };
+            self.modal_prompt_open.store(false, Ordering::Release);
+            let _ = DestroyMenu(menu);
+            action
+        };
+        if action != 0 {
+            self.command(action, BN_CLICKED);
+        }
+    }
+
     fn refresh_sharing_summary(&self) {
-        let text = if self.sharing.is_none() {
+        let active = self.sharing.is_some();
+        let text = if !active {
             "共享未开启"
         } else if self.host_activity.connected() {
             "正在被控制"
         } else {
             "本机共享已开启"
         };
+        self.workspace.set_sharing_active(active);
         self.set_text(SHARING_SUMMARY, text);
+        for control in [NEW_CODE, HOST_PORT] {
+            let _ = unsafe { EnableWindow(self.item(control), !active) };
+        }
     }
 
     fn selected(&self) -> Option<usize> {
-        usize::try_from(self.message(RECENT, LB_GETCURSEL, 0, 0)).ok().filter(|index| *index < self.settings.connections.len())
+        self.selected_record.get().filter(|index| *index < self.settings.connections.len())
+    }
+
+    fn refresh_host_code(&mut self) {
+        let code = self.settings.host_code.as_deref().and_then(unprotect);
+        let mask = if code.is_some() && !self.host_code_visible { '●' as usize } else { 0 };
+        self.message(HOST_CODE, EM_SETPASSWORDCHAR, mask, 0);
+        let placeholder = if self.settings.host_code.is_some() { "配对码无法读取" } else { "首次开始共享时生成" };
+        self.set_text(HOST_CODE, code.as_deref().unwrap_or(placeholder));
+        self.set_text(HOST_SHOW_CODE, if self.host_code_visible { "隐藏" } else { "显示" });
+        unsafe {
+            let _ = EnableWindow(self.item(HOST_SHOW_CODE), code.is_some());
+            let _ = EnableWindow(self.item(COPY_CODE), code.is_some());
+        }
     }
 
     fn connect(&mut self) {
-        let (address, code) = (self.text(ADDRESS), self.text(CODE));
+        let mut address = self.text(ADDRESS);
+        if !address.is_empty() && self.workspace.tailscale_mode() && ViewerTarget::embedded_host(&address).is_none() {
+            address = format!("tailscale:{address}");
+        }
         let Ok(port) = self.text(PORT).parse::<u16>() else { return self.alert("端口应为 1 到 65535 的数字") };
+        self.connect_to(address, port, &self.text(CODE));
+    }
+
+    fn connect_to(&mut self, address: String, port: u16, code: &str) {
         if address.is_empty() || port == 0 {
             return self.alert("请填写被控端的地址和端口");
         }
-        let key = match PairingKey::parse(&code) {
+        let key = match PairingKey::parse(code) {
             Ok(key) => key,
             Err(error) => return self.alert(&error.to_string()),
         };
@@ -378,6 +522,15 @@ impl Main {
             Ok(window) => self.viewers.push((window, Some(Connection { address, port, name: String::new(), code: stored, device_id: None }))),
             Err(error) => self.alert(&format!("无法打开远程窗口：{error}")),
         }
+    }
+
+    fn connect_selected(&mut self) {
+        let Some(connection) = self.selected().map(|index| self.settings.connections[index].clone()) else { return };
+        let Some(code) = unprotect(&connection.code) else {
+            self.alert("无法读取保存的配对码。请重新编辑连接并填写配对码。");
+            return;
+        };
+        self.connect_to(connection.address, connection.port, &code);
     }
 
     fn toggle_sharing(&mut self) {
@@ -418,6 +571,7 @@ impl Main {
         self.sharing = Some(commands);
         self.set_text(SHARE, "停止共享");
         self.set_text(HOST_STATUS, "正在开启共享…");
+        self.refresh_sharing_summary();
         self.set_text(SHARING_SUMMARY, "正在准备共享");
     }
 
@@ -499,17 +653,74 @@ impl Main {
         let chosen = |main: &Self, id: usize| main.message(id, CB_GETCURSEL, 0, 0).max(0) as usize;
         match (id, notification) {
             (NEW_CONNECTION | NEW_CONNECTION_PAGE, BN_CLICKED) => self.new_connection(),
-            (CONTINUE_CONNECTION, BN_CLICKED) => {
-                self.workspace.select(Page::Connection);
-                let _ = unsafe { SetFocus(Some(self.item(ADDRESS))) };
+            (CONTINUE_CONNECTION, BN_CLICKED) => self.show_connection_form(),
+            (CANCEL_CONNECTION, BN_CLICKED) => {
+                self.reset_draft();
+                self.workspace.select(if self.selected().is_some() { Page::Detail } else { Page::Devices });
+            }
+            (DIRECT_MODE | TAILNET_MODE, BN_CLICKED) => self.select_connection_mode(id == TAILNET_MODE),
+            (SEARCH_DEVICES, EN_CHANGE) => self.refresh_device_list(),
+            (RECENT_SCOPE | ALL_SCOPE, BN_CLICKED) => {
+                self.workspace.set_all_records(id == ALL_SCOPE);
+                self.set_text(SEARCH_DEVICES, "");
+                self.refresh_device_list();
+            }
+            (DETAIL_CONNECT, BN_CLICKED) => self.connect_selected(),
+            (DETAIL_EDIT, BN_CLICKED) => {
+                if let Some(index) = self.selected() {
+                    self.edit_record(&self.settings.connections[index]);
+                }
+            }
+            (DETAIL_MENU, BN_CLICKED) => self.device_menu(),
+            (DETAIL_OPTIONS | DETAIL_DISPLAY | DETAIL_TRANSPORT, BN_CLICKED) => {
+                let options = match id {
+                    DETAIL_TRANSPORT => DetailOptions::Transport,
+                    DETAIL_OPTIONS if self.workspace.detail_options() != DetailOptions::Overview => DetailOptions::Overview,
+                    _ => DetailOptions::Display,
+                };
+                self.workspace.set_detail_options(options);
+                self.refresh_device_heading();
+            }
+            (NEW_OPTIONS | DRAFT_DISPLAY, BN_CLICKED) => self.workspace.select(Page::DraftDisplay),
+            (DRAFT_TRANSPORT, BN_CLICKED) => self.workspace.select(Page::DraftTransport),
+            (RETURN_CONNECTION, BN_CLICKED) => self.show_connection_form(),
+            (DETAIL_SETTINGS, BN_CLICKED) => self.workspace.select(Page::Defaults),
+            (DETAIL_READY, BN_CLICKED) => self.device_readiness(),
+            (MANAGE_RECORDS | FINISH_MANAGING, BN_CLICKED) => {
+                self.workspace.select(if id == MANAGE_RECORDS { Page::ManageRecords } else { Page::Devices });
+                self.refresh_device_list();
+            }
+            (PRIVACY_SHARING, BN_CLICKED) => self.workspace.select(Page::Sharing),
+            (ABOUT, BN_CLICKED) => {
+                let description = format!(
+                    "QuietDesk
+版本 {}（Build {}）",
+                    self.updater.config.current_version, self.updater.config.current_build
+                );
+                self.modal_prompt_open.store(true, Ordering::Release);
+                unsafe { MessageBoxW(Some(self.window), PCWSTR(wide(&description).as_ptr()), w!("关于 QuietDesk"), MB_OK | MB_ICONINFORMATION) };
+                self.modal_prompt_open.store(false, Ordering::Release);
             }
             (NAV_DEVICES, BN_CLICKED) => {
                 let has_entry = unsafe { GetWindowTextLengthW(self.item(ADDRESS)) != 0 || GetWindowTextLengthW(self.item(CODE)) != 0 };
                 self.workspace.set_draft_available(has_entry || self.text(PORT) != self.settings.port.to_string());
                 self.workspace.navigate(id);
+                if self.host_code_visible {
+                    self.host_code_visible = false;
+                    self.refresh_host_code();
+                }
+                self.refresh_device_list();
             }
-            (NAV_SHARING | NAV_SETTINGS | TAB_SHARING | TAB_HOST_QUALITY | TAB_KEYBOARD | TAB_DEFAULTS | TAB_UPDATES | TAB_TAILSCALE, BN_CLICKED) => {
+            (
+                NAV_SHARING | NAV_NETWORK | NAV_SETTINGS | TAB_SHARING | TAB_HOST_QUALITY | TAB_BACKGROUND | TAB_KEYBOARD | TAB_DEFAULTS | TAB_PRIVACY
+                | TAB_UPDATES | TAB_TAILSCALE,
+                BN_CLICKED,
+            ) => {
                 self.workspace.navigate(id);
+                if self.host_code_visible && self.workspace.page() != Page::Sharing {
+                    self.host_code_visible = false;
+                    self.refresh_host_code();
+                }
             }
             (CONNECT, BN_CLICKED) => self.connect(),
             (TAILSCALE_LOGIN, BN_CLICKED) => {
@@ -541,37 +752,56 @@ impl Main {
                     self.save();
                 }
             }
-            (AUTO_RECONNECT, BN_CLICKED) => {
+            (AUTO_RECONNECT | DRAFT_RECONNECT, BN_CLICKED) => {
                 let enabled = checked(self, id);
                 self.settings.auto_reconnect = enabled;
+                self.message(if id == AUTO_RECONNECT { DRAFT_RECONNECT } else { AUTO_RECONNECT }, BM_SETCHECK, usize::from(enabled), 0);
                 self.auto_reconnect.send_replace(enabled);
+                self.refresh_device_heading();
                 self.save();
             }
             (RECENT, LBN_SELCHANGE | LBN_DBLCLK) => {
-                if let Some(index) = self.selected()
+                if let Ok(index) = usize::try_from(self.message(RECENT, LB_GETCURSEL, 0, 0))
                     && self.open_device(index)
                     && notification == LBN_DBLCLK
                 {
-                    self.connect();
+                    self.connect_selected();
                 }
             }
-            (DEVICE_TABLE, BN_CLICKED) => {
-                if let Some(index) = device_table::selected(self.item(DEVICE_TABLE))
+            (DEVICE_TABLE | OPEN_DEVICE, BN_CLICKED) => {
+                let index = self.table_selection();
+                if let Some(index) = index
                     && self.open_device(index)
                 {
-                    let _ = unsafe { SetFocus(Some(self.item(CONNECT))) };
+                    let _ = unsafe { SetFocus(Some(self.item(DETAIL_CONNECT))) };
                 }
             }
             (FORGET, BN_CLICKED) => {
-                if let Some(index) = self.selected() {
+                let index = if self.workspace.page() == Page::ManageRecords { self.table_selection() } else { self.selected() };
+                let Some(index) = index else { return };
+                self.modal_prompt_open.store(true, Ordering::Release);
+                let confirm = unsafe {
+                    MessageBoxW(Some(self.window), w!("移除此连接记录和本机保存的配对码？"), w!("移除连接记录"), MB_OKCANCEL | MB_ICONWARNING)
+                };
+                self.modal_prompt_open.store(false, Ordering::Release);
+                if confirm == IDOK {
                     self.settings.connections.remove(index);
                     self.save();
                     self.refresh_recent(None);
                 }
             }
             (SHARE, BN_CLICKED) => self.toggle_sharing(),
+            (HOST_SHOW_CODE, BN_CLICKED) => {
+                self.host_code_visible = !self.host_code_visible;
+                self.refresh_host_code();
+            }
+            (HOST_CODE_INFO, BN_CLICKED) => {
+                self.alert("配对码会以当前 Windows 账户的加密保护存储。请只与受信任的设备共享配对码。重新生成后，其他设备需使用新配对码。");
+            }
             (COPY_CODE, BN_CLICKED) => {
-                if let Err(error) = clipboard::set_text(&self.text(HOST_CODE)) {
+                if let Some(code) = self.settings.host_code.as_deref().and_then(unprotect)
+                    && let Err(error) = clipboard::set_text(&code)
+                {
                     self.alert(&error.to_string());
                 }
             }
@@ -607,8 +837,10 @@ impl Main {
                     let _ = sharing.send(HostCommand::Clipboard(self.settings.clipboard));
                 }
             }
-            (VIEWER_QUALITY, CBN_SELCHANGE) => {
+            (VIEWER_QUALITY | DRAFT_QUALITY, CBN_SELCHANGE) => {
                 self.settings.viewer_quality = chosen(self, id);
+                self.message(if id == VIEWER_QUALITY { DRAFT_QUALITY } else { VIEWER_QUALITY }, CB_SETCURSEL, self.settings.viewer_quality, 0);
+                self.refresh_device_heading();
                 self.save();
             }
             (QUALITY_LIMIT, CBN_SELCHANGE) => {
@@ -750,7 +982,9 @@ impl Main {
             }
             self.message(id, CB_SETCURSEL, selected.min(labels.len() - 1), 0);
         };
-        fill(VIEWER_QUALITY, &VIEWER_QUALITIES.map(|(label, _)| label), self.settings.viewer_quality);
+        for id in [VIEWER_QUALITY, DRAFT_QUALITY] {
+            fill(id, &VIEWER_QUALITIES.map(|(label, _)| label), self.settings.viewer_quality);
+        }
         fill(QUALITY_LIMIT, &QUALITY_LIMITS.map(|(label, _)| label), self.settings.quality_limit);
         fill(
             PC_MODIFIERS,
@@ -764,13 +998,11 @@ impl Main {
         );
         self.message(ALLOW_CONTROL, BM_SETCHECK, usize::from(self.settings.allow_control), 0);
         self.refresh_displays();
-        self.message(AUTO_RECONNECT, BM_SETCHECK, usize::from(self.settings.auto_reconnect), 0);
-        self.message(ALLOW_CLIPBOARD, BM_SETCHECK, usize::from(self.settings.clipboard), 0);
-        if let Some(code) = self.settings.host_code.as_deref().and_then(unprotect) {
-            self.set_text(HOST_CODE, &code);
-        } else if self.settings.host_code.is_none() {
-            self.set_text(HOST_CODE, "首次开始共享时生成");
+        for id in [AUTO_RECONNECT, DRAFT_RECONNECT] {
+            self.message(id, BM_SETCHECK, usize::from(self.settings.auto_reconnect), 0);
         }
+        self.message(ALLOW_CLIPBOARD, BM_SETCHECK, usize::from(self.settings.clipboard), 0);
+        self.refresh_host_code();
         self.refresh_recent(None);
         if !self.settings.connections.is_empty() {
             self.workspace.select(Page::Devices);
@@ -830,11 +1062,22 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
             }
             WM_NOTIFY if lparam.0 != 0 => {
                 let header = &*(lparam.0 as *const NMHDR);
-                if header.idFrom == DEVICE_TABLE && header.code == LVN_ITEMACTIVATE {
-                    if let Ok(mut main) = state.main.try_borrow_mut() {
-                        main.command(DEVICE_TABLE, BN_CLICKED);
+                if header.idFrom == DEVICE_TABLE {
+                    if header.code == LVN_ITEMACTIVATE {
+                        if let Ok(mut main) = state.main.try_borrow_mut() {
+                            main.command(DEVICE_TABLE, BN_CLICKED);
+                        }
+                        return LRESULT(0);
                     }
-                    return LRESULT(0);
+                    if header.code == LVN_ITEMCHANGED {
+                        let enabled = device_table::selected(header.hwndFrom).is_some();
+                        for id in [OPEN_DEVICE, FORGET] {
+                            if let Ok(button) = GetDlgItem(Some(window), id as i32) {
+                                let _ = EnableWindow(button, enabled);
+                            }
+                        }
+                        return LRESULT(0);
+                    }
                 }
                 return DefWindowProcW(window, message, wparam, lparam);
             }
@@ -933,6 +1176,9 @@ unsafe fn run_window() -> windows::core::Result<()> {
             settings,
             displays: Vec::new(),
             active_display: None,
+            selected_record: Cell::new(None),
+            table_records: RefCell::new(Vec::new()),
+            host_code_visible: false,
             host_activity: Arc::default(),
             modal_prompt_open: AtomicBool::new(false),
             runtime: network_runtime(),
@@ -992,9 +1238,12 @@ fn workspace_enter(window: HWND, message: &MSG) -> bool {
             DEVICE_TABLE => {
                 SendMessageW(window, WM_COMMAND, Some(WPARAM(DEVICE_TABLE)), Some(LPARAM(0)));
             }
-            NEW_CONNECTION | NEW_CONNECTION_PAGE | NAV_DEVICES | NAV_SHARING | NAV_SETTINGS | TAB_SHARING | TAB_HOST_QUALITY | TAB_KEYBOARD | TAB_DEFAULTS
-            | TAB_UPDATES | TAB_TAILSCALE | TAILSCALE_LOGIN | TAILSCALE_LOGOUT | CONTINUE_CONNECTION | CONNECT | FORGET | SHARE | COPY_CODE | NEW_CODE
-            | UPDATE_ACTION | UPDATE_NOTES => {
+            NEW_CONNECTION | NEW_CONNECTION_PAGE | NAV_DEVICES | NAV_SHARING | NAV_NETWORK | NAV_SETTINGS | TAB_SHARING | TAB_HOST_QUALITY | TAB_BACKGROUND
+            | TAB_KEYBOARD | TAB_DEFAULTS | TAB_PRIVACY | TAB_UPDATES | TAB_TAILSCALE | TAILSCALE_LOGIN | TAILSCALE_LOGOUT | CONTINUE_CONNECTION | CONNECT
+            | SHARE | COPY_CODE | NEW_CODE | UPDATE_ACTION | UPDATE_NOTES | RECENT_SCOPE | ALL_SCOPE | OPEN_DEVICE | DETAIL_CONNECT | DETAIL_OPTIONS
+            | DETAIL_DISPLAY | DETAIL_TRANSPORT | DETAIL_SETTINGS | DETAIL_EDIT | DETAIL_MENU | DIRECT_MODE | TAILNET_MODE | CANCEL_CONNECTION
+            | NEW_OPTIONS | HOST_SHOW_CODE | HOST_CODE_INFO | PRIVACY_SHARING | ABOUT | DETAIL_READY | MANAGE_RECORDS | FINISH_MANAGING | DRAFT_DISPLAY
+            | DRAFT_TRANSPORT | RETURN_CONNECTION | FORGET => {
                 SendMessageW(message.hwnd, BM_CLICK, None, None);
             }
             _ => return false,

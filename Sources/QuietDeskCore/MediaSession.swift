@@ -85,6 +85,8 @@ public final class MediaSession: @unchecked Sendable {
     public var onSample: ((MediaPathSample) -> Void)?
     /// Host-side frame delivery delay above the recent minimum, excluding keyframes and planned pacing.
     public var onVideoDeliveryDelay: ((Double) -> Void)?
+    /// Host only, on the media queue. Temporarily limits the encoder while earlier video is queued.
+    public var onVideoSendBacklog: ((Bool) -> Void)?
     public var hasRecentMappedPayload: (() -> Bool)?
     // Actual video route classification, delivered before its sample or direct reduction callback.
     public var onLocalNetwork: ((Bool) -> Void)?
@@ -294,6 +296,9 @@ public final class MediaSession: @unchecked Sendable {
     private var sampleDeliveryMilliseconds: Double?
     private var sampleMappedTransfer: MappedTransferState?
     private var waitingCreditStream: MediaStreamID?
+    private var videoBacklogSince: TimeInterval?
+    private var videoBacklogDrainedAt: TimeInterval?
+    private var videoBacklogLimited = false
     private var udpJitter = MediaJitterEstimator()
     private var deliveryEstimator = MediaDeliveryEstimator()
     private var deliveryPath: Path?
@@ -1450,6 +1455,7 @@ public final class MediaSession: @unchecked Sendable {
         guard !paused, !configurationSuspended else { onAcknowledged?(packet.sequence); return }
         if recoveryHold, transaction == nil { onAcknowledged?(packet.sequence); requestRecovery(); return }
         guard negotiated, let target = transaction.map({ ($0.stream, $0.path) }) ?? active.map({ ($0.stream, $0.path) }) else {
+            if !negotiated, packet.sps.isEmpty { noteVideoSendBacklog() }
             do { control.send(Message(.video, try packet.encode())); onFrameSent?() }
             catch { control.close(error.localizedDescription) }
             return
@@ -1458,6 +1464,7 @@ public final class MediaSession: @unchecked Sendable {
         do {
             let isIDR = try MediaFrame.containsIDR(packet.avcc, codec: packet.codec)
             if transaction != nil, !isIDR { abortTransaction(retry: true); onAcknowledged?(packet.sequence); return }
+            if !isIDR { noteVideoSendBacklog() }
             if cache?.stream != target.0 { cache = try MediaRetransmissionCache(stream: target.0, limits: bufferLimits); nextFrameID = 1 }
             let header = MediaFrameHeader(stream: target.0, frameID: nextFrameID, isIDR: isIDR)
             let frame = try MediaFrame(header: header, packet: packet)
@@ -1777,6 +1784,47 @@ public final class MediaSession: @unchecked Sendable {
 
     private var bytesPerSecond: Double { Self.udpPacingBytesPerSecond(megabits: settings.megabits) }
 
+    private static let videoBacklogThreshold: TimeInterval = 0.10
+
+    private var videoSendBacklog: TimeInterval? {
+        guard !paused, !configurationSuspended, !recoveryHold, transaction == nil else { return nil }
+        if active?.path == .udp { return udpVerified ? Double(pendingDatagramBytes) / bytesPerSecond : nil }
+        guard !negotiated || active != nil else { return nil }
+        let peer = active?.path == .tcp ? videoPeer : control
+        guard let peer else { return nil }
+        return Double(peer.queuedSendBytes) / VideoSendPacing(megabits: settings.megabits).bytesPerSecond
+    }
+
+    private func noteVideoSendBacklog() {
+        // Start from a prediction frame waiting behind earlier sends. Its own size and startup IDRs
+        // cannot start the brake. Keep checking if the sender runs out of frame credits.
+        guard onVideoSendBacklog != nil, !videoBacklogLimited, videoBacklogSince == nil,
+              let backlog = videoSendBacklog, backlog >= Self.videoBacklogThreshold else { return }
+        videoBacklogSince = SessionClock.now
+    }
+
+    private func checkVideoSendBacklog(now: TimeInterval) {
+        guard let notify = onVideoSendBacklog, videoBacklogSince != nil || videoBacklogLimited else { return }
+        let backlog = videoSendBacklog
+        if videoBacklogLimited {
+            if let backlog {
+                guard backlog <= 0.035 else { videoBacklogDrainedAt = nil; return }
+                let drainedAt = videoBacklogDrainedAt ?? now
+                videoBacklogDrainedAt = drainedAt
+                guard now - drainedAt >= 1 else { return }
+            }
+            videoBacklogDrainedAt = nil
+            videoBacklogLimited = false
+            notify(false)
+        } else if let since = videoBacklogSince {
+            guard let backlog, backlog >= Self.videoBacklogThreshold else { videoBacklogSince = nil; return }
+            guard now - since >= 0.05 else { return }
+            videoBacklogSince = nil
+            videoBacklogLimited = true
+            notify(true)
+        }
+    }
+
     private func pumpDatagrams() {
         guard !stopped, !paused, let peer = udpPeer, udpVerified else { return }
         let now = SessionClock.now, burst = Self.udpPacingBurstBytes(megabits: settings.megabits)
@@ -1894,6 +1942,7 @@ public final class MediaSession: @unchecked Sendable {
             let header = MediaFrameHeader(stream: pending.stream, frameID: 1, isIDR: true)
             abortTransaction(retry: true, mediaFailure: hasDeliveryFailureEvidence && pending.frameSubmitted && pending.stage == .producing && !reassembledAtPeer.contains(header))
         }
+        if side == .host { checkVideoSendBacklog(now: now) }
         guard negotiated, !paused, !configurationSuspended else { return }
         if udpPeer != nil, SessionClock.uptime - lastPingAt >= (transaction?.awaitingLiveness == true ? Self.fastRequestInterval : 0.2) { sendPing() }
         if side == .viewer, let pending = transaction, pending.fast, pending.path == .udp, !pending.hostReady,

@@ -1076,6 +1076,22 @@ private struct VideoPipelineChecks {
             }
         }
 
+        run("The sender brake changes the running encoder and restores the latest bitrate target") {
+            var bitrates: [Int] = []
+            let encoder = try VideoEncoder(width: 64, height: 64, settings: .init(megabits: 12)) { session, key, value in
+                if key == kVTCompressionPropertyKey_AverageBitRate, let rate = value as? NSNumber {
+                    bitrates.append(rate.intValue)
+                }
+                return VTSessionSetProperty(session, key: key, value: value)
+            }
+            defer { encoder.stop() }
+            try encoder.setVideoSendBacklogLimited(true)
+            try encoder.updateBitrate(megabits: 20)
+            try encoder.setVideoSendBacklogLimited(false)
+            try require(bitrates == [12_000_000, 6_000_000, 10_000_000, 20_000_000],
+                        "The temporary cap overwrote a negotiated bitrate or reconfigured the encoder: \(bitrates)")
+        }
+
         run("A rejected live property restores earlier writes on the running encoder") {
             var session: VTCompressionSession?, rejected: CFString?, failures = 0
             let encoder = try VideoEncoder(width: 64, height: 64, settings: StreamSettings(framesPerSecond: 30, megabits: 8)) {

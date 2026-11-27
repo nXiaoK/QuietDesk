@@ -1885,6 +1885,7 @@ final class DeskModel: ObservableObject, Identifiable {
                         }
                         media.diagnostics = diagnostics
                         media.onVideoDeliveryDelay = { [weak mapping] delay in mapping?.noteVideoDeliveryDelay(delay) }
+                        media.onVideoSendBacklog = { [weak streamer] limited in streamer?.setVideoSendBacklogLimited(limited) }
                         media.hasRecentMappedPayload = { [weak mapping] in mapping?.hasRecentPayload == true }
                         streamer.onFrameCreditWait = { [weak media] in media?.recordFrameCreditWait() }
                         host.media = media

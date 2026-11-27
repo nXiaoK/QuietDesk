@@ -424,6 +424,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private var encoderID = UUID()
     private var displayID: CGDirectDisplayID?
     private var currentSettings = StreamSettings()
+    private var videoSendBacklogLimited = false
     private var outputWidth = 0
     private var outputHeight = 0
     private var sourceWidth = 0
@@ -992,18 +993,12 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         waiter.continuation.resume(with: result)
     }
 
-    // Bitrate alone does not change capture, dimensions or the encoder, so no pause or keyframe is needed.
-    func updateBitrate(_ settings: StreamSettings) throws -> VideoStreamState {
-        try settings.validateControlValues()
-        return try queue.sync {
-            guard running, captureStarted, let encoder, !reconfiguring,
-                  settings.longestEdge == currentSettings.longestEdge,
-                  settings.framesPerSecond == currentSettings.framesPerSecond else {
-                throw DeskError.invalid("画质正在调整，请稍后再试")
-            }
-            try encoder.updateBitrate(megabits: settings.megabits)
-            currentSettings = settings
-            return VideoStreamState(settings: settings, width: outputWidth, height: outputHeight)
+    func setVideoSendBacklogLimited(_ limited: Bool) {
+        queue.async { [weak self] in
+            guard let self, self.running else { return }
+            self.videoSendBacklogLimited = limited
+            if limited { self.cancelRefinement() }
+            try? self.encoder?.setVideoSendBacklogLimited(limited)
         }
     }
 
@@ -1722,7 +1717,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     private func armRefinementTimer() {
-        guard let dueAt = refinement.dueAt else { return }
+        guard !videoSendBacklogLimited, let dueAt = refinement.dueAt else { return }
         let timer: DispatchSourceTimer
         if let refinementTimer { timer = refinementTimer }
         else {
@@ -1739,6 +1734,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     private func refineIfDue() {
         let now = SessionClock.now
         guard running, captureStarted, !reconfiguring, !sessionPaused, !cursorGate.needsFreshFrame,
+              !videoSendBacklogLimited,
               !frameFlow.mediaHold, !frameFlow.encodingFailed,
               refinement.isDue(at: now), latest == nil, let last = lastCapture,
               CVPixelBufferGetWidth(last.0) == outputWidth, CVPixelBufferGetHeight(last.0) == outputHeight else { return }

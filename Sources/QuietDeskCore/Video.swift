@@ -14,6 +14,7 @@ public final class VideoEncoder {
     private var configuredSettings: StreamSettings
     private var refinementBoostActive = false
     private var qualityToRestore: NSNumber?
+    private var videoSendBacklogLimited = false
     public var onOutput: ((Result<VideoPacket, Error>) -> Void)?
     public var onDropped: ((UInt32) -> Void)?
 
@@ -171,8 +172,20 @@ public final class VideoEncoder {
     }
 
     public func updateBitrate(megabits: Int) throws {
-        try updateProperties { try Self.setBitrate(megabits, using: $0) }
+        try updateProperties { try Self.setBitrate(effectiveBitrate(megabits), using: $0) }
         configuredSettings.megabits = megabits
+    }
+
+    public func setVideoSendBacklogLimited(_ limited: Bool) throws {
+        guard limited != videoSendBacklogLimited else { return }
+        let target = configuredSettings.megabits
+        let megabits = limited ? max(1, target / 2) : target
+        try updateProperties { try Self.setBitrate(megabits, using: $0) }
+        videoSendBacklogLimited = limited
+    }
+
+    private func effectiveBitrate(_ megabits: Int) -> Int {
+        videoSendBacklogLimited ? max(1, megabits / 2) : megabits
     }
 
     public func updateEncodingParameters(settings: StreamSettings) throws {
@@ -180,7 +193,7 @@ public final class VideoEncoder {
             try set(kVTCompressionPropertyKey_RealTime,
                     Self.usesRealTimeMode(framesPerSecond: settings.framesPerSecond) ? kCFBooleanTrue : kCFBooleanFalse)
             try set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: settings.framesPerSecond))
-            try Self.setBitrate(settings.megabits, using: set)
+            try Self.setBitrate(effectiveBitrate(settings.megabits), using: set)
             try Self.setKeyFrameInterval(framesPerSecond: settings.framesPerSecond, using: set)
         }
         configuredSettings = settings
@@ -240,7 +253,7 @@ public final class VideoEncoder {
     public func encode(_ buffer: CVPixelBuffer, time: CMTime, sequence: UInt32, forceKeyFrame: Bool = false,
                        refinementPass: Int? = nil) throws {
         guard let session else { throw DeskError.invalid("编码器已停止") }
-        if let pass = refinementPass, !forceKeyFrame {
+        if let pass = refinementPass, !forceKeyFrame, !videoSendBacklogLimited {
             let boost = Self.refinementParameters(for: configuredSettings, pass: pass)
             _ = writeProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: boost.expectedFPS))
             _ = writeProperty(session, kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: boost.megabits * 1_000_000))
@@ -254,7 +267,7 @@ public final class VideoEncoder {
         } else if refinementBoostActive {
             // Live settings can change during stillness. Resume motion using the latest negotiated settings.
             try set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: configuredSettings.framesPerSecond), on: session)
-            try Self.setBitrate(configuredSettings.megabits) { try self.set($0, $1, on: session) }
+            try Self.setBitrate(effectiveBitrate(configuredSettings.megabits)) { try self.set($0, $1, on: session) }
             if let qualityToRestore {
                 try set(kVTCompressionPropertyKey_Quality, qualityToRestore, on: session)
                 self.qualityToRestore = nil

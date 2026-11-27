@@ -64,7 +64,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
               inspectRoundTrip: Bool = false, hevc: Bool = false, recoveries: Bool = false,
               deliveryHints: Bool = false, duplicateHints: Bool = false,
               recoveryConfiguration: RecoveryConfigurationCheck = .none, retryHints: Bool = false,
-              schedulingStall: Bool = false) throws {
+              schedulingStall: Bool = false, sendBacklog: Bool = false) throws {
     let key = try PairingKey.generate(), settings = StreamSettings(longestEdge:1920,framesPerSecond:60,megabits:12)
     let queue = DispatchQueue(label:"session.loopback-listener")
     // A random TCP port can already belong to UDP. Reserve both protocols before choosing it.
@@ -76,6 +76,8 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
     let listener = try NWListener(using:params)
     let listenReady = DispatchSemaphore(value:0), committed = DispatchSemaphore(value:0), dataDone = DispatchSemaphore(value:0), pathStable = DispatchSemaphore(value:0)
     let deliverySampled = DispatchSemaphore(value:0)
+    let backlogEngaged = DispatchSemaphore(value: 0), backlogReleased = DispatchSemaphore(value: 0)
+    let backlogChanges = Box<[Bool]>([])
     let hostSession = Box<MediaSession?>(nil), viewerSession = Box<MediaSession?>(nil), peers = Box<[Peer]>([])
     let states=Box<[String]>([]), errors=Box<[String]>([]), decoded=Box<[UInt64]>([]), sequence=Box<UInt32>(0), prepared=Box(0), committedCount=Box(0)
     let rejectedCandidate = Box(false), candidateSeen = DispatchSemaphore(value:0)
@@ -115,6 +117,12 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
                 hostControl.update{$0=peer}
                 hostSession.update{$0=session}
                 session.diagnostics=diagnostics
+                if sendBacklog {
+                    session.onVideoSendBacklog = { limited in
+                        backlogChanges.update { $0.append(limited) }
+                        (limited ? backlogEngaged : backlogReleased).signal()
+                    }
+                }
                 session.onPrepareRecovery={ complete in
                     prepared.update{$0 += 1}
                     if retryHints, committedCount.get() == 1, !allowHintRecovery.get() {
@@ -431,6 +439,18 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
             try require(SessionClock.now-fallbackTime>=29,"UDP recovery ignored its cooldown")
         }
     }
+    if sendBacklog {
+        try require(backlogChanges.get().isEmpty, "The startup IDR engaged the brake by itself")
+        let startedAt = SessionClock.now
+        sequence.update { $0 += 1 }
+        hostSession.get()?.sendVideo(packet(sequence.get(), idr: false, payloadBytes: 512 * 1024))
+        hostSession.get()?.sendVideo(nextPacket(false))
+        try wait(backlogEngaged, "Queued prediction frames did not engage the brake within a second", seconds: 0.8)
+        try wait(backlogReleased, "The drained send queue did not release the brake", seconds: 3)
+        try require(SessionClock.now - startedAt >= 1 && backlogChanges.get() == [true, false]
+                    && committedCount.get() == 1 && decoded.get().last == UInt64(sequence.get()),
+                    "The send queue did not drain on the same stream or the brake oscillated")
+    }
     if liveBitrate {
         let commitsBefore=committedCount.get(), preparedBefore=prepared.get(), decodedBefore=decoded.get().count
         let lower=StreamSettings(longestEdge:1920,framesPerSecond:60,megabits:6)
@@ -713,6 +733,7 @@ func exercise(udp: Bool, auxiliary: Bool, rejectFirst: Bool, reconfigure: Bool,
    run("Observable diagnostics and authenticated compute samples") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,inspectDiagnostics:true) }
    run("A bitrate-only change keeps the UDP stream and reports host frame delivery") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,liveBitrate:true) }
    run("A bitrate-only change keeps the TCP stream and reports host frame delivery") { try exercise(udp:false,auxiliary:true,rejectFirst:false,reconfigure:false,liveBitrate:true) }
+   run("Persistent UDP send backlog brakes within a second and drains on the same stream") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,largeIDR:true,sendBacklog:true) }
    run("Stopped candidates reject late decode completion") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,stopCandidate:true) }
    run("HEVC frames cross UDP fragments, a configuration cutover and the decode window") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:true,hevc:true) }
    run("A 512 KiB HEVC IDR is paced, reassembled and committed byte-for-byte") { try exercise(udp:true,auxiliary:true,rejectFirst:false,reconfigure:false,largeIDR:true,hevc:true) }

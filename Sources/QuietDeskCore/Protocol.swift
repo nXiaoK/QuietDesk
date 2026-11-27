@@ -137,6 +137,11 @@ public struct StreamSettings: Codable, Equatable, Sendable {
     // Finer automatic steps for hosts that negotiated adaptiveVideoV1. Manual choices keep the coarse list.
     public static let adaptiveBitRates = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50, 60, 80, 100]
     public static let highest = StreamSettings(longestEdge: nativeLongestEdge, framesPerSecond: 60, megabits: 100)
+    /// What a host whose owner chose no default quality offers every viewer: 30 fps at the bitrate that keeps
+    /// about the bits per frame of the earlier 15 fps default, for a path nobody has measured yet.
+    public static let automaticDefault = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 5)
+    /// What a viewer uses instead of `automaticDefault` when it dialled such a host at a local address.
+    public static let automaticLocalDefault = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 12)
     public var longestEdge: Int
     public var framesPerSecond: Int
     public var megabits: Int
@@ -241,7 +246,10 @@ public struct Hello: Codable, Sendable {
     public let qualityProbeV1: Bool?
     // The host supports typing bounded viewer-supplied text directly as simulated keystrokes without touching the remote clipboard.
     public let typeTextV1: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil, displaySwitchingV1: Bool? = nil, displays: [RemoteDisplayInfo]? = nil, selectedDisplayID: UInt32? = nil, remoteAudioV1: Bool? = nil, relativeMouseV1: Bool? = nil, trackpadGesturesV1: Bool? = nil, initialCursorNegotiationV1: Bool? = nil, qualityProbeV1: Bool? = nil, typeTextV1: Bool? = nil, physicalFilePasteV1: Bool? = nil) {
+    // The settings in this hello are the host's automatic default, not a choice of its owner: a viewer without a
+    // saved choice may use StreamSettings.automaticLocalDefault instead when it reaches the host over a local network.
+    public let automaticDefaultQualityV1: Bool?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil, displaySwitchingV1: Bool? = nil, displays: [RemoteDisplayInfo]? = nil, selectedDisplayID: UInt32? = nil, remoteAudioV1: Bool? = nil, relativeMouseV1: Bool? = nil, trackpadGesturesV1: Bool? = nil, initialCursorNegotiationV1: Bool? = nil, qualityProbeV1: Bool? = nil, typeTextV1: Bool? = nil, physicalFilePasteV1: Bool? = nil, automaticDefaultQualityV1: Bool? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -286,6 +294,7 @@ public struct Hello: Codable, Sendable {
         self.initialCursorNegotiationV1 = initialCursorNegotiationV1
         self.qualityProbeV1 = qualityProbeV1
         self.typeTextV1 = typeTextV1
+        self.automaticDefaultQualityV1 = automaticDefaultQualityV1
     }
 
     public func validate() throws {

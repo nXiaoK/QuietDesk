@@ -364,6 +364,76 @@ func runLiveSettingsChecks() {
                   "New host replaced manually saved legacy quality")
     }
 
+    run("A host that chose no default leaves it to the viewer: local paths get the smoother one, and neither is saved with the record") {
+        let offered = StreamSettings.automaticDefault, local = StreamSettings.automaticLocalDefault
+        // Both can be chosen in the settings pickers, and the stream can start at what the host offers
+        // without a settings request first.
+        for settings in [offered, local] {
+            try settings.validateControlValues()
+            try check(StreamSettings.longestEdges.contains(settings.longestEdge) && StreamSettings.frameRates.contains(settings.framesPerSecond)
+                      && StreamSettings.bitRates.contains(settings.megabits), "A default cannot be shown in the pickers: \(settings.summary)")
+        }
+        try check(offered.legacyCompatible == offered && offered.framesPerSecond == 30 && local.framesPerSecond == 60
+                  && local.longestEdge == offered.longestEdge, "The automatic defaults changed: \(offered.summary) and \(local.summary)")
+        // About the bits per frame of the earlier default, 3 Mbps at 15 fps, or more.
+        let earlier = Double(StreamSettings().megabits) / Double(StreamSettings().framesPerSecond)
+        try check(Double(local.megabits) / Double(local.framesPerSecond) >= earlier
+                  && Double(offered.megabits) / Double(offered.framesPerSecond) >= earlier * 0.8, "A default carries far fewer bits per frame than before")
+        func ceiling(leftToViewer: Bool, localPath: Bool, extended: Bool = true, highRefresh: Bool = true) -> StreamSettings {
+            ViewerQualityPolicy.defaultCeiling(offered: offered, leftToViewer: leftToViewer, localPath: localPath,
+                                               supportsExtended: extended, supportsHighRefresh: highRefresh)
+        }
+        try check(ceiling(leftToViewer: true, localPath: true) == local, "A local path did not get the local default")
+        try check(ceiling(leftToViewer: true, localPath: false) == offered, "A wide-area path did not keep what the host offers")
+        // An owner's choice, and a host that says nothing, are kept on every path.
+        let chosen = StreamSettings(longestEdge: 1920, framesPerSecond: 15, megabits: 3)
+        try check(ViewerQualityPolicy.defaultCeiling(offered: chosen, leftToViewer: false, localPath: true,
+                                                     supportsExtended: true, supportsHighRefresh: true) == chosen,
+                  "A default the owner chose was replaced on a local path")
+        // A peer that claims the flag without 60 fps support gets no more than it supports.
+        try check(ceiling(leftToViewer: true, localPath: true, highRefresh: false) == local.extendedCompatible
+                  && ceiling(leftToViewer: true, localPath: true, extended: false, highRefresh: false) == local.legacyCompatible
+                  && local.extendedCompatible.framesPerSecond == 30, "The local default exceeded what the host supports")
+
+        // The default of this connection is in effect but not saved; a choice made by hand is.
+        var policy = ViewerQualityPolicy()
+        let first = policy.settingsForConnection(hostDefault: local, defaultIsAutomatic: true, supportsExtended: true,
+                                                 supportsHighRefresh: true, supportsHigherFrameRate: true)
+        try check(first == local && !policy.maySaveCurrentChoice, "The automatic default would be saved with the record")
+        policy.chooseManually(savePreference: policy.maySaveCurrentChoice)
+        try check(!policy.confirm(local, maySave: policy.maySaveCurrentChoice) && policy.preferred == nil,
+                  "Confirming the automatic default made it a saved choice")
+        // The same record over a wide-area path next time starts from what the host offers there.
+        try check(policy.settingsForConnection(hostDefault: offered, defaultIsAutomatic: true, supportsExtended: true,
+                                               supportsHighRefresh: true, supportsHigherFrameRate: true) == offered,
+                  "An earlier local session decided the default of a wide-area one")
+        policy.chooseManually()
+        try check(policy.confirm(high, maySave: policy.maySaveCurrentChoice) && policy.preferred == high, "A choice made by hand was not saved")
+        try check(policy.settingsForConnection(hostDefault: local, defaultIsAutomatic: true, supportsExtended: true,
+                                               supportsHighRefresh: true, supportsHigherFrameRate: true) == high && policy.maySaveCurrentChoice,
+                  "The automatic default replaced a saved choice")
+        // A default the owner chose keeps being saved on first use, as before.
+        var explicit = ViewerQualityPolicy()
+        _ = explicit.settingsForConnection(hostDefault: high, supportsExtended: true, supportsHighRefresh: true)
+        try check(explicit.maySaveCurrentChoice, "A host default the owner chose is no longer saved")
+
+        // On the wire the flag is optional: older hosts do not send it and older viewers ignore it.
+        let hello = Hello(name: "host", width: 1920, height: 1080, settings: offered.legacyCompatible, canControl: true,
+                          preferredSettings: offered.extendedCompatible, highRefreshVideoSettings: true,
+                          preferredHighRefreshSettings: offered.highRefreshCompatible, higherFrameRateVideoV1: true,
+                          preferredHigherFrameRateSettings: offered, automaticDefaultQualityV1: true)
+        try hello.validate()
+        let decoded = try Wire.readJSON(Hello.self, Wire.json(.hello, hello).payload)
+        try check(decoded.automaticDefaultQualityV1 == true && decoded.preferredHigherFrameRateSettings == offered, "The flag did not round-trip")
+        var object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(hello)) as! [String: Any]
+        object.removeValue(forKey: "automaticDefaultQualityV1")
+        try check(try Wire.readJSON(Hello.self, JSONSerialization.data(withJSONObject: object)).automaticDefaultQualityV1 == nil,
+                  "A hello without the flag did not read as an owner's choice")
+        let chose = Hello(name: "host", width: 1920, height: 1080, settings: chosen, canControl: true)
+        try check(!String(decoding: try JSONEncoder().encode(chose), as: UTF8.self).contains("automaticDefaultQualityV1"),
+                  "A host with a chosen default sent the flag")
+    }
+
     run("Rapid quality edits coalesce while only one request is in flight") {
         var session = try VideoTuningSession(applied: initial)
         try session.choose(low)

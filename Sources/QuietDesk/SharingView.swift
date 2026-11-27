@@ -211,7 +211,7 @@ struct SharingView: View {
                 }
                 Divider()
                 DeskSettingsRow(title: "默认编码上限") {
-                    Text("\(currentPreset?.title ?? model.settings.summary) · 停止后修改")
+                    Text("\(defaultQualityTitle) · 停止后修改")
                         .font(.system(size: 12.5))
                         .foregroundStyle(DeskPalette.secondary)
                 }
@@ -499,56 +499,65 @@ struct SharingView: View {
                                       frameRates: StreamSettings.frameRates, bitRates: StreamSettings.bitRates)
     }
 
+    /// What the owner chose as the default quality of new sessions; automatic until they choose.
+    private enum DefaultQualityChoice: Hashable { case automatic, preset(SessionQualityPreset), custom }
+
+    private var defaultQualityChoice: DefaultQualityChoice {
+        guard model.chosenSettings != nil else { return .automatic }
+        return currentPreset.map { .preset($0) } ?? .custom
+    }
+
+    private var defaultQualityTitle: String {
+        switch defaultQualityChoice {
+        case .automatic: return "自动"
+        case .preset(let preset): return preset.title
+        case .custom: return model.settings.summary
+        }
+    }
+
     private var defaultEncoding: some View {
         VStack(alignment: .leading, spacing: 10) {
             DeskSettingsGroup(title: "新会话默认编码上限") {
                 DeskSettingsRow(title: "画质预设") {
-                    Picker("画质预设", selection: Binding<SessionQualityPreset?>(
-                        get: { currentPreset },
-                        set: { preset in
-                            if let preset {
+                    Picker("画质预设", selection: Binding<DefaultQualityChoice>(
+                        get: { defaultQualityChoice },
+                        set: { choice in
+                            switch choice {
+                            case .automatic: model.useAutomaticDefaultQuality()
+                            case .preset(let preset):
                                 model.settings = preset.resolvedSettings(longestEdges: StreamSettings.longestEdges,
                                                                          frameRates: StreamSettings.frameRates,
                                                                          bitRates: StreamSettings.bitRates)
+                            // Starts from the values in effect and makes them the owner's own, to adjust below.
+                            case .custom: model.settings = model.settings
                             }
                         }
                     )) {
-                        if currentPreset == nil { Text("自定义").tag(nil as SessionQualityPreset?) }
+                        Text("自动（按线路）").tag(DefaultQualityChoice.automatic)
                         ForEach(SessionQualityPreset.allCases, id: \.self) { preset in
-                            Text(preset.title).tag(Optional(preset))
+                            Text(preset.title).tag(DefaultQualityChoice.preset(preset))
                         }
+                        // Any other values show as custom; from automatic, choosing it opens the three values below.
+                        if currentPreset == nil { Text("自定义").tag(DefaultQualityChoice.custom) }
                     }
                     .labelsHidden()
                     .frame(width: 196)
                 }
-                Divider()
-                DeskSettingsRow(title: "最长边") {
-                    Picker("最长边", selection: $model.settings.longestEdge) {
-                        Text("1280 · 省流").tag(1280)
-                        Text("1920 · 办公").tag(1920)
-                        Text("2560 · 清晰").tag(2560)
-                        Text("3840 · 高分辨率").tag(3840)
-                        Text(StreamSettings.resolutionLabel(StreamSettings.nativeLongestEdge))
-                            .tag(StreamSettings.nativeLongestEdge)
+                if model.chosenSettings == nil {
+                    Divider()
+                    DeskSettingsRow(title: "直连局域网地址", detail: "控制端按局域网地址直接连接时") {
+                        Text(StreamSettings.automaticLocalDefault.summary)
+                            .font(.system(size: 13))
+                            .foregroundStyle(DeskPalette.secondary)
                     }
-                    .labelsHidden()
-                    .frame(width: 196)
-                }
-                Divider()
-                DeskSettingsRow(title: "帧率上限") {
-                    Picker("帧率上限", selection: $model.settings.framesPerSecond) {
-                        ForEach(StreamSettings.frameRates, id: \.self) { Text("\($0) fps").tag($0) }
+                    Divider()
+                    DeskSettingsRow(title: "公网与中继", detail: "公网地址、域名、中继，以及尚未更新的控制端") {
+                        Text(StreamSettings.automaticDefault.summary)
+                            .font(.system(size: 13))
+                            .foregroundStyle(DeskPalette.secondary)
                     }
-                    .labelsHidden()
-                    .frame(width: 196)
-                }
-                Divider()
-                DeskSettingsRow(title: "目标码率") {
-                    Picker("目标码率", selection: $model.settings.megabits) {
-                        ForEach(StreamSettings.bitRates, id: \.self) { Text("\($0) Mbps").tag($0) }
-                    }
-                    .labelsHidden()
-                    .frame(width: 196)
+                } else {
+                    chosenQualityRows
                 }
             }
             .disabled(locked)
@@ -567,6 +576,39 @@ struct SharingView: View {
                     ]
                 )
             }
+        }
+    }
+
+    @ViewBuilder
+    private var chosenQualityRows: some View {
+        Divider()
+        DeskSettingsRow(title: "最长边") {
+            Picker("最长边", selection: $model.settings.longestEdge) {
+                Text("1280 · 省流").tag(1280)
+                Text("1920 · 办公").tag(1920)
+                Text("2560 · 清晰").tag(2560)
+                Text("3840 · 高分辨率").tag(3840)
+                Text(StreamSettings.resolutionLabel(StreamSettings.nativeLongestEdge))
+                    .tag(StreamSettings.nativeLongestEdge)
+            }
+            .labelsHidden()
+            .frame(width: 196)
+        }
+        Divider()
+        DeskSettingsRow(title: "帧率上限") {
+            Picker("帧率上限", selection: $model.settings.framesPerSecond) {
+                ForEach(StreamSettings.frameRates, id: \.self) { Text("\($0) fps").tag($0) }
+            }
+            .labelsHidden()
+            .frame(width: 196)
+        }
+        Divider()
+        DeskSettingsRow(title: "目标码率") {
+            Picker("目标码率", selection: $model.settings.megabits) {
+                ForEach(StreamSettings.bitRates, id: \.self) { Text("\($0) Mbps").tag($0) }
+            }
+            .labelsHidden()
+            .frame(width: 196)
         }
     }
 

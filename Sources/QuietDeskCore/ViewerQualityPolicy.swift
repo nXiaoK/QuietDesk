@@ -11,12 +11,25 @@ public struct ViewerQualityPolicy {
         initialDecisionPending = preferred == nil
     }
 
-    public mutating func settingsForConnection(hostDefault: StreamSettings, supportsExtended: Bool, supportsHighRefresh: Bool = false,
+    /// What a connection without a saved choice starts from: what the host offers, or the local default when
+    /// the host left its default to the viewer and the viewer dialled it at a local address. Limited to what
+    /// the host supports.
+    public static func defaultCeiling(offered: StreamSettings, leftToViewer: Bool, localPath: Bool,
+                                      supportsExtended: Bool, supportsHighRefresh: Bool) -> StreamSettings {
+        guard leftToViewer, localPath else { return offered }
+        let local = StreamSettings.automaticLocalDefault
+        return supportsHighRefresh ? local : supportsExtended ? local.extendedCompatible : local.legacyCompatible
+    }
+
+    /// `defaultIsAutomatic`: the default depends on the path of this connection, so it is not saved with the
+    /// record; the next connection decides again. A choice made by hand is saved as before.
+    public mutating func settingsForConnection(hostDefault: StreamSettings, defaultIsAutomatic: Bool = false,
+                                             supportsExtended: Bool, supportsHighRefresh: Bool = false,
                                              supportsHigherFrameRate: Bool = false) -> StreamSettings {
         let desired = preferred ?? hostDefault
         let compatible = supportsHighRefresh ? (supportsHigherFrameRate ? desired : desired.highRefreshCompatible)
             : supportsExtended ? desired.extendedCompatible : desired.legacyCompatible
-        maySaveCurrentChoice = preferred == nil || desired == compatible
+        maySaveCurrentChoice = preferred == nil ? !defaultIsAutomatic : desired == compatible
         return compatible
     }
 

@@ -38,13 +38,25 @@ final class DeskModel: ObservableObject, Identifiable {
     @Published var hostPort = UserDefaults.standard.string(forKey: "listenPort") ?? "5908" {
         didSet { UserDefaults.standard.set(hostPort, forKey: "listenPort") }
     }
-    @Published var settings = StreamSettings() {
-        didSet {
-            if let data = try? JSONEncoder().encode(settings.highRefreshCompatible) { UserDefaults.standard.set(data, forKey: "streamSettings") }
-            if settings.framesPerSecond > 60, let data = try? JSONEncoder().encode(settings) {
+    /// The default quality of new sessions the owner chose; nil leaves it to `StreamSettings.automaticDefault`
+    /// and to viewers on a local network, which are told so.
+    @Published private(set) var chosenSettings: StreamSettings?
+    var settings: StreamSettings {
+        get { chosenSettings ?? .automaticDefault }
+        set {
+            chosenSettings = newValue
+            if let data = try? JSONEncoder().encode(newValue.highRefreshCompatible) { UserDefaults.standard.set(data, forKey: "streamSettings") }
+            if newValue.framesPerSecond > 60, let data = try? JSONEncoder().encode(newValue) {
                 UserDefaults.standard.set(data, forKey: "higherFrameRateStreamSettings")
             } else { UserDefaults.standard.removeObject(forKey: "higherFrameRateStreamSettings") }
         }
+    }
+    /// Returns the default quality of new sessions to the automatic one.
+    func useAutomaticDefaultQuality() {
+        guard chosenSettings != nil else { return }
+        chosenSettings = nil
+        UserDefaults.standard.removeObject(forKey: "streamSettings")
+        UserDefaults.standard.removeObject(forKey: "higherFrameRateStreamSettings")
     }
     @Published var displayID = CGMainDisplayID()
     @Published private(set) var displayFallbackNotice: String?
@@ -573,8 +585,8 @@ final class DeskModel: ObservableObject, Identifiable {
             if let data = UserDefaults.standard.data(forKey: "higherFrameRateStreamSettings"),
                let higher = try? JSONDecoder().decode(StreamSettings.self, from: data),
                higher.framesPerSecond > 60, (try? higher.validateControlValues()) != nil,
-               higher.highRefreshCompatible == saved { settings = higher }
-            else { settings = saved }
+               higher.highRefreshCompatible == saved { chosenSettings = higher }
+            else { chosenSettings = saved }
         }
         if let id = UserDefaults.standard.object(forKey: "sharedDisplay") as? Int { preferredDisplayID = CGDirectDisplayID(clamping: id) }
         if let data = UserDefaults.standard.data(forKey: "rememberedSessionEffects"),
@@ -1811,6 +1823,7 @@ final class DeskModel: ObservableObject, Identifiable {
                         self.refreshDisplays()
                         let (display, snapshot) = try self.selectShareableDisplay(content.displays)
                         let preferredSettings = self.settings
+                        let ownerChoseQuality = self.chosenSettings != nil
                         let settings = preferredSettings.legacyCompatible
                         let capture = ScreenStreamer.prepareCapture(display: display, settings: settings)
                         let (width, height) = (capture.width, capture.height)
@@ -1932,7 +1945,8 @@ final class DeskModel: ObservableObject, Identifiable {
                             trackpadGesturesV1: true,
                             initialCursorNegotiationV1: true,
                             qualityProbeV1: true,
-                            typeTextV1: true)))
+                            typeTextV1: true,
+                            automaticDefaultQualityV1: ownerChoseQuality ? nil : true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -3794,10 +3808,18 @@ final class DeskModel: ObservableObject, Identifiable {
             }
             refreshUnlockState()
             if supportsLiveSettings {
-                let hostDefault = supportsHigherFrameRateVideo ? (hello.preferredHigherFrameRateSettings ?? hello.preferredHighRefreshSettings ?? hello.preferredSettings ?? hello.settings)
+                let offered = supportsHigherFrameRateVideo ? (hello.preferredHigherFrameRateSettings ?? hello.preferredHighRefreshSettings ?? hello.preferredSettings ?? hello.settings)
                     : supportsHighRefreshVideoSettings ? (hello.preferredHighRefreshSettings ?? hello.preferredSettings ?? hello.settings)
                     : supportsExtendedVideoSettings ? (hello.preferredSettings ?? hello.settings) : hello.settings
-                let preferred = viewerQualityPolicy.settingsForConnection(hostDefault: hostDefault, supportsExtended: supportsExtendedVideoSettings,
+                // A host whose owner chose no default leaves it to the viewer, which knows the address it dialled.
+                // Route benchmarks keep what the host offers on every route, so their runs stay comparable.
+                let defaultIsAutomatic = hello.automaticDefaultQualityV1 == true
+                let hostDefault = ViewerQualityPolicy.defaultCeiling(
+                    offered: offered, leftToViewer: defaultIsAutomatic,
+                    localPath: viewerDialledLocally && activeRouteBenchmarkOverride == nil,
+                    supportsExtended: supportsExtendedVideoSettings, supportsHighRefresh: supportsHighRefreshVideoSettings)
+                let preferred = viewerQualityPolicy.settingsForConnection(hostDefault: hostDefault, defaultIsAutomatic: defaultIsAutomatic,
+                                                                         supportsExtended: supportsExtendedVideoSettings,
                                                                          supportsHighRefresh: supportsHighRefreshVideoSettings,
                                                                          supportsHigherFrameRate: supportsHigherFrameRateVideo)
                 videoTuning = try VideoTuningSession(applied: state, preferred: preferred, supportsInPlaceBitrate: supportsAdaptiveVideo)
@@ -4886,6 +4908,13 @@ final class DeskModel: ObservableObject, Identifiable {
                   self.videoTuning?.pending?.id == request.id else { return }
             peer.close("画质调整超过 25 秒未确认，重新建立共享", retryable: true)
         }
+    }
+
+    /// Whether this session dialled the host directly at an address that looks local. Relayed and public
+    /// paths are not, nor is the 100.64.0.0/10 range that overlay networks use.
+    private var viewerDialledLocally: Bool {
+        guard !viewerSession.usesRelayControl, let address = target?.address else { return false }
+        return MediaQualityPolicy.isLikelyLocalHost(address)
     }
 
     /// Identifies the video route of the current target for `startingBitrates`: a relayed session and a

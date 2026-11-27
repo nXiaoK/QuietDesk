@@ -461,6 +461,7 @@ private extension DiagnosticRoute {
         case .unavailable: path = "控制通道未建立"
         case .direct: path = "控制通道直连"
         case .relay: path = "控制通道经中继"
+        case .tailnet: path = "控制通道经 Tailscale"
         }
         return node.map { path + (control == .unavailable ? " · 尝试节点 " : " · 节点 ") + $0 } ?? path
     }
@@ -480,6 +481,9 @@ private extension DiagnosticRoute.Media {
         case .directUDP: return "直连 UDP 视频"
         case .relayUDP: return "中继 UDP 视频"
         case .punchedUDP: return "打洞直连 UDP 视频"
+        case .tailnetUDP: return "Tailscale UDP 视频"
+        case .tailnetTCP: return "Tailscale TCP 视频"
+        case .tailnetCompatibleTCP: return "Tailscale TCP · 兼容模式"
         }
     }
 

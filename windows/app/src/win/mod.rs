@@ -21,6 +21,7 @@ pub mod inject;
 pub mod pipeline;
 mod relative_mouse;
 pub mod settings;
+mod tailnet;
 pub mod ui;
 pub mod update;
 pub mod util;

@@ -2,11 +2,12 @@ import Foundation
 
 /// The control connection and the path carrying the video can use different transports.
 public struct DiagnosticRoute: Hashable, Sendable {
-    public enum Control: Hashable, Sendable { case unavailable, direct, relay }
+    public enum Control: Hashable, Sendable { case unavailable, direct, relay, tailnet }
 
     public enum Media: String, Codable, Hashable, Sendable {
         case negotiating, reconnecting, paused, udpTrial
         case directCompatibleTCP, relayCompatibleTCP, directTCP, relayTCP, directUDP, relayUDP, punchedUDP
+        case tailnetCompatibleTCP, tailnetTCP, tailnetUDP
 
         public init(from decoder: Decoder) throws {
             let container = try decoder.singleValueContainer()
@@ -14,7 +15,7 @@ public struct DiagnosticRoute: Hashable, Sendable {
             self = Self(rawValue: raw) ?? .negotiating
         }
 
-        public var isUDP: Bool { self == .directUDP || self == .relayUDP || self == .punchedUDP }
+        public var isUDP: Bool { self == .directUDP || self == .relayUDP || self == .punchedUDP || self == .tailnetUDP }
     }
 
     public let control: Control

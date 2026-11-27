@@ -395,6 +395,7 @@ async fn run_host(arguments: &HashMap<String, String>) -> Result<()> {
         let connections = HostConnections {
             auxiliary: auxiliary_enabled.then_some(accepted),
             datagram: if datagrams_enabled { stream.get_ref().local_addr().ok() } else { None },
+            ..Default::default()
         };
         emit(json!({ "event": "accepted" }));
         let (peer, incoming) = peer::spawn(stream, PeerConfig::default());

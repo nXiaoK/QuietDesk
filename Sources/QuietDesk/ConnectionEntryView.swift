@@ -83,6 +83,7 @@ enum ConnectionEntryPresentation {
 
     static func endpoint(_ record: ConnectionRecord) -> String {
         if let relay = record.relay { return relay.endpoint.address }
+        if let host = try? TailnetAddress.host(in: record.address) { return "\(host):\(record.port)" }
         let host = record.address.contains(":") && !record.address.hasPrefix("[") ? "[\(record.address)]" : record.address
         return "\(host):\(record.port)"
     }
@@ -93,7 +94,10 @@ enum ConnectionEntryPresentation {
         return "\(raw.prefix(4))…\(raw.suffix(4))"
     }
 
-    static func route(_ record: ConnectionRecord) -> String { (record.relay?.strategy ?? .direct).title }
+    static func route(_ record: ConnectionRecord) -> String {
+        if (try? TailnetAddress.host(in: record.address)) != nil { return "Tailscale" }
+        return (record.relay?.strategy ?? .direct).title
+    }
 
     static func deviceSymbol(_ record: ConnectionRecord) -> String {
         let lower = record.name.lowercased()
@@ -130,6 +134,7 @@ enum ConnectionEntryPresentation {
                 if !relayEnabled || strategy == .direct { return .address }
             } else {
                 if host.contains("://") || host.contains("/") { return .address }
+                if host.lowercased().hasPrefix(TailnetAddress.prefix), (try? TailnetAddress.host(in: host)) == nil { return .address }
                 if UInt16(port).map({ $0 > 0 }) != true { return .port }
             }
         }
@@ -215,6 +220,18 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
 
     private enum Sheet: Equatable {
         case connection, credentials(title: String, endpoint: String), discovery, records, sessions, readiness
+    }
+
+    private var usesTailnet: Bool {
+        !usesRelay && draft.address.lowercased().hasPrefix(TailnetAddress.prefix)
+    }
+
+    private var addressField: Binding<String> {
+        Binding(get: { usesTailnet ? String(draft.address.dropFirst(TailnetAddress.prefix.count)) : draft.address },
+                set: { value in
+                    draft.address = usesTailnet && !value.lowercased().hasPrefix(TailnetAddress.prefix)
+                        ? TailnetAddress.prefix + value : value
+                })
     }
 
     private var usesRelay: Bool { relayEnabled && draft.strategy != .direct }
@@ -1191,9 +1208,16 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                 }
             }
 
+            if !usesRelay {
+                Toggle("通过内置 Tailscale 连接", isOn: Binding(get: { usesTailnet }, set: { enabled in
+                    draft.address = enabled ? TailnetAddress.prefix + draft.address : String(draft.address.dropFirst(TailnetAddress.prefix.count))
+                }))
+                .toggleStyle(.checkbox)
+                .disabled(locked)
+            }
             if showsAddress {
-                labeledField(usesRelay ? "可选直连地址" : "地址") {
-                    TextField("域名或 IP，或粘贴被控 Mac 复制的连接信息", text: $draft.address)
+                labeledField(usesTailnet ? "对端 Tailscale IPv4" : (usesRelay ? "可选直连地址" : "地址")) {
+                    TextField(usesTailnet ? "100.x.y.z" : "域名或 IP，或粘贴被控 Mac 复制的连接信息", text: addressField)
                         .font(.system(size: 13))
                         .focused($focusedField, equals: .address)
                         .deskInputBox(focused: focusedField == .address)
@@ -1228,8 +1252,8 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                         .foregroundStyle(DeskPalette.accent)
                         .disabled(locked)
                 }
-            } else {
-                Text("连接成功后沿用现有记录与凭据保存逻辑。")
+            } else if usesTailnet {
+                Text("两端先在「网络与线路 → Tailscale」登录同一网络，然后填入对端显示的地址和 QuietDesk 配对码。")
                     .font(.system(size: 12))
                     .foregroundStyle(DeskPalette.secondary)
             }

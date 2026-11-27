@@ -11,6 +11,7 @@ final class DeskServices {
 
     let trafficHistoryStore = TrafficHistoryStore()
     let trafficHistory = TrafficHistoryFeed()
+    let tailnet = EmbeddedTailnet()
     let portMappings: PortMappingManager
     let routeBenchmarkStore = RouteQualityBenchmarkStore()
     private var registeredModels: [WeakModel] = []

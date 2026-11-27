@@ -93,6 +93,10 @@ public final class MediaSession: @unchecked Sendable {
     public var prepareAlternateDatagramPath: ((@escaping (DatagramEndpoint?) -> Void) -> Void)?
     public var onDatagramPathRetired: (() -> Void)?
     // Resolve the host lease at admission, before DTLS authentication can outlive that lease.
+    /// The app can expose the host media socket on a private overlay for its bound lifetime.
+    public var beforeHostDatagramBind: ((@escaping () -> Void) -> Void)?
+    public var onHostDatagramReadiness: ((NWListener, Bool) -> Void)?
+    public var retireHostDatagramListener: ((NWListener) -> Void)?
     public var hostDatagramBinding: ((NWEndpoint) -> ((Data) -> Void)?)?
     public var onReliablePathFailure: (() -> Void)?
     // Viewer only, once per relayed DTLS flow after it passed the session-key handshake and a
@@ -629,7 +633,7 @@ public final class MediaSession: @unchecked Sendable {
             self.timer?.cancel(); self.timer = nil
             self.pollTimer?.cancel(); self.pollTimer = nil; self.pollScheduled = false
             self.pathMonitor?.cancel(); self.pathMonitor = nil
-            self.udpListener?.cancel(); self.udpListener = nil
+            self.releaseHostDatagramListener()
             self.udpPeer?.close(); self.udpPeer = nil
             self.challenges.clear()
             for peer in self.pendingDatagramPeers.values { peer.close() }
@@ -701,7 +705,14 @@ public final class MediaSession: @unchecked Sendable {
             negotiated = true
             refreshInteractiveDatagramAvailability()
             refreshHostFrameWindow(forceNotify: true)
-            prepareListener(sessionKey: sessionKey, identifier: identifier)
+            if let beforeHostDatagramBind {
+                beforeHostDatagramBind { [weak self] in
+                    self?.queue.async { [weak self] in
+                        guard let self, !self.stopped else { return }
+                        self.prepareListener(sessionKey: sessionKey, identifier: identifier)
+                    }
+                }
+            } else { prepareListener(sessionKey: sessionKey, identifier: identifier) }
             return
         }
         if value.operation == .offer {
@@ -952,11 +963,16 @@ public final class MediaSession: @unchecked Sendable {
                     } catch { admission.release(reservation); connection.cancel() }
                 }
             }
-            listener.stateUpdateHandler = { [weak self] state in
-                guard let self, !self.stopped, self.sessionID == identifier else { return }
+            listener.stateUpdateHandler = { [weak self, weak listener] state in
+                guard let self, let listener, !self.stopped, self.sessionID == identifier else { return }
                 switch state {
-                case .ready: self.udpAvailable = true; self.sendOffer()
-                case .failed: self.udpAvailable = false; self.sendOffer()
+                case .ready:
+                    self.onHostDatagramReadiness?(listener, true)
+                    self.udpAvailable = true; self.sendOffer()
+                case .failed:
+                    self.onHostDatagramReadiness?(listener, false)
+                    self.udpAvailable = false; self.sendOffer()
+                case .waiting, .cancelled: self.onHostDatagramReadiness?(listener, false)
                 default: break
                 }
             }
@@ -2159,8 +2175,16 @@ public final class MediaSession: @unchecked Sendable {
          .clipboardReceipt, .clipboardCancel, .clipboardManifest, .clipboardPull].contains(kind)
     }
 
+    private func releaseHostDatagramListener() {
+        guard let listener = udpListener else { return }
+        udpListener = nil
+        if let retireHostDatagramListener { retireHostDatagramListener(listener) }
+        else { listener.cancel() }
+    }
+
     deinit {
-        timer?.cancel(); pacingTimer?.cancel(); pathMonitor?.cancel(); udpListener?.cancel(); udpPeer?.close(); videoPeer?.close(); bulkPeer?.close()
+        releaseHostDatagramListener()
+        timer?.cancel(); pacingTimer?.cancel(); pathMonitor?.cancel(); udpPeer?.close(); videoPeer?.close(); bulkPeer?.close()
         for peer in pendingAuxiliary.values { peer.close() }
         for peer in pendingDatagramPeers.values { peer.close() }
     }

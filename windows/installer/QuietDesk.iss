@@ -110,7 +110,7 @@ Name: "autostart"; Description: "登录 Windows 后自动启动 QuietDesk(&A)"; 
 
 [Files]
 Source: "{#BinaryPath}"; DestDir: "{app}"; DestName: "QuietDesk.exe"; Flags: ignoreversion
-Source: "{#RepoRoot}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#ExtractFileDir(BinaryPath)}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RepoRoot}\windows\licenses\THIRD-PARTY-OPUS.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]

@@ -177,6 +177,10 @@ def main():
         architecture = next(iter(architectures))
     else:
         raise ValueError("Unexpected application architectures")
+    helper = app / "Contents/Helpers/QuietDeskTailnet"
+    helper_architectures = set(subprocess.check_output(["xcrun", "lipo", "-archs", str(helper)], text=True).split())
+    if not os.access(helper, os.X_OK) or helper_architectures != architectures:
+        raise ValueError("Embedded Tailscale node must run on every packaged architecture")
     icon = app / "Contents/Resources" / info["CFBundleIconFile"]
     if icon.read_bytes() != (ROOT / "Resources/QuietDesk.icns").read_bytes():
         raise ValueError("Application icon is missing or differs from its source")

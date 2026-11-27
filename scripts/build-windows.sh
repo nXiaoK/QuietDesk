@@ -75,7 +75,8 @@ for arch in "${arches[@]}"; do
     archive="$output/QuietDesk-$version-Windows-$arch.zip"
     staging="$(mktemp -d)"
     mkdir -p "$output"
-    cp "$built/QuietDesk.exe" LICENSE windows/licenses/THIRD-PARTY-OPUS.txt "$staging/"
+    cp "$built/QuietDesk.exe" windows/licenses/THIRD-PARTY-OPUS.txt "$staging/"
+    cat LICENSE Resources/Tailnet-Licenses.txt > "$staging/LICENSE"
     rm -f "$archive"
     (cd "$staging" && zip -q -X "$archive" QuietDesk.exe LICENSE THIRD-PARTY-OPUS.txt)
     rm -rf "$staging"

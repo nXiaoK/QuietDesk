@@ -124,6 +124,7 @@ final class ViewerSession {
     var relayBridge: RelayViewerBridge?
     var mediaRelayBridge: RelayViewerBridge?
     var usesRelayControl = false
+    var closeTailnetBridge: (() -> Void)?
     var transportHost: String?
     var transportPort: UInt16?
     var relayTargetVerified = false

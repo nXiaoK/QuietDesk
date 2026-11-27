@@ -317,6 +317,27 @@ private struct SessionDataChannelChecks {
                         "Lost a partial interval, counted the offline gap or reused a previous channel")
         }
 
+        run("Tailscale video transport measurements preserve the overlay and TCP fallback") {
+            var now: TimeInterval = 0
+            let recording = ViewerConnectionDiagnostics(clock: { now })
+            let channel = SessionDataChannel(send: { _ in }, onFreshFrame: { _ in })
+            recording.attach(channel, relayed: false, node: nil, tailnet: true)
+            recording.setVideoPath(.committed(.udp, relayedUDP: false), on: channel)
+            channel.recordDiagnosticFragments(settled: 100, lost: 3)
+            now = 1
+            recording.setVideoPath(.committed(.tcp, relayedUDP: false), on: channel)
+            now = 4
+            let report = recording.finish(remoteName: "Fixture", reason: "Ended")
+            let udp = report.routes.first { $0.route.media == .tailnetUDP }
+            let candidate = RouteBenchmarkCandidate(kind: .directUDP, address: "tailscale:100.99.0.2", port: 5908)
+            let metrics = RouteBenchmarkMetrics.from(report: report, candidate: candidate,
+                connectMilliseconds: nil, firstFrameMilliseconds: nil, finalRouteLabel: "Tailscale TCP 视频",
+                appliedQualitySummary: "", hostSupportsQualityProbe: false)
+            try require(udp?.route.control == .tailnet && udp?.quality.loss.lostFragments == 3 &&
+                        metrics.fellBackToTCP && !metrics.punchedDirect,
+                        "Overlay transport or physical route was misreported")
+        }
+
         run("Out-of-order cursor datagrams do not overwrite newer queued samples") {
             let channel = SessionDataChannel(send: { _ in }, onFreshFrame: { _ in })
             var delivered: [CursorPosition] = []

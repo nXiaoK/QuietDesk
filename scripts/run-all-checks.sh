@@ -9,6 +9,7 @@ export SWIFTPM_MODULECACHE_OVERRIDE="$CLANG_MODULE_CACHE_PATH"
 mkdir -p "$CLANG_MODULE_CACHE_PATH"
 
 python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+go -C tailnet test -mod=readonly -tags ts_omit_logtail ./...
 swift_build=(swift build --scratch-path "$check_root" --disable-sandbox --cache-path "$check_root/cache" \
     --config-path "$check_root/configuration" --security-path "$check_root/security")
 "${swift_build[@]}" --product QuietDesk

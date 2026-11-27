@@ -116,6 +116,7 @@ public struct RouteBenchmarkTargetDescriptor: Codable, Hashable, Sendable {
             host.removeFirst()
             host.removeLast()
         }
+        if let ip = try? TailnetAddress.host(in: host) { return TailnetAddress.prefix + ip + ":\(port)" }
         if host.contains(":") {
             return "[\(host)]:\(port)"
         }

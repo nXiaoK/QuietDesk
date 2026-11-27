@@ -458,11 +458,12 @@ struct HostSession<'a, P: HostPlatform> {
 pub struct HostConnections {
     pub auxiliary: Option<Accepted>,
     pub datagram: Option<std::net::SocketAddr>,
+    pub datagram_observer: Option<crate::datagram_transport::HostSocketObserver>,
 }
 
 impl From<Option<Accepted>> for HostConnections {
     fn from(auxiliary: Option<Accepted>) -> Self {
-        Self { auxiliary, datagram: None }
+        Self { auxiliary, ..Self::default() }
     }
 }
 
@@ -540,6 +541,7 @@ pub async fn run_with_auxiliary<P: HostPlatform>(
         control_subscribed: false,
         termination_subscribed: false,
     };
+    session.datagrams.host_observer = connections.datagram_observer;
     let reason = session.serve(&mut incoming, &mut commands, &events).await;
     session.release_input();
     session.platform.stop();
@@ -1699,7 +1701,8 @@ mod tests {
             modifiers: MacModifierMapping::Standard,
             preferred_display: None,
         };
-        let session = run_with_auxiliary(host, incoming, &mut platform, options, queue, |_| {}, HostConnections { auxiliary: None, datagram: Some(address) });
+        let session =
+            run_with_auxiliary(host, incoming, &mut platform, options, queue, |_| {}, HostConnections { datagram: Some(address), ..Default::default() });
         let exchange = async {
             next(&mut from_host, MessageKind::Hello).await;
             viewer.send(&Message::empty(MessageKind::ControlStatus)).unwrap();

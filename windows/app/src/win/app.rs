@@ -3,6 +3,7 @@
 
 use super::codec::{H264Decoder, MediaFoundation, Picture};
 use super::pipeline::WindowsHost;
+pub use super::tailnet::ViewerTarget;
 use super::util::Com;
 use quietdesk_core::clipboard::{Exchange, Role};
 use quietdesk_core::clipboard_session::SessionClipboard;
@@ -24,7 +25,8 @@ use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
 pub enum HostNotice {
-    Listening(u16),
+    Listening(Arc<TcpListener>),
+    MediaSocket(bool, Arc<std::net::UdpSocket>),
     /// Sharing could not start or had to stop.
     Failed(String),
     DisplayError(String),
@@ -101,7 +103,7 @@ pub async fn serve_host(
     options: Arc<Mutex<HostOptions>>,
     mut commands: mpsc::UnboundedReceiver<HostCommand>,
     activity: Arc<HostActivity>,
-    notify: impl Fn(HostNotice) + Clone + Send + 'static,
+    notify: impl Fn(HostNotice) + Clone + Send + Sync + 'static,
 ) {
     let listener = match TcpListener::bind(("0.0.0.0", port)).await {
         Ok(listener) => listener,
@@ -111,7 +113,8 @@ pub async fn serve_host(
         Ok(acceptor) => acceptor,
         Err(error) => return notify(HostNotice::Failed(error.to_string())),
     };
-    notify(HostNotice::Listening(listener.local_addr().map_or(port, |address| address.port())));
+    let listener = Arc::new(listener);
+    notify(HostNotice::Listening(listener.clone()));
     let remember = |options: &Mutex<HostOptions>, command: &HostCommand| match command {
         HostCommand::AllowControl(allowed) => options.lock().unwrap().allow_control = *allowed,
         HostCommand::Clipboard(enabled) => options.lock().unwrap().clipboard = *enabled,
@@ -162,7 +165,15 @@ pub async fn serve_host(
         let Some(session_activity) = activity.start_session() else { continue };
         let mut active = tls::PendingHandshakes::new(&acceptor);
         let (auxiliary, accepted) = mpsc::channel(4);
-        let connections = HostConnections { auxiliary: Some(accepted), datagram: stream.get_ref().local_addr().ok() };
+        let address = stream.get_ref().local_addr().ok();
+        let report = notify.clone();
+        let connections = HostConnections {
+            auxiliary: Some(accepted),
+            datagram: address,
+            datagram_observer: address.filter(|a| a.ip() == std::net::Ipv4Addr::LOCALHOST).map(|_| {
+                Arc::new(move |active, socket| report(HostNotice::MediaSocket(active, socket))) as quietdesk_core::datagram_transport::HostSocketObserver
+            }),
+        };
         notify(HostNotice::Connected);
         let (peer, incoming) = peer::spawn(stream, PeerConfig::default());
         let (session_commands, queue) = mpsc::unbounded_channel();
@@ -554,7 +565,7 @@ fn decode<S: ViewerSink>(packets: &DecodeQueue, acknowledgements: mpsc::Unbounde
 
 /// Connects to a host and runs the session until it ends. Pictures appear in `frame`.
 pub async fn run_viewer<S: ViewerSink>(
-    target: (String, u16),
+    target: impl Into<ViewerTarget>,
     key: PairingKey,
     quality: StreamSettings,
     auto_reconnect: bool,
@@ -562,18 +573,23 @@ pub async fn run_viewer<S: ViewerSink>(
     frame: Arc<Mutex<Frame>>,
     sink: Arc<S>,
 ) -> ViewerEnd {
+    let target = target.into();
     reliability::run(
         quality,
         auto_reconnect,
         controls,
         |status| sink.retry(status),
-        || tls::connect(&target.0, target.1, &key),
-        |stream, attempt| {
+        || target.connect(&key),
+        |(stream, bridge), attempt| {
             let attempt = match stream.get_ref().peer_addr() {
                 Ok(addr) => attempt.with_auxiliary(addr, key.clone()).with_datagrams(addr),
                 Err(_) => attempt,
             };
-            viewer_session(stream, attempt, frame.clone(), sink.clone())
+            let (frame, sink) = (frame.clone(), sink.clone());
+            async move {
+                let _bridge = bridge;
+                viewer_session(stream, attempt, frame, sink).await
+            }
         },
     )
     .await

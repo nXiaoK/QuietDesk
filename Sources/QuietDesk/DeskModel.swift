@@ -543,6 +543,7 @@ final class DeskModel: ObservableObject, Identifiable {
         let key: PairingKey
         let recordID: UUID?
         var trafficEndpoint: TrafficEndpoint
+        var tailnetHost: String?
         var relay: RelayConnectionInfo?
         var relayAccessKey: Data?
         var relayCertificate: RelayNodeCertificate?
@@ -1549,13 +1550,15 @@ final class DeskModel: ObservableObject, Identifiable {
                     self.refreshDisplays()
                     _ = try self.selectShareableDisplay(content.displays)
                     self.hostStartupPhase = .listener
+                    await self.services.tailnet.waitForSharingChanges()
+                    guard self.generation == token, self.hostingRequested, !Task.isCancelled else { return }
                     try self.ensureHostListener(key: key, port: port)
                     self.active = true
                     self.updateHostBonjourService()
                     // Keep hidden sharing responsive; prevent idle sleep only while connected to external power.
                     self.refreshHostActivity()
                     self.beginMetrics()
-                    if self.hostListenerReady { self.desktopListenerReady(port: port) }
+                    if self.hostListenerReady { self.desktopListenerReady() }
                 } catch {
                     guard self.generation == token, self.hostingRequested, !Task.isCancelled else { return }
                     self.hostStartupDeadline.cancel()
@@ -1583,18 +1586,28 @@ final class DeskModel: ObservableObject, Identifiable {
             if !active { closeHostListener() }
             return
         }
-        do {
-            prepareHostCode()
-            guard !hostCode.isEmpty else { throw DeskError.invalid("请先设置本机配对码") }
-            let key = try PairingKey(code: hostCode)
-            let port = try validPort(hostPort)
-            try ensureHostListener(key: key, port: port)
-            mappingHosting = true
-            mappingHostingStatus = hostListenerReady ? "已监听 · TCP \(port.rawValue)" : "正在开启监听…"
-        } catch { mappingHostingStatus = "开启失败：\(error.localizedDescription)" }
+        mappingHosting = true
+        mappingHostingStatus = "正在开启监听…"
+        services.tailnet.afterSharingChanges { [weak self] in
+            guard let self, self.mappingHosting else { return }
+            do {
+                self.prepareHostCode()
+                guard !self.hostCode.isEmpty else { throw DeskError.invalid("请先设置本机配对码") }
+                let key = try PairingKey(code: self.hostCode)
+                try self.ensureHostListener(key: key, port: self.validPort(self.hostPort))
+                if self.hostListenerReady, let port = self.listener?.port {
+                    self.mappingHostingStatus = "已监听 · TCP \(port.rawValue)"
+                }
+            } catch {
+                self.mappingHosting = false
+                self.mappingHostingStatus = "开启失败：\(error.localizedDescription)"
+            }
+        }
     }
 
-    private func desktopListenerReady(port: NWEndpoint.Port) {
+    private func desktopListenerReady() {
+        guard let port = listener?.port else { return }
+        services.tailnet.setSharing(port: port.rawValue)
         hostStartupDeadline.cancel()
         DiagnosticLog.shared.record(.hostStarted, role: .host, state: .ready)
         working = false
@@ -1606,7 +1619,10 @@ final class DeskModel: ObservableObject, Identifiable {
         let previous = listener
         listener = nil
         hostListenerReady = false
-        previous?.cancel()
+        if let previous {
+            previous.service = nil
+            services.tailnet.setSharing(port: 0) { previous.cancel() }
+        }
         mappingServer = nil
         portMappings.shutdownHost()
         for candidate in pending.values { candidate.close() }
@@ -1653,12 +1669,13 @@ final class DeskModel: ObservableObject, Identifiable {
                 case .ready:
                     self.hostListenerReady = true
                     if self.mappingHosting { self.mappingHostingStatus = "已监听 · TCP \(port.rawValue)" }
-                    if self.hostingRequested, self.active { self.desktopListenerReady(port: port) }
+                    if self.hostingRequested, self.active { self.desktopListenerReady() }
                     self.startRelayRegistration(localPort: port.rawValue)
                 case .failed(let error):
                     self.recordDiagnosticFailure(.hostStopped, error: error)
                     self.hostListenerFailed("监听失败：\(error.localizedDescription)")
                 case .waiting:
+                    self.services.tailnet.setSharing(port: 0)
                     self.hostListenerReady = false
                     if self.mappingHosting { self.mappingHostingStatus = "监听正在等待网络…" }
                     guard self.hostingRequested, !self.hostStartupDeadline.isArmed else { return }
@@ -1725,7 +1742,9 @@ final class DeskModel: ObservableObject, Identifiable {
     private func accept(_ connection: NWConnection, generation token: UUID, admission: PendingHandshakeGate, id: UUID, listeningPort: UInt16, key: PairingKey) {
         let diagnostics = PerformanceDiagnostics()
         let ackStretchingDisabled = (connection.parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options)?.disableAckStretching
-        let candidate = Peer(connection: connection, handshakeTimeout: peer == nil ? 15 : 5, diagnostics: diagnostics)
+        let loopback = RelayHostRegistration.loopbackPort(of: connection.endpoint) != nil
+        let candidate = Peer(connection: connection, handshakeTimeout: peer == nil ? 15 : 5, diagnostics: diagnostics,
+                             transportDiagnosticsSupported: !loopback)
         let channel = makeDataChannel(for: candidate)
         let session = makeTrafficSession(for: candidate)
         let history = trafficHistoryStore
@@ -1820,8 +1839,9 @@ final class DeskModel: ObservableObject, Identifiable {
                     if relayed, let node = relayRegistration?.endpoint { endpoint = try TrafficEndpoint(address: node.host, port: node.port) }
                     else { endpoint = try TrafficEndpoint(remoteEndpoint: connection.endpoint, listeningPort: listeningPort) }
                     try session.bind(endpoint)
-                    self.trafficHistoryStatus = relayed ? "按中继节点地址＋端口累计：\(endpoint.label)"
-                        : "按控制端来源 IP＋本机监听端口累计：\(endpoint.label)"
+                    if relayed { self.trafficHistoryStatus = "按中继节点地址＋端口累计：\(endpoint.label)" }
+                    else if loopback { self.trafficHistoryStatus = "按本机转接地址＋监听端口累计：\(endpoint.label)" }
+                    else { self.trafficHistoryStatus = "按控制端来源 IP＋本机监听端口累计：\(endpoint.label)" }
                 } catch {
                     self.trafficHistoryStatus = "当前连接的来源地址不可识别，未累计此连接的历史流量。"
                     history.reportCountingError(error.localizedDescription)
@@ -1836,7 +1856,7 @@ final class DeskModel: ObservableObject, Identifiable {
                     candidate.close("共享画面准备超过 30 秒未完成，重新建立会话", retryable: true)
                 }
                 host.usesRelayControl = relayed
-                self.controlTransportStatus = relayed ? "中继控制" : "直连控制"
+                self.controlTransportStatus = relayed ? "中继控制" : (loopback ? "本机转接控制" : "直连控制")
                 let cleanup = self.effectsCleanupTask
                 host.captureTask = Task { [weak self, weak candidate, weak host] in
                     await cleanup?.value
@@ -1878,6 +1898,19 @@ final class DeskModel: ObservableObject, Identifiable {
                         host.streamer = streamer
                         let media = try MediaSession.host(control: candidate, key: key, port: listeningPort, settings: settings,
                                                           relayRouting: true)
+                        let tailnet = self.services.tailnet
+                        media.beforeHostDatagramBind = { begin in
+                            DispatchQueue.main.async { tailnet.afterSharingChanges(begin) }
+                        }
+                        media.onHostDatagramReadiness = { [weak self, weak host] listener, ready in
+                            DispatchQueue.main.async {
+                                guard let self, self.hostSession === host else { return }
+                                tailnet.datagramReadiness(listener, ready: ready)
+                            }
+                        }
+                        media.retireHostDatagramListener = { listener in
+                            DispatchQueue.main.async { tailnet.retireDatagram(listener) }
+                        }
                         // Video may arrive through any node, also when control came directly.
                         media.hostDatagramBinding = { endpoint in
                             for registration in relayRegistrations {
@@ -2005,7 +2038,7 @@ final class DeskModel: ObservableObject, Identifiable {
                             }
                         }
                         let remoteTrafficAddress = (try? TrafficEndpoint(remoteEndpoint: connection.endpoint, listeningPort: listeningPort))?.address
-                        let initialSettingsGrace: Duration = if host.usesRelayControl {
+                        let initialSettingsGrace: Duration = if host.usesRelayControl || loopback {
                             .milliseconds(750)
                         } else if let remoteTrafficAddress, !MediaQualityPolicy.isLikelyLocalHost(remoteTrafficAddress) {
                             .milliseconds(450)
@@ -2178,6 +2211,12 @@ final class DeskModel: ObservableObject, Identifiable {
 
     /// Parse a saved or manually entered route without opening a desktop session.
     private func formTarget(savedRelayRoute: RelayConnectionInfo? = nil) throws -> Target {
+        let enteredAddress = self.address.trimmingCharacters(in: .whitespacesAndNewlines)
+        let strategy = savedRelayRoute?.strategy ?? (relayEnabled ? relayStrategy : .direct)
+        let tailnetHost = strategy == .relay ? nil : try TailnetAddress.host(in: enteredAddress)
+        if tailnetHost != nil, strategy != .direct {
+            throw DeskError.invalid("Tailscale 连接请在连接方式中选择地址直连")
+        }
         let routes: [RelayRoute]
         if let savedRelayRoute {
             guard relayEnabled else { throw DeskError.invalid("此记录需要中继，请先在中继设置中启用服务") }
@@ -2190,7 +2229,7 @@ final class DeskModel: ObservableObject, Identifiable {
             routes = try relayRoutes(deviceID: id, strategy: relayStrategy, preferred: nil)
         } else { routes = [] }
         let relay = routes.first?.info
-        let address = relay?.strategy == .relay ? "" : self.address.trimmingCharacters(in: .whitespacesAndNewlines)
+        let address = relay?.strategy == .relay ? "" : enteredAddress
         guard (!address.isEmpty || relay != nil), !address.contains("://"), !address.contains("/") else {
             throw DeskError.invalid("请输入域名或 IP，端口填在单独的端口栏")
         }
@@ -2200,9 +2239,9 @@ final class DeskModel: ObservableObject, Identifiable {
         let record = ConnectionStore.matching(connections, address: address, port: port.rawValue, preferredID: selectedConnectionID, relay: relay)
         let endpoint: TrafficEndpoint
         if address.isEmpty, let relay { endpoint = try TrafficEndpoint(address: relay.endpoint.host, port: relay.endpoint.port) }
-        else { endpoint = try TrafficEndpoint(address: address, port: port.rawValue) }
+        else { endpoint = try TrafficEndpoint(address: tailnetHost ?? address, port: port.rawValue) }
         var target = Target(address: address, port: port.rawValue, key: key, recordID: record?.id,
-                            trafficEndpoint: endpoint, relay: relay, relayAccessKey: routes.first?.accessKey,
+                            trafficEndpoint: endpoint, tailnetHost: tailnetHost, relay: relay, relayAccessKey: routes.first?.accessKey,
                             relayCertificate: routes.first?.certificate)
         target.relayRoutes = routes
         return target
@@ -2389,6 +2428,12 @@ final class DeskModel: ObservableObject, Identifiable {
         }
         let address = session?.address ?? record.address
         let port = session?.port ?? record.port
+        if let host = try TailnetAddress.host(in: address) {
+            try portMappings.start(rule) { [tailnet = services.tailnet] ready, failed in
+                tailnet.bridge(host: host, port: port, ready: { ready("127.0.0.1", $0, key) }, failed: failed)
+            }
+            return
+        }
         var relayRoute: PortMappingManager.Route?
         if let relay = session?.relay ?? record.relay, relay.strategy != .direct {
             relayRoute = { [weak self] ready, failed in
@@ -2610,7 +2655,7 @@ final class DeskModel: ObservableObject, Identifiable {
         media.onState = { [weak self, weak viewer] value in
             DispatchQueue.main.async {
                 guard let self, let viewer, self.viewerSession === viewer else { return }
-                self.setMediaRoute(Self.mediaRouteLabel(value, relayed: viewer.usesRelayControl))
+                self.setMediaRoute(target.tailnetHost != nil ? "Tailscale " + value : Self.mediaRouteLabel(value, relayed: viewer.usesRelayControl))
                 self.recordMediaRoute(value, role: .viewer, relayed: viewer.usesRelayControl)
             }
         }
@@ -3192,6 +3237,29 @@ final class DeskModel: ObservableObject, Identifiable {
             return
         }
         connectionDiagnostics?.waiting(.negotiating)
+        if let host = target.tailnetHost {
+            let viewer = viewerSession
+            guard viewer.closeTailnetBridge == nil else { return }
+            active = true
+            working = true
+            status = "正在通过 Tailscale 连接 \(host)…"
+            controlTransportStatus = "正在连接 Tailscale"
+            viewer.closeTailnetBridge = services.tailnet.bridge(host: host, port: target.port) { [weak self, weak viewer] port in
+                guard let self, self.viewerSession === viewer else { return }
+                self.beginPeerConnection(target, host: "127.0.0.1", port: port, viaRelay: false)
+            } failed: { [weak self, weak viewer] reason in
+                guard let self, self.viewerSession === viewer else { return }
+                if self.reconnecting, self.effectiveAutoReconnect, self.services.tailnet.enabled {
+                    self.clearSession()
+                    self.scheduleReconnect(reason)
+                } else {
+                    self.stop(reason: reason)
+                    self.status = reason
+                    self.connectionError = reason
+                }
+            }
+            return
+        }
         beginPeerConnection(target, host: target.address, port: target.port, viaRelay: false)
     }
 
@@ -3202,7 +3270,7 @@ final class DeskModel: ObservableObject, Identifiable {
             port: NWEndpoint.Port(rawValue: port)!, using: SecureTransport.parameters(key: target.key, responsiveAcknowledgements: true))
         let ackStretchingDisabled = (connection.parameters.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options)?.disableAckStretching
         let candidate = Peer(connection: connection, handshakeTimeout: viaRelay ? 25 : 15, diagnostics: diagnostics,
-                             transportDiagnosticsSupported: !viaRelay)
+                             transportDiagnosticsSupported: !viaRelay && target.tailnetHost == nil)
         attachPerformanceDiagnostics(diagnostics, role: .viewer)
         DiagnosticLog.shared.record(.connectionStarted, role: .viewer, state: .requested)
         trafficSession = makeTrafficSession(for: candidate, endpoint: target.trafficEndpoint)
@@ -3236,7 +3304,7 @@ final class DeskModel: ObservableObject, Identifiable {
         candidate.onReady = { [weak self, weak candidate, weak viewer] in
             DispatchQueue.main.async {
                 guard let self, let candidate, let viewer, self.peer === candidate, self.viewerSession === viewer else { return }
-                self.connectionDiagnostics?.attach(channel, relayed: viaRelay, node: target.relay?.endpoint.address)
+                self.connectionDiagnostics?.attach(channel, relayed: viaRelay, node: target.relay?.endpoint.address, tailnet: target.tailnetHost != nil)
                 viewer.helloDeadline.arm { [weak self, weak candidate, weak viewer] in
                     guard let self, let candidate, let viewer, self.peer === candidate,
                           self.viewerSession === viewer, !viewer.helloReceived else { return }
@@ -3246,7 +3314,7 @@ final class DeskModel: ObservableObject, Identifiable {
                 }
                 DiagnosticLog.shared.record(.connectionReady, role: .viewer, state: .ready,
                     values: viaRelay ? [.relayControl: 1] : ackStretchingDisabled.map { [.tcpAckStretchingDisabled: $0 ? 1 : 0] } ?? [:])
-                self.controlTransportStatus = viaRelay ? "中继控制" : "直连控制"
+                self.controlTransportStatus = target.tailnetHost != nil ? "Tailscale 控制" : (viaRelay ? "中继控制" : "直连控制")
                 self.status = viaRelay ? "中继连接已端到端加密，等待画面…" : "连接已加密，等待画面…"
             }
         }
@@ -6097,6 +6165,7 @@ final class DeskModel: ObservableObject, Identifiable {
         oldViewer.mediaReceiver?.stop()
         oldViewer.relayBridge?.stop()
         oldViewer.mediaRelayBridge?.stop()
+        oldViewer.closeTailnetBridge?()
         controlTransportStatus = "尚未连接"
         mediaTransportStatus = "TCP 兼容模式"
         mediaRouteValue = ""; peerPathState = .relay; relayPeerStatus = ""
@@ -6309,7 +6378,7 @@ final class DeskModel: ObservableObject, Identifiable {
         if mode == .viewer { stopLANScan() }
         if mode == .host {
             if !mappingHosting { closeHostListener() }
-            else { updateHostBonjourService() }
+            else { services.tailnet.setSharing(port: 0); updateHostBonjourService() }
         }
         relaySelectedForTarget = false
         relayFallbackAttempted = false
@@ -6572,13 +6641,14 @@ final class DeskModel: ObservableObject, Identifiable {
             )
             relaySelectedForTarget = true
         } else {
-            let traffic = try TrafficEndpoint(address: candidate.address, port: candidate.port)
+            let tailnetHost = try TailnetAddress.host(in: candidate.address)
+            let traffic = try TrafficEndpoint(address: tailnetHost ?? candidate.address, port: candidate.port)
             attemptTarget = Target(
                 address: candidate.address,
                 port: candidate.port,
                 key: key,
                 recordID: recordPreference?.id,
-                trafficEndpoint: traffic
+                trafficEndpoint: traffic, tailnetHost: tailnetHost
             )
             relaySelectedForTarget = false
         }

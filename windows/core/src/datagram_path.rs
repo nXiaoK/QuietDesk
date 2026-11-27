@@ -98,6 +98,7 @@ pub(crate) struct DatagramPath {
     listen_after: Option<Instant>,
     probe_by: Option<Instant>,
     endpoint: Option<SocketAddr>,
+    pub host_observer: Option<datagram_transport::HostSocketObserver>,
     driver: Option<PathDriver>,
     started: bool,
     paused: bool,
@@ -113,6 +114,7 @@ impl DatagramPath {
             listen_after: None,
             probe_by: None,
             endpoint,
+            host_observer: None,
             driver: None,
             started: false,
             paused: false,
@@ -144,7 +146,11 @@ impl DatagramPath {
 
     fn start_driver(&mut self, target: Endpoint) -> bool {
         let Endpoint { addr, host, key, session } = target;
-        let io = if host { datagram_transport::host(addr, key, session) } else { datagram_transport::viewer(addr, key, session) };
+        let io = if host {
+            datagram_transport::observed_host(addr, key, session, self.host_observer.as_ref())
+        } else {
+            datagram_transport::viewer(addr, key, session)
+        };
         let Ok(io) = io else {
             if self.credentials.is_none() {
                 log::info!("media DTLS endpoint unavailable");

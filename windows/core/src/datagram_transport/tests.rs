@@ -310,3 +310,28 @@ async fn send_timeout_drops_stalled_flight_without_closing_the_channel() {
     assert!(failing_client.try_send(vec![4, 5, 6]));
     assert!(matches!(timeout(Duration::from_millis(500), failing_client.next()).await.unwrap(), DatagramEvent::Closed));
 }
+
+#[tokio::test]
+async fn observed_host_only_publishes_a_socket_it_bound_and_keeps_it_reserved_until_withdrawal() {
+    let local = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let address = local.local_addr().unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    let observe: HostSocketObserver = Arc::new(move |bound, socket| {
+        send.send((bound, socket)).unwrap();
+    });
+    let id = Uuid::new_v4();
+    assert!(observed_host(address, [17; 32], id, Some(&observe)).is_err());
+    assert!(receive.try_recv().is_err());
+    drop(local);
+    let transport = observed_host(address, [17; 32], id, Some(&observe)).unwrap();
+    let (bound, held) = receive.try_recv().unwrap();
+    assert!(bound);
+    assert_eq!(held.local_addr().unwrap(), address);
+    drop(transport);
+    let (bound, closing) = receive.try_recv().unwrap();
+    assert!(!bound && Arc::ptr_eq(&held, &closing));
+    tokio::task::yield_now().await;
+    assert!(std::net::UdpSocket::bind(address).is_err());
+    drop((held, closing));
+    assert!(std::net::UdpSocket::bind(address).is_ok());
+}

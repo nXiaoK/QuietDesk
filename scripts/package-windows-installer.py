@@ -139,6 +139,7 @@ def build_installers(
                 if "QuietDesk.exe" not in archive.namelist():
                     raise ValueError(f"QuietDesk.exe missing from {zip_path}")
                 exe_bytes = archive.read("QuietDesk.exe")
+                (arch_dir / "LICENSE").write_bytes(archive.read("LICENSE"))
             exe_path = arch_dir / "QuietDesk.exe"
             exe_path.write_bytes(exe_bytes)
             validate_app_executable(exe_path, arch)

@@ -59,6 +59,11 @@ pub(super) const TAB_HOST_QUALITY: usize = 1306;
 pub(super) const TAB_KEYBOARD: usize = 1307;
 pub(super) const TAB_DEFAULTS: usize = 1308;
 pub(super) const TAB_UPDATES: usize = 1309;
+pub(super) const TAB_TAILSCALE: usize = 1310;
+pub(super) const TAILSCALE_STATUS: usize = 1311;
+pub(super) const TAILSCALE_LOGIN: usize = 1312;
+pub(super) const TAILSCALE_LOGOUT: usize = 1313;
+pub(super) const TAILSCALE_ADDRESS: usize = 1314;
 
 pub(super) const FRAME_STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 | WS_CLIPCHILDREN.0);
 const SIDEBAR_WIDTH: i32 = 216;
@@ -80,6 +85,7 @@ pub(super) enum Page {
     Keyboard,
     Defaults,
     Updates,
+    Tailscale,
 }
 
 impl Page {
@@ -91,6 +97,7 @@ impl Page {
             Self::HostQuality | Self::Keyboard => &[(101, 259)],
             Self::Defaults => &[(101, 240)],
             Self::Updates => &[(101, 269)],
+            Self::Tailscale => &[(101, 323)],
         }
     }
 
@@ -99,7 +106,7 @@ impl Page {
     }
 
     fn is_settings(self) -> bool {
-        matches!(self, Self::Keyboard | Self::Defaults | Self::Updates)
+        matches!(self, Self::Keyboard | Self::Defaults | Self::Updates | Self::Tailscale)
     }
 }
 
@@ -261,7 +268,7 @@ impl Workspace {
             &[
                 (title, DEVICE_HEADING, "新建连接", 0, 25, 0, 37),
                 (subtitle, DEVICE_DETAIL, "填写目标设备的连接信息", 0, 63, 0, 23),
-                (label, 0, "地址", 18, 110, -116, 22),
+                (label, 0, "地址（普通主机名、IP 或 tailscale:100.x.x.x）", 18, 110, -116, 22),
                 (entry, ADDRESS, "", 18, 134, -116, 29),
                 (label, 0, "端口", -102, 110, 84, 22),
                 (port_entry, PORT, &port, -102, 134, 84, 29),
@@ -307,6 +314,20 @@ impl Workspace {
                 (Button, TAB_KEYBOARD, "键盘与快捷键", 0, 17, 126, 33),
                 (Button, TAB_DEFAULTS, "连接默认项", 131, 17, 112, 33),
                 (Button, TAB_UPDATES, "软件更新", 248, 17, 102, 33),
+                (Button, TAB_TAILSCALE, "Tailscale", 355, 17, 92, 33),
+            ],
+        )?;
+        add(
+            Area::Page(Tailscale),
+            &[
+                (title, 0, "Tailscale", 0, 59, 0, 36),
+                (section, 0, "内置 Tailscale 节点", 18, 117, -18, 26),
+                (label, TAILSCALE_STATUS, "未启用", 18, 150, -18, 26),
+                (label, 0, "本机连接地址", 18, 186, 110, 26),
+                (host_code, TAILSCALE_ADDRESS, "", 132, 181, -18, 29),
+                (label, 0, "在控制端输入此地址、共享端口和配对码。", 18, 220, -18, 26),
+                (Button, TAILSCALE_LOGIN, "登录 Tailscale", 18, 265, 135, 32),
+                (Button, TAILSCALE_LOGOUT, "退出 Tailscale", 162, 265, 135, 32),
             ],
         )?;
         add(
@@ -369,6 +390,7 @@ impl Workspace {
             TAB_KEYBOARD => Page::Keyboard,
             TAB_DEFAULTS => Page::Defaults,
             TAB_UPDATES => Page::Updates,
+            TAB_TAILSCALE => Page::Tailscale,
             _ => return,
         };
         self.select(page);
@@ -577,11 +599,12 @@ impl Workspace {
             TAB_KEYBOARD => ButtonKind::Tab { selected: page == Page::Keyboard },
             TAB_DEFAULTS => ButtonKind::Tab { selected: page == Page::Defaults },
             TAB_UPDATES => ButtonKind::Tab { selected: page == Page::Updates },
-            CONNECT | SHARE | UPDATE_ACTION => ButtonKind::Primary,
+            TAB_TAILSCALE => ButtonKind::Tab { selected: page == Page::Tailscale },
+            CONNECT | SHARE | UPDATE_ACTION | TAILSCALE_LOGIN => ButtonKind::Primary,
             NEW_CONNECTION_PAGE => ButtonKind::CanvasAction,
             CONTINUE_CONNECTION => ButtonKind::Tab { selected: true },
             FORGET => ButtonKind::Danger,
-            COPY_CODE | NEW_CODE | UPDATE_NOTES => ButtonKind::Secondary,
+            COPY_CODE | NEW_CODE | UPDATE_NOTES | TAILSCALE_LOGOUT => ButtonKind::Secondary,
             _ => return false,
         };
         self.theme.borrow().draw_button(item, button);

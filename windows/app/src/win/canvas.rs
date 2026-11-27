@@ -1,6 +1,6 @@
 //! The viewer's window: draws the host's picture and sends this PC's keyboard and mouse to it.
 
-use super::app::{DisplayGeometry, Frame, ViewerSink, run_viewer};
+use super::app::{DisplayGeometry, Frame, ViewerSink, ViewerTarget, run_viewer};
 use super::clipboard;
 use super::relative_mouse::RelativeMouse;
 use super::settings::{Settings, VIEWER_QUALITIES};
@@ -222,7 +222,7 @@ thread_local! {
 pub(super) fn open(
     runtime: &tokio::runtime::Handle,
     owner: HWND,
-    (address, port): (String, u16),
+    target: ViewerTarget,
     key: PairingKey,
     settings: &Settings,
     local_identity: Option<DeviceIdentity>,
@@ -243,6 +243,7 @@ pub(super) fn open(
         RegisterClassExW(&definition);
         let factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
         let displays = DisplayMenu::new()?;
+        let address = target.address_label();
         let title = wide(&format!("QuietDesk · {address}"));
         let window = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -349,7 +350,7 @@ pub(super) fn open(
         SetWindowLongPtrW(window, GWLP_USERDATA, Box::into_raw(canvas) as isize);
         let _ = ShowWindow(window, SW_SHOW);
         runtime.spawn(async move {
-            let session = run_viewer((address, port), key, quality, enabled, queue, frame, mailbox.clone());
+            let session = run_viewer(target, key, quality, enabled, queue, frame, mailbox.clone());
             tokio::pin!(session);
             let end = loop {
                 tokio::select! {

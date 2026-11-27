@@ -18,6 +18,7 @@ A native macOS remote desktop app for your own Macs. Connect directly over a LAN
 | --- | --- |
 | Remote control | Mouse (including side buttons 4/5 and 3D relative-mouse lock), keyboard, drag, scroll, trackpad pinch/rotate/smart-magnify gestures, host & viewer view-only access/input lock modes, floating fullscreen controls and a top-edge hover toolbar |
 | Self-hosted relay | Single-node full-session relay by device ID, with optional direct path and separate control/media routing |
+| Embedded Tailscale | Sign in from QuietDesk on Mac and Windows. Connect using the host’s `tailscale:100.x.x.x` address, sharing port and QuietDesk pairing code. [Setup and troubleshooting](docs/tailscale.md) |
 | Route quality benchmark | Before connecting, benchmark Direct (UDP/TCP) and each Relay node (auto-punch, pure relay UDP, pure relay TCP) over 15 s / 30 s (default) / 1 min with real video traffic and UDP packet-loss metrics, persist every run locally, and generate a cumulative historical quality assessment with one-click connection |
 | TCP port forwarding | Forward a local loopback port to a TCP service on the host. Devices that have previously remote-controlled the host start immediately without confirmation; other devices require host approval. Start from the home screen, a windowed session or full screen. Desktop sessions take priority over transfers. |
 | Video transport | Updated peers prefer encrypted UDP (with adaptive block Cauchy Reed-Solomon multi-packet FEC for 0-RTT burst-loss recovery), recover or fall back to TCP automatically, and keep input on a reliable channel |
@@ -82,7 +83,7 @@ Release builds remain ad-hoc signed. **After every update, grant Screen Recordin
 
 [User guide (Chinese)](docs/usage.md) · [Windows build, first version (Chinese)](docs/windows.md) · [UDP/TCP transport (Chinese)](docs/udp-tcp-transport.md) · [Security (Chinese)](docs/security.md) · [Build & test (Chinese)](docs/development.md)
 
-With Apple Command Line Tools, Swift 5.9+ and Python 3 installed, run from the repository:
+Build from the repository with Apple Command Line Tools, Swift 5.9+, Python 3 and the Go toolchain specified in `tailnet/go.mod`.
 
 ```sh
 ./build-app.sh universal

@@ -37,7 +37,21 @@ pactl set-default-sink quietdesk_test_sink
 Xvfb :99 -screen 0 1280x800x24 -nolisten tcp >/dev/null 2>&1 &
 sleep 2
 timeout 120 wineboot -i >/dev/null 2>&1
-timeout 90 wine /qa/native-tests.exe --test-threads=1
+if [[ -x /usr/local/bin/quietdesk-qemu64 ]]; then
+    # Go's child process needs the native QEMU loader as well as its Rust parent on ARM/Rosetta.
+    helper_tests=win::tailnet::tests::
+    timeout 90 wine /qa/native-tests.exe --skip "$helper_tests" --test-threads=1
+    (
+        loader=/usr/lib/wine/wine64
+        mv "$loader" "$loader.elf"
+        trap 'mv "$loader.elf" "$loader"' EXIT
+        printf '%s\n' '#!/bin/sh' 'exec /usr/local/bin/quietdesk-qemu64 -0 /usr/lib/wine/wine64 /usr/lib/wine/wine64.elf "$@"' > "$loader"
+        chmod +x "$loader"
+        WINELOADER="$loader" WINELOADERNOEXEC=1 timeout 90 "$loader" /qa/native-tests.exe "$helper_tests" --test-threads=1
+    )
+else
+    timeout 90 wine /qa/native-tests.exe --test-threads=1
+fi
 QUIETDESK_ISOLATED_CLIPBOARD_CHECK=1 timeout 60 wine /qa/native-tests.exe clipboard_native_ --ignored --test-threads=1
 audio_test=win::audio::tests::wasapi_virtual_stereo_roundtrip_pause_resume
 QUIETDESK_ISOLATED_AUDIO_CHECK=1 timeout 60 wine /qa/native-tests.exe "$audio_test" --exact --ignored --test-threads=1 > /tmp/quietdesk-audio-check.log || {

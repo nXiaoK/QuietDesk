@@ -27,6 +27,11 @@ jobs:
         uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1
         with:
           xcode-version: latest-stable
+      - name: Set up Go for the embedded Tailscale node
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: tailnet/go.mod
+          cache-dependency-path: tailnet/go.sum
       - name: Install pinned Rust toolchain
         run: |
           channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' windows/rust-toolchain.toml)"
@@ -55,7 +60,7 @@ jobs:
   windows-installer:
     needs: windows-cross
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: read
       actions: read
@@ -70,6 +75,13 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path outputs/windows | Out-Null
           gh run download "$env:GITHUB_RUN_ID" --repo "$env:GITHUB_REPOSITORY" --name QuietDesk-Windows-CI --dir outputs/windows
+      - name: Set up Go for the native Tailscale check
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: tailnet/go.mod
+          cache-dependency-path: tailnet/go.sum
+      - name: Check two embedded nodes on Windows
+        run: go -C tailnet test -mod=readonly -tags ts_omit_logtail ./...
       - name: Package Windows x64 and ARM64 Inno Setup installers
         shell: pwsh
         run: python scripts/package-windows-installer.py --dist-dir outputs/windows
@@ -110,11 +122,11 @@ jobs:
           swift --version
           xcrun --sdk macosx --show-sdk-version
           xcrun --sdk macosx --show-sdk-path
-      - name: Set up Go for relay
+      - name: Set up Go for the embedded Tailscale node
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version-file: relay/go.mod
-          cache: false
+          go-version-file: tailnet/go.mod
+          cache-dependency-path: tailnet/go.sum
       - name: Verify relay build toolchain
         run: go version
       - name: Run project checks

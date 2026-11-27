@@ -10,6 +10,7 @@ final class ViewerConnectionDiagnostics: @unchecked Sendable {
     private var previous = (bytes: 0, frames: 0, settled: 0, lost: 0)
     private var sampledAt: TimeInterval
     private var controlRelayed = false
+    private var tailnet = false
     private var node: String?
     private var videoPath = MediaSession.DiagnosticVideoPath.preparing
     private var peerPath = RelayPeerPathState.relay
@@ -26,9 +27,10 @@ final class ViewerConnectionDiagnostics: @unchecked Sendable {
         lock.withLock { changeRoute(DiagnosticRoute(control: .unavailable, media: media, node: node)) }
     }
 
-    func attach(_ channel: SessionDataChannel, relayed: Bool, node: String?) {
+    func attach(_ channel: SessionDataChannel, relayed: Bool, node: String?, tailnet: Bool = false) {
         lock.withLock {
             controlRelayed = relayed
+            self.tailnet = tailnet
             self.node = node
             videoPath = .preparing
             peerPath = .relay
@@ -118,15 +120,16 @@ final class ViewerConnectionDiagnostics: @unchecked Sendable {
         case .trialUDP(let relayed):
             media = .udpTrial
             usesNode = usesNode || relayed
-        case .committed(.shared, _): media = controlRelayed ? .relayCompatibleTCP : .directCompatibleTCP
-        case .committed(.tcp, _): media = controlRelayed ? .relayTCP : .directTCP
+        case .committed(.shared, _): media = tailnet ? .tailnetCompatibleTCP : (controlRelayed ? .relayCompatibleTCP : .directCompatibleTCP)
+        case .committed(.tcp, _): media = tailnet ? .tailnetTCP : (controlRelayed ? .relayTCP : .directTCP)
         case .committed(.udp, let relayed):
             usesNode = usesNode || relayed
-            if !relayed { media = .directUDP }
+            if tailnet { media = .tailnetUDP }
+            else if !relayed { media = .directUDP }
             else if case .direct = peerPath { media = .punchedUDP }
             else { media = .relayUDP }
         }
-        changeRoute(DiagnosticRoute(control: controlRelayed ? .relay : .direct,
+        changeRoute(DiagnosticRoute(control: tailnet ? .tailnet : (controlRelayed ? .relay : .direct),
             media: paused ? .paused : media, node: usesNode ? node : nil))
     }
 }

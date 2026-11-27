@@ -57,12 +57,14 @@ if [[ "$IDENTITY" == "-" ]]; then
         echo "HUMAN-ACTION: 未在钥匙串中找到本地代码签名证书；请先运行 ./scripts/setup-cert.sh 生成并信任证书。" >&2
         exit 1
     fi
-    codesign --force --sign - "$APP"
+    sign_args=(--sign -)
 elif is_developer_id "$IDENTITY"; then
-    codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
+    sign_args=(--options runtime --timestamp --sign "$IDENTITY")
 else
-    codesign --force --timestamp=none --sign "$IDENTITY" "$APP"
+    sign_args=(--timestamp=none --sign "$IDENTITY")
 fi
 
+codesign --force "${sign_args[@]}" "$APP/Contents/Helpers/QuietDeskTailnet"
+codesign --force "${sign_args[@]}" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 "$ROOT_DIR/scripts/check-cert-pin.sh" "$APP"

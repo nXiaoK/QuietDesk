@@ -5,7 +5,7 @@
 ## 环境
 
 - macOS 14+、Apple Command Line Tools、Swift 5.9+、Python 3。
-- 全项目检查及中继 Linux 包需 Go 1.25+；只构建 Mac 应用不需要 Go。CI 使用 macOS runner 自带 Go，打印实际版本，模块声明约束最低版本。
+- macOS 与 Windows 安装包都构建内置 Tailscale 节点。CI 以 `tailnet/go.mod` 指定的 Go 版本构建并检查客户端，独立构建中继的最低版本见 `relay/go.mod`。
 - 原生 SwiftUI/AppKit 项目，使用 Swift Package Manager，不依赖第三方运行时包；不要求安装完整 Xcode。
 - `Sources/QuietDesk` 为应用界面、采集和输入，`Sources/QuietDeskCore` 为协议、传输、编解码及可测试逻辑。
 

@@ -171,6 +171,7 @@ public struct RouteBenchmarkCandidate: Codable, Identifiable, Hashable, Sendable
 
     public var title: String {
         guard kind.usesRelay, let relayEndpoint else {
+            if (try? TailnetAddress.host(in: address)) != nil { return kind.mediaTCPOnly ? "Tailscale · 仅 TCP" : "Tailscale · UDP 优先" }
             return kind.modeTitle
         }
         if nodeCount > 1 {
@@ -192,6 +193,7 @@ public struct RouteBenchmarkCandidate: Codable, Identifiable, Hashable, Sendable
         if let relayEndpoint {
             return "\(relayEndpoint.address) · \(kind.modeExplanation)"
         }
+        if let ip = try? TailnetAddress.host(in: address) { return "\(ip):\(port) · 使用内置 Tailscale 网络" }
         let formattedHost = address.contains(":") && !address.hasPrefix("[") ? "[\(address)]" : address
         return "\(formattedHost):\(port) · \(kind.modeExplanation)"
     }
@@ -378,8 +380,7 @@ public struct RouteBenchmarkMetrics: Codable, Equatable, Sendable {
             ?? report.routes.last?.route.media
             ?? .negotiating
         let punched = report.routes.contains { $0.route.media == .punchedUDP && $0.duration >= 0.5 }
-        let isTCPFinal = dominant == .directTCP || dominant == .relayTCP
-            || dominant == .directCompatibleTCP || dominant == .relayCompatibleTCP
+        let isTCPFinal = [.directTCP, .relayTCP, .tailnetTCP, .directCompatibleTCP, .relayCompatibleTCP, .tailnetCompatibleTCP].contains(dominant)
         let fellBack = !candidate.kind.mediaTCPOnly && isTCPFinal
 
         let peakMbps = report.timeline.compactMap(\.quality.megabitsPerSecond).max()

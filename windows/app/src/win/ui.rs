@@ -4,6 +4,7 @@ use super::app::{HostActivity, HostNotice, computer_name, network_runtime, serve
 use super::canvas::{self, WM_CANVAS_CLOSED, WM_CANVAS_CONNECTED, WM_CAPS_PREFERENCE};
 use super::clipboard;
 use super::settings::{Connection, QUALITY_LIMITS, Settings, VIEWER_QUALITIES, local_device_id, protect, unprotect};
+use super::tailnet::{Panel as TailnetPanel, ViewerTarget};
 use super::util::{display_label, from_wide, wide};
 use super::workspace::*;
 use super::{device_table, displays};
@@ -31,6 +32,7 @@ use windows::core::{PCWSTR, w};
 const WM_HOST_NOTICE: u32 = WM_APP + 10;
 const WM_UPDATE_EVENT: u32 = WM_APP + 40;
 const TIMER_UPDATE_TICK: usize = 1;
+const TIMER_TAILNET_TICK: usize = 2;
 
 struct Main {
     window: HWND,
@@ -51,6 +53,7 @@ struct Main {
     /// Keep each window registered; consume its history entry on the first connection.
     viewers: Vec<(canvas::ViewerWindow, Option<Connection>)>,
     updater: super::update::WindowUpdater,
+    tailnet: TailnetPanel,
 }
 
 impl Main {
@@ -92,11 +95,23 @@ impl Main {
         self.message(AUTO_INSTALL_UPDATES, BM_SETCHECK, usize::from(self.settings.auto_install_updates), 0);
     }
 
+    fn refresh_tailnet_controls(&self) {
+        self.set_text(TAILSCALE_STATUS, self.tailnet.status_line());
+        if self.text(TAILSCALE_ADDRESS) != self.tailnet.address() {
+            self.set_text(TAILSCALE_ADDRESS, self.tailnet.address());
+        }
+        unsafe {
+            let _ = EnableWindow(self.item(TAILSCALE_LOGIN), self.tailnet.can_login());
+            let _ = EnableWindow(self.item(TAILSCALE_LOGOUT), self.tailnet.can_logout());
+        }
+    }
+
     fn window_is_minimized_or_hidden(&self) -> bool {
         unsafe { IsIconic(self.window).as_bool() || !IsWindowVisible(self.window).as_bool() }
     }
 
     fn finish_for_update_restart(&mut self) {
+        self.tailnet.share(None);
         self.sharing = None;
         unsafe {
             let _ = KillTimer(Some(self.window), TIMER_UPDATE_TICK);
@@ -355,15 +370,11 @@ impl Main {
             Ok(stored) => stored,
             Err(error) => return self.alert(&error.to_string()),
         };
-        match canvas::open(
-            &self.runtime,
-            self.window,
-            (address.clone(), port),
-            key,
-            &self.settings,
-            self.local_identity.clone(),
-            self.auto_reconnect.subscribe(),
-        ) {
+        let target = match ViewerTarget::parse(&address, port, self.tailnet.client()) {
+            Ok(target) => target,
+            Err(error) => return self.alert(&error.to_string()),
+        };
+        match canvas::open(&self.runtime, self.window, target, key, &self.settings, self.local_identity.clone(), self.auto_reconnect.subscribe()) {
             Ok(window) => self.viewers.push((window, Some(Connection { address, port, name: String::new(), code: stored, device_id: None }))),
             Err(error) => self.alert(&format!("无法打开远程窗口：{error}")),
         }
@@ -372,6 +383,7 @@ impl Main {
     fn toggle_sharing(&mut self) {
         self.viewer_name = None;
         if self.sharing.take().is_some() {
+            self.tailnet.share(None);
             self.active_display = None;
             self.refresh_displays();
             self.set_text(SHARE, "开始共享");
@@ -414,8 +426,14 @@ impl Main {
             return;
         }
         match notice {
-            HostNotice::Listening(port) => self.set_text(HOST_STATUS, &format!("等待连接 · 端口 {port}（首次共享时请在防火墙提示中允许访问）")),
+            HostNotice::Listening(listener) => {
+                let port = listener.local_addr().map_or(self.settings.port, |a| a.port());
+                self.tailnet.share(Some(listener));
+                self.set_text(HOST_STATUS, &format!("等待连接 · 端口 {port}（首次共享时请在防火墙提示中允许访问）"));
+            }
+            HostNotice::MediaSocket(active, socket) => self.tailnet.media_socket(active, socket),
             HostNotice::Failed(reason) => {
+                self.tailnet.share(None);
                 self.sharing = None;
                 self.set_text(SHARE, "开始共享");
                 self.set_text(HOST_STATUS, &format!("共享未开启：{reason}"));
@@ -490,10 +508,21 @@ impl Main {
                 self.workspace.set_draft_available(has_entry || self.text(PORT) != self.settings.port.to_string());
                 self.workspace.navigate(id);
             }
-            (NAV_SHARING | NAV_SETTINGS | TAB_SHARING | TAB_HOST_QUALITY | TAB_KEYBOARD | TAB_DEFAULTS | TAB_UPDATES, BN_CLICKED) => {
+            (NAV_SHARING | NAV_SETTINGS | TAB_SHARING | TAB_HOST_QUALITY | TAB_KEYBOARD | TAB_DEFAULTS | TAB_UPDATES | TAB_TAILSCALE, BN_CLICKED) => {
                 self.workspace.navigate(id);
             }
             (CONNECT, BN_CLICKED) => self.connect(),
+            (TAILSCALE_LOGIN, BN_CLICKED) => {
+                if self.tailnet.enable(true) && !self.settings.tailscale_enabled {
+                    self.settings.tailscale_enabled = true;
+                    self.save();
+                }
+                self.refresh_tailnet_controls();
+            }
+            (TAILSCALE_LOGOUT, BN_CLICKED) => {
+                self.tailnet.logout();
+                self.refresh_tailnet_controls();
+            }
             (SHARED_DISPLAY, CBN_SELCHANGE) => {
                 let choice = self.message(id, CB_GETCURSEL, 0, 0);
                 let selected = match choice {
@@ -675,6 +704,13 @@ impl Main {
                 }
             }
             WM_TIMER if wparam.0 == TIMER_UPDATE_TICK => self.tick_updater(),
+            WM_TIMER if wparam.0 == TIMER_TAILNET_TICK && self.settings.tailscale_enabled => {
+                if self.tailnet.tick() {
+                    self.settings.tailscale_enabled = false;
+                    self.save();
+                }
+                self.refresh_tailnet_controls();
+            }
             WM_DISPLAYCHANGE => {
                 self.refresh_displays();
                 if let Some(sharing) = &self.sharing {
@@ -740,6 +776,10 @@ impl Main {
             self.workspace.select(Page::Devices);
         }
         self.refresh_update_controls();
+        if self.settings.tailscale_enabled {
+            self.tailnet.enable(false);
+        }
+        self.refresh_tailnet_controls();
     }
 }
 
@@ -804,6 +844,7 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
             }
             WM_DESTROY => {
                 let _ = KillTimer(Some(window), TIMER_UPDATE_TICK);
+                let _ = KillTimer(Some(window), TIMER_TAILNET_TICK);
                 PostQuitMessage(0);
                 return LRESULT(0);
             }
@@ -899,6 +940,7 @@ unsafe fn run_window() -> windows::core::Result<()> {
             notices: Arc::new(Mutex::new(VecDeque::new())),
             viewers: Vec::new(),
             updater,
+            tailnet: TailnetPanel::default(),
         };
         main.initialize_controls();
         if post_update_options.as_ref().is_some_and(|options| options.resume_host_sharing) {
@@ -907,6 +949,7 @@ unsafe fn run_window() -> windows::core::Result<()> {
         let state = Box::new(WindowState { workspace, main: RefCell::new(main), pending: RefCell::default() });
         SetWindowLongPtrW(window, GWLP_USERDATA, std::ptr::from_ref(state.as_ref()) as isize);
         let _ = SetTimer(Some(window), TIMER_UPDATE_TICK, 5_000, None);
+        let _ = SetTimer(Some(window), TIMER_TAILNET_TICK, 750, None);
         let minimize = post_update_options.is_some_and(|options| options.minimize_on_launch);
         let _ = ShowWindow(window, if minimize { SW_SHOWMINNOACTIVE } else { SW_SHOW });
         if !minimize && GetActiveWindow() == window {
@@ -926,6 +969,7 @@ unsafe fn run_window() -> windows::core::Result<()> {
             let _ = DestroyWindow(window);
         }
         let mut main = state.main.into_inner();
+        main.tailnet.share(None);
         main.sharing = None;
         main.updater.shutdown();
         Ok(())
@@ -949,7 +993,8 @@ fn workspace_enter(window: HWND, message: &MSG) -> bool {
                 SendMessageW(window, WM_COMMAND, Some(WPARAM(DEVICE_TABLE)), Some(LPARAM(0)));
             }
             NEW_CONNECTION | NEW_CONNECTION_PAGE | NAV_DEVICES | NAV_SHARING | NAV_SETTINGS | TAB_SHARING | TAB_HOST_QUALITY | TAB_KEYBOARD | TAB_DEFAULTS
-            | TAB_UPDATES | CONTINUE_CONNECTION | CONNECT | FORGET | SHARE | COPY_CODE | NEW_CODE | UPDATE_ACTION | UPDATE_NOTES => {
+            | TAB_UPDATES | TAB_TAILSCALE | TAILSCALE_LOGIN | TAILSCALE_LOGOUT | CONTINUE_CONNECTION | CONNECT | FORGET | SHARE | COPY_CODE | NEW_CODE
+            | UPDATE_ACTION | UPDATE_NOTES => {
                 SendMessageW(message.hwnd, BM_CLICK, None, None);
             }
             _ => return false,

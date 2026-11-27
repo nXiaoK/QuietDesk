@@ -95,6 +95,7 @@ struct DeskSettingsPageHeading: View {
 
 enum NetworkWorkspaceSubTab: String, CaseIterable, Hashable {
     case viewerMappings
+    case tailnet
     case relayNodes
     case hostApprovals
 }
@@ -118,6 +119,7 @@ private enum NetworkWorkspacePage: Hashable {
     static let tabs: [(id: Self, title: String)] = [
         (.network(.viewerMappings), "端口映射"),
         (.network(.relayNodes), "自托管中继"),
+        (.network(.tailnet), "Tailscale"),
         (.network(.hostApprovals), "本机映射授权"),
         (.diagnostics(.benchmark), "线路实测"),
         (.diagnostics(.traffic), "地址流量")
@@ -201,6 +203,8 @@ struct NetworkWorkspaceView: View {
                             saveNode: viewer.saveRelayNode,
                             save: viewer.saveRelayConfiguration
                         )
+                    case .tailnet:
+                        TailnetSettingsView(tailnet: viewer.services.tailnet)
                     case .hostApprovals:
                         DeskSettingsPageHeading(title: "本机映射授权")
                         PortMappingHostView(

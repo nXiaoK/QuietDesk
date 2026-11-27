@@ -104,6 +104,24 @@ fn main() {
     println!("cargo:rustc-env=QUIETDESK_UPDATE_PUBLIC_KEYS_JSON={keys_json}");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rerun-if-changed=../../tailnet");
+        let arch = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+            Ok("x86_64") => "amd64",
+            Ok("aarch64") => "arm64",
+            other => panic!("Unsupported Windows target architecture: {other:?}"),
+        };
+        let helper = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo output directory")).join("QuietDeskTailnet.exe");
+        let status = std::process::Command::new("go")
+            .current_dir("../../tailnet")
+            .env("CGO_ENABLED", "0")
+            .env("GOOS", "windows")
+            .env("GOARCH", arch)
+            .args(["build", "-mod=readonly", "-trimpath", "-buildvcs=false", "-tags", "ts_omit_logtail", "-ldflags=-s -w", "-o"])
+            .arg(helper)
+            .arg(".")
+            .status()
+            .expect("building the embedded Tailscale node requires Go");
+        assert!(status.success(), "building the embedded Tailscale node failed");
         embed_resource::compile("resources/app.rc", embed_resource::NONE).manifest_required().expect("the application resources compile");
     }
 }

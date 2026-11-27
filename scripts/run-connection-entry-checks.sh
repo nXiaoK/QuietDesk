@@ -16,3 +16,8 @@ swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     "${core_objects[@]}" Sources/QuietDesk/DeskTheme.swift Sources/QuietDesk/ConnectionEntryView.swift Sources/QuietDesk/SystemQuitHandler.swift AppChecks/ConnectionEntryChecks.swift \
     -o "$build_directory/ConnectionEntryChecks"
 "$build_directory/ConnectionEntryChecks"
+swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
+    -module-cache-path "$build_directory/ModuleCache" -I "$build_directory/Modules" \
+    "${core_objects[@]}" Sources/QuietDesk/AppDataLocation.swift Sources/QuietDesk/EmbeddedTailnet.swift AppChecks/EmbeddedTailnetChecks.swift \
+    -o "$build_directory/EmbeddedTailnetChecks"
+"$build_directory/EmbeddedTailnetChecks"

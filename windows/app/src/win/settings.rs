@@ -59,6 +59,7 @@ pub struct Settings {
     pub shared_display: Option<u32>,
     pub viewer_quality: usize,
     pub auto_reconnect: bool,
+    pub tailscale_enabled: bool,
     pub caps_forwarding: bool,
     #[serde(default = "default_true")]
     pub auto_check_updates: bool,
@@ -86,6 +87,7 @@ impl Default for Settings {
             shared_display: None,
             viewer_quality: 2,
             auto_reconnect: true,
+            tailscale_enabled: false,
             caps_forwarding: false,
             auto_check_updates: true,
             auto_install_updates: false,
@@ -208,9 +210,11 @@ impl Settings {
         let read_key = |stored: &str| unprotect(stored).and_then(|code| PairingKey::parse(&code).ok());
         let key = read_key(&connection.code);
         let advertised = connection.device_id;
+        let embedded = super::tailnet::ViewerTarget::embedded_host(&connection.address).is_some();
         self.connections.retain(|known| {
             let endpoint = known.address.eq_ignore_ascii_case(&connection.address) && known.port == connection.port;
-            let same_id = advertised.is_some() && known.device_id == advertised;
+            let same_route = embedded == super::tailnet::ViewerTarget::embedded_host(&known.address).is_some();
+            let same_id = same_route && advertised.is_some() && known.device_id == advertised;
             if !same_id && !endpoint {
                 return true;
             }
@@ -321,6 +325,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.connections.extend([
             connection("moved.example", id, 1),
+            connection("tailscale:100.68.2.3", id, 1),
             connection("old-address.example", id, 1),
             connection("copied-id.example", id, 2),
             connection("different-id.example", Some(Uuid::new_v4()), 1),
@@ -330,7 +335,7 @@ mod tests {
         settings.connections.push(unreadable);
         settings.remember(connection("new.example", id, 1));
         let addresses: Vec<_> = settings.connections.iter().map(|c| c.address.as_str()).collect();
-        assert_eq!(addresses, ["new.example", "copied-id.example", "different-id.example", "unreadable.example"]);
+        assert_eq!(addresses, ["new.example", "tailscale:100.68.2.3", "copied-id.example", "different-id.example", "unreadable.example"]);
     }
 
     #[test]
@@ -351,6 +356,7 @@ mod tests {
         let json = r#"{"port":49123,"hostCode":"test-host","connections":[{"address":"example.invalid","port":49124,"name":"测试电脑","code":"test-code"}]}"#;
         let mut settings: Settings = serde_json::from_str(json).unwrap();
         assert!(settings.auto_reconnect);
+        assert!(!settings.tailscale_enabled);
         assert!(!settings.caps_forwarding);
         assert_eq!(settings.port, 49123);
         settings.auto_reconnect = false;

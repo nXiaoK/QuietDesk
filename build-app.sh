@@ -28,20 +28,30 @@ else
   ARCHES=("$ARCH")
 fi
 BINARIES=()
+TAILNET_BINARIES=()
 for TARGET_ARCH in "${ARCHES[@]}"; do
   swift build --product QuietDesk -c release --arch "$TARGET_ARCH" --scratch-path "$BUILD_ROOT" --disable-sandbox \
     --cache-path "$BUILD_ROOT/cache" --config-path "$BUILD_ROOT/config" --security-path "$BUILD_ROOT/security"
   BIN_DIR="$(swift build -c release --arch "$TARGET_ARCH" --show-bin-path --scratch-path "$BUILD_ROOT" --disable-sandbox \
     --cache-path "$BUILD_ROOT/cache" --config-path "$BUILD_ROOT/config" --security-path "$BUILD_ROOT/security")"
   BINARIES+=("$BIN_DIR/QuietDesk")
+  GO_ARCH="$TARGET_ARCH"
+  if [[ "$GO_ARCH" == "x86_64" ]]; then GO_ARCH=amd64; fi
+  TAILNET_SLICE="$BIN_DIR/QuietDeskTailnet"
+  CGO_ENABLED=0 GOARCH="$GO_ARCH" GOOS=darwin go -C tailnet build -mod=readonly -trimpath -buildvcs=false \
+    -tags ts_omit_logtail -ldflags="-s -w" -o "${TAILNET_SLICE:A}" .
+  TAILNET_BINARIES+=("$TAILNET_SLICE")
 done
 APP="$DIST_ROOT/QuietDesk.app"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 cp "$PWD/Resources/QuietDesk.icns" "$APP/Contents/Resources/QuietDesk.icns"
+cp "$PWD/Resources/Tailnet-Licenses.txt" "$APP/Contents/Resources/"
 if [[ "${#BINARIES[@]}" == "2" ]]; then
   xcrun lipo -create "${BINARIES[@]}" -output "$APP/Contents/MacOS/QuietDesk.building"
+  xcrun lipo -create "${TAILNET_BINARIES[@]}" -output "$APP/Contents/Helpers/QuietDeskTailnet"
 else
   cp "${BINARIES[1]}" "$APP/Contents/MacOS/QuietDesk.building"
+  cp "${TAILNET_BINARIES[1]}" "$APP/Contents/Helpers/QuietDeskTailnet"
 fi
 mv -f "$APP/Contents/MacOS/QuietDesk.building" "$APP/Contents/MacOS/QuietDesk"
 cat > "$APP/Contents/Info.plist" <<PLIST

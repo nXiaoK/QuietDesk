@@ -60,7 +60,21 @@ pub enum DatagramEvent {
     Closed,
 }
 
+pub type HostSocketObserver = Arc<dyn Fn(bool, Arc<std::net::UdpSocket>) + Send + Sync>;
+
+struct HostBinding {
+    observer: HostSocketObserver,
+    socket: Arc<std::net::UdpSocket>,
+}
+
+impl Drop for HostBinding {
+    fn drop(&mut self) {
+        (self.observer)(false, self.socket.clone());
+    }
+}
+
 pub struct DatagramTransport {
+    binding: Option<HostBinding>,
     events: mpsc::Receiver<DatagramEvent>,
     sender: DatagramSender,
     task: JoinHandle<()>,
@@ -132,12 +146,12 @@ impl Drop for DatagramTransport {
 }
 
 pub fn host(local: SocketAddr, key: [u8; 32], id: Uuid) -> Result<DatagramTransport> {
-    start(local, None, key, id)
+    start(local, None, key, id, None)
 }
 
 pub fn viewer(remote: SocketAddr, key: [u8; 32], id: Uuid) -> Result<DatagramTransport> {
     let any = if remote.is_ipv4() { IpAddr::V4(Ipv4Addr::UNSPECIFIED) } else { IpAddr::V6(Ipv6Addr::UNSPECIFIED) };
-    start(SocketAddr::new(any, 0), Some(remote), key, id)
+    start(SocketAddr::new(any, 0), Some(remote), key, id, None)
 }
 
 trait PacketSocket: Send + Sync + 'static {
@@ -155,11 +169,20 @@ impl PacketSocket for UdpSocket {
     }
 }
 
-fn start(local: SocketAddr, remote: Option<SocketAddr>, key: [u8; 32], id: Uuid) -> Result<DatagramTransport> {
+pub(crate) fn observed_host(local: SocketAddr, key: [u8; 32], id: Uuid, observer: Option<&HostSocketObserver>) -> Result<DatagramTransport> {
+    start(local, None, key, id, observer)
+}
+
+fn start(local: SocketAddr, remote: Option<SocketAddr>, key: [u8; 32], id: Uuid, observer: Option<&HostSocketObserver>) -> Result<DatagramTransport> {
     let socket = std::net::UdpSocket::bind(local)?;
     socket.set_nonblocking(true)?;
-    let socket = UdpSocket::from_std(socket)?;
-    start_with_socket(socket, remote, key, id)
+    let bound = observer.map(|observe| socket.try_clone().map(|handle| (observe.clone(), Arc::new(handle)))).transpose()?;
+    let mut transport = start_with_socket(UdpSocket::from_std(socket)?, remote, key, id)?;
+    if let Some((observer, socket)) = bound {
+        observer(true, socket.clone());
+        transport.binding = Some(HostBinding { observer, socket });
+    }
+    Ok(transport)
 }
 
 fn start_with_socket<S: PacketSocket>(socket: S, remote: Option<SocketAddr>, key: [u8; 32], id: Uuid) -> Result<DatagramTransport> {
@@ -172,7 +195,7 @@ fn start_with_socket<S: PacketSocket>(socket: S, remote: Option<SocketAddr>, key
         run(socket, context, cookie_peer, remote, &events, outgoing, &ready).await;
         ready.store(false, Ordering::Release);
     });
-    Ok(DatagramTransport { events: received, sender, task })
+    Ok(DatagramTransport { binding: None, events: received, sender, task })
 }
 
 fn cookie_digest(mac_key: &PKey<Private>, addr: SocketAddr) -> std::result::Result<[u8; 16], ErrorStack> {

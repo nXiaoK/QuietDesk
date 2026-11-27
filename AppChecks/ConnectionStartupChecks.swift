@@ -128,8 +128,9 @@ struct ConnectionStartupChecks {
             deadline?.cancel()
             deadline?.arm(after: .milliseconds(20)) { oldCalls += 1 }
             deadline?.arm(after: .milliseconds(80)) { newCalls += 1 }
-            try await Task.sleep(for: .milliseconds(150))
-            try require(oldCalls == 0 && newCalls == 1 && deadline?.isArmed == false, "Old deadline escaped its generation")
+            try await eventually("Replacement deadline did not fire") { newCalls > 0 }
+            try require(oldCalls == 0, "Old deadline escaped its generation")
+            try require(newCalls == 1 && deadline?.isArmed == false, "Replacement deadline did not fire exactly once and disarm")
             deadline?.arm(after: .milliseconds(20)) { oldCalls += 1 }
             deadline = nil
             try await Task.sleep(for: .milliseconds(60))

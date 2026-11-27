@@ -79,6 +79,24 @@ private struct ConnectionEntryChecks {
             try require(ConnectionEntryPresentation.title(direct) == direct.address && direct.name == "  ", "Name was changed")
             try require(ConnectionEntryPresentation.title(relay) == "已保存的 Mac", "Empty relay name had no title")
         }
+        run("A saved custom name survives a reported name refresh and remains searchable") {
+            var record = try JSONDecoder().decode(ConnectionRecord.self, from: JSONEncoder().encode(relayed))
+            try require(record.customName == nil, "Legacy records unexpectedly acquired a custom name")
+            record.customName = "办公室远控"
+            record.name = "工作 Mac Studio"
+            let restored = try JSONDecoder().decode(ConnectionRecord.self, from: JSONEncoder().encode(record))
+            try require(restored == record && ConnectionEntryPresentation.title(restored) == "办公室远控",
+                        "Persisting the custom name changed connection metadata or lost the visible title")
+            try require(ConnectionEntryPresentation.matching([restored], query: "办公室") == [restored]
+                        && ConnectionEntryPresentation.matching([restored], query: "Mac Studio") == [restored]
+                        && ConnectionEntryPresentation.deviceSymbol(restored) == "macstudio",
+                        "The custom name hid the reported name from search or changed the device symbol")
+
+            record.customName = " \n "
+            let recovered = try JSONDecoder().decode(ConnectionRecord.self, from: JSONEncoder().encode(record))
+            try require(recovered.customName == nil && ConnectionEntryPresentation.title(recovered) == record.name,
+                        "A blank stored custom name hid the reported name")
+        }
         run("An existing failure always keeps recovery visible even when its string repeats") {
             try require(ConnectionEntryPresentation.showsForm(hasRecords: true, expanded: false, failure: "same error"),
                         "A repeated failure could hide the recovery fields")

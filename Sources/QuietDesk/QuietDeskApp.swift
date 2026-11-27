@@ -326,6 +326,7 @@ struct DeskView: View {
     @State private var workspaceDeviceListInitialized = false
     @State private var showNewConnection = false
     @State private var openDeviceRequest: UUID?
+    @State private var recordToRename: ConnectionRecord?
     @State private var sidebarCollapsed = false
     @State private var dismissedClipboardStatus = ""
     @State private var dismissedReceptionID: UUID?
@@ -495,6 +496,11 @@ struct DeskView: View {
         .sheet(isPresented: $showTypeTextSheet) {
             RemoteTypeTextSheet(model: model, done: { showTypeTextSheet = false })
         }
+        .sheet(item: $recordToRename) { record in
+            DeviceRenameSheet(name: ConnectionEntryPresentation.title(record)) { name in
+                try models.viewer.renameConnection(id: record.id, to: name)
+            }
+        }
         .sheet(item: $routeBenchmarkRunner) { runner in
             RouteQualityBenchmarkView(
                 runner: runner,
@@ -522,6 +528,7 @@ struct DeskView: View {
             showPortMapping = false
             showTypeTextSheet = false
             showNewConnection = false
+            recordToRename = nil
             routeBenchmarkRunner?.shutdown()
             routeBenchmarkRunner = nil
         }
@@ -532,6 +539,7 @@ struct DeskView: View {
             showPortMapping = false
             showTypeTextSheet = false
             showNewConnection = false
+            recordToRename = nil
             routeBenchmarkRunner?.shutdown()
             routeBenchmarkRunner = nil
         }
@@ -558,7 +566,7 @@ struct DeskView: View {
         .onChange(of: fullScreenToolbarCanvas, initial: true) { _, canvas in
             if canvas != nil { fullScreenToolbar.start(canvas: model.canvas) } else { fullScreenToolbar.stop() }
         }
-        .onChange(of: showOptions || showCapsSettings || showTrafficStatistics || showSessionEffects || showPortMapping || showTypeTextSheet || showFullScreenMenu || showNewConnection || routeBenchmarkRunner != nil) { _, presented in
+        .onChange(of: showOptions || showCapsSettings || showTrafficStatistics || showSessionEffects || showPortMapping || showTypeTextSheet || showFullScreenMenu || showNewConnection || recordToRename != nil || routeBenchmarkRunner != nil) { _, presented in
             updates.interfacePromptVisible = presented
             if !presented { model.resumeControlAfterLocalUI() }
         }
@@ -1034,6 +1042,7 @@ struct DeskView: View {
                             models.workspaceSection = .connect
                             openDeviceRequest = id
                         },
+                        renameDevice: { recordToRename = $0 },
                         showNetwork: {
                             guard !roleLocked else { return }
                             if models.viewer.portMappings.hostApprovalPending || models.host.portMappings.hostApprovalPending {
@@ -1562,6 +1571,7 @@ private struct DeskWorkspaceSidebar: View {
     let newConnection: () -> Void
     /// Shows a device's page and connects to it, or brings its session window forward.
     let openDevice: (UUID) -> Void
+    let renameDevice: (ConnectionRecord) -> Void
     let showNetwork: () -> Void
     @State private var copiedHostCode = false
     @State private var recordToRemove: ConnectionRecord?
@@ -1727,7 +1737,7 @@ private struct DeskWorkspaceSidebar: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel(title)
         .accessibilityValue(status ?? "未连接")
-        .help(status ?? "点按查看设备；连按两次或按 Return 连接，按住拖动可调整顺序")
+        .help(status ?? "点按查看设备；连按两次或按 Return 连接，右键可重命名，按住拖动可调整顺序")
     }
 
     @ViewBuilder
@@ -1739,6 +1749,7 @@ private struct DeskWorkspaceSidebar: View {
                 Button("断开连接", role: .destructive) { models.disconnectViewerSession(id: session.sessionID) }
             }
             Divider()
+            Button("重命名…") { renameDevice(record) }
             Button("移除此记录…", role: .destructive) { recordToRemove = record }
                 .disabled(viewer.active || viewer.working || viewer.isRunningRouteBenchmark)
         } else {
@@ -1826,6 +1837,64 @@ private struct DeskWorkspaceSidebar: View {
         .menuIndicator(.hidden)
         .tint(DeskPalette.muted)
         .help("共享快捷操作")
+    }
+}
+
+private struct DeviceRenameSheet: View {
+    let save: (String) throws -> Void
+    private let initialName: String
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var nameFocused: Bool
+    @State private var name: String
+    @State private var failure: String?
+
+    init(name: String, save: @escaping (String) throws -> Void) {
+        initialName = name
+        _name = State(initialValue: name)
+        self.save = save
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            DeskSectionHeading(title: "重命名设备", detail: "此名称仅在本机显示。")
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("设备名称")
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundStyle(DeskPalette.secondary)
+                    .accessibilityHidden(true)
+                TextField("设备名称", text: $name)
+                    .font(.system(size: 13))
+                    .focused($nameFocused)
+                    .deskInputBox(focused: nameFocused)
+            }
+
+            if let failure {
+                DeskCalloutBox(message: failure, symbol: "exclamationmark.circle", tone: .danger)
+            }
+
+            HStack(spacing: 10) {
+                Spacer()
+                Button("取消") { dismiss() }
+                    .buttonStyle(DeskButtonStyle(.secondary))
+                    .keyboardShortcut(.cancelAction)
+                Button("保存") {
+                    do {
+                        try save(name)
+                        dismiss()
+                    } catch {
+                        failure = error.localizedDescription
+                    }
+                }
+                .buttonStyle(DeskButtonStyle(.primary))
+                .keyboardShortcut(.defaultAction)
+                .disabled(name == initialName)
+            }
+        }
+        .padding(26)
+        .frame(width: 420)
+        .deskSurface()
+        .onAppear { nameFocused = true }
     }
 }
 

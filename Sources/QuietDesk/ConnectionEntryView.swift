@@ -57,6 +57,9 @@ enum ConnectionEntryPresentation {
         guard !query.isEmpty else { return records }
         return records.filter { record in
             var fields = [record.name, record.address, String(record.port)]
+            if let customName = record.customName {
+                fields.append(customName)
+            }
             if let deviceID = record.deviceID {
                 fields.append(deviceID.uuidString)
             }
@@ -77,8 +80,9 @@ enum ConnectionEntryPresentation {
     }
 
     static func title(_ record: ConnectionRecord) -> String {
-        record.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? (record.address.isEmpty ? "已保存的 Mac" : record.address) : record.name
+        let name = record.displayName
+        return name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? (record.address.isEmpty ? "已保存的 Mac" : record.address) : name
     }
 
     static func endpoint(_ record: ConnectionRecord) -> String {

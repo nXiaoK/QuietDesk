@@ -2341,10 +2341,12 @@ final class DeskModel: ObservableObject, Identifiable {
     }
 
     var sessionWindowTitle: String {
+        let recordID = currentRecordID ?? target?.recordID ?? lastSessionLaunch?.target.recordID
+        let record = recordID.flatMap { id in connections.first { $0.id == id } }
+        if let customName = record?.customName { return customName }
         if !remoteName.isEmpty { return remoteName }
-        if let id = currentRecordID ?? target?.recordID ?? lastSessionLaunch?.target.recordID,
-           let matched = connections.first(where: { $0.id == id }) {
-            return ConnectionEntryPresentation.title(matched)
+        if let record {
+            return ConnectionEntryPresentation.title(record)
         }
         let cleanAddress = (target?.address ?? lastSessionLaunch?.target.address ?? address)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3450,6 +3452,21 @@ final class DeskModel: ObservableObject, Identifiable {
         guard !active, !working else { return }
         guard let launch = prepareQuickConnectLaunch(record) else { return }
         startLaunchedSession(launch)
+    }
+
+    func renameConnection(id: UUID, to name: String) throws {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw DeskError.invalid("请输入设备名称") }
+        guard let index = connections.firstIndex(where: { $0.id == id }) else {
+            throw DeskError.invalid("未找到要重命名的设备记录")
+        }
+        guard ConnectionEntryPresentation.title(connections[index]) != name else { return }
+
+        var updated = connections
+        updated[index].customName = name
+        try ConnectionStore.save(updated)
+        connections = updated
+        services.notifyConnectionsChanged(excluding: self)
     }
 
     func removeConnection(_ record: ConnectionRecord) {
@@ -6490,7 +6507,7 @@ final class DeskModel: ObservableObject, Identifiable {
                 : nil
             let relayID = record.relay?.deviceID ?? fallbackRelay
             let endpoint = ConnectionEntryPresentation.endpoint(record)
-            let trimmedName = record.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedName = record.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
             let label = trimmedName.isEmpty ? endpoint : "\(trimmedName)（\(endpoint)）"
             return RouteBenchmarkTargetDescriptor(
                 displayName: label,
@@ -6526,7 +6543,7 @@ final class DeskModel: ObservableObject, Identifiable {
         let label: String
         if let matchedRecord {
             let endpoint = ConnectionEntryPresentation.endpoint(matchedRecord)
-            let trimmedName = matchedRecord.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmedName = matchedRecord.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
             label = trimmedName.isEmpty ? endpoint : "\(trimmedName)（\(endpoint)）"
         } else if !cleanAddress.isEmpty && relayEnabled && !cleanDevice.isEmpty {
             label = "\(cleanAddress):\(port) ＋ 中继设备 \(cleanDevice.prefix(8))…"

@@ -29,6 +29,7 @@ public struct ConnectionRecord: Codable, Identifiable, Equatable, Sendable {
     public var address: String
     public var port: UInt16
     public var name: String
+    public var customName: String?
     public var lastConnected: Date
     public var videoSettings: StreamSettings?
     public var chromaSubsampling: VideoChromaSubsampling?
@@ -49,7 +50,7 @@ public struct ConnectionRecord: Codable, Identifiable, Equatable, Sendable {
     }
     private enum CodingKeys: String, CodingKey {
         case id, address, port, name, lastConnected, videoSettings, chromaSubsampling, relay, higherFrameRateVideoSettings, deviceID, wakeOnLAN
-        case sustainedVideoSize
+        case sustainedVideoSize, customName
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -57,6 +58,9 @@ public struct ConnectionRecord: Codable, Identifiable, Equatable, Sendable {
         address = try values.decode(String.self, forKey: .address)
         port = try values.decode(UInt16.self, forKey: .port)
         name = try values.decode(String.self, forKey: .name)
+        customName = (try? values.decode(String.self, forKey: .customName))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if customName?.isEmpty == true { customName = nil }
         lastConnected = try values.decode(Date.self, forKey: .lastConnected)
         videoSettings = try values.decodeIfPresent(StreamSettings.self, forKey: .videoSettings)
         chromaSubsampling = try? values.decode(VideoChromaSubsampling.self, forKey: .chromaSubsampling)
@@ -76,6 +80,7 @@ public struct ConnectionRecord: Codable, Identifiable, Equatable, Sendable {
         try values.encode(address, forKey: .address)
         try values.encode(port, forKey: .port)
         try values.encode(name, forKey: .name)
+        try values.encodeIfPresent(customName, forKey: .customName)
         try values.encode(lastConnected, forKey: .lastConnected)
         try values.encodeIfPresent(videoSettings?.highRefreshCompatible, forKey: .videoSettings)
         try values.encodeIfPresent(chromaSubsampling, forKey: .chromaSubsampling)
@@ -87,6 +92,8 @@ public struct ConnectionRecord: Codable, Identifiable, Equatable, Sendable {
             try values.encode(videoSettings, forKey: .higherFrameRateVideoSettings)
         }
     }
+    public var displayName: String { customName ?? name }
+
     public func matches(address: String, port: UInt16) -> Bool {
         self.port == port && self.address.caseInsensitiveCompare(address) == .orderedSame
     }

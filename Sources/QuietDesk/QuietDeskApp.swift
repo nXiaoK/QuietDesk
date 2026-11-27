@@ -337,7 +337,7 @@ struct DeskView: View {
         !models.viewer.isRunningRouteBenchmark && (models.viewer.connected || models.viewer.reconnecting)
     }
     private var sessionLayout: Bool { isDedicatedSessionWindow || (model.mode == .viewer && viewerHasSession) }
-    private var immersive: Bool { model.isFullScreen && model.mode == .viewer }
+    private var immersive: Bool { sessionLayout && model.isFullScreen }
     private var remoteTitle: String { model.sessionWindowTitle }
     private var remoteSubtitle: String {
         let phase: String
@@ -373,7 +373,7 @@ struct DeskView: View {
 
     var body: some View {
         Group {
-            if sessionLayout || immersive {
+            if sessionLayout {
                 VStack(spacing: 0) {
                     if updates.showBanner && !immersive { UpdateBanner(controller: updates) }
                     remoteContent
@@ -391,7 +391,7 @@ struct DeskView: View {
         .background(
             WindowReader(
                 sessionChrome: sessionLayout && !immersive,
-                immersiveFullScreen: model.mode == .viewer,
+                immersiveFullScreen: sessionLayout,
                 restorable: !isDedicatedSessionWindow,
                 resolved: { window in
                     if isDedicatedSessionWindow {
@@ -417,7 +417,7 @@ struct DeskView: View {
         )
         .focusedSceneValue(\.viewerSession, isDedicatedSessionWindow ? model : nil)
         .frame(minWidth: 700, minHeight: 560)
-        .ignoresSafeArea(.all, edges: immersive ? .all : (!sessionLayout ? .top : []))
+        .ignoresSafeArea(.all, edges: immersive ? .all : [])
         .navigationTitle(sessionLayout ? remoteTitle : "")
         .navigationSubtitle(sessionLayout ? remoteSubtitle : "")
         .toolbar {
@@ -1108,7 +1108,7 @@ struct DeskView: View {
                         .font(.system(size: 13.5, weight: .semibold))
                         .foregroundStyle(DeskPalette.ink)
                 }
-                .padding(.leading, 78)
+                .padding(.leading, 16)
 
                 Spacer(minLength: 0)
 
@@ -1236,7 +1236,7 @@ struct DeskView: View {
         model.releaseControlForLocalUI()
         showOptions = false
         showFullScreenMenu = false
-        if sessionLayout || immersive {
+        if sessionLayout {
             showPortMapping = true
         } else {
             networkSubTab = model.mode == .host ? .hostApprovals : .viewerMappings
@@ -1248,7 +1248,7 @@ struct DeskView: View {
         model.releaseControlForLocalUI()
         showOptions = false
         showFullScreenMenu = false
-        if sessionLayout || immersive {
+        if sessionLayout {
             showTrafficStatistics = true
         } else {
             diagnosticsSubTab = .traffic
@@ -1260,7 +1260,7 @@ struct DeskView: View {
         model.releaseControlForLocalUI()
         showOptions = false
         showFullScreenMenu = false
-        if sessionLayout || immersive {
+        if sessionLayout {
             showSessionEffects = true
         } else {
             preferencesSubTab = .privacy
@@ -1273,7 +1273,7 @@ struct DeskView: View {
         model.releaseControlForLocalUI()
         showOptions = false
         showFullScreenMenu = false
-        if sessionLayout || immersive {
+        if sessionLayout {
             routeBenchmarkRunner = RouteQualityBenchmarkRunner(model: models.viewer, record: record)
         } else {
             inlineBenchmarkRecord = record
@@ -1592,7 +1592,7 @@ private struct DeskWorkspaceSidebar: View {
                 Text("QuietDesk")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(DeskPalette.ink)
-                    .padding(.leading, 78)
+                    .padding(.leading, 18)
                 Spacer(minLength: 0)
                 Button(action: toggleSidebar) {
                     Image(systemName: "sidebar.left")
@@ -2051,23 +2051,16 @@ private struct WindowReader: NSViewRepresentable {
             if window.backgroundColor == .black {
                 window.backgroundColor = .windowBackgroundColor
             }
-            if sessionChrome {
-                if window.styleMask.contains(.fullSizeContentView) {
-                    window.styleMask.remove(.fullSizeContentView)
-                }
-                if window.titleVisibility != .visible { window.titleVisibility = .visible }
-                if window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = false }
-                if window.titlebarSeparatorStyle != .automatic { window.titlebarSeparatorStyle = .automatic }
-                if window.toolbar?.isVisible == false { window.toolbar?.isVisible = true }
-            } else {
-                if !window.styleMask.contains(.fullSizeContentView) {
-                    window.styleMask.insert(.fullSizeContentView)
-                }
-                if window.titleVisibility != .hidden { window.titleVisibility = .hidden }
-                if !window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = true }
-                if window.titlebarSeparatorStyle != .none { window.titlebarSeparatorStyle = .none }
-                if window.toolbar?.isVisible == true { window.toolbar?.isVisible = false }
+            // AppKit reserves the title bar above the workspace, including after a resize.
+            if window.styleMask.contains(.fullSizeContentView) {
+                window.styleMask.remove(.fullSizeContentView)
             }
+            if window.titlebarAppearsTransparent { window.titlebarAppearsTransparent = false }
+            let titleVisibility: NSWindow.TitleVisibility = sessionChrome ? .visible : .hidden
+            if window.titleVisibility != titleVisibility { window.titleVisibility = titleVisibility }
+            let separatorStyle: NSTitlebarSeparatorStyle = sessionChrome ? .automatic : .none
+            if window.titlebarSeparatorStyle != separatorStyle { window.titlebarSeparatorStyle = separatorStyle }
+            if let toolbar = window.toolbar, toolbar.isVisible != sessionChrome { toolbar.isVisible = sessionChrome }
             for buttonType: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
                 if let button = window.standardWindowButton(buttonType) {
                     if button.isHidden { button.isHidden = false }

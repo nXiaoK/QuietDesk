@@ -397,6 +397,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         let sourceWidth: Int
         let sourceHeight: Int
         fileprivate let settings: StreamSettings
+        fileprivate let viewport: VideoViewport?
         let width: Int
         let height: Int
         let colorSpace: VideoColorSpace
@@ -541,13 +542,13 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         CGDisplayCopyColorSpace(id).isWideGamutRGB ? .displayP3 : .sRGB
     }
 
-    static func prepareCapture(display: SCDisplay, settings: StreamSettings,
+    static func prepareCapture(display: SCDisplay, settings: StreamSettings, viewport: VideoViewport? = nil,
                                excludingWindows: [SCWindow] = []) -> CapturePlan {
         let filter = SCContentFilter(display: display, excludingWindows: excludingWindows)
         let source = sourceDimensions(filter: filter, displayID: display.displayID)
-        let (width, height) = settings.dimensions(width: source.width, height: source.height)
+        let (width, height) = settings.dimensions(width: source.width, height: source.height, viewport: viewport)
         return CapturePlan(filter: filter, displayID: display.displayID, sourceWidth: source.width,
-                           sourceHeight: source.height, settings: settings, width: width, height: height,
+                           sourceHeight: source.height, settings: settings, viewport: viewport, width: width, height: height,
                            colorSpace: displayColorSpace(display.displayID))
     }
 
@@ -1031,7 +1032,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
 
     // Same-size, same-codec, same-chroma changes (bitrate and/or frame rate) update the running encoder and
     // capture interval in place without draining in-flight frames or restarting the media epoch.
-    func updateEncodingParameters(_ settings: StreamSettings, codec: VideoCodec? = nil,
+    func updateEncodingParameters(_ settings: StreamSettings, viewport: VideoViewport? = nil, codec: VideoCodec? = nil,
                                   chromaSubsampling: VideoChromaSubsampling? = nil) async throws -> VideoStreamState {
         try settings.validateControlValues()
         let (state, pending) = try queue.sync { () throws -> (VideoStreamState, (SCStream, VideoEncoder, CaptureFrameRateChange)?) in
@@ -1043,7 +1044,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
             let targetChroma: VideoChromaSubsampling = targetCodec == .hevc
                 ? (chromaSubsampling ?? encoder.chromaSubsampling)
                 : .yuv420
-            let (width, height) = settings.dimensions(width: sourceWidth, height: sourceHeight)
+            let (width, height) = settings.dimensions(width: sourceWidth, height: sourceHeight, viewport: viewport)
             guard targetCodec == encoder.codec, targetChroma == encoder.chromaSubsampling,
                   width == outputWidth, height == outputHeight else {
                 throw DeskError.invalid("画质尺寸或编码格式变化需要重新配置")
@@ -1083,7 +1084,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
 
     /// `codec` and `chromaSubsampling` nil keep the running encoder's values.
-    func reconfigure(_ settings: StreamSettings, codec: VideoCodec? = nil,
+    func reconfigure(_ settings: StreamSettings, viewport: VideoViewport? = nil, codec: VideoCodec? = nil,
                      chromaSubsampling: VideoChromaSubsampling? = nil) async throws -> VideoStreamState {
         try settings.validateControlValues()
         let snapshot = try queue.sync { () throws -> (SCStream, Int, Int, Int, Int, StreamSettings, Bool, VideoCodec, VideoChromaSubsampling, VideoColorSpace, SCContentFilter?, Bool, Bool) in
@@ -1097,7 +1098,7 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                     encoder?.codec ?? .h264, encoder?.chromaSubsampling ?? .yuv420, captureColorSpace, activeFilter,
                     encoder != nil && !frameFlow.encodingFailed, capturesAudio)
         }
-        let (width, height) = settings.dimensions(width: snapshot.1, height: snapshot.2)
+        let (width, height) = settings.dimensions(width: snapshot.1, height: snapshot.2, viewport: viewport)
         let targetCodec = codec ?? snapshot.7
         let requestedChroma: VideoChromaSubsampling = targetCodec == .hevc ? (chromaSubsampling ?? snapshot.8) : .yuv420
         let canUpdateInPlace = snapshot.11 && width == snapshot.3 && height == snapshot.4
@@ -1217,7 +1218,8 @@ final class ScreenStreamer: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
                     excludedWindowIDs, encoder != nil && !frameFlow.encodingFailed, capturesAudio)
         }
         let settings = snapshot.1
-        let (width, height) = settings.dimensions(width: capture.sourceWidth, height: capture.sourceHeight)
+        let (width, height) = settings.dimensions(width: capture.sourceWidth, height: capture.sourceHeight,
+                                                  viewport: capture.viewport)
         let targetCodec = snapshot.3
         let requestedChroma: VideoChromaSubsampling = targetCodec == .hevc ? snapshot.4 : .yuv420
         let canReuseEncoder = snapshot.13 && width == snapshot.9 && height == snapshot.10 && capture.colorSpace == snapshot.11

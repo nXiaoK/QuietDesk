@@ -676,6 +676,7 @@ final class DeskModel: ObservableObject, Identifiable {
         }
 
         canvas.scalingMode = canvasScalingMode
+        canvas.onVideoViewportChange = { [weak self] in self?.scheduleViewerVideoViewport() }
         canvas.capturesSystemShortcutsInWindow = systemShortcutsInWindow
         canvas.onUserActivity = { [weak self] in self?.recordSessionActivity() }
         canvas.onInput = { [weak self] value in
@@ -1273,7 +1274,8 @@ final class DeskModel: ObservableObject, Identifiable {
             updateDisplayFallbackNotice()
             let currentSettings = activeVideoState?.settings ?? settings.legacyCompatible
             let (newOutWidth, newOutHeight) = currentSettings.dimensions(width: nextSelection.pixelWidth,
-                                                                         height: nextSelection.pixelHeight)
+                                                                         height: nextSelection.pixelHeight,
+                                                                         viewport: hostSession.videoViewport)
             let sameOutputDimensions = activeVideoState.map {
                 $0.width == newOutWidth && $0.height == newOutHeight
             } ?? false
@@ -1974,7 +1976,8 @@ final class DeskModel: ObservableObject, Identifiable {
                             initialCursorNegotiationV1: true,
                             qualityProbeV1: true,
                             typeTextV1: true,
-                            automaticDefaultQualityV1: ownerChoseQuality ? nil : true)))
+                            automaticDefaultQualityV1: ownerChoseQuality ? nil : true,
+                            videoViewportV1: true)))
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
                         channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
@@ -2026,8 +2029,9 @@ final class DeskModel: ObservableObject, Identifiable {
                             activeChroma = activeCodec == .hevc
                                 && request.chromaSubsampling == .yuv444
                                 && VideoEncoder.hardwareHEVC444Available ? .yuv444 : .yuv420
-                            if request.settings != settings {
-                                activeCapture = ScreenStreamer.prepareCapture(display: display, settings: request.settings)
+                            if request.settings != settings || request.viewport != nil {
+                                activeCapture = ScreenStreamer.prepareCapture(display: display, settings: request.settings,
+                                                                             viewport: request.viewport)
                             }
                             if let wantIndependent = request.independentCursor {
                                 if !wantIndependent, let error = host.effects?.setIndependentCursor(false) {
@@ -2045,6 +2049,7 @@ final class DeskModel: ObservableObject, Identifiable {
                             return
                         }
                         if let request = negotiatedInitial {
+                            host.videoViewport = request.viewport
                             if let cursorReqID = request.cursorRequestID, request.independentCursor != nil {
                                 let actualIncluded = streamer.currentCursorIncluded ?? initialIncludesCursor
                                 host.cursorEnabled = !actualIncluded
@@ -3819,6 +3824,8 @@ final class DeskModel: ObservableObject, Identifiable {
             supportsDisplayDimming = supportsSessionEffects && hello.displayDimmingV1 == true
             hostDisplayDimmable = supportsDisplayDimming && hello.builtInDisplayDimmable == true
             supportsAdaptiveVideo = supportsHighRefreshVideoSettings && hello.adaptiveVideoV1 == true
+            viewerSession.supportsVideoViewport = supportsLiveSettings && hello.videoViewportV1 == true
+                && activeRouteBenchmarkOverride == nil
             supportsSessionUnlock = hello.sessionUnlockV1 == true
             supportsDesktopActions = hello.desktopActionsV1 == true
             supportsRemoteTextTyping = hello.typeTextV1 == true
@@ -3851,6 +3858,7 @@ final class DeskModel: ObservableObject, Identifiable {
                                                                          supportsHighRefresh: supportsHighRefreshVideoSettings,
                                                                          supportsHigherFrameRate: supportsHigherFrameRateVideo)
                 videoTuning = try VideoTuningSession(applied: state, preferred: preferred, supportsInPlaceBitrate: supportsAdaptiveVideo)
+                if viewerSession.supportsVideoViewport { videoTuning?.chooseViewport(canvas.videoViewport) }
                 // HEVC needs the host's hardware encoder and this Mac's hardware decoder; either missing keeps H.264.
                 if hevcSupported {
                     videoTuning?.chooseCodec(.hevc)
@@ -4070,7 +4078,10 @@ final class DeskModel: ObservableObject, Identifiable {
             let previous = tuning.applied.settings
             let previousCodec = tuning.appliedCodec
             let previousChroma = tuning.appliedChroma
+            let previousViewport = tuning.appliedViewport
             guard let request = try tuning.completeRequest(result, maximumFrameRate: supportsHigherFrameRateVideo ? StreamSettings.frameRates.last! : 60) else { return }
+            let viewportOnly = request.viewport != previousViewport && request.settings == previous
+                && (request.codec ?? .h264) == previousCodec && (request.chromaSubsampling ?? .yuv420) == previousChroma
             viewerSession.videoRequestTimeout?.cancel()
             videoTuning = tuning
             activeVideoState = result.state
@@ -4084,7 +4095,8 @@ final class DeskModel: ObservableObject, Identifiable {
                     && previousCodec == tuning.appliedCodec
                     && previousChroma == tuning.appliedChroma))
             viewerSession.media?.updateSettings(result.state.settings, restartsStream: !inPlace)
-            viewerSession.mediaQuality?.receiveSettingsResult(result, for: request.settings, now: SessionClock.now)
+            viewerSession.mediaQuality?.receiveSettingsResult(result, for: request.settings, viewport: tuning.appliedViewport,
+                                                               now: SessionClock.now)
             viewerSession.mediaQuality?.synchronizeTrueColor(tuning.appliedChroma == .yuv444)
             let wasAutomatic = viewerSession.automaticVideoSettings == request.settings
             let adjustment = wasAutomatic && result.error == nil ? viewerSession.automaticVideoAdjustment : nil
@@ -4092,7 +4104,7 @@ final class DeskModel: ObservableObject, Identifiable {
                 viewerSession.automaticVideoSettings = nil
                 viewerSession.automaticVideoAdjustment = nil
             }
-            if result.error == nil {
+            if result.error == nil, !viewportOnly {
                 let withoutTrueColor = tuning.appliedChroma == .yuv420 && (previousChroma == .yuv444
                     || adjustment == .sustainedSize && viewerSession.mediaQuality?.leftTrueColor == true)
                 automaticQualityNote = Self.qualityNote(adjustment, applied: result.state.settings, withoutTrueColor: withoutTrueColor)
@@ -4912,9 +4924,26 @@ final class DeskModel: ObservableObject, Identifiable {
         guard connected, supportsLiveSettings, let peer, var tuning = videoTuning,
               let request = tuning.nextRequest() else { return }
         videoTuning = tuning
-        viewerSession.pendingVideoPreferenceCanSave = viewerQualityPolicy.maySaveCurrentChoice && viewerSession.automaticVideoSettings != request.settings
+        let viewportOnly = request.viewport != tuning.appliedViewport && tuning.applied.settings == request.settings
+            && tuning.appliedCodec == tuning.desiredCodec && tuning.appliedChroma == tuning.desiredChroma
+        viewerSession.pendingVideoPreferenceCanSave = !viewportOnly && viewerQualityPolicy.maySaveCurrentChoice
+            && viewerSession.automaticVideoSettings != request.settings
         videoSettingsStatus = "正在应用：\(request.settings.summary)"
         dispatchVideoSettingsRequest(request, peer: peer)
+    }
+
+    private func scheduleViewerVideoViewport() {
+        let viewer = viewerSession
+        guard connected, viewer.supportsVideoViewport else { return }
+        viewer.videoViewportTask?.cancel()
+        viewer.videoViewportTask = Task { [weak self, weak viewer] in
+            do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
+            guard let self, let viewer, self.viewerSession === viewer, var tuning = self.videoTuning,
+                  tuning.desiredViewport != self.canvas.videoViewport else { return }
+            tuning.chooseViewport(self.canvas.videoViewport)
+            self.videoTuning = tuning
+            self.sendNextVideoSettings()
+        }
     }
 
     private func sendInitialVideoConfirmationIfNeeded() {
@@ -5260,7 +5289,8 @@ final class DeskModel: ObservableObject, Identifiable {
         if let cursorReqID = request.cursorRequestID, let wantIndependent = request.independentCursor, !host.cursorSubscribed {
             applyHostCursorRequest(CursorControl(.request, requestID: cursorReqID, enabled: wantIndependent), peer: peer)
         }
-        if request.settings == state.settings, codec == activeVideoCodec, chroma == activeVideoChroma {
+        if request.settings == state.settings, codec == activeVideoCodec, chroma == activeVideoChroma,
+           request.viewport == host.videoViewport {
             if let result = try? Wire.json(.streamSettingsResult, reply(state, nil, false)) { peer.send(result) }
             return
         }
@@ -5291,11 +5321,13 @@ final class DeskModel: ObservableObject, Identifiable {
                 // Same-size, same-codec, same-chroma changes (bitrate and/or frame rate) update the running encoder in place.
                 let inPlace: VideoStreamState?
                 if self.activeVideoState != nil, codec == self.activeVideoCodec, chroma == self.activeVideoChroma {
-                    inPlace = try? await streamer.updateEncodingParameters(request.settings, codec: codec, chromaSubsampling: chroma)
+                    inPlace = try? await streamer.updateEncodingParameters(request.settings, viewport: request.viewport,
+                                                                          codec: codec, chromaSubsampling: chroma)
                     guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
                           host.settingsRequestID == request.id, !Task.isCancelled else { return }
                 } else { inPlace = nil }
                 if let updated = inPlace {
+                    host.videoViewport = request.viewport
                     self.activeVideoState = updated
                     self.recordVideoConfiguration(updated)
                     self.videoSettingsStatus = "控制端已调整：\(updated.settings.summary)" + self.activeVideoFormatSuffix
@@ -5306,9 +5338,11 @@ final class DeskModel: ObservableObject, Identifiable {
                 }
                 await self.suspendMediaForConfiguration(host.media)
                 guard self.generation == token, self.peer === peer, self.hostSession === host, !Task.isCancelled else { return }
-                let updated = try await streamer.reconfigure(request.settings, codec: codec, chromaSubsampling: chroma)
+                let updated = try await streamer.reconfigure(request.settings, viewport: request.viewport,
+                                                             codec: codec, chromaSubsampling: chroma)
                 guard self.generation == token, self.peer === peer, self.hostSession === host, host.streamer === streamer,
                       host.settingsRequestID == request.id, !Task.isCancelled else { return }
+                host.videoViewport = request.viewport
                 self.activeVideoState = updated
                 self.activeVideoCodec = streamer.videoCodec
                 self.activeVideoChroma = streamer.videoChromaSubsampling
@@ -5433,6 +5467,7 @@ final class DeskModel: ObservableObject, Identifiable {
                 }
                 let streamSettings = self.activeVideoState?.settings ?? self.settings.legacyCompatible
                 let plan = ScreenStreamer.prepareCapture(display: resolved.display, settings: streamSettings,
+                                                         viewport: host.videoViewport,
                                                          excludingWindows: excludedWindows)
                 await self.suspendMediaForConfiguration(host.media)
                 mediaSuspended = true
@@ -6083,6 +6118,7 @@ final class DeskModel: ObservableObject, Identifiable {
         oldViewer.pauseRequestTimeout?.cancel()
         oldViewer.effectsRequestTimeout?.cancel()
         oldViewer.videoDebounceTask?.cancel()
+        oldViewer.videoViewportTask?.cancel()
         oldViewer.videoRequestTimeout?.cancel()
         oldViewer.stableTask?.cancel()
         oldViewer.clipboardPullTimeout?.cancel()

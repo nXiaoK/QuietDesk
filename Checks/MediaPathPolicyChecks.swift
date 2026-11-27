@@ -1630,6 +1630,44 @@ func runMediaPathPolicyChecks() {
         try rejects("Unknown bitrate steps were accepted") { _ = try MediaQualityPolicy(hostDefault: native, bitRates: [7, 9], now: 0) }
     }
 
+    run("A portrait viewport caps useful pixel upgrades and releases them when the window grows") {
+        let ceiling = StreamSettings(longestEdge: 3840, framesPerSecond: 60, megabits: 30)
+        let current = StreamSettings(longestEdge: 1920, framesPerSecond: 60, megabits: 30)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, applied: current,
+                                             appliedSize: (1080, 1920), now: 0)
+        let smaller = VideoViewport(width: 800, height: 2500)
+        let capped = VideoStreamState(settings: current, width: 800, height: 1422)
+        quality.receiveSettingsResult(.init(id: UUID(), state: capped), for: current, viewport: smaller, now: 1)
+        for second in 2...30 {
+            try check(quality.observe(sample(), now: Double(second)) == nil, "Adaptation requested a tier with an identical rendered size")
+        }
+        let larger = VideoViewport(width: 2160, height: 3840)
+        let restored = VideoStreamState(settings: current, width: 1080, height: 1920)
+        quality.receiveSettingsResult(.init(id: UUID(), state: restored), for: current, viewport: larger, now: 31)
+        var recommendation: StreamSettings?
+        for second in 32...60 where recommendation == nil {
+            recommendation = quality.observe(sample(), now: Double(second))
+        }
+        try check(recommendation?.longestEdge == 2560 && quality.upperBound == ceiling,
+                  "Growing the viewport did not allow adaptive recovery to the selected ceiling")
+    }
+
+    run("A slow window-limited size guides the live session without entering reconnect memory") {
+        let ceiling = StreamSettings(longestEdge: 3840, framesPerSecond: 60, megabits: 30)
+        var quality = try MediaQualityPolicy(hostDefault: ceiling, preferred: ceiling, appliedSize: (3840, 2160), now: 0)
+        let viewport = VideoViewport(width: 1500, height: 900)
+        let capped = VideoStreamState(settings: ceiling, width: 1500, height: 842)
+        quality.receiveSettingsResult(.init(id: UUID(), state: capped), for: ceiling, viewport: viewport, now: 1)
+        guard let reduced = quality.reduceLoad(for: .encoder, computeMilliseconds: 25, now: 4) else {
+            throw CheckFailure("A measured slow encode could not reduce the capped size")
+        }
+        try check(reduced.longestEdge == 1280, "The reduction chose a tier above the current output size")
+        let state = VideoStreamState(settings: reduced, width: 1280, height: 720)
+        quality.receiveSettingsResult(.init(id: UUID(), state: state), for: reduced, viewport: viewport, now: 5)
+        try check(quality.sustainedSize == nil && quality.preferred == ceiling,
+                  "The window-specific downgrade would change the next session's starting size")
+    }
+
     run("A reconnect soon after a session starts from the bitrate that route settled at, and only then") {
         var memory = MediaStartingBitrate()
         let direct = "direct|home.test|5908", relay = "relay|node.test|7443|device"

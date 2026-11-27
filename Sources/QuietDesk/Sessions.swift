@@ -71,6 +71,7 @@ final class HostSession {
     var lastSentDisplays: [RemoteDisplayInfo] = []
     var settingsTask: Task<Void, Never>?
     var settingsRequestID: UUID?
+    var videoViewport: VideoViewport?
     var effects: HostSessionEffects?
     var effectsTask: Task<Void, Never>?
     var pauseTask: Task<Void, Never>?
@@ -150,6 +151,8 @@ final class ViewerSession {
     var clipboardPullTimeout: Task<Void, Never>?
     var clipboardPullPending = false
     var videoDebounceTask: Task<Void, Never>?
+    var videoViewportTask: Task<Void, Never>?
+    var supportsVideoViewport = false
     var videoRequestTimeout: Task<Void, Never>?
     var pendingVideoPreferenceCanSave = true
     var effectsRequestID: UUID?

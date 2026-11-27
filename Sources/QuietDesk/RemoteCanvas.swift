@@ -543,6 +543,12 @@ final class RemoteCanvas: NSView {
     var onRemoteSizeChange: (() -> Void)?
     /// The canvas was laid out, in a window or at a new size.
     var onLayout: (() -> Void)?
+    private(set) var videoViewport: VideoViewport? {
+        didSet {
+            if oldValue != videoViewport { onVideoViewportChange?() }
+        }
+    }
+    var onVideoViewportChange: (() -> Void)?
     var scalingMode: RemoteCanvasScalingMode = .fitWindow {
         didSet {
             guard oldValue != scalingMode else { return }
@@ -550,6 +556,7 @@ final class RemoteCanvas: NSView {
             updateLayerFrame()
             window?.invalidateCursorRects(for: self)
             updateCursorPresentation()
+            updateVideoViewport()
         }
     }
     var canControl = false {
@@ -656,6 +663,7 @@ final class RemoteCanvas: NSView {
     override func layout() {
         super.layout()
         onLayout?()
+        updateVideoViewport()
         updateLayerFrame()
         if videoLayer.status == .failed || displayedFrame == nil || mailbox.hasPendingFrame {
             showLatestFrame()
@@ -666,6 +674,23 @@ final class RemoteCanvas: NSView {
             window?.invalidateCursorRects(for: self)
         }
         updateCursorPresentation()
+    }
+
+    private func updateVideoViewport() {
+        guard let window, scalingMode == .fitWindow else {
+            videoViewport = nil
+            return
+        }
+        guard !window.inLiveResize else { return }
+        let size = convertToBacking(bounds.size)
+        guard size.width.isFinite, size.height.isFinite, size.width >= 2, size.height >= 2 else {
+            videoViewport = nil
+            return
+        }
+        let maximum = CGFloat(StreamSettings.nativeLongestEdge)
+        let width = 2 * Int(min(size.width, maximum) / 2)
+        let height = 2 * Int(min(size.height, maximum) / 2)
+        videoViewport = VideoViewport(width: width, height: height)
     }
 
     private func updateLayerFrame() {
@@ -742,6 +767,13 @@ final class RemoteCanvas: NSView {
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
         needsLayout = true
+        updateVideoViewport()
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        needsLayout = true
+        updateVideoViewport()
     }
 
     override func viewDidMoveToWindow() {
@@ -754,6 +786,7 @@ final class RemoteCanvas: NSView {
         cancelPointerMoves()
         setFileDropTargeted(false)
         needsLayout = true
+        updateVideoViewport()
         if systemShortcutMonitor.isRunning { releaseControl() }
         for observer in observers { NotificationCenter.default.removeObserver(observer) }
         observers.removeAll()

@@ -1,5 +1,23 @@
 import Foundation
 
+/// The available picture area on the viewer, in backing pixels.
+public struct VideoViewport: Codable, Equatable, Sendable {
+    public let width: Int
+    public let height: Int
+
+    public init(width: Int, height: Int) {
+        self.width = width
+        self.height = height
+    }
+
+    fileprivate func validate() throws {
+        let dimensions = 2...StreamSettings.nativeLongestEdge
+        guard dimensions.contains(width), dimensions.contains(height) else {
+            throw DeskError.invalid("控制端画面范围无效")
+        }
+    }
+}
+
 public struct VideoStreamState: Codable, Equatable, Sendable {
     public let settings: StreamSettings
     public let width: Int
@@ -26,9 +44,12 @@ public struct StreamSettingsRequest: Codable, Sendable {
     public let independentCursor: Bool?
     // A viewer that can keep decoding after an in-place bitrate change opts in.
     public let inPlaceBitrateV1: Bool?
+    // Sent only to a host that advertised videoViewportV1. Missing clears the limit.
+    public let viewport: VideoViewport?
     public init(id: UUID = UUID(), settings: StreamSettings, codec: VideoCodec? = nil,
                 chromaSubsampling: VideoChromaSubsampling? = nil,
-                cursorRequestID: UUID? = nil, independentCursor: Bool? = nil, inPlaceBitrateV1: Bool? = nil) {
+                cursorRequestID: UUID? = nil, independentCursor: Bool? = nil, inPlaceBitrateV1: Bool? = nil,
+                viewport: VideoViewport? = nil) {
         self.id = id
         self.settings = settings
         self.codec = codec
@@ -36,9 +57,11 @@ public struct StreamSettingsRequest: Codable, Sendable {
         self.cursorRequestID = cursorRequestID
         self.independentCursor = independentCursor
         self.inPlaceBitrateV1 = inPlaceBitrateV1
+        self.viewport = viewport
     }
     public func validate() throws {
         try settings.validateControlValues()
+        try viewport?.validate()
         guard (cursorRequestID == nil) == (independentCursor == nil) else {
             throw DeskError.invalid("初始光标协商字段不完整")
         }
@@ -75,6 +98,8 @@ public struct VideoTuningSession {
     public private(set) var desiredCodec: VideoCodec = .h264
     public private(set) var appliedChroma: VideoChromaSubsampling = .yuv420
     public private(set) var desiredChroma: VideoChromaSubsampling = .yuv420
+    public private(set) var appliedViewport: VideoViewport?
+    public private(set) var desiredViewport: VideoViewport?
     private var pendingInitialCursor: (requestID: UUID, enabled: Bool)?
     private let supportsInPlaceBitrate: Bool
     public init(applied: VideoStreamState, preferred: StreamSettings? = nil, supportsInPlaceBitrate: Bool = false) throws {
@@ -87,6 +112,9 @@ public struct VideoTuningSession {
     public mutating func choose(_ settings: StreamSettings) throws {
         try settings.validateControlValues()
         desired = settings
+    }
+    public mutating func chooseViewport(_ viewport: VideoViewport?) {
+        desiredViewport = viewport
     }
     /// Asks for this codec from the next request on; only for a host that advertised it.
     public mutating func chooseCodec(_ codec: VideoCodec) {
@@ -104,7 +132,8 @@ public struct VideoTuningSession {
     }
     public mutating func nextRequest() -> StreamSettingsRequest? {
         guard pending == nil,
-              desired != applied.settings || desiredCodec != appliedCodec || desiredChroma != appliedChroma else {
+              desired != applied.settings || desiredCodec != appliedCodec || desiredChroma != appliedChroma
+                || desiredViewport != appliedViewport else {
             return nil
         }
         return makeRequest()
@@ -126,7 +155,8 @@ public struct VideoTuningSession {
             chromaSubsampling: effectiveChroma == .yuv420 && appliedChroma == .yuv420 ? nil : effectiveChroma,
             cursorRequestID: initialCursor?.requestID,
             independentCursor: initialCursor?.enabled,
-            inPlaceBitrateV1: supportsInPlaceBitrate ? true : nil
+            inPlaceBitrateV1: supportsInPlaceBitrate ? true : nil,
+            viewport: desiredViewport
         )
         pending = request
         return request
@@ -138,8 +168,14 @@ public struct VideoTuningSession {
         guard let pending, pending.id == result.id else { return nil }
         try result.state.validate()
         guard result.state.settings.framesPerSecond <= maximumFrameRate else { throw DeskError.invalid("画质回复超过已协商的帧率上限") }
+        if result.error == nil, let viewport = pending.viewport,
+           result.state.width > viewport.width || result.state.height > viewport.height {
+            throw DeskError.invalid("画质回复超过控制端画面范围")
+        }
         applied = result.state
         if desired == pending.settings { desired = result.state.settings }
+        if result.error == nil { appliedViewport = pending.viewport }
+        if desiredViewport == pending.viewport { desiredViewport = appliedViewport }
         // A host that kept H.264 or 4:2:0 (no hardware support at this size, or a failed change) is not asked again.
         appliedCodec = result.codec ?? .h264
         if desiredCodec == (pending.codec ?? .h264) { desiredCodec = appliedCodec }

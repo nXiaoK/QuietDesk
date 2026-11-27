@@ -31,6 +31,50 @@ func runLiveSettingsChecks() {
         try check(MessageKind.inputStatus.rawValue == 10 && MessageKind.clipboardCancel.rawValue == 17 && Wire.version == 1, "Legacy wire values changed")
     }
 
+    run("The optional viewport bounds both encoded axes with even pixels") {
+        let viewport = VideoViewport(width: 1101, height: 700)
+        let request = StreamSettingsRequest(settings: high, viewport: viewport)
+        let decoded = try Wire.readJSON(StreamSettingsRequest.self, Wire.json(.streamSettingsRequest, request).payload)
+        try decoded.validate()
+        try check(decoded.viewport == viewport && decoded.settings == high, "The viewport changed the selected quality tier")
+        let legacy = StreamSettingsRequest(settings: high)
+        try check(try Wire.readJSON(StreamSettingsRequest.self, Wire.json(.streamSettingsRequest, legacy).payload).viewport == nil,
+                  "A legacy request gained a viewport")
+        try rejects("An unbounded peer viewport was accepted") {
+            try StreamSettingsRequest(settings: high, viewport: VideoViewport(width: 1101, height: Int.max)).validate()
+        }
+        try check(high.dimensions(width: 5120, height: 2880, viewport: viewport) == (1100, 618)
+                  && high.dimensions(width: 2880, height: 5120, viewport: viewport) == (392, 700),
+                  "Landscape and portrait output must fit within the available axes")
+        try check(high.dimensions(width: 500, height: 300, viewport: viewport) == (500, 300), "A larger viewport upscaled the source")
+    }
+
+    run("A viewport-only request coalesces a resize and preserves the cap if removing it fails") {
+        var tuning = try VideoTuningSession(applied: initial)
+        let smaller = VideoViewport(width: 800, height: 600), larger = VideoViewport(width: 1200, height: 800)
+        tuning.chooseViewport(smaller)
+        guard let first = tuning.nextRequest() else { throw CheckFailure("A viewport-only update sent no request") }
+        try check(first.viewport == smaller && first.settings == initial.settings, "A viewport update replaced the quality settings")
+        tuning.chooseViewport(larger)
+        try check(tuning.nextRequest() == nil, "A resize sent a second in-flight request")
+        let firstState = VideoStreamState(settings: initial.settings, width: 800, height: 450)
+        try check(try tuning.receive(.init(id: first.id, state: firstState)), "The first cap was not confirmed")
+        guard let resize = tuning.nextRequest(), resize.viewport == larger else { throw CheckFailure("The newest resize did not survive") }
+        try rejects("A successful reply exceeded the viewport it acknowledged") {
+            _ = try tuning.receive(.init(id: resize.id, state: initial))
+        }
+        let resized = VideoStreamState(settings: initial.settings, width: 1200, height: 674)
+        try check(try tuning.receive(.init(id: resize.id, state: resized)), "A valid resize reply was ignored")
+        tuning.chooseViewport(nil)
+        guard let clear = tuning.nextRequest(), clear.viewport == nil else { throw CheckFailure("Removing a cap sent no request") }
+        _ = try tuning.receive(.init(id: clear.id, state: resized, error: "Configuration failed"))
+        try check(tuning.appliedViewport == larger && tuning.nextRequest() == nil, "A failed removal changed the cap or kept retrying")
+        tuning.chooseViewport(nil)
+        guard let retry = tuning.nextRequest() else { throw CheckFailure("An explicit retry sent no request") }
+        _ = try tuning.receive(.init(id: retry.id, state: initial))
+        try check(tuning.appliedViewport == nil && tuning.applied == initial, "Removing the cap did not restore the full picture")
+    }
+
     run("HEVC is requested only once chosen, survives later changes and is not asked again after a host keeps H.264") {
         var plain = try VideoTuningSession(applied: initial, preferred: medium)
         guard let first = plain.nextRequest() else { throw CheckFailure("A preferred quality sent no request") }

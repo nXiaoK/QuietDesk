@@ -722,8 +722,10 @@ public struct MediaQualityPolicy: Sendable {
                                            megabits: StreamSettings.adaptiveBitRates.last!)
     private var bitRates: [Int]
     private var sourceLongestEdge: Int?
+    private var viewport: VideoViewport?
     // The shape of the last picture, shorter edge over longer; 16:10 until one was seen.
     private var learnedAspect: Double?
+    private var learnedLandscape = true
     private var aspect: Double { learnedAspect ?? 0.625 }
     private var lastNow: TimeInterval
     private var lastObservationAt: TimeInterval
@@ -747,6 +749,7 @@ public struct MediaQualityPolicy: Sendable {
         var hold: TimeInterval
         // Time the edge has carried frames since it was tried again; nil until then.
         var retriedFor: TimeInterval?
+        var windowLimited = false
     }
     private var slowEdges: [Int: SlowEdge] = [:]
     // The chosen 4:4:4 chroma, given up under compute pressure before any size is.
@@ -762,6 +765,7 @@ public struct MediaQualityPolicy: Sendable {
         // How many times the 4:2:0 time per frame 4:4:4 took, and whether that was measured since it was left.
         var cost: Double?
         var costMeasured = false
+        var windowLimited = false
     }
     private var slowTrueColor: SlowTrueColor?
     /// Under compute pressure the viewer would rather keep the picture size than the frame rate.
@@ -864,10 +868,12 @@ public struct MediaQualityPolicy: Sendable {
     /// The largest size setting below every size compute pressure left and that has not lasted since, with
     /// the shape of the current picture; nil while there is none.
     public var sustainedSize: SustainedVideoSize? {
-        let edge = slowEdges.keys.min().flatMap { slowest in StreamSettings.longestEdges.last(where: { $0 < slowest }) }
-        guard let learnedAspect, edge != nil || slowTrueColor != nil else { return nil }
+        let edge = slowEdges.lazy.filter { !$0.value.windowLimited }.map { $0.key }.min()
+            .flatMap { slowest in StreamSettings.longestEdges.last(where: { $0 < slowest }) }
+        let color: SlowTrueColor? = slowTrueColor.flatMap { $0.windowLimited ? nil : $0 }
+        guard let learnedAspect, edge != nil || color != nil else { return nil }
         return SustainedVideoSize(longestEdge: edge ?? upperBound.longestEdge, aspect: learnedAspect,
-                                  leftTrueColor: slowTrueColor != nil, trueColorCost: slowTrueColor?.cost,
+                                  leftTrueColor: color != nil, trueColorCost: color?.cost,
                                   sharpnessFirst: prefersSharpness)
     }
 
@@ -951,12 +957,13 @@ public struct MediaQualityPolicy: Sendable {
                 let hold = slowTrueColor.map { $0.retriedFor == nil ? $0.hold : min(Self.maximumSlowSizeHold, $0.hold * 2) }
                     ?? Self.maximumUpgradeHold
                 slowTrueColor = SlowTrueColor(leftAt: now, hold: hold, edge: shownEdge(next), milliseconds: computeMilliseconds,
-                                              cost: slowTrueColor?.cost)
+                                              cost: slowTrueColor?.cost,
+                                              windowLimited: slowTrueColor?.windowLimited != false && viewportLimits(next))
                 return recommendReduction(next, trueColor: false, adjustment: adjustment, now: now)
             }
             next = computeReduction(from: next, milliseconds: computeMilliseconds)
             guard next != effective else { return nil }
-            if shownEdge(next) < shownEdge(effective) { leaveSlowEdge(shownEdge(effective), now: now) }
+            if shownEdge(next) < shownEdge(effective) { leaveSlowEdge(effective, now: now) }
             if prefersSharpness, next.framesPerSecond < min(Self.computeRateFloor, effective.framesPerSecond) { sharpnessLoweredRate = true }
             return recommendReduction(next, adjustment: adjustment, now: now)
         }
@@ -1229,7 +1236,8 @@ public struct MediaQualityPolicy: Sendable {
     }
 
     /// Completes a reply whose request ID and stream state were accepted by `VideoTuningSession.completeRequest`.
-    public mutating func receiveSettingsResult(_ result: StreamSettingsResult, for request: StreamSettings, now: TimeInterval) {
+    public mutating func receiveSettingsResult(_ result: StreamSettingsResult, for request: StreamSettings,
+                                               viewport: VideoViewport? = nil, now: TimeInterval) {
         guard accept(now) else { return }
         let applied = result.state.settings
         if result.error == nil {
@@ -1242,6 +1250,7 @@ public struct MediaQualityPolicy: Sendable {
         } else if pending == applied {
             finishPending(appliedAsRequested: true, now: now)
         }
+        self.viewport = viewport
         updateApplied(applied, size: (result.state.width, result.state.height), now: now)
     }
 
@@ -1314,11 +1323,17 @@ public struct MediaQualityPolicy: Sendable {
         let shape = Double(shortest) / Double(longest)
         // Another shape is another display: an edge of it holds a different number of pixels.
         if let learnedAspect, abs(shape - learnedAspect) > 0.01 {
-            slowEdges.removeAll(); recentCompute = nil
+            sourceLongestEdge = nil; slowEdges.removeAll(); recentCompute = nil
             // The time per frame 4:4:4 was left at belongs to the other display; its cost ratio still holds.
-            slowTrueColor = trueColor ? nil : slowTrueColor.map { SlowTrueColor(leftAt: $0.leftAt, hold: $0.hold, cost: $0.cost) }
+            slowTrueColor = trueColor ? nil : slowTrueColor.map {
+                SlowTrueColor(leftAt: $0.leftAt, hold: $0.hold, cost: $0.cost, windowLimited: $0.windowLimited)
+            }
         }
         learnedAspect = shape
+        learnedLandscape = size.width >= size.height
+        if let known = sourceLongestEdge, known < longest { sourceLongestEdge = nil }
+        // A fitted frame near either canvas edge gives no upper bound on the source size.
+        if let viewport, size.width >= viewport.width - 2 || size.height >= viewport.height - 2 { return }
         if longest < settings.longestEdge - 2 {
             sourceLongestEdge = longest
             // No size above the whole screen exists. One listed there before the screen's edge was known,
@@ -1328,11 +1343,27 @@ public struct MediaQualityPolicy: Sendable {
                 if entry.retriedFor != nil, slowEdges[longest] == nil { slowEdges[longest] = entry }
             }
         }
-        else if let known = sourceLongestEdge, known < longest { sourceLongestEdge = nil }
     }
 
     private func shownEdge(_ settings: StreamSettings) -> Int {
+        let sourceEdge = sourceEdge(for: settings)
+        return min(sourceEdge, viewportLongestEdge ?? sourceEdge)
+    }
+
+    private func sourceEdge(for settings: StreamSettings) -> Int {
         min(settings.longestEdge, sourceLongestEdge ?? settings.longestEdge)
+    }
+
+    private var viewportLongestEdge: Int? {
+        guard let viewport else { return nil }
+        let longAxis = learnedLandscape ? viewport.width : viewport.height
+        let shortAxis = learnedLandscape ? viewport.height : viewport.width
+        return Int(min(Double(longAxis), Double(shortAxis) / aspect))
+    }
+
+    private func viewportLimits(_ settings: StreamSettings) -> Bool {
+        guard let viewportLongestEdge else { return false }
+        return viewportLongestEdge < sourceEdge(for: settings)
     }
 
     private func megabits(_ bitsPerPixel: Double, for settings: StreamSettings) -> Double {
@@ -1377,10 +1408,12 @@ public struct MediaQualityPolicy: Sendable {
     }
 
     // An edge is still listed when it is left only if its retry did not last; the next wait is twice as long.
-    private mutating func leaveSlowEdge(_ edge: Int, now: TimeInterval) {
+    private mutating func leaveSlowEdge(_ settings: StreamSettings, now: TimeInterval) {
+        let edge = shownEdge(settings)
         let hold = slowEdges[edge].map { $0.retriedFor == nil ? $0.hold : min(Self.maximumSlowSizeHold, $0.hold * 2) }
             ?? Self.maximumUpgradeHold
-        slowEdges[edge] = SlowEdge(leftAt: now, hold: hold)
+        slowEdges[edge] = SlowEdge(leftAt: now, hold: hold,
+                                   windowLimited: slowEdges[edge]?.windowLimited != false && viewportLimits(settings))
     }
 
     // At the floor rate or above the codec's time per frame is what the produced size costs; below it a Mac

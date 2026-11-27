@@ -1384,6 +1384,44 @@ private struct RemoteCanvasChecks {
                         "Oversized remote picture in 1:1 mode overflowed the window bounds")
         }
 
+        run("Fit to window reports the drawable backing pixels independently of the remote picture") {
+            final class ViewportCheckWindow: NSWindow {
+                var liveResizeActive = false
+                override var inLiveResize: Bool { liveResizeActive }
+            }
+            let frame = NSRect(x: 0, y: 0, width: 400, height: 300)
+            let window = ViewportCheckWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            let content = NSView(frame: frame)
+            window.contentView = content
+            let initialSize = content.convertFromBacking(CGSize(width: 401, height: 301))
+            let canvas = RemoteCanvas(frame: CGRect(origin: .zero, size: initialSize))
+            defer { canvas.reset(); window.close() }
+            var changes: [VideoViewport?] = []
+            canvas.onVideoViewportChange = { [weak canvas] in changes.append(canvas?.videoViewport) }
+            try require(canvas.videoViewport == nil, "Detached canvas advertised a viewport")
+
+            content.addSubview(canvas)
+            let initial = VideoViewport(width: 400, height: 300)
+            try require(changes == [initial], "Attached canvas did not report its backing pixel size: \(changes)")
+            canvas.remoteSize = CGSize(width: 1440, height: 2560)
+            canvas.layout()
+            try require(changes == [initial], "A remote size change changed the reported viewport: \(changes)")
+
+            window.liveResizeActive = true
+            canvas.setFrameSize(content.convertFromBacking(CGSize(width: 503, height: 305)))
+            canvas.layout()
+            try require(changes == [initial], "A live drag updated the viewport before the window settled: \(changes)")
+            window.liveResizeActive = false
+            canvas.viewDidEndLiveResize()
+            canvas.scalingMode = .original1To1
+            canvas.scalingMode = .fitWindow
+            canvas.removeFromSuperview()
+            let resized = VideoViewport(width: 502, height: 304)
+            try require(changes == [initial, resized, nil, resized, nil],
+                        "Resize, 1:1 mode or detachment lost the viewport transition: \(changes)")
+        }
+
         run("Retina 1:1 displays one backing pixel per source pixel and hit-tests the displayed picture") {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
                                   styleMask: .borderless, backing: .buffered, defer: false)

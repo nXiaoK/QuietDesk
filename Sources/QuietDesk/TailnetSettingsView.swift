@@ -22,28 +22,42 @@ struct TailnetSettingsView: View {
         DeskSettingsGroup(title: "本机设备") {
             DeskSettingsRow(title: "连接状态", detail: tailnet.message) {
                 Text(status)
+                    .multilineTextAlignment(.trailing)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if let ip = tailnet.ip, tailnet.state == "Running" {
                 Divider()
                 DeskSettingsRow(title: "QuietDesk 连接地址", detail: "将此地址填入控制端的新建连接，端口与配对码使用本机共享页显示的值。") {
-                    Text(TailnetAddress.prefix + ip).monospaced().textSelection(.enabled)
+                    Text(TailnetAddress.prefix + ip)
+                        .monospaced()
+                        .fixedSize(horizontal: true, vertical: false)
+                        .textSelection(.enabled)
                 }
                 Divider()
                 DeskSettingsRow(title: "本机共享") {
-                    Text(tailnet.shared.port == 0 ? "未通过 Tailscale 共享" : "\(tailnet.shared.udp ? "TCP / UDP" : "TCP") \(tailnet.shared.port)")
+                    if tailnet.shared.port == 0 {
+                        Text("未通过 Tailscale 共享")
+                    } else {
+                        let transport = tailnet.shared.udp ? "TCP / UDP" : "TCP"
+                        Text(verbatim: "\(transport) \(tailnet.shared.port)")
+                            .monospaced()
+                    }
                 }
             }
             Divider()
-            HStack {
+            HStack(spacing: 8) {
                 if !tailnet.enabled || tailnet.state != "Running" {
                     Button("登录 Tailscale…") { tailnet.login() }
                         .buttonStyle(DeskButtonStyle(.primary))
                 }
                 if tailnet.enabled {
                     Button("停用") { tailnet.disable(logout: false) }
-                    Button("退出账号") { tailnet.disable(logout: true) }
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                    Button("退出账号", role: .destructive) { tailnet.disable(logout: true) }
+                        .buttonStyle(DeskButtonStyle(.danger))
                 }
             }
+            .padding(.vertical, 10)
             .disabled(tailnet.changingAccount)
         }
     }

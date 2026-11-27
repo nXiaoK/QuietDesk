@@ -454,7 +454,7 @@ struct DeskView: View {
                     } label: {
                         Label("会话设置", systemImage: "gearshape")
                     }
-                    .help("画质、光标与声音、网络同步及全屏共用控制面板")
+                    .help("画面与声音、输入与剪贴板、连接及全屏共用控制面板")
                     .popover(isPresented: $showOptions, arrowEdge: .top) {
                         SessionControlsView(
                             model: model,

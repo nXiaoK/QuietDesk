@@ -244,10 +244,12 @@ struct ConnectionSettingsView: View {
 }
 
 private struct ConnectionOptionsSections: View {
+    // Grouped by what a setting affects: what is seen and heard, what is typed, pointed and copied, and how
+    // the connection behaves. Each group ends by saying which of its settings outlast this session.
     private enum CompactTab: String, CaseIterable, Hashable {
-        case display = "画质与屏幕"
-        case inputAudio = "光标与声音"
-        case transport = "网络与同步"
+        case display = "画面与声音"
+        case input = "输入与剪贴板"
+        case connection = "连接"
     }
 
     @ObservedObject var model: DeskModel
@@ -267,23 +269,23 @@ private struct ConnectionOptionsSections: View {
                     )
                     switch compactTab {
                     case .display:
-                        displayAndQualityBlock
-                    case .inputAudio:
-                        cursorAndAudioBlock
-                    case .transport:
-                        networkAndClipboardBlock
+                        displayAndSoundBlock
+                    case .input:
+                        inputAndClipboardBlock
+                    case .connection:
+                        connectionBlock
                     }
                 }
             } else {
                 VStack(alignment: .leading, spacing: 17) {
-                    DeskSettingsGroup(title: showsSessionControls ? "画质与屏幕" : "屏幕显示") {
-                        displayAndQualityBlock.padding(.vertical, 10)
+                    DeskSettingsGroup(title: CompactTab.display.rawValue) {
+                        displayAndSoundBlock.padding(.vertical, 10)
                     }
-                    DeskSettingsGroup(title: "光标与声音") {
-                        cursorAndAudioBlock.padding(.vertical, 10)
+                    DeskSettingsGroup(title: CompactTab.input.rawValue) {
+                        inputAndClipboardBlock.padding(.vertical, 10)
                     }
-                    DeskSettingsGroup(title: "网络与同步") {
-                        networkAndClipboardBlock.padding(.vertical, 10)
+                    DeskSettingsGroup(title: CompactTab.connection.rawValue) {
+                        connectionBlock.padding(.vertical, 10)
                     }
                 }
             }
@@ -293,69 +295,83 @@ private struct ConnectionOptionsSections: View {
         .tint(DeskPalette.accent)
     }
 
-    private var displayAndQualityBlock: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if model.connected, model.supportsDisplaySwitching, !model.remoteDisplays.isEmpty {
+    private var displayAndSoundBlock: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 10) {
+                if model.connected, model.supportsDisplaySwitching, !model.remoteDisplays.isEmpty {
+                    HStack(spacing: 8) {
+                        Text("远端显示器")
+                            .foregroundStyle(DeskPalette.ink)
+                        Spacer(minLength: 4)
+                        Picker("远端屏幕", selection: Binding(
+                            get: { model.remoteSelectedDisplayID },
+                            set: { model.selectRemoteDisplay($0) }
+                        )) {
+                            ForEach(model.remoteDisplays) { display in
+                                Text(display.summary).tag(display.id)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(width: 152)
+                        .disabled(model.remoteDisplays.count < 2 || model.displaySwitchWorking)
+                    }
+                    if !model.displaySwitchStatus.isEmpty {
+                        Text(model.displaySwitchStatus)
+                            .font(.caption)
+                            .foregroundStyle(DeskPalette.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Divider()
+                }
+
+                if showsSessionControls {
+                    SessionQualitySection(model: model, compact: compact)
+                    Divider()
+                }
+
                 HStack(spacing: 8) {
-                    Text("远端显示器")
+                    Text("画面缩放")
                         .foregroundStyle(DeskPalette.ink)
                     Spacer(minLength: 4)
-                    Picker("远端屏幕", selection: Binding(
-                        get: { model.remoteSelectedDisplayID },
-                        set: { model.selectRemoteDisplay($0) }
-                    )) {
-                        ForEach(model.remoteDisplays) { display in
-                            Text(display.summary).tag(display.id)
+                    Picker("画面显示", selection: $model.canvasScalingMode) {
+                        ForEach(RemoteCanvasScalingMode.allCases, id: \.self) { mode in
+                            Text(mode.title).tag(mode)
                         }
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)
-                    .frame(width: 152)
-                    .disabled(model.remoteDisplays.count < 2 || model.displaySwitchWorking)
+                    .frame(width: 152, alignment: .trailing)
                 }
-                if !model.displaySwitchStatus.isEmpty {
-                    Text(model.displaySwitchStatus)
-                        .font(.caption)
-                        .foregroundStyle(DeskPalette.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Divider()
             }
+            .padding(.bottom, 2)
 
-            if showsSessionControls {
-                SessionQualitySection(model: model, compact: compact)
-                Divider()
-            }
-
-            HStack(spacing: 8) {
-                Text("画面缩放")
-                    .foregroundStyle(DeskPalette.ink)
-                Spacer(minLength: 4)
-                Picker("画面显示", selection: $model.canvasScalingMode) {
-                    ForEach(RemoteCanvasScalingMode.allCases, id: \.self) { mode in
-                        Text(mode.title).tag(mode)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(width: 152, alignment: .trailing)
-            }
-        }
-    }
-
-    private var cursorAndAudioBlock: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            compactToggleRow(
-                "本机仅观看防误触",
-                detail: model.viewerViewOnlyLock ? "已锁定键鼠发送，画面照常播放" : nil,
-                isOn: Binding(get: { model.viewerViewOnlyLock }, set: { model.setViewerViewOnlyLock($0) })
-            )
             Divider()
             compactToggleRow(
                 "远端系统声音回传",
                 detail: model.connected && !model.supportsRemoteAudio ? "旧端不支持声音回传" : nil,
                 isOn: Binding(get: { model.remoteAudioEnabled }, set: { model.setRemoteAudioEnabled($0) }),
                 disabled: model.connected && !model.supportsRemoteAudio
+            )
+            Divider()
+            compactToggleRow("全屏顶部工具条", detail: "指针在屏幕顶部中间停留片刻时显示", isOn: $model.fullScreenToolbarEnabled)
+            Divider()
+            compactToggleRow("全屏实时连接指标", isOn: $model.showFullScreenStatistics)
+            if model.showFullScreenStatistics {
+                FullScreenStatusSettings(model: model)
+                    .padding(.bottom, 8)
+            }
+
+            scopeNote(showsSessionControls ? "画质随此连接保存，远端显示器只在本次会话有效；其余对所有连接生效。" : "对所有连接生效。")
+        }
+    }
+
+    private var inputAndClipboardBlock: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            compactToggleRow(
+                "本机仅观看防误触",
+                detail: model.viewerViewOnlyLock ? "已锁定键鼠发送，画面照常播放" : nil,
+                isOn: Binding(get: { model.viewerViewOnlyLock }, set: { model.setViewerViewOnlyLock($0) })
             )
             Divider()
             compactToggleRow(
@@ -384,43 +400,7 @@ private struct ConnectionOptionsSections: View {
                         .foregroundStyle(DeskPalette.secondary)
                 }
                 .padding(.vertical, 9)
-            }
 
-            Text("共享端权限未生效造成的仅观看，不等同于本机防误触锁定。旧端能力不足时明确禁用。")
-                .font(.caption)
-                .foregroundStyle(DeskPalette.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.top, 8)
-        }
-    }
-
-    private var networkAndClipboardBlock: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            compactToggleRow(
-                "双向按需同步",
-                isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })
-            )
-            Divider()
-            HStack {
-                Text("接收文件目录")
-                    .foregroundStyle(DeskPalette.ink)
-                Spacer(minLength: 8)
-                HStack(spacing: 6) {
-                    Button("打开目录") {
-                        model.canvas.releaseControl()
-                        model.openReceivedFiles()
-                    }
-                    .buttonStyle(DeskButtonStyle(.secondary))
-                    .help(ClipboardSync.receivingDirectory)
-                    if let id = model.receivingFileID {
-                        Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }
-                            .buttonStyle(DeskButtonStyle(.danger))
-                    }
-                }
-            }
-            .padding(.vertical, 8)
-
-            if model.connected {
                 Divider()
                 VStack(alignment: .leading, spacing: 5) {
                     HStack {
@@ -455,15 +435,38 @@ private struct ConnectionOptionsSections: View {
             }
 
             Divider()
-            compactToggleRow("全屏顶部工具条", detail: "指针在屏幕顶部中间停留片刻时显示", isOn: $model.fullScreenToolbarEnabled)
+            compactToggleRow(
+                "剪贴板双向同步",
+                detail: "复制本身不传内容，粘贴时按需拉取",
+                isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })
+            )
             Divider()
-            compactToggleRow("全屏实时连接指标", isOn: $model.showFullScreenStatistics)
-            if model.showFullScreenStatistics {
-                FullScreenStatusSettings(model: model)
-                    .padding(.bottom, 8)
+            HStack {
+                Text("接收文件目录")
+                    .foregroundStyle(DeskPalette.ink)
+                Spacer(minLength: 8)
+                HStack(spacing: 6) {
+                    Button("打开目录") {
+                        model.canvas.releaseControl()
+                        model.openReceivedFiles()
+                    }
+                    .buttonStyle(DeskButtonStyle(.secondary))
+                    .help(ClipboardSync.receivingDirectory)
+                    if let id = model.receivingFileID {
+                        Button("中断接收", role: .destructive) { model.cancelFileReception(id: id) }
+                            .buttonStyle(DeskButtonStyle(.danger))
+                    }
+                }
             }
+            .padding(.vertical, 8)
 
-            Divider()
+            scopeNote((showsSessionControls ? "相对鼠标只在本次会话有效；其余对所有连接生效。" : "对所有连接生效。")
+                      + "共享端权限未生效造成的仅观看，不等同于本机防误触锁定。")
+        }
+    }
+
+    private var connectionBlock: some View {
+        VStack(alignment: .leading, spacing: 0) {
             compactToggleRow(
                 "断线自动重连",
                 isOn: Binding(get: { model.autoReconnect }, set: { model.setAutoReconnect($0) })
@@ -476,7 +479,7 @@ private struct ConnectionOptionsSections: View {
             .help(IdleAutoPausePresentation.toggleHelp)
 
             Divider()
-            compactToggleRow("仅使用 TCP 视频", isOn: $model.mediaTCPOnly)
+            compactToggleRow("仅使用 TCP 视频", detail: "下次连接生效", isOn: $model.mediaTCPOnly)
 
             if model.relayEnabled {
                 Divider()
@@ -502,11 +505,7 @@ private struct ConnectionOptionsSections: View {
                 disabled: model.isControllingAnotherMac
             )
 
-            Text("TCP 视频仅下次连接生效；复制本身不传文件，粘贴按需拉取。")
-                .font(.caption)
-                .foregroundStyle(DeskPalette.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.top, 8)
+            scopeNote("对所有连接生效。")
 
             if !model.lastDisconnect.isEmpty {
                 Text("上次断开：\(model.lastDisconnect)")
@@ -517,6 +516,15 @@ private struct ConnectionOptionsSections: View {
                     .padding(.top, 4)
             }
         }
+    }
+
+    /// Which of the settings above outlast this session.
+    private func scopeNote(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(DeskPalette.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, 8)
     }
 
     private func compactToggleRow(

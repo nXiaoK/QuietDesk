@@ -759,7 +759,7 @@ final class RemoteCanvas: NSView {
         observers.removeAll()
         systemShortcutMonitor.stop()
         shortcutStartAttempted = false
-        guard let window else { publishShortcutStatus("全屏控制画面获得焦点后自动转发系统快捷键", running: false); return }
+        guard let window else { publishShortcutStatus(shortcutIdleStatus, running: false); return }
         window.acceptsMouseMovedEvents = true
         observers.append(NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification,
             object: window, queue: .main) { [weak self] _ in
@@ -1152,7 +1152,7 @@ final class RemoteCanvas: NSView {
         if window?.firstResponder === self, window?.makeFirstResponder(nil) == true { return }
         systemShortcutMonitor.stop()
         shortcutStartAttempted = false
-        publishShortcutStatus("全屏控制画面获得焦点后自动转发系统快捷键", running: false)
+        publishShortcutStatus(shortcutIdleStatus, running: false)
         capsLockMonitor.reset()
         localShortcutKeys.removeAll()
         onRelease?()
@@ -1176,7 +1176,7 @@ final class RemoteCanvas: NSView {
         activeRotate = nil
         systemShortcutMonitor.stop()
         shortcutStartAttempted = false
-        publishShortcutStatus("全屏控制画面获得焦点后自动转发系统快捷键", running: false)
+        publishShortcutStatus(shortcutIdleStatus, running: false)
         capsLockMonitor.reset(); localShortcutKeys.removeAll(); onRelease?(); onFocus?(false)
         return true
     }
@@ -1244,11 +1244,29 @@ final class RemoteCanvas: NSView {
         reconcileSystemShortcutCapture(retry: retry)
     }
 
+    /// System shortcuts are captured in a window as well, not only in full screen; the viewer's choice.
+    var capturesSystemShortcutsInWindow = false {
+        didSet {
+            guard oldValue != capturesSystemShortcutsInWindow else { return }
+            reconcileSystemShortcutCapture(retry: true)
+        }
+    }
+
     private var shortcutScope: SystemShortcutScope {
         SystemShortcutScope(sessionActive: shortcutSessionActive, canControl: canControl,
             fullScreen: window?.styleMask.contains(.fullScreen) == true,
             keyWindow: NSApp?.isActive == true && window?.isKeyWindow == true,
-            canvasFocused: window?.firstResponder === self)
+            canvasFocused: window?.firstResponder === self,
+            capturesInWindow: capturesSystemShortcutsInWindow)
+    }
+
+    private var shortcutIdleStatus: String {
+        capturesSystemShortcutsInWindow ? "控制画面获得焦点后自动转发系统快捷键" : "全屏控制画面获得焦点后自动转发系统快捷键"
+    }
+
+    private var shortcutRunningStatus: String {
+        window?.styleMask.contains(.fullScreen) == true ? "全屏系统快捷键正在转发；⌃⌥Esc 释放，⌃⌘F 退出全屏"
+            : "系统快捷键正在转发；⌃⌥Esc 释放控制后恢复本机快捷键"
     }
 
     private func reconcileSystemShortcutCapture(retry: Bool = false) {
@@ -1258,7 +1276,7 @@ final class RemoteCanvas: NSView {
             shortcutStartAttempted = false
             if wasCapturing { activeScroll = nil; onRelease?() }
             if retry || shortcutStatus?.1 != false {
-                publishShortcutStatus("全屏控制画面获得焦点后自动转发系统快捷键", running: false)
+                publishShortcutStatus(shortcutIdleStatus, running: false)
             }
             return
         }
@@ -1276,7 +1294,7 @@ final class RemoteCanvas: NSView {
             publishShortcutStatus("本机安全输入已开启，系统快捷键转发暂不可用", running: false)
             return
         }
-        if systemShortcutMonitor.isRunning { publishShortcutStatus("全屏系统快捷键正在转发；⌃⌥Esc 释放，⌃⌘F 退出全屏", running: true); return }
+        if systemShortcutMonitor.isRunning { publishShortcutStatus(shortcutRunningStatus, running: true); return }
         guard retry || !shortcutStartAttempted else {
             if shortcutStatus?.1 == true { publishShortcutStatus("系统快捷键转发已暂停，请重新检测", running: false) }
             return
@@ -1285,7 +1303,7 @@ final class RemoteCanvas: NSView {
         shortcutStartAttempted = true
         do {
             try systemShortcutMonitor.start()
-            publishShortcutStatus("全屏系统快捷键正在转发；⌃⌥Esc 释放，⌃⌘F 退出全屏", running: true)
+            publishShortcutStatus(shortcutRunningStatus, running: true)
         } catch {
             systemShortcutMonitor.stop()
             publishShortcutStatus(error.localizedDescription, running: false)

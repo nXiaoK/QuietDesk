@@ -27,7 +27,7 @@ final class PermissionGuide: NSWindowController {
             switch self {
             case .screenRecording: return "用于被控 Mac 传送画面；生效后请返回“共享这台 Mac”点“开启共享”，不会自动开始。"
             case .accessibility: return "在被控 Mac 上用于接受键盘鼠标控制；在控制 Mac 上用于本机键盘监听。两台 Mac 的授权不能互相代替。"
-            case .inputMonitoring: return "用于这台控制 Mac 监听 Caps Lock 与全屏系统快捷键；不代替被控 Mac 的控制授权。"
+            case .inputMonitoring: return "用于这台控制 Mac 监听 Caps Lock 与系统快捷键；不代替被控 Mac 的控制授权。"
             }
         }
 

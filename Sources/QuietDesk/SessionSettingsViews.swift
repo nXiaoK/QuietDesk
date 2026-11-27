@@ -572,7 +572,7 @@ struct CapsLockSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             if !embedded {
-                DeskSectionHeading(title: "键盘与快捷键", detail: "设置全屏系统快捷键与 Caps Lock 转发。")
+                DeskSectionHeading(title: "键盘与快捷键", detail: "设置系统快捷键与 Caps Lock 转发。")
             }
             if embedded {
                 CapsLockDetails(model: model, compact: false)
@@ -795,10 +795,18 @@ private struct CapsLockDetails: View {
                     }
                 }
                 Divider()
-                DeskSettingsRow(title: "全屏系统快捷键") {
+                DeskSettingsRow(title: "系统快捷键") {
                     Text(model.systemShortcutStatus)
                         .font(.system(size: 12.5))
                         .foregroundStyle(model.systemShortcutsRunning ? DeskPalette.emerald : DeskPalette.secondary)
+                }
+                Divider()
+                DeskSettingsRow(title: "窗口模式也转发系统快捷键",
+                                detail: "控制画面有焦点时，⌘Tab、⌘空格等送到远端而不是本机；按 ⌃⌥Esc 释放控制后恢复本机快捷键。关闭时只在全屏转发") {
+                    Toggle("窗口模式也转发系统快捷键", isOn: $model.systemShortcutsInWindow)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
                 }
                 Divider()
                 DeskSettingsRow(title: "释放控制 / 退出全屏") {

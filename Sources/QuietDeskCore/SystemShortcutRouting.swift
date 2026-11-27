@@ -4,12 +4,14 @@ public struct SystemShortcutScope: Equatable, Sendable {
     public var fullScreen: Bool
     public var keyWindow: Bool
     public var canvasFocused: Bool
+    /// The viewer chose to send system shortcuts from a window as well, not only from full screen.
+    public var capturesInWindow: Bool
     public init(sessionActive: Bool = false, canControl: Bool = false, fullScreen: Bool = false,
-                keyWindow: Bool = false, canvasFocused: Bool = false) {
+                keyWindow: Bool = false, canvasFocused: Bool = false, capturesInWindow: Bool = false) {
         self.sessionActive = sessionActive; self.canControl = canControl; self.fullScreen = fullScreen
-        self.keyWindow = keyWindow; self.canvasFocused = canvasFocused
+        self.keyWindow = keyWindow; self.canvasFocused = canvasFocused; self.capturesInWindow = capturesInWindow
     }
-    public var isActive: Bool { sessionActive && canControl && fullScreen && keyWindow && canvasFocused }
+    public var isActive: Bool { sessionActive && canControl && (fullScreen || capturesInWindow) && keyWindow && canvasFocused }
 }
 
 public enum LocalControlShortcut: Equatable, Sendable {

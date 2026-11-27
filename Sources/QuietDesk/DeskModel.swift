@@ -123,6 +123,18 @@ final class DeskModel: ObservableObject, Identifiable {
         }
     }
     private let sessionWindowFit = SessionWindowFit()
+    /// System shortcuts such as ⌘Tab and ⌘Space go to the remote Mac from a window as well as from full
+    /// screen, while the picture has the keyboard. Off keeps them on this Mac outside full screen.
+    @Published var systemShortcutsInWindow = UserDefaults.standard.bool(forKey: "systemShortcutsInWindow") {
+        didSet {
+            guard oldValue != systemShortcutsInWindow else { return }
+            UserDefaults.standard.set(systemShortcutsInWindow, forKey: "systemShortcutsInWindow")
+            canvas.capturesSystemShortcutsInWindow = systemShortcutsInWindow
+            for other in services.otherModels(excluding: self) where other.systemShortcutsInWindow != systemShortcutsInWindow {
+                other.systemShortcutsInWindow = systemShortcutsInWindow
+            }
+        }
+    }
     @Published var mediaTCPOnly = UserDefaults.standard.bool(forKey: "mediaTCPOnly") {
         didSet { UserDefaults.standard.set(mediaTCPOnly, forKey: "mediaTCPOnly") }
     }
@@ -405,7 +417,8 @@ final class DeskModel: ObservableObject, Identifiable {
     }
     var viewerBitRates: [Int] { supportsHighRefreshVideoSettings ? StreamSettings.bitRates : supportsExtendedVideoSettings ? StreamSettings.extendedBitRates : StreamSettings.legacyBitRates }
     @Published var inputStatus = ""
-    @Published private(set) var systemShortcutStatus = "全屏控制画面获得焦点后自动转发系统快捷键"
+    @Published private(set) var systemShortcutStatus = UserDefaults.standard.bool(forKey: "systemShortcutsInWindow")
+        ? "控制画面获得焦点后自动转发系统快捷键" : "全屏控制画面获得焦点后自动转发系统快捷键"
     @Published private(set) var systemShortcutsRunning = false
     @Published private(set) var connections = ConnectionStore.load()
     @Published var autoReconnect = UserDefaults.standard.object(forKey: "autoReconnect") as? Bool ?? true
@@ -663,6 +676,7 @@ final class DeskModel: ObservableObject, Identifiable {
         }
 
         canvas.scalingMode = canvasScalingMode
+        canvas.capturesSystemShortcutsInWindow = systemShortcutsInWindow
         canvas.onUserActivity = { [weak self] in self?.recordSessionActivity() }
         canvas.onInput = { [weak self] value in
             guard let self else { return }

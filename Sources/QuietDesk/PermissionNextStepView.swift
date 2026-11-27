@@ -43,7 +43,7 @@ struct PermissionNextStep: Equatable {
     static func localKeyboard(accessibility: Bool, inputMonitoring: Bool, capsEnabled: Bool, capsRunning: Bool) -> Self {
         if !accessibility || !inputMonitoring {
             return Self(title: "下一步：处理这台控制 Mac 的权限",
-                detail: "本机辅助功能和输入监控用于 Caps Lock 与全屏系统快捷键监听，不代替被控 Mac 的控制授权。开启缺少的权限后点“重新检测”；已开启但未生效时，请完全退出后重开。",
+                detail: "本机辅助功能和输入监控用于 Caps Lock 与系统快捷键监听，不代替被控 Mac 的控制授权。开启缺少的权限后点“重新检测”；已开启但未生效时，请完全退出后重开。",
                 action: accessibility ? .inputMonitoring : .accessibility)
         }
         if capsEnabled && !capsRunning {
@@ -52,7 +52,7 @@ struct PermissionNextStep: Equatable {
                 action: .recheck)
         }
         return Self(title: capsEnabled ? "本机 Caps Lock 监听已就绪" : "本机权限已生效，Caps Lock 转发未开启",
-            detail: "监听状态只代表本机准备情况。实际转发还需对端支持并允许控制；全屏系统快捷键仅在画面聚焦且监听生效时捕获，安全输入开启时暂停。",
+            detail: "监听状态只代表本机准备情况。实际转发还需对端支持并允许控制；系统快捷键仅在画面聚焦且监听生效时捕获（默认只在全屏），安全输入开启时暂停。",
             action: nil)
     }
 

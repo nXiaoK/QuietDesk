@@ -20,6 +20,35 @@ func runSystemShortcutChecks() {
         }
     }
 
+    run("A viewer who chose so sends system shortcuts from a window too, under the same focus and control conditions") {
+        var routing = SystemShortcutRouting()
+        var windowed = active
+        windowed.fullScreen = false
+        // Without the choice a window keeps its shortcuts on this Mac, as before.
+        try check(!windowed.isActive && routing.route(kind: .keyDown, keyCode: 48, scope: windowed) == .passThrough,
+                  "A window captured Command-Tab without the viewer choosing it")
+        windowed.capturesInWindow = true
+        try check(windowed.isActive && routing.route(kind: .keyDown, keyCode: 48, scope: windowed) == .capture
+                  && routing.route(kind: .keyUp, keyCode: 48, scope: windowed) == .capture, "The choice did not capture Command-Tab in a window")
+        // Full screen captures with or without the choice.
+        var fullScreen = active
+        fullScreen.capturesInWindow = true
+        try check(active.isActive && fullScreen.isActive, "The choice changed full-screen capture")
+        // The choice replaces only the full-screen condition: everything else still has to hold.
+        for index in 0..<4 {
+            var scope = windowed
+            switch index {
+            case 0: scope.sessionActive = false
+            case 1: scope.canControl = false
+            case 2: scope.keyWindow = false
+            default: scope.canvasFocused = false
+            }
+            try check(!scope.isActive && routing.route(kind: .keyDown, keyCode: 49, scope: scope) == .passThrough && routing.capturedKeys.isEmpty,
+                      "A window without focus or control swallowed a local shortcut")
+        }
+        try check(SystemShortcutScope().capturesInWindow == false, "Capturing in a window is on by default")
+    }
+
     run("Captured key repeats and key-up pair once while release and reentry clear the old pair") {
         var routing = SystemShortcutRouting()
         try check(routing.route(kind: .keyDown, keyCode: 48, scope: active) == .capture, "Command-Tab down was not captured")

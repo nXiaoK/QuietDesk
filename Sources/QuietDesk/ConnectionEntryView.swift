@@ -1475,7 +1475,7 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
             DeskSettingsGroup(title: "本机连接前检测") {
                 readinessRow("Caps Lock 远端中英切换", value: preFlight.capsLockTitle, ready: preFlight.capsLockReady)
                 Divider()
-                readinessRow("全屏系统快捷键", value: preFlight.shortcutsTitle, ready: preFlight.shortcutsReady)
+                readinessRow("系统快捷键", value: preFlight.shortcutsTitle, ready: preFlight.shortcutsReady)
                 Divider()
                 readinessRow("剪贴板与文件按需拉取", value: preFlight.clipboardTitle, ready: preFlight.clipboardReady)
             }

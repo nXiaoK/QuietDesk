@@ -113,6 +113,9 @@ final class DeskModels: ObservableObject {
     let viewer: DeskModel
     let host: DeskModel
     @Published private(set) var viewerSessions: [DeskModel] = []
+    /// The order the devices were dragged into in the sidebar; empty keeps the most recently connected first.
+    @Published private(set) var deviceOrder: [UUID] =
+        (UserDefaults.standard.stringArray(forKey: "deviceListOrder") ?? []).compactMap { UUID(uuidString: $0) }
 
     var openSessionWindow: ((UUID) -> Void)?
     var onConnectionDiagnosticReport: ((ConnectionDiagnosticReport) -> Void)? {
@@ -161,6 +164,23 @@ final class DeskModels: ObservableObject {
     var hasConnectedViewerSession: Bool { viewer.connected || viewerSessions.contains(where: \.connected) }
     var anyViewerFullScreen: Bool { viewer.isFullScreen || viewerSessions.contains(where: \.isFullScreen) }
     var activeSessionSummaries: [ActiveRemoteSessionSummary] { viewerSessions.map(\.activeSessionSummary) }
+
+    /// The saved devices as the sidebar lists them: in the dragged order, devices added since first.
+    var arrangedConnections: [ConnectionRecord] {
+        let records = viewer.connections
+        guard !deviceOrder.isEmpty else { return records }
+        let byID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return ManualOrder.arranged(records.map(\.id), by: deviceOrder).compactMap { byID[$0] }
+    }
+
+    /// A drag in the sidebar, as `onMove` reports it. Only the order of the list is saved; the records are not touched.
+    func moveDevices(from offsets: IndexSet, to destination: Int) {
+        let arranged = arrangedConnections.map(\.id)
+        let moved = ManualOrder.moving(arranged, from: offsets, to: destination)
+        guard moved != arranged else { return }
+        deviceOrder = moved
+        UserDefaults.standard.set(moved.map(\.uuidString), forKey: "deviceListOrder")
+    }
 
     func session(for id: UUID) -> DeskModel? {
         viewerSessions.first { $0.sessionID == id }

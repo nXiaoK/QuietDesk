@@ -15,6 +15,7 @@ struct ConnectionView: View {
     var openPortMappingWorkspace: ((ConnectionRecord?) -> Void)? = nil
     let selectedRecord: ConnectionRecord?
     @Binding var showNewConnection: Bool
+    @Binding var openRecordRequest: UUID?
     @State private var showRelaySettings = false
     @State private var wakeConfigurationRecord: ConnectionRecord?
 
@@ -29,7 +30,8 @@ struct ConnectionView: View {
         openRelayWorkspace: (() -> Void)? = nil,
         openPortMappingWorkspace: ((ConnectionRecord?) -> Void)? = nil,
         selectedRecord: ConnectionRecord? = nil,
-        showNewConnection: Binding<Bool> = .constant(false)
+        showNewConnection: Binding<Bool> = .constant(false),
+        openRecordRequest: Binding<UUID?> = .constant(nil)
     ) {
         self.models = models
         self.model = model
@@ -44,6 +46,7 @@ struct ConnectionView: View {
         self.openPortMappingWorkspace = openPortMappingWorkspace
         self.selectedRecord = selectedRecord
         self._showNewConnection = showNewConnection
+        self._openRecordRequest = openRecordRequest
     }
 
     private var locked: Bool { model.active || model.working || model.isRunningRouteBenchmark }
@@ -78,6 +81,7 @@ struct ConnectionView: View {
             records: model.connections,
             selectedRecord: selectedRecord,
             showNewConnection: $showNewConnection,
+            openRecordRequest: $openRecordRequest,
             locked: locked,
             failure: pageFailure,
             status: model.status,

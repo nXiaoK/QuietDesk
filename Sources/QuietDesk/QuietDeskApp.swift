@@ -325,6 +325,7 @@ struct DeskView: View {
     @State private var workspaceDeviceID: UUID?
     @State private var workspaceDeviceListInitialized = false
     @State private var showNewConnection = false
+    @State private var openDeviceRequest: UUID?
     @State private var sidebarCollapsed = false
     @State private var dismissedClipboardStatus = ""
     @State private var dismissedReceptionID: UUID?
@@ -1027,6 +1028,11 @@ struct DeskView: View {
                             models.workspaceSection = .connect
                             showNewConnection = true
                         },
+                        openDevice: { id in
+                            workspaceDeviceID = id
+                            models.workspaceSection = .connect
+                            openDeviceRequest = id
+                        },
                         showNetwork: {
                             guard !roleLocked else { return }
                             if models.viewer.portMappings.hostApprovalPending || models.host.portMappings.hostApprovalPending {
@@ -1164,7 +1170,8 @@ struct DeskView: View {
                     models.workspaceSection = .network
                 },
                 selectedRecord: models.viewer.connections.first { $0.id == workspaceDeviceID },
-                showNewConnection: $showNewConnection
+                showNewConnection: $showNewConnection,
+                openRecordRequest: $openDeviceRequest
             )
         case .sharing:
             SharingView(
@@ -1552,8 +1559,23 @@ private struct DeskWorkspaceSidebar: View {
     let roleLocked: Bool
     let toggleSidebar: () -> Void
     let newConnection: () -> Void
+    /// Shows a device's page and connects to it, or brings its session window forward.
+    let openDevice: (UUID) -> Void
     let showNetwork: () -> Void
     @State private var copiedHostCode = false
+    @State private var recordToRemove: ConnectionRecord?
+
+    /// The device whose page shows; none while another section does. Clicking empty space keeps it.
+    private var deviceSelection: Binding<UUID?> {
+        Binding(
+            get: { models.workspaceSection == .connect ? workspaceDeviceID : nil },
+            set: { id in
+                guard let id else { return }
+                workspaceDeviceID = id
+                models.workspaceSection = .connect
+            }
+        )
+    }
 
     private var sharingStatus: String {
         if host.connected { return "正在被控制" }
@@ -1602,22 +1624,34 @@ private struct DeskWorkspaceSidebar: View {
             .padding(.top, 8)
             .padding(.bottom, 5)
 
-            ScrollView {
-                VStack(spacing: 2) {
-                    ForEach(viewer.connections) { record in
-                        deviceRow(record)
-                    }
-                    Button(action: newConnection) {
-                        rowLabel("新建连接", symbol: "plus")
-                            .foregroundStyle(DeskPalette.muted)
-                    }
-                    .buttonStyle(DeskSidebarRowStyle(selected: false))
-                    .disabled(roleLocked)
+            // A native list: arrow keys move the selection, Return or a double-click connects, a right-click
+            // opens the device's menu and a drag reorders.
+            List(selection: deviceSelection) {
+                ForEach(models.arrangedConnections) { record in
+                    deviceRow(record)
+                        .listRowSeparator(.hidden)
                 }
-                .padding(.horizontal, 10)
-                .frame(maxWidth: .infinity)
+                .onMove { models.moveDevices(from: $0, to: $1) }
+                Button(action: newConnection) {
+                    rowLabel("新建连接", symbol: "plus")
+                        .foregroundStyle(DeskPalette.muted)
+                        .padding(.leading, Self.listRowLeading)
+                        .frame(minHeight: 31)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .listRowSeparator(.hidden)
             }
-            .scrollBounceBehavior(.basedOnSize)
+            .listStyle(.inset)
+            .scrollContentBackground(.hidden)
+            .contentMargins(.vertical, 0, for: .scrollContent)
+            .environment(\.defaultMinListRowHeight, 35)
+            .contextMenu(forSelectionType: UUID.self) { ids in
+                deviceMenu(ids)
+            } primaryAction: { ids in
+                if let id = ids.first { openDevice(id) }
+            }
+            .disabled(roleLocked)
             .frame(maxHeight: .infinity)
 
             VStack(spacing: 2) {
@@ -1659,33 +1693,56 @@ private struct DeskWorkspaceSidebar: View {
             .padding(.bottom, 10)
         }
         .background(DeskPalette.sidebarBackground)
+        .modifier(RecordRemovalAlert(record: $recordToRemove, active: true, remove: viewer.removeConnection))
     }
 
+    /// Brings the symbols of the list's rows in line with those of the rows below it.
+    private static let listRowLeading: CGFloat = 4
+
+    // Colours follow the list: the title and symbol turn light on the highlight of a focused list.
     private func deviceRow(_ record: ConnectionRecord) -> some View {
         let session = models.existingSession(for: record)
-        let selected = models.workspaceSection == .connect && workspaceDeviceID == record.id
         let title = ConnectionEntryPresentation.title(record)
-        return Button {
-            workspaceDeviceID = record.id
-            models.workspaceSection = .connect
-        } label: {
-            HStack(spacing: 6) {
-                rowLabel(title, symbol: ConnectionEntryPresentation.deviceSymbol(record))
-                    .foregroundStyle(DeskPalette.ink)
-                if let session, session.connected || session.working || session.reconnecting {
-                    Circle()
-                        .fill(session.connected ? DeskPalette.emerald : DeskPalette.amber)
-                        .frame(width: 7, height: 7)
-                        .accessibilityHidden(true)
-                }
+        let status = session?.activeSessionSummary.statusLabel
+        return HStack(spacing: 9) {
+            Image(systemName: ConnectionEntryPresentation.deviceSymbol(record))
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+                .frame(width: 19)
+                .accessibilityHidden(true)
+            Text(title)
+                .font(.system(size: 13))
+                .lineLimit(1)
+            Spacer(minLength: 0)
+            if let session, session.connected || session.working || session.reconnecting {
+                Circle()
+                    .fill(session.connected ? DeskPalette.emerald : DeskPalette.amber)
+                    .frame(width: 7, height: 7)
+                    .accessibilityHidden(true)
             }
         }
-        .buttonStyle(DeskSidebarRowStyle(selected: selected))
-        .disabled(roleLocked)
+        .padding(.leading, Self.listRowLeading)
+        .frame(minHeight: 31)
+        .accessibilityElement(children: .combine)
         .accessibilityLabel(title)
-        .accessibilityValue(session?.activeSessionSummary.statusLabel ?? "未连接")
-        .accessibilityAddTraits(selected ? .isSelected : [])
-        .help(session?.activeSessionSummary.statusLabel ?? "查看设备")
+        .accessibilityValue(status ?? "未连接")
+        .help(status ?? "点按查看设备；连按两次或按 Return 连接，按住拖动可调整顺序")
+    }
+
+    @ViewBuilder
+    private func deviceMenu(_ ids: Set<UUID>) -> some View {
+        if let record = viewer.connections.first(where: { ids.contains($0.id) }) {
+            let session = models.existingSession(for: record).flatMap { $0.active || $0.working || $0.reconnecting ? $0 : nil }
+            Button(session == nil ? "连接" : "切到窗口") { openDevice(record.id) }
+            if let session {
+                Button("断开连接", role: .destructive) { models.disconnectViewerSession(id: session.sessionID) }
+            }
+            Divider()
+            Button("移除此记录…", role: .destructive) { recordToRemove = record }
+                .disabled(viewer.active || viewer.working || viewer.isRunningRouteBenchmark)
+        } else {
+            Button("新建连接…", action: newConnection)
+        }
     }
 
     private func navigationRow(

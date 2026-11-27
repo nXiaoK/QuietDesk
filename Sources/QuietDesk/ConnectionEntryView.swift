@@ -154,6 +154,8 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
     let records: [ConnectionRecord]
     let selectedRecord: ConnectionRecord?
     @Binding var showNewConnection: Bool
+    /// A record the sidebar asked to connect to, by a double-click, Return or its menu; taken once.
+    var openRecordRequest: Binding<UUID?> = .constant(nil)
     let locked: Bool
     let failure: String?
     let status: String
@@ -271,6 +273,13 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
         .modifier(recordRemovalAlert(inManagementSheet: false))
         .onChange(of: showNewConnection, initial: true) { _, requested in
             if requested { openNewConnection() }
+        }
+        .onChange(of: openRecordRequest.wrappedValue, initial: true) { _, id in
+            guard let id else { return }
+            openRecordRequest.wrappedValue = nil
+            // The same path as the page's own button: it switches to a running session, or asks for what is missing.
+            guard !locked, sheet == nil, let record = records.first(where: { $0.id == id }) else { return }
+            connectSavedDevice(record)
         }
         .onDisappear(perform: dismissSheet)
         .onReceive(NotificationCenter.default.publisher(for: SystemQuitHandler.dismissSheets)) { _ in
@@ -1688,7 +1697,7 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
     }
 }
 
-private struct RecordRemovalAlert: ViewModifier {
+struct RecordRemovalAlert: ViewModifier {
     @Binding var record: ConnectionRecord?
     let active: Bool
     let remove: (ConnectionRecord) -> Void

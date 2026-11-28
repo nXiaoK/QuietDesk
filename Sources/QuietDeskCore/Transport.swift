@@ -61,6 +61,8 @@ public final class Peer {
     public var onMessageHandled: ((Message, @escaping () -> Void) -> Void)?
     public var onClose: ((String) -> Void)?
     public var onTraffic: ((Int) -> Void)?
+    /// This peer's own framed TCP bytes, in (sent, received) order.
+    public var onTrafficDelta: ((UInt64, UInt64) -> Void)?
     public let trafficMeter = TrafficMeter()
     public var onRoundTripMilliseconds: ((Double) -> Void)?
     public private(set) var closeIsRetryable = false
@@ -317,12 +319,16 @@ public final class Peer {
     private func submit(_ message: OutgoingMessage, range: Range<Int>, last: Bool) {
         let content = range.count == message.data.count ? message.data : message.data.subdata(in: range)
         let meter = trafficMeter
-        connection.send(content: content, contentContext: sendContext, completion: .contentProcessed { [weak self] error in
+        connection.send(content: content, contentContext: sendContext, completion: .contentProcessed { [weak self, onTrafficDelta] error in
             if last {
                 if let self, !self.closed {
                     self.diagnostics?.record(.sendCompletion, since: message.submittedAt, kind: message.kind, identifier: message.identifier)
                 }
-                if error == nil { meter.record(sentBytes: UInt64(message.data.count)) }
+                if error == nil {
+                    let sentBytes = UInt64(message.data.count)
+                    meter.record(sentBytes: sentBytes)
+                    onTrafficDelta?(sentBytes, 0)
+                }
             }
             guard let self else { if last { message.completion?(false) }; return }
             self.pendingBytes -= range.count
@@ -382,6 +388,7 @@ public final class Peer {
         onMessageHandled = nil
         onClose = nil
         onTraffic = nil
+        onTrafficDelta = nil
         onRoundTripMilliseconds = nil
         // Messages still waiting for pacing never reached Network.framework.
         for message in unsent { message.completion?(false) }
@@ -394,6 +401,7 @@ public final class Peer {
         metadata.serviceClass = .background
         sendContext = NWConnection.ContentContext(identifier: "quietdesk-mapping", metadata: [metadata])
         onTraffic = nil
+        onTrafficDelta = nil
         onRoundTripMilliseconds = nil
         onReady = nil
         transportDiagnosticsSupported = false
@@ -487,7 +495,9 @@ public final class Peer {
             if let data, !data.isEmpty {
                 buffer.data.append(data)
                 self.lastReceived = SessionClock.uptime
-                self.trafficMeter.record(receivedBytes: UInt64(data.count))
+                let receivedBytes = UInt64(data.count)
+                self.trafficMeter.record(receivedBytes: receivedBytes)
+                self.onTrafficDelta?(0, receivedBytes)
                 self.onTraffic?(data.count)
             }
             if buffer.data.count == count {

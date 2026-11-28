@@ -184,10 +184,12 @@ struct ConnectionSettingsView: View {
                 .help(IdleAutoPausePresentation.toggleHelp)
             }
             Divider()
-            DeskSettingsRow(title: "结束连接后生成诊断报告") {
-                Toggle("结束连接后生成诊断报告", isOn: $model.connectionDiagnosticsEnabled)
+            DeskSettingsRow(
+                title: "结束连接后自动弹出诊断报告",
+                detail: "每次连接都会自动记录诊断报告，可在「流量统计」中回看。"
+            ) {
+                Toggle("结束连接后自动弹出诊断报告", isOn: $model.connectionDiagnosticsEnabled)
                     .labelsHidden()
-                    .disabled(model.isControllingAnotherMac)
             }
             if model.relayEnabled {
                 Divider()
@@ -642,9 +644,9 @@ private struct ConnectionOptionsSections: View {
     private var diagnosticsBlock: some View {
         VStack(alignment: .leading, spacing: 0) {
             compactToggleRow(
-                "结束后生成诊断报告",
-                isOn: $model.connectionDiagnosticsEnabled,
-                disabled: model.isControllingAnotherMac
+                "结束连接后自动弹出诊断报告",
+                detail: "连接报告可在「流量统计」中回看。",
+                isOn: $model.connectionDiagnosticsEnabled
             )
 
             if !model.lastDisconnect.isEmpty {

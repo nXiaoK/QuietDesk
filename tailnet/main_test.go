@@ -1,10 +1,41 @@
 package main
 
 import (
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/types/key"
 )
+
+func TestOutboundPeerRoutesRequireTheBridgedActivePeer(t *testing.T) {
+	status := &ipnstate.Status{Peer: make(map[key.NodePublic]*ipnstate.PeerStatus)}
+	outbound := make(map[uint16]outboundRoute)
+	add := func(address string, port uint16, peer ipnstate.PeerStatus) {
+		ip := netip.MustParseAddr(address)
+		peer.TailscaleIPs = []netip.Addr{ip}
+		peer.InNetworkMap = true
+		peer.InMagicSock = true
+		status.Peer[key.NewNode().Public()] = &peer
+		outbound[port] = outboundRoute{target: ip}
+	}
+	add("100.100.0.1", 34001, ipnstate.PeerStatus{Active: true, CurAddr: "192.0.2.1:41641", Relay: "home"})
+	add("100.100.0.2", 34002, ipnstate.PeerStatus{Active: true, Relay: "test"})
+	add("100.100.0.3", 34003, ipnstate.PeerStatus{Relay: "unused"})
+	add("100.100.0.4", 34004, ipnstate.PeerStatus{Active: true, Relay: "home", PeerRelay: "192.0.2.9:41641:vni:1"})
+	add("100.100.0.5", 34005, ipnstate.PeerStatus{Active: true})
+	outbound[34006] = outboundRoute{target: netip.MustParseAddr("100.100.0.6")}
+	got := outboundPeerRoutes(status, outbound)
+	if len(got) != 2 || got[34001] != (peerRoute{Path: "direct"}) || got[34002] != (peerRoute{Path: "derp", Relay: "test"}) {
+		t.Fatalf("route attribution included an inactive, unsupported, or unrelated peer: %+v", got)
+	}
+	delete(outbound, 34002)
+	if got := outboundPeerRoutes(status, outbound); len(got) != 1 {
+		t.Fatalf("a closed bridge remains in status: %+v", got)
+	}
+}
 
 func TestNormalizedControlURL(t *testing.T) {
 	for _, value := range []string{"", "https://headscale.example", "https://headscale.example:8443/tailnet",

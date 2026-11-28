@@ -4,6 +4,14 @@ import QuietDeskCore
 // A connection owns its data handlers. Invalidation also fences late decoder callbacks.
 final class SessionDataChannel: @unchecked Sendable {
     typealias VideoReceiver = (VideoPacket, @escaping () -> Void) -> Void
+    struct ChannelTraffic {
+        var controlTCP = DiagnosticTrafficBucket()
+        var videoTCP = DiagnosticTrafficBucket()
+        var bulkTCP = DiagnosticTrafficBucket()
+        var mediaUDP = DiagnosticTrafficBucket()
+        // Relayed datagrams are measured at the forwarding pipe, not again on loopback.
+        var unrelayedMediaUDP = DiagnosticTrafficBucket()
+    }
     private let lock = NSLock()
     private let send: (Message) -> Void
     private let firstFrameClock: (() -> TimeInterval)?
@@ -21,6 +29,8 @@ final class SessionDataChannel: @unchecked Sendable {
     private var freshFrameToken: UUID?
     private var mediaFreshFrame: (stream: MediaStreamID, token: UUID?)?
     private var bytes = 0
+    private var legacyBytes = 0
+    private var channelTraffic = ChannelTraffic()
     private var frames = 0
     private var settledFragments = 0
     private var lostFragments = 0
@@ -140,7 +150,47 @@ final class SessionDataChannel: @unchecked Sendable {
         }
     }
 
-    func recordBytes(_ count: Int) { lock.withLock { if valid { bytes += count } } }
+    func recordBytes(_ count: Int) {
+        lock.withLock {
+            if valid { bytes += count; legacyBytes += count }
+        }
+    }
+
+    func recordChannelTraffic(_ channel: MediaTrafficChannel, sent: UInt64, received: UInt64) {
+        lock.withLock {
+            guard valid else { return }
+            switch channel {
+            case .controlTCP: channelTraffic.controlTCP.add(sent: sent, received: received)
+            case .videoTCP: channelTraffic.videoTCP.add(sent: sent, received: received)
+            case .bulkTCP: channelTraffic.bulkTCP.add(sent: sent, received: received)
+            case .mediaUDP:
+                channelTraffic.mediaUDP.add(sent: sent, received: received)
+                channelTraffic.unrelayedMediaUDP.add(sent: sent, received: received)
+            }
+            addDisplayTraffic(sent: sent, received: received)
+        }
+    }
+
+    func recordDatagramTraffic(relayed: Bool, sent: UInt64, received: UInt64) {
+        lock.withLock {
+            guard valid else { return }
+            channelTraffic.mediaUDP.add(sent: sent, received: received)
+            if !relayed { channelTraffic.unrelayedMediaUDP.add(sent: sent, received: received) }
+            addDisplayTraffic(sent: sent, received: received)
+        }
+    }
+
+    private func addDisplayTraffic(sent: UInt64, received: UInt64) {
+        let (sum, overflow) = bytes.addingReportingOverflow(Int(clamping: sent))
+        let (total, totalOverflow) = sum.addingReportingOverflow(Int(clamping: received))
+        bytes = overflow || totalOverflow ? .max : total
+    }
+
+    func channelTrafficSnapshot() -> ChannelTraffic { lock.withLock { channelTraffic } }
+
+    func diagnosticSnapshot() -> (traffic: ChannelTraffic, legacyBytes: Int, frames: Int, settled: Int, lost: Int) {
+        lock.withLock { (channelTraffic, legacyBytes, frames, settledFragments, lostFragments) }
+    }
     @discardableResult
     func recordFrame() -> Bool {
         lock.withLock {
@@ -197,6 +247,8 @@ final class SessionDataChannel: @unchecked Sendable {
             mediaFreshFrame = nil
             freshFrameToken = nil
             bytes = 0; frames = 0
+            legacyBytes = 0
+            channelTraffic = ChannelTraffic()
             lastDisplaySample = (0, 0)
             settledFragments = 0; lostFragments = 0
             defer { firstFrameAt = nil }

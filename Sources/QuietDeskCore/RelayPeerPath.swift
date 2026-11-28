@@ -276,15 +276,39 @@ public struct TransportPathStateMachine: Sendable {
     }
 }
 
-/// Counts assisted-lease datagram payload bytes by the outer path they used, in both directions.
+/// Counts relayed and punched datagram payload bytes by their outer path and direction.
 public final class RelayPeerTrafficCounter: @unchecked Sendable {
+    public struct DetailedSnapshot: Equatable, Sendable {
+        public var relayedSent: UInt64
+        public var relayedReceived: UInt64
+        public var directSent: UInt64
+        public var directReceived: UInt64
+
+        public init(relayedSent: UInt64 = 0, relayedReceived: UInt64 = 0,
+                    directSent: UInt64 = 0, directReceived: UInt64 = 0) {
+            self.relayedSent = relayedSent
+            self.relayedReceived = relayedReceived
+            self.directSent = directSent
+            self.directReceived = directReceived
+        }
+    }
+
     private let lock = NSLock()
-    private var relayed: UInt64 = 0
-    private var direct: UInt64 = 0
+    private var totals = DetailedSnapshot()
     public init() {}
-    public var snapshot: (relayed: UInt64, direct: UInt64) { lock.withLock { (relayed, direct) } }
-    func record(relayed: Int = 0, direct: Int = 0) {
-        lock.withLock { self.relayed &+= UInt64(relayed); self.direct &+= UInt64(direct) }
+    public var snapshot: (relayed: UInt64, direct: UInt64) {
+        let detail = detailedSnapshot
+        return (detail.relayedSent &+ detail.relayedReceived, detail.directSent &+ detail.directReceived)
+    }
+    public var detailedSnapshot: DetailedSnapshot { lock.withLock { totals } }
+
+    func record(relayedSent: Int = 0, relayedReceived: Int = 0, directSent: Int = 0, directReceived: Int = 0) {
+        lock.withLock {
+            totals.relayedSent &+= UInt64(relayedSent)
+            totals.relayedReceived &+= UInt64(relayedReceived)
+            totals.directSent &+= UInt64(directSent)
+            totals.directReceived &+= UInt64(directReceived)
+        }
     }
 }
 
@@ -1111,7 +1135,9 @@ final class RelayAssistedPipe: RelayDatagramPipe {
     func send(_ payload: Data, completion: @escaping (Bool) -> Void) {
         guard ready, let socket, payload.count <= RelayDatagram.maximumPayloadBytes else { completion(false); return }
         if let agent, let (packet, destination) = agent.sealData(payload) {
-            if socket.send(packet, to: destination) != .failed { counter.record(direct: payload.count); completion(true); return }
+            let result = socket.send(packet, to: destination)
+            if result == .sent { counter.record(directSent: payload.count) }
+            if result != .failed { completion(true); return }
             perform(agent.directSendFailed(now: SessionClock.now))
         }
         if relayChoices.count > 1, firstPayload == nil { firstPayload = payload }
@@ -1120,9 +1146,7 @@ final class RelayAssistedPipe: RelayDatagramPipe {
 
     @discardableResult
     private func sendRelayedMedia(_ payload: Data) -> Bool {
-        guard sendRelay(payload) else { return false }
-        counter.record(relayed: payload.count)
-        return true
+        sendRelay(payload, recordMedia: true)
     }
 
     func enableAssist(secret: Data) {
@@ -1217,12 +1241,12 @@ final class RelayAssistedPipe: RelayDatagramPipe {
                 }
                 return
             }
-            counter.record(relayed: packet.payload.count)
+            counter.record(relayedReceived: packet.payload.count)
             deliver(packet.payload)
         } else if let agent, RelayPeerAgent.isPeerPacket(data) {
             let result = agent.receive(data, from: source, now: SessionClock.now)
             perform(result.actions)
-            if let payload = result.payload { counter.record(direct: payload.count); deliver(payload) }
+            if let payload = result.payload { counter.record(directReceived: payload.count); deliver(payload) }
         }
     }
 
@@ -1256,7 +1280,7 @@ final class RelayAssistedPipe: RelayDatagramPipe {
     }
 
     @discardableResult
-    private func sendRelay(_ payload: Data, observeMappings: Bool = false) -> Bool {
+    private func sendRelay(_ payload: Data, observeMappings: Bool = false, recordMedia: Bool = false) -> Bool {
         guard ready, sequence < .max else { return false }
         sequence += 1
         guard let data = try? RelayDatagram(side: side, sequence: sequence, id: id, payload: payload).encode(key: key) else {
@@ -1265,7 +1289,9 @@ final class RelayAssistedPipe: RelayDatagramPipe {
         for _ in relayChoices.indices {
             let address = relayChoices[relayIndex]
             socket = socket ?? relaySocket(for: address)
-            if let socket, socket.send(data, to: address) != .failed {
+            let result = socket?.send(data, to: address)
+            if let socket, result != .failed {
+                if recordMedia, result == .sent { counter.record(relayedSent: payload.count) }
                 if observeMappings, let probePort, mode != .off {
                     probeMappings(from: socket, activeRelay: address, probePort: probePort, registration: data)
                 }

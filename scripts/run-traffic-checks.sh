@@ -16,3 +16,10 @@ swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
     "${core_objects[@]}" Sources/QuietDesk/AppDataLocation.swift Sources/QuietDesk/TrafficHistory.swift AppChecks/TrafficHistoryChecks.swift \
     -o "$build_directory/TrafficHistoryChecks"
 "$build_directory/TrafficHistoryChecks"
+swiftc -parse-as-library -target "$(uname -m)-apple-macosx14.0" \
+    -module-cache-path "$build_directory/ModuleCache" -I "$build_directory/Modules" \
+    "${core_objects[@]}" Sources/QuietDesk/AppDataLocation.swift Sources/QuietDesk/TrafficHistory.swift \
+    Sources/QuietDesk/ConnectionReportHistory.swift Sources/QuietDesk/SessionDataChannel.swift \
+    Sources/QuietDesk/ViewerConnectionDiagnostics.swift AppChecks/ConnectionReportHistoryChecks.swift \
+    -o "$build_directory/ConnectionReportHistoryChecks"
+"$build_directory/ConnectionReportHistoryChecks"

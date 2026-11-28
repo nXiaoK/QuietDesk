@@ -82,6 +82,7 @@ final class RelayUDPPipe {
     private let id: Data
     private let key: Data
     private let side: UInt8
+    private let counter: RelayPeerTrafficCounter?
     private var sequence: UInt64 = 0
     private var replay = RelayReplayWindow()
     private var ready = false
@@ -93,9 +94,11 @@ final class RelayUDPPipe {
     private var sends: [UUID: (Int, (Bool) -> Void)] = [:]
     private var keepalive: DispatchSourceTimer?
 
-    init(endpoint: RelayEndpoint, port: UInt16, id: Data, key: Data, side: UInt8, queue: DispatchQueue) throws {
+    init(endpoint: RelayEndpoint, port: UInt16, id: Data, key: Data, side: UInt8, queue: DispatchQueue,
+         counter: RelayPeerTrafficCounter? = nil) throws {
         guard id.count == 16, key.count == 32, side <= 1, port > 0 else { throw RelayServiceError.invalid }
         self.id = id; self.key = key; self.side = side; self.queue = queue
+        self.counter = counter
         // The relayed datagrams are the desktop's interactive video, and are marked like the direct path.
         let parameters = NWParameters.udp
         parameters.serviceClass = .interactiveVideo
@@ -144,7 +147,9 @@ final class RelayUDPPipe {
             let data = try RelayDatagram(side: side, sequence: sequence, id: id, payload: payload).encode(key: key)
             pendingBytes += data.count
             let token = UUID(); sends[token] = (data.count, completion)
-            connection.send(content: data, completion: .contentProcessed { [weak self] error in
+            let payloadBytes = payload.count
+            connection.send(content: data, completion: .contentProcessed { [weak self, counter] error in
+                if error == nil, payloadBytes > 0 { counter?.record(relayedSent: payloadBytes) }
                 guard let self, let pending = self.sends.removeValue(forKey: token) else { return }
                 self.pendingBytes -= pending.0; pending.1(error == nil && !self.closed)
                 if error != nil { self.finish(RelayTransportError.network) }
@@ -163,6 +168,7 @@ final class RelayUDPPipe {
                   packet.id == self.id, packet.side == self.side, packet.downstream,
                   self.replay.accept(packet.sequence), !packet.payload.isEmpty else { self.receive(); return }
             self.peerSeen = true
+            self.counter?.record(relayedReceived: packet.payload.count)
             guard let callback = self.onPayload else { self.receive(); return }
             self.delivering += 1
             let once = NSLock(); var finished = false

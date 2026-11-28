@@ -3,11 +3,38 @@ import QuietDeskCore
 import SwiftUI
 
 struct TrafficStatisticsView: View {
+    private enum Tab { case reports, addresses }
+    private enum HistoryAction {
+        case delete(UUID)
+        case clear
+
+        var title: String {
+            switch self {
+            case .delete: return "删除这条诊断报告？"
+            case .clear: return "清空连接诊断报告？"
+            }
+        }
+
+        var buttonLabel: String {
+            switch self {
+            case .delete: return "删除"
+            case .clear: return "清空"
+            }
+        }
+    }
+
     @ObservedObject var model: DeskModel
     @ObservedObject var history: TrafficHistoryFeed
+    @ObservedObject var reportHistory: ConnectionReportHistoryFeed
+    let reportHistoryStore: ConnectionReportHistoryStore
     let done: () -> Void
     var embedded: Bool = false
+    @State private var tab: Tab = .reports
     @State private var selectedEndpoint: TrafficEndpoint?
+    @State private var selectedReportID: UUID?
+    @State private var presentedReport: ConnectionDiagnosticReport?
+    @State private var pendingHistoryAction: HistoryAction?
+    @State private var confirmingHistoryAction = false
 
     private var selectedRecord: EndpointTrafficRecord? {
         if let selectedEndpoint, let found = history.records.first(where: { $0.id == selectedEndpoint }) {
@@ -26,6 +53,10 @@ struct TrafficStatisticsView: View {
 
     private var totalCombined: Decimal {
         history.records.reduce(Decimal.zero) { $0 + $1.totalBytes }
+    }
+
+    private var selectedReport: ConnectionDiagnosticReport? {
+        reportHistory.reports.first { $0.id == selectedReportID }
     }
 
     var body: some View {
@@ -60,19 +91,192 @@ struct TrafficStatisticsView: View {
             if selectedEndpoint == nil {
                 selectedEndpoint = history.records.first?.id
             }
+            updateSelectedReport()
         }
         .onChange(of: history.records.first?.id) { _, firstID in
             if selectedEndpoint == nil {
                 selectedEndpoint = firstID
             }
         }
+        .onChange(of: reportHistory.reports.map(\.id)) { _, _ in updateSelectedReport() }
         .onDisappear { model.flushTrafficHistory() }
         .onExitCommand {
             if !embedded { done() }
         }
+        .sheet(item: $presentedReport) { report in
+            VStack(spacing: 0) {
+                ConnectionDiagnosticReportView(report: report)
+                Divider()
+                HStack {
+                    Spacer()
+                    Button("关闭") { presentedReport = nil }
+                        .buttonStyle(DeskButtonStyle(.quiet))
+                        .keyboardShortcut(.cancelAction)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+                .background(DeskPalette.canvasBackground)
+            }
+            .frame(width: 800, height: 640)
+        }
+        .alert(pendingHistoryAction?.title ?? "", isPresented: $confirmingHistoryAction, presenting: pendingHistoryAction) { action in
+            Button("取消", role: .cancel) { pendingHistoryAction = nil }
+            Button(action.buttonLabel, role: .destructive) {
+                switch action {
+                case .delete(let id): reportHistoryStore.delete(id: id)
+                case .clear: reportHistoryStore.clearAll()
+                }
+                pendingHistoryAction = nil
+            }
+        } message: { _ in
+            Text("此操作会永久删除所选的连接诊断记录。")
+        }
     }
 
     private var content: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            DeskSegmentedTabs(
+                tabs: [(.reports, "连接记录与诊断报告"), (.addresses, "地址累计流量")], selection: $tab
+            )
+            .frame(maxWidth: 345)
+            switch tab {
+            case .reports: connectionReports
+            case .addresses: addressTraffic
+            }
+        }
+    }
+
+    private var connectionReports: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 12) {
+                DeskSettingsPageHeading(title: "连接记录", detail: "在本机保留最近 100 次连接的诊断报告。")
+                Spacer()
+                if !reportHistory.reports.isEmpty {
+                    Button("清空记录…") { confirm(.clear) }
+                        .buttonStyle(DeskButtonStyle(.quiet))
+                }
+            }
+
+            if let error = reportHistory.error {
+                DeskCalloutBox(message: error, symbol: "exclamationmark.triangle.fill", tone: .warning)
+            }
+
+            reportSummary
+
+            if reportHistory.reports.isEmpty {
+                DeskSurfaceCard(padding: 24, cornerRadius: 10) {
+                    Text(reportHistory.error == nil ? "连接结束后，诊断报告会出现在这里。" : "暂无可显示的连接诊断报告。")
+                        .font(.system(size: 13))
+                        .foregroundStyle(DeskPalette.secondary)
+                        .frame(maxWidth: .infinity)
+                }
+            } else {
+                reportTable
+                if let selectedReport { reportDetails(selectedReport) }
+            }
+        }
+    }
+
+    private var reportSummary: some View {
+        let reports = reportHistory.reports
+        let metrics = [
+            ("记录数", "\(reports.count) 次"),
+            ("累计连接时长", DiagnosticReportFormat.elapsed(reports.reduce(0) { $0 + $1.duration })),
+            ("累计总流量", DiagnosticReportFormat.bytes(reports.reduce(Decimal.zero) { $0 + Decimal($1.traffic.totalBytes) })),
+            ("累计中转流量", DiagnosticReportFormat.bytes(reports.reduce(Decimal.zero) { $0 + Decimal($1.traffic.relayedBytes) })),
+            ("累计打洞直连流量", DiagnosticReportFormat.bytes(reports.reduce(Decimal.zero) { $0 + Decimal($1.traffic.punchedBytes) }))
+        ]
+        return ViewThatFits(in: .horizontal) {
+            trafficSummaryGrid(metrics, columns: 5).frame(minWidth: 640)
+            trafficSummaryGrid(metrics, columns: 3).frame(minWidth: 410)
+            trafficSummaryGrid(metrics, columns: 2)
+        }
+    }
+
+    private var reportTable: some View {
+        DeskSurfaceCard(padding: 0, cornerRadius: 10) {
+            Table(reportHistory.reports, selection: $selectedReportID) {
+                TableColumn("开始时间") { report in
+                    Text(DiagnosticReportFormat.date(report.startedAt)).monospacedDigit()
+                }
+                .width(min: 92, ideal: 110)
+                TableColumn("设备 / 地址") { report in
+                    Text(report.diagnosticDisplayName).lineLimit(1).help(report.diagnosticDisplayName)
+                }
+                .width(min: 105, ideal: 150)
+                TableColumn("连接时长") { report in
+                    Text(DiagnosticReportFormat.elapsed(report.duration)).monospacedDigit()
+                }
+                .width(min: 54, ideal: 66)
+                TableColumn("总流量") { report in reportAmount(report.traffic.totalBytes) }
+                    .width(min: 52, ideal: 67)
+                TableColumn("中转流量") { report in reportAmount(report.traffic.relayedBytes) }
+                    .width(min: 57, ideal: 68)
+                TableColumn("打洞直连") { report in reportAmount(report.traffic.punchedBytes) }
+                    .width(min: 57, ideal: 68)
+                TableColumn("活跃帧率与稳定度") { report in
+                    HStack(spacing: 5) {
+                        Text(DiagnosticReportFormat.fps(report.frameRate.activeMeanFPS))
+                            .monospacedDigit()
+                        DiagnosticStabilityBadge(stats: report.frameRate)
+                    }
+                }
+                .width(min: 119, ideal: 127)
+            }
+            .tableStyle(.inset(alternatesRowBackgrounds: true))
+            .frame(height: min(305, max(88, 30 + CGFloat(reportHistory.reports.count) * 27)))
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func reportAmount(_ bytes: UInt64) -> some View {
+        Text(DiagnosticReportFormat.bytes(bytes))
+            .monospacedDigit()
+            .help(bytes.formatted() + " 字节")
+    }
+
+    private func reportDetails(_ report: ConnectionDiagnosticReport) -> some View {
+        let traffic = report.traffic
+        return DeskSettingsGroup(title: "连接摘要") {
+            DeskSettingsRow(title: report.diagnosticDisplayName, detail: report.reason) {
+                DiagnosticStabilityBadge(stats: report.frameRate)
+            }
+            Divider()
+            DeskSettingsRow(title: "本机收发", detail: "发 \(DiagnosticReportFormat.bytes(traffic.totalSentBytes)) / 收 \(DiagnosticReportFormat.bytes(traffic.totalReceivedBytes))") {
+                Text("TCP \(DiagnosticReportFormat.bytes(traffic.tcpBytes)) · UDP \(DiagnosticReportFormat.bytes(traffic.udpBytes))")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(DeskPalette.secondary)
+            }
+            Divider()
+            DeskSettingsRow(title: "活跃平均帧率", detail: DiagnosticReportFormat.fpsRange(report.frameRate)) {
+                Text(DiagnosticReportFormat.fps(report.frameRate.activeMeanFPS))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(DeskPalette.secondary)
+            }
+            Divider()
+            HStack {
+                Button("查看完整诊断报告") { presentedReport = report }
+                    .buttonStyle(DeskButtonStyle(.primary))
+                Spacer()
+                Button("删除记录…") { confirm(.delete(report.id)) }
+                    .buttonStyle(DeskButtonStyle(.quiet))
+            }
+            .padding(.vertical, 9)
+        }
+    }
+
+    private func updateSelectedReport() {
+        if selectedReport == nil {
+            selectedReportID = reportHistory.reports.first?.id
+        }
+    }
+
+    private func confirm(_ action: HistoryAction) {
+        pendingHistoryAction = action
+        confirmingHistoryAction = true
+    }
+
+    private var addressTraffic: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .top, spacing: 12) {
                 DeskSettingsPageHeading(

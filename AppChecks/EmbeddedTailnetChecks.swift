@@ -21,11 +21,13 @@ struct EmbeddedTailnetChecks {
         let base = URL(fileURLWithPath: directory)
         let logURL = base.appendingPathComponent("requests")
         let pathFixture = base.appendingPathComponent("peer-path")
+        let bridgeFixture = base.appendingPathComponent("bridge-routes")
         if !FileManager.default.fileExists(atPath: logURL.path) { _ = FileManager.default.createFile(atPath: logURL.path, contents: nil) }
         let log = try FileHandle(forWritingTo: logURL)
         try log.seekToEnd()
         try log.write(contentsOf: Data("launch \(controlURL ?? "official")\n".utf8))
         var shared = 0, udp = false
+        var bridges = Set<Int>()
         while let text = readLine(), let req = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
               let op = req["op"] as? String, let id = req["id"] as? Int {
             let port = req["port"] as? Int ?? 0
@@ -43,6 +45,10 @@ struct EmbeddedTailnetChecks {
                     reply["peerPath"] = path
                     if path == "derp" { reply["peerRelay"] = "hkg" }
                 }
+                if let data = try? Data(contentsOf: bridgeFixture),
+                   let routes = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    reply["bridgeRoutes"] = routes.filter { (Int($0.key).map { bridges.contains($0) }) == true }
+                }
             case "share":
                 udp = req["udp"] as? Bool ?? false
                 if shared != 0 { Thread.sleep(forTimeInterval: 0.08) }
@@ -50,9 +56,14 @@ struct EmbeddedTailnetChecks {
                 reply["port"] = shared
                 reply["udp"] = udp
             case "open":
-                try require(req["host"] as? String == "100.100.0.2" && port == 5908, "错误的对端地址")
+                let host = req["host"] as? String
+                try require((host == "100.100.0.2" || host == "100.100.0.3") && port == 5908, "错误的对端地址")
                 Thread.sleep(forTimeInterval: 0.12)
-                reply["port"] = 34907
+                let localPort = host == "100.100.0.2" ? 34907 : 34908
+                bridges.insert(localPort)
+                reply["port"] = localPort
+            case "close":
+                bridges.remove(port)
             default: break
             }
             var packet = try JSONSerialization.data(withJSONObject: reply)
@@ -78,6 +89,7 @@ struct EmbeddedTailnetChecks {
         let daemon = EmbeddedTailnet(defaults: defaults, executable: URL(fileURLWithPath: CommandLine.arguments[0]), directory: base)
         let logURL = base.appendingPathComponent("requests")
         let pathFixture = base.appendingPathComponent("peer-path")
+        let bridgeFixture = base.appendingPathComponent("bridge-routes")
         func log() -> String { (try? String(contentsOf: logURL, encoding: .utf8)) ?? "" }
 
         try require(EmbeddedTailnet.loginURL("https://login.tailscale.com/a/example") != nil &&
@@ -177,6 +189,32 @@ struct EmbeddedTailnetChecks {
         }
         try require(defaults.string(forKey: "embeddedTailnetControlURL") == control, "启用后未保存规范化的控制服务配置")
 
+        try Data(#"{"34907":{"path":"direct"},"34908":{"path":"derp","relay":"test"}}"#.utf8).write(to: bridgeFixture, options: .atomic)
+        var firstRoutes: [(String?, String?)] = []
+        var secondRoutes: [(String?, String?)] = []
+        let closeFirst = daemon.bridge(host: "100.100.0.2", port: 5908, ready: { _ in }, failed: { error = $0 },
+                                       peerRouteChanged: { firstRoutes.append(($0, $1)) })
+        let closeSecond = daemon.bridge(host: "100.100.0.3", port: 5908, ready: { _ in }, failed: { error = $0 },
+                                        peerRouteChanged: { secondRoutes.append(($0, $1)) })
+        try await eventually("并发连接没有各自收到真实的对端路径") {
+            firstRoutes.last?.0 == "direct" && secondRoutes.last?.0 == "derp" && secondRoutes.last?.1 == "test"
+        }
+        closeFirst()
+        try await eventually("关闭连接后未撤销旧路径观察") {
+            log().components(separatedBy: "close 34907\n").count == 4
+        }
+        let firstEvents = firstRoutes.count
+        try Data(#"{"34907":{"path":"derp","relay":"other"}}"#.utf8).write(to: bridgeFixture, options: .atomic)
+        var reusedRoutes: [(String?, String?)] = []
+        let closeReused = daemon.bridge(host: "100.100.0.2", port: 5908, ready: { _ in }, failed: { error = $0 },
+                                        peerRouteChanged: { reusedRoutes.append(($0, $1)) })
+        try await eventually("复用端口沿用了旧路径，或缺省路径仍被报告为中继") {
+            reusedRoutes.last?.0 == "derp" && reusedRoutes.last?.1 == "other" &&
+            secondRoutes.count == 2 && secondRoutes.last?.0 == nil
+        }
+        try require(firstRoutes.count == firstEvents && error == nil, "已关闭的连接收到复用端口的路径事件")
+        closeSecond()
+
         try Data("direct".utf8).write(to: pathFixture, options: .atomic)
         daemon.login()
         try await eventually("未发布 P2P 路径或沿用了上一条 DERP 区域") {
@@ -194,6 +232,8 @@ struct EmbeddedTailnetChecks {
         try daemon.setControlURL("")
         try require(daemon.controlURL.isEmpty && daemon.peerPath == nil && daemon.peerRelay == nil,
                     "恢复默认设置时没有同步清除旧组件的路径状态")
+        try require(reusedRoutes.count == 2 && reusedRoutes.last?.0 == nil, "组件替换后没有同步清除连接的旧路径")
+        closeReused()
         try await eventually("恢复默认设置后没有用官方默认参数重启") {
             log().components(separatedBy: "launch official\n").count == 3 && daemon.state == "Running"
         }

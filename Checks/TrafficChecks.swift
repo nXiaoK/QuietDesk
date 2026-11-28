@@ -158,6 +158,7 @@ func runTrafficChecks() {
             guard let port = listener.port else { throw CheckFailure("No traffic check port") }
             let server = Box<Peer?>(nil)
             let clientTotals = Box(TrafficTotals()), serverTotals = Box(TrafficTotals())
+            let clientOwnTraffic = Box(TrafficTotals()), serverOwnTraffic = Box(TrafficTotals())
             let clientLegacy = Box(0), serverLegacy = Box(0)
             let failure = Box<String?>(nil), done = DispatchSemaphore(value: 0)
             let examine = {
@@ -172,6 +173,9 @@ func runTrafficChecks() {
                     onDelta: { _, delta in serverTotals.update { try! $0.add(delta) }; examine() })
                 peer.trafficMeter.onUpdate = session.receive
                 peer.onTraffic = { count in serverLegacy.update { $0 += count } }
+                peer.onTrafficDelta = { sent, received in
+                    serverOwnTraffic.update { try! $0.add(.init(sentBytes: sent, receivedBytes: received)) }
+                }
                 peer.onMessage = { [weak peer] message in
                     guard message.kind == .clipboard, message.payload == Data(repeating: 7, count: 123) else {
                         failure.set("Application payload changed"); done.signal(); return
@@ -187,6 +191,9 @@ func runTrafficChecks() {
                 onDelta: { _, delta in clientTotals.update { try! $0.add(delta) }; examine() })
             client.trafficMeter.onUpdate = session.receive
             client.onTraffic = { count in clientLegacy.update { $0 += count } }
+            client.onTrafficDelta = { sent, received in
+                clientOwnTraffic.update { try! $0.add(.init(sentBytes: sent, receivedBytes: received)) }
+            }
             client.onReady = { [weak client] in client?.send(Message(.clipboard, Data(repeating: 7, count: 123))) }
             client.start()
             try wait(done, "Directional traffic snapshots were not completed")
@@ -194,6 +201,12 @@ func runTrafficChecks() {
             server.read()?.queue.sync {}
             try check(failure.read() == nil, failure.read() ?? "Traffic exchange failed")
             try check(clientLegacy.read() == 140 && serverLegacy.read() == 140, "Legacy traffic callback behavior changed")
+            try check(clientOwnTraffic.read() == clientTotals.read() && serverOwnTraffic.read() == serverTotals.read(),
+                      "The peer callback did not report exact framed bytes by direction")
+            client.trafficMeter.record(sentBytes: 50, receivedBytes: 100)
+            try check(clientTotals.read() == TrafficTotals(sentBytes: 178, receivedBytes: 112)
+                      && clientOwnTraffic.read() == TrafficTotals(sentBytes: 128, receivedBytes: 12),
+                      "A child-meter contribution was counted as control TCP")
         }
     }
 }

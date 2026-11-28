@@ -2,7 +2,7 @@ import AppKit
 import Combine
 import QuietDeskCore
 
-/// State all role and viewer session models share. The traffic history file has one writer and one observer.
+/// State all role and viewer session models share, including a single writer for each history.
 @MainActor
 final class DeskServices {
     private struct WeakModel {
@@ -11,6 +11,8 @@ final class DeskServices {
 
     let trafficHistoryStore = TrafficHistoryStore()
     let trafficHistory = TrafficHistoryFeed()
+    let connectionReportHistoryStore = ConnectionReportHistoryStore()
+    let connectionReportHistory = ConnectionReportHistoryFeed()
     let tailnet = EmbeddedTailnet()
     let portMappings: PortMappingManager
     let routeBenchmarkStore = RouteQualityBenchmarkStore()
@@ -23,6 +25,21 @@ final class DeskServices {
             DispatchQueue.main.async {
                 MainActor.assumeIsolated { feed?.update(records: records, legacyRecords: legacyRecords, error: message) }
             }
+        }
+        let reports = connectionReportHistory
+        connectionReportHistoryStore.observe { [weak reports] records, message in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { reports?.update(reports: records, error: message) }
+            }
+        }
+    }
+
+    func updateConnectionReportPopup(_ enabled: Bool) {
+        let key = "connectionDiagnosticsEnabled"
+        guard UserDefaults.standard.bool(forKey: key) != enabled else { return }
+        UserDefaults.standard.set(enabled, forKey: key)
+        for model in allModels where model.connectionDiagnosticsEnabled != enabled {
+            model.connectionDiagnosticsEnabled = enabled
         }
     }
 
@@ -355,5 +372,6 @@ final class DeskModels: ObservableObject {
         viewerSessions.removeAll()
         viewer.stop()
         host.stop()
+        services.connectionReportHistoryStore.flush()
     }
 }

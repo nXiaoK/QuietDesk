@@ -39,15 +39,26 @@ type request struct {
 }
 
 type response struct {
-	ID        int    `json:"id"`
-	State     string `json:"state,omitempty"`
-	IP        string `json:"ip,omitempty"`
-	AuthURL   string `json:"authURL,omitempty"`
-	Port      uint16 `json:"port,omitempty"`
-	Error     string `json:"error,omitempty"`
-	UDP       bool   `json:"udp,omitempty"`
-	PeerPath  string `json:"peerPath,omitempty"`
-	PeerRelay string `json:"peerRelay,omitempty"`
+	ID           int                  `json:"id"`
+	State        string               `json:"state,omitempty"`
+	IP           string               `json:"ip,omitempty"`
+	AuthURL      string               `json:"authURL,omitempty"`
+	Port         uint16               `json:"port,omitempty"`
+	Error        string               `json:"error,omitempty"`
+	UDP          bool                 `json:"udp,omitempty"`
+	PeerPath     string               `json:"peerPath,omitempty"`
+	PeerRelay    string               `json:"peerRelay,omitempty"`
+	BridgeRoutes map[uint16]peerRoute `json:"bridgeRoutes,omitempty"`
+}
+
+type peerRoute struct {
+	Path  string `json:"path"`
+	Relay string `json:"relay,omitempty"`
+}
+
+type outboundRoute struct {
+	bridge *bridge
+	target netip.Addr
 }
 
 type helper struct {
@@ -58,7 +69,7 @@ type helper struct {
 	sharedUDP    *bridge
 	port         uint16
 	boundIP      string
-	outbound     map[uint16]*bridge
+	outbound     map[uint16]outboundRoute
 	lastPeerIP   netip.Addr
 	lastPeerPort uint16
 }
@@ -87,7 +98,7 @@ func main() {
 	machine, _ := os.Hostname()
 	node := tsnet.Server{Dir: nodeStateDir(*stateDir, control), Hostname: dnsname.SanitizeHostname("quietdesk-" + machine),
 		Logf: logger.Discard, UserLogf: logger.Discard, ControlURL: control, Port: uint16(*listenPort)}
-	h := helper{server: &node, portStateDir: *stateDir, outbound: make(map[uint16]*bridge)}
+	h := helper{server: &node, portStateDir: *stateDir}
 	defer node.Close()
 	defer h.closeRoutes()
 	serve(os.Stdin, os.Stdout, h.handle)
@@ -260,8 +271,8 @@ func (h *helper) handle(req request) (response, error) {
 		}
 		return h.status(ctx)
 	case "close":
-		if b := h.outbound[req.Port]; b != nil {
-			b.close()
+		if route, ok := h.outbound[req.Port]; ok {
+			route.bridge.close()
 			delete(h.outbound, req.Port)
 			if req.Port == h.lastPeerPort {
 				h.lastPeerIP, h.lastPeerPort = netip.Addr{}, 0
@@ -307,9 +318,44 @@ func (h *helper) status(ctx context.Context) (response, error) {
 				res.PeerPath, res.PeerRelay = "derp", peer.Relay
 			}
 		}
+		res.BridgeRoutes = outboundPeerRoutes(st, h.outbound)
 	}
 	res.Port, res.UDP = h.port, h.sharedUDP != nil
 	return res, nil
+}
+
+func outboundPeerRoutes(st *ipnstate.Status, outbound map[uint16]outboundRoute) map[uint16]peerRoute {
+	if len(outbound) == 0 {
+		return nil
+	}
+	routes := make(map[netip.Addr]peerRoute)
+	for _, peer := range st.Peer {
+		if peer == nil || !peer.InNetworkMap || !peer.InMagicSock || !peer.Active || peer.PeerRelay != "" {
+			continue
+		}
+		// Match the pinned Tailscale client's status classification for an active
+		// peer. Its DERP home region by itself does not indicate a carried flow.
+		var route peerRoute
+		if peer.CurAddr != "" {
+			route.Path = "direct"
+		} else if peer.Relay != "" {
+			route = peerRoute{Path: "derp", Relay: peer.Relay}
+		} else {
+			continue
+		}
+		for _, ip := range peer.TailscaleIPs {
+			if ip.Is4() {
+				routes[ip] = route
+			}
+		}
+	}
+	known := make(map[uint16]peerRoute)
+	for port, outbound := range outbound {
+		if route, ok := routes[outbound.target]; ok {
+			known[port] = route
+		}
+	}
+	return known
 }
 
 func statusPeer(st *ipnstate.Status, target netip.Addr) *ipnstate.PeerStatus {
@@ -346,8 +392,8 @@ func (h *helper) stopUDP() {
 func (h *helper) closeRoutes() {
 	h.stopSharing()
 	h.lastPeerIP, h.lastPeerPort = netip.Addr{}, 0
-	for port, b := range h.outbound {
-		b.close()
+	for port, route := range h.outbound {
+		route.bridge.close()
 		delete(h.outbound, port)
 	}
 }
@@ -425,12 +471,16 @@ func (h *helper) open(ctx context.Context, host string, port uint16) (uint16, er
 	if err != nil {
 		return 0, err
 	}
-	h.outbound[bound] = startBridge(tcp, udp, func(ctx context.Context, network string) (net.Conn, error) {
+	b := startBridge(tcp, udp, func(ctx context.Context, network string) (net.Conn, error) {
 		if network == "tcp" {
 			return dialer.NetstackDialTCP(ctx, target)
 		}
 		return dialer.NetstackDialUDP(ctx, target)
 	})
+	if h.outbound == nil {
+		h.outbound = make(map[uint16]outboundRoute)
+	}
+	h.outbound[bound] = outboundRoute{bridge: b, target: ip}
 	h.lastPeerIP, h.lastPeerPort = ip, bound
 	return bound, nil
 }

@@ -6,7 +6,9 @@ import QuietDeskCore
 @MainActor
 final class EmbeddedTailnet: ObservableObject {
     private struct Reply: Decodable {
-        private enum CodingKeys: String, CodingKey { case id, state, ip, authURL, port, udp, error, peerPath, peerRelay }
+        private enum CodingKeys: String, CodingKey {
+            case id, state, ip, authURL, port, udp, error, peerPath, peerRelay, bridgeRoutes
+        }
         var source: Process?
         let id: Int
         let state: String?
@@ -17,6 +19,18 @@ final class EmbeddedTailnet: ObservableObject {
         let error: String?
         let peerPath: String?
         let peerRelay: String?
+        let bridgeRoutes: [String: BridgeRoute]?
+    }
+
+    private struct BridgeRoute: Decodable, Equatable {
+        let path: String
+        let relay: String?
+    }
+
+    private struct BridgeObservation {
+        let openedWith: Int
+        let onChange: (String?, String?) -> Void
+        var route: BridgeRoute?
     }
 
     private struct Request: Encodable {
@@ -50,7 +64,9 @@ final class EmbeddedTailnet: ObservableObject {
     private let writes = DispatchQueue(label: "quietdesk.tailnet.stdin")
     private var nextID = 0
     private var lastExposureReply = 0
+    private var lastBridgeStatusReply = 0
     private var pending: [Int: CheckedContinuation<Reply, Error>] = [:]
+    private var bridgeObservations: [UInt16: BridgeObservation] = [:]
     private var pollTask: Task<Void, Never>?
     private var requestedShare: UInt16 = 0
     private var datagramListener: NWListener?
@@ -140,6 +156,9 @@ final class EmbeddedTailnet: ObservableObject {
         shared = Exposure()
         peerPath = nil
         peerRelay = nil
+        let observations = bridgeObservations.values
+        bridgeObservations.removeAll()
+        for observation in observations where observation.route != nil { observation.onChange(nil, nil) }
     }
 
     private func received(_ reply: Reply, from child: Process) {
@@ -241,6 +260,10 @@ final class EmbeddedTailnet: ObservableObject {
         ip = reply.ip
         peerPath = reply.peerPath
         peerRelay = reply.peerRelay
+        if reply.id > lastBridgeStatusReply {
+            lastBridgeStatusReply = reply.id
+            updateBridgeRoutes(backendState == "Running" ? reply.bridgeRoutes : nil, replyID: reply.id)
+        }
         updateExposure(reply)
         if message == lastStatusError { message = nil }
         lastStatusError = nil
@@ -256,6 +279,19 @@ final class EmbeddedTailnet: ObservableObject {
         }
     }
 
+    private func updateBridgeRoutes(_ routes: [String: BridgeRoute]?, replyID: Int? = nil) {
+        for (port, var observation) in bridgeObservations {
+            // A status requested before the open cannot describe a reused loopback port.
+            if let replyID, replyID <= observation.openedWith { continue }
+            let reported = routes?[String(port)]
+            let route = reported.flatMap { $0.path == "direct" || $0.path == "derp" ? $0 : nil }
+            guard route != observation.route else { continue }
+            observation.route = route
+            bridgeObservations[port] = observation
+            observation.onChange(route?.path, route?.path == "derp" ? route?.relay : nil)
+        }
+    }
+
     private func startPolling() {
         pollTask?.cancel()
         pollTask = Task { [weak self] in
@@ -265,9 +301,14 @@ final class EmbeddedTailnet: ObservableObject {
                     guard !Task.isCancelled else { return }
                     self.update(reply)
                 } catch {
-                    if !Task.isCancelled { self.lastStatusError = error.localizedDescription; self.message = self.lastStatusError }
+                    if !Task.isCancelled {
+                        self.updateBridgeRoutes(nil)
+                        self.lastStatusError = error.localizedDescription
+                        self.message = self.lastStatusError
+                    }
                 }
-                do { try await Task.sleep(for: .seconds(self.state == "Running" ? 10 : 2)) }
+                let interval = self.bridgeObservations.isEmpty ? (self.state == "Running" ? 10 : 2) : 1
+                do { try await Task.sleep(for: .seconds(interval)) }
                 catch { return }
             }
         }
@@ -371,7 +412,20 @@ final class EmbeddedTailnet: ObservableObject {
     /// The owner releases the returned lease when its desktop or mapping session ends.
     func bridge(host: String, port: UInt16, ready: @escaping (UInt16) -> Void,
                 failed: @escaping (String) -> Void) -> () -> Void {
+        openBridge(host: host, port: port, ready: ready, failed: failed, peerRouteChanged: nil)
+    }
+
+    func bridge(host: String, port: UInt16, ready: @escaping (UInt16) -> Void,
+                failed: @escaping (String) -> Void,
+                peerRouteChanged: @escaping (String?, String?) -> Void) -> () -> Void {
+        openBridge(host: host, port: port, ready: ready, failed: failed, peerRouteChanged: peerRouteChanged)
+    }
+
+    private func openBridge(host: String, port: UInt16, ready: @escaping (UInt16) -> Void,
+                            failed: @escaping (String) -> Void,
+                            peerRouteChanged: ((String?, String?) -> Void)?) -> () -> Void {
         var localPort: UInt16?
+        var openedWith: Int?
         weak var owner: Process?
         let opening = Task {
             do {
@@ -382,6 +436,12 @@ final class EmbeddedTailnet: ObservableObject {
                 guard let port = reply.port, port != 0 else { throw DeskError.invalid("Tailscale 没有返回可用端口") }
                 if Task.isCancelled { self.closeBridge(port, on: owner); return }
                 localPort = port
+                openedWith = reply.id
+                if let peerRouteChanged {
+                    let startsRoutePolling = bridgeObservations.isEmpty
+                    bridgeObservations[port] = BridgeObservation(openedWith: reply.id, onChange: peerRouteChanged)
+                    if startsRoutePolling { startPolling() }
+                }
                 ready(port)
             } catch {
                 if !Task.isCancelled { failed(error.localizedDescription) }
@@ -389,7 +449,13 @@ final class EmbeddedTailnet: ObservableObject {
         }
         return {
             opening.cancel()
-            if let port = localPort { localPort = nil; self.closeBridge(port, on: owner) }
+            if let port = localPort {
+                localPort = nil
+                if self.bridgeObservations[port]?.openedWith == openedWith {
+                    self.bridgeObservations.removeValue(forKey: port)
+                }
+                self.closeBridge(port, on: owner)
+            }
         }
     }
 

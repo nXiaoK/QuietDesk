@@ -30,7 +30,7 @@ func TestPairedNodesUseRelayedTailnet(t *testing.T) {
 		t.Helper()
 		s := &tsnet.Server{Hostname: name, ControlURL: control.HTTPTestServer.URL,
 			Dir: t.TempDir(), UserLogf: logger.Discard, Logf: logger.Discard}
-		h := &helper{server: s, outbound: make(map[uint16]*bridge)}
+		h := &helper{server: s}
 		t.Cleanup(func() { h.closeRoutes(); s.Close() })
 		r, err := h.handle(request{Op: "login"})
 		if err != nil {
@@ -130,6 +130,9 @@ func TestPairedNodesUseRelayedTailnet(t *testing.T) {
 		if status.PeerPath != "derp" {
 			t.Fatalf("embedded node reported path %q and region %q with forced DERP", status.PeerPath, status.PeerRelay)
 		}
+		if node == viewer && status.BridgeRoutes[route.Port].Path != "derp" {
+			t.Fatalf("viewer bridge did not report its observed DERP route: %+v", status.BridgeRoutes)
+		}
 	}
 	if _, err := host.handle(request{Op: "share", Port: port}); err != nil {
 		t.Fatal(err)
@@ -148,7 +151,7 @@ func TestPairedNodesUseRelayedTailnet(t *testing.T) {
 	if _, err := viewer.handle(request{Op: "close", Port: route.Port}); err != nil {
 		t.Fatal(err)
 	}
-	if status, err := viewer.handle(request{Op: "status"}); err != nil || status.PeerPath != "" || status.PeerRelay != "" {
+	if status, err := viewer.handle(request{Op: "status"}); err != nil || status.PeerPath != "" || status.PeerRelay != "" || len(status.BridgeRoutes) != 0 {
 		t.Fatalf("closed route returned a peer path: %+v, %v", status, err)
 	}
 }

@@ -62,4 +62,114 @@ func runConnectionDiagnosticsChecks() {
         try check(report.timeline.first?.quality.framesPerSecond == 2 && report.timeline.last?.quality.roundTrip.maximum == 404,
                   "First or last observations were lost after compaction")
     }
+
+    run("Connection diagnostics traffic partitions protocols and paths without counting channels twice") {
+        var breakdown = DiagnosticTrafficBreakdown()
+        let paths: [WritableKeyPath<DiagnosticTrafficBreakdown, DiagnosticTrafficBucket>] = [
+            \.directTCP, \.directUDP, \.relayTCP, \.relayUDP, \.punchedUDP, \.tailnetDirectTCP,
+            \.tailnetDirectUDP, \.tailnetDERPTCP, \.tailnetDERPUDP, \.tailnetUnknownTCP, \.tailnetUnknownUDP,
+        ]
+        for (index, path) in paths.enumerated() {
+            let sent = UInt64(index + 1)
+            breakdown[keyPath: path].add(sent: sent, received: sent * 10)
+        }
+        breakdown.controlChannel.add(sent: 28, received: 280)
+        breakdown.videoChannel.add(sent: 38, received: 380)
+        try check(breakdown.tcp == .init(sentBytes: 28, receivedBytes: 280)
+                  && breakdown.udp == .init(sentBytes: 38, receivedBytes: 380), "TCP and UDP were misclassified")
+        try check(breakdown.totalSentBytes == 66 && breakdown.totalReceivedBytes == 660 && breakdown.totalBytes == 726
+                  && breakdown.tcpBytes + breakdown.udpBytes == breakdown.totalBytes, "Channels duplicated path bytes")
+        try check(breakdown.directBytes == 33 && breakdown.relayedBytes == 264 && breakdown.punchedBytes == 198
+                  && breakdown.tailnetUnknownBytes == 231, "Direct, relayed, punched or unknown traffic was misclassified")
+        try check(breakdown.directBytes + breakdown.relayedBytes + breakdown.punchedBytes + breakdown.tailnetUnknownBytes
+                    == breakdown.totalBytes, "Route groups overlapped or omitted traffic")
+        try check(breakdown.relayShareFraction == 264.0 / 726 && breakdown.punchedShareFraction == 198.0 / 726
+                  && breakdown.punchedSavedRelayFraction == 198.0 / 462, "Traffic shares used the wrong denominators")
+        try check(DiagnosticTrafficBreakdown().relayShareFraction == nil && DiagnosticTrafficBreakdown().punchedSavedRelayFraction == nil,
+                  "An empty report claimed measurable savings")
+        var limit = DiagnosticTrafficBucket(sentBytes: UInt64.max - 1, receivedBytes: 1)
+        limit.merge(.init(sentBytes: 2, receivedBytes: UInt64.max))
+        try check(limit.sentBytes == UInt64.max && limit.receivedBytes == UInt64.max && limit.totalBytes == UInt64.max,
+                  "Directional counters did not saturate on overflow")
+    }
+
+    run("Connection diagnostics frame-rate variation excludes idle samples and counts only abrupt active drops") {
+        var frameRate = DiagnosticFrameRateStats()
+        var previous: Double?
+        for fps in [40.0, 12, 30, 0, 9, 60, 30] {
+            frameRate.recordSample(fps: fps, seconds: 1, previousActiveFPS: &previous)
+        }
+        frameRate.recordIdle(seconds: 2)
+        let mean = 181.0 / 6
+        let deviation = sqrt(7_225.0 / 6 - mean * mean)
+        try check(frameRate.activeSamples == 6 && frameRate.activeSeconds == 6 && frameRate.idleSeconds == 3
+                  && frameRate.activeMeanFPS == mean, "Idle intervals changed the active frame-rate mean")
+        try check(frameRate.minimumActiveFPS == 9 && frameRate.maximumFPS == 60
+                  && frameRate.standardDeviationFPS == deviation && frameRate.coefficientOfVariation == deviation / mean,
+                  "Active extrema or variation lost precision")
+        try check(frameRate.histogram.count == 12 && frameRate.histogram.reduce(0, +) == 6
+                  && frameRate.p10LowFPS == 7.5 && frameRate.lowFrameRateShare == 2.0 / 6, "Histogram or low frame-rate share was wrong")
+        try check(frameRate.dropEvents == 1 && frameRate.stabilityLabel == "明显波动", "Idle or an exact 50% drop counted as a sudden drop")
+        try check(DiagnosticFrameRateStats().stabilityLabel == "样本不足", "No observations produced a stability claim")
+    }
+
+    run("Connection diagnostics report JSON preserves mixed routes, compacted extrema, compatibility and privacy") {
+        let tailnetDERP = DiagnosticRoute(control: .tailnet, media: .tailnetUDP, tailnetPath: "derp")
+        let paused = DiagnosticRoute(control: .tailnet, media: .paused, tailnetPath: "derp")
+        let recorder = ConnectionDiagnosticRecorder(startedAt: start, now: 0, route: direct)
+        var original = DiagnosticTrafficBreakdown()
+        original.directUDP.add(sent: 15, received: 30)
+        original.videoChannel = original.directUDP
+        recorder.recordDetailedTraffic(original, frames: 10, seconds: 0.5, at: 0.5)
+        recorder.changeRoute(tailnetDERP, at: 0.5)
+        var derp = DiagnosticTrafficBreakdown()
+        derp.tailnetDERPUDP.add(sent: 40, received: 80)
+        derp.videoChannel = derp.tailnetDERPUDP
+        recorder.recordDetailedTraffic(derp, frames: 30, seconds: 0.5, at: 1)
+        recorder.changeRoute(paused, at: 1)
+        recorder.recordDetailedTraffic(.init(), frames: 0, seconds: 1, at: 2)
+        recorder.changeRoute(reconnect, at: 2)
+        recorder.recordTraffic(bytes: 0, frames: 0, seconds: 1, at: 3)
+        recorder.changeRoute(tailnetDERP, at: 3)
+        recorder.recordDetailedTraffic(.init(), frames: 0, seconds: 1, at: 4)
+        recorder.recordDetailedTraffic(derp, frames: 0, seconds: 0, at: 4)
+        recorder.recordRoundTrip(milliseconds: 40, at: 640)
+        let report = recorder.finish(remoteName: "Test Mac", endpointLabel: "[fd00::1]:7443", reason: "Disconnect", at: 640)
+        try check(report.endedAt == start.addingTimeInterval(640)
+                  && report.totals.bytes == 285 && report.traffic.totalBytes == 285, "Detailed and legacy byte totals diverged")
+        try check(report.frameRate.activeSamples == 2 && report.frameRate.idleSeconds == 1,
+                  "Paused or disconnected time appeared as an idle observation")
+        let first = report.timeline.first
+        try check(first?.routes == [direct: 0.5, tailnetDERP: 1.5, paused: 1, reconnect: 1]
+                  && first?.quality.frameRate.minimumActiveFPS == 20 && first?.quality.frameRate.maximumFPS == 60,
+                  "Compaction lost mixed routes or their observed frame-rate range")
+        let json = try JSONEncoder().encode(report)
+        let decoded = try JSONDecoder().decode(ConnectionDiagnosticReport.self, from: json)
+        try check(decoded == report && report.timeline.count <= 256, "Detailed report was not preserved in a bounded JSON round trip")
+        try check(report.plainTextSummary().contains("传输流量合计　285 B"), "Shareable summary omitted the recorded traffic")
+
+        var previousFormat = try (JSONSerialization.jsonObject(with: json) as? [String: Any]) ?? [:]
+        previousFormat.removeValue(forKey: "endpointLabel")
+        previousFormat.removeValue(forKey: "endedAt")
+        if var totals = previousFormat["totals"] as? [String: Any] {
+            totals.removeValue(forKey: "traffic")
+            totals.removeValue(forKey: "frameRate")
+            previousFormat["totals"] = totals
+        }
+        let legacy = try JSONDecoder().decode(ConnectionDiagnosticReport.self, from: JSONSerialization.data(withJSONObject: previousFormat))
+        try check(legacy.endpointLabel == "" && legacy.endedAt == report.endedAt
+                  && legacy.totals.bytes == 285 && legacy.traffic.totalBytes == 0 && legacy.frameRate.activeSamples == 0,
+                  "Older reports without new fields could not preserve legacy measurements")
+
+        let pairingCode = Array(repeating: "ABCD0123", count: 8).joined(separator: "-")
+        let privateRecorder = ConnectionDiagnosticRecorder(startedAt: start, now: 0, route:
+            .init(control: .relay, media: .relayTCP, node: "tls://user:relay-secret@relay.test:7443"))
+        let privateReport = privateRecorder.finish(remoteName: "Test \(pairingCode)", endpointLabel: "/Users/example/private-folder/file",
+                                                   reason: "锁屏密码：screen-secret", at: 1)
+        let export = String(decoding: try JSONEncoder().encode(privateReport), as: UTF8.self)
+        for sensitive in [pairingCode, "relay-secret", "private-folder", "screen-secret"] {
+            try check(!privateReport.plainTextSummary().contains(sensitive) && !export.contains(sensitive),
+                      "Shareable report exposed private metadata")
+        }
+    }
 }

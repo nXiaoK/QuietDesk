@@ -213,7 +213,8 @@ public final class RelayViewerBridge: @unchecked Sendable {
                             }
                             self.assistedPipe = assisted; pipe = assisted
                         } else {
-                            pipe = try RelayUDPPipe(endpoint: self.endpoint, port: self.endpoint.port, id: id, key: key, side: 0, queue: self.queue)
+                            pipe = try RelayUDPPipe(endpoint: self.endpoint, port: self.endpoint.port, id: id, key: key, side: 0,
+                                                    queue: self.queue, counter: self.peerTraffic)
                         }
                         self.datagramPipe = pipe; self.datagramID = id
                         pipe.onReady = { [weak self, weak pipe] in

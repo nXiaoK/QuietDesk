@@ -3,14 +3,21 @@ import Foundation
 import Network
 import Security
 
+public enum MediaTrafficChannel: Sendable {
+    case controlTCP, videoTCP, bulkTCP, mediaUDP
+}
+
 // A child meter can outlive its Peer while Network.framework finishes submitted data.
 private final class MediaTrafficRelay: @unchecked Sendable {
     private let lock = NSLock()
     private let parent: TrafficMeter
-    private let onBytes: (Int) -> Void
+    private let onTraffic: (TrafficTotals) -> Void
     private var previous = TrafficTotals()
 
-    init(parent: TrafficMeter, onBytes: @escaping (Int) -> Void) { self.parent = parent; self.onBytes = onBytes }
+    init(parent: TrafficMeter, onTraffic: @escaping (TrafficTotals) -> Void) {
+        self.parent = parent
+        self.onTraffic = onTraffic
+    }
 
     func receive(_ snapshot: TrafficSnapshot) {
         let delta = lock.withLock { () -> TrafficTotals in
@@ -22,8 +29,7 @@ private final class MediaTrafficRelay: @unchecked Sendable {
         }
         guard delta.sentBytes > 0 || delta.receivedBytes > 0 else { return }
         parent.record(sentBytes: delta.sentBytes, receivedBytes: delta.receivedBytes)
-        let total = delta.sentBytes.addingReportingOverflow(delta.receivedBytes)
-        if !total.overflow, let count = Int(exactly: total.partialValue) { onBytes(count) }
+        onTraffic(delta)
     }
 }
 
@@ -76,6 +82,12 @@ public final class MediaSession: @unchecked Sendable {
     // Viewer only, on the media queue: a new transaction moves video to another path (labels match onState).
     public var onPathSwitch: ((String, MediaSwitchCause) -> Void)?
     public var onBytes: ((Int) -> Void)?
+    /// Application payload in (channel, sent, received) order, on the transport delivering it.
+    /// Use the control Peer to observe its own TCP traffic.
+    public var onChannelTraffic: ((MediaTrafficChannel, UInt64, UInt64) -> Void)?
+    /// The same UDP payload with the installed socket's route, in (relayed, sent, received) order.
+    /// A relay bridge counts its opaque DTLS payload on a different boundary.
+    public var onDatagramChannelTraffic: ((Bool, UInt64, UInt64) -> Void)?
     public var onFrameSent: (() -> Void)?
     public var onReliableData: ((Message) -> Void)?
     public var onCursorPosition: ((CursorPosition) -> Void)?
@@ -1046,7 +1058,11 @@ public final class MediaSession: @unchecked Sendable {
                 if self.bulkPeer === peer { self.bulkPeer = nil; self.bulkBound = false }
             }
         }
-        let relay = MediaTrafficRelay(parent: control.trafficMeter) { [weak self] count in
+        let channel: MediaTrafficChannel = role == .video ? .videoTCP : .bulkTCP
+        let relay = MediaTrafficRelay(parent: control.trafficMeter) { [weak self] delta in
+            self?.onChannelTraffic?(channel, delta.sentBytes, delta.receivedBytes)
+            let total = delta.sentBytes.addingReportingOverflow(delta.receivedBytes)
+            guard !total.overflow, let count = Int(exactly: total.partialValue) else { return }
             self?.queue.async { [weak self] in
                 guard let self, !self.stopped else { return }
                 self.onBytes?(count)
@@ -1090,6 +1106,7 @@ public final class MediaSession: @unchecked Sendable {
 
     private func installDatagram(_ peer: BoundedDatagramPeer, hostBinding: ((Data) -> Void)? = nil, start: Bool = true, release: @escaping () -> Void = {}) {
         if side == .host { hostAssist = hostBinding; udpRelayed = hostBinding != nil }
+        let relayed = udpRelayed
         udpPeer = peer; udpVerified = false; receivedChallenge = false; challenges.clear(); lastPongAt = 0
         lastAnsweredChallengeAt = 0
         refreshInteractiveDatagramAvailability()
@@ -1101,7 +1118,11 @@ public final class MediaSession: @unchecked Sendable {
         }
         peer.onDatagram = { [weak self, weak peer] data in
             guard let self, let peer, !self.stopped, self.udpPeer === peer else { return }
-            self.control.trafficMeter.record(receivedBytes: UInt64(data.count)); self.onBytes?(data.count)
+            let receivedBytes = UInt64(data.count)
+            self.control.trafficMeter.record(receivedBytes: receivedBytes)
+            self.onBytes?(data.count)
+            self.onChannelTraffic?(.mediaUDP, 0, receivedBytes)
+            self.onDatagramChannelTraffic?(relayed, 0, receivedBytes)
             self.diagnostics?.recordValue(.mediaDatagramReceivedBytes, data.count, kind: .mediaFrame)
             self.receiveDatagram(data)
         }
@@ -1927,12 +1948,16 @@ public final class MediaSession: @unchecked Sendable {
     private func sendDatagram(_ data: Data, using peer: BoundedDatagramPeer? = nil, repair: Bool = false) -> Bool {
         guard let target = peer ?? udpPeer else { return false }
         let meter = control.trafficMeter
+        let relayed = udpRelayed
         return target.send(data) { [weak self] success in
             guard success else { return }
-            meter.record(sentBytes: UInt64(data.count))
+            let sentBytes = UInt64(data.count)
+            meter.record(sentBytes: sentBytes)
             self?.diagnostics?.recordValue(.mediaDatagramSentBytes, data.count, kind: .mediaFrame)
             if repair { self?.diagnostics?.recordValue(.mediaRepairBytes, data.count, kind: .mediaFrame) }
             self?.onBytes?(data.count)
+            self?.onChannelTraffic?(.mediaUDP, sentBytes, 0)
+            self?.onDatagramChannelTraffic?(relayed, sentBytes, 0)
         }
     }
 

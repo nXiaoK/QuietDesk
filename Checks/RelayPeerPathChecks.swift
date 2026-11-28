@@ -155,6 +155,20 @@ private final class SimulatedPeerNetwork {
 }
 
 func runRelayPeerPathChecks() {
+    run("Relay traffic keeps exact path and direction totals") {
+        let counter = RelayPeerTrafficCounter()
+        counter.record(relayedSent: 20)
+        counter.record(relayedReceived: 55)
+        counter.record(directSent: 100)
+        counter.record(directReceived: 270)
+        counter.record(relayedSent: 5, directReceived: 3)
+        let detailed = counter.detailedSnapshot
+        try check(detailed == .init(relayedSent: 25, relayedReceived: 55, directSent: 100, directReceived: 273),
+                  "Directional byte totals crossed paths or directions")
+        let aggregate = counter.snapshot
+        try check(aggregate.relayed == 80 && aggregate.direct == 373, "Legacy path totals diverged from the directional meter")
+    }
+
     run("NAT classification distinguishes cone, linear and random observed mappings") {
         func mappings(_ ports: UInt16...) -> [RelayPeerAddress] { ports.map { RelayPeerAddress(host: "198.51.100.10", port: $0) } }
         try check(NATClassifier.classify(mappedAddresses: []) == .blockedOrUnknown, "Empty observations classified as a usable mapping")

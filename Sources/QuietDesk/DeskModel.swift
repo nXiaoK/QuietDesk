@@ -82,6 +82,8 @@ final class DeskModel: ObservableObject, Identifiable {
     @Published private(set) var sessionTraffic = ""
     let portMappings: PortMappingManager
     let trafficHistory: TrafficHistoryFeed
+    let connectionReportHistory: ConnectionReportHistoryFeed
+    let connectionReportHistoryStore: ConnectionReportHistoryStore
     @Published private(set) var trafficHistoryStatus = "按网址/IP＋端口累计；旧版按设备统计单独保留。"
     @Published var frameRate = "0 fps"
     @Published var latency = "— ms"
@@ -217,7 +219,7 @@ final class DeskModel: ObservableObject, Identifiable {
     private var mediaRouteValue = ""
     private var peerPathState = RelayPeerPathState.relay
     @Published var connectionDiagnosticsEnabled = UserDefaults.standard.bool(forKey: "connectionDiagnosticsEnabled") {
-        didSet { UserDefaults.standard.set(connectionDiagnosticsEnabled, forKey: "connectionDiagnosticsEnabled") }
+        didSet { services.updateConnectionReportPopup(connectionDiagnosticsEnabled) }
     }
     var onConnectionDiagnosticReport: ((ConnectionDiagnosticReport) -> Void)?
     private var connectionDiagnostics: ViewerConnectionDiagnostics?
@@ -534,7 +536,6 @@ final class DeskModel: ObservableObject, Identifiable {
         let mediaTCPOnly: Bool
         let relayPeerAssist: RelayPeerAssistMode
         let relayNodeChoice: String
-        let connectionDiagnosticsEnabled: Bool
     }
     private var lastSessionLaunch: SessionLaunch?
     struct Target {
@@ -603,6 +604,8 @@ final class DeskModel: ObservableObject, Identifiable {
         portMappings = services.portMappings
         trafficHistory = services.trafficHistory
         trafficHistoryStore = services.trafficHistoryStore
+        connectionReportHistory = services.connectionReportHistory
+        connectionReportHistoryStore = services.connectionReportHistoryStore
         routeBenchmarkStore = services.routeBenchmarkStore
         services.register(self)
         idlePolicy = SessionIdlePolicy(now: SessionClock.now, enabled: !disableIdleAutoPause)
@@ -2497,8 +2500,7 @@ final class DeskModel: ObservableObject, Identifiable {
                 viewerCode: self.viewerCode,
                 mediaTCPOnly: self.mediaTCPOnly,
                 relayPeerAssist: self.relayPeerAssist,
-                relayNodeChoice: self.relayNodeChoice,
-                connectionDiagnosticsEnabled: self.connectionDiagnosticsEnabled
+                relayNodeChoice: self.relayNodeChoice
             )
         } catch {
             recordDiagnosticFailure(.connectionFailed, error: error)
@@ -2520,7 +2522,6 @@ final class DeskModel: ObservableObject, Identifiable {
         mediaTCPOnly = launch.mediaTCPOnly
         relayPeerAssist = launch.relayPeerAssist
         relayNodeChoice = launch.relayNodeChoice
-        connectionDiagnosticsEnabled = launch.connectionDiagnosticsEnabled
         remoteName = ""
         connectionError = nil
         let target = launch.target
@@ -2544,7 +2545,7 @@ final class DeskModel: ObservableObject, Identifiable {
         savedTarget = false
         retryBackoff.reset()
         generation = UUID()
-        if connectionDiagnosticsEnabled { connectionDiagnostics = ViewerConnectionDiagnostics() }
+        connectionDiagnostics = ViewerConnectionDiagnostics()
         beginMetrics()
         beginConnection(target)
     }
@@ -2648,7 +2649,12 @@ final class DeskModel: ObservableObject, Identifiable {
                 }
             }
         }
-        media.onBytes = { channel.recordBytes($0) }
+        media.onChannelTraffic = { type, sent, received in
+            if type != .mediaUDP { channel.recordChannelTraffic(type, sent: sent, received: received) }
+        }
+        media.onDatagramChannelTraffic = { relayed, sent, received in
+            channel.recordDatagramTraffic(relayed: relayed, sent: sent, received: received)
+        }
         media.onCursorPosition = { _ = channel.receiveCursorPosition($0) }
         media.onReliableData = { [weak peer] message in
             do { _ = try channel.receive(message) }
@@ -2704,6 +2710,7 @@ final class DeskModel: ObservableObject, Identifiable {
                             let bridge = try RelayViewerBridge(endpoint: relay.endpoint, accessKey: access, deviceID: relay.deviceID,
                                                               trustedCertificate: target.relayCertificate, peerAssist: self.effectiveRelayPeerAssist)
                             viewer.mediaRelayBridge = bridge
+                            self.connectionDiagnostics?.attachRelayTrafficCounter(bridge.peerTraffic)
                             self.observePeerPath(bridge, viewer: viewer)
                             bridge.onReady = { [weak self, weak viewer, weak bridge] port in
                                 DispatchQueue.main.async {
@@ -3202,6 +3209,7 @@ final class DeskModel: ObservableObject, Identifiable {
                 let bridge = try RelayViewerBridge(endpoint: relay.endpoint, accessKey: access, deviceID: relay.deviceID, udpEnabled: !effectiveMediaTCPOnly,
                                                   trustedCertificate: target.relayCertificate, peerAssist: effectiveRelayPeerAssist)
                 viewer.relayBridge = bridge; viewer.usesRelayControl = true
+                connectionDiagnostics?.attachRelayTrafficCounter(bridge.peerTraffic)
                 observePeerPath(bridge, viewer: viewer)
                 active = true; working = true
                 controlTransportStatus = "正在接通中继"
@@ -3246,10 +3254,10 @@ final class DeskModel: ObservableObject, Identifiable {
             working = true
             status = "正在通过 Tailscale 连接 \(host)…"
             controlTransportStatus = "正在连接 Tailscale"
-            viewer.closeTailnetBridge = services.tailnet.bridge(host: host, port: target.port) { [weak self, weak viewer] port in
+            viewer.closeTailnetBridge = services.tailnet.bridge(host: host, port: target.port, ready: { [weak self, weak viewer] port in
                 guard let self, self.viewerSession === viewer else { return }
                 self.beginPeerConnection(target, host: "127.0.0.1", port: port, viaRelay: false)
-            } failed: { [weak self, weak viewer] reason in
+            }, failed: { [weak self, weak viewer] reason in
                 guard let self, self.viewerSession === viewer else { return }
                 if self.reconnecting, self.effectiveAutoReconnect, self.services.tailnet.enabled {
                     self.clearSession()
@@ -3259,7 +3267,10 @@ final class DeskModel: ObservableObject, Identifiable {
                     self.status = reason
                     self.connectionError = reason
                 }
-            }
+            }, peerRouteChanged: { [weak self, weak viewer] path, relay in
+                guard let self, let viewer, self.viewerSession === viewer else { return }
+                self.connectionDiagnostics?.setTailnetPath(peerPath: path, relay: relay)
+            })
             return
         }
         beginPeerConnection(target, host: target.address, port: target.port, viaRelay: false)
@@ -3287,6 +3298,8 @@ final class DeskModel: ObservableObject, Identifiable {
         let viewer = viewerSession
         viewer.usesRelayControl = viaRelay; viewer.transportHost = host; viewer.transportPort = port
         viewer.helloReceived = false
+        connectionDiagnostics?.attach(channel, relayed: viaRelay, node: target.relay?.endpoint.address,
+                                      tailnet: target.tailnetHost != nil && !viaRelay)
         candidate.onRoundTripMilliseconds = { [weak self, weak candidate, weak viewer] milliseconds in
             DispatchQueue.main.async {
                 guard let self, let candidate, let viewer, self.peer === candidate, self.viewerSession === viewer else { return }
@@ -3306,7 +3319,6 @@ final class DeskModel: ObservableObject, Identifiable {
         candidate.onReady = { [weak self, weak candidate, weak viewer] in
             DispatchQueue.main.async {
                 guard let self, let candidate, let viewer, self.peer === candidate, self.viewerSession === viewer else { return }
-                self.connectionDiagnostics?.attach(channel, relayed: viaRelay, node: target.relay?.endpoint.address, tailnet: target.tailnetHost != nil)
                 viewer.helloDeadline.arm { [weak self, weak candidate, weak viewer] in
                     guard let self, let candidate, let viewer, self.peer === candidate,
                           self.viewerSession === viewer, !viewer.helloReceived else { return }
@@ -3336,7 +3348,9 @@ final class DeskModel: ObservableObject, Identifiable {
                 }
             }
         }
-        candidate.onTraffic = { channel.recordBytes($0) }
+        candidate.onTrafficDelta = { sent, received in
+            channel.recordChannelTraffic(.controlTCP, sent: sent, received: received)
+        }
         let relayBridge = viewer.relayBridge
         candidate.onClose = { [weak self, weak candidate, weak relayBridge, weak viewer] originalReason in
             history.requestFlush()
@@ -6380,7 +6394,7 @@ final class DeskModel: ObservableObject, Identifiable {
             else if let relay = target?.relay { name = "设备 " + relay.deviceID.uuidString }
             else { name = "远端 Mac" }
             let end = reason ?? (reconnecting ? "已停止重连" : connected ? "已主动断开连接" : "已取消连接")
-            report = diagnostics.finish(remoteName: name, reason: end)
+            report = diagnostics.finish(remoteName: name, endpointLabel: target?.trafficEndpoint.label ?? "", reason: end)
             connectionDiagnostics = nil
         } else { report = nil }
         if peer != nil { DiagnosticLog.shared.record(.connectionClosed, role: diagnosticRole, state: .cancelled) }
@@ -6429,7 +6443,8 @@ final class DeskModel: ObservableObject, Identifiable {
         if activeRouteBenchmarkOverride != nil {
             lastRouteBenchmarkReport = report
         } else if let report {
-            onConnectionDiagnosticReport?(report)
+            connectionReportHistoryStore.append(report)
+            if connectionDiagnosticsEnabled { onConnectionDiagnosticReport?(report) }
         }
     }
 

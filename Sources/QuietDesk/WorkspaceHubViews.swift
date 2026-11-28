@@ -442,7 +442,8 @@ struct DiagnosticsWorkspaceView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             case .traffic:
-                TrafficStatisticsView(model: viewer, history: history, done: {}, embedded: true)
+                TrafficStatisticsView(model: viewer, history: history, reportHistory: viewer.connectionReportHistory,
+                                      reportHistoryStore: viewer.connectionReportHistoryStore, done: {}, embedded: true)
             }
         }
         .background(DeskPalette.canvasBackground)

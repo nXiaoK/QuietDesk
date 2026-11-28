@@ -102,13 +102,17 @@ func runFileApprovalChecks() {
                                              allowsDecoupledFileTransfer: true, allowsOnDemandClipboard: true, allowsPhysicalFilePaste: true)
             let file = folder.appendingPathComponent("source")
             try Data([1]).write(to: file)
-            let ready = DispatchSemaphore(value: 0), done = DispatchSemaphore(value: 0)
+            let ready = DispatchSemaphore(value: 0), done = DispatchSemaphore(value: 0), drained = DispatchSemaphore(value: 0)
             let offered = Box<UUID?>(nil), delivered = Box(true), payloadSeen = Box(false), superseded = Box(false)
+            let acceptanceSeen = Box(false)
             sender.onSend = { [weak receiver] message in
                 if message.kind == .clipboardEntry || message.kind == .clipboardChunk { payloadSeen.set(true) }
                 receiver?.receive(message)
             }
-            receiver.onSend = { [weak sender] message in sender?.receive(message) }
+            receiver.onSend = { [weak sender] message in
+                if message.kind == .clipboardReceipt { acceptanceSeen.set(true) }
+                sender?.receive(message)
+            }
             sender.onPullRequested = { [weak sender] request in
                 sender?.sendPulled(.files([file]), requestID: request.requestID) { delivered.set($0); done.signal() }
             }
@@ -121,9 +125,12 @@ func runFileApprovalChecks() {
             guard let oldID = offered.read() else { throw CheckFailure("Missing approval ID") }
             receiver.announceManifest(kind: .text)
             receiver.respondToFileOffer(id: oldID, accept: true)
+            // The sender can process the cancellation before the receiver withdraws the prompt.
+            receiver.prepareSend { _ in drained.signal() }
+            try wait(drained, "Receiver did not process the late click")
             try wait(done, "Replacing the pasteboard did not stop the sending file")
-            try check(superseded.read() && !delivered.read() && !payloadSeen.read(),
-                      "The replaced approval started a download")
+            try check(superseded.read(), "The receiver did not withdraw the replaced approval")
+            try check(!acceptanceSeen.read() && !delivered.read() && !payloadSeen.read(), "The replaced approval started a download")
         }
     }
 

@@ -267,7 +267,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var reportWindows = Set<NSWindow>()
 
     func showConnectionReport(_ report: ConnectionDiagnosticReport) {
-        let window = NSWindow(contentViewController: NSHostingController(rootView: ConnectionDiagnosticReportView(report: report)))
+        let view = ConnectionDiagnosticReportView(report: report, relayNodeNames: models?.viewer.relayNodeNames ?? [:])
+        let window = NSWindow(contentViewController: NSHostingController(rootView: view))
         window.title = "连接诊断报告"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         window.isReleasedWhenClosed = false
@@ -560,7 +561,8 @@ struct DeskView: View {
                 },
                 onClose: {
                     routeBenchmarkRunner = nil
-                }
+                },
+                relayNodeNames: model.relayNodeNames
             )
         }
         .alert("QuietDesk", isPresented: Binding(get: { model.error != nil },

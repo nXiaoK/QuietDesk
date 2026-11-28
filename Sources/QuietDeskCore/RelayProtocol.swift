@@ -30,6 +30,126 @@ public struct RelayEndpoint: Codable, Equatable, Hashable, Sendable {
     public var credentialAccount: String { "relay." + SHA256.hash(data: Data(address.utf8)).map { String(format: "%02x", $0) }.joined() }
 }
 
+public enum RelayNodeNaming {
+    public static let maximumNameLength = 40
+    public static let maximumNodeDigests = 32
+
+    public static func sanitize(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let clean = raw.components(separatedBy: .controlCharacters).joined(separator: " ")
+        let normalized = clean.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let name = String(normalized.prefix(maximumNameLength)).trimmingCharacters(in: .whitespaces)
+        return name.isEmpty ? nil : name
+    }
+
+    public static func shortTitle(for endpoint: RelayEndpoint, names: [String: String]) -> String {
+        sanitize(names[endpoint.address]) ?? socketAddress(endpoint)
+    }
+
+    public static func fullTitle(for endpoint: RelayEndpoint, names: [String: String]) -> String {
+        guard let name = sanitize(names[endpoint.address]) else { return endpoint.address }
+        return "\(name)（\(socketAddress(endpoint))）"
+    }
+
+    public static func endpointDigest(_ endpoint: RelayEndpoint) -> String {
+        SHA256.hash(data: Data(("QuietDesk-relay-node-v1:" + endpoint.address).utf8))
+            .prefix(16).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func isEndpointDigest(_ text: String) -> Bool {
+        text.utf8.count == 32 && text.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+    }
+
+    public static func capabilityLabel(_ capabilities: Set<String>) -> String {
+        let labels = [("tcp", "TCP"), ("udp", "UDP"), ("assist", "打洞辅助"), ("dualProbe", "双端口打洞")]
+            .compactMap { capabilities.contains($0.0) ? $0.1 : nil }
+        return labels.isEmpty ? "能力未确认" : labels.joined(separator: " · ")
+    }
+
+    private static func socketAddress(_ endpoint: RelayEndpoint) -> String {
+        String(endpoint.address.dropFirst("tls://".count))
+    }
+}
+
+public enum RelayNodeVersionStatus: Equatable, Sendable {
+    case unknown
+    case upToDate(version: String)
+    case updatable(version: String, currentAppVersion: String)
+    case legacyUnversioned
+
+    public var badgeText: String {
+        switch self {
+        case .unknown: return "—"
+        case .upToDate(let version):
+            return (try? UpdateVersion(version)) == nil ? version : "v\(version) · 最新"
+        case .updatable(let version, _): return "v\(version) · 可升级"
+        case .legacyUnversioned: return "旧版节点 · 建议升级"
+        }
+    }
+
+    public static func evaluate(serverVersion: String?, currentAppVersion: String) -> Self {
+        guard let version = serverVersion?.trimmingCharacters(in: .whitespacesAndNewlines), !version.isEmpty else {
+            return .legacyUnversioned
+        }
+        if let node = try? UpdateVersion(version), let app = try? UpdateVersion(currentAppVersion), node < app {
+            return .updatable(version: version, currentAppVersion: currentAppVersion)
+        }
+        return .upToDate(version: version)
+    }
+}
+
+public enum RelayPeerNodeMatch: Equatable, Sendable {
+    case onlineShared
+    case configuredOffline
+    case notConfiguredOnHost
+    case configuredUnverified
+    case configuredLegacy
+    case unknownLegacy
+    case unreachable(String)
+
+    public static func evaluate(deviceOnline: Bool?, isConfigured: Bool, versionStatus: RelayNodeVersionStatus,
+                                failure: String? = nil) -> Self {
+        if let deviceOnline {
+            return deviceOnline ? .onlineShared : isConfigured ? .configuredOffline : .notConfiguredOnHost
+        }
+        if let failure { return .unreachable(failure) }
+        if !isConfigured { return .unknownLegacy }
+        return versionStatus == .legacyUnversioned ? .configuredLegacy : .configuredUnverified
+    }
+
+    public var badgeText: String {
+        switch self {
+        case .onlineShared: return "双端共有 · 在线"
+        case .configuredOffline: return "双端已配 · 离线"
+        case .notConfiguredOnHost: return "被控未添加或未共享"
+        case .configuredUnverified: return "双端已配 · 在线状态待检测"
+        case .configuredLegacy: return "双端已配 · 旧版节点"
+        case .unknownLegacy: return "待连接验证"
+        case .unreachable: return "无法检测"
+        }
+    }
+}
+
+public struct RelaySwitchableNodeOption: Identifiable, Equatable, Sendable {
+    public var id: String { endpoint.address }
+    public let endpoint: RelayEndpoint
+    public let customName: String?
+    public let latencyLabel: String?
+    public let versionStatus: RelayNodeVersionStatus
+    public let capabilities: Set<String>
+    public let peerMatch: RelayPeerNodeMatch
+
+    public init(endpoint: RelayEndpoint, customName: String?, latencyLabel: String?, versionStatus: RelayNodeVersionStatus,
+                capabilities: Set<String>, peerMatch: RelayPeerNodeMatch) {
+        self.endpoint = endpoint
+        self.customName = RelayNodeNaming.sanitize(customName)
+        self.latencyLabel = latencyLabel
+        self.versionStatus = versionStatus
+        self.capabilities = capabilities
+        self.peerMatch = peerMatch
+    }
+}
+
 public enum RelayConnectionStrategy: String, Codable, CaseIterable, Sendable {
     case direct, automatic, relay
     public var title: String {
@@ -112,6 +232,7 @@ public struct RelayMessage: Codable, Sendable {
     public enum Operation: String, Codable, Sendable {
         case register, registered, connect, accept, ready, datagram, datagramReady
         case incoming, incomingDatagram, datagramClosed, ping, pong, error
+        case info, nodeInfo
         // Only sent after both endpoints negotiated `assist`; older peers never see them.
         case assist, peerCandidates
     }
@@ -130,16 +251,21 @@ public struct RelayMessage: Codable, Sendable {
     public var error: RelayServiceError?
     public var assist: Bool?
     public var candidates: [RelayCandidate]?
+    public var serverVersion: String?
+    public var capabilities: [String]?
+    public var deviceOnline: Bool?
 
     public init(_ op: Operation, accessKey: Data? = nil, deviceID: UUID? = nil, ownerKey: Data? = nil,
                 registration: String? = nil, circuitID: String? = nil, datagramID: Data? = nil,
                 datagramKey: Data? = nil, udpPort: Int? = nil, probeUDPPort: Int? = nil, assist: Bool? = nil,
-                candidates: [RelayCandidate]? = nil) {
+                candidates: [RelayCandidate]? = nil, serverVersion: String? = nil,
+                capabilities: [String]? = nil, deviceOnline: Bool? = nil) {
         self.op = op; self.accessKey = accessKey; self.deviceID = deviceID?.uuidString.lowercased()
         self.ownerKey = ownerKey; self.registration = registration; self.circuitID = circuitID
         self.datagramID = datagramID; self.datagramKey = datagramKey; self.udpPort = udpPort
         self.probeUDPPort = probeUDPPort
         self.assist = assist; self.candidates = candidates
+        self.serverVersion = serverVersion; self.capabilities = capabilities; self.deviceOnline = deviceOnline
     }
 
     /// A service behind NAT can advertise its private listener ports. Use their offset on the configured public endpoint.
@@ -160,7 +286,9 @@ public struct RelayMessage: Codable, Sendable {
               datagramID.map({ $0.count == 16 }) ?? true, datagramKey.map({ $0.count == 32 }) ?? true,
               udpPort.map({ (1...65_535).contains($0) }) ?? true,
               probeUDPPort.map({ (1...65_535).contains($0) }) ?? true,
-              candidates.map({ $0.count <= RelayCandidate.maximumPeer && $0.allSatisfy(\.wireValid) }) ?? true else { throw RelayServiceError.invalid }
+              candidates.map({ $0.count <= RelayCandidate.maximumPeer && $0.allSatisfy(\.wireValid) }) ?? true,
+              serverVersion.map({ (1...64).contains($0.utf8.count) && $0.rangeOfCharacter(from: .controlCharacters) == nil }) ?? true,
+              capabilities.map({ $0.count <= 16 && $0.allSatisfy(Self.validCapability) }) ?? true else { throw RelayServiceError.invalid }
         switch op {
         case .register: guard accessKey != nil, deviceID != nil, ownerKey != nil else { throw RelayServiceError.invalid }
         case .connect, .datagram: guard accessKey != nil, deviceID != nil else { throw RelayServiceError.invalid }
@@ -175,7 +303,14 @@ public struct RelayMessage: Codable, Sendable {
             guard datagramID != nil, (candidates ?? []).count <= RelayCandidate.maximumLocal,
                   (candidates ?? []).allSatisfy({ $0.kind == .host }) else { throw RelayServiceError.invalid }
         case .peerCandidates: guard datagramID != nil, candidates != nil else { throw RelayServiceError.invalid }
-        case .ready, .ping, .pong: break
+        case .info: guard accessKey != nil else { throw RelayServiceError.invalid }
+        case .nodeInfo, .ready, .ping, .pong: break
+        }
+    }
+
+    private static func validCapability(_ value: String) -> Bool {
+        (1...32).contains(value.utf8.count) && value.utf8.allSatisfy {
+            (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 95
         }
     }
 

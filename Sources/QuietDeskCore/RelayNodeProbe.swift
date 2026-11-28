@@ -31,14 +31,19 @@ public enum RelayNodeProbe {
         return Measurement(milliseconds: best, attempts: made, failures: failures)
     }
 
-    /// Orders nodes best first. Nodes that never connected follow, then unmeasured ones; ties keep the given order.
-    public static func ordered(_ nodes: [RelayEndpoint], by measurements: [RelayEndpoint: Measurement]) -> [RelayEndpoint] {
+    /// Orders nodes by preference, then latency. Unreachable nodes follow measured nodes, then unmeasured ones.
+    /// Ties preserve input order.
+    public static func ordered(_ nodes: [RelayEndpoint], by measurements: [RelayEndpoint: Measurement],
+                               preferredRanks: [RelayEndpoint: Int] = [:]) -> [RelayEndpoint] {
         func rank(_ node: RelayEndpoint) -> (Int, Double) {
             guard let measurement = measurements[node] else { return (2, 0) }
             guard let score = measurement.score else { return (1, 0) }
             return (0, score)
         }
         return nodes.enumerated().sorted { first, second in
+            let firstPreference = preferredRanks[first.element, default: 0]
+            let secondPreference = preferredRanks[second.element, default: 0]
+            if firstPreference != secondPreference { return firstPreference < secondPreference }
             let a = rank(first.element), b = rank(second.element)
             if a.0 != b.0 { return a.0 < b.0 }
             if a.1 != b.1 { return a.1 < b.1 }
@@ -81,6 +86,46 @@ public enum RelayNodeProbe {
             }
             connection.start(queue: queue)
             queue.asyncAfter(deadline: .now() + timeout) { attempt.finish(nil) }
+        }
+    }
+}
+
+public enum RelayNodeInspector {
+    public typealias Info = (versionStatus: RelayNodeVersionStatus, serverVersion: String?, capabilities: Set<String>, deviceOnline: Bool?)
+
+    public static func inspect(endpoint: RelayEndpoint, accessKey: Data, trustedCertificate: RelayNodeCertificate?,
+                               targetDeviceID: UUID?, currentAppVersion: String, timeout: TimeInterval = 4) async -> Result<Info, Error> {
+        guard accessKey.count == 32, timeout.isFinite, timeout > 0 else { return .failure(RelayServiceError.invalid) }
+        do {
+            let queue = DispatchQueue(label: "quietdesk.relay-inspector")
+            let channel = try RelayTLSChannel(endpoint: endpoint, queue: queue, trustedCertificate: trustedCertificate)
+            defer { channel.close() }
+            // Older nodes validate UUIDs before checking the operation and otherwise reject a node-only query as malformed.
+            let deviceID = targetDeviceID ?? UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+            let request = RelayMessage(.info, accessKey: accessKey, deviceID: deviceID)
+            let response: RelayMessage = try await CallbackOperation.run { finish in
+                channel.onReady = { [weak channel] in
+                    guard let channel else { return }
+                    channel.send(request)
+                    channel.readMessage(timeout: timeout, completion: finish)
+                }
+                channel.onClose = { finish(.failure($0)) }
+                channel.start()
+                queue.asyncAfter(deadline: .now() + timeout) { finish(.failure(RelayTransportError.timeout)) }
+            }
+            switch response.op {
+            case .nodeInfo:
+                return .success((RelayNodeVersionStatus.evaluate(serverVersion: response.serverVersion, currentAppVersion: currentAppVersion),
+                                 response.serverVersion, Set(response.capabilities ?? []), targetDeviceID == nil ? nil : response.deviceOnline))
+            case .error where response.error == .unsupported:
+                return .success((.legacyUnversioned, nil, [], nil))
+            case .error:
+                return .failure(response.error ?? RelayServiceError.invalid)
+            default:
+                return .failure(RelayServiceError.invalid)
+            }
+        } catch {
+            return .failure(error)
         }
     }
 }

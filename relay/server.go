@@ -317,7 +317,7 @@ func (s *Server) handle(conn net.Conn) {
 		return
 	}
 	message.DeviceID = strings.ToLower(message.DeviceID)
-	if !devicePattern.MatchString(message.DeviceID) {
+	if (message.Op != "info" || message.DeviceID != "") && !devicePattern.MatchString(message.DeviceID) {
 		WriteMessage(conn, Message{Op: "error", Error: "protocol"})
 		return
 	}
@@ -330,9 +330,35 @@ func (s *Server) handle(conn net.Conn) {
 		s.accept(conn, message)
 	case "datagram":
 		s.openDatagram(conn, message)
+	case "info":
+		s.nodeInfo(conn, message)
 	default:
 		WriteMessage(conn, Message{Op: "error", Error: "unsupported"})
 	}
+}
+
+func (s *Server) capabilities() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	capabilities := []string{"tcp", "info"}
+	if s.udp != nil {
+		capabilities = append(capabilities, "udp", "assist")
+	}
+	if s.probeUDP != nil {
+		capabilities = append(capabilities, "dualProbe")
+	}
+	return capabilities
+}
+
+func (s *Server) nodeInfo(conn net.Conn, request Message) {
+	response := Message{Op: "nodeInfo", ServerVersion: NormalizedServerVersion(), Capabilities: s.capabilities()}
+	if request.DeviceID != "" {
+		s.mu.RLock()
+		online := s.hosts[request.DeviceID] != nil
+		s.mu.RUnlock()
+		response.DeviceOnline = &online
+	}
+	WriteMessage(conn, response)
 }
 
 func writeOwnersState(statePath string, owners map[string]string) error {
@@ -469,7 +495,8 @@ func (s *Server) register(conn net.Conn, message Message) {
 			connection.Close()
 		}
 	}()
-	if h.send(Message{Op: "registered", Registration: registration}) != nil {
+	if h.send(Message{Op: "registered", Registration: registration,
+		ServerVersion: NormalizedServerVersion(), Capabilities: s.capabilities()}) != nil {
 		return
 	}
 	for {
@@ -703,7 +730,9 @@ func (s *Server) openDatagram(conn net.Conn, message Message) {
 		WriteMessage(conn, Message{Op: "error", Error: "timeout"})
 		return
 	}
-	if lease.writeViewer(Message{Op: "datagramReady", DatagramID: id[:], DatagramKey: lease.keys[0][:], UDPPort: port, ProbeUDPPort: lease.probePort, Assist: lease.assist}) != nil {
+	if lease.writeViewer(Message{Op: "datagramReady", DatagramID: id[:], DatagramKey: lease.keys[0][:],
+		UDPPort: port, ProbeUDPPort: lease.probePort, Assist: lease.assist,
+		ServerVersion: NormalizedServerVersion(), Capabilities: s.capabilities()}) != nil {
 		return
 	}
 	if lease.assist {

@@ -73,6 +73,18 @@ private struct ConnectionEntryChecks {
             try require(ConnectionEntryPresentation.endpoint(relayed) == route.endpoint.address
                         && ConnectionEntryPresentation.route(relayed) == "自动（直连优先）", "Saved relay route mislabeled")
         }
+        run("Relay aliases appear in endpoint labels and search only when supplied") {
+            let names = [route.endpoint.address: "上海阿里云"]
+            let direct = ConnectionRecord(address: "mac.example.invalid", port: 5908, name: "直连 Mac")
+            var shared = direct
+            shared.hostRelayNodeDigests = [RelayNodeNaming.endpointDigest(route.endpoint)]
+            try require(ConnectionEntryPresentation.endpoint(relayed, relayNodeNames: names) == "上海阿里云（relay.example.invalid:7443）",
+                        "Alias did not retain the node address")
+            try require(ConnectionEntryPresentation.matching([relayed, direct], query: "阿里云").isEmpty,
+                        "Alias matched without a name mapping")
+            try require(ConnectionEntryPresentation.matching([relayed, shared], query: "阿里云", relayNodeNames: names) == [relayed, shared],
+                        "Alias search missed the saved route or a shared node")
+        }
         run("Unnamed saved records have a useful title without modifying the stored name") {
             let direct = ConnectionRecord(address: "example.invalid", port: 5908, name: "  ")
             let relay = ConnectionRecord(address: "", port: 5908, name: "", relay: route)

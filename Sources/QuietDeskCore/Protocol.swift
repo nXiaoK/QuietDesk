@@ -257,7 +257,8 @@ public struct Hello: Codable, Sendable {
     // The host accepts a dynamic StreamSettingsRequest.viewport in backing pixels.
     public let videoViewportV1: Bool?
     public let hostUpdateRestartV1: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil, displaySwitchingV1: Bool? = nil, displays: [RemoteDisplayInfo]? = nil, selectedDisplayID: UInt32? = nil, remoteAudioV1: Bool? = nil, relativeMouseV1: Bool? = nil, trackpadGesturesV1: Bool? = nil, initialCursorNegotiationV1: Bool? = nil, qualityProbeV1: Bool? = nil, typeTextV1: Bool? = nil, physicalFilePasteV1: Bool? = nil, automaticDefaultQualityV1: Bool? = nil, videoViewportV1: Bool? = nil, hostUpdateRestartV1: Bool? = nil) {
+    public let relayNodeDigests: [String]?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil, displaySwitchingV1: Bool? = nil, displays: [RemoteDisplayInfo]? = nil, selectedDisplayID: UInt32? = nil, remoteAudioV1: Bool? = nil, relativeMouseV1: Bool? = nil, trackpadGesturesV1: Bool? = nil, initialCursorNegotiationV1: Bool? = nil, qualityProbeV1: Bool? = nil, typeTextV1: Bool? = nil, physicalFilePasteV1: Bool? = nil, automaticDefaultQualityV1: Bool? = nil, videoViewportV1: Bool? = nil, hostUpdateRestartV1: Bool? = nil, relayNodeDigests: [String]? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -305,6 +306,7 @@ public struct Hello: Codable, Sendable {
         self.automaticDefaultQualityV1 = automaticDefaultQualityV1
         self.videoViewportV1 = videoViewportV1
         self.hostUpdateRestartV1 = hostUpdateRestartV1
+        self.relayNodeDigests = relayNodeDigests
     }
 
     public func validate() throws {
@@ -320,6 +322,10 @@ public struct Hello: Codable, Sendable {
             throw DeskError.invalid("兼容画质字段的帧率不能超过 60 fps")
         }
         if higherFrameRateVideoV1 == true, let preferredHigherFrameRateSettings { try preferredHigherFrameRateSettings.validateControlValues() }
+        if let relayNodeDigests,
+           relayNodeDigests.count > RelayNodeNaming.maximumNodeDigests || !relayNodeDigests.allSatisfy(RelayNodeNaming.isEndpointDigest) {
+            throw DeskError.invalid("远端中继节点摘要无效")
+        }
         if let displays {
             try RemoteDisplayInfo.validateList(displays, selectedDisplayID: selectedDisplayID)
         } else if let selectedDisplayID, selectedDisplayID == 0 {

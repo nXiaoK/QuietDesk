@@ -13,6 +13,7 @@ struct ConnectionDiagnosticReportView: View {
     }
 
     let report: ConnectionDiagnosticReport
+    var relayNodeNames: [String: String] = [:]
     @State private var tab: Tab = .overview
     @State private var selectedTime: Double?
     @State private var actionFeedback: String?
@@ -68,7 +69,7 @@ struct ConnectionDiagnosticReportView: View {
                         .font(.system(size: 23, weight: .bold))
                         .foregroundStyle(DeskPalette.ink)
                         .accessibilityAddTraits(.isHeader)
-                    Text(report.diagnosticDisplayName)
+                    Text(report.diagnosticDisplayName(relayNodeNames: relayNodeNames))
                         .font(.system(size: 13))
                         .foregroundStyle(DeskPalette.secondary)
                         .textSelection(.enabled)
@@ -544,9 +545,10 @@ struct ConnectionDiagnosticReportView: View {
                 Text(DiagnosticReportFormat.elapsed(entry.duration))
                     .font(.system(size: 15, weight: .semibold, design: .monospaced))
             }
-            Text(entry.route.detail)
+            Text(entry.route.detail(relayNodeNames: relayNodeNames))
                 .font(.system(size: 13))
                 .foregroundStyle(DeskPalette.secondary)
+                .help(entry.route.node ?? "")
                 .textSelection(.enabled)
             if entry.quality.hasMeasurements {
                 valuesGrid(ReportMetric.allCases.map { metric in
@@ -599,7 +601,7 @@ struct ConnectionDiagnosticReportView: View {
     }
 
     private func pathList(_ bucket: DiagnosticTimeBucket) -> String {
-        let paths = bucket.routes.keys.map { $0.media.title + " · " + $0.detail }.sorted()
+        let paths = bucket.routes.keys.map { $0.media.title + " · " + $0.detail(relayNodeNames: relayNodeNames) }.sorted()
         return paths.isEmpty ? "暂无路径观测" : paths.joined(separator: " / ")
     }
 
@@ -695,9 +697,15 @@ struct DiagnosticStabilityBadge: View {
 }
 
 extension ConnectionDiagnosticReport {
-    var diagnosticDisplayName: String {
-        if remoteName.isEmpty { return endpointLabel.isEmpty ? "远程连接" : endpointLabel }
-        return endpointLabel.isEmpty || endpointLabel == remoteName ? remoteName : remoteName + " · " + endpointLabel
+    func diagnosticDisplayName(relayNodeNames: [String: String] = [:]) -> String {
+        var displayEndpoint = endpointLabel
+        if let endpoint = try? RelayEndpoint(address: endpointLabel),
+           RelayNodeNaming.sanitize(relayNodeNames[endpoint.address]) != nil,
+           routes.contains(where: { $0.route.control == .relay && $0.route.node == endpoint.address }) {
+            displayEndpoint = RelayNodeNaming.fullTitle(for: endpoint, names: relayNodeNames)
+        }
+        if remoteName.isEmpty { return displayEndpoint.isEmpty ? "远程连接" : displayEndpoint }
+        return displayEndpoint.isEmpty || displayEndpoint == remoteName ? remoteName : remoteName + " · " + displayEndpoint
     }
 }
 
@@ -815,7 +823,7 @@ private extension DiagnosticRoute {
         }
     }
 
-    var detail: String {
+    func detail(relayNodeNames: [String: String]) -> String {
         let path: String
         switch control {
         case .unavailable: path = "控制通道未建立"
@@ -828,7 +836,15 @@ private extension DiagnosticRoute {
             default: path = "控制通道经 Tailscale · 底层路径未知"
             }
         }
-        return node.map { path + (control == .unavailable ? " · 尝试节点 " : " · 节点 ") + $0 } ?? path
+        guard let node else { return path }
+        let title: String
+        if let endpoint = try? RelayEndpoint(address: node),
+           RelayNodeNaming.sanitize(relayNodeNames[endpoint.address]) != nil {
+            title = RelayNodeNaming.fullTitle(for: endpoint, names: relayNodeNames)
+        } else {
+            title = node
+        }
+        return path + (control == .unavailable ? " · 尝试节点 " : " · 节点 ") + title
     }
 }
 

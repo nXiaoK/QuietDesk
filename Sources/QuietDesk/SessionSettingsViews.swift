@@ -58,31 +58,32 @@ struct RelayNodePicker: View {
                 .pickerStyle(.menu)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                Button(model.relayProbing ? "测量中…" : "测速") { model.measureRelayNodes() }
+                Button(model.relayProbing ? "检测中…" : "检测") { model.measureRelayNodes() }
                     .buttonStyle(DeskButtonStyle(.quiet))
                     .disabled(model.relayProbing)
-                    .help("测量各节点的 TCP 连接延迟（约一次网络往返，不含中继凭据）；连接前也会自动测量")
+                    .help("测量节点连接延迟，并查询版本及支持的能力")
             }
             .onAppear { model.measureRelayNodesIfStale() }
         } else {
-            Text(model.relayAddress.isEmpty ? "尚未添加中继节点" : model.relayAddress)
+            Text(model.relayNodes.first.map(title) ?? "尚未添加中继节点")
                 .font(.system(size: 13))
                 .foregroundStyle(DeskPalette.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .help(model.relayNodes.first ?? "")
         }
     }
 
     private var automaticTitle: String {
         let best = model.relayNodes.min { (score($0) ?? .infinity) < (score($1) ?? .infinity) }
-        guard let best, score(best) != nil, let host = try? RelayEndpoint(address: best).host else { return "自动选择最快节点" }
-        return "自动 · 当前最快 \(host)"
+        guard let best, score(best) != nil else { return "自动选择最快节点" }
+        return "自动 · 当前最快 \(title(best))"
     }
 
     private func score(_ node: String) -> Double? { model.relayNodeMeasurements[node]?.score }
 
     private func title(_ node: String) -> String {
-        let name = (try? RelayEndpoint(address: node)).map { "\($0.host):\($0.port)" } ?? node
+        let name = model.relayNodeDisplayName(node)
         return RelayNodeLabel.latency(model.relayNodeMeasurements[node]).map { "\(name) · \($0)" } ?? name
     }
 }

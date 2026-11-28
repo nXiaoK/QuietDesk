@@ -2,10 +2,12 @@
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
 ARG TARGETOS
 ARG TARGETARCH
+ARG RELAY_VERSION=""
 WORKDIR /src
 COPY go.mod *.go ./
 COPY cmd/ ./cmd/
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -buildvcs=false -o /quietdesk-relay ./cmd/quietdesk-relay
+RUN if [ -n "$RELAY_VERSION" ]; then set -- -ldflags "-X quietdesk/relay.ServerVersion=$RELAY_VERSION"; fi \
+    && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -buildvcs=false "$@" -o /quietdesk-relay ./cmd/quietdesk-relay
 
 FROM alpine:3.23
 RUN apk add --no-cache openssl \

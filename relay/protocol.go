@@ -22,7 +22,21 @@ const (
 	MaxPeerCandidates  = 8
 )
 
+const defaultServerVersion = "0.7.56"
+
+// ServerVersion is the release version and can be set at build time with -ldflags -X.
+var ServerVersion = defaultServerVersion
+
+// NormalizedServerVersion returns the configured release version or its default.
+func NormalizedServerVersion() string {
+	if version := strings.TrimSpace(ServerVersion); version != "" {
+		return version
+	}
+	return defaultServerVersion
+}
+
 // These credentials authorize routing, never the inner desktop TLS/DTLS session.
+// An authenticated info request returns nodeInfo, with online status only for a supplied device ID.
 type Message struct {
 	Version      int    `json:"version"`
 	Op           string `json:"op"`
@@ -39,6 +53,10 @@ type Message struct {
 	// Optional assisted-direct-path capability; omitted fields keep the original wire bytes.
 	Assist     bool        `json:"assist,omitempty"`
 	Candidates []Candidate `json:"candidates,omitempty"`
+
+	ServerVersion string   `json:"serverVersion,omitempty"`
+	Capabilities  []string `json:"capabilities,omitempty"`
+	DeviceOnline  *bool    `json:"deviceOnline,omitempty"`
 }
 
 // A candidate is an address hint for an assisted direct UDP path, never a routing instruction for the node.

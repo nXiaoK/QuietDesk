@@ -105,7 +105,7 @@ struct TrafficStatisticsView: View {
         }
         .sheet(item: $presentedReport) { report in
             VStack(spacing: 0) {
-                ConnectionDiagnosticReportView(report: report)
+                ConnectionDiagnosticReportView(report: report, relayNodeNames: model.relayNodeNames)
                 Divider()
                 HStack {
                     Spacer()
@@ -201,7 +201,8 @@ struct TrafficStatisticsView: View {
                 }
                 .width(min: 92, ideal: 110)
                 TableColumn("设备 / 地址") { report in
-                    Text(report.diagnosticDisplayName).lineLimit(1).help(report.diagnosticDisplayName)
+                    let title = report.diagnosticDisplayName(relayNodeNames: model.relayNodeNames)
+                    Text(title).lineLimit(1).help(title)
                 }
                 .width(min: 105, ideal: 150)
                 TableColumn("连接时长") { report in
@@ -238,7 +239,7 @@ struct TrafficStatisticsView: View {
     private func reportDetails(_ report: ConnectionDiagnosticReport) -> some View {
         let traffic = report.traffic
         return DeskSettingsGroup(title: "连接摘要") {
-            DeskSettingsRow(title: report.diagnosticDisplayName, detail: report.reason) {
+            DeskSettingsRow(title: report.diagnosticDisplayName(relayNodeNames: model.relayNodeNames), detail: report.reason) {
                 DiagnosticStabilityBadge(stats: report.frameRate)
             }
             Divider()

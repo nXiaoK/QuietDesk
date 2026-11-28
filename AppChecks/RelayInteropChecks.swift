@@ -60,6 +60,52 @@ private func relayPacket(_ sequence: UInt32, idr: Bool) -> VideoPacket {
                 avcc: Data([0, 0, 0, 2, idr ? 0x65 : 0x41, 0x88]))
 }
 
+private func exerciseNodeInspection(_ fixture: Fixture) throws {
+    let certificate = try RelayNodeCertificate(data: fixture.authorities[0])
+    let endpoint = try fixture.endpoint, deviceID = UUID()
+    let expectedCapabilities: Set<String> = ["tcp", "info", "udp", "assist"]
+    func inspect(target: UUID?, accessKey: Data) throws -> RelayNodeInspector.Info {
+        let completed = DispatchSemaphore(value: 0)
+        let result = RelayBox<Result<RelayNodeInspector.Info, Error>?>(nil)
+        Task.detached {
+            let response = await RelayNodeInspector.inspect(endpoint: endpoint, accessKey: accessKey,
+                trustedCertificate: certificate, targetDeviceID: target, currentAppVersion: "0.7.56")
+            result.update { $0 = response }
+            completed.signal()
+        }
+        try waitRelay(completed, "Node inspection did not complete")
+        guard let response = result.read() else { throw RelayCheckFailure(message: "Node inspection lost its response") }
+        return try response.get()
+    }
+    let node = try inspect(target: nil, accessKey: fixture.accessKey)
+    try requireRelay(node.serverVersion?.isEmpty == false && node.capabilities == expectedCapabilities && node.deviceOnline == nil,
+                    "Node-only inspection lost version, capabilities or included the placeholder result")
+    let before = try inspect(target: deviceID, accessKey: fixture.accessKey)
+    try requireRelay(before.deviceOnline == false, "An unregistered target was treated as online")
+    let registration = try RelayHostRegistration(endpoint: endpoint, accessKey: fixture.accessKey, deviceID: deviceID,
+        ownerKey: PairingKey.generate().data, localPort: 9, trustedCertificate: certificate)
+    let isOnline = DispatchSemaphore(value: 0)
+    let registrationInfo = RelayBox<(String?, Set<String>)>((nil, []))
+    registration.onServerInfo = { version, capabilities in registrationInfo.update { $0 = (version, Set(capabilities)) } }
+    registration.onStatus = { if case .online = $0 { isOnline.signal() } }
+    registration.start()
+    defer { registration.stop() }
+    try waitRelay(isOnline, "Synthetic registration never came online")
+    let after = try inspect(target: deviceID, accessKey: fixture.accessKey)
+    try requireRelay(after.deviceOnline == true, "An authenticated registration was treated as offline")
+    let (registeredVersion, registeredCapabilities) = registrationInfo.read()
+    try requireRelay(registeredVersion == node.serverVersion && registeredCapabilities == expectedCapabilities,
+                    "Registration metadata differed from authenticated inspection")
+    var wrongKey = fixture.accessKey
+    wrongKey[wrongKey.startIndex] ^= 1
+    do {
+        _ = try inspect(target: deviceID, accessKey: wrongKey)
+        throw RelayCheckFailure(message: "An invalid access key returned node or device metadata")
+    } catch RelayServiceError.unauthorized {
+        // The device lookup shares the node's access-key guard.
+    }
+}
+
 private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false, wrongPairing: Bool = false, pinned: Bool = false, testMapping: Bool = false) throws {
     let queue = DispatchQueue(label: "checks.relay.host-listener")
     let key = try PairingKey.generate(), device = UUID()
@@ -71,6 +117,7 @@ private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false,
     let committed = DispatchSemaphore(value: 0), predicted = DispatchSemaphore(value: 0), data = DispatchSemaphore(value: 0), closed = DispatchSemaphore(value: 0)
     let hostMedia = RelayBox<MediaSession?>(nil), viewerMedia = RelayBox<MediaSession?>(nil), peers = RelayBox<[Peer]>([])
     let errors = RelayBox<[String]>([]), states = RelayBox<[String]>([]), sequence = RelayBox<UInt32>(0), bridgePort = RelayBox<UInt16?>(nil)
+    let bridgeInfo = RelayBox<(String?, Set<String>)>((nil, []))
     let hostAgent = RelayBox<RelayHostRegistration?>(nil), hostReady = RelayBox(false), verifiedSource = RelayBox(false)
     let shuttingDown = RelayBox(false)
     let allowed = RelayBox<PortMappingTarget?>(nil)
@@ -119,6 +166,7 @@ private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false,
     agent.start()
     let bridge = try RelayViewerBridge(endpoint: fixture.endpoint, accessKey: fixture.accessKey, deviceID: device,
         udpEnabled: udp, certificateAuthorities: authorities, trustedCertificate: certificate)
+    bridge.onServerInfo = { version, capabilities in bridgeInfo.update { $0 = (version, Set(capabilities)) } }
     bridge.onReady = { port in bridgePort.update { $0 = port }; localReady.signal() }
     bridge.onClose = { error in if !shuttingDown.read() && !wrongPairing { errors.update { $0.append("Bridge failed: \(error.localizedDescription)") } } }
     bridge.onDatagramFailure = { error in
@@ -161,6 +209,11 @@ private func exerciseRelay(_ fixture: Fixture, udp: Bool, blocked: Bool = false,
     let expected = udp && !blocked ? "UDP 视频" : "TCP 视频"
     for _ in 0..<100 where !states.read().contains(expected) { Thread.sleep(forTimeInterval: 0.01) }
     try requireRelay(states.read().contains(expected), "Wrong committed relay transport: \(states.read())")
+    if udp && !blocked {
+        let (version, capabilities) = bridgeInfo.read()
+        try requireRelay(version?.isEmpty == false && capabilities.isSuperset(of: ["tcp", "info", "udp", "assist"]),
+                         "Datagram readiness did not publish node metadata")
+    }
     try requireRelay(errors.read().isEmpty, "Relayed session failed: \(errors.read())")
     if testMapping {
         try exerciseIndependentMapping(fixture, device: device, key: key, allowed: allowed) {
@@ -513,6 +566,9 @@ private func rejectedRelay(_ fixture: Fixture, wrongKey: Bool) throws {
             } else if CommandLine.arguments.contains("--private-udp-port") {
                 run("A private node listen port cannot redirect public-endpoint DTLS forwarding") { try exerciseRelay(fixture, udp: true, pinned: true) }
             } else {
+            run("Authenticated relay inspection reads node version and capabilities and follows device registration") {
+                try exerciseNodeInspection(fixture)
+            }
             run("A stalled relay reader gets bounded grace without losing its missing-response timeout") {
                 let queue = DispatchQueue(label: "checks.relay.stalled-read")
                 let channel = try RelayTLSChannel(endpoint: fixture.endpoint, queue: queue,

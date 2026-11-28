@@ -17,6 +17,20 @@ func runRelayNodeProbeChecks() {
         try check(RelayNodeProbe.ordered([b, a], by: tie) == [b, a], "Equal nodes were reordered")
     }
 
+    run("Relay node presence preference takes precedence over probe delay and preserves latency within each rank") {
+        let a = try RelayEndpoint(address: "a.example"), b = try RelayEndpoint(address: "b.example")
+        let c = try RelayEndpoint(address: "c.example"), d = try RelayEndpoint(address: "d.example")
+        let measurements: [RelayEndpoint: RelayNodeProbe.Measurement] = [
+            a: .init(milliseconds: 50, attempts: 3, failures: 0),
+            b: .init(milliseconds: 10, attempts: 3, failures: 0),
+            c: .init(milliseconds: 1, attempts: 3, failures: 0),
+            d: .init(milliseconds: nil, attempts: 3, failures: 3)
+        ]
+        let ranks = [a: 1, b: 1, c: 2, d: 0]
+        try check(RelayNodeProbe.ordered([a, b, c, d], by: measurements, preferredRanks: ranks) == [d, b, a, c],
+                  "Latency overrode authenticated presence preference or stopped ranking equally preferred nodes")
+    }
+
     run("A relay probe times a local TCP accept and reports a closed port as unreachable") {
         let listener = try NWListener(using: .tcp, on: .any)
         let ready = DispatchSemaphore(value: 0)

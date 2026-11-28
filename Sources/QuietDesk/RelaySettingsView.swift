@@ -2,18 +2,53 @@ import SwiftUI
 import AppKit
 import QuietDeskCore
 
+struct RelayNodeStatusBadge: View {
+    let status: RelayNodeVersionStatus
+    let capabilities: Set<String>
+
+    var body: some View {
+        Group {
+            if status == .unknown {
+                Text("—")
+                    .font(.caption)
+                    .foregroundStyle(DeskPalette.secondary)
+                    .accessibilityLabel("版本未检测")
+            } else {
+                DeskPillBadge(text: status.badgeText, tint: tint)
+                    .help(capabilityLabel)
+                    .accessibilityHint(capabilityLabel)
+            }
+        }
+    }
+
+    private var tint: Color {
+        switch status {
+        case .upToDate: return DeskPalette.emerald
+        case .updatable, .legacyUnversioned: return DeskPalette.amber
+        case .unknown: return DeskPalette.secondary
+        }
+    }
+
+    private var capabilityLabel: String {
+        if capabilities.contains("tcp"), !capabilities.contains("udp") { return "仅 TCP" }
+        return RelayNodeNaming.capabilityLabel(capabilities)
+    }
+}
+
 @MainActor
 struct RelaySettingsView: View {
-    private enum EditorField: Hashable { case address, accessCode }
+    private enum EditorField: Hashable { case name, address, accessCode }
     @Environment(\.dismiss) private var dismiss
     @State private var enabled: Bool
     @State private var nodes: [String]
+    @State private var nodeNames: [String: String]
     @State private var deviceID: String
     @State private var failure: String?
     @State private var savedFeedback = false
     @State private var copiedDeviceID = false
     // The node being edited: nil when none, empty for a new node, otherwise its saved address.
     @State private var editing: String?
+    @State private var name = ""
     @State private var address = ""
     @State private var accessCode = ""
     @State private var certificate: RelayNodeCertificate?
@@ -26,27 +61,48 @@ struct RelaySettingsView: View {
 
     let locked: Bool
     let measurements: [String: RelayNodeProbe.Measurement]
+    let nodeInfos: [String: (versionStatus: RelayNodeVersionStatus, serverVersion: String?, capabilities: Set<String>)]
+    let probing: Bool
+    let measure: () -> Void
     let loadTrust: @MainActor (RelayEndpoint) throws -> RelayNodeCertificate?
-    let saveNode: @MainActor (String, String, RelayNodeCertificate?) throws -> String
-    let save: @MainActor (Bool, [String], String) throws -> Void
+    let saveNode: @MainActor (String, String?, String, RelayNodeCertificate?) throws -> String
+    let save: @MainActor (Bool, [String], [String: String], String) throws -> Void
     var embedded: Bool = false
 
     init(enabled: Bool, nodes: [String], deviceID: String, locked: Bool,
+         nodeNames: [String: String] = [:],
          measurements: [String: RelayNodeProbe.Measurement] = [:],
+         nodeInfos: [String: (versionStatus: RelayNodeVersionStatus, serverVersion: String?, capabilities: Set<String>)] = [:],
+         probing: Bool = false, measure: @escaping () -> Void = {},
          embedded: Bool = false,
          loadTrust: @escaping @MainActor (RelayEndpoint) throws -> RelayNodeCertificate?,
-         saveNode: @escaping @MainActor (String, String, RelayNodeCertificate?) throws -> String,
-         save: @escaping @MainActor (Bool, [String], String) throws -> Void) {
+         saveNode: @escaping @MainActor (String, String?, String, RelayNodeCertificate?) throws -> String,
+         save: @escaping @MainActor (Bool, [String], [String: String], String) throws -> Void) {
         _enabled = State(initialValue: enabled)
         _nodes = State(initialValue: nodes)
+        _nodeNames = State(initialValue: nodeNames)
         _deviceID = State(initialValue: deviceID.isEmpty ? UUID().uuidString.lowercased() : deviceID)
         _editing = State(initialValue: nodes.isEmpty && enabled ? "" : nil)
         self.locked = locked
         self.measurements = measurements
+        self.nodeInfos = nodeInfos
+        self.probing = probing
+        self.measure = measure
         self.embedded = embedded
         self.loadTrust = loadTrust
         self.saveNode = saveNode
         self.save = save
+    }
+
+    init(enabled: Bool, nodes: [String], deviceID: String, locked: Bool,
+         measurements: [String: RelayNodeProbe.Measurement] = [:], embedded: Bool = false,
+         loadTrust: @escaping @MainActor (RelayEndpoint) throws -> RelayNodeCertificate?,
+         saveNode: @escaping @MainActor (String, String, RelayNodeCertificate?) throws -> String,
+         save: @escaping @MainActor (Bool, [String], String) throws -> Void) {
+        self.init(enabled: enabled, nodes: nodes, deviceID: deviceID, locked: locked, measurements: measurements,
+                  embedded: embedded, loadTrust: loadTrust,
+                  saveNode: { address, _, accessCode, certificate in try saveNode(address, accessCode, certificate) },
+                  save: { enabled, nodes, _, deviceID in try save(enabled, nodes, deviceID) })
     }
 
     var body: some View {
@@ -87,13 +143,14 @@ struct RelaySettingsView: View {
                             .help("节点证书绑定当前地址与端口，不写入系统根证书。")
                     }
                 }
+                .disabled(locked)
 
                 if enabled {
                     nodeList
                     deviceIdentitySection
+                        .disabled(locked)
                 }
             }
-            .disabled(locked)
 
             if embedded {
                 inner
@@ -118,7 +175,7 @@ struct RelaySettingsView: View {
                 }
                 Button(embedded ? "保存中继配置" : "保存") {
                     do {
-                        try save(enabled, nodes, deviceID)
+                        try save(enabled, nodes, nodeNames, deviceID)
                         failure = nil
                         if embedded {
                             savedFeedback = true
@@ -140,7 +197,7 @@ struct RelaySettingsView: View {
             }
         }
         .padding(embedded ? 0 : 24)
-        .frame(width: embedded ? nil : 580)
+        .frame(width: embedded ? nil : 660)
         .frame(maxWidth: embedded ? .infinity : nil, alignment: .leading)
         .background(embedded ? Color.clear : DeskPalette.canvasBackground)
         .tint(DeskPalette.accent)
@@ -169,11 +226,20 @@ struct RelaySettingsView: View {
                     .font(.system(size: 12.5, weight: .medium))
                     .foregroundStyle(DeskPalette.secondary)
                 Spacer()
+                Button {
+                    measure()
+                } label: {
+                    Label(probing ? "检测中…" : "检测节点", systemImage: "waveform.path")
+                }
+                .buttonStyle(DeskButtonStyle(.secondary))
+                .disabled(probing || nodes.isEmpty)
+                .help("检测已保存节点的连接延迟、版本及能力")
                 if editing == nil {
                     Button { beginEditing("") } label: {
                         Label("添加节点…", systemImage: "plus")
                     }
                     .buttonStyle(DeskButtonStyle(.secondary))
+                    .disabled(locked)
                 }
             }
 
@@ -181,7 +247,8 @@ struct RelaySettingsView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     nodeColumns {
                         Text("节点").frame(maxWidth: .infinity, alignment: .leading)
-                        Text("探测结果").frame(width: 128, alignment: .leading)
+                        Text("版本与能力").frame(width: 138, alignment: .leading)
+                        Text("延迟探测").frame(width: 104, alignment: .leading)
                         Text("操作").frame(width: 112, alignment: .leading)
                     }
                     .font(.system(size: 12, weight: .medium))
@@ -210,32 +277,47 @@ struct RelaySettingsView: View {
 
     private func nodeRow(_ node: String) -> some View {
         nodeColumns {
-            Text(node)
-                .font(.system(size: 13, design: .monospaced))
+            VStack(alignment: .leading, spacing: 3) {
+                Text((try? RelayEndpoint(address: node)).map {
+                    RelayNodeNaming.shortTitle(for: $0, names: nodeNames)
+                } ?? node)
+                .font(.system(size: 13, weight: .semibold))
                 .lineLimit(1)
-                .truncationMode(.middle)
-                .help(node)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                Text(node)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(DeskPalette.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .help(node)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            RelayNodeStatusBadge(status: nodeInfos[node]?.versionStatus ?? .unknown,
+                                 capabilities: nodeInfos[node]?.capabilities ?? [])
+                .frame(width: 138, alignment: .leading)
 
             let latency = RelayNodeLabel.latency(measurements[node])
             Text(latency ?? "—")
                 .font(.system(size: 12.5, design: .monospaced))
                 .foregroundStyle(latency == "不可达" ? DeskPalette.coral : DeskPalette.secondary)
-                .frame(width: 128, alignment: .leading)
+                .frame(width: 104, alignment: .leading)
 
             HStack(spacing: 6) {
                 Button("编辑") { beginEditing(node) }
                     .buttonStyle(DeskButtonStyle(.quiet))
                     .accessibilityLabel("编辑 \(node)")
-                Button("移除", role: .destructive) { nodes.removeAll { $0 == node } }
+                Button("移除", role: .destructive) {
+                    nodes.removeAll { $0 == node }
+                    nodeNames.removeValue(forKey: node)
+                }
                     .buttonStyle(DeskButtonStyle(.quiet))
                     .foregroundStyle(DeskPalette.coral)
                     .accessibilityLabel("移除 \(node)")
             }
             .frame(width: 112, alignment: .leading)
+            .disabled(locked || editing != nil)
         }
         .frame(minHeight: 44)
-        .disabled(editing != nil)
     }
 
     private func nodeColumns(@ViewBuilder _ content: () -> some View) -> some View {
@@ -290,6 +372,17 @@ struct RelaySettingsView: View {
 
             VStack(alignment: .leading, spacing: 13) {
                 VStack(alignment: .leading, spacing: 6) {
+                    Text("节点名称（选填）")
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(DeskPalette.secondary)
+                    TextField("例如：上海阿里云 / 广州电信，留空显示地址", text: $name)
+                        .font(.system(size: 13))
+                        .focused($editorFocus, equals: .name)
+                        .deskInputBox(focused: editorFocus == .name)
+                        .accessibilityLabel("中继节点名称")
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
                     Text("节点地址")
                         .font(.system(size: 12.5, weight: .medium))
                         .foregroundStyle(DeskPalette.secondary)
@@ -335,11 +428,12 @@ struct RelaySettingsView: View {
         .padding(26)
         .frame(width: 540)
         .deskSurface()
-        .onAppear { editorFocus = .address }
+        .onAppear { editorFocus = editing?.isEmpty == true ? .address : .name }
     }
 
     private func beginEditing(_ node: String) {
         editing = node
+        name = nodeNames[node] ?? ""
         address = node.isEmpty ? "" : node
         accessCode = ""
         failure = nil
@@ -349,13 +443,20 @@ struct RelaySettingsView: View {
     private func cancelEditing() {
         requestID = UUID(); probe?.cancel(); probe = nil
         editing = nil; address = ""; accessCode = ""; candidate = nil; certificate = nil; fingerprintChecked = false
+        name = ""
     }
 
     private func saveEditedNode() {
         do {
-            let saved = try saveNode(address, accessCode, certificate)
-            if let original = editing, !original.isEmpty, let index = nodes.firstIndex(of: original) { nodes[index] = saved }
-            else { nodes.append(saved) }
+            let alias = RelayNodeNaming.sanitize(name)
+            let saved = try saveNode(address, alias, accessCode, certificate)
+            if let original = editing, !original.isEmpty, let index = nodes.firstIndex(of: original) {
+                nodes[index] = saved
+                nodeNames.removeValue(forKey: original)
+            } else {
+                nodes.append(saved)
+            }
+            nodeNames[saved] = alias
             var seen = Set<String>()
             nodes = nodes.filter { seen.insert($0).inserted }
             failure = nil

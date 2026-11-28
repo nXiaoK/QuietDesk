@@ -16,6 +16,101 @@ func runRelayProtocolChecks() {
             try rejects("Invalid relay endpoint accepted") { _ = try RelayEndpoint(address: address) }
         }
     }
+    run("Relay node aliases normalize and endpoint digests use the salted wire format") {
+        let endpoint = try RelayEndpoint(address: "RELAY.example.com")
+        let names = [endpoint.address: "  上海\n\u{0007}  节点 "]
+        try check(RelayNodeNaming.shortTitle(for: endpoint, names: names) == "上海 节点", "Alias whitespace leaked into the UI")
+        try check(RelayNodeNaming.fullTitle(for: endpoint, names: names) == "上海 节点（relay.example.com:443）",
+                  "A custom title lost its address")
+        try check(RelayNodeNaming.fullTitle(for: endpoint, names: [:]) == endpoint.address, "Unnamed titles changed")
+        try check(RelayNodeNaming.sanitize("\n\u{001F}  ") == nil &&
+                  RelayNodeNaming.sanitize(String(repeating: "沪", count: 41))?.count == 40, "Alias length or blank handling changed")
+        let digest = RelayNodeNaming.endpointDigest(endpoint)
+        let equivalent = try RelayEndpoint(address: "tls://relay.example.com:443")
+        let other = try RelayEndpoint(address: "tls://relay.example.com:444")
+        try check(digest == "114b34a468535a3ed9366021eb7e5ba7" && RelayNodeNaming.isEndpointDigest(digest) &&
+                  !digest.contains(endpoint.host) && RelayNodeNaming.endpointDigest(equivalent) == digest &&
+                  RelayNodeNaming.endpointDigest(other) != digest, "Node fingerprints changed across equivalent endpoints or exposed the address")
+    }
+    run("Relay node inspection message metadata is optional, bounded and distinguishes false from missing") {
+        let key = Data(count: 32)
+        let request = RelayMessage(.info, accessKey: key)
+        let decodedRequest = try RelayMessage.decode(Data(try request.framed().dropFirst(4)))
+        try check(decodedRequest.op == .info && decodedRequest.deviceID == nil && decodedRequest.accessKey == key,
+                  "Node-only request required a target device")
+        let info = RelayMessage(.nodeInfo, serverVersion: "0.7.56", capabilities: ["tcp", "dualProbe"], deviceOnline: false)
+        let decodedInfo = try RelayMessage.decode(Data(try info.framed().dropFirst(4)))
+        try check(decodedInfo.op == .nodeInfo && decodedInfo.serverVersion == "0.7.56" &&
+                  decodedInfo.capabilities == ["tcp", "dualProbe"] && decodedInfo.deviceOnline == false, "Node metadata was lost")
+        let legacy = Data(try RelayMessage(.registered, registration: String(repeating: "a", count: 64)).framed().dropFirst(4))
+        let fields = try JSONSerialization.jsonObject(with: legacy) as! [String: Any]
+        try check(fields["serverVersion"] == nil && fields["capabilities"] == nil && fields["deviceOnline"] == nil,
+                  "Absent metadata was added to an old registration message")
+        try rejects("Authenticated query without an access key") { try RelayMessage(.info).validate() }
+        var invalidDeviceQuery = request
+        invalidDeviceQuery.deviceID = "not-a-uuid"
+        try rejects("Invalid device ID accepted") { try invalidDeviceQuery.validate() }
+        for invalid in [
+            RelayMessage(.nodeInfo, serverVersion: ""),
+            RelayMessage(.nodeInfo, serverVersion: String(repeating: "1", count: 65)),
+            RelayMessage(.nodeInfo, serverVersion: "1.0.0\n"),
+            RelayMessage(.nodeInfo, capabilities: Array(repeating: "tcp", count: 17)),
+            RelayMessage(.nodeInfo, capabilities: ["\u{001B}"])
+        ] {
+            try rejects("Unbounded or unsafe node metadata accepted") { try invalid.validate() }
+        }
+    }
+    run("Relay node version comparison preserves legacy and development build labels") {
+        let app = "0.7.56"
+        try check(RelayNodeVersionStatus.evaluate(serverVersion: app, currentAppVersion: app) == .upToDate(version: app) &&
+                  RelayNodeVersionStatus.evaluate(serverVersion: "0.7.57", currentAppVersion: app) == .upToDate(version: "0.7.57") &&
+                  RelayNodeVersionStatus.evaluate(serverVersion: "0.7.52", currentAppVersion: app) == .updatable(version: "0.7.52", currentAppVersion: app) &&
+                  RelayNodeVersionStatus.evaluate(serverVersion: nil, currentAppVersion: app) == .legacyUnversioned &&
+                  RelayNodeVersionStatus.evaluate(serverVersion: "0.7.56-dev", currentAppVersion: app).badgeText == "0.7.56-dev",
+                  "Node version assessment misclassified a release or development build")
+    }
+    run("Relay device presence distinguishes authenticated answers from stored node membership") {
+        let version: RelayNodeVersionStatus = .upToDate(version: "0.7.56")
+        try check(RelayPeerNodeMatch.evaluate(deviceOnline: true, isConfigured: false, versionStatus: version) == .onlineShared,
+                  "Live registration was hidden because it was missing from the saved digest list")
+        try check(RelayPeerNodeMatch.evaluate(deviceOnline: false, isConfigured: true, versionStatus: version) == .configuredOffline &&
+                  RelayPeerNodeMatch.evaluate(deviceOnline: false, isConfigured: false, versionStatus: version) == .notConfiguredOnHost,
+                  "An authenticated offline answer lost the saved membership distinction")
+        try check(RelayPeerNodeMatch.evaluate(deviceOnline: nil, isConfigured: true, versionStatus: version) == .configuredUnverified &&
+                  RelayPeerNodeMatch.evaluate(deviceOnline: nil, isConfigured: true, versionStatus: .legacyUnversioned) == .configuredLegacy &&
+                  RelayPeerNodeMatch.evaluate(deviceOnline: nil, isConfigured: false, versionStatus: .unknown) == .unknownLegacy &&
+                  RelayPeerNodeMatch.evaluate(deviceOnline: nil, isConfigured: true, versionStatus: version, failure: "timeout") == .unreachable("timeout"),
+                  "Stored membership implied presence without a live result")
+    }
+    run("Relay device and digest metadata preserves historical ConnectionRecord and Hello payloads") {
+        let encoder = JSONEncoder(), decoder = JSONDecoder()
+        let settings = StreamSettings(longestEdge: 1920, framesPerSecond: 30, megabits: 8)
+        let legacy = ConnectionRecord(address: "192.0.2.1", port: 9999, name: "Mac")
+        let legacyData = try encoder.encode(legacy)
+        let legacyFields = try JSONSerialization.jsonObject(with: legacyData) as! [String: Any]
+        try check(legacyFields["knownRelayDeviceID"] == nil && legacyFields["hostRelayNodeDigests"] == nil &&
+                  decoder.decode(ConnectionRecord.self, from: legacyData) == legacy, "Historical connection fields changed")
+        let endpoint = try RelayEndpoint(address: "relay.example.com")
+        let digest = RelayNodeNaming.endpointDigest(endpoint), deviceID = UUID(), alternateID = UUID()
+        var record = ConnectionRecord(address: legacy.address, port: legacy.port, name: legacy.name,
+                                      knownRelayDeviceID: deviceID, hostRelayNodeDigests: [digest])
+        try check(record.effectiveRelayDeviceID == deviceID && decoder.decode(ConnectionRecord.self, from: encoder.encode(record)) == record,
+                  "Learned relay identity did not round-trip")
+        record.relay = try RelayConnectionInfo(endpoint: endpoint, deviceID: alternateID)
+        try check(record.effectiveRelayDeviceID == alternateID, "Learned identity overrode the explicit relay target")
+        func hello(_ digests: [String]?) -> Hello {
+            Hello(name: "Mac", width: 1920, height: 1080, settings: settings, canControl: true, relayNodeDigests: digests)
+        }
+        let legacyHelloFields = try JSONSerialization.jsonObject(with: encoder.encode(hello(nil))) as! [String: Any]
+        try check(legacyHelloFields["relayNodeDigests"] == nil, "Default Hello sent an unknown field")
+        for digests in [[], [digest]] {
+            let decodedHello = try decoder.decode(Hello.self, from: encoder.encode(hello(digests)))
+            try decodedHello.validate()
+            try check(decodedHello.relayNodeDigests == digests, "Explicit digest list became absent")
+        }
+        try rejects("Unbounded host digest list accepted") { try hello(Array(repeating: digest, count: 33)).validate() }
+        try rejects("Plaintext relay host leaked into Hello") { try hello([endpoint.address]).validate() }
+    }
     run("Relay framed messages bind required fields and reject invalid or oversized routing material") {
         let original = RelayMessage(.incoming, circuitID: String(repeating: "a", count: 64))
         let framed = try original.framed()

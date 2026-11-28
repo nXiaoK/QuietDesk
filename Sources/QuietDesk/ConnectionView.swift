@@ -214,16 +214,29 @@ struct ConnectionView: View {
             viewerViewOnlyLocked: model.viewerViewOnlyLock,
             toggleViewerViewOnly: {
                 model.setViewerViewOnlyLock(!model.viewerViewOnlyLock)
+            },
+            relayNodeNames: model.relayNodeNames,
+            relayOptions: model.switchableRelayOptions(for:),
+            probeRelayOptions: model.probeRelayNodes(for:),
+            connectViaRelayNode: { record, node in
+                performAttempt { models.connectSavedRecord(record, viaRelayNode: node) != nil }?.message
             }
         )
         .sheet(isPresented: $showRelaySettings) {
-            RelaySettingsView(enabled: model.relayEnabled, nodes: model.relayNodes, deviceID: model.relayDeviceID,
-                              locked: model.relaySettingsLocked, measurements: model.relayNodeMeasurements,
-                              loadTrust: model.relayCertificate, saveNode: model.saveRelayNode, save: model.saveRelayConfiguration)
+            RelaySettingsView(
+                enabled: model.relayEnabled, nodes: model.relayNodes, deviceID: model.relayDeviceID,
+                locked: model.relaySettingsLocked, nodeNames: model.relayNodeNames,
+                measurements: model.relayNodeMeasurements, nodeInfos: model.relayNodeInfos,
+                probing: model.relayProbing, measure: { model.measureRelayNodes() },
+                loadTrust: model.relayCertificate,
+                saveNode: model.saveRelayNode(address:name:accessCode:certificate:),
+                save: model.saveRelayConfiguration(enabled:nodes:nodeNames:deviceID:)
+            )
         }
         .sheet(item: $wakeConfigurationRecord) { record in
             WakeOnLANConfigurationSheet(
                 record: record,
+                relayNodeNames: model.relayNodeNames,
                 save: { configuration in
                     try model.saveWakeOnLAN(configuration, for: record.id)
                 },
@@ -287,6 +300,7 @@ struct ConnectionView: View {
 private struct WakeOnLANConfigurationSheet: View {
     private enum Field: Hashable { case mac, broadcast, port }
     let record: ConnectionRecord
+    let relayNodeNames: [String: String]
     let save: (WakeOnLANConfiguration?) throws -> Void
     let sendWakeNow: (WakeOnLANConfiguration) throws -> Void
     @Environment(\.dismiss) private var dismiss
@@ -299,10 +313,12 @@ private struct WakeOnLANConfigurationSheet: View {
 
     init(
         record: ConnectionRecord,
+        relayNodeNames: [String: String],
         save: @escaping (WakeOnLANConfiguration?) throws -> Void,
         sendWakeNow: @escaping (WakeOnLANConfiguration) throws -> Void
     ) {
         self.record = record
+        self.relayNodeNames = relayNodeNames
         self.save = save
         self.sendWakeNow = sendWakeNow
         _macAddress = State(initialValue: record.wakeOnLAN?.macAddress.formatted ?? "")
@@ -316,7 +332,7 @@ private struct WakeOnLANConfigurationSheet: View {
                 Text("配置网络唤醒")
                     .font(.system(size: 20, weight: .bold))
                     .accessibilityAddTraits(.isHeader)
-                Text("目标设备 \(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record))")
+                Text("目标设备 \(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record, relayNodeNames: relayNodeNames))")
                     .font(.system(size: 13))
                     .foregroundStyle(DeskPalette.secondary)
             }

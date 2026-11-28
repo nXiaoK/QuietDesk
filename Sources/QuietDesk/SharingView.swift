@@ -113,10 +113,14 @@ struct SharingView: View {
                 nodes: model.relayNodes,
                 deviceID: model.relayDeviceID,
                 locked: model.relaySettingsLocked,
+                nodeNames: model.relayNodeNames,
                 measurements: model.relayNodeMeasurements,
+                nodeInfos: model.relayNodeInfos,
+                probing: model.relayProbing,
+                measure: { model.measureRelayNodes() },
                 loadTrust: model.relayCertificate,
-                saveNode: model.saveRelayNode,
-                save: model.saveRelayConfiguration
+                saveNode: model.saveRelayNode(address:name:accessCode:certificate:),
+                save: model.saveRelayConfiguration(enabled:nodes:nodeNames:deviceID:)
             )
         }
         .sheet(isPresented: $showRestoreCodeSheet) {
@@ -804,6 +808,19 @@ struct SharingView: View {
                 .buttonStyle(DeskButtonStyle(.secondary))
             }
             if model.relayEnabled {
+                let registered = model.registeredRelayNodeAddresses
+                ForEach(registered, id: \.self) { node in
+                    Divider()
+                    DeskSettingsRow(title: model.relayNodeDisplayName(node), detail: node) {
+                        let info = model.relayNodeInfos[node]
+                        RelayNodeStatusBadge(status: info?.versionStatus ?? .unknown, capabilities: info?.capabilities ?? [])
+                    }
+                }
+                if registered.contains(where: needsRelayUpgrade) {
+                    Text("部分已登记节点未提供双端口打洞能力，可升级中继镜像或程序。")
+                        .font(.caption)
+                        .foregroundStyle(DeskPalette.secondary)
+                }
                 if !model.relayDeviceID.isEmpty {
                     Divider()
                     DeskSettingsRow(title: "本机设备标识") {
@@ -816,6 +833,14 @@ struct SharingView: View {
                 Divider()
                 RelayPeerAssistPicker(model: model).padding(.vertical, 10)
             }
+        }
+    }
+
+    private func needsRelayUpgrade(_ node: String) -> Bool {
+        guard let info = model.relayNodeInfos[node], !info.capabilities.contains("dualProbe") else { return false }
+        switch info.versionStatus {
+        case .legacyUnversioned, .updatable: return true
+        case .unknown, .upToDate: return false
         }
     }
 

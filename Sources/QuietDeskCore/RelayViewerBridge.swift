@@ -8,6 +8,7 @@ public final class RelayViewerBridge: @unchecked Sendable {
     public var onDatagramFailure: ((Error) -> Void)?
     /// Outer path of the current assisted video lease; reported on the bridge queue.
     public var onPeerPath: ((RelayPeerPathState) -> Void)?
+    public var onServerInfo: ((String?, [String]) -> Void)?
     public let peerTraffic = RelayPeerTrafficCounter()
     public let endpoint: RelayEndpoint
     public let deviceID: UUID
@@ -195,6 +196,7 @@ public final class RelayViewerBridge: @unchecked Sendable {
                         guard message.op == .datagramReady, let id = message.datagramID, let key = message.datagramKey, message.udpPort != nil else {
                             throw RelayServiceError.invalid
                         }
+                        self.onServerInfo?(message.serverVersion, message.capabilities ?? [])
                         // A node's listener port may be private behind NAT. Only the user-configured
                         // public service endpoint determines where routing datagrams are sent.
                         let pipe: RelayDatagramPipe

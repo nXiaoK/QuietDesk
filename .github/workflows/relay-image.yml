@@ -2,6 +2,11 @@ name: Publish relay image
 
 on:
   workflow_call:
+    inputs:
+      version:
+        description: Version allocated for this QuietDesk release
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -41,11 +46,12 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+          build-args: RELAY_VERSION=${{ inputs.version }}
           labels: |
             org.opencontainers.image.title=QuietDesk relay
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=sha-${{ github.sha }}
+            org.opencontainers.image.version=${{ inputs.version }}
           cache-from: type=gha,scope=quietdesk-relay
           cache-to: type=gha,mode=max,scope=quietdesk-relay
       - name: Wait before second image build attempt

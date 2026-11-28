@@ -35,6 +35,7 @@ final class RelayHostDatagramBindings {
 
 public final class RelayHostRegistration: @unchecked Sendable {
     public var onStatus: ((RelayRegistrationStatus) -> Void)?
+    public var onServerInfo: ((String?, [String]) -> Void)?
     /// Outer path of the most recently authenticated assisted video route; reported on the registration queue.
     public var onPeerPath: ((RelayPeerPathState) -> Void)?
     public let peerTraffic = RelayPeerTrafficCounter()
@@ -143,7 +144,9 @@ public final class RelayHostRegistration: @unchecked Sendable {
                         guard message.op == .registered, let registration = message.registration else {
                             self.disconnected(message.error ?? .invalid, channel: connection); return
                         }
-                        self.registration = registration; self.onStatus?(.online)
+                        self.registration = registration
+                        self.onServerInfo?(message.serverVersion, message.capabilities ?? [])
+                        self.onStatus?(.online)
                         let timer = DispatchSource.makeTimerSource(queue: self.queue)
                         timer.schedule(deadline: .now() + 15, repeating: 15)
                         timer.setEventHandler { [weak connection] in connection?.send(RelayMessage(.ping)) }

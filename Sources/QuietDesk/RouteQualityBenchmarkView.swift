@@ -21,6 +21,7 @@ struct RouteQualityBenchmarkView: View {
     var availableRecords: [ConnectionRecord] = []
     var selectedTargetRecord: ConnectionRecord? = nil
     var onSelectTargetRecord: ((ConnectionRecord?) -> Void)? = nil
+    var relayNodeNames: [String: String] = [:]
 
     @Namespace private var assessmentAnchor
     @Namespace private var runsAnchor
@@ -254,7 +255,7 @@ struct RouteQualityBenchmarkView: View {
                     }
                     Divider()
                     ForEach(availableRecords) { record in
-                        Button("\(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record))") {
+                        Button("\(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record, relayNodeNames: relayNodeNames))") {
                             onSelectTargetRecord(record)
                         }
                     }
@@ -453,7 +454,7 @@ struct RouteQualityBenchmarkView: View {
             }
 
             if let best = assessment.recommendedRoute {
-                Text("长期最优线路：\(best.candidate.title) — \(assessment.recommendationReason)")
+                Text("长期最优线路：\(routeTitle(best.candidate)) — \(assessment.recommendationReason)")
                     .font(.caption)
                     .foregroundStyle(DeskPalette.secondary)
                     .lineLimit(2)
@@ -514,7 +515,7 @@ struct RouteQualityBenchmarkView: View {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 ProgressView()
                     .controlSize(.small)
-                Text(activeItem.map { "正在测试：\($0.candidate.title)" } ?? "正在准备下一条线路…")
+                Text(activeItem.map { "正在测试：\(routeTitle($0.candidate))" } ?? "正在准备下一条线路…")
                     .font(.headline)
                 Spacer()
                 if let activeItem, case let .measuring(elapsed, duration) = activeItem.status {
@@ -569,7 +570,7 @@ struct RouteQualityBenchmarkView: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
-                        Text("本次推荐线路：\(winner.candidate.title)")
+                        Text("本次推荐线路：\(routeTitle(winner.candidate))")
                             .font(.headline)
                         if let eval = winner.evaluation {
                             scoreBadge(eval)
@@ -627,7 +628,7 @@ struct RouteQualityBenchmarkView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(runner.isRunning)
-                .accessibilityLabel(item.isSelected ? "取消勾选 \(item.candidate.title)" : "勾选 \(item.candidate.title)")
+                .accessibilityLabel(item.isSelected ? "取消勾选 \(routeTitle(item.candidate))" : "勾选 \(routeTitle(item.candidate))")
                 .accessibilityAddTraits(item.isSelected ? .isSelected : [])
 
                 ViewThatFits(in: .horizontal) {
@@ -686,14 +687,26 @@ struct RouteQualityBenchmarkView: View {
 
     private func candidateTitle(_ candidate: RouteBenchmarkCandidate, isWinner: Bool = false) -> some View {
         HStack(spacing: 6) {
-            Text(candidate.kind.usesRelay ? candidate.kind.modeTitle : candidate.title)
+            Text(candidateRowTitle(candidate))
                 .font(.system(size: 12, weight: .semibold))
                 .lineLimit(1)
-                .help(candidate.title)
+                .help(routeTitle(candidate))
             if isWinner {
                 capsuleTag(text: "本次最佳", color: DeskPalette.emerald)
             }
         }
+    }
+
+    private func routeTitle(_ candidate: RouteBenchmarkCandidate) -> String {
+        candidate.displayTitle(relayNodeNames: relayNodeNames)
+    }
+
+    private func candidateRowTitle(_ candidate: RouteBenchmarkCandidate) -> String {
+        if candidate.kind.usesRelay, let endpoint = candidate.relayEndpoint,
+           RelayNodeNaming.sanitize(relayNodeNames[endpoint.address]) == nil {
+            return candidate.kind.modeTitle
+        }
+        return routeTitle(candidate)
     }
 
     private func candidateAddress(_ candidate: RouteBenchmarkCandidate) -> some View {
@@ -906,11 +919,11 @@ struct RouteQualityBenchmarkView: View {
 
     private func recommendedHistoryRoute(_ best: RouteBenchmarkHistoricalRouteSummary) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text("长期推荐 · \(best.candidate.kind.usesRelay ? best.candidate.kind.modeTitle : best.candidate.title)")
+            Text("长期推荐 · \(candidateRowTitle(best.candidate))")
                 .font(.system(size: 13, weight: .semibold))
             candidateAddress(best.candidate)
         }
-        .help("\(best.candidate.title)，\(best.overallScore) 分 · \(best.overallGrade.title)")
+        .help("\(routeTitle(best.candidate))，\(best.overallScore) 分 · \(best.overallGrade.title)")
     }
 
     private func connectHistoricalRoute(_ best: RouteBenchmarkHistoricalRouteSummary, targetRecordID: UUID?) -> some View {
@@ -1027,7 +1040,7 @@ struct RouteQualityBenchmarkView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(summary.candidate.title)
+                .accessibilityLabel(routeTitle(summary.candidate))
                 .accessibilityHint(expanded ? "收起线路评估详情" : "展开线路评估详情")
                 .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -1038,7 +1051,7 @@ struct RouteQualityBenchmarkView: View {
                             connectWith(summary.candidate, preferredTargetRecordID: targetRecordID)
                         }
                         .buttonStyle(DeskButtonStyle(.quiet, compact: true))
-                        .accessibilityLabel("使用 \(summary.candidate.title) 连接")
+                        .accessibilityLabel("使用 \(routeTitle(summary.candidate)) 连接")
                     }
                 }
                 .frame(width: 45, alignment: .leading)
@@ -1216,7 +1229,7 @@ struct RouteQualityBenchmarkView: View {
 
                         if let best = run.bestEntry, let eval = best.evaluation {
                             HStack(spacing: 6) {
-                                Text("最佳：\(best.candidate.title)")
+                                Text("最佳：\(routeTitle(best.candidate))")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                                     .lineLimit(1)
@@ -1306,7 +1319,7 @@ struct RouteQualityBenchmarkView: View {
                             connectWith(entry.candidate, preferredTargetRecordID: targetRecordID)
                         }
                         .buttonStyle(DeskButtonStyle(.quiet, compact: true))
-                        .accessibilityLabel("使用 \(entry.candidate.title) 连接")
+                        .accessibilityLabel("使用 \(routeTitle(entry.candidate)) 连接")
                     }
                 }
                 .frame(width: 45, alignment: .leading)

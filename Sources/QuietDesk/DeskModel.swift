@@ -20,6 +20,14 @@ final class DeskModel: ObservableObject, Identifiable {
     /// Relay nodes this Mac registers on while sharing and may connect through. The first is also kept
     /// under the single-node key, so an older version still finds a node.
     @Published private(set) var relayNodes = DeskModel.loadRelayNodes()
+    @Published private(set) var relayNodeNames = DeskModel.loadRelayNodeNames()
+    typealias RelayNodeInformation = (versionStatus: RelayNodeVersionStatus, serverVersion: String?, capabilities: Set<String>)
+    @Published private(set) var relayNodeInfos: [String: RelayNodeInformation] = [:]
+    @Published private(set) var targetRelayOnlineByNode: [UUID: [String: Bool?]] = [:]
+    private var targetRelayInspectionErrors: [UUID: [String: String]] = [:]
+    private var targetRelayMeasuredAt: [UUID: TimeInterval] = [:]
+    private var relayProbeRequests = Set<UUID?>()
+    private var relayConfigurationRevision = UUID()
     var relayAddress: String { relayNodes.first ?? "" }
     /// The viewer's node choice: empty picks the node with the best measured connection.
     @Published var relayNodeChoice = UserDefaults.standard.string(forKey: "relayNodeChoice") ?? "" {
@@ -569,6 +577,10 @@ final class DeskModel: ObservableObject, Identifiable {
         /// Every node this connection may use, best first; `relay` is the one in use.
         var relayRoutes: [RelayRoute] = []
         var relayRoutesOrdered = false
+        /// Explicit switching changes the transport for this session without creating another device card.
+        var reuseSavedRecord = false
+        var expectedSavedHostID: UUID?
+        var relayNodePriority: [RelayEndpoint: Int] = [:]
 
         func using(_ route: RelayRoute) -> Target {
             var next = self
@@ -1353,9 +1365,44 @@ final class DeskModel: ObservableObject, Identifiable {
         return stored.compactMap { try? RelayEndpoint(address: $0).address }.filter { seen.insert($0).inserted }
     }
 
+    static func loadRelayNodeNames() -> [String: String] {
+        normalizedRelayNodeNames(UserDefaults.standard.dictionary(forKey: "relayNodeNames") as? [String: String] ?? [:],
+                                 addresses: Set(loadRelayNodes()))
+    }
+
+    private static func normalizedRelayNodeNames(_ names: [String: String], addresses: Set<String>) -> [String: String] {
+        var normalized: [String: String] = [:]
+        for rawAddress in names.keys.sorted() {
+            guard let endpoint = try? RelayEndpoint(address: rawAddress), addresses.contains(endpoint.address),
+                  let name = RelayNodeNaming.sanitize(names[rawAddress]) else { continue }
+            if normalized[endpoint.address] == nil || rawAddress == endpoint.address { normalized[endpoint.address] = name }
+        }
+        return normalized
+    }
+
+    func relayNodeDisplayName(_ addressOrEndpoint: String) -> String {
+        guard let endpoint = try? RelayEndpoint(address: addressOrEndpoint) else { return addressOrEndpoint }
+        return RelayNodeNaming.shortTitle(for: endpoint, names: relayNodeNames)
+    }
+
     /// Validates one node and stores its access code and trusted certificate, keyed by its address.
     /// Returns the normalized address; the node list itself is saved with `saveRelayConfiguration`.
     func saveRelayNode(address: String, accessCode: String, certificate: RelayNodeCertificate?) throws -> String {
+        try saveRelayNodeCredentials(address: address, accessCode: accessCode, certificate: certificate)
+    }
+
+    func saveRelayNode(address: String, name: String?, accessCode: String, certificate: RelayNodeCertificate?) throws -> String {
+        let normalized = try saveRelayNodeCredentials(address: address, accessCode: accessCode, certificate: certificate)
+        if relayNodes.contains(normalized) {
+            var names = relayNodeNames
+            names[normalized] = RelayNodeNaming.sanitize(name)
+            UserDefaults.standard.set(names, forKey: "relayNodeNames")
+            for model in services.allModels { model.relayNodeNames = names }
+        }
+        return normalized
+    }
+
+    private func saveRelayNodeCredentials(address: String, accessCode: String, certificate: RelayNodeCertificate?) throws -> String {
         guard !relaySettingsLocked else { throw DeskError.invalid("请先停止共享并断开连接，再修改中继设置") }
         let endpoint = try RelayEndpoint(address: address)
         let supplied = accessCode.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1370,6 +1417,10 @@ final class DeskModel: ObservableObject, Identifiable {
     }
 
     func saveRelayConfiguration(enabled: Bool, nodes: [String], deviceID: String) throws {
+        try saveRelayConfiguration(enabled: enabled, nodes: nodes, nodeNames: relayNodeNames, deviceID: deviceID)
+    }
+
+    func saveRelayConfiguration(enabled: Bool, nodes: [String], nodeNames: [String: String], deviceID: String) throws {
         guard !relaySettingsLocked else { throw DeskError.invalid("请先停止共享并断开连接，再修改中继设置") }
         let localID = deviceID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard localID.isEmpty || UUID(uuidString: localID) != nil else { throw DeskError.invalid("本机中继设备标识无效，请恢复配置或更换设备标识") }
@@ -1383,6 +1434,7 @@ final class DeskModel: ObservableObject, Identifiable {
             guard UUID(uuidString: localID) != nil else { throw DeskError.invalid("请先生成本机设备标识") }
         }
         let defaults = UserDefaults.standard
+        defaults.set(Self.normalizedRelayNodeNames(nodeNames, addresses: Set(endpoints.map(\.address))), forKey: "relayNodeNames")
         defaults.set(endpoints.map(\.address), forKey: "relayNodes")
         defaults.set(endpoints.first?.address ?? "", forKey: "relayAddress")
         defaults.set(localID, forKey: "relayDeviceID")
@@ -1400,31 +1452,167 @@ final class DeskModel: ObservableObject, Identifiable {
         let defaults = UserDefaults.standard
         relayEnabled = defaults.bool(forKey: "relayEnabled")
         relayNodes = Self.loadRelayNodes()
+        relayNodeNames = Self.loadRelayNodeNames()
+        relayConfigurationRevision = UUID()
+        relayProbeRequests.removeAll()
+        relayProbing = false
+        relayMeasuredAt = nil
+        targetRelayOnlineByNode.removeAll()
+        targetRelayInspectionErrors.removeAll()
+        targetRelayMeasuredAt.removeAll()
         relayDeviceID = defaults.string(forKey: "relayDeviceID") ?? ""
         relayStrategy = RelayConnectionStrategy(rawValue: defaults.string(forKey: "relayStrategy") ?? "") ?? .direct
         relayNodeChoice = defaults.string(forKey: "relayNodeChoice") ?? ""
         relayNodeMeasurements = relayNodeMeasurements.filter { relayNodes.contains($0.key) }
+        relayNodeInfos = relayNodeInfos.filter { relayNodes.contains($0.key) }
         relayHostStatus = relayEnabled ? "下次开启共享时连接中继" : "中继已关闭"
     }
 
     func measureRelayNodesIfStale() {
-        guard relayEnabled, relayNodes.count > 1 else { return }
-        if let relayMeasuredAt, SessionClock.now - relayMeasuredAt < 60 { return }
+        guard relayEnabled, !relayNodes.isEmpty else { return }
+        if let relayMeasuredAt, SessionClock.now - relayMeasuredAt < 60,
+           relayNodes.allSatisfy({ relayNodeInfos[$0] != nil }) { return }
         measureRelayNodes()
     }
 
-    /// Measures every configured node; the results order relayed connections and label the node picker.
-    func measureRelayNodes() {
-        guard !relayProbing else { return }
+    func probeRelayNodes(for record: ConnectionRecord) {
+        guard relayEnabled, let identity = resolvedRelayIdentity(for: record) else { return }
+        if hasFreshRelayPresence(for: identity.deviceID) { return }
+        measureRelayNodes(targetDeviceID: identity.deviceID)
+    }
+
+    func resolvedRelayIdentity(for record: ConnectionRecord) -> (deviceID: UUID, hostDigests: Set<String>, credentialRecordID: UUID)? {
+        let related = portMappingMachineGroups().first { $0.contains(recordID: record.id) }?.routes ?? []
+        let relatedIDs = Set(related.compactMap(\.effectiveRelayDeviceID))
+        guard let deviceID = record.effectiveRelayDeviceID ?? (relatedIDs.count == 1 ? relatedIDs.first : nil),
+              let credential = try? savedPairingCredential(for: record, related: related) else { return nil }
+        let hostDigests = record.hostRelayNodeDigests
+            ?? related.first { $0.effectiveRelayDeviceID == deviceID && $0.hostRelayNodeDigests != nil }?.hostRelayNodeDigests
+        return (deviceID, Set(hostDigests ?? []), credential.recordID)
+    }
+
+    private func savedPairingCredential(for record: ConnectionRecord, related: [ConnectionRecord]) throws
+        -> (recordID: UUID, key: PairingKey)? {
+        if let key = try KeyStore.load(account: "remote." + record.id.uuidString) { return (record.id, key) }
+        guard let host = record.deviceID else { return nil }
+        var credential: (recordID: UUID, key: PairingKey)?
+        for route in related where route.id != record.id && route.deviceID == host {
+            guard let key = try KeyStore.load(account: "remote." + route.id.uuidString) else { continue }
+            if let credential, credential.key.data != key.data { return nil }
+            if credential == nil { credential = (route.id, key) }
+        }
+        return credential
+    }
+
+    private func hasFreshRelayPresence(for deviceID: UUID) -> Bool {
+        guard let measured = targetRelayMeasuredAt[deviceID] else { return false }
+        return SessionClock.now - measured < 60
+    }
+
+    private func relayPeerMatch(at endpoint: RelayEndpoint, deviceID: UUID, hostDigests: Set<String>) -> RelayPeerNodeMatch {
+        let node = endpoint.address
+        let fresh = hasFreshRelayPresence(for: deviceID)
+        let online = targetRelayOnlineByNode[deviceID] ?? [:]
+        return RelayPeerNodeMatch.evaluate(
+            deviceOnline: fresh ? online[node].flatMap { $0 } : nil,
+            isConfigured: hostDigests.contains(RelayNodeNaming.endpointDigest(endpoint)),
+            versionStatus: relayNodeInfos[node]?.versionStatus ?? .unknown,
+            failure: fresh ? targetRelayInspectionErrors[deviceID]?[node] : nil
+        )
+    }
+
+    func switchableRelayOptions(for record: ConnectionRecord) -> [RelaySwitchableNodeOption] {
+        guard relayEnabled, let identity = resolvedRelayIdentity(for: record) else { return [] }
+        return relayNodes.compactMap { address in
+            guard let endpoint = try? RelayEndpoint(address: address) else { return nil }
+            let info = relayNodeInfos[endpoint.address]
+            return RelaySwitchableNodeOption(
+                endpoint: endpoint, customName: relayNodeNames[endpoint.address],
+                latencyLabel: relayNodeMeasurements[endpoint.address]?.milliseconds.map { String(format: "%.0f ms", $0) },
+                versionStatus: info?.versionStatus ?? .unknown, capabilities: info?.capabilities ?? [],
+                peerMatch: relayPeerMatch(at: endpoint, deviceID: identity.deviceID, hostDigests: identity.hostDigests)
+            )
+        }
+    }
+
+    /// Measures TCP latency in parallel with authenticated version and presence queries.
+    func measureRelayNodes(targetDeviceID: UUID? = nil) {
+        guard !relayProbeRequests.contains(targetDeviceID) else { return }
         let endpoints = relayNodes.compactMap { try? RelayEndpoint(address: $0) }
         guard !endpoints.isEmpty else { return }
-        relayProbing = true
-        Task { [weak self] in
-            let results = await Self.probe(endpoints, attempts: 3, timeout: 2)
-            guard let self else { return }
-            self.relayProbing = false
-            self.record(results)
+        let inputs: [(RelayEndpoint, Result<(Data, RelayNodeCertificate?), Error>)] = endpoints.map { endpoint in
+            (endpoint, Result {
+                guard let key = try KeyStore.load(account: endpoint.credentialAccount) else {
+                    throw DeskError.invalid("本机缺少此节点的中继接入码")
+                }
+                return (key.data, try relayCertificate(for: endpoint))
+            })
         }
+        relayProbeRequests.insert(targetDeviceID)
+        relayProbing = true
+        let revision = relayConfigurationRevision
+        let appVersion = Self.relayClientVersion
+        Task { [weak self] in
+            async let latencies = Self.probe(endpoints, attempts: targetDeviceID == nil ? 3 : 1, timeout: 2)
+            let inspections = await withTaskGroup(of: (RelayEndpoint, Result<RelayInspection, Error>).self) { group in
+                for (endpoint, credentials) in inputs {
+                    group.addTask {
+                        switch credentials {
+                        case .failure(let error): return (endpoint, .failure(error))
+                        case .success(let (key, certificate)):
+                            return (endpoint, await RelayNodeInspector.inspect(endpoint: endpoint, accessKey: key,
+                                trustedCertificate: certificate, targetDeviceID: targetDeviceID, currentAppVersion: appVersion))
+                        }
+                    }
+                }
+                var output: [(RelayEndpoint, Result<RelayInspection, Error>)] = []
+                for await result in group { output.append(result) }
+                return output
+            }
+            let results = await latencies
+            guard let self, self.relayConfigurationRevision == revision else { return }
+            self.relayProbeRequests.remove(targetDeviceID)
+            self.relayProbing = !self.relayProbeRequests.isEmpty
+            self.record(results)
+            var online: [String: Bool?] = [:]
+            var errors: [String: String] = [:]
+            for (endpoint, result) in inspections {
+                switch result {
+                case .success(let info):
+                    self.publishRelayNodeInfo(endpoint, version: info.serverVersion, capabilities: info.capabilities)
+                    online[endpoint.address] = .some(info.deviceOnline)
+                case .failure(let error): errors[endpoint.address] = error.localizedDescription
+                }
+            }
+            if let targetDeviceID {
+                self.recordRelayPresence(for: targetDeviceID, online: online, errors: errors)
+            }
+        }
+    }
+
+    private typealias RelayInspection = (versionStatus: RelayNodeVersionStatus, serverVersion: String?,
+                                         capabilities: Set<String>, deviceOnline: Bool?)
+    private static var relayClientVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+    }
+
+    private func publishRelayNodeInfo(_ endpoint: RelayEndpoint, version: String?, capabilities: Set<String>) {
+        let status = RelayNodeVersionStatus.evaluate(serverVersion: version, currentAppVersion: Self.relayClientVersion)
+        for model in services.allModels where model.relayNodes.contains(endpoint.address) {
+            model.relayNodeInfos[endpoint.address] = (status, version, capabilities)
+        }
+    }
+
+    private func recordRelayPresence(for device: UUID, online: [String: Bool?], errors: [String: String]) {
+        if targetRelayMeasuredAt[device] == nil, targetRelayMeasuredAt.count >= 32,
+           let oldest = targetRelayMeasuredAt.min(by: { $0.value < $1.value })?.key {
+            targetRelayMeasuredAt[oldest] = nil
+            targetRelayOnlineByNode[oldest] = nil
+            targetRelayInspectionErrors[oldest] = nil
+        }
+        targetRelayMeasuredAt[device] = SessionClock.now
+        targetRelayInspectionErrors[device] = errors
+        targetRelayOnlineByNode[device] = online
     }
 
     private func record(_ results: [RelayEndpoint: RelayNodeProbe.Measurement]) {
@@ -1469,6 +1657,13 @@ final class DeskModel: ObservableObject, Identifiable {
                         self.setPeerPath(state, role: .host)
                     }
                 }
+                registration.onServerInfo = { [weak self, weak registration] version, capabilities in
+                    DispatchQueue.main.async {
+                        guard let self, let registration,
+                              self.relayHostRegistrations.contains(where: { $0 === registration }) else { return }
+                        self.publishRelayNodeInfo(endpoint, version: version, capabilities: Set(capabilities))
+                    }
+                }
                 registration.onStatus = { [weak self, weak registration] state in
                     DispatchQueue.main.async {
                         guard let self, let registration, self.hostingRequested || self.mappingHosting,
@@ -1483,7 +1678,7 @@ final class DeskModel: ObservableObject, Identifiable {
                     }
                 }
                 relayRegistrationStates[endpoint] = .connecting
-            } catch { failures.append("\(address)：\(error.localizedDescription)") }
+            } catch { failures.append("\(relayNodeDisplayName(address))：\(error.localizedDescription)") }
         }
         guard !relayHostRegistrations.isEmpty else {
             relayHostStatus = "中继未启动：" + (failures.first ?? "没有可用的中继节点")
@@ -1493,12 +1688,19 @@ final class DeskModel: ObservableObject, Identifiable {
         relayHostRegistrations.forEach { $0.start() }
     }
 
+    var registeredRelayNodeAddresses: [String] {
+        relayHostRegistrations.compactMap { registration in
+            guard case .online = relayRegistrationStates[registration.endpoint] else { return nil }
+            return registration.endpoint.address
+        }
+    }
+
     private func publishRelayHostStatus() {
         let states = relayHostRegistrations.map { ($0.endpoint, relayRegistrationStates[$0.endpoint] ?? .connecting) }
         if states.count == 1, let (endpoint, state) = states.first {
             switch state {
             case .connecting: relayHostStatus = "正在连接中继服务…"
-            case .online: relayHostStatus = "已在中继登记 · \(endpoint.host)"
+            case .online: relayHostStatus = "已在中继登记 · \(relayNodeDisplayName(endpoint.address))"
             case .failed(let error): relayHostStatus = "中继不可用：\(error.localizedDescription)"
             }
             return
@@ -1507,8 +1709,8 @@ final class DeskModel: ObservableObject, Identifiable {
         for (endpoint, state) in states {
             switch state {
             case .connecting: connecting += 1
-            case .online: online.append(endpoint.host)
-            case .failed(let error): failed.append("\(endpoint.host) 不可用：\(error.localizedDescription)")
+            case .online: online.append(relayNodeDisplayName(endpoint.address))
+            case .failed(let error): failed.append("\(relayNodeDisplayName(endpoint.address)) 不可用：\(error.localizedDescription)")
             }
         }
         var parts = ["已在 \(online.count)/\(states.count) 个中继登记" + (online.isEmpty ? "" : " · " + online.joined(separator: "、"))]
@@ -2017,7 +2219,8 @@ final class DeskModel: ObservableObject, Identifiable {
                             deviceIdentityExchange: host.deviceIdentityAdvertised ? true : nil,
                             highRefreshVideoSettings: true, preferredHighRefreshSettings: preferredSettings.highRefreshCompatible,
                             sessionEffects: true, sessionPause: true, mediaTransportV1: true, independentCursorV1: true,
-                            relayTransportV1: true, relayDeviceID: relayRegistrations.first?.deviceID, sessionLockV1: true,
+                            relayTransportV1: true, relayDeviceID: self.relayEnabled ? UUID(uuidString: self.relayDeviceID) : nil,
+                            sessionLockV1: true,
                             adaptiveVideoV1: true, sessionUnlockV1: true, screenLocked: ScreenLockState.isLockedOnConsole,
                             higherFrameRateVideoV1: true, preferredHigherFrameRateSettings: preferredSettings,
                             displayDimmingV1: true, builtInDisplayDimmable: host.effects?.canDimBuiltInDisplay == true,
@@ -2036,7 +2239,10 @@ final class DeskModel: ObservableObject, Identifiable {
                             typeTextV1: true,
                             automaticDefaultQualityV1: ownerChoseQuality ? nil : true,
                             videoViewportV1: true,
-                            hostUpdateRestartV1: true)))
+                            hostUpdateRestartV1: true,
+                            relayNodeDigests: self.relayEnabled ? Array(self.relayNodes
+                                .compactMap { try? RelayEndpoint(address: $0) }
+                                .prefix(RelayNodeNaming.maximumNodeDigests).map(RelayNodeNaming.endpointDigest)) : nil)))
                         host.connectionID = UUID()
                         self.objectWillChange.send()
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
@@ -2407,7 +2613,7 @@ final class DeskModel: ObservableObject, Identifiable {
                 return "\(target.address):\(target.port)"
             }
             if let relay = target.relay {
-                return "中继 \(relay.endpoint.host) · \(relay.deviceID.uuidString.prefix(8).lowercased())…"
+                return "中继 \(relayNodeDisplayName(relay.endpoint.address)) · \(relay.deviceID.uuidString.prefix(8).lowercased())…"
             }
         }
         if let launch = lastSessionLaunch {
@@ -2415,7 +2621,7 @@ final class DeskModel: ObservableObject, Identifiable {
                 return "\(launch.target.address):\(launch.target.port)"
             }
             if let relay = launch.target.relay {
-                return "中继 \(relay.endpoint.host) · \(relay.deviceID.uuidString.prefix(8).lowercased())…"
+                return "中继 \(relayNodeDisplayName(relay.endpoint.address)) · \(relay.deviceID.uuidString.prefix(8).lowercased())…"
             }
         }
         let cleanAddress = address.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2622,13 +2828,12 @@ final class DeskModel: ObservableObject, Identifiable {
     private func mappingRelayCandidate(_ relay: RelayConnectionInfo, key: PairingKey,
                                        session: Target?) throws -> PortMappingManager.RouteCandidate? {
         let endpoint = relay.endpoint
-        let host = endpoint.host.contains(":") ? "[\(endpoint.host)]" : endpoint.host
         let active = session?.relay?.endpoint == endpoint ? session : nil
         guard let access = try active?.relayAccessKey ?? KeyStore.load(account: endpoint.credentialAccount)?.data else {
             return nil
         }
         var openedBridge: RelayViewerBridge?
-        return .init(label: "中继 · \(host):\(endpoint.port)", viewerNetworkFailure: { message in
+        return .init(label: "中继 · \(relayNodeDisplayName(endpoint.address))", viewerNetworkFailure: { message in
             // A loopback socket can report its closure before the bridge's upstream error reaches the main actor.
             guard let bridge = openedBridge, bridge.failedBeforeDesktopStream, let failure = bridge.lastFailure else {
                 return .network(message)
@@ -2986,6 +3191,13 @@ final class DeskModel: ObservableObject, Identifiable {
                 guard let self, let viewer, let bridge, self.viewerSession === viewer,
                       viewer.relayBridge === bridge || viewer.mediaRelayBridge === bridge else { return }
                 self.setPeerPath(state, role: .viewer)
+            }
+        }
+        bridge.onServerInfo = { [weak self, weak viewer, weak bridge] version, capabilities in
+            DispatchQueue.main.async {
+                guard let self, let viewer, let bridge, self.viewerSession === viewer,
+                      viewer.relayBridge === bridge || viewer.mediaRelayBridge === bridge else { return }
+                self.publishRelayNodeInfo(bridge.endpoint, version: version, capabilities: Set(capabilities))
             }
         }
     }
@@ -3381,7 +3593,7 @@ final class DeskModel: ObservableObject, Identifiable {
             guard let self, self.generation == token, self.active, self.peer == nil, !self.systemSleeping else { return }
             self.record(results)
             var ordered = target
-            ordered.relayRoutes = RelayNodeProbe.ordered(endpoints, by: results).compactMap { endpoint in
+            ordered.relayRoutes = RelayNodeProbe.ordered(endpoints, by: results, preferredRanks: target.relayNodePriority).compactMap { endpoint in
                 target.relayRoutes.first { $0.info.endpoint == endpoint }
             }
             ordered.relayRoutesOrdered = true
@@ -3398,10 +3610,16 @@ final class DeskModel: ObservableObject, Identifiable {
               index + 1 < target.relayRoutes.count else { return false }
         let next = target.using(target.relayRoutes[index + 1])
         self.target = next
-        status = "\(current.host) 未接通（\(reason)），改用 \(next.relay?.endpoint.host ?? "下一个节点")…"
+        let name = next.relay.map { relayNodeDisplayName($0.endpoint.address) } ?? "下一个节点"
+        status = "\(relayNodeDisplayName(current.address)) 未接通（\(reason)），改用 \(name)…"
         DiagnosticLog.shared.record(.relayRegistration, role: .viewer, state: .rejected)
         beginConnection(next)
         return true
+    }
+
+    private func relayConnectionFailure(_ error: Error, endpoint: RelayEndpoint) -> String {
+        guard (error as? RelayServiceError) == .offline else { return error.localizedDescription }
+        return "被控端未在此中继节点（\(relayNodeDisplayName(endpoint.address))）登记，请确认被控端也已添加该节点并开启共享"
     }
 
     private func beginConnection(_ target: Target) {
@@ -3428,7 +3646,7 @@ final class DeskModel: ObservableObject, Identifiable {
                 observePeerPath(bridge, viewer: viewer)
                 active = true; working = true
                 controlTransportStatus = "正在接通中继"
-                status = viewerSession.awaitingHostUpdate?.status ?? "正在通过 \(relay.endpoint.host) 接通目标设备…"
+                status = viewerSession.awaitingHostUpdate?.status ?? "正在通过 \(relayNodeDisplayName(relay.endpoint.address)) 接通目标设备…"
                 let token = generation
                 bridge.onReady = { [weak self, weak viewer, weak bridge] port in
                     DispatchQueue.main.async {
@@ -3441,11 +3659,12 @@ final class DeskModel: ObservableObject, Identifiable {
                     DispatchQueue.main.async {
                         guard let self, let viewer, let bridge, self.generation == token, self.viewerSession === viewer,
                               viewer.relayBridge === bridge, self.active else { return }
-                        let retryable = (error as? RelayServiceError)?.retryable ?? (error as? RelayTransportError)?.retryable ?? false
+                        let serviceError = error as? RelayServiceError
+                        let retryable = serviceError?.retryable ?? (error as? RelayTransportError)?.retryable ?? false
+                        let reason = self.relayConnectionFailure(error, endpoint: relay.endpoint)
                         if let peer = self.peer {
-                            if bridge.failedBeforeDesktopStream { peer.close(error.localizedDescription, retryable: retryable) }
+                            if bridge.failedBeforeDesktopStream { peer.close(reason, retryable: retryable) }
                         } else {
-                            let reason = error.localizedDescription
                             if self.expireHostUpdateWaitIfNeeded() { return }
                             if let update = self.viewerSession.awaitingHostUpdate, retryable {
                                 self.clearSession()
@@ -3453,8 +3672,10 @@ final class DeskModel: ObservableObject, Identifiable {
                                 return
                             }
                             self.recordDisconnect(reason); self.clearSession()
-                            if !self.isAwaitingHostUpdateRestart, self.failOverRelay(from: target, reason: reason) { return }
-                            if retryable, self.effectiveAutoReconnect, self.target != nil {
+                            if !self.isAwaitingHostUpdateRestart, retryable || !target.reuseSavedRecord,
+                               self.failOverRelay(from: target, reason: reason) { return }
+                            if retryable, self.effectiveAutoReconnect, self.target != nil,
+                               serviceError != .offline || !target.reuseSavedRecord || self.reconnecting {
                                 if relay.strategy == .automatic, !target.address.isEmpty {
                                     self.relaySelectedForTarget = false; self.relayFallbackFailed()
                                 }
@@ -3578,11 +3799,13 @@ final class DeskModel: ObservableObject, Identifiable {
         candidate.onClose = { [weak self, weak candidate, weak relayBridge, weak viewer] originalReason in
             history.requestFlush()
             let relayError = relayBridge?.failedBeforeDesktopStream == true ? relayBridge?.lastFailure : nil
-            let reason = relayError?.localizedDescription ?? originalReason
             let retryable = (relayError as? RelayServiceError)?.retryable ?? (relayError as? RelayTransportError)?.retryable ?? (candidate?.closeIsRetryable == true)
             let mayTryAlternate = candidate?.closeAllowsAlternateRoute == true
             DispatchQueue.main.async {
                 guard let self, let candidate, self.peer === candidate else { return }
+                let reason = if let relayError, let endpoint = target.relay?.endpoint {
+                    self.relayConnectionFailure(relayError, endpoint: endpoint)
+                } else { originalReason }
                 if self.expireHostUpdateWaitIfNeeded() { return }
                 if let update = self.viewerSession.awaitingHostUpdate {
                     // Port refusal while the host relaunches is a network failure even if ordinary
@@ -3603,7 +3826,8 @@ final class DeskModel: ObservableObject, Identifiable {
                 let verifiedTarget = viewer?.relayTargetVerified == true
                 let mediaFallback = viewer?.relayFallbackRequested == true
                 self.clearSession()
-                if viaRelay, relayError != nil, !wasConnected, self.failOverRelay(from: target, reason: reason) { return }
+                if viaRelay, relayError != nil, !wasConnected, retryable || !target.reuseSavedRecord,
+                   self.failOverRelay(from: target, reason: reason) { return }
                 if !viaRelay, mayTryAlternate || mediaFallback, target.relay?.strategy == .automatic,
                    !wasConnected || self.effectiveAutoReconnect || mediaFallback,
                    !wasConnected || verifiedTarget {
@@ -3612,7 +3836,8 @@ final class DeskModel: ObservableObject, Identifiable {
                     // Leaving an established session is a reconnect, so idle pause still defers it.
                     if wasConnected { self.reconnecting = true }
                     self.beginConnection(target)
-                } else if retryable, self.effectiveAutoReconnect, self.target != nil {
+                } else if retryable, self.effectiveAutoReconnect, self.target != nil,
+                          (relayError as? RelayServiceError) != .offline || !target.reuseSavedRecord || wasConnected || self.reconnecting {
                     if viaRelay, target.relay?.strategy == .automatic, !target.address.isEmpty {
                         self.relaySelectedForTarget = false; self.relayFallbackFailed()
                     }
@@ -3762,6 +3987,99 @@ final class DeskModel: ObservableObject, Identifiable {
         startLaunchedSession(launch)
     }
 
+    func prepareSavedRouteLaunch(_ record: ConnectionRecord, viaRelayNode nodeAddress: String?) -> SessionLaunch? {
+        guard mode == .viewer, !isRunningRouteBenchmark else { return nil }
+        connectionError = nil
+        do {
+            guard let saved = connections.first(where: { $0.id == record.id }) else {
+                throw DeskError.invalid("没有找到此设备的连接记录")
+            }
+            let target: Target
+            if let nodeAddress {
+                target = try savedRelayTarget(for: saved, nodeAddress: nodeAddress)
+            } else {
+                let group = portMappingMachineGroups().first { $0.contains(recordID: saved.id) }
+                guard !saved.address.isEmpty, let credential = try savedPairingCredential(for: saved, related: group?.routes ?? []) else {
+                    throw DeskError.invalid("此设备缺少可用的原地址或已保存的配对码")
+                }
+                let tailnet = try TailnetAddress.host(in: saved.address)
+                let endpoint = try TrafficEndpoint(address: tailnet ?? saved.address, port: saved.port)
+                target = Target(address: saved.address, port: saved.port, key: credential.key, recordID: saved.id,
+                                trafficEndpoint: endpoint, tailnetHost: tailnet, reuseSavedRecord: true,
+                                expectedSavedHostID: saved.deviceID)
+            }
+            return SessionLaunch(
+                target: target,
+                identity: RemoteSessionTargetIdentity(recordID: saved.id, address: target.address,
+                    port: target.port, relayDeviceID: target.relay?.deviceID),
+                address: saved.address, port: String(saved.port), relayStrategy: saved.relay?.strategy ?? .direct,
+                targetRelayDeviceID: saved.effectiveRelayDeviceID?.uuidString.lowercased() ?? "",
+                selectedConnectionID: saved.id, viewerCode: "", mediaTCPOnly: mediaTCPOnly,
+                relayPeerAssist: relayPeerAssist, relayNodeChoice: relayNodeChoice
+            )
+        } catch {
+            connectionError = error.localizedDescription
+            return nil
+        }
+    }
+
+    private func savedRelayTarget(for record: ConnectionRecord, nodeAddress: String) throws -> Target {
+        guard relayEnabled else { throw DeskError.invalid("请先在中继设置中启用服务") }
+        guard let identity = resolvedRelayIdentity(for: record),
+              let key = try KeyStore.load(account: "remote." + identity.credentialRecordID.uuidString) else {
+            throw DeskError.invalid("此设备还没有可用的中继标识或已保存的配对码")
+        }
+        let endpoints: [RelayEndpoint]
+        if nodeAddress.isEmpty {
+            endpoints = relayNodes.compactMap { try? RelayEndpoint(address: $0) }
+        } else {
+            let picked = try RelayEndpoint(address: nodeAddress)
+            guard relayNodes.contains(picked.address) else { throw DeskError.invalid("此节点已从中继设置中移除") }
+            endpoints = [picked]
+        }
+
+        var candidates: [RelayRoute] = []
+        var firstFailure: Error?
+        for endpoint in endpoints {
+            do {
+                guard let access = try KeyStore.load(account: endpoint.credentialAccount) else {
+                    throw DeskError.invalid("此中继节点尚未保存接入码，请打开中继设置")
+                }
+                let info = try RelayConnectionInfo(endpoint: endpoint, deviceID: identity.deviceID, strategy: .relay)
+                candidates.append(RelayRoute(info: info, accessKey: access.data, certificate: try relayCertificate(for: endpoint)))
+            } catch {
+                if firstFailure == nil { firstFailure = error }
+            }
+        }
+        guard let first = candidates.first else {
+            throw firstFailure ?? DeskError.invalid("请先添加可用的中继节点")
+        }
+        let online = hasFreshRelayPresence(for: identity.deviceID) ? targetRelayOnlineByNode[identity.deviceID] ?? [:] : [:]
+        if nodeAddress.isEmpty, candidates.allSatisfy({ online[$0.info.endpoint.address].flatMap { $0 } == false }) {
+            throw DeskError.invalid("被控端当前未在任何共有的中继节点在线，请确认被控端已添加相同中继节点并开启共享")
+        }
+        let priority = Dictionary(uniqueKeysWithValues: candidates.map { route in
+            let endpoint = route.info.endpoint
+            let present = online[endpoint.address].flatMap { $0 }
+            let shared = identity.hostDigests.contains(RelayNodeNaming.endpointDigest(endpoint))
+            let rank = present == true ? 0 : present == false ? 3 : shared ? 1 : 2
+            return (endpoint, rank)
+        })
+        let endpoint = try TrafficEndpoint(address: first.info.endpoint.host, port: first.info.endpoint.port)
+        return Target(address: "", port: record.port, key: key, recordID: record.id, trafficEndpoint: endpoint,
+                      relay: first.info, relayAccessKey: first.accessKey, relayCertificate: first.certificate,
+                      relayRoutes: candidates, reuseSavedRecord: true, expectedSavedHostID: record.deviceID, relayNodePriority: priority)
+    }
+
+    func connectSavedRecord(_ record: ConnectionRecord, viaRelayNode nodeAddress: String?) {
+        guard let launch = prepareSavedRouteLaunch(record, viaRelayNode: nodeAddress) else { return }
+        if active || working || reconnecting {
+            guard sessionTargetIdentity.recordID == record.id else { return }
+            stop(reason: "已切换连接线路", exitFullScreen: false)
+        }
+        startLaunchedSession(launch)
+    }
+
     func renameConnection(id: UUID, to name: String) throws {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { throw DeskError.invalid("请输入设备名称") }
@@ -3794,10 +4112,17 @@ final class DeskModel: ObservableObject, Identifiable {
         catch { self.error = "连接记录已移除，但保存的锁屏密码未能删除：\(error.localizedDescription)" }
     }
 
-    private func saveConnection(name: String, remoteDeviceID: UUID? = nil) {
+    private func saveConnection(name: String, remoteDeviceID: UUID?, remoteRelayDeviceID: UUID?, hostRelayNodeDigests: [String]?) {
         guard activeRouteBenchmarkOverride == nil, !savedTarget, let target else { return }
         do {
-            let existing = ConnectionStore.matching(connections, address: target.address, port: target.port, preferredID: target.recordID, relay: target.relay)
+            let existing: ConnectionRecord?
+            if target.reuseSavedRecord {
+                guard let saved = connections.first(where: { $0.id == target.recordID }) else { return }
+                existing = saved
+            } else {
+                existing = ConnectionStore.matching(connections, address: target.address, port: target.port,
+                                                    preferredID: target.recordID, relay: target.relay)
+            }
             var record = existing
                 ?? ConnectionRecord(address: target.address, port: target.port, name: name, videoSettings: viewerQualityPolicy.preferred, chromaSubsampling: savedChromaPreference, relay: target.relay, deviceID: remoteDeviceID)
             // Relay device IDs are scoped to a node, so another node gets its own record. This session
@@ -3809,14 +4134,37 @@ final class DeskModel: ObservableObject, Identifiable {
                 try? KeyStore.saveSecret(password, account: Self.unlockAccount(record.id))
                 Self.setAutoUnlock(Self.autoUnlocks(source), for: record.id)
             }
-            record.address = target.address; record.port = target.port; record.relay = target.relay
+            let oldRelayID = record.effectiveRelayDeviceID
+            if target.reuseSavedRecord {
+                if let previous = record.relay, let relay = target.relay {
+                    record.relay = try RelayConnectionInfo(endpoint: relay.endpoint, deviceID: relay.deviceID, strategy: previous.strategy)
+                }
+            } else {
+                record.address = target.address
+                record.port = target.port
+                record.relay = target.relay
+            }
             if let remoteDeviceID { record.deviceID = remoteDeviceID }
+            if let relayID = remoteRelayDeviceID ?? target.relay?.deviceID {
+                record.knownRelayDeviceID = relayID
+                if let oldRelayID, oldRelayID != relayID { record.hostRelayNodeDigests = nil }
+            }
+            if let hostRelayNodeDigests { record.hostRelayNodeDigests = hostRelayNodeDigests }
             record.name = name
             record.lastConnected = Date()
             try KeyStore.save(target.key, account: "remote." + record.id.uuidString)
-            connections.removeAll { $0.id == record.id }
-            connections.insert(record, at: 0)
-            try ConnectionStore.save(connections)
+            var updated = connections.filter { $0.id != record.id }
+            if let remoteDeviceID, let relayID = record.knownRelayDeviceID {
+                // Propagate fresh metadata only between records with the same authenticated Mac ID.
+                for index in updated.indices where updated[index].deviceID == remoteDeviceID {
+                    guard updated[index].effectiveRelayDeviceID == nil || updated[index].effectiveRelayDeviceID == relayID else { continue }
+                    if updated[index].knownRelayDeviceID == nil { updated[index].knownRelayDeviceID = relayID }
+                    if updated[index].hostRelayNodeDigests == nil { updated[index].hostRelayNodeDigests = hostRelayNodeDigests }
+                }
+            }
+            updated.insert(record, at: 0)
+            try ConnectionStore.save(updated)
+            connections = updated
             viewerSession.mappingRecordID = record.id
             if let remoteDeviceID {
                 portMappings.synchronizeHostDeviceID(forRecordID: record.id, hostDeviceID: remoteDeviceID)
@@ -4160,6 +4508,10 @@ final class DeskModel: ObservableObject, Identifiable {
             if viewerSession.usesRelayControl, !viewerSession.relayTargetVerified {
                 throw DeskError.invalid("中继目标标识不匹配或对端版本不支持，请检查设备标识并升级两端")
             }
+            if let expected = target?.expectedSavedHostID, let received = hello.deviceID, expected != received {
+                peer.close("目标设备与已保存的 Mac 身份不匹配", retryable: false)
+                return
+            }
             guard !expireHostUpdateWaitIfNeeded() else { return }
             let recoveredFromHostUpdate = viewerSession.awaitingHostUpdate != nil
             if recoveredFromHostUpdate {
@@ -4211,7 +4563,8 @@ final class DeskModel: ObservableObject, Identifiable {
                 pauseTransmission.choose(paused: true)
             }
             if freshFrameRequiredOnReconnect { pauseTransmission.requireFreshFrame() }
-            saveConnection(name: hello.name, remoteDeviceID: hello.deviceID)
+            saveConnection(name: hello.name, remoteDeviceID: hello.deviceID,
+                           remoteRelayDeviceID: hello.relayDeviceID, hostRelayNodeDigests: hello.relayNodeDigests)
             if activeRouteBenchmarkOverride == nil, hello.deviceIdentityExchange == true, let id = trafficHistoryStore.localDeviceID {
                 peer.send(try Wire.json(.deviceIdentity, DeviceIdentity(id: id, name: Host.current().localizedName ?? "这台 Mac")))
             }
@@ -4796,6 +5149,7 @@ final class DeskModel: ObservableObject, Identifiable {
     /// The saved record of the current viewer connection; lock screen passwords are kept per record.
     var currentRecordID: UUID? {
         guard mode == .viewer, let target else { return nil }
+        if target.reuseSavedRecord { return target.recordID }
         return ConnectionStore.matching(connections, address: target.address, port: target.port,
                                         preferredID: target.recordID, relay: target.relay)?.id
     }

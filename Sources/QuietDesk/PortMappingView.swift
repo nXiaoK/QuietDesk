@@ -76,6 +76,7 @@ struct PortMappingView<DeviceProfile: View>: View {
             PortMappingEditor(
                 item: item,
                 groups: item.allowsMachineSelection ? groups : groups.filter { $0.id == item.machineID },
+                relayNodeNames: model.relayNodeNames,
                 sessionAvailable: { model.hasConnectedDesktopSession(forMachine: $0) },
                 save: { rule in try manager.saveRule(rule); error = nil },
                 enable: { rule in
@@ -408,10 +409,12 @@ struct PortMappingView<DeviceProfile: View>: View {
         if let group {
             let bound = group.routes.first { $0.id == rule.deviceID } ?? group.primaryRecord
             let actual = manager.activeRouteLabels[rule.id]
-            let configured = RemoteMachineGroup.routeShortLabel(for: bound)
+            let configured = RemoteMachineGroup.routeShortLabel(for: bound, relayNodeNames: model.relayNodeNames)
+            let boundAddress = bound.relay?.endpoint.address
             if group.routes.count > 1 {
                 let actualKind = actual?.components(separatedBy: " · ").first
-                let label = rule.routeMode == .automatic ? (actualKind.map { "自动 · \($0)" } ?? "自动") : configured
+                let actualTitle = actualKind == "中继" ? actual : actualKind
+                let label = rule.routeMode == .automatic ? (actualTitle.map { "自动 · \($0)" } ?? "自动") : configured
                 Menu {
                     routeOptions(group, rule: rule)
                 } label: {
@@ -432,7 +435,7 @@ struct PortMappingView<DeviceProfile: View>: View {
                     .font(.system(size: 12))
                 }
                 .buttonStyle(DeskButtonStyle(.quiet))
-                .help(actual.map { "当前线路 · \($0)" } ?? label)
+                .help(actual.map { "当前线路 · \($0)" } ?? boundAddress ?? label)
                 .accessibilityLabel("\(rule.name)的连接线路")
                 .accessibilityValue(label)
             } else {
@@ -440,7 +443,8 @@ struct PortMappingView<DeviceProfile: View>: View {
                     .font(.system(size: 12))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .help("为同一台电脑保存其他线路（如 Tailscale 或中继）后，系统会自动识别并允许在此直接切换。")
+                    .help([boundAddress, "为同一台电脑保存其他线路（如 Tailscale 或中继）后，系统会自动识别并允许在此直接切换。"]
+                        .compactMap { $0 }.joined(separator: "\n"))
             }
         } else {
             Text("原线路不可用")
@@ -460,10 +464,12 @@ struct PortMappingView<DeviceProfile: View>: View {
         Divider()
         ForEach(group.routes) { record in
             let active = model.hasConnectedDesktopSession(for: record.id)
-            let title = RemoteMachineGroup.routeShortLabel(for: record) + (active ? "（当前远控）" : "")
+            let title = RemoteMachineGroup.routeShortLabel(for: record, relayNodeNames: model.relayNodeNames)
+                + (active ? "（当前远控）" : "")
             Button { switchRoute(group, rule: rule, to: record.id, mode: .pinned) } label: {
                 filterLabel(title, selected: rule?.routeMode == .pinned && rule?.deviceID == record.id)
             }
+            .help(record.relay?.endpoint.address ?? title)
         }
     }
 
@@ -571,6 +577,7 @@ private struct PortMappingEditor: View {
 
     let item: MappingEditorSelection
     let groups: [RemoteMachineGroup]
+    let relayNodeNames: [String: String]
     let sessionAvailable: (RemoteMachineGroup) -> Bool
     let save: (PortMappingRule) throws -> Void
     let enable: (PortMappingRule) throws -> Void
@@ -587,11 +594,12 @@ private struct PortMappingEditor: View {
     @State private var enableError: String?
     @FocusState private var focusedField: Field?
 
-    init(item: MappingEditorSelection, groups: [RemoteMachineGroup],
+    init(item: MappingEditorSelection, groups: [RemoteMachineGroup], relayNodeNames: [String: String],
          sessionAvailable: @escaping (RemoteMachineGroup) -> Bool, save: @escaping (PortMappingRule) throws -> Void,
          enable: @escaping (PortMappingRule) throws -> Void) {
         self.item = item
         self.groups = groups
+        self.relayNodeNames = relayNodeNames
         self.sessionAvailable = sessionAvailable
         self.save = save
         self.enable = enable
@@ -732,7 +740,8 @@ private struct PortMappingEditor: View {
                     Picker("连接线路", selection: $routeChoice) {
                         Text("同机自动选路（跟随当前会话 / 失败自动切线）").tag(RouteChoice.automatic)
                         ForEach(machine.routes) { record in
-                            Text(RemoteMachineGroup.routeShortLabel(for: record)).tag(RouteChoice.pinned(record.id))
+                            Text(RemoteMachineGroup.routeShortLabel(for: record, relayNodeNames: relayNodeNames))
+                                .tag(RouteChoice.pinned(record.id))
                         }
                     }
                     .labelsHidden()

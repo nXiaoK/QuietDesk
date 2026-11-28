@@ -252,6 +252,27 @@ final class DeskModels: ObservableObject {
     }
 
     @discardableResult
+    func connectSavedRecord(_ record: ConnectionRecord, viaRelayNode nodeAddress: String?) -> DeskModel? {
+        guard let launch = viewer.prepareSavedRouteLaunch(record, viaRelayNode: nodeAddress) else { return nil }
+        let exactSession = viewerSessions.first { $0.sessionTargetIdentity.recordID == record.id }
+        let expectedHost = launch.target.expectedSavedHostID
+        let verifiedRecordIDs = Set(viewer.connections.filter { expectedHost != nil && $0.deviceID == expectedHost }.map(\.id))
+        let sameMacSession = viewerSessions.first {
+            guard let id = $0.sessionTargetIdentity.recordID else { return false }
+            return verifiedRecordIDs.contains(id)
+        }
+        if let existing = exactSession ?? sameMacSession {
+            if existing.active || existing.working || existing.reconnecting {
+                existing.stop(reason: "已切换连接线路", exitFullScreen: false)
+            }
+            existing.startLaunchedSession(launch)
+            focusViewerSession(existing)
+            return existing
+        }
+        return spawnViewerSession(with: launch)
+    }
+
+    @discardableResult
     func connectOrFillDiscoveredHost(_ discovered: DiscoveredLANHost) -> DeskModel? {
         let candidateIdentity = RemoteSessionTargetIdentity(
             recordID: BonjourDiscovery.matchingRecord(for: discovered, in: viewer.connections)?.id,
@@ -283,6 +304,10 @@ final class DeskModels: ObservableObject {
             focusViewerSession(existing)
             return existing
         }
+        return spawnViewerSession(with: launch)
+    }
+
+    private func spawnViewerSession(with launch: DeskModel.SessionLaunch) -> DeskModel {
         let session = DeskModel(mode: .viewer, services: services)
         session.onConnectionDiagnosticReport = onConnectionDiagnosticReport
         registerViewerSession(session)

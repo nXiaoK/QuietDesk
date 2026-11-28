@@ -275,11 +275,15 @@ struct NetworkWorkspaceView: View {
                             nodes: viewer.relayNodes,
                             deviceID: viewer.relayDeviceID,
                             locked: viewer.relaySettingsLocked,
+                            nodeNames: viewer.relayNodeNames,
                             measurements: viewer.relayNodeMeasurements,
+                            nodeInfos: viewer.relayNodeInfos,
+                            probing: viewer.relayProbing,
+                            measure: { viewer.measureRelayNodes() },
                             embedded: true,
                             loadTrust: viewer.relayCertificate,
-                            saveNode: viewer.saveRelayNode,
-                            save: viewer.saveRelayConfiguration
+                            saveNode: viewer.saveRelayNode(address:name:accessCode:certificate:),
+                            save: viewer.saveRelayConfiguration(enabled:nodes:nodeNames:deviceID:)
                         )
                     case .tailnet:
                         TailnetSettingsView(tailnet: viewer.services.tailnet)
@@ -325,10 +329,11 @@ struct NetworkWorkspaceView: View {
 
                 if let assessment {
                     if let best = assessment.recommendedRoute {
-                        Text("长期推荐 · \(best.candidate.title)")
+                        Text("长期推荐 · \(best.candidate.displayTitle(relayNodeNames: viewer.relayNodeNames))")
                             .font(.system(size: 12.5, weight: .medium))
                             .foregroundStyle(DeskPalette.ink)
                             .fixedSize(horizontal: false, vertical: true)
+                            .help(best.candidate.subtitle)
                     }
                     Text(assessment.recommendationReason)
                         .font(.caption)
@@ -362,9 +367,10 @@ struct NetworkWorkspaceView: View {
                         VStack(alignment: .leading, spacing: 7) {
                             ForEach(Array(assessment.routeSummaries.prefix(3))) { item in
                                 HStack {
-                                    Text(item.candidate.title)
+                                    Text(item.candidate.displayTitle(relayNodeNames: viewer.relayNodeNames))
                                         .font(.system(size: 11.5, weight: .medium))
                                         .fixedSize(horizontal: false, vertical: true)
+                                        .help(item.candidate.subtitle)
                                     Spacer(minLength: 6)
                                     if let rtt = item.meanRTTMilliseconds {
                                         Text(String(format: "延迟 %.1f ms", rtt))
@@ -435,7 +441,8 @@ struct DiagnosticsWorkspaceView: View {
                         embedded: true,
                         availableRecords: viewer.connections,
                         selectedTargetRecord: benchmarkTargetRecord,
-                        onSelectTargetRecord: { rebuildRunner(for: $0) }
+                        onSelectTargetRecord: { rebuildRunner(for: $0) },
+                        relayNodeNames: viewer.relayNodeNames
                     )
                 } else {
                     ProgressView()

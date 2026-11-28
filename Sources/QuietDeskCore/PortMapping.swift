@@ -26,14 +26,19 @@ public struct RemoteMachineGroup: Identifiable, Equatable, Sendable {
     public func contains(recordID: UUID) -> Bool { routes.contains { $0.id == recordID } }
 
     public static func routeShortLabel(for record: ConnectionRecord) -> String {
+        routeShortLabel(for: record, relayNodeNames: [:])
+    }
+
+    public static func routeShortLabel(for record: ConnectionRecord, relayNodeNames: [String: String]) -> String {
         if let host = try? TailnetAddress.host(in: record.address) {
             return "Tailscale · \(endpoint(host, port: record.port))"
         }
         if let relay = record.relay {
             if relay.strategy == .relay || record.address.isEmpty {
-                return "中继 · \(endpoint(relay.endpoint.host, port: relay.endpoint.port))"
+                return "中继 · \(RelayNodeNaming.shortTitle(for: relay.endpoint, names: relayNodeNames))"
             }
-            return "直连优先+中继 · \(endpoint(record.address, port: record.port))"
+            let label = "直连优先+中继 · \(endpoint(record.address, port: record.port))"
+            return RelayNodeNaming.sanitize(relayNodeNames[relay.endpoint.address]).map { label + " · " + $0 } ?? label
         }
         return "直连 · \(endpoint(record.address, port: record.port))"
     }

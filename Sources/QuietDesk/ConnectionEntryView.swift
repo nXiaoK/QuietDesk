@@ -52,9 +52,14 @@ enum ConnectionEntryPresentation {
     enum Field: Hashable { case address, port, code, deviceID }
     static let recentLimit = 3
 
-    static func matching(_ records: [ConnectionRecord], query: String) -> [ConnectionRecord] {
+    static func matching(_ records: [ConnectionRecord], query: String, relayNodeNames: [String: String] = [:]) -> [ConnectionRecord] {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return records }
+        let nodeDigests = Set(relayNodeNames.compactMap { address, name -> String? in
+            guard name.localizedStandardContains(query),
+                  let endpoint = try? RelayEndpoint(address: address) else { return nil }
+            return RelayNodeNaming.endpointDigest(endpoint)
+        })
         return records.filter { record in
             var fields = [record.name, record.address, String(record.port)]
             if let customName = record.customName {
@@ -68,13 +73,18 @@ enum ConnectionEntryPresentation {
             }
             if let relay = record.relay {
                 fields += [relay.deviceID.uuidString, relay.endpoint.host, String(relay.endpoint.port)]
+                if let name = relayNodeNames[relay.endpoint.address] { fields.append(name) }
             }
+            if let deviceID = record.knownRelayDeviceID { fields.append(deviceID.uuidString) }
+            if let digests = record.hostRelayNodeDigests, !nodeDigests.isDisjoint(with: digests) { return true }
             return fields.contains { $0.localizedStandardContains(query) }
         }
     }
 
-    static func visible(_ records: [ConnectionRecord], query: String, expanded: Bool) -> [ConnectionRecord] {
-        let matches = matching(records, query: query)
+    static func visible(
+        _ records: [ConnectionRecord], query: String, expanded: Bool, relayNodeNames: [String: String] = [:]
+    ) -> [ConnectionRecord] {
+        let matches = matching(records, query: query, relayNodeNames: relayNodeNames)
         return expanded || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? matches : Array(matches.prefix(recentLimit))
     }
@@ -85,8 +95,14 @@ enum ConnectionEntryPresentation {
             ? (record.address.isEmpty ? "已保存的 Mac" : record.address) : name
     }
 
-    static func endpoint(_ record: ConnectionRecord) -> String {
-        if let relay = record.relay { return relay.endpoint.address }
+    static func endpoint(_ record: ConnectionRecord, relayNodeNames: [String: String] = [:]) -> String {
+        if let relay = record.relay {
+            return RelayNodeNaming.fullTitle(for: relay.endpoint, names: relayNodeNames)
+        }
+        return directEndpoint(record)
+    }
+
+    static func directEndpoint(_ record: ConnectionRecord) -> String {
         if let host = try? TailnetAddress.host(in: record.address) { return "\(host):\(record.port)" }
         let host = record.address.contains(":") && !record.address.hasPrefix("[") ? "[\(record.address)]" : record.address
         return "\(host):\(record.port)"
@@ -211,6 +227,10 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
     var openReceivedFiles: () -> Void = {}
     var viewerViewOnlyLocked: Bool = false
     var toggleViewerViewOnly: () -> Void = {}
+    var relayNodeNames: [String: String] = [:]
+    var relayOptions: (ConnectionRecord) -> [RelaySwitchableNodeOption] = { _ in [] }
+    var probeRelayOptions: (ConnectionRecord) -> Void = { _ in }
+    var connectViaRelayNode: (ConnectionRecord, String?) -> String? = { _, _ in nil }
 
     @State private var sheet: Sheet?
     @State private var query = ""
@@ -218,6 +238,7 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
     @State private var draft = ConnectionEntryDraft()
     @State private var draftTitle: String?
     @State private var draftFailure: String?
+    @State private var relaySwitchFailure: String?
     @State private var discoveryFromComposer = false
     @State private var recordToRemove: ConnectionRecord?
     @State private var afterSheetDismissal: (() -> Void)?
@@ -225,6 +246,17 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
 
     private enum Sheet: Equatable {
         case connection, credentials(title: String, endpoint: String), discovery, records, sessions, readiness
+    }
+
+    private struct RelayProbeSelection: Equatable {
+        let recordID: UUID?
+        let deviceID: UUID?
+        let enabled: Bool
+    }
+
+    private var relayProbeSelection: RelayProbeSelection {
+        RelayProbeSelection(recordID: selectedRecord?.id, deviceID: selectedRecord?.effectiveRelayDeviceID,
+                            enabled: relayEnabled)
     }
 
     private var usesTailnet: Bool {
@@ -241,10 +273,12 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
 
     private var usesRelay: Bool { relayEnabled && draft.strategy != .direct }
     private var showsAddress: Bool { !relayEnabled || draft.strategy != .relay }
-    private var matches: [ConnectionRecord] { ConnectionEntryPresentation.matching(records, query: query) }
+    private var matches: [ConnectionRecord] {
+        ConnectionEntryPresentation.matching(records, query: query, relayNodeNames: relayNodeNames)
+    }
     private var searching: Bool { !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     private var visibleRecords: [ConnectionRecord] {
-        ConnectionEntryPresentation.visible(records, query: query, expanded: expandedRecords)
+        ConnectionEntryPresentation.visible(records, query: query, expanded: expandedRecords, relayNodeNames: relayNodeNames)
     }
 
     var body: some View {
@@ -295,6 +329,10 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
         .modifier(recordRemovalAlert(inManagementSheet: false))
         .onChange(of: selectedRecord?.id) { _, _ in
             if sheet == nil { showOptions = false }
+            relaySwitchFailure = nil
+        }
+        .onChange(of: relayProbeSelection, initial: true) { _, selection in
+            if selection.enabled, let selectedRecord { probeRelayOptions(selectedRecord) }
         }
         .onChange(of: showNewConnection, initial: true) { _, requested in
             if requested { openNewConnection() }
@@ -336,7 +374,7 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                         .accessibilityAddTraits(.isHeader)
                     HStack(spacing: 8) {
                         Text(selectedRecord.relay.map { "中继设备标识 · " + ConnectionEntryPresentation.compactRelayIdentity($0.deviceID) }
-                             ?? ConnectionEntryPresentation.endpoint(selectedRecord))
+                             ?? ConnectionEntryPresentation.endpoint(selectedRecord, relayNodeNames: relayNodeNames))
                             .font(.system(size: 11.5))
                             .foregroundStyle(DeskPalette.secondary)
                             .lineLimit(1)
@@ -810,7 +848,12 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                     .frame(maxHeight: 425)
                 } else {
                     detailRow("连接方式", ConnectionEntryPresentation.route(record))
-                    detailRow(record.relay == nil ? "连接地址" : "中继节点", ConnectionEntryPresentation.endpoint(record))
+                    detailRow(record.relay == nil ? "连接地址" : "中继节点",
+                              ConnectionEntryPresentation.endpoint(record, relayNodeNames: relayNodeNames))
+                    let nodes = relayOptions(record)
+                    if !nodes.isEmpty {
+                        relaySwitching(record, nodes: nodes)
+                    }
                     if let live {
                         let summary = [live.resolution, live.qualitySummary].filter { !$0.isEmpty }.joined(separator: " · ")
                         detailRow("当前画质", summary.isEmpty ? "正在等待画面" : summary)
@@ -840,6 +883,56 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                 }
             }
             .frame(minHeight: alignedHeight ? 420 : 0, alignment: .topLeading)
+        }
+    }
+
+    private func relaySwitching(_ record: ConnectionRecord, nodes: [RelaySwitchableNodeOption]) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Divider()
+            Text("中继节点切换").font(.system(size: 11)).foregroundStyle(DeskPalette.secondary)
+            Menu("选择线路并连接…") {
+                if !record.address.isEmpty {
+                    Button("使用原地址连接（\(ConnectionEntryPresentation.directEndpoint(record))）") {
+                        relaySwitchFailure = connectViaRelayNode(record, nil)
+                    }
+                    Divider()
+                }
+                Button {
+                    relaySwitchFailure = connectViaRelayNode(record, "")
+                } label: {
+                    Label("自动选择共有最快中继", systemImage: "bolt")
+                }
+                ForEach(nodes) { node in
+                    Button {
+                        relaySwitchFailure = connectViaRelayNode(record, node.id)
+                    } label: {
+                        Label(relaySwitchLabel(node), systemImage: relaySwitchSymbol(node.peerMatch))
+                    }
+                }
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .disabled(locked)
+            if let relaySwitchFailure {
+                Text(relaySwitchFailure)
+                    .font(.caption)
+                    .foregroundStyle(DeskPalette.coral)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func relaySwitchLabel(_ node: RelaySwitchableNodeOption) -> String {
+        let name = RelayNodeNaming.shortTitle(
+            for: node.endpoint, names: node.customName.map { [node.id: $0] } ?? [:])
+        return [name, node.latencyLabel, node.peerMatch.badgeText].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    private func relaySwitchSymbol(_ match: RelayPeerNodeMatch) -> String {
+        switch match {
+        case .onlineShared: return "checkmark.circle.fill"
+        case .notConfiguredOnHost, .unreachable: return "exclamationmark.triangle"
+        default: return "circle"
         }
     }
 
@@ -899,11 +992,11 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
                                 tableCell("设备标识 · \(ConnectionEntryPresentation.compactRelayIdentity(relay.deviceID))")
                                     .font(.system(size: 12.5, design: .monospaced))
                                     .help("\(relay.endpoint.address) · \(relay.deviceID.uuidString.lowercased())")
-                                tableCell(relay.endpoint.address)
+                                tableCell(RelayNodeNaming.fullTitle(for: relay.endpoint, names: relayNodeNames))
                                     .font(.system(size: 11, design: .monospaced))
                                     .foregroundStyle(DeskPalette.muted)
                             } else {
-                                tableCell(ConnectionEntryPresentation.endpoint(record))
+                                tableCell(ConnectionEntryPresentation.endpoint(record, relayNodeNames: relayNodeNames))
                                     .font(.system(size: 12.5, design: .monospaced))
                             }
                             if let wake = record.wakeOnLAN, inManagementSheet {
@@ -1645,7 +1738,7 @@ struct ConnectionEntryView<NodePicker: View, Options: View>: View {
         finishSavedAttempt(
             quickConnect(record),
             title: ConnectionEntryPresentation.title(record),
-            endpoint: ConnectionEntryPresentation.endpoint(record)
+            endpoint: ConnectionEntryPresentation.endpoint(record, relayNodeNames: relayNodeNames)
         )
     }
 

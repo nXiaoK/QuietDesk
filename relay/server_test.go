@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -199,6 +200,64 @@ func (f *fixture) register(t *testing.T, id string, owner []byte) (net.Conn, Mes
 	return conn, read(t, conn, "registered")
 }
 
+func TestNodeInfoRequiresAuthenticationAndReportsRegistration(t *testing.T) {
+	f := newFixture(t, Config{})
+	request := func(key []byte, deviceID, op string) Message {
+		conn := f.dial(t)
+		defer conn.Close()
+		write(t, conn, Message{Op: "info", AccessKey: key, DeviceID: deviceID})
+		return read(t, conn, op)
+	}
+	wrongKey := bytes.Clone(f.access)
+	wrongKey[0] ^= 1
+	for _, info := range []Message{request(wrongKey, deviceA, "error"), request(nil, "invalid", "error")} {
+		if info.Error != "unauthorized" || info.ServerVersion != "" || len(info.Capabilities) != 0 || info.DeviceOnline != nil {
+			t.Fatalf("unauthenticated info disclosed node metadata: %+v", info)
+		}
+	}
+	if info := request(f.access, "invalid", "error"); info.Error != "protocol" {
+		t.Fatalf("invalid device ID did not get a protocol error: %+v", info)
+	}
+	expected := []string{"tcp", "info", "udp", "assist"}
+	info := request(f.access, "", "nodeInfo")
+	if info.DeviceOnline != nil {
+		t.Fatal("info without a device ID included an online status")
+	}
+	assertNodeMetadata(t, info, expected)
+	assertOnline := func(deviceID string, want bool) {
+		t.Helper()
+		info := request(f.access, deviceID, "nodeInfo")
+		if info.DeviceOnline == nil || *info.DeviceOnline != want {
+			t.Fatalf("device online status for %s: got %+v, want %t", deviceID, info, want)
+		}
+	}
+	assertOnline(deviceA, false)
+	registration, registered := f.register(t, deviceA, randomKey(t))
+	assertNodeMetadata(t, registered, expected)
+	assertOnline(strings.ToUpper(deviceA), true)
+	assertOnline(deviceB, false)
+	registration.Close()
+	until(t, func() bool { return f.server.Snapshot().OnlineDevices == 0 })
+	assertOnline(deviceA, false)
+}
+
+func TestNodeInfoCapabilitiesWithoutDatagramListeners(t *testing.T) {
+	server, err := NewServer(Config{AccessKey: randomKey(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capabilities := server.capabilities(); !slices.Equal(capabilities, []string{"tcp", "info"}) {
+		t.Fatalf("unexpected TCP-only capabilities: %v", capabilities)
+	}
+}
+
+func assertNodeMetadata(t *testing.T, message Message, capabilities []string) {
+	t.Helper()
+	if message.ServerVersion == "" || message.ServerVersion != NormalizedServerVersion() || !slices.Equal(message.Capabilities, capabilities) {
+		t.Fatalf("unexpected node metadata for %s: version=%q capabilities=%v", message.Op, message.ServerVersion, message.Capabilities)
+	}
+}
+
 type shortWriter struct{ bytes.Buffer }
 
 func (w *shortWriter) Write(data []byte) (int, error) {
@@ -212,6 +271,9 @@ func TestFramingAndReplayBounds(t *testing.T) {
 	writer := &shortWriter{}
 	if err := WriteMessage(writer, Message{Op: "ping"}); err != nil {
 		t.Fatal(err)
+	}
+	if payload := string(writer.Bytes()[4:]); payload != `{"version":1,"op":"ping"}` {
+		t.Fatalf("legacy ping payload changed: %s", payload)
 	}
 	if _, err := ReadMessage(&writer.Buffer); err != nil {
 		t.Fatal(err)
@@ -693,9 +755,13 @@ func TestAssistedLeaseAnnouncesTwoDistinctReflexiveMappings(t *testing.T) {
 	t.Cleanup(func() { probe.Close() })
 	f := newFixtureWithProbe(t, Config{}, false, false, false, probe)
 	probeAddress := probe.LocalAddr().(*net.UDPAddr)
+	capabilities := []string{"tcp", "info", "udp", "assist", "dualProbe"}
+	nodeInfo := f.dial(t)
+	write(t, nodeInfo, Message{Op: "info", AccessKey: f.access})
+	assertNodeMetadata(t, read(t, nodeInfo, "nodeInfo"), capabilities)
 	registration := f.dial(t)
 	write(t, registration, Message{Op: "register", AccessKey: f.access, DeviceID: deviceA, OwnerKey: randomKey(t), Assist: true})
-	read(t, registration, "registered")
+	assertNodeMetadata(t, read(t, registration, "registered"), capabilities)
 	lease := f.dial(t)
 	write(t, lease, Message{Op: "datagram", DeviceID: deviceA, AccessKey: f.access, Assist: true})
 	host := read(t, registration, "incomingDatagram")
@@ -729,6 +795,7 @@ func TestAssistedLeaseAnnouncesTwoDistinctReflexiveMappings(t *testing.T) {
 	silent(t, lease, 75*time.Millisecond)
 	send(hostMain, 1, 1, nil, host.DatagramKey)
 	viewer := read(t, lease, "datagramReady")
+	assertNodeMetadata(t, viewer, capabilities)
 	if viewer.ProbeUDPPort != probeAddress.Port || viewer.UDPPort != f.udpAddress.Port {
 		t.Fatalf("unexpected viewer UDP ports: %d %d", viewer.UDPPort, viewer.ProbeUDPPort)
 	}

@@ -22,17 +22,21 @@ jobs:
   relay-docker:
     uses: ./.github/workflows/relay-docker.yml
   relay-image:
-    needs: relay-docker
+    needs: [relay-docker, windows-portable]
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/relay-image.yml
+    with:
+      version: ${{ needs.windows-portable.outputs.version }}
   windows-portable:
     if: github.ref == 'refs/heads/main'
     runs-on: macos-26
     timeout-minutes: 35
     permissions:
       contents: read
+    outputs:
+      version: ${{ steps.win-version.outputs.version }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:

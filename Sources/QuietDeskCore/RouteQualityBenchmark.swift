@@ -170,9 +170,16 @@ public struct RouteBenchmarkCandidate: Codable, Identifiable, Hashable, Sendable
     }
 
     public var title: String {
+        displayTitle(relayNodeNames: [:])
+    }
+
+    public func displayTitle(relayNodeNames: [String: String]) -> String {
         guard kind.usesRelay, let relayEndpoint else {
             if (try? TailnetAddress.host(in: address)) != nil { return kind.mediaTCPOnly ? "Tailscale · 仅 TCP" : "Tailscale · UDP 优先" }
             return kind.modeTitle
+        }
+        if let name = RelayNodeNaming.sanitize(relayNodeNames[relayEndpoint.address]) {
+            return "中继（\(name)）· \(shortRelayMode)"
         }
         if nodeCount > 1 {
             return "中继（\(relayEndpoint.host)）· \(shortRelayMode)"

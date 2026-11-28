@@ -1727,11 +1727,9 @@ private struct DeskWorkspaceSidebar: View {
                     if let id = ids.first { openDevice(id) }
                 }
                 .disabled(roleLocked)
-                .frame(height: CGFloat(min(ConnectionEntryPresentation.recentLimit, models.arrangedConnections.count)) * 35)
-
+            } else {
+                Spacer(minLength: 0)
             }
-
-            Spacer(minLength: 0)
 
             VStack(spacing: 6) {
                 Rectangle().fill(DeskPalette.hairline).frame(height: 1)
@@ -1775,7 +1773,7 @@ private struct DeskWorkspaceSidebar: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel(title)
         .accessibilityValue(status ?? "未连接")
-        .help(status ?? "点按查看设备；连按两次或按 Return 连接，右键可重命名，按住拖动可调整顺序")
+        .help("\(title)\n\(status ?? "点按查看设备；连按两次或按 Return 连接，右键可重命名，按住拖动可调整顺序")")
         .padding(.trailing, deviceSelection.wrappedValue == record.id ? 25 : 0)
         .overlay(alignment: .trailing) {
             if deviceSelection.wrappedValue == record.id {

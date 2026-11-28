@@ -31,10 +31,34 @@ pub(super) struct Status {
     pub ip: Option<Ipv4Addr>,
     #[serde(rename = "authURL")]
     pub auth_url: Option<String>,
+    #[serde(rename = "peerPath")]
+    pub peer_path: Option<String>,
+    #[serde(rename = "peerRelay")]
+    pub peer_relay: Option<String>,
     port: Option<u16>,
     #[serde(default)]
     udp: bool,
     error: Option<String>,
+}
+
+impl Status {
+    fn append_peer_path(&self, text: &mut String) {
+        match self.peer_path.as_deref() {
+            Some("direct") => text.push_str(" · P2P 打洞直连"),
+            Some("derp") => {
+                let relay = self
+                    .peer_relay
+                    .as_deref()
+                    .filter(|region| !region.is_empty() && region.len() <= 32 && region.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+                if let Some(relay) = relay {
+                    text.push_str(&format!(" · DERP 中继 ({relay})"));
+                } else {
+                    text.push_str(" · DERP 中继转发");
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 struct Executable(PathBuf);
@@ -516,6 +540,9 @@ impl Panel {
                         Some("Stopped") => "节点已停止".into(),
                         _ => "等待节点就绪".into(),
                     };
+                    if self.running {
+                        status.append_peer_path(&mut self.text);
+                    }
                     if let Some(error) = status.error {
                         self.text.push_str(&format!(" · {error}"));
                     }

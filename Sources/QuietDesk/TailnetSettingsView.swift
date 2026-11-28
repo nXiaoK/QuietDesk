@@ -3,6 +3,9 @@ import QuietDeskCore
 
 struct TailnetSettingsView: View {
     @ObservedObject var tailnet: EmbeddedTailnet
+    @State private var controlURLDraft = ""
+    @State private var controlURLFailure: String?
+    @FocusState private var controlURLFocused: Bool
 
     private var status: String {
         guard tailnet.enabled else { return "未启用" }
@@ -59,6 +62,7 @@ struct TailnetSettingsView: View {
         }
 
         accountActions
+        controlService
     }
 
     private var deviceCard: some View {
@@ -77,6 +81,16 @@ struct TailnetSettingsView: View {
                             .font(.system(size: 13.5, weight: .semibold))
                             .accessibilityAddTraits(.isHeader)
                         DeskPillBadge(text: status, symbol: "circle.fill", tint: statusTint)
+                        if tailnet.state == "Running" {
+                            switch tailnet.peerPath {
+                            case "direct":
+                                DeskPillBadge(text: "P2P 打洞直连", tint: DeskPalette.emerald)
+                            case "derp":
+                                let relay = tailnet.peerRelay ?? ""
+                                DeskPillBadge(text: relay.isEmpty ? "DERP 中继转发" : "DERP 中继 (\(relay))", tint: DeskPalette.amber)
+                            default: EmptyView()
+                            }
+                        }
                         if let message = tailnet.message, !message.isEmpty {
                             Text(message)
                                 .font(.system(size: 12))
@@ -117,5 +131,43 @@ struct TailnetSettingsView: View {
             }
         }
         .disabled(tailnet.changingAccount)
+    }
+
+    private var controlService: some View {
+        DeskSettingsGroup(title: "控制服务（可选，支持自建 Headscale / 国内 DERP）") {
+            VStack(alignment: .leading, spacing: 9) {
+                TextField("https://headscale.example.com", text: $controlURLDraft)
+                    .font(.system(size: 13, design: .monospaced))
+                    .focused($controlURLFocused)
+                    .deskInputBox(focused: controlURLFocused)
+                    .accessibilityLabel("Tailscale 控制服务地址")
+                    .onSubmit { saveControlURL(controlURLDraft) }
+                if let controlURLFailure {
+                    DeskCalloutBox(message: controlURLFailure, symbol: "exclamationmark.triangle", tone: .danger)
+                }
+                HStack(spacing: 8) {
+                    Button("保存控制服务") { saveControlURL(controlURLDraft) }
+                        .buttonStyle(DeskButtonStyle(.primary))
+                        .disabled(controlURLDraft == tailnet.controlURL)
+                    Button("恢复官方默认") { saveControlURL("") }
+                        .buttonStyle(DeskButtonStyle(.secondary))
+                        .disabled(tailnet.controlURL.isEmpty && controlURLDraft.isEmpty)
+                }
+            }
+            .padding(.vertical, 10)
+            .disabled(tailnet.changingAccount)
+        }
+        .onAppear { controlURLDraft = tailnet.controlURL }
+        .onChange(of: tailnet.controlURL) { _, value in controlURLDraft = value }
+    }
+
+    private func saveControlURL(_ value: String) {
+        do {
+            try tailnet.setControlURL(value)
+            controlURLDraft = tailnet.controlURL
+            controlURLFailure = nil
+        } catch {
+            controlURLFailure = error.localizedDescription
+        }
     }
 }

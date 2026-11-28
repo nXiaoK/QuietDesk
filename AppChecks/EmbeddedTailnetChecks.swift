@@ -16,12 +16,15 @@ struct EmbeddedTailnetChecks {
         throw DeskError.invalid(description)
     }
 
-    // Subprocess fixture: it records only operations and synthetic ports, and never creates a node.
-    private static func helper(directory: String) throws {
-        let logURL = URL(fileURLWithPath: directory).appendingPathComponent("requests")
+    // The fixture records arguments and operations and returns synthetic status without creating a node.
+    private static func helper(directory: String, controlURL: String?) throws {
+        let base = URL(fileURLWithPath: directory)
+        let logURL = base.appendingPathComponent("requests")
+        let pathFixture = base.appendingPathComponent("peer-path")
         if !FileManager.default.fileExists(atPath: logURL.path) { _ = FileManager.default.createFile(atPath: logURL.path, contents: nil) }
         let log = try FileHandle(forWritingTo: logURL)
         try log.seekToEnd()
+        try log.write(contentsOf: Data("launch \(controlURL ?? "official")\n".utf8))
         var shared = 0, udp = false
         while let text = readLine(), let req = try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
               let op = req["op"] as? String, let id = req["id"] as? Int {
@@ -34,6 +37,12 @@ struct EmbeddedTailnetChecks {
                 reply["ip"] = "100.99.0.1"
                 reply["port"] = shared
                 reply["udp"] = udp
+                if controlURL != nil,
+                   let path = try? String(contentsOf: pathFixture, encoding: .utf8),
+                   ["direct", "derp"].contains(path) {
+                    reply["peerPath"] = path
+                    if path == "derp" { reply["peerRelay"] = "hkg" }
+                }
             case "share":
                 udp = req["udp"] as? Bool ?? false
                 if shared != 0 { Thread.sleep(forTimeInterval: 0.08) }
@@ -54,8 +63,10 @@ struct EmbeddedTailnetChecks {
 
     @MainActor
     static func main() async throws {
-        if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--state-dir" {
-            try helper(directory: CommandLine.arguments[2])
+        let args = Array(CommandLine.arguments.dropFirst())
+        if args.first == "--state-dir" {
+            try require(args.count == 2 || (args.count == 4 && args[2] == "--control-url"), "组件收到了非预期启动参数")
+            try helper(directory: args[1], controlURL: args.count == 4 ? args[3] : nil)
             return
         }
         let identifier = "QuietDesk.Test.Tailnet." + UUID().uuidString
@@ -66,12 +77,39 @@ struct EmbeddedTailnetChecks {
         defer { try? FileManager.default.removeItem(at: base) }
         let daemon = EmbeddedTailnet(defaults: defaults, executable: URL(fileURLWithPath: CommandLine.arguments[0]), directory: base)
         let logURL = base.appendingPathComponent("requests")
+        let pathFixture = base.appendingPathComponent("peer-path")
         func log() -> String { (try? String(contentsOf: logURL, encoding: .utf8)) ?? "" }
 
         try require(EmbeddedTailnet.loginURL("https://login.tailscale.com/a/example") != nil &&
+                    EmbeddedTailnet.loginURL("https://controlplane.tailscale.com:443/a/example") != nil &&
+                    EmbeddedTailnet.loginURL("https://login.tailscale.com:8443/a/example") == nil &&
                     EmbeddedTailnet.loginURL("https://login.tailscale.com.example.invalid/a/example") == nil &&
                     EmbeddedTailnet.loginURL("https://evil@login.tailscale.com/a/example") == nil,
                     "登录浏览器地址没有限定到官方 HTTPS 域名")
+        let control = "https://headscale.example:8443"
+        let normalized = try EmbeddedTailnet.normalizedControlURL(" \n\(control) \t")
+        let official = try EmbeddedTailnet.normalizedControlURL(" \n\t")
+        try require(normalized == control && official.isEmpty && daemon.controlURL.isEmpty, "控制服务地址未去除外侧空白或丢失官方默认设置")
+        for value in ["http://headscale.example", "http://localhost", "https:///headscale.example", "https://user:pass@headscale.example",
+                      "https://headscale.example?token=example", "https://headscale.example#login", "https://headscale.example:0",
+                      "https://headscale.example:65536"] {
+            do {
+                _ = try EmbeddedTailnet.normalizedControlURL(value)
+                throw CocoaError(.coderInvalidValue)
+            } catch is DeskError {}
+        }
+        try require(EmbeddedTailnet.loginURL("https://HEADSCALE.example:8443/register?key=sample", controlURL: control) != nil &&
+                    EmbeddedTailnet.loginURL("https://headscale.example/a/example", controlURL: "https://headscale.example:443") != nil &&
+                    EmbeddedTailnet.loginURL("https://login.tailscale.com/a/example", controlURL: control) != nil &&
+                    EmbeddedTailnet.loginURL("https://headscale.example:8443/a/example") == nil,
+                    "登录浏览器未按自定义控制服务来源验证")
+        for value in ["http://headscale.example:8443/register", "https://headscale.example/register",
+                      "https://headscale.example:8444/register", "https://headscale.example.other.invalid:8443/register",
+                      "https://user:pass@headscale.example:8443/register"] {
+            try require(EmbeddedTailnet.loginURL(value, controlURL: control) == nil, "登录浏览器接受了不同来源或含凭据的地址")
+        }
+        try require(EmbeddedTailnet.loginURL("https://headscale.example/register", controlURL: "https://headscale.example#invalid") == nil,
+                    "无效的控制服务配置扩大了允许的登录地址范围")
         let valid = try TailnetAddress.host(in: "tailscale:100.100.0.2")
         let native = try TailnetAddress.host(in: "100.100.0.2")
         try require(valid == "100.100.0.2" && native == nil, "显式 Tailscale 线路和系统线路混淆")
@@ -80,10 +118,18 @@ struct EmbeddedTailnetChecks {
             throw CocoaError(.coderInvalidValue)
         } catch is DeskError {}
 
+        try daemon.setControlURL(control)
+        try require(daemon.controlURL == control && defaults.string(forKey: "embeddedTailnetControlURL") == control,
+                    "禁用时未保存控制服务配置")
+        try daemon.setControlURL("")
         daemon.setSharing(port: 5908)
         try require(!FileManager.default.fileExists(atPath: base.path), "未启用时启动了组件")
         daemon.login()
-        try await eventually("未发布正在运行的共享端口") { daemon.ip == "100.99.0.1" && daemon.shared == .init(port: 5908, udp: false) }
+        try await eventually("未发布正在运行的共享端口") {
+            !daemon.changingAccount && daemon.ip == "100.99.0.1" && daemon.shared == .init(port: 5908, udp: false)
+        }
+        try require(log().contains("launch official\n") && daemon.peerPath == nil && daemon.peerRelay == nil,
+                    "默认启动传入了控制服务或旧版状态被误判为已有传输路径")
         let mode = try FileManager.default.attributesOfItem(atPath: base.path)[.posixPermissions] as? NSNumber
         try require(mode?.intValue == 0o700, "节点状态目录权限错误")
         let loopback = NWParameters.udp
@@ -123,9 +169,39 @@ struct EmbeddedTailnetChecks {
         cancel()
         try await eventually("取消过程中建立的端口没有释放") { log().components(separatedBy: "close 34907\n").count == 3 }
         try require(!cancelledCompleted, "已取消的连接继续启动")
+
+        try Data("derp".utf8).write(to: pathFixture, options: .atomic)
+        try daemon.setControlURL(" \(control) ")
+        try await eventually("组件未携带控制服务参数重启或未发布 DERP 路径") {
+            log().contains("launch \(control)\n") && daemon.state == "Running" && daemon.peerPath == "derp" && daemon.peerRelay == "hkg"
+        }
+        try require(defaults.string(forKey: "embeddedTailnetControlURL") == control, "启用后未保存规范化的控制服务配置")
+
+        try Data("direct".utf8).write(to: pathFixture, options: .atomic)
+        daemon.login()
+        try await eventually("未发布 P2P 路径或沿用了上一条 DERP 区域") {
+            !daemon.changingAccount && daemon.peerPath == "direct" && daemon.peerRelay == nil
+        }
+        try FileManager.default.removeItem(at: pathFixture)
+        daemon.login()
+        try await eventually("较旧的状态回复省略路径字段后没有清除 P2P 路径") {
+            !daemon.changingAccount && daemon.peerPath == nil && daemon.peerRelay == nil
+        }
+
+        try Data("derp".utf8).write(to: pathFixture, options: .atomic)
+        daemon.login()
+        try await eventually("未恢复模拟的 DERP 路径") { !daemon.changingAccount && daemon.peerPath == "derp" }
+        try daemon.setControlURL("")
+        try require(daemon.controlURL.isEmpty && daemon.peerPath == nil && daemon.peerRelay == nil,
+                    "恢复默认设置时没有同步清除旧组件的路径状态")
+        try await eventually("恢复默认设置后没有用官方默认参数重启") {
+            log().components(separatedBy: "launch official\n").count == 3 && daemon.state == "Running"
+        }
+        try require((defaults.string(forKey: "embeddedTailnetControlURL") ?? "").isEmpty && daemon.peerPath == nil && daemon.peerRelay == nil,
+                    "恢复默认设置后仍保留自定义控制服务或旧路径")
         daemon.disable(logout: true)
         try await eventually("退出账号后组件依然启用") { !daemon.enabled && !daemon.changingAccount }
         try require(log().contains("logout 0\n") && !defaults.bool(forKey: "embeddedTailnetEnabled"), "退出账号未完成")
-        print("PASS Embedded Tailscale opt-in, login URL, forward lifecycle, cancellation and logout (synthetic helper)")
+        print("PASS Embedded Tailscale opt-in, control server restart and login URL, P2P/DERP status, forward lifecycle, cancellation and logout (synthetic helper)")
     }
 }

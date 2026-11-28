@@ -6,7 +6,7 @@ import QuietDeskCore
 @MainActor
 final class EmbeddedTailnet: ObservableObject {
     private struct Reply: Decodable {
-        private enum CodingKeys: String, CodingKey { case id, state, ip, authURL, port, udp, error }
+        private enum CodingKeys: String, CodingKey { case id, state, ip, authURL, port, udp, error, peerPath, peerRelay }
         var source: Process?
         let id: Int
         let state: String?
@@ -15,6 +15,8 @@ final class EmbeddedTailnet: ObservableObject {
         let port: UInt16?
         let udp: Bool?
         let error: String?
+        let peerPath: String?
+        let peerRelay: String?
     }
 
     private struct Request: Encodable {
@@ -36,6 +38,9 @@ final class EmbeddedTailnet: ObservableObject {
     @Published private(set) var shared = Exposure()
     @Published private(set) var message: String?
     @Published private(set) var changingAccount = false
+    @Published private(set) var peerPath: String?
+    @Published private(set) var peerRelay: String?
+    @Published private(set) var controlURL: String
 
     private let defaults: UserDefaults
     private let executable: URL
@@ -63,6 +68,7 @@ final class EmbeddedTailnet: ObservableObject {
         self.directory = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(AppDataLocation.folderName()).appendingPathComponent("Tailscale", isDirectory: true)
         enabled = defaults.bool(forKey: "embeddedTailnetEnabled")
+        controlURL = defaults.string(forKey: "embeddedTailnetControlURL") ?? ""
         if enabled { startPolling() }
     }
 
@@ -73,6 +79,7 @@ final class EmbeddedTailnet: ObservableObject {
         let child = Process(), stdin = Pipe(), stdout = Pipe()
         child.executableURL = executable
         child.arguments = ["--state-dir", directory.path]
+        if !controlURL.isEmpty { child.arguments?.append(contentsOf: ["--control-url", controlURL]) }
         child.standardInput = stdin
         child.standardOutput = stdout
         child.standardError = FileHandle.nullDevice
@@ -131,6 +138,8 @@ final class EmbeddedTailnet: ObservableObject {
         state = ""
         ip = nil
         shared = Exposure()
+        peerPath = nil
+        peerRelay = nil
     }
 
     private func received(_ reply: Reply, from child: Process) {
@@ -141,6 +150,11 @@ final class EmbeddedTailnet: ObservableObject {
     }
 
     private func request(_ op: String, host: String? = nil, port: UInt16? = nil, udp: Bool? = nil) async throws -> Reply {
+        // The replacement helper reuses the private state directory and the WireGuard port.
+        if process == nil, let processExit {
+            await processExit.value
+            try Task.checkCancellation()
+        }
         guard enabled else { throw DeskError.invalid("请先在「网络与线路 → Tailscale」登录") }
         try launch()
         guard let child = process, let input else { throw DeskError.invalid("无法启动 Tailscale 组件") }
@@ -163,10 +177,55 @@ final class EmbeddedTailnet: ObservableObject {
         return reply
     }
 
-    static func loginURL(_ value: String) -> URL? {
+    static func normalizedControlURL(_ value: String) throws -> String {
+        let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty { return "" }
+        let invalid = DeskError.invalid("Tailscale 控制服务地址需为 https://域名或IP[:端口]，且不含账号密码或查询参数")
+        guard text.prefix(8).lowercased() == "https://",
+              let url = URL(string: text, encodingInvalidCharacters: false),
+              let parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let host = parts.host, !host.isEmpty,
+              parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
+              parts.rangeOfPort == nil || parts.port != nil, (1...65_535).contains(parts.port ?? 443) else { throw invalid }
+        let authority = text.dropFirst(8).prefix { $0 != "/" }
+        guard !authority.hasSuffix(":"), !authority.contains("%") else { throw invalid }
+        if authority.hasPrefix("[") {
+            guard let closing = authority.firstIndex(of: "]"),
+                  closing == authority.index(before: authority.endIndex) || (parts.port != nil && authority[authority.index(after: closing)] == ":"),
+                  IPv6Address(String(authority[authority.index(after: authority.startIndex)..<closing])) != nil else { throw invalid }
+        } else {
+            let hostname = authority.prefix { $0 != ":" }
+            let domain = hostname.hasSuffix(".") ? hostname.dropLast() : hostname
+            let labels = domain.split(separator: ".", omittingEmptySubsequences: false)
+            let numericHost = domain.utf8.allSatisfy { (48...57).contains($0) || $0 == 46 }
+            guard !domain.isEmpty, domain.utf8.count <= 253,
+                  !numericHost || IPv4Address(String(domain)) != nil,
+                  labels.allSatisfy({ label in
+                      (1...63).contains(label.utf8.count) && !label.hasPrefix("-") && !label.hasSuffix("-") &&
+                          label.utf8.allSatisfy { (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 }
+                  }) else { throw invalid }
+        }
+        return text
+    }
+
+    func setControlURL(_ value: String) throws {
+        let normalized = try Self.normalizedControlURL(value)
+        guard normalized != controlURL else { return }
+        controlURL = normalized
+        defaults.set(normalized, forKey: "embeddedTailnetControlURL")
+        browserRequested = false
+        if process != nil { shutdown() }
+        if enabled { startPolling() }
+    }
+
+    static func loginURL(_ value: String, controlURL: String? = nil) -> URL? {
         guard let url = URL(string: value), url.scheme?.lowercased() == "https",
-              let host = url.host?.lowercased(), ["login.tailscale.com", "controlplane.tailscale.com"].contains(host),
-              url.user == nil, url.password == nil, url.port == nil || url.port == 443 else { return nil }
+              let parts = URLComponents(url: url, resolvingAgainstBaseURL: false), parts.rangeOfPort == nil || url.port != nil,
+              let host = url.host?.lowercased(), url.user == nil, url.password == nil else { return nil }
+        let port = url.port ?? 443
+        if ["login.tailscale.com", "controlplane.tailscale.com"].contains(host), port == 443 { return url }
+        guard let controlURL, let normalized = try? normalizedControlURL(controlURL), !normalized.isEmpty,
+              let control = URL(string: normalized), host == control.host?.lowercased(), port == (control.port ?? 443) else { return nil }
         return url
     }
 
@@ -180,6 +239,8 @@ final class EmbeddedTailnet: ObservableObject {
         guard reply.source === process, let backendState = reply.state else { return }
         state = backendState
         ip = reply.ip
+        peerPath = reply.peerPath
+        peerRelay = reply.peerRelay
         updateExposure(reply)
         if message == lastStatusError { message = nil }
         lastStatusError = nil
@@ -188,7 +249,7 @@ final class EmbeddedTailnet: ObservableObject {
             synchronizeSharing()
         } else if browserRequested, let address = reply.authURL, !address.isEmpty {
             browserRequested = false
-            guard let url = Self.loginURL(address), NSWorkspace.shared.open(url) else {
+            guard let url = Self.loginURL(address, controlURL: controlURL), NSWorkspace.shared.open(url) else {
                 message = "无法打开 Tailscale 登录页，请重新登录"
                 return
             }
@@ -316,7 +377,8 @@ final class EmbeddedTailnet: ObservableObject {
             do {
                 guard !Task.isCancelled else { return }
                 let reply = try await request("open", host: host, port: port)
-                owner = reply.source
+                guard let source = reply.source, process === source else { throw DeskError.invalid("Tailscale 组件已断开") }
+                owner = source
                 guard let port = reply.port, port != 0 else { throw DeskError.invalid("Tailscale 没有返回可用端口") }
                 if Task.isCancelled { self.closeBridge(port, on: owner); return }
                 localPort = port

@@ -4,6 +4,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,7 +13,9 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,6 +23,7 @@ import (
 
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/logger"
@@ -35,29 +39,41 @@ type request struct {
 }
 
 type response struct {
-	ID      int    `json:"id"`
-	State   string `json:"state,omitempty"`
-	IP      string `json:"ip,omitempty"`
-	AuthURL string `json:"authURL,omitempty"`
-	Port    uint16 `json:"port,omitempty"`
-	Error   string `json:"error,omitempty"`
-	UDP     bool   `json:"udp,omitempty"`
+	ID        int    `json:"id"`
+	State     string `json:"state,omitempty"`
+	IP        string `json:"ip,omitempty"`
+	AuthURL   string `json:"authURL,omitempty"`
+	Port      uint16 `json:"port,omitempty"`
+	Error     string `json:"error,omitempty"`
+	UDP       bool   `json:"udp,omitempty"`
+	PeerPath  string `json:"peerPath,omitempty"`
+	PeerRelay string `json:"peerRelay,omitempty"`
 }
 
 type helper struct {
-	server    *tsnet.Server
-	local     *local.Client
-	sharedTCP *bridge
-	sharedUDP *bridge
-	port      uint16
-	boundIP   string
-	outbound  map[uint16]*bridge
+	server       *tsnet.Server
+	portStateDir string
+	local        *local.Client
+	sharedTCP    *bridge
+	sharedUDP    *bridge
+	port         uint16
+	boundIP      string
+	outbound     map[uint16]*bridge
+	lastPeerIP   netip.Addr
+	lastPeerPort uint16
 }
 
 func main() {
 	stateDir := flag.String("state-dir", "", "private node state directory")
+	controlURL := flag.String("control-url", "", "custom HTTPS control server URL")
+	listenPort := flag.Uint("listen-port", 0, "WireGuard UDP port (0 reuses a port in the state directory)")
 	flag.Parse()
-	if *stateDir == "" || flag.NArg() != 0 {
+	if *stateDir == "" || flag.NArg() != 0 || *listenPort > 65535 {
+		os.Exit(2)
+	}
+	control, err := normalizedControlURL(*controlURL)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
 	log.SetOutput(io.Discard)
@@ -69,11 +85,124 @@ func main() {
 		}
 	}
 	machine, _ := os.Hostname()
-	node := tsnet.Server{Dir: *stateDir, Hostname: dnsname.SanitizeHostname("quietdesk-" + machine), Logf: logger.Discard, UserLogf: logger.Discard}
-	h := helper{server: &node, outbound: make(map[uint16]*bridge)}
+	node := tsnet.Server{Dir: nodeStateDir(*stateDir, control), Hostname: dnsname.SanitizeHostname("quietdesk-" + machine),
+		Logf: logger.Discard, UserLogf: logger.Discard, ControlURL: control, Port: uint16(*listenPort)}
+	h := helper{server: &node, portStateDir: *stateDir, outbound: make(map[uint16]*bridge)}
 	defer node.Close()
 	defer h.closeRoutes()
 	serve(os.Stdin, os.Stdout, h.handle)
+}
+
+func normalizedControlURL(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	invalid := errors.New("control URL must use HTTPS (or loopback HTTP for testing) without credentials, query, or fragment")
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.ForceQuery || parsed.RawQuery != "" || strings.Contains(value, "#") {
+		return "", invalid
+	}
+	host := parsed.Hostname()
+	loopback := host == "127.0.0.1" || strings.EqualFold(host, "localhost")
+	if parsed.Scheme != "https" && (parsed.Scheme != "http" || !loopback) {
+		return "", invalid
+	}
+	host = strings.ToLower(host)
+	canonicalHost := host
+	if strings.HasPrefix(parsed.Host, "[") {
+		ip, err := netip.ParseAddr(host)
+		if err != nil || !ip.Is6() || ip.Zone() != "" {
+			return "", invalid
+		}
+		host = ip.String()
+		canonicalHost = "[" + host + "]"
+	} else if dnsname.ValidHostname(host) != nil {
+		return "", invalid
+	}
+	if port := parsed.Port(); port != "" || strings.HasSuffix(parsed.Host, ":") {
+		n, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || n == 0 {
+			return "", invalid
+		}
+		if !(parsed.Scheme == "https" && n == 443 || parsed.Scheme == "http" && n == 80) {
+			canonicalHost = net.JoinHostPort(host, strconv.FormatUint(n, 10))
+		}
+	}
+	parsed.Host = canonicalHost
+	if parsed.EscapedPath() == "/" {
+		parsed.Path = ""
+	}
+	return parsed.String(), nil
+}
+
+func nodeStateDir(stateDir, controlURL string) string {
+	if controlURL == "" {
+		return stateDir
+	}
+	// tsnet reuses saved enrollment when its ControlURL changes in the same directory.
+	return filepath.Join(stateDir, fmt.Sprintf("control-%x", sha256.Sum256([]byte(controlURL))))
+}
+
+func persistedListenPort(stateDir string) (uint16, error) {
+	if err := os.MkdirAll(stateDir, 0700); err != nil {
+		return 0, err
+	}
+	path := filepath.Join(stateDir, "wg-port")
+	if port, err := readListenPort(path); !errors.Is(err, os.ErrNotExist) {
+		return port, err
+	}
+	udp, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return 0, err
+	}
+	defer udp.Close()
+	port := uint16(udp.LocalAddr().(*net.UDPAddr).Port)
+	if port < 1024 {
+		return 0, errors.New("automatic UDP port is outside the unprivileged range")
+	}
+	file, err := os.CreateTemp(stateDir, ".wg-port-*")
+	if err != nil {
+		return 0, err
+	}
+	defer os.Remove(file.Name())
+	if _, err = fmt.Fprintln(file, port); err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return 0, err
+	}
+	// Publish a complete file without replacing a port chosen by another process.
+	if err := os.Link(file.Name(), path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return readListenPort(path)
+		}
+		return 0, err
+	}
+	return port, nil
+}
+
+func readListenPort(path string) (uint16, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, err
+	}
+	invalid := errors.New("invalid wg-port file")
+	if !info.Mode().IsRegular() || info.Size() > 32 {
+		return 0, invalid
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	port, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 16)
+	if err != nil || port < 1024 {
+		return 0, invalid
+	}
+	return uint16(port), nil
 }
 
 func serve(in io.Reader, out io.Writer, handle func(request) (response, error)) {
@@ -101,6 +230,13 @@ func serve(in io.Reader, out io.Writer, handle func(request) (response, error)) 
 func (h *helper) handle(req request) (response, error) {
 	var res response
 	if h.local == nil {
+		if h.server.Port == 0 && h.portStateDir != "" {
+			port, err := persistedListenPort(h.portStateDir)
+			if err != nil {
+				return res, fmt.Errorf("无法保存 WireGuard UDP 端口：%w", err)
+			}
+			h.server.Port = port
+		}
 		lc, err := h.server.LocalClient()
 		if err != nil {
 			return res, fmt.Errorf("无法启动 Tailscale 节点：%w", err)
@@ -127,6 +263,9 @@ func (h *helper) handle(req request) (response, error) {
 		if b := h.outbound[req.Port]; b != nil {
 			b.close()
 			delete(h.outbound, req.Port)
+			if req.Port == h.lastPeerPort {
+				h.lastPeerIP, h.lastPeerPort = netip.Addr{}, 0
+			}
 		}
 		return res, nil
 	case "share":
@@ -142,7 +281,11 @@ func (h *helper) handle(req request) (response, error) {
 }
 
 func (h *helper) status(ctx context.Context) (response, error) {
-	st, err := h.local.StatusWithoutPeers(ctx)
+	readStatus := h.local.StatusWithoutPeers
+	if h.sharedTCP != nil || len(h.outbound) > 0 {
+		readStatus = h.local.Status
+	}
+	st, err := readStatus(ctx)
 	if err != nil {
 		return response{}, fmt.Errorf("无法读取 Tailscale 状态：%w", err)
 	}
@@ -156,8 +299,33 @@ func (h *helper) status(ctx context.Context) (response, error) {
 	if h.sharedTCP != nil && (res.State != ipn.Running.String() || res.IP != h.boundIP) {
 		h.stopSharing()
 	}
+	if res.State == ipn.Running.String() && (h.sharedTCP != nil || len(h.outbound) > 0) {
+		if peer := statusPeer(st, h.lastPeerIP); peer != nil {
+			if peer.CurAddr != "" {
+				res.PeerPath, res.PeerRelay = "direct", peer.Relay
+			} else if peer.Active || peer.InMagicSock || peer.Relay != "" {
+				res.PeerPath, res.PeerRelay = "derp", peer.Relay
+			}
+		}
+	}
 	res.Port, res.UDP = h.port, h.sharedUDP != nil
 	return res, nil
+}
+
+func statusPeer(st *ipnstate.Status, target netip.Addr) *ipnstate.PeerStatus {
+	var active *ipnstate.PeerStatus
+	for _, peer := range st.Peer {
+		if peer == nil {
+			continue
+		}
+		if target.IsValid() && peer.InNetworkMap && slices.Contains(peer.TailscaleIPs, target) {
+			return peer
+		}
+		if active == nil && peer.Active {
+			active = peer
+		}
+	}
+	return active
 }
 
 func (h *helper) stopSharing() {
@@ -177,6 +345,7 @@ func (h *helper) stopUDP() {
 
 func (h *helper) closeRoutes() {
 	h.stopSharing()
+	h.lastPeerIP, h.lastPeerPort = netip.Addr{}, 0
 	for port, b := range h.outbound {
 		b.close()
 		delete(h.outbound, port)
@@ -262,6 +431,7 @@ func (h *helper) open(ctx context.Context, host string, port uint16) (uint16, er
 		}
 		return dialer.NetstackDialUDP(ctx, target)
 	})
+	h.lastPeerIP, h.lastPeerPort = ip, bound
 	return bound, nil
 }
 

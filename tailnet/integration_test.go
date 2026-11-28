@@ -122,6 +122,15 @@ func TestPairedNodesUseRelayedTailnet(t *testing.T) {
 	}
 	defer udpClient.Close()
 	roundTrip(udpClient, "datagram")
+	for _, node := range []*helper{viewer, host} {
+		status, err := node.handle(request{Op: "status"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.PeerPath != "derp" {
+			t.Fatalf("embedded node reported path %q and region %q with forced DERP", status.PeerPath, status.PeerRelay)
+		}
+	}
 	if _, err := host.handle(request{Op: "share", Port: port}); err != nil {
 		t.Fatal(err)
 	}
@@ -138,5 +147,8 @@ func TestPairedNodesUseRelayedTailnet(t *testing.T) {
 	}
 	if _, err := viewer.handle(request{Op: "close", Port: route.Port}); err != nil {
 		t.Fatal(err)
+	}
+	if status, err := viewer.handle(request{Op: "status"}); err != nil || status.PeerPath != "" || status.PeerRelay != "" {
+		t.Fatalf("closed route returned a peer path: %+v, %v", status, err)
 	}
 }

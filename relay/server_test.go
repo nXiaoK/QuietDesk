@@ -66,6 +66,10 @@ func (socket privatePortSocket) LocalAddr() net.Addr {
 }
 
 func newFixtureWithDatagrams(t *testing.T, cfg Config, blocked, privatePort, ipv6Datagrams bool) *fixture {
+	return newFixtureWithProbe(t, cfg, blocked, privatePort, ipv6Datagrams, nil)
+}
+
+func newFixtureWithProbe(t *testing.T, cfg Config, blocked, privatePort, ipv6Datagrams bool, probe net.PacketConn) *fixture {
 	t.Helper()
 	if cfg.AccessKey == nil {
 		cfg.AccessKey = randomKey(t)
@@ -136,7 +140,13 @@ func newFixtureWithDatagrams(t *testing.T, cfg Config, blocked, privatePort, ipv
 		packets = privatePortSocket{packets}
 	}
 	go func() {
-		if err := server.Serve(listener, packets); err != nil {
+		var err error
+		if probe == nil {
+			err = server.Serve(listener, packets)
+		} else {
+			err = server.ServeWithProbe(listener, packets, probe)
+		}
+		if err != nil {
 			t.Errorf("serve: %v", err)
 		}
 	}()
@@ -605,8 +615,8 @@ func TestAssistedLeaseExchangesCandidatesOnlyAfterBothConsent(t *testing.T) {
 	lease := f.dial(t)
 	write(t, lease, Message{Op: "datagram", DeviceID: deviceA, AccessKey: f.access, Assist: true})
 	host := read(t, registration, "incomingDatagram")
-	if !host.Assist {
-		t.Fatal("negotiated lease did not offer assistance to the host")
+	if !host.Assist || host.ProbeUDPPort != 0 {
+		t.Fatal("legacy Serve should offer assistance without an auxiliary port")
 	}
 	var id [16]byte
 	copy(id[:], host.DatagramID)
@@ -632,8 +642,8 @@ func TestAssistedLeaseExchangesCandidatesOnlyAfterBothConsent(t *testing.T) {
 	}
 	send(hostSocket, 1, host.DatagramKey)
 	viewer := read(t, lease, "datagramReady")
-	if !viewer.Assist {
-		t.Fatal("negotiated lease did not offer assistance to the viewer")
+	if !viewer.Assist || viewer.ProbeUDPPort != 0 {
+		t.Fatal("legacy Serve should offer assistance without an auxiliary port")
 	}
 	send(viewerSocket, 0, viewer.DatagramKey)
 	until(t, func() bool {
@@ -675,17 +685,113 @@ func TestAssistedLeaseExchangesCandidatesOnlyAfterBothConsent(t *testing.T) {
 	read(t, registration, "pong")
 }
 
+func TestAssistedLeaseAnnouncesTwoDistinctReflexiveMappings(t *testing.T) {
+	probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { probe.Close() })
+	f := newFixtureWithProbe(t, Config{}, false, false, false, probe)
+	probeAddress := probe.LocalAddr().(*net.UDPAddr)
+	registration := f.dial(t)
+	write(t, registration, Message{Op: "register", AccessKey: f.access, DeviceID: deviceA, OwnerKey: randomKey(t), Assist: true})
+	read(t, registration, "registered")
+	lease := f.dial(t)
+	write(t, lease, Message{Op: "datagram", DeviceID: deviceA, AccessKey: f.access, Assist: true})
+	host := read(t, registration, "incomingDatagram")
+	if host.ProbeUDPPort != probeAddress.Port || host.UDPPort != f.udpAddress.Port {
+		t.Fatalf("unexpected host UDP ports: %d %d", host.UDPPort, host.ProbeUDPPort)
+	}
+	var id [16]byte
+	copy(id[:], host.DatagramID)
+	dial := func(address *net.UDPAddr) *net.UDPConn {
+		conn, err := net.DialUDP("udp4", nil, address)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		return conn
+	}
+	send := func(conn *net.UDPConn, side byte, sequence uint64, payload, key []byte) {
+		packet, err := EncodeDatagram(Datagram{Side: side, Sequence: sequence, ID: id, Payload: payload}, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write(packet); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hostProbe, hostMain, viewerMain, replayProbe := dial(probeAddress), dial(f.udpAddress), dial(f.udpAddress), dial(probeAddress)
+	send(replayProbe, 1, 1, nil, randomKey(t))
+	until(t, func() bool { return f.server.Snapshot().RejectedDatagrams == 1 })
+	send(hostProbe, 1, 1, nil, host.DatagramKey)
+	// An auxiliary probe cannot complete registration, even when authenticated.
+	silent(t, lease, 75*time.Millisecond)
+	send(hostMain, 1, 1, nil, host.DatagramKey)
+	viewer := read(t, lease, "datagramReady")
+	if viewer.ProbeUDPPort != probeAddress.Port || viewer.UDPPort != f.udpAddress.Port {
+		t.Fatalf("unexpected viewer UDP ports: %d %d", viewer.UDPPort, viewer.ProbeUDPPort)
+	}
+	send(viewerMain, 0, 1, nil, viewer.DatagramKey)
+	until(t, func() bool {
+		f.server.mu.Lock()
+		defer f.server.mu.Unlock()
+		active := f.server.datagrams[id]
+		return active != nil && active.addresses[0] != nil && active.probeAddresses[1] != nil
+	})
+	send(replayProbe, 1, 1, nil, host.DatagramKey)
+	until(t, func() bool { return f.server.Snapshot().RejectedDatagrams == 2 })
+	write(t, lease, Message{Op: "assist", DatagramID: id[:]})
+	silent(t, lease, 40*time.Millisecond)
+	write(t, registration, Message{Op: "assist", DatagramID: id[:]})
+	viewerCandidates := read(t, lease, "peerCandidates").Candidates
+	read(t, registration, "peerCandidates")
+	port := func(conn *net.UDPConn) int { return conn.LocalAddr().(*net.UDPAddr).Port }
+	expected := []Candidate{{"srflx", "127.0.0.1", port(hostMain)}, {"srflx", "127.0.0.1", port(hostProbe)}}
+	if candidateKey(viewerCandidates) != candidateKey(expected) {
+		t.Fatalf("expected two mappings in observation order, got %v", viewerCandidates)
+	}
+	// Probe payloads, even authenticated ones, must be isolated from main forwarding and sequencing.
+	send(hostProbe, 1, 20, []byte("auxiliary"), host.DatagramKey)
+	send(hostMain, 1, 2, []byte("main"), host.DatagramKey)
+	viewerMain.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buffer := make([]byte, DatagramOverhead+MaxDatagramPayload)
+	n, err := viewerMain.Read(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := DecodeDatagram(buffer[:n], viewer.DatagramKey)
+	if err != nil || !packet.Downstream || packet.Sequence != 1 || string(packet.Payload) != "main" {
+		t.Fatalf("unexpected forwarded datagram: %+v (%v)", packet, err)
+	}
+	viewerMain.SetReadDeadline(time.Now().Add(75 * time.Millisecond))
+	if n, err := viewerMain.Read(buffer); n != 0 || err == nil {
+		t.Fatal("probe payload was forwarded")
+	}
+
+	send(replayProbe, 1, 21, nil, host.DatagramKey)
+	expected[1].Port = port(replayProbe)
+	if updated := read(t, lease, "peerCandidates").Candidates; candidateKey(updated) != candidateKey(expected) {
+		t.Fatalf("updated auxiliary mapping was not announced: %v", updated)
+	}
+}
+
 func TestAssistIsCapabilityGatedAndValidated(t *testing.T) {
-	f := newFixture(t, Config{})
+	probe, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { probe.Close() })
+	f := newFixtureWithProbe(t, Config{}, false, false, false, probe)
 	legacy, _ := f.register(t, deviceA, randomKey(t))
 	lease := f.dial(t)
 	write(t, lease, Message{Op: "datagram", DeviceID: deviceA, AccessKey: f.access, Assist: true})
 	offered := read(t, legacy, "incomingDatagram")
-	if offered.Assist {
+	if offered.Assist || offered.ProbeUDPPort != 0 {
 		t.Fatal("assistance offered to a host that never declared it")
 	}
 	data, _ := json.Marshal(Message{Op: "datagramReady", DatagramID: offered.DatagramID})
-	if strings.Contains(string(data), "assist") || strings.Contains(string(data), "candidates") {
+	if strings.Contains(string(data), "assist") || strings.Contains(string(data), "candidates") || strings.Contains(string(data), "probeUDPPort") {
 		t.Fatal("unnegotiated messages changed their wire bytes")
 	}
 	var id [16]byte
@@ -697,7 +803,7 @@ func TestAssistIsCapabilityGatedAndValidated(t *testing.T) {
 	defer hostSocket.Close()
 	packet, _ := EncodeDatagram(Datagram{Side: 1, Sequence: 1, ID: id}, offered.DatagramKey)
 	hostSocket.Write(packet)
-	if read(t, lease, "datagramReady").Assist {
+	if ready := read(t, lease, "datagramReady"); ready.Assist || ready.ProbeUDPPort != 0 {
 		t.Fatal("assistance offered to a viewer of a legacy host")
 	}
 	// Without negotiation an assist request is an unknown operation that ends the lease.
@@ -712,7 +818,7 @@ func TestAssistIsCapabilityGatedAndValidated(t *testing.T) {
 	plain := f.dial(t)
 	write(t, plain, Message{Op: "datagram", DeviceID: deviceB, AccessKey: f.access})
 	offered = read(t, capable, "incomingDatagram")
-	if offered.Assist {
+	if offered.Assist || offered.ProbeUDPPort != 0 {
 		t.Fatal("assistance offered without the viewer's request")
 	}
 	// A host consent for an unnegotiated or vanished lease is ignored without losing the registration.
@@ -724,7 +830,10 @@ func TestAssistIsCapabilityGatedAndValidated(t *testing.T) {
 	for _, candidates := range [][]Candidate{
 		{{Kind: "host", Address: "127.0.0.1", Port: 5000}},
 		{{Kind: "host", Address: "fe80::1", Port: 5000}},
+		{{Kind: "host", Address: "2001:db8::1%en0", Port: 5000}},
+		{{Kind: "host", Address: "192.0.2.1/24", Port: 5000}},
 		{{Kind: "host", Address: "224.0.0.1", Port: 5000}},
+		{{Kind: "host", Address: "255.255.255.255", Port: 5000}},
 		{{Kind: "host", Address: "0.0.0.0", Port: 5000}},
 		{{Kind: "host", Address: "relay.example.com", Port: 5000}},
 		{{Kind: "srflx", Address: "192.0.2.1", Port: 5000}},

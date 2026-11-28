@@ -201,6 +201,7 @@ public final class RelayViewerBridge: @unchecked Sendable {
                         if message.assist == true, self.peerAssist != .off {
                             let assisted = try RelayAssistedPipe(endpoint: self.endpoint, id: id, key: key, side: 0, mode: self.peerAssist,
                                                                  queue: self.queue, counter: self.peerTraffic,
+                                                                 probePort: message.probePort(relativeTo: self.endpoint),
                                                                  interfaceCandidates: self.peerInterfaceCandidates)
                             assisted.onConsent = { [weak self, weak channel] candidates in
                                 guard let self, let channel, self.datagramGeneration == token else { return }

@@ -4,7 +4,10 @@ import Network
 
 // Drives the real RelayPeerAgent through a synthetic two-NAT network with a millisecond clock.
 private final class SimulatedPeerNetwork {
-    enum NAT { case fullCone, portRestricted, symmetric }
+    enum NAT: Equatable {
+        case fullCone, portRestricted, symmetric
+        case linearSymmetric(step: UInt16)
+    }
     final class Endpoint {
         let agent: RelayPeerAgent
         let privateAddress: RelayPeerAddress
@@ -21,6 +24,7 @@ private final class SimulatedPeerNetwork {
     }
 
     let relay = RelayPeerAddress(host: "198.18.0.1", port: 7443)
+    let relayProbe = RelayPeerAddress(host: "198.18.0.1", port: 7444)
     let viewer: Endpoint
     let host: Endpoint
     var directLatency: TimeInterval = 0.02
@@ -43,19 +47,32 @@ private final class SimulatedPeerNetwork {
     }
 
     func mapping(_ endpoint: Endpoint, toward destination: RelayPeerAddress) -> RelayPeerAddress {
-        let key = endpoint.nat == .symmetric ? destination.description : "*"
+        let key: String
+        let step: UInt16
+        switch endpoint.nat {
+        case .fullCone, .portRestricted:
+            key = "*"; step = 1
+        case .symmetric:
+            key = destination.description; step = 1
+        case .linearSymmetric(let portStep):
+            key = destination.description; step = portStep
+        }
         let port = endpoint.mappings[key] ?? { () -> UInt16 in
-            let port = endpoint.nextPort; endpoint.nextPort += 1; endpoint.mappings[key] = port; return port
+            let port = endpoint.nextPort; endpoint.nextPort += step; endpoint.mappings[key] = port; return port
         }()
         endpoint.permissions.insert("\(port)|\(destination.host)|\(destination.port)")
         return RelayPeerAddress(host: endpoint.publicIP, port: port)
     }
 
-    /// The node announces each side's relay-facing mapping plus the other side's interface address.
-    func announce(includeInterfaceCandidates: Bool = true) {
+    /// The node announces each side's observed mappings and interface address to the other side.
+    func announce(includeInterfaceCandidates: Bool = true, includeProbe: Bool = false) {
         func candidates(for endpoint: Endpoint) -> [RelayCandidate] {
             let mapped = mapping(endpoint, toward: relay)
             var result = [RelayCandidate(kind: .srflx, address: mapped.host, port: mapped.port)]
+            if includeProbe {
+                let probed = mapping(endpoint, toward: relayProbe)
+                if mapped != probed { result.append(RelayCandidate(kind: .srflx, address: probed.host, port: probed.port)) }
+            }
             if includeInterfaceCandidates {
                 result.append(RelayCandidate(kind: .host, address: endpoint.privateAddress.host, port: endpoint.privateAddress.port))
             }
@@ -138,6 +155,74 @@ private final class SimulatedPeerNetwork {
 }
 
 func runRelayPeerPathChecks() {
+    run("NAT classification distinguishes cone, linear and random observed mappings") {
+        func mappings(_ ports: UInt16...) -> [RelayPeerAddress] { ports.map { RelayPeerAddress(host: "198.51.100.10", port: $0) } }
+        try check(NATClassifier.classify(mappedAddresses: []) == .blockedOrUnknown, "Empty observations classified as a usable mapping")
+        try check(NATClassifier.classify(mappedAddresses: [RelayPeerAddress(host: "invalid.test", port: 40_000)] + mappings(0)) == .blockedOrUnknown,
+                  "Invalid mapping addresses or ports were accepted")
+        try check(NATClassifier.classify(mappedAddresses: mappings(40_000)) == .cone, "A single mapping did not use the cone heuristic")
+        try check(NATClassifier.classify(mappedAddresses: mappings(40_000, 40_000, 40_000)) == .cone, "A stable mapping was not cone")
+        for step: UInt16 in [1, 2, 4] {
+            try check(NATClassifier.classify(mappedAddresses: mappings(40_000, 40_000 + step, 40_000 + 2 * step)) == .linearSymmetric(step: Int(step)),
+                      "Positive linear step \(step) was misclassified")
+        }
+        try check(NATClassifier.classify(mappedAddresses: mappings(40_000, 40_002, 40_006)) == .linearSymmetric(step: 2),
+                  "A small step variation should keep the first observed positive step")
+        for irregular in [mappings(40_000, 40_001, 40_005), mappings(40_000, 39_999), mappings(40_000, 40_017),
+                          mappings(40_000) + [RelayPeerAddress(host: "2001:db8::10", port: 40_001)]] {
+            try check(NATClassifier.classify(mappedAddresses: irregular) == .randomSymmetric, "An irregular mapping claimed a stable step")
+        }
+    }
+    run("Hole-punch strategy matrix and address predictions stay bounded") {
+        let strategies: [(NATType, NATType, HolePunchingStrategy)] = [
+            (.blockedOrUnknown, .cone, .skipToRelay), (.randomSymmetric, .randomSymmetric, .skipToRelay),
+            (.cone, .cone, .directPunch), (.cone, .linearSymmetric(step: 2), .singleSidePortPrediction(step: 2)),
+            (.linearSymmetric(step: 0), .cone, .singleSidePortPrediction(step: 1)),
+            (.linearSymmetric(step: 2), .linearSymmetric(step: 4), .dualLinearPortPrediction(localStep: 2, remoteStep: 4)),
+            (.cone, .randomSymmetric, .burstPortScan(window: 6)), (.randomSymmetric, .linearSymmetric(step: 4), .burstPortScan(window: 6)),
+            (.linearSymmetric(step: 4), .blockedOrUnknown, .skipToRelay),
+        ]
+        for (local, remote, expected) in strategies {
+            try check(HolePunchingMatrix.strategy(local: local, remote: remote) == expected, "Wrong strategy for \(local) and \(remote)")
+        }
+        func predict(_ port: UInt16, _ nat: NATType, count: Int = 4) -> [UInt16] {
+            HolePunchingMatrix.predictAddresses(base: RelayPeerAddress(host: "198.51.100.10", port: port), remoteNAT: nat, maxCount: count).map(\.port)
+        }
+        try check(predict(40_000, .linearSymmetric(step: 2)) == [40_002, 40_004, 40_006, 40_008], "Linear prediction did not use the step")
+        try check(predict(65_504, .linearSymmetric(step: Int.max), count: Int.max) == [65_520], "Prediction crossed the maximum port or step")
+        try check(predict(1022, .linearSymmetric(step: 1)) == [1024, 1025, 1026], "Prediction targeted privileged ports")
+        try check(predict(40_000, .randomSymmetric, count: 8) == [40_001, 39_999, 40_002, 39_998, 40_003, 39_997], "Neighbor scan order or limit changed")
+        try check(predict(1024, .randomSymmetric, count: 2) == [1025, 1026] && predict(65_535, .randomSymmetric) == [65_534, 65_533, 65_532],
+                  "Neighbor scan did not skip invalid ports before applying the count")
+        try check(predict(40_000, .cone).isEmpty && predict(40_000, .randomSymmetric, count: 0).isEmpty, "Inactive predictions produced ports")
+    }
+    run("Transport path quality steps down, waits for healthy P2P and honors manual switches") {
+        var policy = TransportPathStateMachine()
+        try check(TransportPathKind.allCases == [.p2p, .udpRelay, .tlsRelay] && TransportPathKind.p2p < .udpRelay && TransportPathKind.udpRelay < .tlsRelay,
+                  "Transport path priority changed")
+        for time in 0..<15 { policy.update(loss: 0.10, latency: 0.2, now: Double(time)) }
+        try check(policy.path == .p2p, "Metrics equal to the downgrade thresholds triggered a downgrade")
+        var degraded = TransportPathStateMachine()
+        for time in 0..<14 { degraded.update(loss: 0.11, latency: 0.08, now: Double(time)) }
+        try check(degraded.path == .p2p, "Too few samples caused a downgrade")
+        try check(degraded.update(loss: 0.11, latency: 0.08, now: 14) == .udpRelay, "Loss did not downgrade P2P to UDP relay")
+        for time in 15..<29 { degraded.update(loss: 0, latency: 0.21, now: Double(time)) }
+        try check(degraded.path == .udpRelay, "A downgrade reused the previous path's sample window")
+        try check(degraded.update(loss: 0, latency: 0.21, now: 29) == .tlsRelay, "Latency did not downgrade UDP relay to TLS relay")
+        for time in 30..<60 { degraded.update(loss: 0, latency: 0.04, p2pProbeLoss: 0.01, p2pProbeLatency: 0.07, now: Double(time)) }
+        try check(degraded.path == .tlsRelay, "P2P returned before 30 healthy seconds")
+        degraded.update(loss: 0, latency: 0.04, p2pProbeLoss: 0.02, p2pProbeLatency: 0.07, now: 60)
+        for time in 61..<91 { degraded.update(loss: 0, latency: 0.04, p2pProbeLoss: 0.01, p2pProbeLatency: 0.07, now: Double(time)) }
+        try check(degraded.path == .tlsRelay, "An unhealthy probe did not restart the P2P recovery timer")
+        try check(degraded.update(loss: 0, latency: 0.04, p2pProbeLoss: 0.01, p2pProbeLatency: 0.07, now: 91) == .p2p,
+                  "Healthy P2P did not return after 30 seconds")
+        degraded.switchManually(to: .udpRelay)
+        for time in 92...125 { degraded.update(loss: 0.3, latency: 0.4, p2pProbeLoss: 0, p2pProbeLatency: 0.01, now: Double(time)) }
+        try check(degraded.manualSwitched && degraded.path == .udpRelay, "Automatic quality switched a manual path")
+        degraded.resumeAutomaticSelection()
+        try check(!degraded.manualSwitched && degraded.update(loss: 0, latency: 0.01, now: 126) == .udpRelay,
+                  "Resuming automatic selection reused samples collected during the manual switch")
+    }
     run("A delayed DTLS authentication stays bound to its admitted relay lease") {
         let queue = DispatchQueue(label: "relay-lease-test")
         let bindings = RelayHostDatagramBindings(queue: queue)
@@ -282,6 +367,20 @@ func runRelayPeerPathChecks() {
         network.run(for: 5)
         try check(network.viewer.states.filter { $0 == .checking }.count == 2, "Backoff never retried")
     }
+    run("Two observed mappings predict the linear symmetric NAT port and carry direct video") {
+        for step: UInt16 in [1, 2, 4] {
+            let network = try SimulatedPeerNetwork(viewerNAT: .portRestricted, hostNAT: .linearSymmetric(step: step))
+            network.announce(includeInterfaceCandidates: false, includeProbe: true)
+            network.run(for: 2)
+            let predicted = RelayPeerAddress(host: network.host.publicIP, port: 30_000 + 2 * step)
+            try check(network.bothDirect && network.viewer.agent.state == .direct(.srflx) && network.host.agent.state == .direct(.srflx)
+                      && network.viewer.agent.selected == predicted, "The predicted step \(step) did not nominate an srflx path: \(network.viewer.states)")
+            let video = Data([23, 254, 253, UInt8(step)])
+            try check(network.sendVideo(video), "The nominated host did not send video directly")
+            network.run(for: 0.1)
+            try check(network.viewer.delivered == [video], "Predicted mapping did not carry the video payload unchanged")
+        }
+    }
     run("A symmetric NAT reaches a full-cone host through a learned peer-reflexive address") {
         let network = try SimulatedPeerNetwork(viewerNAT: .symmetric, hostNAT: .fullCone)
         network.announce(); network.run(for: 2)
@@ -294,7 +393,7 @@ func runRelayPeerPathChecks() {
         let network = try SimulatedPeerNetwork(viewerNAT: .symmetric, hostNAT: .fullCone, mode: .on)
         network.announce()
         let hostAddress = network.mapping(network.host, toward: network.relay)
-        for _ in 0..<13 {
+        for _ in 0..<25 {
             network.run(for: 2)
             let current = network.mapping(network.viewer, toward: hostAddress)
             try check(network.bothDirect && network.host.agent.selected == current,

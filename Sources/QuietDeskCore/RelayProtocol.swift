@@ -126,17 +126,28 @@ public struct RelayMessage: Codable, Sendable {
     public var datagramID: Data?
     public var datagramKey: Data?
     public var udpPort: Int?
+    public var probeUDPPort: Int?
     public var error: RelayServiceError?
     public var assist: Bool?
     public var candidates: [RelayCandidate]?
 
     public init(_ op: Operation, accessKey: Data? = nil, deviceID: UUID? = nil, ownerKey: Data? = nil,
                 registration: String? = nil, circuitID: String? = nil, datagramID: Data? = nil,
-                datagramKey: Data? = nil, udpPort: Int? = nil, assist: Bool? = nil, candidates: [RelayCandidate]? = nil) {
+                datagramKey: Data? = nil, udpPort: Int? = nil, probeUDPPort: Int? = nil, assist: Bool? = nil,
+                candidates: [RelayCandidate]? = nil) {
         self.op = op; self.accessKey = accessKey; self.deviceID = deviceID?.uuidString.lowercased()
         self.ownerKey = ownerKey; self.registration = registration; self.circuitID = circuitID
         self.datagramID = datagramID; self.datagramKey = datagramKey; self.udpPort = udpPort
+        self.probeUDPPort = probeUDPPort
         self.assist = assist; self.candidates = candidates
+    }
+
+    /// A service behind NAT can advertise its private listener ports. Use their offset on the configured public endpoint.
+    public func probePort(relativeTo endpoint: RelayEndpoint) -> UInt16? {
+        guard let udpPort, let probeUDPPort, (1...65_535).contains(udpPort), (1...65_535).contains(probeUDPPort),
+              udpPort != probeUDPPort else { return nil }
+        let port = Int(endpoint.port) + (probeUDPPort - udpPort)
+        return (1...65_535).contains(port) ? UInt16(port) : nil
     }
 
     public func validate() throws {
@@ -148,6 +159,7 @@ public struct RelayMessage: Codable, Sendable {
               registration == nil || token(registration), circuitID == nil || token(circuitID),
               datagramID.map({ $0.count == 16 }) ?? true, datagramKey.map({ $0.count == 32 }) ?? true,
               udpPort.map({ (1...65_535).contains($0) }) ?? true,
+              probeUDPPort.map({ (1...65_535).contains($0) }) ?? true,
               candidates.map({ $0.count <= RelayCandidate.maximumPeer && $0.allSatisfy(\.wireValid) }) ?? true else { throw RelayServiceError.invalid }
         switch op {
         case .register: guard accessKey != nil, deviceID != nil, ownerKey != nil else { throw RelayServiceError.invalid }

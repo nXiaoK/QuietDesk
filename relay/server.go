@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -55,6 +56,7 @@ type Server struct {
 	connections   map[net.Conn]struct{}
 	listener      net.Listener
 	udp           net.PacketConn
+	probeUDP      net.PacketConn
 	closed        bool
 	slots         chan struct{}
 	activeTunnels int
@@ -93,12 +95,15 @@ type datagramLease struct {
 	hostReady chan struct{}
 	// Assisted direct paths: both endpoints must have negotiated the capability and,
 	// after authenticating their desktop session, consented before any address leaves the node.
-	assist    bool
-	consent   [2]bool
-	local     [2][]Candidate
-	announced [2]string
-	notify    chan struct{}
-	done      chan struct{}
+	assist         bool
+	consent        [2]bool
+	local          [2][]Candidate
+	announced      [2]string
+	notify         chan struct{}
+	done           chan struct{}
+	probePort      int
+	probeAddresses [2]net.Addr
+	probeReplay    [2]ReplayWindow
 }
 
 func (lease *datagramLease) wake() {
@@ -176,6 +181,11 @@ func NewServer(cfg Config) (*Server, error) {
 
 // The TCP listener must already terminate service TLS. Inner desktop TLS is opaque bytes.
 func (s *Server) Serve(listener net.Listener, udp net.PacketConn) error {
+	return s.ServeWithProbe(listener, udp, nil)
+}
+
+// ServeWithProbe optionally listens on a second UDP port for assisted address observations.
+func (s *Server) ServeWithProbe(listener net.Listener, udp net.PacketConn, probeUDP net.PacketConn) error {
 	s.mu.Lock()
 	if s.closed || s.listener != nil {
 		s.mu.Unlock()
@@ -183,12 +193,21 @@ func (s *Server) Serve(listener net.Listener, udp net.PacketConn) error {
 	}
 	s.listener = listener
 	s.udp = udp
+	s.probeUDP = probeUDP
+	primaryPort, probePort := datagramPort(udp), datagramPort(probeUDP)
+	serveProbe := primaryPort != 0 && probePort != 0 && primaryPort != probePort
 	if udp != nil {
+		s.wg.Add(1)
+	}
+	if serveProbe {
 		s.wg.Add(1)
 	}
 	s.mu.Unlock()
 	if udp != nil {
 		go func() { defer s.wg.Done(); s.serveUDP(udp) }()
+	}
+	if serveProbe {
+		go func() { defer s.wg.Done(); s.serveProbeUDP(probeUDP) }()
 	}
 	for {
 		conn, err := listener.Accept()
@@ -232,7 +251,7 @@ func (s *Server) Close() error {
 		return nil
 	}
 	s.closed = true
-	listener, udp := s.listener, s.udp
+	listener, udp, probeUDP := s.listener, s.udp, s.probeUDP
 	connections := make([]net.Conn, 0, len(s.connections))
 	for conn := range s.connections {
 		connections = append(connections, conn)
@@ -243,6 +262,9 @@ func (s *Server) Close() error {
 	}
 	if udp != nil {
 		udp.Close()
+	}
+	if probeUDP != nil {
+		probeUDP.Close()
 	}
 	for _, conn := range connections {
 		conn.Close()
@@ -504,7 +526,7 @@ func candidateKey(candidates []Candidate) string {
 	return text.String()
 }
 
-// announce sends each side the other's node-observed address and self-reported candidates when they changed.
+// announce sends each side the other's node-observed addresses and self-reported candidates when they changed.
 func (s *Server) announce(id [16]byte, lease *datagramLease) bool {
 	s.mu.RLock()
 	if s.datagrams[id] != lease {
@@ -522,12 +544,14 @@ func (s *Server) announce(id [16]byte, lease *datagramLease) bool {
 	for side := range lists {
 		other := 1 - side
 		list := make([]Candidate, 0, MaxPeerCandidates)
-		if address, ok := lease.addresses[other].(*net.UDPAddr); ok {
-			if candidate, ok := ReflexiveCandidate(address.AddrPort()); ok {
-				list = append(list, candidate)
-			}
+		primary, hasPrimary := ReflexiveCandidate(observedUDPAddress(lease.addresses[other]))
+		if hasPrimary {
+			list = append(list, primary)
 		}
-		list = append(list, lease.local[other]...)
+		if probe, ok := ReflexiveCandidate(observedUDPAddress(lease.probeAddresses[other])); ok && probe != primary {
+			list = append(list, probe)
+		}
+		list = append(list, lease.local[other][:min(len(lease.local[other]), MaxPeerCandidates-len(list))]...)
 		key := candidateKey(list)
 		if len(list) > 0 && key != lease.announced[side] {
 			lists[side], changed[side], lease.announced[side] = list, true, key
@@ -651,13 +675,15 @@ func (s *Server) openDatagram(conn net.Conn, message Message) {
 	lease.host = h
 	lease.assist = message.Assist && h.assist
 	s.datagrams[id] = lease
-	address, ok := s.udp.LocalAddr().(*net.UDPAddr)
-	if !ok {
+	port := datagramPort(s.udp)
+	if port == 0 {
 		delete(s.datagrams, id)
 		s.mu.Unlock()
 		return
 	}
-	port := address.Port
+	if probePort := datagramPort(s.probeUDP); lease.assist && probePort != 0 && probePort != port {
+		lease.probePort = probePort
+	}
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -666,7 +692,7 @@ func (s *Server) openDatagram(conn net.Conn, message Message) {
 		close(lease.done)
 		h.send(Message{Op: "datagramClosed", DatagramID: id[:]})
 	}()
-	if h.send(Message{Op: "incomingDatagram", DatagramID: id[:], DatagramKey: lease.keys[1][:], UDPPort: port, Assist: lease.assist}) != nil {
+	if h.send(Message{Op: "incomingDatagram", DatagramID: id[:], DatagramKey: lease.keys[1][:], UDPPort: port, ProbeUDPPort: lease.probePort, Assist: lease.assist}) != nil {
 		return
 	}
 	select {
@@ -677,7 +703,7 @@ func (s *Server) openDatagram(conn net.Conn, message Message) {
 		WriteMessage(conn, Message{Op: "error", Error: "timeout"})
 		return
 	}
-	if lease.writeViewer(Message{Op: "datagramReady", DatagramID: id[:], DatagramKey: lease.keys[0][:], UDPPort: port, Assist: lease.assist}) != nil {
+	if lease.writeViewer(Message{Op: "datagramReady", DatagramID: id[:], DatagramKey: lease.keys[0][:], UDPPort: port, ProbeUDPPort: lease.probePort, Assist: lease.assist}) != nil {
 		return
 	}
 	if lease.assist {
@@ -721,7 +747,57 @@ func (s *Server) openDatagram(conn net.Conn, message Message) {
 	}
 }
 
+func datagramPort(conn net.PacketConn) int {
+	if conn != nil {
+		if address, ok := conn.LocalAddr().(*net.UDPAddr); ok && address != nil && address.Port > 0 && address.Port <= 65535 {
+			return address.Port
+		}
+	}
+	return 0
+}
+
+func observedUDPAddress(address net.Addr) netip.AddrPort {
+	udp, ok := address.(*net.UDPAddr)
+	if !ok || udp == nil || udp.Zone != "" || udp.Port < 1 || udp.Port > 65535 {
+		return netip.AddrPort{}
+	}
+	ip, ok := normalizeAddress(udp.AddrPort().Addr())
+	if !ok {
+		return netip.AddrPort{}
+	}
+	return netip.AddrPortFrom(ip, uint16(udp.Port))
+}
+
+// A distinct same-family observation carries the most useful port-allocation signal.
+func (lease *datagramLease) observeProbe(side byte, address net.Addr, observed, primary netip.AddrPort) bool {
+	previous := observedUDPAddress(lease.probeAddresses[side])
+	if observed == previous {
+		return false
+	}
+	if primary.IsValid() {
+		primaryIsIPv4 := primary.Addr().Is4()
+		if observed == primary {
+			// A matching auxiliary observation supersedes stale port information for this family.
+			if !previous.IsValid() || previous.Addr().Is4() != primaryIsIPv4 {
+				return false
+			}
+		} else if observed.Addr().Is4() != primaryIsIPv4 && previous.IsValid() && previous != primary && previous.Addr().Is4() == primaryIsIPv4 {
+			return false
+		}
+	}
+	lease.probeAddresses[side] = address
+	return true
+}
+
 func (s *Server) serveUDP(conn net.PacketConn) {
+	s.serveDatagramSocket(conn, false)
+}
+
+func (s *Server) serveProbeUDP(conn net.PacketConn) {
+	s.serveDatagramSocket(conn, true)
+}
+
+func (s *Server) serveDatagramSocket(conn net.PacketConn, probeOnly bool) {
 	buffer := make([]byte, MaxDatagramPayload+DatagramOverhead+1)
 	for {
 		n, address, err := conn.ReadFrom(buffer)
@@ -737,7 +813,7 @@ func (s *Server) serveUDP(conn net.PacketConn) {
 		side := buffer[4]
 		s.mu.RLock()
 		lease := s.datagrams[id]
-		if lease == nil {
+		if lease == nil || probeOnly && lease.probePort == 0 {
 			s.mu.RUnlock()
 			s.rejected.Add(1)
 			continue
@@ -745,7 +821,8 @@ func (s *Server) serveUDP(conn net.PacketConn) {
 		sideKey := lease.keys[side]
 		s.mu.RUnlock()
 		packet, err := DecodeDatagram(buffer[:n], sideKey[:])
-		if err != nil {
+		observed := observedUDPAddress(address)
+		if err != nil || !observed.IsValid() {
 			s.rejected.Add(1)
 			continue
 		}
@@ -756,19 +833,37 @@ func (s *Server) serveUDP(conn net.PacketConn) {
 			continue
 		}
 		lease.mu.Lock()
-		if !lease.replay[side].Accept(packet.Sequence) {
+		replay := &lease.replay[side]
+		if probeOnly {
+			replay = &lease.probeReplay[side]
+		}
+		if !replay.Accept(packet.Sequence) {
 			lease.mu.Unlock()
 			s.mu.RUnlock()
 			s.rejected.Add(1)
 			continue
 		}
-		if side == 1 && lease.addresses[side] == nil {
+		previous := observedUDPAddress(lease.addresses[side])
+		consented := lease.assist && lease.consent[0] && lease.consent[1]
+		// An empty packet on the main port from another family is a second observation.
+		// Normal traffic may still rebind the forwarding endpoint to that family.
+		alternateFamily := lease.probePort != 0 && previous.IsValid() && observed.Addr().Is4() != previous.Addr().Is4() && len(packet.Payload) == 0
+		if probeOnly || alternateFamily {
+			changed := lease.observeProbe(side, address, observed, previous)
+			lease.mu.Unlock()
+			s.mu.RUnlock()
+			if changed && consented {
+				lease.wake()
+			}
+			continue
+		}
+		if side == 1 && !previous.IsValid() {
 			close(lease.hostReady)
 		}
-		shouldWake := false
-		if previous := lease.addresses[side]; lease.assist && lease.consent[0] && lease.consent[1] && (previous == nil || previous.String() != address.String()) {
-			shouldWake = true
+		if lease.probePort != 0 && previous.IsValid() && previous != observed {
+			lease.probeAddresses[side] = lease.addresses[side]
 		}
+		shouldWake := consented && previous != observed
 		lease.addresses[side] = address
 		other := byte(1) - side
 		destination := lease.addresses[other]

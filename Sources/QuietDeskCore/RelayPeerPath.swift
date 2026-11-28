@@ -51,6 +51,7 @@ public struct RelayPeerAddress: Hashable, Sendable, CustomStringConvertible {
         switch Int32(storage.ss_family) {
         case AF_INET6:
             let address = withUnsafeBytes(of: &storage) { $0.load(as: sockaddr_in6.self) }
+            guard address.sin6_scope_id == 0 else { return nil }
             let bytes = withUnsafeBytes(of: address.sin6_addr) { Data($0) }
             let mapped = bytes.prefix(10).allSatisfy { $0 == 0 } && bytes[10] == 0xff && bytes[11] == 0xff
             host = mapped ? Self.text(v4: Data(bytes.suffix(4))) : Self.text(v6: bytes)
@@ -108,8 +109,9 @@ public struct RelayPeerAddress: Hashable, Sendable, CustomStringConvertible {
             guard let address = entry.pointee.ai_addr else { continue }
             var storage = sockaddr_storage()
             withUnsafeMutableBytes(of: &storage) { $0.copyMemory(from: UnsafeRawBufferPointer(start: address, count: Int(entry.pointee.ai_addrlen))) }
-            if let resolved = RelayPeerAddress(storage: storage) {
-                let candidate = RelayPeerAddress(host: resolved.host, port: port)
+            if let resolved = RelayPeerAddress(storage: storage),
+               let canonical = RelayCandidate.canonicalAddress(resolved.host, allowLoopback: true) {
+                let candidate = RelayPeerAddress(host: canonical, port: port)
                 if !resolvedList.contains(candidate) { resolvedList.append(candidate) }
             }
         }
@@ -121,6 +123,156 @@ public struct RelayPeerAddress: Hashable, Sendable, CustomStringConvertible {
             return [preferred, other] + rest.filter { $0 != other }
         }
         return [preferred] + rest
+    }
+}
+
+public enum NATType: Equatable, Sendable {
+    case cone
+    case linearSymmetric(step: Int)
+    case randomSymmetric
+    case blockedOrUnknown
+}
+
+public enum NATClassifier {
+    public static let maxLinearStep = 16
+
+    /// Observations are ordered from the primary relay endpoint to subsequent probes.
+    public static func classify(mappedAddresses: [RelayPeerAddress]) -> NATType {
+        let mappings = mappedAddresses.compactMap { address -> RelayPeerAddress? in
+            guard address.port > 0, let host = RelayCandidate.canonicalAddress(address.host, allowLoopback: true) else { return nil }
+            return RelayPeerAddress(host: host, port: address.port)
+        }
+        guard let first = mappings.first else { return .blockedOrUnknown }
+        guard mappings.allSatisfy({ $0.host == first.host }) else { return .randomSymmetric }
+        if mappings.allSatisfy({ $0.port == first.port }) { return .cone }
+
+        let deltas = zip(mappings, mappings.dropFirst()).map { Int($0.1.port) - Int($0.0.port) }
+        guard let firstDelta = deltas.first, let minimum = deltas.min(), let maximum = deltas.max(),
+              minimum > 0, maximum <= maxLinearStep, maximum - minimum <= 2 else { return .randomSymmetric }
+        return .linearSymmetric(step: firstDelta)
+    }
+}
+
+public enum HolePunchingStrategy: Equatable, Sendable {
+    case skipToRelay
+    case directPunch
+    case singleSidePortPrediction(step: Int)
+    case dualLinearPortPrediction(localStep: Int, remoteStep: Int)
+    case burstPortScan(window: Int)
+}
+
+public enum HolePunchingMatrix {
+    public static func strategy(local: NATType, remote: NATType) -> HolePunchingStrategy {
+        switch (local, remote) {
+        case (.blockedOrUnknown, _), (_, .blockedOrUnknown), (.randomSymmetric, .randomSymmetric):
+            return .skipToRelay
+        case (.cone, .cone):
+            return .directPunch
+        case (.cone, .linearSymmetric(let step)), (.linearSymmetric(let step), .cone):
+            return .singleSidePortPrediction(step: max(1, step))
+        case (.linearSymmetric(let localStep), .linearSymmetric(let remoteStep)):
+            return .dualLinearPortPrediction(localStep: max(1, localStep), remoteStep: max(1, remoteStep))
+        case (.randomSymmetric, _), (_, .randomSymmetric):
+            return .burstPortScan(window: 6)
+        }
+    }
+
+    public static func predictAddresses(base: RelayPeerAddress, remoteNAT: NATType, maxCount: Int = 4) -> [RelayPeerAddress] {
+        guard maxCount > 0, base.port > 0,
+              let host = RelayCandidate.canonicalAddress(base.host, allowLoopback: true) else { return [] }
+        let port = Int(base.port)
+        let ports: [Int]
+        switch remoteNAT {
+        case .linearSymmetric(let rawStep):
+            let step = max(1, min(NATClassifier.maxLinearStep, rawStep))
+            let firstOffset = max(1, (1024 - port + step - 1) / step)
+            let lastOffset = min(maxCount, (Int(UInt16.max) - port) / step)
+            guard firstOffset <= lastOffset else { return [] }
+            ports = (firstOffset...lastOffset).map { port + step * $0 }
+        case .randomSymmetric:
+            ports = [1, -1, 2, -2, 3, -3].map { port + $0 }.filter { (1024...65_535).contains($0) }
+        case .cone, .blockedOrUnknown:
+            return []
+        }
+        return ports.prefix(maxCount).map { RelayPeerAddress(host: host, port: UInt16($0)) }
+    }
+}
+
+public enum TransportPathKind: UInt8, Comparable, CaseIterable, Sendable {
+    case p2p = 0
+    case udpRelay = 1
+    case tlsRelay = 2
+
+    public static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+}
+
+/// Quality-based path selection. Latency is in seconds and loss is a fraction from zero to one.
+/// Pass missing P2P probe windows as nil; they interrupt a healthy recovery streak.
+public struct TransportPathStateMachine: Sendable {
+    public static let minimumSamples = 15
+    public private(set) var path: TransportPathKind
+    public private(set) var manualSwitched = false
+    private let downgradeLoss: Double
+    private let downgradeLatency: TimeInterval
+    private var samples: [(loss: Double, latency: TimeInterval)] = []
+    private var healthyP2PSince: TimeInterval?
+    private var lastSampleAt: TimeInterval?
+
+    public init(path: TransportPathKind = .p2p, downgradeLoss: Double = 0.10, downgradeLatency: TimeInterval = 0.2) {
+        self.path = path
+        self.downgradeLoss = downgradeLoss
+        self.downgradeLatency = downgradeLatency
+    }
+
+    @discardableResult
+    public mutating func update(loss: Double, latency: TimeInterval, p2pProbeLoss: Double? = nil,
+                                p2pProbeLatency: TimeInterval? = nil, now: TimeInterval) -> TransportPathKind {
+        guard !manualSwitched, now.isFinite else { return path }
+        if let lastSampleAt, now < lastSampleAt { resetSamples() }
+        lastSampleAt = now
+
+        if let next = TransportPathKind(rawValue: path.rawValue + 1),
+           (0...1).contains(loss), latency.isFinite, latency >= 0 {
+            samples.append((loss, latency))
+            if samples.count > Self.minimumSamples { samples.removeFirst() }
+            if samples.count == Self.minimumSamples,
+               samples.reduce(0, { $0 + ($1.loss - downgradeLoss) }) > 0
+                || samples.reduce(0, { $0 + ($1.latency - downgradeLatency) }) > 0 {
+                transition(to: next)
+                return path
+            }
+        }
+
+        guard path != .p2p, let p2pProbeLoss, (0..<0.02).contains(p2pProbeLoss),
+              let p2pProbeLatency, (0..<0.08).contains(p2pProbeLatency) else {
+            healthyP2PSince = nil
+            return path
+        }
+        let since = healthyP2PSince ?? now
+        healthyP2PSince = since
+        if now - since >= 30 { transition(to: .p2p) }
+        return path
+    }
+
+    public mutating func switchManually(to path: TransportPathKind) {
+        manualSwitched = true
+        transition(to: path)
+    }
+
+    public mutating func resumeAutomaticSelection() {
+        manualSwitched = false
+        resetSamples()
+    }
+
+    private mutating func transition(to path: TransportPathKind) {
+        self.path = path
+        resetSamples()
+    }
+
+    private mutating func resetSamples() {
+        samples.removeAll(keepingCapacity: true)
+        healthyP2PSince = nil
+        lastSampleAt = nil
     }
 }
 
@@ -211,7 +363,7 @@ public final class RelayPeerAgent {
     private let allowLoopback: Bool
     private var phase = Phase.idle(next: nil)
     private var remotes: [Remote] = []
-    private static let maximumRemotes = 12
+    private static let maximumRemotes = 24
     private var cursor = 0
     private var pending: [UInt64: Pending] = [:]
     private var failures = 0
@@ -243,10 +395,19 @@ public final class RelayPeerAgent {
 
     public func updateCandidates(_ candidates: [RelayCandidate], now: TimeInterval) -> [Action] {
         var merged: [Remote] = []
+        var srflxAddresses: [RelayPeerAddress] = []
         for candidate in candidates.prefix(RelayCandidate.maximumPeer) where candidate.kind != .prflx && candidate.port > 0 {
             guard let host = RelayCandidate.canonicalAddress(candidate.address, allowLoopback: allowLoopback && candidate.kind == .srflx) else { continue }
             let address = RelayPeerAddress(host: host, port: candidate.port)
+            if candidate.kind == .srflx { srflxAddresses.append(address) }
             if !merged.contains(where: { $0.address == address }) { merged.append(Remote(address: address, kind: candidate.kind, due: now)) }
+        }
+        if srflxAddresses.count >= 2, let latest = srflxAddresses.last {
+            let remoteNAT = NATClassifier.classify(mappedAddresses: srflxAddresses)
+            for address in HolePunchingMatrix.predictAddresses(base: latest, remoteNAT: remoteNAT)
+                where merged.count < Self.maximumRemotes && !merged.contains(where: { $0.address == address }) {
+                merged.append(Remote(address: address, kind: .srflx, due: now))
+            }
         }
         for learned in remotes where learned.kind == .prflx && !merged.contains(where: { $0.address == learned.address }) && merged.count < Self.maximumRemotes {
             merged.append(learned)
@@ -304,7 +465,12 @@ public final class RelayPeerAgent {
     }
 
     /// `source` is nil for packets that arrived inside the authenticated relay datagram stream.
-    public func receive(_ packet: Data, from source: RelayPeerAddress?, now: TimeInterval) -> (payload: Data?, actions: [Action]) {
+    public func receive(_ packet: Data, from sourceAddress: RelayPeerAddress?, now: TimeInterval) -> (payload: Data?, actions: [Action]) {
+        let source: RelayPeerAddress?
+        if let sourceAddress, sourceAddress != selected {
+            guard sourceAddress.port > 0, let host = RelayCandidate.canonicalAddress(sourceAddress.host, allowLoopback: allowLoopback) else { return (nil, []) }
+            source = RelayPeerAddress(host: host, port: sourceAddress.port)
+        } else { source = sourceAddress }
         guard let (kind, viaRelay, payload) = open(packet), viaRelay == (source == nil) else { return (nil, []) }
         if let source, source == selected { lastDirectReceive = now }
         switch kind {
@@ -717,15 +883,22 @@ final class RelayPeerSocket {
 }
 
 public enum RelayPeerLocalCandidates {
+    private static let ignoredPrefixes = ["awdl", "llw", "anpi", "ipsec", "gif", "stf", "xhc", "pktap"]
+
     public static func isUsableInterface(name: String, ipv4 bytes: Data) -> Bool {
         guard bytes.count == 4 else { return false }
         // Exclude proxy TUN Fake-IP benchmark range (198.18.0.0/15) and Class E reserved (240.0.0.0/4).
         if bytes[0] == 198 && (bytes[1] & 0xfe) == 18 { return false }
         if bytes[0] >= 240 { return false }
-        let ignoredPrefixes = ["awdl", "llw", "anpi", "ipsec", "gif", "stf", "xhc", "pktap"]
         let lower = name.lowercased()
         if ignoredPrefixes.contains(where: { lower.hasPrefix($0) }) { return false }
         return true
+    }
+
+    public static func isUsableIPv6Interface(name: String, ipv6 bytes: Data) -> Bool {
+        guard bytes.count == 16, let first = bytes.first, (first & 0xe0) == 0x20 else { return false }
+        let lower = name.lowercased()
+        return !lower.hasPrefix("utun") && !ignoredPrefixes.contains(where: { lower.hasPrefix($0) })
     }
 
     public static func interfacePriority(name: String, address: String, preferred: String?, tunnel: Bool) -> Int {
@@ -739,38 +912,52 @@ public enum RelayPeerLocalCandidates {
     /// Interface addresses another Mac on the same LAN or IPv6 internet can try. Loopback,
     /// link-local and multicast addresses are never reported.
     public static func gather(port: UInt16) -> [RelayCandidate] {
-        let preferred = preferredIPv4()
-        var addresses: [(address: String, priority: Int)] = []
+        typealias InterfaceAddress = (address: String, priority: Int)
+        let preferredV4 = preferredIPv4(), preferredV6 = preferredIPv6()
+        var ipv4: [InterfaceAddress] = [], ipv6: [InterfaceAddress] = []
+        func record(_ address: String, priority: Int, in list: inout [InterfaceAddress]) {
+            if let existing = list.firstIndex(where: { $0.address == address }) {
+                list[existing].priority = min(list[existing].priority, priority)
+            } else {
+                list.append((address, priority))
+            }
+        }
+        func ordered(_ list: [InterfaceAddress]) -> [String] {
+            list.enumerated()
+                .sorted { $0.element.priority != $1.element.priority ? $0.element.priority < $1.element.priority : $0.offset < $1.offset }
+                .map(\.element.address)
+        }
         var head: UnsafeMutablePointer<ifaddrs>?
         if getifaddrs(&head) == 0, let first = head {
             defer { freeifaddrs(head) }
             for pointer in sequence(first: first, next: { $0.pointee.ifa_next }) {
                 let entry = pointer.pointee, flags = Int32(entry.ifa_flags)
                 guard flags & IFF_UP != 0, flags & IFF_RUNNING != 0, flags & IFF_LOOPBACK == 0,
-                      let namePointer = entry.ifa_name,
-                      let address = entry.ifa_addr, address.pointee.sa_family == sa_family_t(AF_INET) else { continue }
+                      let namePointer = entry.ifa_name, let address = entry.ifa_addr else { continue }
                 let name = String(cString: namePointer)
-                let bytes = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { pointer in
-                    withUnsafeBytes(of: pointer.pointee.sin_addr) { Data($0) }
-                }
-                guard isUsableInterface(name: name, ipv4: bytes),
-                      let canonical = RelayCandidate.canonicalAddress(RelayPeerAddress.text(v4: bytes), allowLoopback: false) else { continue }
                 let tunnel = flags & IFF_POINTOPOINT != 0 || name.lowercased().hasPrefix("utun")
-                let priority = interfacePriority(name: name, address: canonical, preferred: preferred, tunnel: tunnel)
-                if let existing = addresses.firstIndex(where: { $0.address == canonical }) {
-                    addresses[existing].priority = min(addresses[existing].priority, priority)
-                } else {
-                    addresses.append((canonical, priority))
+                switch Int32(address.pointee.sa_family) {
+                case AF_INET:
+                    let bytes = address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { pointer in
+                        withUnsafeBytes(of: pointer.pointee.sin_addr) { Data($0) }
+                    }
+                    guard isUsableInterface(name: name, ipv4: bytes),
+                          let canonical = RelayCandidate.canonicalAddress(RelayPeerAddress.text(v4: bytes), allowLoopback: false) else { continue }
+                    record(canonical, priority: interfacePriority(name: name, address: canonical, preferred: preferredV4, tunnel: tunnel), in: &ipv4)
+                case AF_INET6:
+                    let ipv6Address = address.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee }
+                    let bytes = withUnsafeBytes(of: ipv6Address.sin6_addr) { Data($0) }
+                    guard !tunnel, ipv6Address.sin6_scope_id == 0, isUsableIPv6Interface(name: name, ipv6: bytes),
+                          let canonical = RelayCandidate.canonicalAddress(RelayPeerAddress.text(v6: bytes), allowLoopback: false) else { continue }
+                    record(canonical, priority: interfacePriority(name: name, address: canonical, preferred: preferredV6, tunnel: false), in: &ipv6)
+                default: continue
                 }
             }
         }
-        let ordered = addresses.enumerated()
-            .sorted { $0.element.priority != $1.element.priority ? $0.element.priority < $1.element.priority : $0.offset < $1.offset }
-            .map(\.element.address)
-        var result = ordered.prefix(3)
+        let globalIPv6 = ordered(ipv6).prefix(2)
+        let primaryIPv4 = ordered(ipv4).prefix(min(3, RelayCandidate.maximumLocal - globalIPv6.count))
+        return (Array(globalIPv6) + primaryIPv4)
             .map { RelayCandidate(kind: .host, address: $0, port: port) }
-        if let v6 = preferredIPv6() { result.append(RelayCandidate(kind: .host, address: v6, port: port)) }
-        return Array(result.prefix(RelayCandidate.maximumLocal))
     }
 
     private static func preferredIPv4() -> String? {
@@ -839,9 +1026,11 @@ final class RelayAssistedPipe: RelayDatagramPipe {
     private let counter: RelayPeerTrafficCounter
     private let timing: RelayPeerAgent.Timing
     private let interfaceCandidates: Bool
+    private let probePort: UInt16?
     private var mode: RelayPeerAssistMode
     private var socket: RelayPeerSocket?
     private var attempts: [(address: RelayPeerAddress, socket: RelayPeerSocket)] = []
+    private var resolvedRelays: [RelayPeerAddress] = []
     private var relayChoices: [RelayPeerAddress] = []
     private var relayIndex = 0
     private var firstPayload: Data?
@@ -864,10 +1053,12 @@ final class RelayAssistedPipe: RelayDatagramPipe {
 
     /// Without `interfaceCandidates` only the node-observed mapping is tried; no interface address is shared.
     init(endpoint: RelayEndpoint, id: Data, key: Data, side: UInt8, mode: RelayPeerAssistMode, queue: DispatchQueue,
-         counter: RelayPeerTrafficCounter, interfaceCandidates: Bool = true, timing: RelayPeerAgent.Timing = .init()) throws {
+         counter: RelayPeerTrafficCounter, probePort: UInt16? = nil, interfaceCandidates: Bool = true,
+         timing: RelayPeerAgent.Timing = .init()) throws {
         guard id.count == 16, key.count == 32, side <= 1 else { throw RelayServiceError.invalid }
         self.endpoint = endpoint; self.id = id; self.key = key; self.side = side; self.mode = mode
         self.queue = queue; self.counter = counter; self.interfaceCandidates = interfaceCandidates; self.timing = timing
+        self.probePort = probePort
     }
 
     func start() {
@@ -883,13 +1074,13 @@ final class RelayAssistedPipe: RelayDatagramPipe {
     private func open(relays: [RelayPeerAddress]) {
         guard !closed else { return }
         guard !relays.isEmpty else { finish(RelayTransportError.network); return }
-        relayChoices = relays; ready = true
-        guard sendRelay(Data()) else { return }
+        resolvedRelays = relays; relayChoices = relays; ready = true
+        guard sendRelay(Data(), observeMappings: true) else { return }
         if relays.count == 1 {
             for delay in [0.15, 0.4, 0.8] {
                 queue.asyncAfter(deadline: .now() + delay) { [weak self] in
                     guard let self, self.ready, !self.closed, !self.relayRegistered else { return }
-                    self.sendRelay(Data())
+                    self.sendRelay(Data(), observeMappings: true)
                 }
             }
         }
@@ -982,7 +1173,7 @@ final class RelayAssistedPipe: RelayDatagramPipe {
             guard let self, !self.closed, let agent = self.agent, let socket = self.socket else { return }
             guard self.monitorPrimed else { self.monitorPrimed = true; return }
             // Refresh the node's view of our mapping right away rather than at the next 15-second keepalive.
-            self.sendRelay(Data())
+            self.sendRelay(Data(), observeMappings: true)
             self.consent(self.localCandidates(port: socket.port))
             self.perform(agent.networkChanged(now: SessionClock.now))
         }
@@ -1015,7 +1206,7 @@ final class RelayAssistedPipe: RelayDatagramPipe {
                     attempt.socket.close(); return true
                 }
                 keepalive?.schedule(deadline: .now() + 15, repeating: 15)
-                sendRelay(Data())
+                sendRelay(Data(), observeMappings: true)
             }
             // DTLS records begin with a content type of 20-25, never the "QDP1" magic.
             if RelayPeerAgent.isPeerPacket(packet.payload) {
@@ -1065,7 +1256,7 @@ final class RelayAssistedPipe: RelayDatagramPipe {
     }
 
     @discardableResult
-    private func sendRelay(_ payload: Data) -> Bool {
+    private func sendRelay(_ payload: Data, observeMappings: Bool = false) -> Bool {
         guard ready, sequence < .max else { return false }
         sequence += 1
         guard let data = try? RelayDatagram(side: side, sequence: sequence, id: id, payload: payload).encode(key: key) else {
@@ -1074,10 +1265,26 @@ final class RelayAssistedPipe: RelayDatagramPipe {
         for _ in relayChoices.indices {
             let address = relayChoices[relayIndex]
             socket = socket ?? relaySocket(for: address)
-            if let socket, socket.send(data, to: address) != .failed { return true }
+            if let socket, socket.send(data, to: address) != .failed {
+                if observeMappings, let probePort, mode != .off {
+                    probeMappings(from: socket, activeRelay: address, probePort: probePort, registration: data)
+                }
+                return true
+            }
             advanceRelay()
         }
         finish(RelayTransportError.network); return false
+    }
+
+    private func probeMappings(from socket: RelayPeerSocket, activeRelay: RelayPeerAddress, probePort: UInt16, registration: Data) {
+        // The auxiliary listener authenticates the registration with an independent replay window.
+        _ = socket.send(registration, to: RelayPeerAddress(host: activeRelay.host, port: probePort))
+        let activeIsIPv4 = IPv4Address(activeRelay.host) != nil
+        guard sequence < .max, let alternate = resolvedRelays.first(where: { (IPv4Address($0.host) != nil) != activeIsIPv4 }) else { return }
+        // The other family uses the main listener and therefore its shared sequence space.
+        sequence += 1
+        guard let packet = try? RelayDatagram(side: side, sequence: sequence, id: id, payload: Data()).encode(key: key) else { return }
+        _ = socket.send(packet, to: alternate)
     }
 
     private func perform(_ actions: [RelayPeerAgent.Action]) {

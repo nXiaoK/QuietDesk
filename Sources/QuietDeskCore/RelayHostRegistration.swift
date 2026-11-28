@@ -292,7 +292,8 @@ private final class HostDatagramRoute {
         self.queue = queue
         if let assist {
             let assisted = try RelayAssistedPipe(endpoint: endpoint, id: id, key: key, side: 1, mode: assist, queue: queue,
-                                                 counter: counter, interfaceCandidates: interfaceCandidates)
+                                                 counter: counter, probePort: message.probePort(relativeTo: endpoint),
+                                                 interfaceCandidates: interfaceCandidates)
             assistedPipe = assisted; pipe = assisted
         } else {
             assistedPipe = nil

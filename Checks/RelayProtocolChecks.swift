@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import QuietDeskCore
 
 func runRelayProtocolChecks() {
@@ -49,6 +50,38 @@ func runRelayProtocolChecks() {
         try rejects("Unbounded UDP payload accepted") {
             _ = try RelayDatagram(side: 0, sequence: 1, id: id, payload: Data(count: RelayDatagram.maximumPayloadBytes + 1))
         }
+    }
+    run("Relay auxiliary UDP ports remain optional and follow the public endpoint offset") {
+        let id = Data(count: 16), key = Data(count: 32)
+        let endpoint = try RelayEndpoint(address: "relay.example.com:28443")
+        var legacy = RelayMessage(.datagramReady, datagramID: id, datagramKey: key, udpPort: 7443)
+        let legacyBody = Data(try legacy.framed().dropFirst(4))
+        let legacyFields = try JSONSerialization.jsonObject(with: legacyBody) as! [String: Any]
+        try check(legacyFields["probeUDPPort"] == nil && RelayMessage.decode(legacyBody).probePort(relativeTo: endpoint) == nil,
+                  "A legacy relay lease advertised auxiliary probing")
+        legacy.probeUDPPort = 7444
+        let ready = try RelayMessage.decode(Data(try legacy.framed().dropFirst(4)))
+        try check(ready.probeUDPPort == 7444 && ready.probePort(relativeTo: endpoint) == 28444,
+                  "A private auxiliary port was used instead of its public offset")
+        let lastPort = try RelayEndpoint(address: "relay.example.com:65535")
+        try check(ready.probePort(relativeTo: lastPort) == nil, "A public auxiliary port overflowed")
+        legacy.probeUDPPort = 7443
+        try check(legacy.probePort(relativeTo: endpoint) == nil, "Main port was accepted as an auxiliary port")
+        for invalid in [0, -1, 65_536] {
+            legacy.probeUDPPort = invalid
+            try rejects("An invalid auxiliary UDP port was accepted") { _ = try legacy.framed() }
+        }
+    }
+    run("Relay IPv6 host candidates accept global unicast on eligible interfaces") {
+        let global = IPv6Address("2001:db8::8")!.rawValue
+        try check(RelayPeerLocalCandidates.isUsableIPv6Interface(name: "en0", ipv6: global), "Global IPv6 was excluded from Ethernet")
+        for interface in ["awdl0", "llw0", "anpi1", "ipsec0", "gif0", "stf0", "xhc0", "pktap0", "UTUN5"] {
+            try check(!RelayPeerLocalCandidates.isUsableIPv6Interface(name: interface, ipv6: global), "Excluded interface \(interface) supplied an IPv6 host candidate")
+        }
+        for address in ["::", "::1", "fe80::1", "fc00::1", "ff02::1", "::ffff:192.0.2.1"] {
+            try check(!RelayPeerLocalCandidates.isUsableIPv6Interface(name: "en0", ipv6: IPv6Address(address)!.rawValue), "Non-global IPv6 was accepted: \(address)")
+        }
+        try check(!RelayPeerLocalCandidates.isUsableIPv6Interface(name: "en0", ipv6: Data([0x20])), "Truncated IPv6 was accepted")
     }
     run("Relay replay windows allow bounded reordering across 512 packets but never duplicate, zero or wrapped counters") {
         var window = RelayReplayWindow()

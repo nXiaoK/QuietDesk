@@ -64,9 +64,18 @@ func run(address, certificate, privateKey, accessFile, state, health string, max
 		return err
 	}
 	defer udp.Close()
+	var probeUDP net.PacketConn
 	if udpConn, ok := udp.(*net.UDPConn); ok {
 		_ = udpConn.SetReadBuffer(4 << 20)
 		_ = udpConn.SetWriteBuffer(4 << 20)
+		probeAddress := *udpConn.LocalAddr().(*net.UDPAddr)
+		if probeAddress.Port < 65535 {
+			probeAddress.Port++
+			if conn, err := net.ListenUDP("udp", &probeAddress); err == nil {
+				probeUDP = conn
+				defer probeUDP.Close()
+			}
+		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -95,5 +104,5 @@ func run(address, certificate, privateKey, accessFile, state, health string, max
 	}
 	go func() { <-ctx.Done(); server.Close() }()
 	fmt.Fprintln(os.Stdout, "QuietDesk relay listening on", listener.Addr())
-	return server.Serve(listener, udp)
+	return server.ServeWithProbe(listener, udp, probeUDP)
 }

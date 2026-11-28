@@ -17,7 +17,7 @@ const (
 	MaxDatagramPayload = 1152
 	DatagramOverhead   = 64
 	// Assisted direct paths: each side reports at most MaxLocalCandidates of its own
-	// addresses; a peer list adds the node-observed address and stays within MaxPeerCandidates.
+	// addresses; a peer list adds the node-observed addresses and stays within MaxPeerCandidates.
 	MaxLocalCandidates = 4
 	MaxPeerCandidates  = 8
 )
@@ -34,6 +34,7 @@ type Message struct {
 	DatagramID   []byte `json:"datagramID,omitempty"`
 	DatagramKey  []byte `json:"datagramKey,omitempty"`
 	UDPPort      int    `json:"udpPort,omitempty"`
+	ProbeUDPPort int    `json:"probeUDPPort,omitempty"`
 	Error        string `json:"error,omitempty"`
 	// Optional assisted-direct-path capability; omitted fields keep the original wire bytes.
 	Assist     bool        `json:"assist,omitempty"`
@@ -48,8 +49,11 @@ type Candidate struct {
 }
 
 func normalizeAddress(address netip.Addr) (netip.Addr, bool) {
+	if address.Zone() != "" {
+		return netip.Addr{}, false
+	}
 	address = address.Unmap()
-	if !address.IsValid() || address.Zone() != "" || address.IsUnspecified() || address.IsMulticast() ||
+	if !address.IsValid() || address.IsUnspecified() || address.IsMulticast() ||
 		address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast() || address.IsInterfaceLocalMulticast() ||
 		address == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
 		return netip.Addr{}, false

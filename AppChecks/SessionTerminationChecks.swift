@@ -149,6 +149,42 @@ private struct SessionTerminationChecks {
                 try require(messages.read() == 0, "A legacy viewer received the optional ending notice")
             }
 
+            run("A subscribed viewer processes the update target version before retryable closure") {
+                let connection = try Connection(), remoteClosed = DispatchSemaphore(value: 0), localClosed = DispatchSemaphore(value: 0)
+                let events = Box<[String]>([]), completionCount = Box(0)
+                let host = try connection.start()
+                connection.client.onMessageHandled = { message, resume in
+                    if message.kind == .hostUpdateRestart, let notice = try? HostUpdateRestartNotice.read(message.payload) {
+                        events.update { $0.append(notice.targetVersion) }
+                    } else { events.update { $0.append("unexpected") } }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 0.04) { resume() }
+                }
+                connection.client.onClose = { _ in events.update { $0.append("closed") }; remoteClosed.signal() }
+                host.closeAfterHostUpdateRestart(version: "0.8.0", notify: true) {
+                    completionCount.update { $0 += 1 }
+                    localClosed.signal()
+                }
+                try wait(localClosed, "Host did not close after its update notice")
+                try wait(remoteClosed, "Viewer did not observe update restart closure")
+                try require(events.read() == ["0.8.0", "closed"], "The restart notice was missing or arrived after closure")
+                try require(host.closeIsRetryable && connection.client.closeIsRetryable, "The restart closure was not retryable")
+                try require(localClosed.wait(timeout: .now() + 0.45) == .timedOut && completionCount.read() == 1,
+                            "The bounded fallback completed the restart closure twice")
+            }
+
+            run("A legacy viewer sees retryable EOF without a restart or ending message") {
+                let connection = try Connection(), remoteClosed = DispatchSemaphore(value: 0), localClosed = DispatchSemaphore(value: 0)
+                let messages = Box<[MessageKind]>([])
+                let host = try connection.start()
+                connection.client.onMessage = { message in messages.update { $0.append(message.kind) } }
+                connection.client.onClose = { _ in remoteClosed.signal() }
+                host.closeAfterHostUpdateRestart(version: "0.8.0", notify: false) { localClosed.signal() }
+                try wait(localClosed, "Host did not close for the legacy viewer")
+                try wait(remoteClosed, "Legacy viewer did not observe restart EOF")
+                try require(messages.read().isEmpty, "Legacy viewer received an optional control message")
+                try require(host.closeIsRetryable && connection.client.closeIsRetryable, "Legacy restart closure blocked retry")
+            }
+
             run("A stalled paced send cannot delay revocation beyond the shutdown bound") {
                 let connection = try Connection(), closed = DispatchSemaphore(value: 0), closedCount = Box(0)
                 let host = try connection.start()

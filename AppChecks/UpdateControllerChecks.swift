@@ -323,6 +323,189 @@ private struct UpdateControllerChecks {
             try requireUpdate(terminations == 0 && controller.state == .available, "Cancelled installer still handed off")
         }
 
+        await run("A prepared incoming host session checks once and presents only on the shared-screen path") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
+            fixture.defaults.set(true, forKey: "autoCheckUpdates")
+            fixture.defaults.set(fixture.now, forKey: "lastUpdateCheck")
+            var context = UpdateSessionContext()
+            let changes = PassthroughSubject<Void, Never>()
+            let controller = UpdateController(info: fixture.info, defaults: fixture.defaults,
+                launchedAt: fixture.now, clock: { fixture.now }, sessionContext: { context },
+                contextChanges: changes.eraseToAnyPublisher(),
+                loadFeed: { [feed = fixture.feed] url, version in try await feed.fetch(url, version) })
+            defer { controller.shutdown(); controller.later() }
+            var screenRequests = 0
+            controller.preferredHostScreen = { screenRequests += 1; return NSScreen.main }
+
+            context.hasHostConnection = true
+            context.isSharing = true
+            context.isHostConnectionPreparing = true
+            context.hostConnectionID = UUID()
+            changes.send()
+            await drain()
+            try await requireRequests(fixture.feed, 0, "A host in capability negotiation triggered a check")
+
+            context.isHostConnectionPreparing = false
+            context.isHostQualityProbeSession = true
+            changes.send()
+            controller.tick(now: fixture.now)
+            await drain()
+            try await requireRequests(fixture.feed, 0, "The quality probe triggered an update request")
+            try requireUpdate(screenRequests == 0 && visibleUpdatePanel() == nil, "The quality probe showed an update panel")
+
+            context.hostConnectionID = UUID()
+            context.isHostQualityProbeSession = false
+            changes.send()
+            await drain()
+            try await settled(controller)
+            try await requireRequests(fixture.feed, 1, "An incoming host session did not trigger exactly one independent check")
+            let panel = visibleUpdatePanel()
+            try requireUpdate(controller.manifest?.version == "0.8.0" && screenRequests == 1 && panel != nil,
+                              "An available update was not shown for the remote controller")
+            try requireUpdate(panel?.collectionBehavior == [.moveToActiveSpace, .fullScreenAuxiliary],
+                              "The remote update panel did not follow the active Space")
+            try requireUpdate(!controller.showBanner && controller.installBlocked, "The host offer changed default banner or install policy")
+            for _ in 0..<4 { changes.send(); controller.tick(now: fixture.now) }
+            await drain()
+            try await requireRequests(fixture.feed, 1, "The same session triggered more than one request")
+            try requireUpdate(screenRequests == 1, "The same session presented its window twice")
+
+            context.hasHostConnection = false
+            context.hostConnectionID = nil
+            changes.send()
+            await drain()
+            try requireUpdate(visibleUpdatePanel() == nil, "A remote-only offer outlived its session")
+        }
+
+        await run("Host reconnect checks have a 60-second cooldown and silently handle failure or a current version") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.failure, .data(try signedManifest(version: "0.7.0", build: 30))])
+            fixture.defaults.set(true, forKey: "autoCheckUpdates")
+            var context = UpdateSessionContext(hasHostConnection: true, hostConnectionID: UUID())
+            let controller = fixture.controller(context: { context })
+            defer { controller.shutdown(); controller.later() }
+            controller.tick(now: fixture.now)
+            try await settled(controller)
+            try requireUpdate(controller.state == .failed && visibleUpdatePanel() == nil,
+                              "A failed host check opened the update panel")
+            context.hostConnectionID = UUID()
+            controller.tick(now: fixture.now.addingTimeInterval(59))
+            try await requireRequests(fixture.feed, 1, "A new session bypassed the host check cooldown")
+            context.hostConnectionID = UUID()
+            controller.tick(now: fixture.now.addingTimeInterval(60))
+            try await settled(controller)
+            try await requireRequests(fixture.feed, 2, "A session after the cooldown did not check")
+            try requireUpdate(controller.state == .upToDate && visibleUpdatePanel() == nil,
+                              "An up-to-date host check opened the update panel")
+        }
+
+        await run("A cached update is shown immediately to a new host session, respecting the original check preference") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
+            var context = UpdateSessionContext()
+            let controller = fixture.controller(context: { context })
+            defer { controller.shutdown(); controller.later() }
+            controller.check(manual: false)
+            try await settled(controller)
+            context.hasHostConnection = true
+            context.hostConnectionID = UUID()
+            controller.tick(now: fixture.now)
+            try requireUpdate(visibleUpdatePanel() == nil, "A cached update bypassed automatic-check consent")
+            controller.setAutomaticChecks(true)
+            controller.tick(now: fixture.now)
+            try requireUpdate(visibleUpdatePanel() != nil, "The new host session did not get its cached update")
+            try await requireRequests(fixture.feed, 1, "Showing the cached version unnecessarily checked again")
+        }
+
+        await run("Explicit host restart waits for installer readiness and host teardown before a single normal quit") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
+            let installer = UpdateCheckInstaller(directory: directory)
+            let context = UpdateSessionContext(hasHostConnection: true, isSharing: true,
+                                               isHostDesktopSharing: true, autoStartSharing: true, hostConnectionID: UUID())
+            var events: [String] = []
+            var optionsAtPreparation: UpdateInstaller.LaunchOptions?
+            let controller = fixture.controller(context: { context }, installer: installer, terminate: { events.append("quit") })
+            defer { controller.shutdown(); controller.later() }
+            controller.onPrepareHostUpdateRestart = { version in
+                optionsAtPreparation = installer.lastLaunchOptions
+                events.append("prepare " + version)
+                await drain()
+                events.append("prepared")
+            }
+            controller.check(manual: false)
+            try await settled(controller)
+            controller.download()
+            try await settled(controller)
+            controller.install()
+            try requireUpdate(controller.installBlocked && !controller.showBanner && installer.launchCount == 0,
+                              "The regular install path bypassed the connected-host gate")
+
+            controller.installDisconnectingHost(now: fixture.now)
+            let deadline = Date().addingTimeInterval(5)
+            while events.last != "quit" && Date() < deadline { await drain() }
+            try requireUpdate(events == ["prepare 0.8.0", "prepared", "quit"], "Quit did not wait for the host's restart preparation")
+            try requireUpdate(installer.launchCount == 1 && optionsAtPreparation?.automatic == false
+                && optionsAtPreparation?.resumeHostSharing == true,
+                "Host restart did not preserve sharing when launch-at-startup sharing was enabled")
+            controller.shutdown()
+            try requireUpdate(installer.abortCount == 0 && installer.discardCount == 0,
+                              "Host restart cleanup cancelled a successful installer handoff")
+        }
+
+        await run("Explicit download and host restart stages once and then uses the connected-host exception") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
+            let installer = UpdateCheckInstaller(directory: directory)
+            let context = UpdateSessionContext(hasHostConnection: true, hostConnectionID: UUID())
+            var notice: String?
+            var terminations = 0
+            let controller = fixture.controller(context: { context }, installer: installer, terminate: { terminations += 1 })
+            defer { controller.shutdown(); controller.later() }
+            controller.onPrepareHostUpdateRestart = { notice = $0 }
+            controller.check(manual: false)
+            try await settled(controller)
+            controller.downloadAndInstallDisconnectingHost()
+            let deadline = Date().addingTimeInterval(5)
+            while terminations == 0 && Date() < deadline { await drain() }
+            try requireUpdate(installer.downloadCount == 1 && installer.launchCount == 1 && terminations == 1 && notice == "0.8.0"
+                && installer.lastLaunchOptions?.resumeHostSharing == true,
+                "The verified download did not continue into an explicit sharing-restoring restart")
+        }
+
+        await run("A replacement remote host must confirm again before either download or helper handoff can disconnect it") { directory in
+            let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
+            let installer = UpdateCheckInstaller(directory: directory)
+            var context = UpdateSessionContext(hasHostConnection: true, hostConnectionID: UUID())
+            var preparations = 0
+            var terminations = 0
+            let controller = fixture.controller(context: { context }, installer: installer, terminate: { terminations += 1 })
+            defer { controller.shutdown(); controller.later() }
+            controller.onPrepareHostUpdateRestart = { _ in preparations += 1 }
+
+            controller.check(manual: false)
+            try await settled(controller)
+            controller.downloadAndInstallDisconnectingHost()
+            context.hostConnectionID = UUID()
+            try await settled(controller)
+            try requireUpdate(controller.state == .ready && installer.downloadCount == 1 && installer.launchCount == 0,
+                              "A newly connected host inherited restart confirmation during download")
+
+            installer.launchDelay = .milliseconds(300)
+            controller.installDisconnectingHost()
+            let launchDeadline = Date().addingTimeInterval(3)
+            while installer.launchCount == 0 && Date() < launchDeadline { await drain() }
+            context.hostConnectionID = UUID()
+            try await settled(controller)
+            try requireUpdate(controller.state == .ready && installer.launchCount == 1
+                && installer.abortCount == 1 && preparations == 0 && terminations == 0,
+                "A new host arriving during helper readiness was disconnected without confirmation")
+
+            controller.installDisconnectingHost()
+            context.hasHostConnection = false
+            context.hostConnectionID = nil
+            let quitDeadline = Date().addingTimeInterval(5)
+            while terminations == 0 && Date() < quitDeadline { await drain() }
+            try requireUpdate(terminations == 1 && preparations == 1 && installer.launchCount == 2,
+                              "Disconnecting a confirmed session without a replacement blocked the update")
+        }
+
         await run("A ready installer handoff requests a single normal application termination and preserves staging") { directory in
             let fixture = try Fixture(directory: directory, responses: [.data(try signedManifest())])
             let installer = UpdateCheckInstaller(directory: directory)
@@ -725,6 +908,10 @@ private struct UpdateControllerChecks {
             signature: signing.signature(for: UpdateManifestVerifier.signingPrefix + payload).base64EncodedString()))
     }
     private static func drain() async { try? await Task.sleep(for: .milliseconds(30)) }
+
+    private static func visibleUpdatePanel() -> NSWindow? {
+        NSApp.windows.first { $0.title == "QuietDesk 更新" && $0.isVisible }
+    }
 
     private static func expectDownloadProgress(_ controller: UpdateController, received: Int64, total: Int64?,
                                                message: String) async throws {

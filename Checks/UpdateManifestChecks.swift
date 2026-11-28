@@ -203,6 +203,69 @@ func runUpdateManifestChecks() {
         try check(UpdateCheckPolicy.shouldOffer(version: "0.8.1", skippedVersion: "0.8.0", manual: false), "Newer version inherited old skip")
     }
 
+    run("Host connection update checks require consent and wait sixty seconds between checks") {
+        let now = Date(timeIntervalSince1970: 10_000)
+        func due(_ preference: Bool? = true, enabled: Bool = true, probe: Bool = false, last: Date? = nil) -> Bool {
+            UpdateCheckPolicy.shouldCheckOnHostSessionConnect(updaterEnabled: enabled, autoCheckPreference: preference,
+                isBenchmarkProbe: probe, now: now, lastHostConnectCheck: last)
+        }
+        try check(due(), "A regular authenticated host connection did not trigger the check")
+        try check(!due(false) && !due(nil) && !due(enabled: false) && !due(probe: true),
+                  "A disabled updater, missing consent or a benchmark triggered the check")
+        try check(!due(last: now.addingTimeInterval(-59.9)) && due(last: now.addingTimeInterval(-60)),
+                  "The sixty-second host connection cooldown changed")
+        try check(!due(last: now.addingTimeInterval(1)), "A backward clock movement triggered a duplicate check")
+    }
+
+    run("Host update restart capability preserves the legacy hello and subscription wire format") {
+        struct LegacyTermination: Decodable { let operation: SessionTermination.Operation }
+        let old = try SessionTermination(.subscribe).message()
+        try check(old.kind == .sessionTermination && old.payload == Data(#"{"operation":"subscribe"}"#.utf8),
+                  "The unmodified subscription payload changed")
+        try check(try SessionTermination.read(old.payload).supportsUpdateRestart == nil,
+                  "A legacy subscription unexpectedly supported restart notices")
+        let subscribed = try SessionTermination(.subscribe, supportsUpdateRestart: true).message()
+        try check(try SessionTermination.read(subscribed.payload) == SessionTermination(.subscribe, supportsUpdateRestart: true),
+                  "The restart capability was lost")
+        try check(try Wire.readJSON(LegacyTermination.self, subscribed.payload).operation == .subscribe,
+                  "A legacy reader could not decode the updated subscription")
+
+        let oldHello = Hello(name: "old", width: 1920, height: 1080, settings: .init(), canControl: true)
+        let fields = try JSONSerialization.jsonObject(with: JSONEncoder().encode(oldHello)) as? [String: Any]
+        try check(fields?["hostUpdateRestartV1"] == nil, "The default hello added an optional capability")
+        let newHello = Hello(name: "new", width: 1920, height: 1080, settings: .init(), canControl: true,
+                             sessionTerminationV1: true, hostUpdateRestartV1: true)
+        try check(try Wire.readJSON(Hello.self, JSONEncoder().encode(newHello)).hostUpdateRestartV1 == true,
+                  "The advertised capability was lost")
+    }
+
+    run("Host update restart notice round trips and rejects invalid versions") {
+        let notice = HostUpdateRestartNotice(targetVersion: "0.8.0")
+        let message = try Wire.decodeBody(Data(try notice.message().framed().dropFirst(4)))
+        try check(message.kind == .hostUpdateRestart && message.kind.rawValue == 48
+                  && MessageKind.typeTextResult.rawValue == 47, "The update notice shifted the existing message numbers")
+        try check(try HostUpdateRestartNotice.read(message.payload) == notice, "The restart notice did not round trip")
+        for version in ["", "0.8", "v0.8.0", "00.8.0", "0.8.0-beta", "1.2." + String(repeating: "9", count: 128)] {
+            let invalid = HostUpdateRestartNotice(targetVersion: version)
+            try rejects("Encoded an invalid restart version") { _ = try invalid.message() }
+            try rejects("Decoded an invalid restart version") {
+                _ = try HostUpdateRestartNotice.read(JSONEncoder().encode(invalid))
+            }
+        }
+    }
+
+    run("Host update restart reconnect timing uses a fast minute and a bounded retry deadline") {
+        let started: TimeInterval = 100
+        func delay(_ elapsed: TimeInterval) -> TimeInterval? {
+            HostUpdateRestartNotice.reconnectDelay(startedAt: started, now: started + elapsed)
+        }
+        try check(delay(0) == 2 && delay(59.9) == 2, "The first minute did not use two-second retries")
+        try check(delay(60) == 5 && delay(174) == 5, "Later retries did not use five-second waits")
+        try check(delay(178) == 2, "A retry extended beyond the restart deadline")
+        try check(delay(180) == nil && delay(181) == nil && delay(.infinity) == nil,
+                  "An expired restart still allowed automatic reconnect")
+    }
+
     run("Automatic update installation proceeds when idle or waiting for sharing, and defers during remote control") {
         let now = Date(timeIntervalSince1970: 10_000)
         func eval(enabled: Bool = true, autoInstall: Bool = true, controlling: Bool = false, fullScreen: Bool = false,

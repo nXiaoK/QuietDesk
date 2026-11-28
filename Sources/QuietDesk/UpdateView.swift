@@ -3,7 +3,7 @@ import QuietDeskCore
 
 struct UpdateView: View {
     @ObservedObject var controller: UpdateController
-    @State private var confirmInstallation = false
+    @State private var installationConfirmation: UpdateInstallationAction?
 
     private var changing: Bool {
         [.checking, .downloading, .verifying, .installing].contains(controller.state)
@@ -25,7 +25,8 @@ struct UpdateView: View {
         case .downloading: return "正在下载更新"
         case .verifying: return "正在校验更新"
         case .installing: return "正在安装更新"
-        case .ready: return controller.autoInstallDeferredBySession ? "暂缓自动安装" : "更新已就绪"
+        case .ready:
+            return controller.autoInstallDeferredBySession && !controller.session.hasHostConnection ? "暂缓自动安装" : "更新已就绪"
         case .available: return "QuietDesk 有可用更新"
         case .upToDate: return "已是最新版本"
         case .failed: return "更新失败"
@@ -39,6 +40,10 @@ struct UpdateView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    if controller.session.hasHostConnection {
+                        HostUpdateRestartCallout()
+                    }
+
                     if let update = controller.manifest {
                         releaseCard(update)
                     }
@@ -56,15 +61,6 @@ struct UpdateView: View {
                             tone: .warning
                         )
                     }
-
-                    if controller.installBlocked {
-                        DeskCalloutBox(
-                            title: "暂缓自动安装",
-                            message: "仍有远控、被控或活动映射连接，等待会话结束后安装。",
-                            symbol: "hand.raised.fill",
-                            tone: .warning
-                        )
-                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -77,12 +73,7 @@ struct UpdateView: View {
         .padding(24)
         .frame(minWidth: 530, minHeight: 430)
         .deskSurface()
-        .alert("安装并重新启动？", isPresented: $confirmInstallation) {
-            Button("取消", role: .cancel) {}.keyboardShortcut(.defaultAction)
-            Button("安装并重启") { controller.install() }
-        } message: {
-            Text(UpdateInstallationCopy.confirmationMessage(controller: controller))
-        }
+        .updateInstallationConfirmation($installationConfirmation, controller: controller)
     }
 
     private var headerSection: some View {
@@ -158,7 +149,7 @@ struct UpdateView: View {
     private var automaticSettingsCard: some View {
         DeskSurfaceCard(padding: 0, cornerRadius: 10) {
             VStack(alignment: .leading, spacing: 0) {
-                DeskSettingsRow(title: "自动检查更新", detail: "每 24 小时最多检查一次") {
+                DeskSettingsRow(title: "自动检查更新", detail: UpdateInstallationCopy.automaticCheckDetail) {
                     Toggle("自动检查更新", isOn: Binding(
                         get: { controller.autoCheckPreference == true },
                         set: { controller.setAutomaticChecks($0) }
@@ -214,18 +205,23 @@ struct UpdateView: View {
                         .buttonStyle(DeskButtonStyle(.primary))
                 }
             } else if controller.state == .ready {
-                Button("安装并重启") {
-                    if requiresInstallConfirmation {
-                        confirmInstallation = true
-                    } else {
-                        controller.install()
+                if controller.session.hasHostConnection {
+                    remoteUpdateButton(.restartHost)
+                } else {
+                    Button("安装并重启") {
+                        if requiresInstallConfirmation {
+                            installationConfirmation = .restart
+                        } else {
+                            controller.install()
+                        }
                     }
+                    .buttonStyle(DeskButtonStyle(.primary))
+                    .disabled(controller.installBlocked)
                 }
-                .buttonStyle(DeskButtonStyle(.primary))
-                .disabled(controller.installBlocked)
             } else if controller.manifest != nil && !changing {
-                if controller.installBlocked {
-                    Button("先下载更新") { controller.download() }
+                if controller.session.hasHostConnection {
+                    Button("仅下载不重启") { controller.download() }
+                    remoteUpdateButton(.downloadAndRestartHost)
                 } else {
                     Button("立即下载并安装") { controller.downloadAndInstall() }
                         .buttonStyle(DeskButtonStyle(.primary))
@@ -236,11 +232,16 @@ struct UpdateView: View {
         }
         .buttonStyle(DeskButtonStyle(.secondary))
     }
+
+    private func remoteUpdateButton(_ action: UpdateInstallationAction) -> some View {
+        Button(action.buttonTitle) { installationConfirmation = action }
+            .buttonStyle(DeskButtonStyle(.primary))
+    }
 }
 
 struct UpdateSettingsPanel: View {
     @ObservedObject var controller: UpdateController
-    @State private var confirmInstallation = false
+    @State private var installationConfirmation: UpdateInstallationAction?
 
     private var changing: Bool {
         [.checking, .downloading, .verifying, .installing].contains(controller.state)
@@ -263,17 +264,15 @@ struct UpdateSettingsPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             versionAndActionCard
+            if controller.session.hasHostConnection {
+                HostUpdateRestartCallout()
+            }
             automaticPolicyCard
             if let update = controller.manifest {
                 releaseNotesCard(update)
             }
         }
-        .alert("安装并重新启动？", isPresented: $confirmInstallation) {
-            Button("取消", role: .cancel) {}.keyboardShortcut(.defaultAction)
-            Button("安装并重启") { controller.install() }
-        } message: {
-            Text(UpdateInstallationCopy.confirmationMessage(controller: controller))
-        }
+        .updateInstallationConfirmation($installationConfirmation, controller: controller)
     }
 
     private var versionAndActionCard: some View {
@@ -351,19 +350,24 @@ struct UpdateSettingsPanel: View {
                     }
                 } else if controller.state == .ready {
                     Button("取消更新") { controller.cancel() }
-                    Button("安装并重启") {
-                        if requiresInstallConfirmation {
-                            confirmInstallation = true
-                        } else {
-                            controller.install()
+                    if controller.session.hasHostConnection {
+                        remoteUpdateButton(.restartHost)
+                    } else {
+                        Button("安装并重启") {
+                            if requiresInstallConfirmation {
+                                installationConfirmation = .restart
+                            } else {
+                                controller.install()
+                            }
                         }
+                        .buttonStyle(DeskButtonStyle(.primary))
+                        .disabled(controller.installBlocked)
                     }
-                    .buttonStyle(DeskButtonStyle(.primary))
-                    .disabled(controller.installBlocked)
                 } else if controller.manifest != nil, controller.requiredSystemVersion == nil {
                     Button("跳过此版本") { controller.skip() }
-                    if controller.installBlocked {
-                        Button("先下载更新") { controller.download() }
+                    if controller.session.hasHostConnection {
+                        Button("仅下载不重启") { controller.download() }
+                        remoteUpdateButton(.downloadAndRestartHost)
                     } else {
                         Button("立即下载并安装") { controller.downloadAndInstall() }
                             .buttonStyle(DeskButtonStyle(.primary))
@@ -381,10 +385,15 @@ struct UpdateSettingsPanel: View {
         }
     }
 
+    private func remoteUpdateButton(_ action: UpdateInstallationAction) -> some View {
+        Button(action.buttonTitle) { installationConfirmation = action }
+            .buttonStyle(DeskButtonStyle(.primary))
+    }
+
     private var automaticPolicyCard: some View {
         VStack(alignment: .leading, spacing: 11) {
             DeskSettingsGroup(title: "更新策略") {
-                DeskSettingsRow(title: "自动检查更新", detail: "每 24 小时最多检查一次") {
+                DeskSettingsRow(title: "自动检查更新", detail: UpdateInstallationCopy.automaticCheckDetail) {
                     Toggle("自动检查更新", isOn: Binding(
                         get: { controller.autoCheckPreference == true },
                         set: { controller.setAutomaticChecks($0) }
@@ -409,7 +418,7 @@ struct UpdateSettingsPanel: View {
 
             DeskCalloutBox(
                 title: "自动安装时机",
-                message: "安装时须无远控、无被控、无活动映射连接。自动检查在启动满 2 分钟后运行，网络异常时按小时退避。"
+                message: "自动安装需无远控、无被控、无活动映射连接。例行检查在启动满 2 分钟后运行，网络异常时按小时退避。"
             ) {
                 DeskInfoPopoverButton(
                     title: "自动更新安全与空闲判定说明",
@@ -421,7 +430,7 @@ struct UpdateSettingsPanel: View {
                 )
             }
 
-            if controller.isRemoteControlActive {
+            if controller.isRemoteControlActive && !controller.session.hasHostConnection {
                 DeskCalloutBox(
                     message: "当前有活动远控或端口映射连接，自动更新将自动延后。",
                     symbol: "clock",
@@ -510,6 +519,7 @@ private struct UpdateStateBadge: View {
     @ObservedObject var controller: UpdateController
 
     var body: some View {
+        let deferred = controller.autoInstallDeferredBySession && !controller.session.hasHostConnection
         switch controller.state {
         case .checking:
             DeskPillBadge(text: "正在检查", tint: DeskPalette.accent)
@@ -521,13 +531,13 @@ private struct UpdateStateBadge: View {
             DeskPillBadge(text: "正在安装", tint: DeskPalette.emerald)
         case .ready:
             DeskPillBadge(
-                text: controller.autoInstallDeferredBySession ? "待空闲安装" : "更新已就绪",
-                tint: controller.autoInstallDeferredBySession ? DeskPalette.amber : DeskPalette.emerald
+                text: deferred ? "待空闲安装" : "更新已就绪",
+                tint: deferred ? DeskPalette.amber : DeskPalette.emerald
             )
         case .available:
             DeskPillBadge(
-                text: controller.autoInstallDeferredBySession ? "待空闲更新" : "新版本可用",
-                tint: controller.autoInstallDeferredBySession ? DeskPalette.amber : DeskPalette.accent
+                text: deferred ? "待空闲更新" : "新版本可用",
+                tint: deferred ? DeskPalette.amber : DeskPalette.accent
             )
         case .upToDate:
             DeskPillBadge(text: "已是最新", tint: DeskPalette.emerald)
@@ -567,7 +577,75 @@ private struct UpdateDownloadProgressRow: View {
     }
 }
 
+private struct HostUpdateRestartCallout: View {
+    var body: some View {
+        DeskCalloutBox(
+            title: "远程控制期间更新",
+            message: "当前正处于远程控制会话。下载校验完成后，QuietDesk 会临时断开连接、自动安装新版本并恢复共享。支持更新重连的主控端会自动尝试连接。",
+            symbol: "arrow.triangle.2.circlepath",
+            tone: .info
+        )
+    }
+}
+
+private enum UpdateInstallationAction {
+    case restart, restartHost, downloadAndRestartHost
+
+    var buttonTitle: String {
+        switch self {
+        case .restart: return "安装并重启"
+        case .restartHost: return "临时断开并重启更新"
+        case .downloadAndRestartHost: return "下载并更新（自动重连）"
+        }
+    }
+
+    var confirmationTitle: String {
+        switch self {
+        case .restart: return "安装并重新启动？"
+        case .restartHost: return "临时断开远控并更新？"
+        case .downloadAndRestartHost: return "下载并更新被控端？"
+        }
+    }
+
+    @MainActor
+    func perform(controller: UpdateController) {
+        switch self {
+        case .restart: controller.install()
+        case .restartHost: controller.installDisconnectingHost()
+        case .downloadAndRestartHost: controller.downloadAndInstallDisconnectingHost()
+        }
+    }
+
+    @MainActor
+    func confirmationMessage(controller: UpdateController) -> String {
+        if self == .restart { return UpdateInstallationCopy.confirmationMessage(controller: controller) }
+        let preparation = self == .downloadAndRestartHost ? "QuietDesk 会先下载并校验更新。" : ""
+        var text = preparation + "安装将临时断开远控。重启后会自动恢复共享，支持更新重连的主控端会自动尝试连接。"
+        if controller.usesAdHocSignature {
+            text += "\n\n此构建使用临时签名。替换应用后，macOS 可能要求在被控机本机重新授予屏幕录制与辅助功能权限。未重新授权时，重启后可能无法直接恢复画面或控制。"
+        }
+        return text
+    }
+}
+
+private extension View {
+    @MainActor
+    func updateInstallationConfirmation(_ action: Binding<UpdateInstallationAction?>, controller: UpdateController) -> some View {
+        alert(action.wrappedValue?.confirmationTitle ?? "安装并重新启动？", isPresented: Binding(
+            get: { action.wrappedValue != nil },
+            set: { if !$0 { action.wrappedValue = nil } }
+        ), presenting: action.wrappedValue) { confirmed in
+            Button("取消", role: .cancel) {}.keyboardShortcut(.defaultAction)
+            Button(confirmed.buttonTitle) { confirmed.perform(controller: controller) }
+        } message: { confirmed in
+            Text(confirmed.confirmationMessage(controller: controller))
+        }
+    }
+}
+
 private enum UpdateInstallationCopy {
+    static let automaticCheckDetail = "例行检查间隔 24 小时，主控接入时也会检查"
+
     @MainActor
     static func confirmationMessage(controller: UpdateController) -> String {
         var text = "QuietDesk 将替换应用并重新启动。"

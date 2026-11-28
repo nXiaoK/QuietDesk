@@ -43,6 +43,11 @@ final class HostSession {
     let startupDeadline = ConnectionStartupDeadline()
     var startupPhase = DiagnosticLog.StartupPhase.sessionPreparation
     var terminationSubscribed = false
+    var connectionID: UUID?
+    var updateCheckReady = false
+    var qualityProbeActive = false
+    var viewerSupportsUpdateRestart = false
+    var restartingForUpdate = false
     var usesRelayControl = false
     var media: MediaSession?
     var mediaPrepared = false
@@ -120,6 +125,13 @@ final class HostSession {
 
 @MainActor
 final class ViewerSession {
+    struct HostUpdateWait {
+        let version: String
+        let startedAt: TimeInterval
+        var deadline: TimeInterval { startedAt + HostUpdateRestartNotice.maximumWaitSeconds }
+        var status: String { "被控端正在更新至 v\(version) 并重启，等待自动重连…" }
+    }
+
     let helloDeadline = ConnectionStartupDeadline()
     // Keep the authenticated mapping identity available if the saved route is deleted while connected.
     var mappingRecordID: UUID?
@@ -150,6 +162,8 @@ final class ViewerSession {
     var automaticVideoSettings: StreamSettings?
     var automaticVideoAdjustment: MediaQualityPolicy.Adjustment?
     var terminationSubscribed = false
+    var hostUpdateRestartNegotiated = false
+    var awaitingHostUpdate: HostUpdateWait?
     var helloReceived = false
     var stableTask: Task<Void, Never>?
     var clipboardPullTimeout: Task<Void, Never>?

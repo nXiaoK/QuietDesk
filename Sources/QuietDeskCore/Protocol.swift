@@ -41,6 +41,8 @@ public enum MessageKind: UInt8, Sendable {
     case mappingControl = 43, mappingData, mappingEOF
     // Sent only after the host advertises typeTextV1.
     case typeTextRequest = 46, typeTextResult = 47
+    // Sent only to viewers that subscribe with supportsUpdateRestart.
+    case hostUpdateRestart = 48
 }
 
 public struct Message: Sendable {
@@ -254,7 +256,8 @@ public struct Hello: Codable, Sendable {
     public let automaticDefaultQualityV1: Bool?
     // The host accepts a dynamic StreamSettingsRequest.viewport in backing pixels.
     public let videoViewportV1: Bool?
-    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil, displaySwitchingV1: Bool? = nil, displays: [RemoteDisplayInfo]? = nil, selectedDisplayID: UInt32? = nil, remoteAudioV1: Bool? = nil, relativeMouseV1: Bool? = nil, trackpadGesturesV1: Bool? = nil, initialCursorNegotiationV1: Bool? = nil, qualityProbeV1: Bool? = nil, typeTextV1: Bool? = nil, physicalFilePasteV1: Bool? = nil, automaticDefaultQualityV1: Bool? = nil, videoViewportV1: Bool? = nil) {
+    public let hostUpdateRestartV1: Bool?
+    public init(name: String, width: Int, height: Int, settings: StreamSettings, canControl: Bool, inputActions: Bool? = true, clipboardSync: Bool? = true, liveSettings: Bool? = true, controlStatusUpdates: Bool? = true, extendedVideoSettings: Bool? = true, preferredSettings: StreamSettings? = nil, deviceID: UUID? = nil, deviceIdentityExchange: Bool? = nil, highRefreshVideoSettings: Bool? = nil, preferredHighRefreshSettings: StreamSettings? = nil, sessionEffects: Bool? = nil, sessionPause: Bool? = nil, mediaTransportV1: Bool? = nil, independentCursorV1: Bool? = nil, relayTransportV1: Bool? = nil, relayDeviceID: UUID? = nil, sessionLockV1: Bool? = nil, adaptiveVideoV1: Bool? = nil, sessionUnlockV1: Bool? = nil, screenLocked: Bool? = nil, higherFrameRateVideoV1: Bool? = nil, preferredHigherFrameRateSettings: StreamSettings? = nil, displayDimmingV1: Bool? = nil, builtInDisplayDimmable: Bool? = nil, sessionTerminationV1: Bool? = nil, desktopActionsV1: Bool? = nil, hevcVideoV1: Bool? = nil, initialStreamNegotiationV1: Bool? = nil, hevc444VideoV1: Bool? = nil, displaySwitchingV1: Bool? = nil, displays: [RemoteDisplayInfo]? = nil, selectedDisplayID: UInt32? = nil, remoteAudioV1: Bool? = nil, relativeMouseV1: Bool? = nil, trackpadGesturesV1: Bool? = nil, initialCursorNegotiationV1: Bool? = nil, qualityProbeV1: Bool? = nil, typeTextV1: Bool? = nil, physicalFilePasteV1: Bool? = nil, automaticDefaultQualityV1: Bool? = nil, videoViewportV1: Bool? = nil, hostUpdateRestartV1: Bool? = nil) {
         self.name = name
         self.width = width
         self.height = height
@@ -301,6 +304,7 @@ public struct Hello: Codable, Sendable {
         self.typeTextV1 = typeTextV1
         self.automaticDefaultQualityV1 = automaticDefaultQualityV1
         self.videoViewportV1 = videoViewportV1
+        self.hostUpdateRestartV1 = hostUpdateRestartV1
     }
 
     public func validate() throws {

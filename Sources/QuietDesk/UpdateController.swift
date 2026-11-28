@@ -16,6 +16,9 @@ struct UpdateSessionContext: Equatable {
     var hasActiveConnection = false
     var autoStartSharing = false
     var hasOtherPrompt = false
+    var hostConnectionID: UUID? = nil
+    var isHostQualityProbeSession = false
+    var isHostConnectionPreparing = false
 }
 
 protocol UpdateInstalling: Sendable {
@@ -61,6 +64,8 @@ final class UpdateController: ObservableObject {
     let enabled: Bool
     let usesAdHocSignature: Bool
     var onRestoreLaunchOptions: ((UpdateInstaller.LaunchOptions) -> Void)?
+    var preferredHostScreen: (@MainActor () -> NSScreen?)?
+    var onPrepareHostUpdateRestart: (@MainActor (String) async -> Void)?
     private let feedURL: URL?
     private let publicKeys: [UpdatePublicKey]
     private let bundleIdentifier: String
@@ -84,8 +89,15 @@ final class UpdateController: ObservableObject {
     private var wasRemoteControlActive: Bool
     private var lastRemoteSessionEndedAt: Date?
     private var lastFailedAutomaticCheckAt: Date?
+    private var lastHandledHostConnectionID: UUID?
+    private var lastHostConnectCheckAt: Date?
+    private var promptedHostConnectionID: UUID?
+    private var unidentifiedHostConnectionID: UUID?
+    private var panelPresentedForHost = false
     private var deferredAutoInstallVersion: String?
     private var pendingImmediateInstallVersion: String?
+    private var pendingHostDisconnectInstallVersion: String?
+    private var pendingHostDisconnectInstallConnectionID: UUID?
     private var currentDownloadIsAutomatic = false
     private var pausedDownloadForRemoteSession = false
     private var autoDownloadFailures = 0
@@ -94,6 +106,7 @@ final class UpdateController: ObservableObject {
     private var prepared: UpdateInstaller.PreparedUpdate?
     private var started = false
     private var installationHandedOff = false
+    private var preparingHostUpdateRestart = false
     var interfacePromptVisible = false {
         didSet { if interfacePromptVisible { dismissConsent() } }
     }
@@ -159,8 +172,9 @@ final class UpdateController: ObservableObject {
             let current = self.session
             if current != self.lastObservedSession {
                 self.lastObservedSession = current
-                let emitted = self.observeRemoteSessionTransition(current, now: self.clock())
-                if !emitted {
+                let now = self.clock()
+                let emitted = self.observeRemoteSessionTransition(current, now: now)
+                if !self.handleIncomingHostConnectionIfNeeded(current, now: now), !emitted {
                     self.objectWillChange.send()
                 }
             }
@@ -246,6 +260,7 @@ final class UpdateController: ObservableObject {
         let currentNow = now ?? clock()
         let context = session
         _ = observeRemoteSessionTransition(context, now: currentNow)
+        _ = handleIncomingHostConnectionIfNeeded(context, now: currentNow)
         let window = mainWindow()
         let consentWindow = consentAlert?.window
         let otherPrompt = hasBlockingInterfacePrompt(context: context, window: window, consentWindow: consentWindow, includeUpdatePanel: true)
@@ -259,7 +274,7 @@ final class UpdateController: ObservableObject {
         if canPresentConsent, consentAlert == nil, let window {
             let alert = NSAlert()
             alert.messageText = "自动检查并更新？"
-            alert.informativeText = "QuietDesk 每天最多访问一次 GitHub 获取签名版本信息。开启自动更新后，仅在未处于远程控制或活动连接时自动下载并安装。随时可在偏好设置或菜单栏修改。"
+            alert.informativeText = "QuietDesk 每天访问 GitHub 检查签名版本信息。远控连入时也会检查，连入触发的检查至少间隔 60 秒。开启自动更新后，仅在未处于远程控制或活动连接时自动下载并安装。随时可在偏好设置或菜单栏修改。"
             alert.addButton(withTitle: "自动检查")
             alert.addButton(withTitle: "不检查")
             alert.addButton(withTitle: "开启自动更新")
@@ -272,7 +287,13 @@ final class UpdateController: ObservableObject {
                 else if response == .alertThirdButtonReturn { self.setAutomaticInstall(true) }
             }
         }
-        if UpdateCheckPolicy.shouldAutomaticallyCheck(
+        let canCheckOnSchedule = !context.hasHostConnection
+            || (!context.isHostConnectionPreparing && !context.isHostQualityProbeSession && !hasOfferForRemoteHost
+                && UpdateCheckPolicy.shouldCheckOnHostSessionConnect(
+                    updaterEnabled: enabled, autoCheckPreference: autoCheckPreference, isBenchmarkProbe: false,
+                    now: currentNow, lastHostConnectCheck: lastHostConnectCheckAt
+                ))
+        if canCheckOnSchedule && UpdateCheckPolicy.shouldAutomaticallyCheck(
             updaterEnabled: enabled, autoCheckPreference: autoCheckPreference,
             now: currentNow, launchedAt: launchedAt,
             lastCheck: defaults.object(forKey: "lastUpdateCheck") as? Date,
@@ -324,6 +345,10 @@ final class UpdateController: ObservableObject {
     }
 
     func check(manual: Bool = true, presentWindow: Bool? = nil, now: Date? = nil) {
+        check(manual: manual, presentWindow: presentWindow, now: now, offeringToHost: nil)
+    }
+
+    private func check(manual: Bool, presentWindow: Bool?, now: Date?, offeringToHost hostID: UUID?) {
         let checkTime = now ?? clock()
         guard enabled, let feedURL else { return }
         if presentWindow ?? manual { present() }
@@ -381,6 +406,7 @@ final class UpdateController: ObservableObject {
                     case .available:
                         self.manifest = update; self.state = .available; self.bannerDismissed = false
                         self.message = "新版本 \(update.version) 可用"
+                        if let hostID { self.presentForRemoteHostSession(hostID) }
                         shouldEvaluateAutoProgress = self.autoInstallPreference
                     case .requiresNewerSystem(let required):
                         self.manifest = update; self.state = .available; self.bannerDismissed = false
@@ -408,6 +434,11 @@ final class UpdateController: ObservableObject {
     }
 
     func present() {
+        panelPresentedForHost = false
+        present(on: nil, forRemoteHost: false)
+    }
+
+    private func present(on screen: NSScreen?, forRemoteHost: Bool) {
         guard enabled || completionNotice != nil else { return }
         dismissConsent()
         releaseControl()
@@ -421,6 +452,14 @@ final class UpdateController: ObservableObject {
             window.center()
             panel = window
         }
+        if forRemoteHost, let window = panel {
+            window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+            if let screen {
+                let frame = screen.visibleFrame
+                window.setFrameOrigin(NSPoint(x: frame.midX - window.frame.width / 2,
+                                              y: frame.midY - window.frame.height / 2))
+            }
+        }
         NSApp.activate(ignoringOtherApps: true)
         panel?.makeKeyAndOrderFront(nil)
     }
@@ -430,6 +469,8 @@ final class UpdateController: ObservableObject {
             deferredAutoInstallVersion = version
         }
         pendingImmediateInstallVersion = nil
+        clearPendingHostDisconnectInstall()
+        panelPresentedForHost = false
         panel?.close()
         bannerDismissed = true
     }
@@ -439,6 +480,8 @@ final class UpdateController: ObservableObject {
         defaults.set(update.version, forKey: "skippedUpdateVersion")
         deferredAutoInstallVersion = nil
         pendingImmediateInstallVersion = nil
+        clearPendingHostDisconnectInstall()
+        panelPresentedForHost = false
         manifest = nil; manualReleaseURL = nil; needsManualInstall = false; requiredSystemVersion = nil; state = .idle
         panel?.close(); bannerDismissed = true
     }
@@ -449,12 +492,23 @@ final class UpdateController: ObservableObject {
     func downloadAndInstall() {
         guard let update = manifest else { return }
         deferredAutoInstallVersion = nil
+        clearPendingHostDisconnectInstall()
         pendingImmediateInstallVersion = update.version
         if state == .ready {
             install(automatic: false)
         } else {
             download(automatic: false)
         }
+    }
+
+    func downloadAndInstallDisconnectingHost() {
+        guard let update = manifest, !busy, !needsManualInstall, requiredSystemVersion == nil else { return }
+        deferredAutoInstallVersion = nil
+        pendingHostDisconnectInstallVersion = update.version
+        pendingHostDisconnectInstallConnectionID = session.hostConnectionID
+        pendingImmediateInstallVersion = nil
+        if state == .ready { installDisconnectingHost() }
+        else { download(automatic: false) }
     }
 
     func download(automatic: Bool = false, now: Date? = nil) {
@@ -476,13 +530,16 @@ final class UpdateController: ObservableObject {
         operation = Task { [weak self] in
             guard let self else { return }
             var triggerInstallAfterReady = false
+            var triggerHostInstallAfterReady = false
             var triggerAutoEvaluate = false
             defer {
                 if self.operationID == id {
                     self.operation = nil
                     self.currentDownloadIsAutomatic = false
                 }
-                if triggerInstallAfterReady {
+                if triggerHostInstallAfterReady {
+                    self.installDisconnectingHost(confirmedConnectionID: self.pendingHostDisconnectInstallConnectionID, now: now)
+                } else if triggerInstallAfterReady {
                     self.install(automatic: false, now: now)
                 } else if triggerAutoEvaluate {
                     self.evaluateAutomaticProgress(now: now ?? self.clock())
@@ -508,7 +565,9 @@ final class UpdateController: ObservableObject {
                 self.message = staged.manualInstallationReason ?? "更新已通过校验，可以安装并重新启动。"
                 DiagnosticLog.shared.record(.updateDownload, state: .succeeded)
                 if !self.needsManualInstall {
-                    if self.pendingImmediateInstallVersion == update.version {
+                    if self.pendingHostDisconnectInstallVersion == update.version {
+                        triggerHostInstallAfterReady = true
+                    } else if self.pendingImmediateInstallVersion == update.version {
                         self.pendingImmediateInstallVersion = nil
                         if !self.installBlocked {
                             triggerInstallAfterReady = true
@@ -518,10 +577,12 @@ final class UpdateController: ObservableObject {
                     }
                 } else {
                     self.pendingImmediateInstallVersion = nil
+                    self.clearPendingHostDisconnectInstall()
                 }
             } catch {
                 guard !Task.isCancelled, self.operationID == id else { return }
                 self.pendingImmediateInstallVersion = nil
+                self.clearPendingHostDisconnectInstall()
                 self.state = .failed
                 if automatic, (error as NSError).domain == NSURLErrorDomain {
                     self.autoDownloadFailures += 1
@@ -538,7 +599,32 @@ final class UpdateController: ObservableObject {
     }
 
     func install(automatic: Bool = false, now: Date? = nil) {
+        performInstall(automatic: automatic, allowHostDisconnect: false, now: now)
+    }
+
+    func installDisconnectingHost(now: Date? = nil) {
+        installDisconnectingHost(confirmedConnectionID: session.hostConnectionID, now: now)
+    }
+
+    private func installDisconnectingHost(confirmedConnectionID: UUID?, now: Date?) {
+        clearPendingHostDisconnectInstall()
+        performInstall(automatic: false, allowHostDisconnect: true, confirmedConnectionID: confirmedConnectionID, now: now)
+    }
+
+    private func clearPendingHostDisconnectInstall() {
+        pendingHostDisconnectInstallVersion = nil
+        pendingHostDisconnectInstallConnectionID = nil
+    }
+
+    private func hasOriginalHostConfirmation(_ connectionID: UUID?) -> Bool {
+        guard let connectionID else { return true }
+        let context = session
+        return !context.hasHostConnection || context.hostConnectionID == connectionID
+    }
+
+    private func performInstall(automatic: Bool, allowHostDisconnect: Bool, confirmedConnectionID: UUID? = nil, now: Date?) {
         guard state == .ready, let prepared, !busy, !needsManualInstall else { return }
+        let confirmationExpired = "远控会话已更换，请重新确认断开并更新。"
         if automatic {
             switch currentAutoInstallDecision(now: now ?? clock()) {
             case .proceed:
@@ -549,6 +635,8 @@ final class UpdateController: ObservableObject {
                 }
                 return
             }
+        } else if allowHostDisconnect {
+            guard hasOriginalHostConfirmation(confirmedConnectionID) else { message = confirmationExpired; return }
         } else {
             guard !installBlocked else { message = "这台 Mac 正被远程控制，请先停止共享后安装。"; return }
         }
@@ -558,7 +646,7 @@ final class UpdateController: ObservableObject {
             automatic: automatic,
             openInBackground: automatic && (!preInstallContext.applicationActive || !preInstallContext.mainWindowVisible),
             minimizeWindowOnLaunch: automatic && !preInstallContext.mainWindowVisible,
-            resumeHostSharing: (preInstallContext.isHostDesktopSharing || preInstallContext.isSharing) && !preInstallContext.autoStartSharing,
+            resumeHostSharing: allowHostDisconnect || preInstallContext.isHostDesktopSharing || preInstallContext.isSharing,
             resumeMappingHosting: preInstallContext.isMappingHosting
         )
         let id = UUID(); operationID = id
@@ -582,6 +670,12 @@ final class UpdateController: ObservableObject {
                             ?? "检测到远程连接，自动安装已推迟，将在空闲后继续。"
                         return
                     }
+                } else if allowHostDisconnect {
+                    guard self.hasOriginalHostConfirmation(confirmedConnectionID) else {
+                        self.installer.abortPendingInstallation()
+                        self.state = .ready; self.message = confirmationExpired
+                        return
+                    }
                 } else {
                     guard !self.installBlocked else {
                         self.installer.abortPendingInstallation()
@@ -590,7 +684,13 @@ final class UpdateController: ObservableObject {
                     }
                 }
                 self.dismissConsent()
+                if let sheet = self.panel?.attachedSheet { self.panel?.endSheet(sheet, returnCode: .abort) }
                 self.panel?.close()
+                if allowHostDisconnect {
+                    // The ready installer now depends on a normal application exit.
+                    self.preparingHostUpdateRestart = true
+                    await self.onPrepareHostUpdateRestart?(prepared.expectation.version)
+                }
                 self.installationHandedOff = true
                 self.terminateApplication()
             } catch {
@@ -607,11 +707,12 @@ final class UpdateController: ObservableObject {
     }
 
     func cancel() {
-        guard !installationHandedOff, operation != nil || prepared != nil else { return }
+        guard !installationHandedOff, !preparingHostUpdateRestart, operation != nil || prepared != nil else { return }
         if let version = manifest?.version {
             deferredAutoInstallVersion = version
         }
         pendingImmediateInstallVersion = nil
+        clearPendingHostDisconnectInstall()
         pausedDownloadForRemoteSession = false
         operation?.cancel()
         installer.cancel(); installer.abortPendingInstallation()
@@ -625,6 +726,7 @@ final class UpdateController: ObservableObject {
     func shutdown() {
         scheduler?.cancel(); scheduler = nil
         dismissConsent()
+        dismissRemoteHostOffer()
         if !installationHandedOff { cancel() }
     }
 
@@ -689,6 +791,69 @@ final class UpdateController: ObservableObject {
             || (panel?.attachedSheet != nil)
             || (window?.attachedSheet != nil && window?.attachedSheet !== consentWindow)
             || (NSApp.modalWindow != nil && NSApp.modalWindow !== consentWindow)
+    }
+
+    @discardableResult
+    private func handleIncomingHostConnectionIfNeeded(_ context: UpdateSessionContext, now: Date) -> Bool {
+        guard context.hasHostConnection else {
+            lastHandledHostConnectionID = nil
+            unidentifiedHostConnectionID = nil
+            dismissRemoteHostOffer()
+            return false
+        }
+        if context.isHostConnectionPreparing {
+            if promptedHostConnectionID != context.hostConnectionID { dismissRemoteHostOffer() }
+            return false
+        }
+
+        // Callers that do not carry the authenticated ID still get one check per connected interval.
+        if context.hostConnectionID == nil, unidentifiedHostConnectionID == nil {
+            unidentifiedHostConnectionID = UUID()
+        }
+        guard let id = context.hostConnectionID ?? unidentifiedHostConnectionID else { return false }
+        if promptedHostConnectionID != id || context.isHostQualityProbeSession { dismissRemoteHostOffer() }
+        if context.isHostQualityProbeSession {
+            lastHandledHostConnectionID = id
+            return false
+        }
+        guard enabled, autoCheckPreference == true, lastHandledHostConnectionID != id, !busy else { return false }
+        lastHandledHostConnectionID = id
+        if hasOfferForRemoteHost {
+            presentForRemoteHostSession(id)
+            return false
+        }
+        guard state != .ready, UpdateCheckPolicy.shouldCheckOnHostSessionConnect(
+            updaterEnabled: enabled, autoCheckPreference: autoCheckPreference,
+            isBenchmarkProbe: context.isHostQualityProbeSession, now: now, lastHostConnectCheck: lastHostConnectCheckAt
+        ) else { return false }
+        lastHostConnectCheckAt = now
+        check(manual: false, presentWindow: false, now: now, offeringToHost: id)
+        return true
+    }
+
+    private var hasOfferForRemoteHost: Bool {
+        guard state == .available || state == .ready, let update = manifest, requiredSystemVersion == nil else { return false }
+        return UpdateCheckPolicy.shouldOffer(version: update.version,
+            skippedVersion: defaults.string(forKey: "skippedUpdateVersion"), manual: false)
+    }
+
+    private func presentForRemoteHostSession(_ id: UUID) {
+        let context = session
+        guard enabled, autoCheckPreference == true, context.hasHostConnection,
+              !context.isHostConnectionPreparing, !context.isHostQualityProbeSession,
+              id == (context.hostConnectionID ?? unidentifiedHostConnectionID),
+              id != promptedHostConnectionID, hasOfferForRemoteHost else { return }
+        promptedHostConnectionID = id
+        if panel?.isVisible != true { panelPresentedForHost = true }
+        present(on: preferredHostScreen?() ?? NSScreen.main, forRemoteHost: true)
+    }
+
+    private func dismissRemoteHostOffer() {
+        promptedHostConnectionID = nil
+        guard panelPresentedForHost else { return }
+        panelPresentedForHost = false
+        if let sheet = panel?.attachedSheet { panel?.endSheet(sheet, returnCode: .abort) }
+        panel?.close()
     }
 
     @discardableResult

@@ -42,9 +42,16 @@ struct ConnectionRecoveryPresentation {
         connecting: Bool = false,
         failure: String? = nil,
         disconnectedActionTitle: String = "返回连接",
-        isDedicatedSessionWindow: Bool = false
+        isDedicatedSessionWindow: Bool = false,
+        hostUpdateStatus: String? = nil
     ) {
-        if reconnecting && paused {
+        if reconnecting, let hostUpdateStatus {
+            state = wait == nil ? .connecting : .waiting
+            title = "等待被控端更新重启"
+            detail = hostUpdateStatus
+            reason = wait?.countdown(at: now)
+            actionTitle = "取消连接"
+        } else if reconnecting && paused {
             state = .paused
             title = "空闲暂停，等待返回窗口"
             detail = status
@@ -113,6 +120,7 @@ struct ConnectionRecoveryView: View {
     var disconnectedActionTitle: String = "返回连接"
     var isDedicatedSessionWindow: Bool = false
     var retry: (() -> Void)? = nil
+    var hostUpdateStatus: String? = nil
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
@@ -126,7 +134,8 @@ struct ConnectionRecoveryView: View {
                 connecting: connecting,
                 failure: failure,
                 disconnectedActionTitle: disconnectedActionTitle,
-                isDedicatedSessionWindow: isDedicatedSessionWindow
+                isDedicatedSessionWindow: isDedicatedSessionWindow,
+                hostUpdateStatus: hostUpdateStatus
             )
             VStack(alignment: .leading, spacing: 11) {
                 HStack(spacing: 10) {

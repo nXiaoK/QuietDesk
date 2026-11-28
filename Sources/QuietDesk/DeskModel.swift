@@ -502,12 +502,23 @@ final class DeskModel: ObservableObject, Identifiable {
     private var permissionGuide: PermissionGuide?
     var updatePromptBlocked: Bool { permissionGuide?.isVisible == true || error != nil || pendingFileOffer != nil || portMappings.hostApprovalPending }
     var hasIncomingControlConnection: Bool { mode == .host && peer != nil }
+    var currentHostConnectionID: UUID? { mode == .host ? hostSession.connectionID : nil }
+    var isHostQualityProbeActive: Bool { mode == .host && hostSession.qualityProbeActive }
+    var isHostUpdateCheckReady: Bool { mode == .host && hostSession.updateCheckReady && !hostSession.restartingForUpdate }
+    var currentHostSharedScreen: NSScreen? {
+        guard mode == .host else { return nil }
+        let sharedDisplayID = hostSession.capturedDisplay?.id ?? displayID
+        return NSScreen.screens.first {
+            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == sharedDisplayID
+        } ?? NSScreen.main
+    }
     /// This Mac is connecting to, connected to or about to reconnect to another Mac.
     var isControllingAnotherMac: Bool { mode == .viewer && (active || working || connected || reconnecting) }
     private var capsLockStartAttempted = false
     private var controlStatusUpdatesEnabled = false
     private var lastMetrics = SessionClock.now
     private var reconnectTask: Task<Void, Never>?
+    private var hostUpdateDeadlineTask: Task<Void, Never>?
     private var hostRetryTask: Task<Void, Never>?
     private var retryBackoff = RetryBackoff()
     private var hostBackoff = RetryBackoff()
@@ -1831,6 +1842,10 @@ final class DeskModel: ObservableObject, Identifiable {
             DispatchQueue.main.async {
                 guard let self, let candidate, self.pending.removeValue(forKey: id) != nil,
                       self.generation == token, self.active, self.hostingRequested else { candidate?.close("桌面共享尚未开启"); return }
+                guard !self.hostSession.restartingForUpdate else {
+                    candidate.close("被控端正在安装更新并重新启动", retryable: true)
+                    return
+                }
                 guard MultiSessionPolicy.allowsIncomingHostConnection(
                     existingHostPeerActive: self.peer != nil,
                     outgoingViewerSessionCount: self.services.otherModels(excluding: self).filter(\.isControllingAnotherMac).count
@@ -2020,9 +2035,23 @@ final class DeskModel: ObservableObject, Identifiable {
                             qualityProbeV1: true,
                             typeTextV1: true,
                             automaticDefaultQualityV1: ownerChoseQuality ? nil : true,
-                            videoViewportV1: true)))
+                            videoViewportV1: true,
+                            hostUpdateRestartV1: true)))
+                        host.connectionID = UUID()
+                        self.objectWillChange.send()
                         candidate.setVideoPacing(VideoSendPacing(megabits: settings.megabits))
-                        channel.configureAcknowledgement { [weak streamer] in streamer?.acknowledge($0) }
+                        // A legacy viewer may never subscribe. Its first validated frame acknowledgement
+                        // establishes readiness after any ordered quality-probe request.
+                        var acknowledgedInitialFrame = false
+                        channel.configureAcknowledgement { [weak self, weak candidate, weak streamer] sequence in
+                            streamer?.acknowledge(sequence)
+                            guard !acknowledgedInitialFrame else { return }
+                            acknowledgedInitialFrame = true
+                            DispatchQueue.main.async {
+                                guard let self, let candidate, self.peer === candidate else { return }
+                                self.markHostUpdateCheckReady()
+                            }
+                        }
                         streamer.onFrame = { [weak media] packet in media?.sendVideo(packet) }
                         streamer.onDiagnosticError = { [weak self, weak candidate, weak host] error in
                             DispatchQueue.main.async {
@@ -2190,8 +2219,10 @@ final class DeskModel: ObservableObject, Identifiable {
                         if message.kind != .releaseInput { candidate.close("屏幕共享尚未就绪", retryable: true) }
                         return
                     }
-                    do { try await self.handleHost(message, peer: candidate) }
-                    catch {
+                    do {
+                        try await self.handleHost(message, peer: candidate)
+                        if self.peer === candidate { self.markHostUpdateCheckReady() }
+                    } catch {
                         self.recordDiagnosticFailure(.connectionFailed, error: error)
                         candidate.close(error.localizedDescription)
                     }
@@ -3374,8 +3405,8 @@ final class DeskModel: ObservableObject, Identifiable {
     }
 
     private func beginConnection(_ target: Target) {
-        guard peer == nil, !systemSleeping else { return }
-        if reconnecting {
+        guard peer == nil, !systemSleeping, !expireHostUpdateWaitIfNeeded() else { return }
+        if reconnecting, !isAwaitingHostUpdateRestart {
             _ = idlePolicy.tick(now: SessionClock.now, attended: sessionWindowAttended)
             if idlePolicy.isPaused { deferReconnectForIdle("离开窗口 10 分钟"); return }
         }
@@ -3397,7 +3428,7 @@ final class DeskModel: ObservableObject, Identifiable {
                 observePeerPath(bridge, viewer: viewer)
                 active = true; working = true
                 controlTransportStatus = "正在接通中继"
-                status = "正在通过 \(relay.endpoint.host) 接通目标设备…"
+                status = viewerSession.awaitingHostUpdate?.status ?? "正在通过 \(relay.endpoint.host) 接通目标设备…"
                 let token = generation
                 bridge.onReady = { [weak self, weak viewer, weak bridge] port in
                     DispatchQueue.main.async {
@@ -3415,8 +3446,14 @@ final class DeskModel: ObservableObject, Identifiable {
                             if bridge.failedBeforeDesktopStream { peer.close(error.localizedDescription, retryable: retryable) }
                         } else {
                             let reason = error.localizedDescription
+                            if self.expireHostUpdateWaitIfNeeded() { return }
+                            if let update = self.viewerSession.awaitingHostUpdate, retryable {
+                                self.clearSession()
+                                self.scheduleReconnect(update.status)
+                                return
+                            }
                             self.recordDisconnect(reason); self.clearSession()
-                            if self.failOverRelay(from: target, reason: reason) { return }
+                            if !self.isAwaitingHostUpdateRestart, self.failOverRelay(from: target, reason: reason) { return }
                             if retryable, self.effectiveAutoReconnect, self.target != nil {
                                 if relay.strategy == .automatic, !target.address.isEmpty {
                                     self.relaySelectedForTarget = false; self.relayFallbackFailed()
@@ -3436,14 +3473,15 @@ final class DeskModel: ObservableObject, Identifiable {
             guard viewer.closeTailnetBridge == nil else { return }
             active = true
             working = true
-            status = "正在通过 Tailscale 连接 \(host)…"
+            status = viewerSession.awaitingHostUpdate?.status ?? "正在通过 Tailscale 连接 \(host)…"
             controlTransportStatus = "正在连接 Tailscale"
             viewer.closeTailnetBridge = services.tailnet.bridge(host: host, port: target.port, ready: { [weak self, weak viewer] port in
                 guard let self, self.viewerSession === viewer else { return }
                 self.beginPeerConnection(target, host: "127.0.0.1", port: port, viaRelay: false)
             }, failed: { [weak self, weak viewer] reason in
                 guard let self, self.viewerSession === viewer else { return }
-                if self.reconnecting, self.effectiveAutoReconnect, self.services.tailnet.enabled {
+                if self.expireHostUpdateWaitIfNeeded() { return }
+                if self.reconnecting, self.effectiveAutoReconnect || self.isAwaitingHostUpdateRestart, self.services.tailnet.enabled {
                     self.clearSession()
                     self.scheduleReconnect(reason)
                 } else {
@@ -3461,7 +3499,7 @@ final class DeskModel: ObservableObject, Identifiable {
     }
 
     private func beginPeerConnection(_ target: Target, host: String, port: UInt16, viaRelay: Bool) {
-        guard peer == nil, !systemSleeping else { return }
+        guard peer == nil, !systemSleeping, !expireHostUpdateWaitIfNeeded() else { return }
         let diagnostics = PerformanceDiagnostics(enabled: performanceDiagnosticsEnabled)
         let connection = NWConnection(host: NWEndpoint.Host(host),
             port: NWEndpoint.Port(rawValue: port)!, using: SecureTransport.parameters(key: target.key, responsiveAcknowledgements: true))
@@ -3499,7 +3537,7 @@ final class DeskModel: ObservableObject, Identifiable {
                 self.applyInitialVideoQualityIfReady()
             }
         }
-        status = reconnecting ? "正在重新建立加密连接…" : "正在建立加密连接…"
+        status = viewer.awaitingHostUpdate?.status ?? (reconnecting ? "正在重新建立加密连接…" : "正在建立加密连接…")
         candidate.onReady = { [weak self, weak candidate, weak viewer] in
             DispatchQueue.main.async {
                 guard let self, let candidate, let viewer, self.peer === candidate, self.viewerSession === viewer else { return }
@@ -3513,7 +3551,8 @@ final class DeskModel: ObservableObject, Identifiable {
                 DiagnosticLog.shared.record(.connectionReady, role: .viewer, state: .ready,
                     values: viaRelay ? [.relayControl: 1] : ackStretchingDisabled.map { [.tcpAckStretchingDisabled: $0 ? 1 : 0] } ?? [:])
                 self.controlTransportStatus = target.tailnetHost != nil ? "Tailscale 控制" : (viaRelay ? "中继控制" : "直连控制")
-                self.status = viaRelay ? "中继连接已端到端加密，等待画面…" : "连接已加密，等待画面…"
+                self.status = viewer.awaitingHostUpdate?.status
+                    ?? (viaRelay ? "中继连接已端到端加密，等待画面…" : "连接已加密，等待画面…")
             }
         }
         candidate.onMessageHandled = { [weak self, weak candidate] message, resume in
@@ -3528,7 +3567,7 @@ final class DeskModel: ObservableObject, Identifiable {
                     channel.expectFreshFrame(self.pauseTransmission.freshFrameToken)
                 } catch {
                     self.recordDiagnosticFailure(.connectionFailed, error: error)
-                    candidate.close(error.localizedDescription)
+                    candidate.close(error.localizedDescription, retryable: self.viewerSession.awaitingHostUpdate == nil)
                 }
             }
         }
@@ -3544,6 +3583,21 @@ final class DeskModel: ObservableObject, Identifiable {
             let mayTryAlternate = candidate?.closeAllowsAlternateRoute == true
             DispatchQueue.main.async {
                 guard let self, let candidate, self.peer === candidate else { return }
+                if self.expireHostUpdateWaitIfNeeded() { return }
+                if let update = self.viewerSession.awaitingHostUpdate {
+                    // Port refusal while the host relaunches is a network failure even if ordinary
+                    // automatic reconnect would stop. Keep authentication and protocol errors terminal.
+                    if self.connected || retryable || (relayError == nil && mayTryAlternate) {
+                        self.clearSession()
+                        self.scheduleReconnect(update.status)
+                    } else {
+                        self.recordDisconnect(reason)
+                        self.stop(reason: reason)
+                        self.status = reason
+                        self.connectionError = reason
+                    }
+                    return
+                }
                 self.recordDisconnect(reason)
                 let wasConnected = self.connected
                 let verifiedTarget = viewer?.relayTargetVerified == true
@@ -3576,19 +3630,27 @@ final class DeskModel: ObservableObject, Identifiable {
     private func scheduleReconnect(_ reason: String) {
         reconnectTask?.cancel()
         reconnectWait = nil
-        guard !systemSleeping else { return }
-        _ = idlePolicy.tick(now: SessionClock.now, attended: sessionWindowAttended)
-        if idlePolicy.isPaused {
-            deferReconnectForIdle(reason)
-            return
+        let now = SessionClock.now
+        guard !systemSleeping, !expireHostUpdateWaitIfNeeded(now: now) else { return }
+        let update = viewerSession.awaitingHostUpdate
+        if update == nil {
+            _ = idlePolicy.tick(now: now, attended: sessionWindowAttended)
+            if idlePolicy.isPaused {
+                deferReconnectForIdle(reason)
+                return
+            }
+            if var target, target.relayRoutes.count > 1 {
+                target.relayRoutesOrdered = false
+                if let first = target.relayRoutes.first { target = target.using(first) }
+                self.target = target
+            }
+        } else {
+            reconnectDeferredForIdle = false
+            sessionPaused = false
         }
-        if var target, target.relayRoutes.count > 1 {
-            target.relayRoutesOrdered = false
-            if let first = target.relayRoutes.first { target = target.using(first) }
-            self.target = target
-        }
-        let delay = retryBackoff.next()
-        let wait = ReconnectWait(attempt: retryBackoff.attempt, delay: delay, reason: reason, now: SessionClock.now)
+        let ordinaryDelay = retryBackoff.next()
+        let delay = update.flatMap { HostUpdateRestartNotice.reconnectDelay(startedAt: $0.startedAt, now: now) } ?? ordinaryDelay
+        let wait = ReconnectWait(attempt: retryBackoff.attempt, delay: delay, reason: update?.status ?? reason, now: now)
         reconnectWait = wait
         connectionDiagnostics?.waiting(.reconnecting)
         DiagnosticLog.shared.record(.reconnectScheduled, role: .viewer, state: .requested,
@@ -3597,13 +3659,61 @@ final class DeskModel: ObservableObject, Identifiable {
         active = true
         working = true
         reconnecting = true
-        status = wait.status
+        status = update?.status ?? wait.status
         reconnectTask = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(wait.delay)) } catch { return }
-            guard let self, self.generation == token, let target = self.target, self.effectiveAutoReconnect,
-                  !Task.isCancelled, self.peer == nil else { return }
+            guard let self, self.generation == token, !Task.isCancelled, self.peer == nil,
+                  !self.expireHostUpdateWaitIfNeeded(), let target = self.target,
+                  self.effectiveAutoReconnect || self.isAwaitingHostUpdateRestart else { return }
             self.beginConnection(target)
         }
+    }
+
+    private var isAwaitingHostUpdateRestart: Bool {
+        guard let update = viewerSession.awaitingHostUpdate else { return false }
+        return SessionClock.now < update.deadline
+    }
+
+    var hostUpdateReconnectStatus: String? {
+        reconnecting ? viewerSession.awaitingHostUpdate?.status : nil
+    }
+
+    private func beginHostUpdateWait(_ notice: HostUpdateRestartNotice) {
+        guard viewerSession.awaitingHostUpdate == nil else { return }
+        let update = ViewerSession.HostUpdateWait(version: notice.targetVersion, startedAt: SessionClock.now)
+        viewerSession.awaitingHostUpdate = update
+        retryBackoff.reset()
+        let token = generation
+        hostUpdateDeadlineTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let remaining = update.deadline - SessionClock.now
+                if remaining <= 0 {
+                    guard let self, self.generation == token else { return }
+                    _ = self.expireHostUpdateWaitIfNeeded()
+                    return
+                }
+                do { try await Task.sleep(for: .seconds(remaining)) } catch { return }
+            }
+        }
+    }
+
+    private func clearHostUpdateWait() {
+        hostUpdateDeadlineTask?.cancel()
+        hostUpdateDeadlineTask = nil
+        viewerSession.awaitingHostUpdate = nil
+    }
+
+    @discardableResult
+    private func expireHostUpdateWaitIfNeeded(now: TimeInterval = SessionClock.now) -> Bool {
+        guard let update = viewerSession.awaitingHostUpdate, now >= update.deadline else { return false }
+        clearHostUpdateWait()
+        // A host that sent a notice but never disconnected may still be in use.
+        guard !connected else { return false }
+        let reason = "等待被控端更新至 v\(update.version) 后重连超时，请检查被控端再重新连接。"
+        stop(reason: reason)
+        status = reason
+        connectionError = reason
+        return true
     }
 
     // Only an automatic fallback that never reached the desktop stream starts the cooldown.
@@ -3880,6 +3990,7 @@ final class DeskModel: ObservableObject, Identifiable {
             let notification = try SessionTermination.read(message.payload)
             guard notification.operation == .subscribe else { throw DeskError.invalid("结束连接消息方向无效") }
             hostSession.terminationSubscribed = true
+            hostSession.viewerSupportsUpdateRestart = notification.supportsUpdateRestart == true
         case .cursorControl:
             let request = try CursorControl.read(message.payload)
             guard request.operation == .request, hostSession.mediaPrepared else { throw DeskError.invalid("光标功能未协商") }
@@ -3954,9 +4065,19 @@ final class DeskModel: ObservableObject, Identifiable {
         case .qualityProbeControl:
             let control = try QualityProbeControl.read(message.payload)
             hostSession.qualityProbeRequested = true
+            if control.enabled, !hostSession.qualityProbeActive {
+                hostSession.qualityProbeActive = true
+                objectWillChange.send()
+            }
             hostSession.streamer?.setQualityProbe(enabled: control.enabled, durationSeconds: control.durationSeconds)
         default: throw DeskError.invalid("收到当前角色不支持的消息")
         }
+    }
+
+    private func markHostUpdateCheckReady() {
+        guard hostSession.connectionID != nil, !hostSession.updateCheckReady else { return }
+        hostSession.updateCheckReady = true
+        objectWillChange.send()
     }
 
     private func handleHostImmediateInput(_ input: RemoteInput, peer: Peer) throws {
@@ -3991,6 +4112,12 @@ final class DeskModel: ObservableObject, Identifiable {
         case .typeTextResult:
             guard supportsRemoteTextTyping else { throw DeskError.invalid("模拟键入功能未协商") }
             receiveTypeTextResult(try Wire.readJSON(TypeTextResult.self, message.payload))
+        case .hostUpdateRestart:
+            guard viewerSession.helloReceived, viewerSession.hostUpdateRestartNegotiated else {
+                throw DeskError.invalid("当前连接未协商更新重启通知")
+            }
+            let notice = try HostUpdateRestartNotice.read(message.payload)
+            if activeRouteBenchmarkOverride == nil { beginHostUpdateWait(notice) }
         case .sessionTermination:
             guard viewerSession.helloReceived, viewerSession.terminationSubscribed else {
                 throw DeskError.invalid("当前连接未启用结束通知")
@@ -4033,7 +4160,17 @@ final class DeskModel: ObservableObject, Identifiable {
             if viewerSession.usesRelayControl, !viewerSession.relayTargetVerified {
                 throw DeskError.invalid("中继目标标识不匹配或对端版本不支持，请检查设备标识并升级两端")
             }
-            if reconnecting, idlePolicy.isPaused || idlePolicy.tick(now: SessionClock.now, attended: sessionWindowAttended) {
+            guard !expireHostUpdateWaitIfNeeded() else { return }
+            let recoveredFromHostUpdate = viewerSession.awaitingHostUpdate != nil
+            if recoveredFromHostUpdate {
+                clearHostUpdateWait()
+                retryBackoff.reset()
+                idlePolicy = SessionIdlePolicy(now: SessionClock.now, enabled: !disableIdleAutoPause)
+                _ = idlePolicy.attentionChanged(now: SessionClock.now, attended: sessionWindowAttended, suppressWake: true)
+                pauseTransmission = SessionPauseTransmission()
+            }
+            if reconnecting, !recoveredFromHostUpdate,
+               idlePolicy.isPaused || idlePolicy.tick(now: SessionClock.now, attended: sessionWindowAttended) {
                 clearSession()
                 peer.close("空闲暂停，返回窗口后继续连接")
                 deferReconnectForIdle("连接恢复前已达到空闲时限")
@@ -4052,7 +4189,9 @@ final class DeskModel: ObservableObject, Identifiable {
             }
             if hello.sessionTerminationV1 == true {
                 viewerSession.terminationSubscribed = true
-                peer.send(try SessionTermination(.subscribe).message())
+                viewerSession.hostUpdateRestartNegotiated = hello.hostUpdateRestartV1 == true
+                peer.send(try SessionTermination(.subscribe,
+                    supportsUpdateRestart: viewerSession.hostUpdateRestartNegotiated ? true : nil).message())
             }
             if viewerSession.usesRelayControl { relayFallbackAttempted = false; relayFallbackCooldown.reset() }
             dataChannel?.configureVideo(canvas.makeVideoReceiver(diagnostics: performanceDiagnostics))
@@ -6085,7 +6224,7 @@ final class DeskModel: ObservableObject, Identifiable {
     func setAutoReconnect(_ enabled: Bool) {
         autoReconnect = enabled
         UserDefaults.standard.set(enabled, forKey: "autoReconnect")
-        if !enabled, reconnecting { stop(reason: "已关闭自动重连") }
+        if !enabled, reconnecting, !isAwaitingHostUpdateRestart { stop(reason: "已关闭自动重连") }
     }
 
     func setDisableIdleAutoPause(_ disabled: Bool) {
@@ -6254,9 +6393,9 @@ final class DeskModel: ObservableObject, Identifiable {
             connectionDiagnostics?.waiting(.paused)
             candidate?.close("本机进入睡眠，等待唤醒后重新连接")
             active = true
-            reconnecting = effectiveAutoReconnect
+            reconnecting = effectiveAutoReconnect || isAwaitingHostUpdateRestart
             freshFrameRequiredOnReconnect = true
-            status = "系统即将睡眠，连接已暂停"
+            status = viewerSession.awaitingHostUpdate?.status ?? "系统即将睡眠，连接已暂停"
         }
     }
 
@@ -6274,11 +6413,12 @@ final class DeskModel: ObservableObject, Identifiable {
             }
             startHosting(interactive: false)
         } else if let target, active || working || reconnecting {
+            if expireHostUpdateWaitIfNeeded() { return }
             reconnectTask?.cancel()
             let candidate = peer
             clearSession()
             candidate?.close("系统唤醒，重新建立连接")
-            guard effectiveAutoReconnect else {
+            guard effectiveAutoReconnect || isAwaitingHostUpdateRestart else {
                 stop(reason: "系统已唤醒，自动重连已关闭")
                 status = "系统已唤醒，请重新连接"
                 return
@@ -6288,7 +6428,8 @@ final class DeskModel: ObservableObject, Identifiable {
             pauseTransmission.requireFreshFrame()
             active = true
             reconnecting = true
-            beginConnection(target)
+            if let update = viewerSession.awaitingHostUpdate { scheduleReconnect(update.status) }
+            else { beginConnection(target) }
         }
     }
 
@@ -6298,7 +6439,8 @@ final class DeskModel: ObservableObject, Identifiable {
         metricsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                if self.mode == .viewer,
+                if self.expireHostUpdateWaitIfNeeded() { return }
+                if self.mode == .viewer, !self.isAwaitingHostUpdateRestart,
                    (self.connected && self.supportsSessionPause || self.reconnecting && self.target != nil),
                    self.idlePolicy.tick(now: SessionClock.now, attended: self.sessionWindowAttended) {
                     self.viewerSession.restoreCanvasFocusAfterIdle = self.controlling
@@ -6497,7 +6639,9 @@ final class DeskModel: ObservableObject, Identifiable {
             }
         }
         hostSession = HostSession()
+        hostSession.restartingForUpdate = oldHost.restartingForUpdate
         viewerSession = ViewerSession()
+        viewerSession.awaitingHostUpdate = oldViewer.awaitingHostUpdate
         supportsSessionPause = false
         pauseTransmission = SessionPauseTransmission(paused: idlePolicy.isPaused)
         if freshFrameRequiredOnReconnect { pauseTransmission.requireFreshFrame() }
@@ -6574,7 +6718,7 @@ final class DeskModel: ObservableObject, Identifiable {
 
     /// Ends only the authenticated control session. The listener and relay registrations stay available.
     func disconnectController() {
-        guard mode == .host, let oldPeer = peer else { return }
+        guard mode == .host, !hostSession.restartingForUpdate, let oldPeer = peer else { return }
         let subscribed = hostSession.terminationSubscribed
         recordDisconnect("已断开控制端")
         // Revoke input/data handlers and cancel capture before attempting the final control notification.
@@ -6584,7 +6728,21 @@ final class DeskModel: ObservableObject, Identifiable {
         oldPeer.closeAfterSessionTermination(notify: subscribed)
     }
 
+    func prepareHostForUpdateRestart(targetVersion: String) async {
+        guard mode == .host, !hostSession.restartingForUpdate else { return }
+        hostSession.restartingForUpdate = true
+        guard let oldPeer = peer else { return }
+        let notify = hostSession.viewerSupportsUpdateRestart
+        recordDisconnect("被控端正在安装更新并重新启动")
+        clearSession()
+        status = "正在安装更新并重新启动…"
+        await withCheckedContinuation { continuation in
+            oldPeer.closeAfterHostUpdateRestart(version: targetVersion, notify: notify) { continuation.resume() }
+        }
+    }
+
     func stop(reason: String? = nil, exitFullScreen: Bool = true) {
+        clearHostUpdateWait()
         let report: ConnectionDiagnosticReport?
         if let diagnostics = connectionDiagnostics {
             let name: String

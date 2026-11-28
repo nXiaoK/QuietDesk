@@ -37,10 +37,17 @@ struct QuietDeskApp: App {
                 isMappingHosting: host.mappingHosting,
                 hasActiveConnection: models.hasConnectedViewerSession || host.connected || viewer.portMappings.hasRunningMappings || host.portMappings.hasIncomingMappings,
                 autoStartSharing: host.autoStartSharing,
-                hasOtherPrompt: models.updatePromptBlocked
+                hasOtherPrompt: models.updatePromptBlocked,
+                hostConnectionID: host.currentHostConnectionID,
+                isHostQualityProbeSession: host.isHostQualityProbeActive,
+                isHostConnectionPreparing: host.hasIncomingControlConnection && !host.isHostUpdateCheckReady
             )
         }, mainWindow: { [weak models] in models?.preferredAlertWindow }, releaseControl: { [weak models] in models?.releaseAllViewerControls() },
             contextChanges: models.changes)
+        updater.preferredHostScreen = { [weak models] in models?.host.currentHostSharedScreen }
+        updater.onPrepareHostUpdateRestart = { [weak models] version in
+            await models?.host.prepareHostForUpdateRestart(targetVersion: version)
+        }
         updater.onRestoreLaunchOptions = { [weak models] options in
             guard let models else { return }
             if options.minimizeWindowOnLaunch {
@@ -940,7 +947,8 @@ struct DeskView: View {
                     isDedicatedSessionWindow: isDedicatedSessionWindow,
                     retry: (isDedicatedSessionWindow && model.canRetryLastSessionLaunch)
                         ? { model.retryLastSessionLaunch() }
-                        : nil
+                        : nil,
+                    hostUpdateStatus: model.hostUpdateReconnectStatus
                 )
             }
         }

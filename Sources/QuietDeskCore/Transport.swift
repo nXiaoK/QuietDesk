@@ -363,6 +363,13 @@ public final class Peer {
         queue.async { [weak self] in self?.finish(reason, retryable: retryable) }
     }
 
+    func close(_ reason: String, retryable: Bool, completion: (() -> Void)?) {
+        queue.async { [self] in
+            finish(reason, retryable: retryable)
+            completion?()
+        }
+    }
+
     private func finish(_ reason: String, retryable: Bool = true) {
         guard !closed else { return }
         closed = true

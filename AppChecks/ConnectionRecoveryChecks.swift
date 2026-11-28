@@ -75,6 +75,20 @@ private struct ConnectionRecoveryChecks {
                 try require(value.actionTitle == "停止重连" && !value.symbol.isEmpty, "Cancellation unavailable")
             }
         }
+        run("Host update recovery reports the expected restart in both phases and offers cancellation") {
+            let detail = "被控端正在更新至 v0.8.0 并重启，等待自动重连…"
+            let wait = ReconnectWait(attempt: 1, delay: 2, reason: detail, now: 100)
+            let waiting = ConnectionRecoveryPresentation(reconnecting: true, paused: true, wait: wait,
+                status: "普通状态", now: 100, hostUpdateStatus: detail)
+            let connecting = ConnectionRecoveryPresentation(reconnecting: true, paused: false, wait: nil,
+                status: "正在通过中继连接…", now: 102, hostUpdateStatus: detail)
+            try require(waiting.state == .waiting && waiting.reason == "2 秒后第 1 次重连", "Update wait lost its countdown")
+            try require(connecting.state == .connecting && connecting.showsActivity, "Update retry lost its progress state")
+            for value in [waiting, connecting] {
+                try require(value.title == "等待被控端更新重启" && value.detail == detail && value.actionTitle == "取消连接",
+                            "Expected update recovery was treated as a generic interruption")
+            }
+        }
         print("\(passed) passed, \(failed) failed")
         if failed != 0 { exit(1) }
     }

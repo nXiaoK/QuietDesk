@@ -415,6 +415,7 @@ public enum UpdateURLPolicy {
 public enum UpdateCheckPolicy {
     public static let dailyInterval: TimeInterval = 24 * 60 * 60
     public static let failureRetryInterval: TimeInterval = 60 * 60
+    public static let hostConnectCheckCooldown: TimeInterval = 60
 
     public static func shouldPresentConsent(updaterEnabled: Bool, autoCheckPreference: Bool?, mainWindowVisible: Bool,
                                             applicationActive: Bool, isControlling: Bool, isFullScreen: Bool,
@@ -431,6 +432,17 @@ public enum UpdateCheckPolicy {
     }
     public static func shouldOffer(version: String, skippedVersion: String?, manual: Bool) -> Bool {
         manual || version != skippedVersion
+    }
+
+    public static func shouldCheckOnHostSessionConnect(
+        updaterEnabled: Bool, autoCheckPreference: Bool?, isBenchmarkProbe: Bool, now: Date,
+        lastHostConnectCheck: Date?
+    ) -> Bool {
+        guard updaterEnabled, autoCheckPreference == true, !isBenchmarkProbe else { return false }
+        if let lastHostConnectCheck, now.timeIntervalSince(lastHostConnectCheck) < hostConnectCheckCooldown {
+            return false
+        }
+        return true
     }
 }
 

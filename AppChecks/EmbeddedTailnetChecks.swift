@@ -4,6 +4,8 @@ import QuietDeskCore
 
 @main
 struct EmbeddedTailnetChecks {
+    private static let bridgeReplyGate = "hold-bridge-reply"
+
     private static func require(_ condition: Bool, _ description: String) throws {
         if !condition { throw DeskError.invalid(description) }
     }
@@ -22,6 +24,7 @@ struct EmbeddedTailnetChecks {
         let logURL = base.appendingPathComponent("requests")
         let pathFixture = base.appendingPathComponent("peer-path")
         let bridgeFixture = base.appendingPathComponent("bridge-routes")
+        let replyGate = base.appendingPathComponent(bridgeReplyGate)
         if !FileManager.default.fileExists(atPath: logURL.path) { _ = FileManager.default.createFile(atPath: logURL.path, contents: nil) }
         let log = try FileHandle(forWritingTo: logURL)
         try log.seekToEnd()
@@ -58,7 +61,15 @@ struct EmbeddedTailnetChecks {
             case "open":
                 let host = req["host"] as? String
                 try require((host == "100.100.0.2" || host == "100.100.0.3") && port == 5908, "错误的对端地址")
-                Thread.sleep(forTimeInterval: 0.12)
+                if FileManager.default.fileExists(atPath: replyGate.path) {
+                    let deadline = DispatchTime.now() + .seconds(5)
+                    while FileManager.default.fileExists(atPath: replyGate.path) {
+                        try require(DispatchTime.now() < deadline, "测试未释放延迟的连接回复")
+                        Thread.sleep(forTimeInterval: 0.01)
+                    }
+                } else {
+                    Thread.sleep(forTimeInterval: 0.12)
+                }
                 let localPort = host == "100.100.0.2" ? 34907 : 34908
                 bridges.insert(localPort)
                 reply["port"] = localPort
@@ -175,10 +186,13 @@ struct EmbeddedTailnetChecks {
         close()
         try await eventually("断开后仍然保留转发端口") { log().contains("close 34907\n") }
 
+        let replyGate = base.appendingPathComponent(bridgeReplyGate)
+        try Data().write(to: replyGate, options: .atomic)
         var cancelledCompleted = false
         let cancel = daemon.bridge(host: "100.100.0.2", port: 5908, ready: { _ in cancelledCompleted = true }, failed: { _ in cancelledCompleted = true })
         try await eventually("组件未开始第二次连接") { log().components(separatedBy: "open 5908\n").count == 3 }
         cancel()
+        try FileManager.default.removeItem(at: replyGate)
         try await eventually("取消过程中建立的端口没有释放") { log().components(separatedBy: "close 34907\n").count == 3 }
         try require(!cancelledCompleted, "已取消的连接继续启动")
 

@@ -14,7 +14,9 @@ public final class PortMappingViewer: @unchecked Sendable {
     private let queue = DispatchQueue(label: "quietdesk.mapping.viewer", qos: .utility)
     private let statusLock = NSLock()
     private var alternateAllowed = false
+    private var authenticatedRoute = false
     public var mayTryAlternateRoute: Bool { statusLock.withLock { alternateAllowed } }
+    public var hasAuthenticatedRoute: Bool { statusLock.withLock { authenticatedRoute } }
     private var started = false
     private var stopped = false
     private var lease: Peer?
@@ -47,7 +49,10 @@ public final class PortMappingViewer: @unchecked Sendable {
             guard let self, !self.started, !self.stopped else { return }
             self.started = true
             self.onState?(.authorizing)
-            let peer = self.newPeer(open: .authorize(self.target, deviceID: self.deviceID))
+            let peer = self.newPeer(open: .authorize(self.target, deviceID: self.deviceID), onAuthenticated: { [weak self] in
+                guard let self else { return }
+                self.statusLock.withLock { self.authenticatedRoute = true }
+            })
             self.lease = peer
             peer.onClose = { [weak self, weak peer] reason in
                 let canRetry = peer?.allowsUnauthenticatedRouteRetry == true
@@ -80,11 +85,12 @@ public final class PortMappingViewer: @unchecked Sendable {
         }
     }
 
-    private func newPeer(open: PortMappingControl) -> Peer {
+    private func newPeer(open: PortMappingControl, onAuthenticated: (() -> Void)? = nil) -> Peer {
         let connection = NWConnection(to: endpoint, using: params)
         let peer = Peer(connection: connection, qos: .utility)
         peer.onReady = { [weak peer] in
             guard let peer else { return }
+            onAuthenticated?()
             guard peer.prepareForMapping() else { peer.close("被控端未协商端口映射通道"); return }
             open.send(to: peer)
         }

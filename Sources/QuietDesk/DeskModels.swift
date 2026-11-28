@@ -72,14 +72,10 @@ final class DeskServices {
         )
     }
 
-    func connectedViewerSession(forRecordID recordID: UUID) -> DeskModel? {
-        allModels.first { $0.mode == .viewer && $0.connected && $0.currentRecordID == recordID }
-    }
-
-    func connectedViewerRecordIDs(excluding model: DeskModel) -> Set<UUID> {
-        Set(otherModels(excluding: model).compactMap {
-            $0.mode == .viewer && $0.connected ? $0.currentRecordID : nil
-        })
+    func notifyMappingSessionsChanged(excluding sender: DeskModel) {
+        for model in otherModels(excluding: sender) where model.mode == .viewer {
+            model.objectWillChange.send()
+        }
     }
 
     var anyModelBlocksRelaySettings: Bool {

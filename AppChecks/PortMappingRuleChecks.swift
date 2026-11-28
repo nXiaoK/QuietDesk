@@ -1,8 +1,9 @@
 import AppKit
 import CryptoKit
+import Network
 import QuietDeskCore
 
-/// All writes stay in this in-memory dictionary. No application domain, credential, port or real UI is opened.
+/// All configuration writes stay in this in-memory dictionary.
 private final class MappingDefaults: UserDefaults {
     var values: [String: Data] = [:]
     override func data(forKey defaultName: String) -> Data? { values[defaultName] }
@@ -10,9 +11,56 @@ private final class MappingDefaults: UserDefaults {
     override func set(_ value: Any?, forKey defaultName: String) { values[defaultName] = value as? Data }
 }
 
+private final class MappingRouteFixture: @unchecked Sendable {
+    private let listener: NWListener
+    private let host: PortMappingHost
+    private let lock = NSLock()
+    private var peers: [Peer] = []
+
+    init(key: PairingKey, allowed: PortMappingTarget) throws {
+        host = PortMappingHost { target, reply in reply(target == allowed) }
+        let parameters = try MediaSecureTransport.tlsParameters(key: key, roles: [.portMapping])
+        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+        listener = try NWListener(using: parameters)
+        listener.newConnectionHandler = { [weak self] connection in
+            guard let self else { connection.cancel(); return }
+            let peer = Peer(connection: connection)
+            self.lock.withLock { self.peers.append(peer) }
+            peer.onReady = { [weak self, weak peer] in
+                if let self, let peer { self.host.accept(peer) }
+            }
+            peer.start()
+        }
+    }
+
+    func start() async throws -> UInt16 {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<UInt16, Error>) in
+            listener.stateUpdateHandler = { [weak listener] state in
+                switch state {
+                case .ready:
+                    listener?.stateUpdateHandler = nil
+                    if let port = listener?.port { continuation.resume(returning: port.rawValue) }
+                    else { continuation.resume(throwing: DeskError.invalid("回环端口未就绪")) }
+                case .failed(let error):
+                    listener?.stateUpdateHandler = nil
+                    continuation.resume(throwing: error)
+                default: break
+                }
+            }
+            listener.start(queue: DispatchQueue(label: "checks.mapping-rule.fixture"))
+        }
+    }
+
+    func stop() {
+        listener.cancel()
+        host.stop()
+        lock.withLock { peers.forEach { $0.close() }; peers.removeAll() }
+    }
+}
+
 @main
 private enum PortMappingRuleChecks {
-    @MainActor static func main() throws {
+    @MainActor static func main() async throws {
         let defaults = MappingDefaults()
         let manager = PortMappingManager(defaults: defaults)
         let target = try PortMappingTarget(host: "127.0.0.1", port: 8080)
@@ -169,6 +217,164 @@ private enum PortMappingRuleChecks {
             && corrupted.trustedRemoteDevices.isEmpty && corruptAuthReply == false,
             "损坏的已有配置保留原值、拒绝写入且不自动放行")
         corrupted.shutdownHost()
+
+        try legacyRulesAndMigration(template: session)
+        try await candidateFailoverAndDenial(target: target, key: key)
+    }
+
+    @MainActor
+    private static func legacyRulesAndMigration(template: PortMappingRule) throws {
+        let defaults = MappingDefaults()
+        let encoded = try JSONEncoder().encode([template])
+        let rows = try JSONSerialization.jsonObject(with: encoded) as? [[String: Any]]
+        guard var legacy = rows?.first else { throw DeskError.invalid("无法构建旧版规则夹具") }
+        legacy.removeValue(forKey: "hostDeviceID")
+        legacy.removeValue(forKey: "routeMode")
+        defaults.values["tcpMappingRules.v1"] = try JSONSerialization.data(withJSONObject: [legacy])
+        let manager = PortMappingManager(defaults: defaults)
+        try check(manager.rules == [template] && manager.rules.first?.routeMode == .pinned
+            && manager.rules.first?.hostDeviceID == nil, "旧版规则默认指定线路，保留原字段")
+
+        let machine = UUID(), replacement = UUID()
+        var closed = 0
+        try manager.start(template) { _, _ in { closed += 1 } }
+        manager.synchronizeHostDeviceID(forRecordID: template.deviceID, hostDeviceID: machine)
+        manager.synchronizeHostDeviceID(forRecordID: template.deviceID, hostDeviceID: UUID())
+        try check(manager.rules.first?.hostDeviceID == machine && manager.isEnabled(template.id),
+                  "认证后静默补齐机器 ID，不覆盖已保存的认证身份或中断映射")
+        manager.stopSessionMappings(forRecordIDs: [replacement], hostDeviceID: machine)
+        try check(closed == 1 && !manager.isEnabled(template.id), "可按已认证的同机身份停止随会话映射")
+
+        try manager.start(template) { _, _ in { closed += 1 } }
+        manager.migrateOrRemoveRecord(template.deviceID, replacementRecordID: replacement, hostDeviceID: machine)
+        var migrated = template
+        migrated.deviceID = replacement
+        migrated.hostDeviceID = machine
+        try check(closed == 2 && !manager.isEnabled(template.id)
+            && PortMappingManager(defaults: defaults).rules == [migrated], "删除旧线路时停用旧连接并无损迁移规则")
+
+        try manager.start(migrated) { _, _ in { closed += 1 } }
+        let switched = try manager.updateRuleRoute(id: migrated.id, recordID: replacement,
+                                                   hostDeviceID: machine, routeMode: .automatic)
+        migrated.routeMode = .automatic
+        try check(switched.wasRunning && switched.updated == migrated && closed == 3
+            && PortMappingManager(defaults: defaults).rules == [migrated], "切换线路保存新模式并返回可热重连的运行标记")
+        manager.migrateOrRemoveRecord(replacement, replacementRecordID: nil, hostDeviceID: machine)
+        try check(PortMappingManager(defaults: defaults).rules.isEmpty, "删除同机最后一条线路才清除规则")
+    }
+
+    @MainActor
+    private static func candidateFailoverAndDenial(target: PortMappingTarget, key: PairingKey) async throws {
+        let manager = PortMappingManager(defaults: MappingDefaults(), showsApprovalPanel: false)
+        let fixture = try MappingRouteFixture(key: key, allowed: target)
+        let port = try await fixture.start()
+        defer { manager.stopAllMappings(); fixture.stop() }
+        let rule = PortMappingRule(id: UUID(), deviceID: UUID(), name: "线路切换", localPort: 0,
+                                   target: target, scope: .independent)
+        var attempts: [String] = []
+        var previousFailure: (@MainActor (PortMappingManager.RouteOpenFailure) -> Void)?
+        let first = PortMappingManager.RouteCandidate(label: "直连", classifiedOpen: { _, failed in
+            attempts.append("开始直连")
+            previousFailure = failed
+            failed(.network("模拟网络不可达"))
+            return { attempts.append("清理直连") }
+        })
+        let second = PortMappingManager.RouteCandidate(label: "Tailscale · 合成回环", open: { ready, _ in
+            attempts.append("开始备用")
+            ready("127.0.0.1", port, key)
+            return { attempts.append("清理备用") }
+        })
+        try manager.start(rule, candidates: [first, second])
+        previousFailure?(.terminal("上次尝试的回调"))
+        try await waitUntil("备用线路未能进入监听") {
+            if case .listening = manager.states[rule.id] { return true }
+            return false
+        }
+        try check(attempts == ["开始直连", "清理直连", "开始备用"]
+            && manager.activeRouteLabels[rule.id] == second.label, "网络失败先清理旧线路，再走通并显示备用线路")
+        guard case .listening(let localPort, _) = manager.states[rule.id] else {
+            throw DeskError.invalid("备用线路没有监听端口")
+        }
+        manager.stop(rule.id)
+        try check(attempts.last == "清理备用" && manager.activeRouteLabels[rule.id] == nil, "停用映射清除当前线路")
+
+        let unavailable = PortMappingManager.RouteCandidate(label: "不可达", open: { _, _ in
+            throw DeskError.invalid("首条线路超时")
+        })
+        let stillUnavailable = PortMappingManager.RouteCandidate(label: "也不可达", classifiedOpen: { _, failed in
+            failed(.network("最后线路超时"))
+            return {}
+        })
+        try manager.start(rule, candidates: [unavailable, stillUnavailable])
+        try check(manager.states[rule.id] == .failed("最后线路超时") && !manager.isEnabled(rule.id),
+                  "同步抛错可网络回退，候选耗尽时保留最后真实错误")
+
+        var forbiddenFallback = false
+        let never = PortMappingManager.RouteCandidate(label: "不应尝试", open: { _, _ in
+            forbiddenFallback = true
+            return {}
+        })
+        let deniedRelay = PortMappingManager.RouteCandidate(label: "中继", classifiedOpen: { _, failed in
+            failed(.terminal("中继拒绝接入"))
+            return {}
+        })
+        try manager.start(rule, candidates: [deniedRelay, never])
+        try check(!forbiddenFallback && manager.states[rule.id] == .failed("中继拒绝接入"),
+                  "外层线路拒绝授权时立即结束，不尝试备用线路")
+
+        var denied = rule
+        denied.target = try PortMappingTarget(host: target.host, port: target.port + 1)
+        try manager.start(denied, candidates: [second, never])
+        try await waitUntil("远端授权拒绝未结束") {
+            if case .failed = manager.states[denied.id] { return true }
+            return false
+        }
+        try check(!forbiddenFallback && manager.activeRouteLabels[denied.id] == nil, "远端目标拒绝不触发备用线路")
+
+        let wrongKey = try PairingKey.generate()
+        let unauthenticated = PortMappingManager.RouteCandidate(label: "错误配对码", open: { ready, _ in
+            ready("127.0.0.1", port, wrongKey)
+            return {}
+        })
+        try manager.start(rule, candidates: [unauthenticated, never])
+        try await waitUntil("错误配对码未结束", timeout: 24) {
+            if case .failed = manager.states[rule.id] { return true }
+            return false
+        }
+        try check(!forbiddenFallback && manager.activeRouteLabels[rule.id] == nil, "错误配对码不触发备用线路")
+
+        var fixed = rule
+        fixed.localPort = localPort
+        try manager.saveRule(fixed)
+        let firstRoute = PortMappingManager.RouteCandidate(label: "直连 · 合成回环", open: { ready, _ in
+            ready("127.0.0.1", port, key)
+            return {}
+        })
+        try manager.start(fixed, candidates: [firstRoute])
+        for index in 0..<6 {
+            try await waitUntil("热切换前本地固定端口尚未监听") {
+                if case .listening(let port, _) = manager.states[fixed.id] { return port == localPort }
+                return false
+            }
+            let nextRoute = index.isMultiple(of: 2) ? second : firstRoute
+            let changed = try manager.updateRuleRoute(id: fixed.id, recordID: UUID(), hostDeviceID: nil, routeMode: .pinned)
+            try check(changed.wasRunning, "第 \(index + 1) 次切换识别原规则正在运行")
+            try manager.start(changed.updated, candidates: [nextRoute])
+        }
+        try await waitUntil("热切换后本地固定端口未重新监听") {
+            if case .listening(let port, _) = manager.states[fixed.id] { return port == localPort }
+            return false
+        }
+        try check(manager.activeRouteLabels[fixed.id] == firstRoute.label, "连续热切换保留固定本地端口并更新实际线路")
+    }
+
+    @MainActor
+    private static func waitUntil(_ message: String, timeout: TimeInterval = 12, condition: () -> Bool) async throws {
+        let deadline = SessionClock.now + timeout
+        while !condition() {
+            guard SessionClock.now < deadline else { throw DeskError.invalid(message) }
+            try await Task.sleep(for: .milliseconds(20))
+        }
     }
 
     private static func check(_ ok: Bool, _ message: String) throws {

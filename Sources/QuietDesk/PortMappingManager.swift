@@ -14,11 +14,37 @@ enum PortMappingScope: String, Codable, CaseIterable {
 
 struct PortMappingRule: Identifiable, Codable, Equatable {
     let id: UUID
-    let deviceID: UUID
+    var deviceID: UUID
+    var hostDeviceID: UUID?
+    var routeMode: PortMappingRouteMode
     var name: String
     var localPort: UInt16
     var target: PortMappingTarget
     var scope: PortMappingScope
+
+    init(id: UUID, deviceID: UUID, name: String, localPort: UInt16, target: PortMappingTarget,
+         scope: PortMappingScope, hostDeviceID: UUID? = nil, routeMode: PortMappingRouteMode = .pinned) {
+        self.id = id
+        self.deviceID = deviceID
+        self.name = name
+        self.localPort = localPort
+        self.target = target
+        self.scope = scope
+        self.hostDeviceID = hostDeviceID
+        self.routeMode = routeMode
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        deviceID = try values.decode(UUID.self, forKey: .deviceID)
+        name = try values.decode(String.self, forKey: .name)
+        localPort = try values.decode(UInt16.self, forKey: .localPort)
+        target = try values.decode(PortMappingTarget.self, forKey: .target)
+        scope = try values.decode(PortMappingScope.self, forKey: .scope)
+        hostDeviceID = try values.decodeIfPresent(UUID.self, forKey: .hostDeviceID)
+        routeMode = (try? values.decodeIfPresent(PortMappingRouteMode.self, forKey: .routeMode)) ?? .pinned
+    }
 }
 
 struct TrustedRemoteMappingDevice: Identifiable, Codable, Equatable {
@@ -31,12 +57,69 @@ struct TrustedRemoteMappingDevice: Identifiable, Codable, Equatable {
 final class PortMappingManager: ObservableObject {
     typealias Route = (_ ready: @escaping @MainActor (String, UInt16, PairingKey) -> Void,
                        _ failed: @escaping @MainActor (String) -> Void) throws -> (() -> Void)
+    typealias ClassifiedRoute = (_ ready: @escaping @MainActor (String, UInt16, PairingKey) -> Void,
+                                 _ failed: @escaping @MainActor (RouteOpenFailure) -> Void) throws -> (() -> Void)
 
-    private final class RunningRule {
-        let rule: PortMappingRule
+    enum RouteOpenFailure: LocalizedError {
+        case network(String)
+        case terminal(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .network(let message), .terminal(let message): message
+            }
+        }
+
+        var mayTryAlternateRoute: Bool {
+            if case .network = self { return true }
+            return false
+        }
+    }
+
+    struct RouteCandidate {
+        let label: String
+        let open: ClassifiedRoute
+        let viewerNetworkFailure: @MainActor (String) -> RouteOpenFailure
+
+        /// Use this initializer for openers whose string callbacks and unclassified throws are network failures.
+        init(label: String, open: @escaping Route) {
+            self.init(label: label, classifiedOpen: { ready, failed in
+                do { return try open(ready) { failed(.network($0)) } }
+                catch { throw (error as? RouteOpenFailure) ?? RouteOpenFailure.network(error.localizedDescription) }
+            })
+        }
+
+        init(label: String, viewerNetworkFailure: @escaping @MainActor (String) -> RouteOpenFailure = { .network($0) },
+             classifiedOpen: @escaping ClassifiedRoute) {
+            self.label = label
+            self.open = classifiedOpen
+            self.viewerNetworkFailure = viewerNetworkFailure
+        }
+    }
+
+    private final class RouteAttempt {
+        let label: String
+        let viewerNetworkFailure: @MainActor (String) -> RouteOpenFailure
         var viewer: PortMappingViewer?
         var closeRoute: (() -> Void)?
-        init(_ rule: PortMappingRule) { self.rule = rule }
+        var opening = true
+        var openingFailure: RouteOpenFailure?
+
+        init(_ candidate: RouteCandidate) {
+            label = candidate.label
+            viewerNetworkFailure = candidate.viewerNetworkFailure
+        }
+    }
+
+    private final class RunningRule {
+        var rule: PortMappingRule
+        var remainingCandidates: [RouteCandidate]
+        var attempt: RouteAttempt?
+
+        init(_ rule: PortMappingRule, candidates: [RouteCandidate]) {
+            self.rule = rule
+            remainingCandidates = candidates
+        }
     }
 
     private struct Grants: Codable {
@@ -52,6 +135,7 @@ final class PortMappingManager: ObservableObject {
 
     @Published private(set) var rules: [PortMappingRule] = []
     @Published private(set) var states: [UUID: PortMappingState] = [:]
+    @Published private(set) var activeRouteLabels: [UUID: String] = [:]
     @Published private(set) var pendingTargets: [PortMappingTarget] = []
     @Published private(set) var allowedTargets: Set<PortMappingTarget> = []
     @Published private(set) var trustedRemoteDevices: [TrustedRemoteMappingDevice] = []
@@ -120,63 +204,174 @@ final class PortMappingManager: ObservableObject {
         catch { storageError = error.localizedDescription }
     }
 
+    func updateRuleRoute(id: UUID, recordID: UUID, hostDeviceID: UUID?, routeMode: PortMappingRouteMode) throws
+        -> (updated: PortMappingRule, wasRunning: Bool) {
+        guard let index = rules.firstIndex(where: { $0.id == id }) else { throw DeskError.invalid("找不到此映射规则") }
+        var next = rules
+        next[index].deviceID = recordID
+        next[index].hostDeviceID = hostDeviceID
+        next[index].routeMode = routeMode
+        try save(next, key: Self.rulesKey)
+        let wasRunning = isEnabled(id)
+        if wasRunning { stop(id) }
+        rules = next
+        return (next[index], wasRunning)
+    }
+
+    func synchronizeHostDeviceID(forRecordID recordID: UUID, hostDeviceID: UUID) {
+        var next = rules
+        let indices = next.indices.filter { next[$0].deviceID == recordID && next[$0].hostDeviceID == nil }
+        guard !indices.isEmpty else { return }
+        for index in indices { next[index].hostDeviceID = hostDeviceID }
+        do {
+            try save(next, key: Self.rulesKey)
+            for index in indices { running[next[index].id]?.rule.hostDeviceID = hostDeviceID }
+            rules = next
+        } catch { storageError = error.localizedDescription }
+    }
+
+    func migrateOrRemoveRecord(_ removedRecordID: UUID, replacementRecordID: UUID?, hostDeviceID: UUID?) {
+        guard let replacementRecordID else { removeDevice(removedRecordID); return }
+        guard replacementRecordID != removedRecordID else { return }
+        var next = rules
+        let indices = next.indices.filter { next[$0].deviceID == removedRecordID }
+        guard !indices.isEmpty else { return }
+        for index in indices {
+            next[index].deviceID = replacementRecordID
+            if next[index].hostDeviceID == nil { next[index].hostDeviceID = hostDeviceID }
+        }
+        do {
+            try save(next, key: Self.rulesKey)
+            for index in indices { stop(next[index].id) }
+            rules = next
+        } catch { storageError = error.localizedDescription }
+    }
+
     func isEnabled(_ id: UUID) -> Bool { running[id] != nil }
 
     func start(_ rule: PortMappingRule, fallback: Route? = nil, route: Route) throws {
+        // The first opener is consumed synchronously. Only its callbacks and cleanup escape.
+        try withoutActuallyEscaping(route) { initial in
+            let candidates = ([initial] + (fallback.map { [$0] } ?? [])).map { legacy in
+                RouteCandidate(label: "", classifiedOpen: { ready, failed in
+                    try legacy(ready) { failed(.terminal($0)) }
+                })
+            }
+            try start(rule, candidates: candidates)
+        }
+    }
+
+    func start(_ rule: PortMappingRule, candidates: [RouteCandidate]) throws {
         guard running[rule.id] == nil else { return }
+        guard !candidates.isEmpty else { throw DeskError.invalid("此设备没有可用的端口映射线路") }
         if running.values.contains(where: { $0.rule.localPort == rule.localPort }) {
             let reason = "本地端口 \(rule.localPort) 已用于另一条映射，请修改本地端口。"
             states[rule.id] = .failed(reason)
             throw DeskError.invalid(reason)
         }
-        let run = RunningRule(rule)
+        let run = RunningRule(rule, candidates: candidates)
         running[rule.id] = run
-        try startRoute(run, fallback: fallback, route: route)
+        try startNextRoute(run)
     }
 
-    private func startRoute(_ run: RunningRule, fallback: Route?, route: Route) throws {
-        let rule = run.rule
-        states[rule.id] = .authorizing
-        do {
-            let cleanup = try route({ [weak self, weak run] address, port, key in
-                guard let self, let run, self.running[rule.id] === run else { return }
-                do {
-                    let viewer = try PortMappingViewer(host: address, port: port, key: key, target: rule.target,
-                                                       localPort: rule.localPort, traffic: self.traffic, deviceID: self.localDeviceID)
-                    run.viewer = viewer
-                    viewer.onState = { [weak self, weak run, weak viewer] state in
-                        DispatchQueue.main.async {
-                            guard let self, let run, let viewer, self.running[rule.id] === run, run.viewer === viewer else { return }
-                            if case .failed = state, let fallback, viewer.mayTryAlternateRoute {
-                                self.finish(rule.id, state: nil)
-                                do { try self.start(rule, route: fallback) }
-                                catch { self.states[rule.id] = .failed(error.localizedDescription) }
-                                return
-                            }
-                            switch state {
-                            case .failed, .stopped: self.finish(rule.id, state: state)
-                            default: self.states[rule.id] = state
-                            }
-                        }
-                    }
-                    viewer.start()
-                } catch { self.finish(rule.id, state: .failed(error.localizedDescription)) }
-            }, { [weak self, weak run] message in
-                guard let self, let run, self.running[rule.id] === run else { return }
-                self.finish(rule.id, state: .failed(message))
-            })
-            if running[rule.id] === run { run.closeRoute = cleanup } else { cleanup() }
-        } catch {
-            finish(rule.id, state: .failed(error.localizedDescription))
-            throw error
+    private func startNextRoute(_ run: RunningRule) throws {
+        let id = run.rule.id
+        while running[id] === run, !run.remainingCandidates.isEmpty {
+            let candidate = run.remainingCandidates.removeFirst()
+            let attempt = RouteAttempt(candidate)
+            run.attempt = attempt
+            states[id] = .authorizing
+            do {
+                let cleanup = try candidate.open({ [weak self, weak run, weak attempt] address, port, key in
+                    guard let self, let run, let attempt, self.isCurrent(attempt, in: run),
+                          attempt.viewer == nil, attempt.openingFailure == nil else { return }
+                    self.startViewer(for: run, attempt: attempt, address: address, port: port, key: key)
+                }, { [weak self, weak run, weak attempt] failure in
+                    guard let self, let run, let attempt, self.isCurrent(attempt, in: run) else { return }
+                    let effectiveFailure = attempt.viewer?.hasAuthenticatedRoute == true
+                        ? .terminal(failure.localizedDescription) : failure
+                    self.reportAttemptFailure(effectiveFailure, in: run, attempt: attempt)
+                })
+                guard isCurrent(attempt, in: run) else { cleanup(); return }
+                attempt.closeRoute = cleanup
+                attempt.opening = false
+                guard let failure = attempt.openingFailure else { return }
+                if !prepareAlternate(after: failure, in: run) { return }
+            } catch {
+                guard isCurrent(attempt, in: run) else { return }
+                let failure = (error as? RouteOpenFailure) ?? .terminal(error.localizedDescription)
+                if let pending = attempt.openingFailure, !pending.mayTryAlternateRoute {
+                    _ = prepareAlternate(after: pending, in: run)
+                    throw pending
+                }
+                if !prepareAlternate(after: failure, in: run) { throw error }
+            }
         }
+    }
+
+    private func startViewer(for run: RunningRule, attempt: RouteAttempt, address: String, port: UInt16, key: PairingKey) {
+        let rule = run.rule
+        do {
+            let viewer = try PortMappingViewer(host: address, port: port, key: key, target: rule.target,
+                                               localPort: rule.localPort, traffic: traffic, deviceID: localDeviceID)
+            attempt.viewer = viewer
+            viewer.onState = { [weak self, weak run, weak attempt, weak viewer] state in
+                DispatchQueue.main.async {
+                    guard let self, let run, let attempt, let viewer, self.isCurrent(attempt, in: run) else { return }
+                    switch state {
+                    case .failed(let message):
+                        let failure = viewer.mayTryAlternateRoute
+                            ? attempt.viewerNetworkFailure(message) : .terminal(message)
+                        self.reportAttemptFailure(failure, in: run, attempt: attempt)
+                    case .stopped:
+                        self.finish(rule.id, state: state)
+                    case .authorizing, .listening:
+                        if case .listening = state { run.remainingCandidates.removeAll() }
+                        if !attempt.label.isEmpty { self.activeRouteLabels[rule.id] = attempt.label }
+                        self.states[rule.id] = state
+                    case .targetFailed:
+                        self.states[rule.id] = state
+                    }
+                }
+            }
+            viewer.start()
+        } catch { reportAttemptFailure(.terminal(error.localizedDescription), in: run, attempt: attempt) }
+    }
+
+    private func isCurrent(_ attempt: RouteAttempt, in run: RunningRule) -> Bool {
+        running[run.rule.id] === run && run.attempt === attempt
+    }
+
+    private func reportAttemptFailure(_ failure: RouteOpenFailure, in run: RunningRule, attempt: RouteAttempt) {
+        if attempt.opening {
+            // An opener may fail synchronously and still return resources that must be closed before retry.
+            if attempt.openingFailure?.mayTryAlternateRoute != false { attempt.openingFailure = failure }
+        } else if prepareAlternate(after: failure, in: run) {
+            try? startNextRoute(run)
+        }
+    }
+
+    private func prepareAlternate(after failure: RouteOpenFailure, in run: RunningRule) -> Bool {
+        guard failure.mayTryAlternateRoute, !run.remainingCandidates.isEmpty else {
+            finish(run.rule.id, state: .failed(failure.localizedDescription))
+            return false
+        }
+        closeAttempt(in: run)
+        return true
+    }
+
+    private func closeAttempt(in run: RunningRule) {
+        let attempt = run.attempt
+        run.attempt = nil
+        activeRouteLabels[run.rule.id] = nil
+        attempt?.viewer?.stop()
+        attempt?.closeRoute?()
     }
 
     private func finish(_ id: UUID, state: PortMappingState?) {
         let run = running.removeValue(forKey: id)
         states[id] = state
-        run?.viewer?.stop()
-        run?.closeRoute?()
+        if let run { closeAttempt(in: run) }
     }
 
     func stop(_ id: UUID) { finish(id, state: nil) }
@@ -186,7 +381,12 @@ final class PortMappingManager: ObservableObject {
     }
 
     func stopSessionMappings(forDeviceID deviceID: UUID) {
-        for run in Array(running.values) where run.rule.scope == .session && run.rule.deviceID == deviceID {
+        stopSessionMappings(forRecordIDs: [deviceID])
+    }
+
+    func stopSessionMappings(forRecordIDs recordIDs: Set<UUID>, hostDeviceID: UUID? = nil) {
+        for run in Array(running.values) where run.rule.scope == .session
+            && (recordIDs.contains(run.rule.deviceID) || (hostDeviceID != nil && run.rule.hostDeviceID == hostDeviceID)) {
             stop(run.rule.id)
         }
     }

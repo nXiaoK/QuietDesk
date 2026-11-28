@@ -121,6 +121,9 @@ final class HostSession {
 @MainActor
 final class ViewerSession {
     let helloDeadline = ConnectionStartupDeadline()
+    // Keep the authenticated mapping identity available if the saved route is deleted while connected.
+    var mappingRecordID: UUID?
+    var mappingHostDeviceID: UUID?
     var relayBridge: RelayViewerBridge?
     var mediaRelayBridge: RelayViewerBridge?
     var usesRelayControl = false

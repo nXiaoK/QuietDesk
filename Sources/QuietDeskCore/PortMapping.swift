@@ -1,6 +1,214 @@
 import Foundation
 import Network
 
+public enum PortMappingRouteMode: String, Codable, CaseIterable, Sendable {
+    case pinned
+    case automatic
+
+    public var title: String {
+        switch self {
+        case .pinned: return "指定线路"
+        case .automatic: return "同机自动选路"
+        }
+    }
+}
+
+public struct RemoteMachineGroup: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let hostDeviceID: UUID?
+    public let relayDeviceID: UUID?
+    public let title: String
+    public let routes: [ConnectionRecord]
+
+    public var recordIDs: Set<UUID> { Set(routes.map(\.id)) }
+    public var primaryRecord: ConnectionRecord { routes[0] }
+
+    public func contains(recordID: UUID) -> Bool { routes.contains { $0.id == recordID } }
+
+    public static func routeShortLabel(for record: ConnectionRecord) -> String {
+        if let host = try? TailnetAddress.host(in: record.address) {
+            return "Tailscale · \(endpoint(host, port: record.port))"
+        }
+        if let relay = record.relay {
+            if relay.strategy == .relay || record.address.isEmpty {
+                return "中继 · \(endpoint(relay.endpoint.host, port: relay.endpoint.port))"
+            }
+            return "直连优先+中继 · \(endpoint(record.address, port: record.port))"
+        }
+        return "直连 · \(endpoint(record.address, port: record.port))"
+    }
+
+    public static func routeKindBadge(for record: ConnectionRecord) -> String {
+        if (try? TailnetAddress.host(in: record.address)) != nil { return "Tailscale" }
+        guard let relay = record.relay else { return "直连" }
+        return relay.strategy == .relay || record.address.isEmpty ? "自托管中继" : "直连+中继"
+    }
+
+    fileprivate static func endpoint(_ host: String, port: UInt16) -> String {
+        let formattedHost = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
+        return "\(formattedHost):\(port)"
+    }
+}
+
+public enum PortMappingMachineResolver {
+    private enum DraftIdentity: Hashable {
+        case key(Data)
+        case relay(UUID)
+        case record(UUID)
+    }
+
+    public static func group(records: [ConnectionRecord], pairingIdentities: [UUID: Data] = [:]) -> [RemoteMachineGroup] {
+        let sortedRecords = records.enumerated().sorted { left, right in
+            left.element.lastConnected == right.element.lastConnected ? left.offset < right.offset
+                : left.element.lastConnected > right.element.lastConnected
+        }
+        var positions: [UUID: Int] = [:]
+        let records = sortedRecords.compactMap { item -> ConnectionRecord? in
+            guard positions[item.element.id] == nil else { return nil }
+            positions[item.element.id] = positions.count
+            return item.element
+        }
+        let digests = pairingIdentities.filter { !$0.value.isEmpty }
+        var confirmed: [UUID: [ConnectionRecord]] = [:]
+        var confirmedByDigest: [Data: Set<UUID>] = [:]
+        var confirmedByRelay: [UUID: [ConnectionRecord]] = [:]
+        var relayDigests: [UUID: Set<Data>] = [:]
+        var draftRelayIDs = Set<UUID>()
+
+        for record in records {
+            let relayID = record.relay?.deviceID
+            let digest = digests[record.id]
+            if let relayID, let digest { relayDigests[relayID, default: []].insert(digest) }
+            if let hostID = record.deviceID {
+                confirmed[hostID, default: []].append(record)
+                if let digest { confirmedByDigest[digest, default: []].insert(hostID) }
+                if let relayID { confirmedByRelay[relayID, default: []].append(record) }
+            } else if let relayID, digest != nil {
+                draftRelayIDs.insert(relayID)
+            }
+        }
+
+        var drafts: [DraftIdentity: [ConnectionRecord]] = [:]
+        for record in records where record.deviceID == nil {
+            let identity: DraftIdentity
+            if let digest = digests[record.id] {
+                identity = .key(digest)
+            } else if let relayID = record.relay?.deviceID {
+                // A draft without a key cannot bridge incompatible keys for the same relay identity.
+                if draftRelayIDs.contains(relayID), let candidates = relayDigests[relayID], candidates.count == 1,
+                   let digest = candidates.first {
+                    identity = .key(digest)
+                } else {
+                    identity = .relay(relayID)
+                }
+            } else {
+                identity = .record(record.id)
+            }
+            drafts[identity, default: []].append(record)
+        }
+
+        var unconfirmed: [[ConnectionRecord]] = []
+        for (identity, routes) in drafts {
+            let digest: Data?
+            if case .key(let key) = identity { digest = key }
+            else { digest = nil }
+            var possibleHosts = digest.flatMap { confirmedByDigest[$0] } ?? []
+            for record in routes {
+                guard let relayID = record.relay?.deviceID else { continue }
+                for peer in confirmedByRelay[relayID] ?? [] {
+                    if let digest, let peerDigest = digests[peer.id], digest != peerDigest { continue }
+                    if let hostID = peer.deviceID { possibleHosts.insert(hostID) }
+                }
+            }
+            switch possibleHosts.count {
+            case 0: unconfirmed.append(routes)
+            case 1:
+                if let hostID = possibleHosts.first { confirmed[hostID, default: []] += routes }
+            default:
+                // When the available evidence points at distinct authenticated machines, keep the drafts separate.
+                unconfirmed += routes.map { [$0] }
+            }
+        }
+
+        let grouped = (Array(confirmed.values) + unconfirmed).map { group in
+            group.sorted { positions[$0.id, default: 0] < positions[$1.id, default: 0] }
+        }.sorted { positions[$0[0].id, default: 0] < positions[$1[0].id, default: 0] }
+        return identifiedGroups(grouped, digests: digests)
+    }
+
+    public static func orderedCandidateRecords(for group: RemoteMachineGroup, preferredRecordID: UUID?,
+                                               activeConnectedRecordIDs: Set<UUID>, tailnetRunning: Bool,
+                                               relayEnabled: Bool) -> [ConnectionRecord] {
+        let ranked = group.routes.enumerated().compactMap { index, record -> (Int, Int, ConnectionRecord)? in
+            let priority: Int
+            if (try? TailnetAddress.host(in: record.address)) != nil {
+                priority = tailnetRunning ? 3 : 5
+            } else if record.relay?.strategy == .relay || record.address.isEmpty {
+                guard relayEnabled, record.relay != nil else { return nil }
+                priority = 4
+            } else {
+                guard !record.address.lowercased().hasPrefix(TailnetAddress.prefix), record.port != 0 else { return nil }
+                priority = 2
+            }
+            if activeConnectedRecordIDs.contains(record.id) { return (0, index, record) }
+            if record.id == preferredRecordID { return (1, index, record) }
+            return (priority, index, record)
+        }
+        return ranked.sorted { ($0.0, $0.1) < ($1.0, $1.1) }.map(\.2)
+    }
+
+    private static func identifiedGroups(_ groups: [[ConnectionRecord]], digests: [UUID: Data]) -> [RemoteMachineGroup] {
+        let identities = groups.map { routes -> (UUID?, UUID?, [String]) in
+            let host = routes.lazy.compactMap(\.deviceID).first
+            let relayIDs = Set(routes.compactMap { $0.relay?.deviceID })
+            let relay = relayIDs.count == 1 ? relayIDs.first : nil
+            let keys = Set(routes.compactMap { digests[$0.id] })
+            var identifiers: [String] = []
+            if let host { identifiers.append("device:" + host.uuidString.lowercased()) }
+            if let relay { identifiers.append("relay:" + relay.uuidString.lowercased()) }
+            if keys.count == 1, let key = keys.first {
+                identifiers.append("key:" + key.prefix(8).map { String(format: "%02x", $0) }.joined())
+            }
+            return (host, relay, identifiers)
+        }
+        let occurrences = identities.flatMap(\.2).reduce(into: [String: Int]()) { $0[$1, default: 0] += 1 }
+        return zip(groups, identities).map { routes, identity in
+            let id = identity.2.first { occurrences[$0] == 1 } ?? "record:" + routes[0].id.uuidString.lowercased()
+            return RemoteMachineGroup(id: id, hostDeviceID: identity.0, relayDeviceID: identity.1,
+                                      title: title(for: routes), routes: routes)
+        }
+    }
+
+    private static func title(for routes: [ConnectionRecord]) -> String {
+        let customName = routes.lazy.compactMap(\.customName).map(trim).first { !$0.isEmpty }
+        if let customName { return customName }
+
+        let storedAddresses = Set(routes.flatMap { record in
+            var addresses = [record.address, RemoteMachineGroup.endpoint(record.address, port: record.port)]
+            if let relay = record.relay { addresses += [relay.endpoint.address, relay.endpoint.host] }
+            return addresses.map { trim($0).lowercased() }
+        })
+        let name = routes.lazy.map { trim($0.name) }.first { name in
+            !name.isEmpty && !storedAddresses.contains(name.lowercased()) && !isAddressName(name)
+        }
+        if let name { return name }
+        let primary = routes[0]
+        return [primary.displayName, primary.address, primary.relay?.endpoint.host ?? ""]
+            .map(trim).first { !$0.isEmpty } ?? "已保存的 Mac"
+    }
+
+    private static func isAddressName(_ name: String) -> Bool {
+        let literal = name.hasPrefix("[") && name.hasSuffix("]") ? String(name.dropFirst().dropLast()) : name
+        if UUID(uuidString: literal) != nil || IPv4Address(literal) != nil || IPv6Address(literal) != nil { return true }
+        if (try? TailnetAddress.host(in: literal)) != nil || literal.hasPrefix("tls://") { return true }
+        // Dotted hostnames and host:port are also saved as names on unconnected records.
+        guard let endpoint = try? RelayEndpoint(address: literal) else { return false }
+        return endpoint.host.contains(".") || literal != endpoint.host && literal.hasSuffix(":\(endpoint.port)")
+    }
+
+    private static func trim(_ string: String) -> String { string.trimmingCharacters(in: .whitespacesAndNewlines) }
+}
+
 public struct PortMappingTarget: Codable, Hashable, Sendable {
     public let host: String
     public let port: UInt16

@@ -63,7 +63,11 @@ final class DeskModel: ObservableObject, Identifiable {
     @Published private(set) var screens: [(id: CGDirectDisplayID, name: String)] = []
     @Published var active = false
     @Published var working = false
-    @Published var connected = false
+    @Published var connected = false {
+        didSet {
+            if mode == .viewer, connected != oldValue { services.notifyMappingSessionsChanged(excluding: self) }
+        }
+    }
     @Published private(set) var mappingHosting = false
     @Published private(set) var mappingHostingStatus = "独立映射服务已关闭"
     /// When the current viewer connection received the host's hello; an automatic reconnect starts a new one.
@@ -422,7 +426,10 @@ final class DeskModel: ObservableObject, Identifiable {
     @Published private(set) var systemShortcutStatus = UserDefaults.standard.bool(forKey: "systemShortcutsInWindow")
         ? "控制画面获得焦点后自动转发系统快捷键" : "全屏控制画面获得焦点后自动转发系统快捷键"
     @Published private(set) var systemShortcutsRunning = false
-    @Published private(set) var connections = ConnectionStore.load()
+    @Published private(set) var connections = ConnectionStore.load() {
+        didSet { cachedPortMappingMachines = nil }
+    }
+    private var cachedPortMappingMachines: [RemoteMachineGroup]?
     @Published var autoReconnect = UserDefaults.standard.object(forKey: "autoReconnect") as? Bool ?? true
     @Published var reconnecting = false
     @Published private(set) var reconnectWait: ReconnectWait?
@@ -2250,15 +2257,63 @@ final class DeskModel: ObservableObject, Identifiable {
         return target
     }
 
-    var currentMappingRecordID: UUID? { connected ? currentRecordID : nil }
+    var currentMappingRecordID: UUID? {
+        guard connected, activeRouteBenchmarkOverride == nil else { return nil }
+        return viewerSession.mappingRecordID ?? currentRecordID
+    }
 
     func hasConnectedDesktopSession(for recordID: UUID) -> Bool {
-        currentMappingRecordID == recordID || services.connectedViewerSession(forRecordID: recordID) != nil
+        guard let group = portMappingMachineGroups().first(where: { $0.contains(recordID: recordID) }) else { return false }
+        return desktopSessions(forMachine: group).contains { $0.currentMappingRecordID == recordID }
+    }
+
+    func portMappingMachineGroups() -> [RemoteMachineGroup] {
+        if let cachedPortMappingMachines { return cachedPortMappingMachines }
+        var digests: [UUID: Data] = [:]
+        var canCache = true
+        for record in connections {
+            do {
+                if let key = try KeyStore.load(account: "remote." + record.id.uuidString) {
+                    digests[record.id] = Data(SHA256.hash(data: key.data))
+                }
+            } catch { canCache = false }
+        }
+        let groups = PortMappingMachineResolver.group(records: connections, pairingIdentities: digests)
+        if canCache { cachedPortMappingMachines = groups }
+        return groups
+    }
+
+    func machineGroup(for rule: PortMappingRule, in snapshot: [RemoteMachineGroup]? = nil) -> RemoteMachineGroup? {
+        let groups = snapshot ?? portMappingMachineGroups()
+        if let group = groups.first(where: { $0.contains(recordID: rule.deviceID) }) {
+            guard let expected = rule.hostDeviceID, let actual = group.hostDeviceID else { return group }
+            return expected == actual ? group : nil
+        }
+        guard let host = rule.hostDeviceID else { return nil }
+        return groups.first { $0.hostDeviceID == host }
+    }
+
+    private func desktopSessions(forMachine group: RemoteMachineGroup) -> [DeskModel] {
+        services.allModels.filter { model in
+            guard model.mode == .viewer, model.connected, model.activeRouteBenchmarkOverride == nil else { return false }
+            if let expected = group.hostDeviceID, let actual = model.viewerSession.mappingHostDeviceID {
+                return expected == actual
+            }
+            return model.currentMappingRecordID.map(group.contains(recordID:)) ?? false
+        }
+    }
+
+    func connectedDesktopSession(forMachine group: RemoteMachineGroup) -> DeskModel? {
+        desktopSessions(forMachine: group).first
+    }
+
+    func hasConnectedDesktopSession(forMachine group: RemoteMachineGroup) -> Bool {
+        connectedDesktopSession(forMachine: group) != nil
     }
 
     var preferredMappingRecordID: UUID? {
         currentMappingRecordID
-            ?? services.allModels.first(where: { $0.mode == .viewer && $0.connected && $0.currentRecordID != nil })?.currentRecordID
+            ?? services.allModels.lazy.compactMap(\.currentMappingRecordID).first
     }
 
     func reloadSavedConnections() {
@@ -2390,11 +2445,16 @@ final class DeskModel: ObservableObject, Identifiable {
         let target = try formTarget()
         if let id = target.recordID, let index = connections.firstIndex(where: { $0.id == id }) {
             let account = "remote." + id.uuidString
+            let addedKey: Bool
             if let existing = try KeyStore.load(account: account) {
                 guard existing.data == target.key.data else {
                     throw DeskError.invalid("配对码与已有记录不同。请核对设备，或通过桌面连接更新配对码")
                 }
-            } else { try KeyStore.save(target.key, account: account) }
+                addedKey = false
+            } else {
+                try KeyStore.save(target.key, account: account)
+                addedKey = true
+            }
             var records = connections
             records[index].address = target.address
             records[index].port = target.port
@@ -2402,6 +2462,10 @@ final class DeskModel: ObservableObject, Identifiable {
             if records != connections {
                 try ConnectionStore.save(records)
                 connections = records
+                services.notifyConnectionsChanged(excluding: self)
+            } else if addedKey {
+                cachedPortMappingMachines = nil
+                objectWillChange.send()
                 services.notifyConnectionsChanged(excluding: self)
             }
             selectedConnectionID = id
@@ -2422,51 +2486,171 @@ final class DeskModel: ObservableObject, Identifiable {
     }
 
     func startPortMapping(_ rule: PortMappingRule) throws {
-        guard mode == .viewer, let record = connections.first(where: { $0.id == rule.deviceID }) else {
+        guard mode == .viewer, let group = machineGroup(for: rule) else {
             throw DeskError.invalid("请先保存远端设备的连接信息")
         }
-        let connectedModel = (currentMappingRecordID == record.id) ? self : services.connectedViewerSession(forRecordID: record.id)
-        let session = connectedModel?.target
-        if rule.scope == .session, session == nil { throw DeskError.invalid("请先连接此设备的远控会话，或选择独立运行") }
-        guard let key = try session?.key ?? KeyStore.load(account: "remote." + record.id.uuidString) else {
-            throw DeskError.invalid("此设备缺少配对码，请在连接页面输入")
+        let sessions = desktopSessions(forMachine: group)
+        if rule.scope == .session, sessions.isEmpty {
+            throw DeskError.invalid("请先连接此设备的远控会话，或选择独立运行")
         }
-        let address = session?.address ?? record.address
-        let port = session?.port ?? record.port
-        if let host = try TailnetAddress.host(in: address) {
-            try portMappings.start(rule) { [tailnet = services.tailnet] ready, failed in
-                tailnet.bridge(host: host, port: port, ready: { ready("127.0.0.1", $0, key) }, failed: failed)
-            }
-            return
-        }
-        var relayRoute: PortMappingManager.Route?
-        if let relay = session?.relay ?? record.relay, relay.strategy != .direct {
-            relayRoute = { [weak self] ready, failed in
-                guard let self, self.relayEnabled else { throw DeskError.invalid("请先启用此设备使用的中继服务") }
-                guard let access = try session?.relayAccessKey ?? KeyStore.load(account: relay.endpoint.credentialAccount)?.data else {
-                    throw DeskError.invalid("缺少此中继的接入码，请检查中继设置")
-                }
-                let certificate = try session?.relayCertificate ?? self.relayCertificate(for: relay.endpoint)
-                let bridge = try RelayViewerBridge(endpoint: relay.endpoint, accessKey: access, deviceID: relay.deviceID,
-                                                   udpEnabled: false, trustedCertificate: certificate)
-                bridge.onReady = { localPort in DispatchQueue.main.async { ready("127.0.0.1", localPort, key) } }
-                bridge.onClose = { error in DispatchQueue.main.async { failed(error.localizedDescription) } }
-                bridge.start()
-                return { bridge.stop() }
-            }
-        }
-        let usesRelayControl = connectedModel?.viewerSession.usesRelayControl ?? false
-        let useRelay = address.isEmpty || (session == nil ? record.relay?.strategy == .relay : usesRelayControl)
-        if useRelay {
-            guard let relayRoute else { throw DeskError.invalid("此设备缺少可用的中继线路") }
-            try portMappings.start(rule, route: relayRoute)
+        let activeIDs = Set(sessions.compactMap(\.currentMappingRecordID))
+        let tailnet = services.tailnet
+        let tailnetRunning = tailnet.enabled && tailnet.state == "Running"
+        let automatic = rule.routeMode == .automatic
+        let records: [ConnectionRecord]
+        if automatic {
+            records = PortMappingMachineResolver.orderedCandidateRecords(
+                for: group, preferredRecordID: rule.deviceID, activeConnectedRecordIDs: activeIDs,
+                tailnetRunning: tailnetRunning, relayEnabled: relayEnabled
+            )
         } else {
-            let fallback = (session?.relay ?? record.relay)?.strategy == .automatic ? relayRoute : nil
-            try portMappings.start(rule, fallback: fallback) { ready, _ in
-                ready(address, port, key)
-                return {}
+            guard let record = group.routes.first(where: { $0.id == rule.deviceID }) else {
+                throw DeskError.invalid("原指定线路已移除，请重新选择连接线路")
+            }
+            records = [record]
+        }
+
+        var candidates: [PortMappingManager.RouteCandidate] = []
+        var relayFallbacks: [PortMappingManager.RouteCandidate] = []
+        var inactiveTailnet: [PortMappingManager.RouteCandidate] = []
+        var missingPairing = false
+        var missingRelayAccess = false
+        for record in records {
+            let live = sessions.first { $0.currentMappingRecordID == record.id }
+            guard let key = try portMappingPairingKey(for: record, in: group, currentSession: live) else {
+                missingPairing = true
+                continue
+            }
+            let prioritize = activeIDs.contains(record.id) || record.id == rule.deviceID
+            if let host = try TailnetAddress.host(in: record.address) {
+                let candidate = PortMappingManager.RouteCandidate(label: RemoteMachineGroup.routeShortLabel(for: record),
+                                                                  classifiedOpen: { ready, failed in
+                    tailnet.bridge(host: host, port: record.port, ready: { ready("127.0.0.1", $0, key) },
+                                   failed: { failed(.network($0)) })
+                })
+                if automatic, !tailnetRunning, !prioritize { inactiveTailnet.append(candidate) }
+                else { candidates.append(candidate) }
+                continue
+            }
+
+            let relay = record.relay
+            var activeRelay: RelayConnectionInfo?
+            if automatic, relayEnabled, live?.viewerSession.usesRelayControl == true,
+               let actual = live?.target?.relay {
+                if let candidate = try mappingRelayCandidate(actual, key: key, session: live?.target) {
+                    candidates.append(candidate)
+                    activeRelay = actual
+                } else { missingRelayAccess = true }
+            }
+            var relayCandidate: PortMappingManager.RouteCandidate?
+            if relayEnabled, let relay, relay.endpoint != activeRelay?.endpoint || relay.deviceID != activeRelay?.deviceID {
+                relayCandidate = try mappingRelayCandidate(relay, key: key, session: live?.target)
+                if relayCandidate == nil { missingRelayAccess = true }
+            }
+            let relayOnly = record.address.isEmpty || relay?.strategy == .relay
+            if !relayOnly {
+                let host = record.address.contains(":") && !record.address.hasPrefix("[") ? "[\(record.address)]" : record.address
+                candidates.append(.init(label: "直连 · \(host):\(record.port)", open: { ready, _ in
+                    ready(record.address, record.port, key)
+                    return {}
+                }))
+            }
+            if let relayCandidate {
+                if !automatic || (relayOnly && prioritize && activeRelay == nil) { candidates.append(relayCandidate) }
+                else { relayFallbacks.append(relayCandidate) }
             }
         }
+        candidates.append(contentsOf: relayFallbacks)
+        candidates.append(contentsOf: inactiveTailnet)
+        if candidates.isEmpty {
+            if missingPairing { throw DeskError.invalid("此设备缺少配对码，请在连接页面输入") }
+            if missingRelayAccess { throw DeskError.invalid("缺少此中继的接入码，请检查中继设置") }
+            if !relayEnabled, group.routes.contains(where: { $0.relay != nil }) {
+                throw DeskError.invalid("请先启用此设备使用的中继服务")
+            }
+            throw DeskError.invalid("此设备没有可用的映射线路")
+        }
+        try portMappings.start(rule, candidates: candidates)
+    }
+
+    private func portMappingPairingKey(for record: ConnectionRecord, in group: RemoteMachineGroup,
+                                       currentSession: DeskModel?) throws -> PairingKey? {
+        if let key = try KeyStore.load(account: "remote." + record.id.uuidString) { return key }
+        if let key = currentSession?.target?.key { return key }
+        // A shared credential is safe only between routes that both confirmed the same physical ID.
+        guard let host = group.hostDeviceID, record.deviceID == host else { return nil }
+        var shared: PairingKey?
+        for route in group.routes where route.id != record.id && route.deviceID == host {
+            guard let key = try KeyStore.load(account: "remote." + route.id.uuidString) else { continue }
+            if let shared, shared.data != key.data { return nil }
+            shared = key
+        }
+        return shared
+    }
+
+    private func mappingRelayCandidate(_ relay: RelayConnectionInfo, key: PairingKey,
+                                       session: Target?) throws -> PortMappingManager.RouteCandidate? {
+        let endpoint = relay.endpoint
+        let host = endpoint.host.contains(":") ? "[\(endpoint.host)]" : endpoint.host
+        let active = session?.relay?.endpoint == endpoint ? session : nil
+        guard let access = try active?.relayAccessKey ?? KeyStore.load(account: endpoint.credentialAccount)?.data else {
+            return nil
+        }
+        var openedBridge: RelayViewerBridge?
+        return .init(label: "中继 · \(host):\(endpoint.port)", viewerNetworkFailure: { message in
+            // A loopback socket can report its closure before the bridge's upstream error reaches the main actor.
+            guard let bridge = openedBridge, bridge.failedBeforeDesktopStream, let failure = bridge.lastFailure else {
+                return .network(message)
+            }
+            return Self.mappingRelayFailure(failure)
+        }, classifiedOpen: { [weak self] ready, failed in
+            guard let self, self.relayEnabled else { throw DeskError.invalid("请先启用此设备使用的中继服务") }
+            let certificate = try active?.relayCertificate ?? self.relayCertificate(for: endpoint)
+            let bridge = try RelayViewerBridge(endpoint: endpoint, accessKey: access, deviceID: relay.deviceID,
+                                               udpEnabled: false, trustedCertificate: certificate)
+            openedBridge = bridge
+            bridge.onReady = { localPort in DispatchQueue.main.async { ready("127.0.0.1", localPort, key) } }
+            bridge.onClose = { [weak bridge] error in
+                // Once bytes are forwarded the viewer owns the end-to-end TLS and authorization result.
+                guard bridge?.failedBeforeDesktopStream == true else { return }
+                DispatchQueue.main.async { failed(Self.mappingRelayFailure(error)) }
+            }
+            bridge.start()
+            return { bridge.stop() }
+        })
+    }
+
+    private static func mappingRelayFailure(_ error: Error) -> PortMappingManager.RouteOpenFailure {
+        switch error {
+        case RelayTransportError.network, RelayTransportError.timeout, RelayServiceError.offline, RelayServiceError.timeout:
+            return .network(error.localizedDescription)
+        default:
+            return .terminal(error.localizedDescription)
+        }
+    }
+
+    func switchPortMappingRoute(_ rule: PortMappingRule, to recordID: UUID, mode: PortMappingRouteMode) throws {
+        guard let current = portMappings.rules.first(where: { $0.id == rule.id }),
+              let group = machineGroup(for: current), group.contains(recordID: recordID) else {
+            throw DeskError.invalid("这条连接线路不属于映射规则的目标设备")
+        }
+        let result = try portMappings.updateRuleRoute(id: current.id, recordID: recordID,
+                                                       hostDeviceID: group.hostDeviceID ?? current.hostDeviceID, routeMode: mode)
+        if result.wasRunning { try startPortMapping(result.updated) }
+    }
+
+    func switchMachinePortMappingsRoute(in group: RemoteMachineGroup, to recordID: UUID, mode: PortMappingRouteMode) throws {
+        guard let current = portMappingMachineGroups().first(where: { $0.id == group.id }),
+              current.contains(recordID: recordID) else {
+            throw DeskError.invalid("此设备的线路已变更，请重新选择")
+        }
+        let rules = portMappings.rules.filter { machineGroup(for: $0)?.id == current.id }
+        var failures: [String] = []
+        for rule in rules {
+            do { try switchPortMappingRoute(rule, to: recordID, mode: mode) }
+            catch { failures.append("\(rule.name)：\(error.localizedDescription)") }
+        }
+        if !failures.isEmpty { throw DeskError.invalid(failures.joined(separator: "\n")) }
     }
 
     func prepareSessionLaunch(savedRelayRoute: RelayConnectionInfo?) -> SessionLaunch? {
@@ -3484,6 +3668,8 @@ final class DeskModel: ObservableObject, Identifiable {
     }
 
     func removeConnection(_ record: ConnectionRecord) {
+        let group = portMappingMachineGroups().first { $0.contains(recordID: record.id) }
+        let replacement = group?.routes.first { $0.id != record.id }
         do {
             try KeyStore.remove(account: "remote." + record.id.uuidString)
             connections.removeAll { $0.id == record.id }
@@ -3491,7 +3677,8 @@ final class DeskModel: ObservableObject, Identifiable {
             try ConnectionStore.save(connections)
             services.notifyConnectionsChanged(excluding: self)
         } catch { self.error = error.localizedDescription; return }
-        portMappings.removeDevice(record.id)
+        portMappings.migrateOrRemoveRecord(record.id, replacementRecordID: replacement?.id,
+                                          hostDeviceID: group?.hostDeviceID ?? record.deviceID)
         Self.setAutoUnlock(false, for: record.id)
         do { try KeyStore.removeSecret(account: Self.unlockAccount(record.id)) }
         catch { self.error = "连接记录已移除，但保存的锁屏密码未能删除：\(error.localizedDescription)" }
@@ -3520,6 +3707,10 @@ final class DeskModel: ObservableObject, Identifiable {
             connections.removeAll { $0.id == record.id }
             connections.insert(record, at: 0)
             try ConnectionStore.save(connections)
+            viewerSession.mappingRecordID = record.id
+            if let remoteDeviceID {
+                portMappings.synchronizeHostDeviceID(forRecordID: record.id, hostDeviceID: remoteDeviceID)
+            }
             services.notifyConnectionsChanged(excluding: self)
             savedTarget = true
         } catch { self.error = "已连接，但快捷连接保存失败：\(error.localizedDescription)" }
@@ -3865,6 +4056,8 @@ final class DeskModel: ObservableObject, Identifiable {
             }
             if viewerSession.usesRelayControl { relayFallbackAttempted = false; relayFallbackCooldown.reset() }
             dataChannel?.configureVideo(canvas.makeVideoReceiver(diagnostics: performanceDiagnostics))
+            viewerSession.mappingRecordID = currentRecordID ?? target?.recordID
+            viewerSession.mappingHostDeviceID = hello.deviceID
             connected = true
             connectedSince = Date()
             sessionTraffic = peer.trafficMeter.snapshot().totals.runningTotalLabel
@@ -6144,14 +6337,20 @@ final class DeskModel: ObservableObject, Identifiable {
     }
 
     private func clearSession() {
-        if mode == .viewer {
-            let clearingRecordID = currentRecordID
-            let remainingConnected = services.connectedViewerRecordIDs(excluding: self)
-            for deviceID in MultiSessionPolicy.deviceIDsToStopSessionMappings(
-                disconnectedDeviceID: clearingRecordID,
-                remainingConnectedDeviceIDs: remainingConnected
-            ) {
-                portMappings.stopSessionMappings(forDeviceID: deviceID)
+        if mode == .viewer, connected, activeRouteBenchmarkOverride == nil {
+            let record = currentMappingRecordID
+            let host = viewerSession.mappingHostDeviceID
+            let groups = portMappingMachineGroups()
+            let group = host.flatMap { host in groups.first { $0.hostDeviceID == host } }
+                ?? groups.first { group in
+                    (host == nil || group.hostDeviceID == nil) && (record.map(group.contains(recordID:)) ?? false)
+                }
+            if let group {
+                if !desktopSessions(forMachine: group).contains(where: { $0 !== self }) {
+                    portMappings.stopSessionMappings(forRecordIDs: group.recordIDs, hostDeviceID: group.hostDeviceID)
+                }
+            } else if let record, !services.otherModels(excluding: self).contains(where: { $0.currentMappingRecordID == record }) {
+                portMappings.stopSessionMappings(forDeviceID: record)
             }
         }
         // Only a session whose video ran on a path that is not the local network says what the route carries.

@@ -3,23 +3,30 @@ import QuietDeskCore
 
 private struct MappingEditorSelection: Identifiable {
     let id: UUID
-    let device: ConnectionRecord
+    let machineID: String
+    let recordID: UUID
+    let allowsMachineSelection: Bool
     let rule: PortMappingRule?
-    init(device: ConnectionRecord, rule: PortMappingRule? = nil) {
-        self.id = rule?.id ?? UUID()
-        self.device = device
+
+    init(machine: RemoteMachineGroup, recordID: UUID, allowsMachineSelection: Bool, rule: PortMappingRule? = nil) {
+        id = rule?.id ?? UUID()
+        machineID = machine.id
+        self.recordID = recordID
+        self.allowsMachineSelection = allowsMachineSelection
         self.rule = rule
     }
 }
 
 struct PortMappingView<DeviceProfile: View>: View {
+    private enum ScopeFilter: Hashable { case allMachines, machine(String) }
+
     @ObservedObject var model: DeskModel
     @ObservedObject var manager: PortMappingManager
     let done: () -> Void
     let embedded: Bool
     @Binding private var workspaceDeviceID: UUID?
     @ViewBuilder let deviceProfile: (ConnectionRecord) -> DeviceProfile
-    @State private var sheetDeviceID: UUID?
+    @State private var sheetFilter: ScopeFilter?
     @State private var editor: MappingEditorSelection?
     @State private var deleting: PortMappingRule?
     @State private var error: String?
@@ -40,53 +47,36 @@ struct PortMappingView<DeviceProfile: View>: View {
         self.deviceProfile = deviceProfile
     }
 
-    private var selected: ConnectionRecord? {
-        let candidates = [embedded ? workspaceDeviceID : sheetDeviceID,
-                          model.preferredMappingRecordID, model.selectedConnectionID]
-        for case let id? in candidates {
-            if let record = model.connections.first(where: { $0.id == id }) { return record }
-        }
-        return model.connections.first
-    }
-
-    private var rules: [PortMappingRule] {
-        let id = selected?.id
-        return manager.rules.filter { $0.deviceID == id }
-    }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            deviceSelector
+        let groups = model.portMappingMachineGroups()
+        let selection = selectedScope(in: groups)
+        let selected = groups.first { selection == .machine($0.id) }
+        let rulesByMachine = Dictionary(grouping: manager.rules) { rule in
+            model.machineGroup(for: rule, in: groups)?.id
+        }
 
-            if embedded {
-                mappingTable
-            } else {
-                ScrollView { mappingTable }
-            }
-
+        VStack(alignment: .leading, spacing: 16) {
+            mappingHeading(groups: groups, selected: selected, filter: selection)
             if let message = error ?? manager.storageError {
                 DeskCalloutBox(message: message, symbol: "exclamationmark.triangle.fill", tone: .warning)
             }
-
-            DeskCalloutBox(
-                title: "被控端授权",
-                message: "仅支持 TCP。访问目标需经过被控端授权。远控活动时映射流量自动退让，TLS 与证书信任沿用连接配置。",
-                symbol: "info.circle",
-                tone: .info
-            )
-
-            if let selected { deviceProfile(selected) }
+            if embedded {
+                mappingContent(groups: groups, selected: selected, rules: rulesByMachine)
+            } else {
+                ScrollView { mappingContent(groups: groups, selected: selected, rules: rulesByMachine) }
+            }
         }
         .padding(embedded ? 0 : 24)
         .frame(width: embedded ? nil : 760, height: embedded ? nil : 520)
         .frame(maxWidth: embedded ? .infinity : nil, alignment: .leading)
         .background(embedded ? Color.clear : DeskPalette.canvasBackground)
         .tint(DeskPalette.accent)
-        .onChange(of: selected?.id) { _, _ in error = nil }
+        .onChange(of: selection) { _, _ in error = nil }
         .sheet(item: $editor) { item in
             PortMappingEditor(
                 item: item,
-                sessionAvailable: model.hasConnectedDesktopSession(for: item.device.id),
+                groups: item.allowsMachineSelection ? groups : groups.filter { $0.id == item.machineID },
+                sessionAvailable: { model.hasConnectedDesktopSession(forMachine: $0) },
                 save: { rule in try manager.saveRule(rule); error = nil },
                 enable: { rule in
                     try model.startPortMapping(rule)
@@ -99,69 +89,97 @@ struct PortMappingView<DeviceProfile: View>: View {
         .confirmationDialog("删除「\(deleting?.name ?? "")」？",
             isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
             titleVisibility: .visible, presenting: deleting) { rule in
-            Button("删除规则", role: .destructive) {
-                do { try manager.deleteRule(rule.id); error = nil }
-                catch { self.error = error.localizedDescription }
-            }
+            Button("删除规则", role: .destructive) { perform { try manager.deleteRule(rule.id) } }
             Button("取消", role: .cancel) {}
-        } message: { _ in Text("删除后停止对应映射；其他连接记录和规则保持不变。") }
+        } message: { _ in Text("删除后会停止这条映射。") }
     }
 
-    private var deviceSelector: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .top, spacing: 14) {
-                mappingHeading
-                Spacer(minLength: 8)
-                mappingActions
-                    .fixedSize(horizontal: true, vertical: false)
+    private func selectedScope(in groups: [RemoteMachineGroup]) -> ScopeFilter {
+        if !embedded, let sheetFilter {
+            return groups.contains { sheetFilter == .machine($0.id) } ? sheetFilter : .allMachines
+        }
+        let id = embedded ? workspaceDeviceID : (workspaceDeviceID ?? model.preferredMappingRecordID ?? model.selectedConnectionID)
+        guard let id, let group = groups.first(where: { $0.contains(recordID: id) }) else { return .allMachines }
+        return .machine(group.id)
+    }
+
+    private func select(_ group: RemoteMachineGroup?, recordID: UUID? = nil) {
+        if embedded { workspaceDeviceID = recordID ?? group?.primaryRecord.id }
+        else { sheetFilter = group.map { .machine($0.id) } ?? .allMachines }
+        error = nil
+    }
+
+    private func mappingHeading(groups: [RemoteMachineGroup], selected: RemoteMachineGroup?, filter: ScopeFilter) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 14) {
+                    pageHeading
+                    Spacer(minLength: 8)
+                    mappingActions(groups: groups, selected: selected, filter: filter)
+                        .fixedSize(horizontal: true, vertical: false)
+                }
+                VStack(alignment: .leading, spacing: 10) {
+                    pageHeading
+                    mappingActions(groups: groups, selected: selected, filter: filter)
+                }
             }
-            VStack(alignment: .leading, spacing: 10) {
-                mappingHeading
-                mappingActions
+            HStack(spacing: 7) {
+                DeskPillBadge(text: "\(manager.rules.count) 条规则", tint: DeskPalette.secondary, monospaced: true)
+                DeskPillBadge(text: "\(manager.rules.filter { manager.isEnabled($0.id) }.count) 条运行中",
+                              tint: DeskPalette.accent, monospaced: true)
             }
         }
     }
 
-    private var mappingHeading: some View {
-        DeskSettingsPageHeading(
-            title: "TCP 端口映射",
-            detail: selected.map {
-                "\(ConnectionEntryPresentation.title($0)) · \(ConnectionEntryPresentation.endpoint($0))"
-            } ?? "先连接目标设备，或从新建连接导入草稿。",
-            badgeText: selected.flatMap { model.hasConnectedDesktopSession(for: $0.id) ? "已连接" : nil }
-        )
+    private var pageHeading: some View {
+        DeskSettingsPageHeading(title: "TCP 端口映射")
     }
 
-    private var mappingActions: some View {
+    private func mappingActions(groups: [RemoteMachineGroup], selected: RemoteMachineGroup?, filter: ScopeFilter) -> some View {
         HStack(spacing: 8) {
-            if model.connections.count > 1 {
+            if !groups.isEmpty {
                 Menu {
-                    ForEach(model.connections) { record in
-                        Button {
-                            selectDevice(record.id)
-                        } label: {
-                            if record.id == selected?.id {
-                                Label("\(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record))", systemImage: "checkmark")
-                            } else {
-                                Text("\(ConnectionEntryPresentation.title(record)) · \(ConnectionEntryPresentation.endpoint(record))")
-                            }
-                        }
+                    Button { select(nil) } label: { filterLabel("全部机器（集中管理）", selected: filter == .allMachines) }
+                    Divider()
+                    ForEach(groups, id: \.id) { group in
+                        Button { select(group) } label: { filterLabel(group.title, selected: filter == .machine(group.id)) }
                     }
                 } label: {
-                    Label("切换设备", systemImage: "chevron.up.chevron.down")
+                    HStack(spacing: 5) {
+                        Text(selected?.title ?? "全部机器")
+                            .lineLimit(1)
+                        Image(systemName: "chevron.up.chevron.down")
+                            .accessibilityHidden(true)
+                    }
+                    .frame(maxWidth: 164)
                 }
                 .buttonStyle(DeskButtonStyle(.secondary))
-                .accessibilityLabel("切换目标设备")
+                .accessibilityLabel("筛选被控电脑")
+                .accessibilityValue(selected?.title ?? "全部机器")
             }
 
             if !model.connected && !model.working && !model.address.trimmingCharacters(in: .whitespaces).isEmpty {
                 Button("导入连接草稿") {
-                    do { selectDevice(try model.savePortMappingDevice()) }
-                    catch { self.error = error.localizedDescription }
+                    perform {
+                        let recordID = try model.savePortMappingDevice()
+                        let group = model.portMappingMachineGroups().first { $0.contains(recordID: recordID) }
+                        select(group, recordID: recordID)
+                    }
                 }
                 .buttonStyle(DeskButtonStyle(.secondary))
                 .help("将新建连接中填写的目标信息导入为端口映射目标")
             }
+
+            Button {
+                if let group = selected ?? groups.first {
+                    beginEditor(for: group, allowsMachineSelection: selected == nil)
+                }
+            } label: {
+                Label("添加映射", systemImage: "plus")
+            }
+            .buttonStyle(DeskButtonStyle(.primary))
+            .disabled(groups.isEmpty)
+
             if !embedded {
                 Button("完成", action: done)
                     .buttonStyle(DeskButtonStyle(.secondary))
@@ -170,190 +188,326 @@ struct PortMappingView<DeviceProfile: View>: View {
         }
     }
 
-    private func selectDevice(_ id: UUID?) {
-        if embedded { workspaceDeviceID = id } else { sheetDeviceID = id }
-        error = nil
+    @ViewBuilder
+    private func filterLabel(_ title: String, selected: Bool) -> some View {
+        if selected { Label(title, systemImage: "checkmark") }
+        else { Text(title) }
     }
 
-    private var mappingTable: some View {
-        ViewThatFits(in: .horizontal) {
-            mappingTable(compact: false)
-                .frame(minWidth: 580)
-            mappingTable(compact: true)
+    private func mappingContent(groups: [RemoteMachineGroup], selected: RemoteMachineGroup?,
+                                rules: [String?: [PortMappingRule]]) -> some View {
+        LazyVStack(alignment: .leading, spacing: 14) {
+            if groups.isEmpty, rules[nil, default: []].isEmpty {
+                DeskSurfaceCard(padding: 0, cornerRadius: 10) {
+                    emptyRules("先连接目标设备，或从「新建连接 → 用于端口映射…」导入草稿。")
+                }
+            }
+            ForEach(selected.map { [$0] } ?? groups, id: \.id) { group in
+                machineCard(group, rules: rules[group.id, default: []], allowsMachineSelection: selected == nil)
+            }
+            if selected == nil, let unmatched = rules[nil], !unmatched.isEmpty {
+                DeskSurfaceCard(padding: 0, cornerRadius: 10) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text("原连接记录不可用")
+                            .font(.system(size: 15, weight: .semibold))
+                            .padding(16)
+                        ForEach(unmatched) { rule in
+                            Divider()
+                            compactRow(rule, group: nil, allowsMachineSelection: false)
+                        }
+                    }
+                }
+            }
+            DeskCalloutBox(
+                title: "被控端授权",
+                message: "本机仅监听 127.0.0.1。访问目标需经过被控端授权，TLS 与证书信任沿用连接配置。远控活动时映射流量自动退让。",
+                symbol: "info.circle",
+                tone: .info
+            )
+            if let selected {
+                let record = selected.routes.first { $0.id == workspaceDeviceID } ?? selected.primaryRecord
+                deviceProfile(record)
+            }
         }
     }
 
-    private func mappingTable(compact: Bool) -> some View {
+    private func machineCard(_ group: RemoteMachineGroup, rules: [PortMappingRule],
+                             allowsMachineSelection: Bool) -> some View {
         DeskSurfaceCard(padding: 0, cornerRadius: 10) {
             VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 8) {
-                    Text("映射列表")
-                        .font(.system(size: 15, weight: .semibold))
-                    DeskPillBadge(text: "\(rules.count) 条规则", tint: DeskPalette.secondary, monospaced: true)
-                    Spacer()
-                    Button {
-                        if let selected { editor = MappingEditorSelection(device: selected) }
-                    } label: {
-                        Label("添加映射", systemImage: "plus")
-                    }
-                    .buttonStyle(DeskButtonStyle(.primary))
-                    .disabled(selected == nil)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 11)
-
-                Divider()
-
-                mappingColumns(compact: compact)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(DeskPalette.secondary)
-                    .padding(.vertical, 8)
+                machineHeading(group, showsBatchMenu: !rules.isEmpty && group.routes.count > 1)
                     .padding(.horizontal, 16)
-                    .background(DeskPalette.insetBackground)
-
-                if rules.isEmpty {
-                    Divider()
-                    VStack(spacing: 6) {
-                        Image(systemName: "point.3.connected.trianglepath.dotted")
-                            .font(.system(size: 22, weight: .medium))
-                            .foregroundStyle(DeskPalette.accent)
-                            .accessibilityHidden(true)
-                        Text("暂无映射规则")
-                            .font(.system(size: 14, weight: .semibold))
-                        Text(selected == nil
-                             ? "先连接目标设备，或从「新建连接 → 用于端口映射…」导入草稿。"
-                             : "点按「添加映射」配置一条 TCP 转发。")
-                            .font(.system(size: 12))
-                            .foregroundStyle(DeskPalette.secondary)
-                            .multilineTextAlignment(.center)
-                    }
-                    .padding(22)
-                    .frame(maxWidth: .infinity)
-                } else {
-                    ForEach(rules) { rule in
-                        Divider()
-                        mappingRow(rule, compact: compact)
-                    }
-                }
-
+                    .padding(.vertical, 13)
                 Divider()
-                HStack {
-                    Text("本地仅监听 127.0.0.1")
-                        .monospacedDigit()
-                    Spacer()
-                    if !rules.isEmpty {
-                        Text("\(rules.filter { manager.isEnabled($0.id) }.count) 条已启用")
+                if rules.isEmpty {
+                    emptyRules("点按「添加映射」配置一条 TCP 转发。")
+                } else {
+                    ViewThatFits(in: .horizontal) {
+                        VStack(alignment: .leading, spacing: 0) {
+                            mappingColumns
+                            ForEach(rules) { rule in
+                                Divider()
+                                wideRow(rule, group: group, allowsMachineSelection: allowsMachineSelection)
+                            }
+                        }
+                        .frame(minWidth: 672)
+
+                        VStack(alignment: .leading, spacing: 0) {
+                            ForEach(rules) { rule in
+                                if rule.id != rules.first?.id { Divider() }
+                                compactRow(rule, group: group, allowsMachineSelection: allowsMachineSelection)
+                            }
+                        }
                     }
                 }
-                .font(.system(size: 12))
-                .foregroundStyle(DeskPalette.secondary)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 9)
-                .background(DeskPalette.insetBackground.opacity(0.5))
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
-    private func mappingColumns(compact: Bool) -> some View {
+    private func machineHeading(_ group: RemoteMachineGroup, showsBatchMenu: Bool) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "desktopcomputer")
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(DeskPalette.accent)
+                .frame(width: 30, height: 30)
+                .background(DeskPalette.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 7))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(group.title)
+                    .font(.system(size: 15, weight: .semibold))
+                    .lineLimit(1)
+                    .help(group.title)
+                    .accessibilityAddTraits(.isHeader)
+                HStack(spacing: 6) {
+                    if model.hasConnectedDesktopSession(forMachine: group) {
+                        DeskPillBadge(text: "远控已连接", symbol: "circle.fill", tint: DeskPalette.emerald)
+                    }
+                    DeskPillBadge(text: "\(group.routes.count) 条同机线路", tint: DeskPalette.secondary, monospaced: true)
+                }
+            }
+            Spacer(minLength: 0)
+            if showsBatchMenu {
+                Menu {
+                    routeOptions(group, rule: nil)
+                } label: {
+                    Label("切换全部线路", systemImage: "arrow.triangle.branch")
+                }
+                .buttonStyle(DeskButtonStyle(.secondary))
+                .fixedSize()
+                .help("切换这台电脑的所有映射，并重新连接已启用的映射")
+            }
+        }
+    }
+
+    private func emptyRules(_ hint: String) -> some View {
+        VStack(spacing: 6) {
+            Text("暂无映射规则")
+                .font(.system(size: 14, weight: .semibold))
+            Text(hint)
+                .font(.system(size: 12))
+                .foregroundStyle(DeskPalette.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding(19)
+        .frame(maxWidth: .infinity)
+    }
+
+    private func beginEditor(for group: RemoteMachineGroup, allowsMachineSelection: Bool, rule: PortMappingRule? = nil) {
+        let preferredID = rule?.deviceID ?? workspaceDeviceID ?? model.preferredMappingRecordID
+        let record = group.routes.first { $0.id == preferredID } ?? group.primaryRecord
+        editor = MappingEditorSelection(machine: group, recordID: record.id, allowsMachineSelection: allowsMachineSelection, rule: rule)
+    }
+
+    private var mappingColumns: some View {
         HStack(spacing: 10) {
             Text("名称").frame(maxWidth: .infinity, alignment: .leading)
-            portColumn(Text("本地端口"), compact: compact)
-            addressColumn(Text(compact ? "目标地址与端口" : "目标地址"), compact: compact)
-            if !compact { portColumn(Text("目标端口"), compact: false) }
-            statusColumn(Text("映射状态"), compact: compact)
+            Text("本地端口 → 远端目标").frame(width: 184, alignment: .leading)
+            Text("线路").frame(width: 142, alignment: .leading)
+            Text("映射状态").frame(width: 126, alignment: .leading)
             Text("操作").frame(width: 72, alignment: .leading)
         }
+        .font(.system(size: 12, weight: .medium))
+        .foregroundStyle(DeskPalette.secondary)
+        .padding(.vertical, 8)
+        .padding(.horizontal, 16)
+        .background(DeskPalette.insetBackground)
         .accessibilityHidden(true)
     }
 
-    private func mappingRow(_ rule: PortMappingRule, compact: Bool) -> some View {
-        let targetAddress = compact ? rule.target.mappingAddress : rule.target.host
-        return HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(rule.name)
-                    .font(.system(size: 13.5, weight: .medium))
-                    .lineLimit(1)
-                    .help(rule.name)
-                if rule.scope == .independent {
-                    Text("独立映射")
-                        .font(.system(size: 11))
-                        .foregroundStyle(DeskPalette.muted)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            portColumn(
-                Text(rule.localPort.formatted(.number.grouping(.never)))
-                    .font(.system(size: 13, design: .monospaced)),
-                compact: compact
-            )
-            .accessibilityLabel("本地端口 \(rule.localPort)")
-
-            addressColumn(
-                Text(verbatim: targetAddress)
-                    .font(.system(size: 13, design: .monospaced))
-                    .lineLimit(1)
-                    .truncationMode(.middle),
-                compact: compact
-            )
-            .help(targetAddress)
-            .textSelection(.enabled)
-            .accessibilityLabel("目标地址 \(targetAddress)")
-
-            if !compact {
-                portColumn(
-                    Text(rule.target.port.formatted(.number.grouping(.never)))
-                        .font(.system(size: 13, design: .monospaced)),
-                    compact: false
-                )
-                .accessibilityLabel("目标端口 \(rule.target.port)")
-            }
-
-            statusColumn(statusView(manager.states[rule.id]), compact: compact)
-
-            HStack(spacing: 8) {
-                Toggle("启用 \(rule.name)", isOn: Binding(get: { manager.isEnabled(rule.id) }, set: { enabled in
-                    do {
-                        if enabled { try model.startPortMapping(rule) } else { manager.stop(rule.id) }
-                        error = nil
-                    } catch { self.error = error.localizedDescription }
-                }))
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.small)
-
-                Menu {
-                    Button("编辑规则…") { if let selected { editor = MappingEditorSelection(device: selected, rule: rule) } }
-                    Divider()
-                    Button("删除规则…", role: .destructive) { deleting = rule }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(DeskPalette.secondary)
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .accessibilityLabel("\(rule.name)的更多操作")
-            }
-            .frame(width: 72, alignment: .leading)
+    private func wideRow(_ rule: PortMappingRule, group: RemoteMachineGroup, allowsMachineSelection: Bool) -> some View {
+        HStack(spacing: 10) {
+            ruleName(rule).frame(maxWidth: .infinity, alignment: .leading)
+            ruleEndpoints(rule).frame(width: 184, alignment: .leading)
+            routeControl(rule, group: group).frame(width: 142, alignment: .leading)
+            statusView(manager.states[rule.id]).frame(width: 126, alignment: .leading)
+            ruleActions(rule, editorGroup: group, allowsMachineSelection: allowsMachineSelection)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .frame(minHeight: 46)
+        .frame(minHeight: 49)
     }
 
-    private func portColumn(_ content: some View, compact: Bool) -> some View {
-        content.frame(width: compact ? 62 : 68, alignment: .leading)
+    private func compactRow(_ rule: PortMappingRule, group: RemoteMachineGroup?, allowsMachineSelection: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .top, spacing: 8) {
+                ruleName(rule)
+                Spacer(minLength: 0)
+                ruleActions(rule, editorGroup: group, allowsMachineSelection: allowsMachineSelection)
+            }
+            ruleEndpoints(rule)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    routeControl(rule, group: group).fixedSize()
+                    statusView(manager.states[rule.id]).fixedSize()
+                }
+                VStack(alignment: .leading, spacing: 5) {
+                    routeControl(rule, group: group)
+                    statusView(manager.states[rule.id])
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
     }
 
-    private func addressColumn(_ content: some View, compact: Bool) -> some View {
-        content.frame(width: compact ? 140 : 114, alignment: .leading)
+    private func ruleName(_ rule: PortMappingRule) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(rule.name)
+                .font(.system(size: 13.5, weight: .medium))
+                .lineLimit(1)
+                .help(rule.name)
+            Text(rule.scope.title)
+                .font(.system(size: 11))
+                .foregroundStyle(DeskPalette.muted)
+        }
     }
 
-    private func statusColumn(_ content: some View, compact: Bool) -> some View {
-        content.frame(width: compact ? 104 : 156, alignment: .leading)
+    private func ruleEndpoints(_ rule: PortMappingRule) -> some View {
+        let localPort = rule.localPort.formatted(.number.grouping(.never))
+        return HStack(spacing: 5) {
+            Text(localPort).fixedSize()
+            Image(systemName: "arrow.right")
+                .font(.caption2)
+                .foregroundStyle(DeskPalette.muted)
+                .accessibilityHidden(true)
+            Text(verbatim: rule.target.mappingAddress)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .font(.system(size: 12.5, design: .monospaced))
+        .help("\(localPort) → \(rule.target.mappingAddress)")
+        .textSelection(.enabled)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("本地端口 \(localPort)，目标 \(rule.target.mappingAddress)")
+    }
+
+    @ViewBuilder
+    private func routeControl(_ rule: PortMappingRule, group: RemoteMachineGroup?) -> some View {
+        if let group {
+            let bound = group.routes.first { $0.id == rule.deviceID } ?? group.primaryRecord
+            let actual = manager.activeRouteLabels[rule.id]
+            let configured = RemoteMachineGroup.routeShortLabel(for: bound)
+            if group.routes.count > 1 {
+                let actualKind = actual?.components(separatedBy: " · ").first
+                let label = rule.routeMode == .automatic ? (actualKind.map { "自动 · \($0)" } ?? "自动") : configured
+                Menu {
+                    routeOptions(group, rule: rule)
+                } label: {
+                    HStack(spacing: 4) {
+                        if rule.routeMode == .automatic {
+                            Image(systemName: "bolt.fill")
+                                .foregroundStyle(DeskPalette.accent)
+                                .accessibilityHidden(true)
+                        }
+                        Text(label)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(DeskPalette.secondary)
+                            .accessibilityHidden(true)
+                    }
+                    .font(.system(size: 12))
+                }
+                .buttonStyle(DeskButtonStyle(.quiet))
+                .help(actual.map { "当前线路 · \($0)" } ?? label)
+                .accessibilityLabel("\(rule.name)的连接线路")
+                .accessibilityValue(label)
+            } else {
+                Text(actual ?? configured)
+                    .font(.system(size: 12))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help("为同一台电脑保存其他线路（如 Tailscale 或中继）后，系统会自动识别并允许在此直接切换。")
+            }
+        } else {
+            Text("原线路不可用")
+                .font(.system(size: 12))
+                .foregroundStyle(DeskPalette.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private func routeOptions(_ group: RemoteMachineGroup, rule: PortMappingRule?) -> some View {
+        Button {
+            let recordID = rule.flatMap { group.contains(recordID: $0.deviceID) ? $0.deviceID : nil } ?? group.primaryRecord.id
+            switchRoute(group, rule: rule, to: recordID, mode: .automatic)
+        } label: {
+            Label("同机自动选路（推荐）", systemImage: rule?.routeMode == .automatic ? "checkmark" : "bolt.fill")
+        }
+        Divider()
+        ForEach(group.routes) { record in
+            let active = model.hasConnectedDesktopSession(for: record.id)
+            let title = RemoteMachineGroup.routeShortLabel(for: record) + (active ? "（当前远控）" : "")
+            Button { switchRoute(group, rule: rule, to: record.id, mode: .pinned) } label: {
+                filterLabel(title, selected: rule?.routeMode == .pinned && rule?.deviceID == record.id)
+            }
+        }
+    }
+
+    private func switchRoute(_ group: RemoteMachineGroup, rule: PortMappingRule?, to recordID: UUID, mode: PortMappingRouteMode) {
+        perform {
+            if let rule { try model.switchPortMappingRoute(rule, to: recordID, mode: mode) }
+            else { try model.switchMachinePortMappingsRoute(in: group, to: recordID, mode: mode) }
+        }
+    }
+
+    private func ruleActions(_ rule: PortMappingRule, editorGroup: RemoteMachineGroup?, allowsMachineSelection: Bool) -> some View {
+        HStack(spacing: 8) {
+            Toggle("启用 \(rule.name)", isOn: Binding(get: { manager.isEnabled(rule.id) }, set: { enabled in
+                perform {
+                    if enabled { try model.startPortMapping(rule) }
+                    else { manager.stop(rule.id) }
+                }
+            }))
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.small)
+
+            Menu {
+                if let editorGroup {
+                    Button("编辑规则…") { beginEditor(for: editorGroup, allowsMachineSelection: allowsMachineSelection, rule: rule) }
+                    Divider()
+                }
+                Button("删除规则…", role: .destructive) { deleting = rule }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(DeskPalette.secondary)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel("\(rule.name)的更多操作")
+        }
+        .frame(width: 72, alignment: .leading)
+    }
+
+    private func perform(_ action: () throws -> Void) {
+        do { try action(); error = nil }
+        catch { self.error = error.localizedDescription }
     }
 
     @ViewBuilder
@@ -363,7 +517,7 @@ struct PortMappingView<DeviceProfile: View>: View {
             HStack(spacing: 6) {
                 Image(systemName: "clock.fill")
                     .font(.system(size: 11.5))
-                Text("正在握手或等待被控端确认…")
+                Text("握手或等待授权")
                     .lineLimit(1)
             }
             .font(.system(size: 12))
@@ -373,7 +527,7 @@ struct PortMappingView<DeviceProfile: View>: View {
             HStack(spacing: 6) {
                 Image(systemName: "checkmark.circle.fill")
                     .font(.system(size: 12))
-                Text(connections > 0 ? "正在转发 · \(connections) 个连接" : "监听就绪")
+                Text(connections > 0 ? "转发中 · \(connections) 个连接" : "监听就绪")
                     .lineLimit(1)
             }
             .font(.system(size: 12, weight: .medium))
@@ -413,32 +567,47 @@ struct PortMappingView<DeviceProfile: View>: View {
 
 private struct PortMappingEditor: View {
     private enum Field: Hashable { case name, localPort, host, remotePort }
+    private enum RouteChoice: Hashable { case automatic, pinned(UUID) }
+
     let item: MappingEditorSelection
-    let sessionAvailable: Bool
+    let groups: [RemoteMachineGroup]
+    let sessionAvailable: (RemoteMachineGroup) -> Bool
     let save: (PortMappingRule) throws -> Void
     let enable: (PortMappingRule) throws -> Void
     @Environment(\.dismiss) private var dismiss
+    @State private var machineID: String
+    @State private var routeChoice: RouteChoice
     @State private var name: String
     @State private var localPort: String
     @State private var host: String
     @State private var remotePort: String
     @State private var scope: PortMappingScope
+    @State private var scopeWasEdited = false
     @State private var error: String?
     @State private var enableError: String?
     @FocusState private var focusedField: Field?
 
-    init(item: MappingEditorSelection, sessionAvailable: Bool, save: @escaping (PortMappingRule) throws -> Void,
+    init(item: MappingEditorSelection, groups: [RemoteMachineGroup],
+         sessionAvailable: @escaping (RemoteMachineGroup) -> Bool, save: @escaping (PortMappingRule) throws -> Void,
          enable: @escaping (PortMappingRule) throws -> Void) {
         self.item = item
+        self.groups = groups
         self.sessionAvailable = sessionAvailable
         self.save = save
         self.enable = enable
+        let group = groups.first { $0.id == item.machineID }
+        let defaultsToAutomatic = item.rule == nil && (group?.routes.count ?? 0) > 1
+        _machineID = State(initialValue: item.machineID)
+        _routeChoice = State(initialValue: item.rule?.routeMode == .automatic || defaultsToAutomatic
+                             ? .automatic : .pinned(item.recordID))
         _name = State(initialValue: item.rule?.name ?? "")
         _localPort = State(initialValue: item.rule.map { String($0.localPort) } ?? "")
         _host = State(initialValue: item.rule?.target.host ?? "127.0.0.1")
         _remotePort = State(initialValue: item.rule.map { String($0.target.port) } ?? "")
-        _scope = State(initialValue: item.rule?.scope ?? (sessionAvailable ? .session : .independent))
+        _scope = State(initialValue: item.rule?.scope ?? (group.map(sessionAvailable) == true ? .session : .independent))
     }
+
+    private var machine: RemoteMachineGroup? { groups.first { $0.id == machineID } }
 
     private var headingTitle: String {
         if item.rule == nil { return "添加 TCP 映射规则" }
@@ -452,6 +621,10 @@ private struct PortMappingEditor: View {
                 symbol: "point.3.connected.trianglepath.dotted",
                 detail: "配置从本机端口到被控端目标的 TCP 转发。"
             )
+
+            if groups.count > 1 || (machine?.routes.count ?? 0) > 1 {
+                routeSettings
+            }
 
             editorField("名称") {
                 TextField("例如：开发预览", text: $name)
@@ -482,7 +655,7 @@ private struct PortMappingEditor: View {
 
             DeskSettingsGroup(title: "") {
                 DeskSettingsRow(title: "运行方式") {
-                    Picker("运行方式", selection: $scope) {
+                    Picker("运行方式", selection: Binding(get: { scope }, set: { scope = $0; scopeWasEdited = true })) {
                         ForEach(PortMappingScope.allCases, id: \.self) { Text($0.title).tag($0) }
                     }
                     .labelsHidden()
@@ -491,8 +664,8 @@ private struct PortMappingEditor: View {
             }
 
             Text(scope == .independent
-                 ? "无需远控画面；被控端需开启共享或允许独立映射服务。编辑保存会先停止已有运行规则。"
-                 : "目标地址从被控 Mac「\(ConnectionEntryPresentation.title(item.device))」访问；127.0.0.1 表示它自身。")
+                 ? "被控端需开启共享或允许独立映射服务。编辑保存会先停止已有运行规则。"
+                 : "目标地址从被控电脑「\(machine?.title ?? "—")」访问，127.0.0.1 表示它自身。")
                 .font(.system(size: 12.5))
                 .foregroundStyle(DeskPalette.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -518,10 +691,11 @@ private struct PortMappingEditor: View {
                 Spacer()
                 Button(item.rule == nil ? "仅保存" : "保存并停用") { submit(enable: false) }
                     .buttonStyle(DeskButtonStyle(.secondary))
+                    .disabled(machine == nil)
                 Button(enableError == nil ? "保存并启用" : "保存并重试启用") { submit(enable: true) }
                     .buttonStyle(DeskButtonStyle(.primary))
                     .keyboardShortcut(.defaultAction)
-                    .disabled(scope == .session && !sessionAvailable)
+                    .disabled(machine == nil || (scope == .session && machine.map(sessionAvailable) != true))
             }
             .padding(.top, 6)
         }
@@ -531,6 +705,41 @@ private struct PortMappingEditor: View {
         .foregroundStyle(DeskPalette.ink)
         .tint(DeskPalette.accent)
         .onAppear { focusedField = item.rule == nil ? .name : .localPort }
+        .onChange(of: machineID) { _, _ in
+            guard let machine else { return }
+            routeChoice = machine.routes.count > 1 ? .automatic : .pinned(machine.primaryRecord.id)
+            if item.rule == nil, !scopeWasEdited {
+                scope = sessionAvailable(machine) ? .session : .independent
+            }
+            error = nil
+        }
+    }
+
+    private var routeSettings: some View {
+        DeskSettingsGroup(title: "") {
+            if groups.count > 1 {
+                DeskSettingsRow(title: "目标被控电脑") {
+                    Picker("目标被控电脑", selection: $machineID) {
+                        ForEach(groups, id: \.id) { group in Text(group.title).tag(group.id) }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: 325)
+                }
+            }
+            if let machine, machine.routes.count > 1 {
+                if groups.count > 1 { Divider() }
+                DeskSettingsRow(title: "连接线路") {
+                    Picker("连接线路", selection: $routeChoice) {
+                        Text("同机自动选路（跟随当前会话 / 失败自动切线）").tag(RouteChoice.automatic)
+                        ForEach(machine.routes) { record in
+                            Text(RemoteMachineGroup.routeShortLabel(for: record)).tag(RouteChoice.pinned(record.id))
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: 325)
+                }
+            }
+        }
     }
 
     private var localEndpoint: some View {
@@ -595,6 +804,7 @@ private struct PortMappingEditor: View {
 
     private func submit(enable: Bool) {
         do {
+            guard let machine else { throw DeskError.invalid("目标被控电脑已移除。") }
             guard let port = UInt16(localPort.trimmingCharacters(in: .whitespaces)), port > 0 else {
                 throw DeskError.invalid("本地端口须为 1 至 65535 之间的整数。")
             }
@@ -602,8 +812,20 @@ private struct PortMappingEditor: View {
             guard let targetPort = remote.isEmpty ? port : UInt16(remote) else { throw DeskError.invalid("目标端口无效。") }
             let target = try PortMappingTarget(host: host.trimmingCharacters(in: .whitespaces), port: targetPort)
             let label = name.trimmingCharacters(in: .whitespacesAndNewlines)
-            let rule = PortMappingRule(id: item.id, deviceID: item.device.id, name: label.isEmpty ? target.mappingAddress : label,
-                                       localPort: port, target: target, scope: scope)
+            let recordID: UUID
+            let mode: PortMappingRouteMode
+            switch routeChoice {
+            case .automatic:
+                recordID = machine.contains(recordID: item.recordID) ? item.recordID : machine.primaryRecord.id
+                mode = .automatic
+            case .pinned(let id):
+                guard machine.contains(recordID: id) else { throw DeskError.invalid("指定线路已移除，请重新选择。") }
+                recordID = id
+                mode = .pinned
+            }
+            let rule = PortMappingRule(id: item.id, deviceID: recordID, name: label.isEmpty ? target.mappingAddress : label,
+                                       localPort: port, target: target, scope: scope,
+                                       hostDeviceID: machine.hostDeviceID, routeMode: mode)
             try save(rule)
             error = nil
             if enable {
